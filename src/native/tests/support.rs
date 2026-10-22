@@ -365,7 +365,7 @@ pub(super) fn cli_search(root: &Path, args: &[&str]) -> serde_json::Value {
     let NativeCommand::Search(request) = parse_args(args).unwrap() else {
         panic!("{args:?} is not a search command")
     };
-    query::search_value_in(root, &request).unwrap()
+    query::search::search_value_in(root, &request).unwrap()
 }
 
 pub(super) fn cli_sessions(root: &Path) -> Vec<serde_json::Value> {
@@ -433,7 +433,7 @@ pub(super) fn seed_claimed_session_with_claim(directory: &Path) -> (String, turn
 
 /// Points `link` at `target` as a directory symlink, or on Windows a junction when
 /// symlinks need a privilege. Returns false where neither can be created.
-pub(super) fn link_directory(target: &Path, link: &Path) -> bool {
+pub(in crate::native) fn link_directory(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let created = std::os::unix::fs::symlink(target, link).is_ok();
     #[cfg(windows)]

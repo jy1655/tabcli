@@ -2,7 +2,7 @@ use super::support::*;
 use super::*;
 use crate::native::delivery::{remaining_turn_timeout, terminal_input_bytes};
 use crate::native::session::primitives::read_json;
-use crate::native::session::test_support::TURN_CLAIM_FILE;
+use crate::native::session::test_support::{TURN_CLAIM_FILE, write_test_manifest};
 use crate::native::session::turn::Report;
 use crate::native::session::{SessionState, SessionStatus, update_status};
 use crate::native::{delivery, provider, terminal};
@@ -126,6 +126,8 @@ fn terminal_input_framing_matches_each_adapter_contract() {
 fn initial_prompt_failures_distinguish_safe_abort_from_uncertain_delivery() {
     for delivery_started in [false, true] {
         let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        write_test_manifest(directory.path(), "codex");
         update_status(
             directory.path(),
             SessionState::AwaitingInitialInput,
@@ -165,6 +167,7 @@ fn follow_up_terminal_send_failure_releases_only_confirmed_not_started_claims() 
     for delivery_may_have_occurred in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
+        write_test_manifest(directory.path(), "codex");
         update_status(directory.path(), SessionState::Ready, None, None).unwrap();
         let (mut claim, _) = turn::claim_ready(
             &Store::open_unchecked(directory.path()),

@@ -201,6 +201,25 @@ launch, observe, continue, and close without replacing the capabilities those CL
   when Pi provides an addressed interruption endpoint and Bridge has an adapter claim
   retirement boundary.
 
+- Native Windows Pi input has no verified addressed first-party endpoint with per-turn
+  acceptance. Bridge requires the installed extension's actual schema 2 startup record
+  with `input_ack_schema: 1` before one console attempt, never a version inference.
+  The extension matches the complete framed prompt's SHA-256 and UTF-8 byte length to
+  Pi pending state at `before_agent_start`. Reading the whole trimmed core `turn.claim`
+  at the correlated `agent_start` is also a declared read-only exception: it witnesses
+  historical submission, without acquiring result or cancel authority. Latch one receipt
+  publication attempt per claim before writing `pi-input-accepted-<claim>.json` through
+  exclusive temporary creation and rename. Retirement after the witness read or a Pi
+  conversation change does not invalidate that history. Retain receipts through later
+  installs, rollback and close; they grant no input, result or abort authority. Sent
+  requires a matching receipt within the original deadline. Read it before interpreting
+  retirement or close, then re-read once; later publication can still leave Uncertain.
+  Never resend text or Return. This fallback assumes no concurrent input and cannot
+  distinguish a manual exact copy of the framed prompt. Keep open sessions on the same
+  or a newer Bridge binary, including `AGENT_BRIDGE_EXECUTABLE`: older follow-ups can
+  strip the startup input capability. Replace this fallback when Pi exposes addressed
+  interactive input with per-turn acceptance identity.
+
 - Pi v1.0.4 exposes `ctx.abort()` to an interactive extension, but no verified official
   endpoint addresses that running interactive session from outside. Cancel therefore
   reaches the official API through a Pi-owned record and polling fallback. Replace the
@@ -363,7 +382,29 @@ launch, observe, continue, and close without replacing the capabilities those CL
   provides a terminal lifecycle event that carries the answer, delivers notify through
   stdin, or lets a TUI launched with overrides attach to the daemon (the embedded app
   server is in-process, so no external client can observe `turn/completed`).
-- Live on native Windows, 2026-10-18, codex-cli 0.163.0
+- The same Cursor observes question emissions only from the bound turn's completed
+  `AgentMessage` with `delivery: async` and validated structured questions, after accepted
+  framed input. Only a request bound through injected Codex hooks can have this evidence;
+  an unbound, notify-settled Claim cannot. Raw calls, tool output and prose supply no emission
+  evidence. Optional turn attribution that is absent, malformed or different is ignored
+  during byte-zero replay; an attributable item's malformed optional content marks incompleteness without
+  suspending completion. One private `codex-questions-<claim>.json` holds a prefix that
+  replay never rewrites. The 64 KiB limit covers the whole pretty-encoded record, Request
+  identity included. Replay preserves prior items and monotone incompleteness. Publication
+  checks the same locked Claim/status/pending predicate as binding plus exact Binding equality; failure
+  never changes completion, and there is no backfill after Claim release, so a write that
+  still fails at the terminal poll loses that evidence. The terminal flush reuses the
+  successful terminal integrity checkpoint; nonterminal publication verifies separately.
+  Queries use the selected historical Receipt under their existing lock. Ordinary single
+  `result` shows content; status focuses its active Receipt or existing latest Result's Receipt;
+  ordinary inspect shows per-request presence. Wait, list, timeline, attachments and completion
+  records retain their contracts. Emitted never means pending or answered, absence is
+  unknown, and a later `tell` is another Request, not resolution. Tool availability depends
+  on model/configuration and retained history. Replace this provider-owned transcript
+  fallback when Codex provides a verified, addressed question event or lifecycle for the
+  same injected TUI launch; never switch on a version check. Question component verification
+  is recorded in `docs/verification/2026-10-19-codex-question-emissions.md`.
+- Lifecycle completion live verification on native Windows, 2026-10-18, codex-cli 0.163.0
   (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
   from `task_complete` with and without a notify record (a 25,463-character prompt with a
   10,092-character answer left none), a steered TUI message joined the bound turn without
@@ -538,6 +579,17 @@ launch, observe, continue, and close without replacing the capabilities those CL
   model time or billing time, and do not collect provider usage from a signal that the
   provider does not document as usage. Usage a query shows is what the event records
   (`usage`, or `usage_reason` with the bounded `usage_error`); never estimate or total it.
+- A delivery refusal (`Delivery::NotSent`) is settled by `settle_delivery_refusal_locked`
+  as the receipt's failed event: Bridge-owned evidence of what was not sent, with
+  `provenance: "delivery_not_sent"`, the refusal text as `error`, the session's provider
+  from the manifest and no provider session or turn id. It is journaled through the same
+  completion machinery under the one lifecycle lock, after a pending completion is
+  recovered and only for the installed claim of a session that is not closed; a failed
+  journal write leaves the claim installed. Every query reads it as `failed`; the timeline
+  marks it `stage: delivery_refusal` and `delivery: refused_not_sent`; reopen accepts it.
+  Historical receipts without an event stay `unresolved`: never infer a refusal from
+  `status.error`, never repair such a receipt, and the reopened-conversation refusal in
+  `reopen.rs` still leaves one on purpose.
 - The self-test runs in the ordinary state root by default and in a private directory
   only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
   installed setup as it is. It closes only what it created, bounds every command it
@@ -584,6 +636,13 @@ launch, observe, continue, and close without replacing the capabilities those CL
   `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`, and
   `git diff --check` before claiming completion. Use serial test-harness execution for
   local, CI, and release checks; retain concurrency created inside individual tests.
+- Finish every release with local build cleanup after publication verification, installation
+  (if requested), and all checks. Follow `docs/releasing.md#local-build-cleanup`: preserve
+  evidence outside `target/`, ensure no build or live session depends on its binaries, then
+  run `cargo --config 'build.build-dir="./target"' clean --target-dir ./target` from the
+  checkout root. Clean only this checkout's build output, never other worktrees, installed
+  binaries, session records, a separately configured build directory or global Cargo caches.
+  Report reclaimed space, or the dependency or verification gap that deferred cleanup.
 - Tests requiring authenticated CLIs and visible terminal surfaces remain manual live
   tests; do not represent ignored live tests as runtime verification.
 - A claim about Windows behavior is not verified until its `cfg(windows)` test has run on the

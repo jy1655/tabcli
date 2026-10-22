@@ -30,6 +30,114 @@ fn reason<'a>(checks: &'a Value, id: &str) -> &'a str {
 }
 
 #[test]
+fn partial_observation_releases_cancel_lock_before_reading_hold_and_manifest() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let store = Store::open_unchecked(&fixture.directory);
+    store
+        .record(CoreRecord::Cancel)
+        .write_json(&json!({
+            "schema":1, "request_id":"request-exact", "claim_token":"123-456-0", "created_unix_ms":1
+        }))
+        .unwrap();
+    let mut attempts = 0;
+    let observed = PartialObservation::read_with_lock(&reader, "session-fault", || {
+        attempts += 1;
+        let writer = File::open(fixture.directory.join("turn.claim.lock")).unwrap();
+        writer.try_lock().unwrap();
+        drop(writer);
+        if attempts == 2 {
+            store
+                .record(CoreRecord::Cancel)
+                .write_json(&json!({}))
+                .unwrap();
+            store
+                .record(CoreRecord::Hold)
+                .write_json(&json!({"held":true, "created_unix_ms":1}))
+                .unwrap();
+            let mut manifest = reader.manifest().unwrap();
+            manifest.title = "after cancel observation".into();
+            store
+                .record(CoreRecord::Manifest)
+                .write_json(&manifest)
+                .unwrap();
+        }
+        reader.lock_shared()
+    });
+    assert_eq!(attempts, 2);
+    assert_eq!(observed.cancel, judgment::Cancel::Recorded(None));
+    assert!(matches!(observed.hold, judgment::Hold::Held { .. }));
+    assert_eq!(observed.manifest.unwrap().title, "after cancel observation");
+    assert!(observed.evidence.owner_judgment.get().is_none());
+    assert!(observed.evidence.surface_presence.get().is_none());
+    File::open(fixture.directory.join("turn.claim.lock"))
+        .unwrap()
+        .try_lock()
+        .unwrap();
+}
+
+#[test]
+fn partial_observation_keeps_lock_failures_local_and_tombstone_reads_lazy() {
+    for failed_attempt in [1, 2] {
+        let fixture = seed_close_fixture(JournaledEventState::Committed);
+        let reader = Reader::open_unchecked(&fixture.directory);
+        let mut attempts = 0;
+        let before = entries(&fixture.directory);
+        let observed = PartialObservation::read_with_lock(&reader, "session-fault", || {
+            attempts += 1;
+            if attempts == failed_attempt {
+                bail!("lock attempt {attempts}");
+            }
+            reader.lock_shared()
+        });
+        assert_eq!(attempts, 2);
+        if failed_attempt == 1 {
+            assert_eq!(
+                observed.cancel,
+                judgment::Cancel::Unreadable("lock attempt 1".into())
+            );
+            assert_eq!(observed.hold, judgment::Hold::NotHeld);
+        } else {
+            assert_eq!(observed.cancel, judgment::Cancel::Absent);
+            assert_eq!(
+                observed.hold,
+                judgment::Hold::Unreadable("lock attempt 2".into())
+            );
+        }
+        assert!(observed.evidence.owner.is_ok());
+        assert!(!matches!(
+            observed.surface,
+            judgment::Surface::Unreadable { .. }
+        ));
+        assert!(observed.manifest.is_some());
+        assert_eq!(entries(&fixture.directory), before);
+    }
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let store = Store::open_unchecked(&fixture.directory);
+    store
+        .record(CoreRecord::Closed)
+        .write_private(b"{")
+        .unwrap();
+    assert!(
+        PartialObservation::read(&reader, "session-fault")
+            .evidence
+            .close_tombstone
+            .is_none()
+    );
+    store
+        .record(CoreRecord::Hold)
+        .write_json(&json!({"held":true, "created_unix_ms":1}))
+        .unwrap();
+    assert!(matches!(
+        PartialObservation::read(&reader, "session-fault")
+            .evidence
+            .close_tombstone,
+        Some(Err(_))
+    ));
+}
+
+#[test]
 fn damage_keeps_inspect_and_doctor_failure_scopes() {
     for part in [
         "status",

@@ -18,6 +18,62 @@ fn frame(text: &str) -> String {
 fn evidence(rendered: &str, expected: &str) -> Observation {
     composer_segments(&frame(rendered)).map_or(Observation::Ambiguous, |s| observe(&s, expected))
 }
+
+#[test]
+fn paired_initial_readiness_and_draft_observation_need_different_evidence() {
+    let empty = super::super::COMPOSER_ROW;
+    assert!(super::super::composer_is_ready(empty));
+    assert_eq!(
+        classification(Ok(empty.into())),
+        "ambiguous (unresolved overlay)"
+    );
+
+    let pending = super::super::PendingCodexTurn::new("1-2-3").unwrap();
+    let prompt = super::super::correlated_prompt("body", &pending);
+    let screen = format!("› {}", prompt.replace('\n', "\n  "));
+    assert!(!super::super::composer_is_ready(&screen));
+    for tail in ["", "<!-- agent-bridge-codex-turn:4-5-6 -->"] {
+        assert!(super::composer_segments(&screen, tail, Path::new(WORKSPACE)).is_err());
+    }
+    let segments =
+        super::composer_segments(&screen, &pending.marker, Path::new(WORKSPACE)).unwrap();
+    assert_eq!(segments.last(), Some(&Segment::Inline(pending.marker)));
+    assert_eq!(observe(&segments, &prompt), Observation::Complete);
+}
+
+#[test]
+fn paired_global_hook_veto_still_allows_plain_words_in_an_addressed_draft() {
+    let pending = super::super::PendingCodexTurn::new("1-2-3").unwrap();
+    for phrase in ["Review hooks", "Trust all and continue"] {
+        let body = format!(
+            "Explain these labels\n{}\n{phrase}",
+            super::super::COMPOSER_ROW
+        );
+        let prompt = super::super::correlated_prompt(&body, &pending);
+        let screen = frame(&prompt);
+        assert!(super::super::legacy_composer_is_ready(&screen));
+        assert!(!super::super::composer_is_ready(&screen));
+        let segments =
+            super::composer_segments(&screen, &pending.marker, Path::new(WORKSPACE)).unwrap();
+        assert_eq!(observe(&segments, &prompt), Observation::Complete);
+    }
+}
+
+#[test]
+fn paired_structural_picker_refuses_both_initial_readiness_and_addressed_draft() {
+    let pending = super::super::PendingCodexTurn::new("1-2-3").unwrap();
+    let prompt = super::super::correlated_prompt("body", &pending);
+    let picker: String = serde_json::from_str(include_str!("picker-screen.json")).unwrap();
+    let screen = format!("{}\n{picker}", frame(&prompt));
+    assert!(!super::super::composer_is_ready(&screen));
+    assert_eq!(
+        super::composer_segments(&screen, &pending.marker, Path::new(WORKSPACE))
+            .unwrap_err()
+            .0,
+        "blocked"
+    );
+}
+
 #[test]
 fn parser_ordered_placeholder_inline_and_unicode_fixtures() {
     for n in [1001, 1500] {
@@ -125,6 +181,7 @@ impl Fake {
     fn new() -> (Self, turn::Claim, String) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("events")).unwrap();
+        crate::native::session::test_support::write_test_manifest(root.path(), "codex");
         update_status(root.path(), SessionState::Working, None, None).unwrap();
         let claim = turn::claim(&Store::open_unchecked(root.path()), &[]).unwrap();
         let token = claim.token().to_owned();
@@ -405,13 +462,22 @@ fn unrelated_provider_routes_keep_send_file_and_single_return_facts() {
             1
         );
     }
-    for source in [
-        include_str!("../../../agy/mod.rs"),
-        include_str!("../../../pi/mod.rs"),
+    for (source, console_source, dispatch) in [
+        (
+            include_str!("../../../agy/mod.rs"),
+            include_str!("../../../agy/mod.rs"),
+            "terminal::send_file(session, prompt_path, deadline)",
+        ),
+        (
+            include_str!("../../../pi/mod.rs"),
+            include_str!("../../../pi/input.rs"),
+            "terminal::send_file(turn.surface, path, turn.deadline)",
+        ),
     ] {
-        assert!(source.contains("terminal::send_file(session, prompt_path, deadline)"));
+        assert!(console_source.contains(dispatch));
         assert!(source.contains("submit_count: 1"));
         assert!(!source.contains("send_file_text_only"));
+        assert!(!console_source.contains("send_file_text_only"));
     }
 }
 
@@ -478,10 +544,6 @@ fn no_binding_diagnostic_distinguishes_all_final_screen_classes() {
     assert!(
         include_str!("../../../agy/delivery.rs")
             .contains("|| terminal::send_file(session, prompt_path, deadline)")
-    );
-    assert!(
-        include_str!("../../../pi/startup.rs")
-            .contains("terminal::send_file(session, prompt_path, deadline)")
     );
 }
 
@@ -1128,17 +1190,25 @@ fn real_console_payload_to_helper_seam_fences_late_retirement() {
             let prompt = format!("body\n<!-- agent-bridge-codex-turn:{token} -->");
             let session = serde_json::from_value(serde_json::json!({"terminal":"windows-console", "session_id":"1", "managed_session_id":directory.file_name().unwrap().to_str().unwrap()})).unwrap();
             let deadline = Instant::now() + Duration::from_secs(25);
-            terminal::with_stale_helper(&directory, phase, change, &frame(&prompt), || {
-                let mut io = Console {
-                    session: &session,
-                    directory: &directory,
-                    claim: &token,
-                    deadline,
-                };
-                let error = run(&mut io, &prompt, &token, deadline).unwrap_err();
-                assert_eq!(error.delivery_may_have_occurred(), phase != 1);
-                assert!(error.error().to_string().contains("stale"), "{error:?}");
-            });
+            terminal::with_in_process_helper(
+                &directory,
+                &session,
+                agent_bridge::FirstPartyCli::Codex,
+                phase,
+                change,
+                &frame(&prompt),
+                || {
+                    let mut io = Console {
+                        session: &session,
+                        directory: &directory,
+                        claim: &token,
+                        deadline,
+                    };
+                    let error = run(&mut io, &prompt, &token, deadline).unwrap_err();
+                    assert_eq!(error.delivery_may_have_occurred(), phase != 1);
+                    assert!(error.error().to_string().contains("stale"), "{error:?}");
+                },
+            );
             claim.retain();
         }
     }

@@ -2,7 +2,7 @@
 //! runs it in the surface. Admission, the fd handoff, the owner record, the version gate,
 //! the provider plan, the spawn with its durable identity and the exit settlement.
 use super::WRAPPER_EXIT_CODE_MARKER;
-use crate::native::reopen::{REOPEN_LAUNCH_GATE, read_resumed_from, record_reopen_refusal};
+use crate::native::reopen::{ReopenGate, read_resumed_from, record_reopen_refusal};
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
 use crate::native::session::state::{SessionState, update_status};
@@ -163,7 +163,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
         let _ = watcher.stop();
         return Err(record_reopen_refusal(
             directory,
-            REOPEN_LAUNCH_GATE,
+            ReopenGate::ProviderUnsupported,
             format!("{error:#}"),
         ));
     }

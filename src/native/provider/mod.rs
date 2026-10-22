@@ -12,6 +12,45 @@ use std::{ffi::OsString, fmt::Debug, path::Path, path::PathBuf, time::Instant};
 
 use super::{delivery::Transport, terminal};
 
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub(super) struct EmittedQuestion {
+    pub(super) title: String,
+    pub(super) options: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub(super) struct QuestionEmission {
+    pub(super) id: String,
+    pub(super) questions: Vec<EmittedQuestion>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum QuestionObservation {
+    Complete,
+    Incomplete,
+    Unreadable,
+}
+
+pub(super) struct QuestionEmissions {
+    pub(super) items: Vec<QuestionEmission>,
+    pub(super) observation: QuestionObservation,
+}
+
+/// Reads under the Snapshot's lifecycle lock; a snapshot without it gets no question fields.
+pub(super) fn question_emissions(
+    reader: &super::session::Reader,
+    provider: &str,
+    locked: bool,
+    receipt: &super::session::requests::Receipt,
+) -> Option<QuestionEmissions> {
+    if provider == "codex" && locked {
+        codex::questions::read(reader, receipt)
+    } else {
+        None
+    }
+}
+
 // The manifest's policy inputs travel with every launch context. Each adapter maps them to
 // its CLI's flags itself through the public mappings; no shared code assembles them.
 pub(super) struct LaunchContext<'a> {
@@ -169,8 +208,8 @@ trait NativeProviderAdapter: Sync {
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey>;
-    fn result_timeout_diagnostic(&self) -> Option<super::doctor::ResultTimeoutDiagnostic>;
-    fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
+    fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
+    fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
     // Caller-environment variables removed from every short-lived provider query the
     // bridge runs (version preflight, doctor probes). Each adapter states its own list;
     // there is no shared default.
@@ -229,14 +268,14 @@ pub(super) fn workspace_trust_key(
 
 pub(super) fn diagnose(
     provider: FirstPartyCli,
-    context: super::doctor::Context<'_>,
-) -> Vec<super::doctor::Check> {
+    context: super::diagnostics::Context<'_>,
+) -> Vec<super::diagnostics::Check> {
     adapter(provider).diagnose(context)
 }
 
 pub(super) fn result_timeout_diagnostic(
     provider: FirstPartyCli,
-) -> Option<super::doctor::ResultTimeoutDiagnostic> {
+) -> Option<super::diagnostics::ResultTimeoutDiagnostic> {
     adapter(provider).result_timeout_diagnostic()
 }
 

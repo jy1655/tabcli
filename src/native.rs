@@ -16,6 +16,7 @@ mod consent;
 mod console_control;
 mod context;
 mod delivery;
+mod diagnostics;
 mod doctor;
 mod envelope;
 mod hold;
@@ -63,7 +64,7 @@ pub(crate) enum NativeCommand {
     },
     Result(query::ResultRequest),
     Wait(query::wait::WaitRequest),
-    Search(query::SearchRequest),
+    Search(query::search::SearchRequest),
     Status(query::status::StatusRequest),
     Doctor(doctor::DoctorRequest),
     Sessions(SessionsRequest),
@@ -171,7 +172,7 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "search",
-        parse: |_, args| query::parse_search(args),
+        parse: |_, args| query::search::parse_search(args),
         hidden: false,
     },
     CommandSpec {
@@ -315,7 +316,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         } => query::run_inspect(&id, json, timeline, request.as_deref()),
         NativeCommand::Result(request) => query::run_result(request),
         NativeCommand::Wait(request) => query::wait::run(request),
-        NativeCommand::Search(request) => query::run_search(request),
+        NativeCommand::Search(request) => query::search::run_search(request),
         NativeCommand::Doctor(request) => doctor::run(request),
         NativeCommand::Sessions(request) => sessions::run(request),
         NativeCommand::Status(request) => query::status::run(request),

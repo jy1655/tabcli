@@ -169,7 +169,9 @@ fn trust_store(env: &super::super::consent::Environment) -> Result<PathBuf> {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
-    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
+    fn result_timeout_diagnostic(
+        &self,
+    ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {
         None
     }
 
@@ -264,9 +266,12 @@ impl NativeProviderAdapter for ClaudeAdapter {
 
     fn diagnose(
         &self,
-        context: super::super::doctor::Context<'_>,
-    ) -> Vec<super::super::doctor::Check> {
-        use super::super::doctor::{Availability::*, Check};
+        context: super::super::diagnostics::Context<'_>,
+    ) -> Vec<super::super::diagnostics::Check> {
+        use super::super::diagnostics::{
+            Availability::{Available, Unknown},
+            Check,
+        };
         let setting = context.directory.map(|directory| {
             RecordReader::at(&directory.join("claude-settings.json"))
                 .optional_json::<serde_json::Value>()
@@ -616,8 +621,13 @@ fn valid_claude_conversation_id(value: &str) -> bool {
 
 // Doctor scans other live holders now, with the delivery gate's best-effort check.
 // It proves nothing between scans; non-resumed sessions return None.
-fn resumed_conversation_holders_check(directory: &Path) -> Option<super::super::doctor::Check> {
-    use super::super::doctor::{Availability::*, Check};
+fn resumed_conversation_holders_check(
+    directory: &Path,
+) -> Option<super::super::diagnostics::Check> {
+    use super::super::diagnostics::{
+        Availability::{Available, Unavailable, Unknown},
+        Check,
+    };
     // The manifest's optional `resumed_from` projection, read as the manifest is read.
     let manifest = Reader::open_unchecked(directory)
         .record(CoreRecord::Manifest)

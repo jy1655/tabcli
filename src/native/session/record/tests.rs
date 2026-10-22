@@ -1,4 +1,38 @@
 use super::*;
+
+#[test]
+fn reopen_auxiliary_decoders_keep_legacy_shape_policy() {
+    // These historical auxiliary shapes allow u128 timestamps and unknown schema/gate
+    // values. Reopen judges authority after decoding; moving them must not add the
+    // Snapshot timestamp rule or grant authority to an unknown value.
+    let marker = r#"{"schema":77,"claim":"fixture","provider_session_id":"conversation","created_unix_ms":18446744073709551616}"#;
+    let decoded = reopen_marker(marker).unwrap();
+    assert_eq!(decoded.schema, 77);
+    assert_eq!(decoded.created_unix_ms, u64::MAX as u128 + 1);
+    assert_eq!(decoded.reopened_by, None);
+    assert!(
+        reopen_marker(&marker.replace(
+            "\"claim\":\"fixture\"",
+            "\"claim\":\"fixture\",\"claim\":\"other\""
+        ))
+        .is_err()
+    );
+    let refusal = reopen_refusal(r#"{"schema":2,"phase":"launch","gate":"future-gate","detail":"fixture","created_unix_ms":1}"#).unwrap();
+    assert_eq!(refusal.gate, "future-gate");
+    assert_eq!(refusal.claim_token, None);
+    assert_eq!(refusal.cleanup, None);
+    assert_eq!(refusal.cleanup_detail, None);
+    let process = provider_process(
+        r#"{"schema":1,"managed_session_id":"session-fixture","pid":42,"spawned_unix_ms":1}"#,
+    )
+    .unwrap();
+    assert_eq!(process.pid, 42);
+    assert_eq!(process.windows_process_identity, None);
+    assert!(
+        provider_process(r#"{"schema":1,"managed_session_id":"session-fixture","pid":42}"#)
+            .is_err()
+    );
+}
 use crate::native::session::primitives::write_json_atomic;
 use crate::native::session::schema::EVENT_READ_LIMIT;
 use crate::native::session::snapshot::{PublicationRead, Snapshot};

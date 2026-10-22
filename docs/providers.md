@@ -218,6 +218,28 @@ truncation or malformed evidence suspends observation and leaves the claim pendi
 falls back to notify for a bound claim. Replace this polling reader when Codex supplies an
 addressed first-party terminal signal with equivalent identity and settlement semantics.
 
+The same watcher observes Codex's emitted async questions from completed `AgentMessage`
+items attributed to the bound turn, after it verifies accepted framed input. Only requests
+bound through Bridge's injected Codex hooks can have this evidence; unbound, notify-settled
+claims cannot. The optional `codex-questions-<claim>.json` retains an ordered prefix within
+64 KiB of serialized JSON.
+Duplicate ids keep their first content; conflicting or invalid items and the size limit mark
+known incompleteness. Storage failures can lose optional evidence, including at completion.
+They do not block the ordinary result. No record is backfilled after the claim ends.
+
+Ordinary `result` exposes `question_emissions` during the turn and afterward. `status`
+reports presence for its active or latest-result request, and ordinary `inspect` reports
+per-request presence. Absence is unknown. Emission never means that a question is still
+pending or has been answered. A Ready `tell` is a new request, without a resolution receipt.
+Codex registers the tool only for a root session with its question configuration on and a
+model whose catalog offers it. Codex keeps the item only under its paginated rollout history;
+its legacy history policy can omit it. Bridge does not infer support from a version,
+parse question-shaped prose, or accept a raw `function_call` as emission evidence.
+Replace this transcript fallback when the same managed TUI exposes a verified official
+addressed question event or lifecycle. Answer handling and parent wake remain deferred.
+Component verification is recorded in
+[the focused verification note](verification/2026-10-19-codex-question-emissions.md).
+
 Unbound claims retain the `notify` fallback: Bridge accepts an assistant result ending with
 the pending marker, or a completion whose string input begins with the delegation header and
 ends with that marker. A steered TUI input may follow Bridge's prompt; the answer serves both.
@@ -255,7 +277,8 @@ The native-queue follow-up has a send-side limit of its own on native Windows. `
 client or writing its pending-turn record, Bridge measures the prepared command line, including
 the launcher, arguments and Windows quoting, in UTF-16 units (excluding the terminating NUL).
 At 32,767 units or more it refuses delivery with the measured size, limit and remedy; nothing
-is sent, the request is recorded as unresolved and the session returns to `ready` (issue #251).
+is sent, the request is recorded as `failed` with that refusal (`provenance: "delivery_not_sent"`)
+and the session returns to `ready` (issue #251).
 Shorten the follow-up and pass long material by path in the workspace. Codex's inner hop from
 `codex.ps1` to `node` is unmeasured and can still fail below Bridge's limit. The lifecycle-hook
 route does not change this send-side limit; the console-pasted initial prompt has no such limit
@@ -422,8 +445,6 @@ observed quota-failure log is not evidence of cancellation.
 
 ## Pi
 
-Pi per-turn submission acknowledgement is tracked separately in [#254](https://github.com/jy1655/tabcli/issues/254).
-
 Install and sign in to `pi` 0.84.1 or newer. If Pi asks you to resolve project trust, answer that
 prompt before launching through Bridge.
 
@@ -438,6 +459,31 @@ against the claim. It collects the result at `agent_end` and reports it at `agen
 accepted prompt can produce an exact result body without an added marker. The result includes
 Pi's session and turn identity. Errors reported by those events are recorded too; a separate failure signal
 preserves an error when the extension cannot deliver the result to Bridge.
+
+On native Windows, both initial and follow-up input require the extension's
+`input_ack_schema: 1` startup capability. Bridge refuses input before typing when the session's
+extension did not report that capability and asks you to start a new session. Bridge sends one
+console batch, then waits for that claim's `agent_start` receipt. The extension matches the
+SHA-256 and UTF-8 byte length of the complete framed prompt against `pi-pending-turn.json`
+before publishing `pi-input-accepted-<claim>.json`. It accepts both the older string-prompt
+event and the newer explicit user event; custom runs cannot acknowledge input. This fallback
+assumes no concurrent input. The match identifies the framed prompt, not who typed it;
+a manual exact copy of the complete framed prompt is indistinguishable.
+
+On native Windows, even with `--detach`, the command waits for this submission evidence and
+can wait until the full original request deadline. A lost Return, input transformed by another
+extension, a busy run without a fresh correlated start, or a receipt publication failure leaves
+delivery uncertain. The sender re-reads the receipt once after observing claim retirement or
+close. Publication after that re-read, or evidence first observed after the deadline, still
+reports uncertain delivery even if Pi started the prompt. A result can still arrive. Inspect
+the request and Pi editor before further input; never retry the prompt or Return automatically.
+The receipt records historical submission, including after claim retirement or a Pi conversation
+change. It grants no result, input, or cancellation authority and stays with the session's
+retained records through close. Do not downgrade the Bridge binary or `AGENT_BRIDGE_EXECUTABLE`
+while these sessions remain open. An older binary can drop the startup input
+capability on a follow-up, causing later input to be refused. macOS keeps its existing input
+paths. Replace this receipt fallback when Pi exposes addressed interactive input with per-turn
+acceptance.
 
 `cancel` supports sessions whose installed extension has reported schema 2 in
 `pi-startup-ready.json`. Bridge carries that capability evidence to each new Claim when

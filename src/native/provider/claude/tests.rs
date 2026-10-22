@@ -450,7 +450,7 @@ fn assert_no_op_watcher(watcher: Box<dyn crate::native::provider::CompletionWatc
 
 #[test]
 fn diagnostics_never_promote_configured_inbound_to_runtime_messaging() {
-    use super::super::super::doctor::{Availability, Context};
+    use super::super::super::diagnostics::{Availability, Context};
     let directory = tempfile::tempdir().unwrap();
     for settings in [
         serde_json::json!({}),
@@ -488,7 +488,7 @@ fn diagnostics_never_promote_configured_inbound_to_runtime_messaging() {
 #[cfg(windows)]
 #[test]
 fn doctor_reports_other_live_holders_of_a_resumed_conversation() {
-    use super::super::super::doctor::{Availability, Context};
+    use super::super::super::diagnostics::{Availability, Context};
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("sessions");
     std::fs::create_dir(&registry).unwrap();
@@ -1234,7 +1234,7 @@ fn reopen_bundle_exists_on_every_platform() {
 
 #[test]
 fn doctor_empty_registry_preserves_unverified_detail_and_omission() {
-    use super::super::super::doctor::Availability;
+    use super::super::super::diagnostics::Availability;
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("registry");
     std::fs::create_dir(&registry).unwrap();

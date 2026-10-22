@@ -29,9 +29,18 @@
     "native-hook": 2
   },
   "src/native/console_control.rs": {
-    "native-console-control": 1
+    "native-console-control": 1,
+    "console process is no longer available": 1,
+    "Windows console submission delays do not fit inside the remaining turn timeout": 1,
+    "exact_helper_message(message, MISSING_PROCESS)": 1,
+    "exact_helper_message(message, SUBMIT_DELAYS_EXHAUSTED)": 1,
+    "message.strip_prefix(\"Error: \")": 1
   },
-  "src/native/consent.rs": {
+  "src/native/console_control/client.rs": {
+    ".prefix(\"pending-prompt-\")": 1,
+    "command.arg(\"native-console-control\")": 1
+  },
+  "src/native/consent/record.rs": {
     "const SESSION_FILE: &str = \"workspace-consent.json\";": 1,
     "root.join(\"workspace-consent\")": 1,
     "workspace-consent.json": 1
@@ -39,9 +48,11 @@
   "src/native/context.rs": {
     "[Agent Bridge context result {index}/{total}]": 1
   },
-  "src/native/reopen.rs": {
-    "provider-process.json": 1,
+  "src/native/reopen/reservation.rs": {
     "status.json": 1
+  },
+  "src/native/reopen/reservation/marker.rs": {
+    "provider-process.json": 1
   },
   "src/native/provider/agy/mod.rs": {
     "const PENDING_TURN_FILE: &str = \"agy-pending-turn.json\";": 1,
@@ -198,9 +209,12 @@
     "agent_bridge_claim_token": 1,
     "agent_bridge_prompt_correlated": 1,
     "agent_bridge_error": 1,
-    "struct PendingPiTurn {\n    schema: u32,\n    claim_token: String,\n    marker: String,\n}": 1,
+    "schema: u32,": 2,
+    "claim_token: String,": 2,
+    "marker: String,": 1,
     "marker: format!(\"<!-- agent-bridge-pi-turn:{claim_token} -->\"),": 1,
-    "impl PendingPiTurn {\n    fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: format!(\"<!-- agent-bridge-pi-turn:{claim_token} -->\"),\n        })\n    }\n}": 1,
+    "schema: 1,": 1,
+    "claim_token: claim_token.to_owned(),": 1,
     "[Agent Bridge Pi Windows console turn protocol]": 1,
     "[Agent Bridge Pi turn protocol]": 1,
     "agent-bridge-pi-turn": 1,
@@ -214,12 +228,12 @@
     "pi-hook-failure.json": 1
   },
   "src/native/provider/pi_extension.js": {
-    "AGENT_BRIDGE_NATIVE_SESSION_DIR": 5,
+    "AGENT_BRIDGE_NATIVE_SESSION_DIR": 7,
     "AGENT_BRIDGE_EXECUTABLE": 1,
     "agent_bridge_claim_token": 2,
     "agent_bridge_prompt_correlated": 1,
     "agent_bridge_error": 3,
-    "agent-bridge-pi-turn": 1,
+    "agent-bridge-pi-turn": 2,
     "native-hook": 1,
     "pi-hook-failure.json": 1,
     "pi-startup-ready.json": 1,
@@ -227,7 +241,7 @@
     "agent_bridge_prompt_correlated: true,": 1,
     "\"agent_end\"": 1,
     "\"before_agent_start\"": 1,
-    "\"agent_start\"": 1,
+    "\"agent_start\"": 2,
     "\"agent_settled\"": 1,
     "\"session_start\"": 1,
     "\"stop\"": 2,
@@ -238,7 +252,7 @@
   "src/native/provider_process.rs": {
     "AGENT_BRIDGE_BATCH_ARG_": 1
   },
-  "src/native/query.rs": {
+  "src/native/query/search.rs": {
     "AGENT_BRIDGE_TEST_SEARCH_AIDS": 1
   },
   "src/native/self_test.rs": {
@@ -362,7 +376,7 @@
     "const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;": 1
   },
   "src/native/terminal/macos/ownership.rs": {
-    "native-session": 6
+    "native-session": 1
   },
   "src/native/terminal/macos/process.rs": {
     "native-session": 7
@@ -394,24 +408,21 @@
     "const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;": 1
   },
   "src/native/terminal/windows/budget.rs": {
-    "console process is no longer available": 2,
-    "Windows console submission delays do not fit inside the remaining turn timeout": 3
+    "crate::native::console_control::SUBMIT_DELAYS_EXHAUSTED": 1
   },
   "src/native/terminal/close_authority.rs": {
     "native-session": 4,
     "native-session.json": 1
   },
   "src/native/terminal/ownership.rs": {
-    "native-session": 15
+    "native-session": 11
   },
   "src/native/terminal/windows/focus.rs": {
     "const CONSOLE_HOST_CLASS: &str = \"ConsoleWindowClass\";": 1
   },
   "src/native/terminal/windows/mod.rs": {
-    ".prefix(\"pending-prompt-\")": 1,
-    "native-console-control": 1,
-    "console process is no longer available": 1,
-    "Windows console submission delays do not fit inside the remaining turn timeout": 1
+    "console_control::MISSING_PROCESS": 1,
+    "console_control::SUBMIT_DELAYS_EXHAUSTED": 1
   },
   "src/native/terminal/windows/ownership.rs": {
     "native-session": 4

@@ -4,6 +4,7 @@ use crate::native::provider::{CompletionWatcher, NativeProviderAdapter};
 use crate::native::session::{Reader, SessionState, Store, turn, update_status};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path};
+mod questions;
 const THREAD: &str = "01234567-89ab-cdef-0123-456789abcdef";
 fn fixture() -> (tempfile::TempDir, PendingCodexTurn, Value) {
     let root = tempfile::tempdir().unwrap();
@@ -732,6 +733,8 @@ fn launch_plan_owns_session_watcher_even_before_hook_availability_is_known() {
 pub(super) enum ReadCheckpoint {
     BeforePostReadVerify,
     AfterPostReadVerify,
+    AfterTerminalVerify,
+    BeforeQuestionLock,
 }
 type ReadHook = Box<dyn FnMut(ReadCheckpoint)>;
 thread_local! {
@@ -867,6 +870,7 @@ fn post_read_observed_growth_then_truncation_suspends_with_terminal_still_presen
                     .set_len(retained_length)
                     .unwrap();
             }
+            ReadCheckpoint::BeforeQuestionLock | ReadCheckpoint::AfterTerminalVerify => (),
         },
         || observer.poll(root.path(), false),
     );

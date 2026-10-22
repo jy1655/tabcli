@@ -82,7 +82,7 @@ Start a new provider conversation when you do not want to continue an existing s
 tabcli ask PROVIDER [--workspace PATH] (--prompt TEXT | --prompt-file PATH)
     [--title NAME] [--model MODEL] [--effort EFFORT] [--terminal TERMINAL]
     [--yolo] [--timeout-secs N] [--detach] [--json]
-    [--context-result SESSION/REQUEST]...
+    [--context-result SESSION/REQUEST]... [--context-mode <full|compact>]
 ```
 
 ```sh
@@ -172,7 +172,7 @@ Use `tell` for the next prompt in a session whose previous request has finished.
 
 ```text
 tabcli tell SESSION (--prompt TEXT | --prompt-file PATH)
-    [--timeout-secs N] [--detach] [--json] [--context-result SESSION/REQUEST]...
+    [--timeout-secs N] [--detach] [--json] [--context-result SESSION/REQUEST]... [--context-mode <full|compact>]
 ```
 
 See the command and output in the [opening workflow](#command-reference).
@@ -193,6 +193,10 @@ turn; unavailable messaging is an error, not a terminal fallback. Agy and Pi use
 terminal fallback. See [providers](providers.md) for readiness and receipt gates.
 On native Windows, Codex follow-ups also have a measured command-line size refusal; see the
 [Codex send-side limit](providers.md#codex) for the limit and remedy.
+On native Windows, Pi waits for its extension's per-turn submission receipt even with `--detach`.
+That wait shares the request deadline. Bridge refuses input before typing when the session's
+extension did not report the required capability. See
+[Pi](providers.md#pi) for uncertain-delivery recovery and receipt limits.
 
 Exit behaviour matches `ask`. If you see `tell requires the ready state`, inspect the session and
 wait for its active request with `result SESSION --request REQUEST --wait`. A closed session cannot
@@ -314,7 +318,10 @@ Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsuppor
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
 SESSION --explicit` on the source, then inspect it again. `request-unresolved` and
 `source-identity-missing` mean Bridge cannot verify the recorded results or find a conversation to
-resume; inspect the source and use a new `ask` if that evidence is unavailable.
+resume; inspect the source and use a new `ask` if that evidence is unavailable. A request that this
+release settled as `Delivery::NotSent` is a recorded `failed` request (`delivery_not_sent`) and does
+not block reopen. A receipt without any event does: one recorded by an earlier release, or a
+reopened-conversation follow-up refusal, which still leaves such a receipt.
 
 `workspace-refused` is the launch admission of [`ask`](#ask) applied to the source's workspace. It
 runs after the platform and provider check, so `provider-unsupported` still comes first, and before
@@ -444,6 +451,14 @@ surface is not probed. At most two result events are decoded per listed session:
 published event and the active request's published event when they differ. Result bodies are
 not returned.
 
+For Codex, status also reads at most one optional 64 KiB question record per listed session,
+under its existing budget. Attention `question_emitted` means that record has emissions for
+the active request, or for the request behind the latest published result when no claim exists.
+A claim without a readable receipt has no question focus. Closed sessions have no
+`question_emitted` attention. Changing focus does not resolve an older emission.
+`question_observation` is present only as `incomplete` or `unreadable`; unreadable evidence
+also adds `records_partially_unreadable`. Question content is in `result --request`.
+
 A required-record failure omits that session and adds its id and reason to `incomplete_reasons`.
 Unreadable hold, owner or terminal records, reopen history, latest events, or request indexes leave
 the session in the list with attention flags. Fields whose evidence could not be read stay
@@ -513,6 +528,11 @@ The default inspection also reports `held` as true, false, or null with `hold_er
 Timeline does not include hold history. The default inspection adds `origin` and
 `origin_observation` as in `status`; the timeline has no origin entry.
 
+For Codex, ordinary JSON inspection adds `question_emitted: true` to a request reference
+when retained emissions exist. It adds `question_observation` only as `incomplete` or
+`unreadable`. This reads at most one optional 64 KiB record per request. Retrieve content
+with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
+
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.
 
@@ -559,8 +579,33 @@ including older events with no receipt. `--request` follows the receipt of that 
 `--wait` defaults to off and requires `--request`; waiting for an unspecified latest turn is
 refused. `--timeout-secs` requires `--wait` and defaults to 900 seconds.
 
+An ordinary single Codex result can include `question_emissions` while the request is still
+`pending`, and retains them after completion or close. Each item has the provider's `id`
+and `questions`, whose `title` and optional `options` preserve the provider's strings.
+Free-text questions use `options: null`. For example:
+
+```json
+{"question_emissions": [{"id": "call_example", "questions": [
+  {"title": "Which report format?", "options": ["Text", "Table"]}
+]}]}
+```
+
+Only a request that Bridge bound through its injected Codex hooks can have this evidence.
+An unbound request settled through notify cannot have it.
+
+These fields report emission, without changing request state, result text, or exit status.
+`question_observation: "incomplete"` means Bridge retained a limited prefix or rejected
+optional evidence. `"unreadable"` means the retained record could not be validated.
+Absence of either field is unknown; it does not prove that no question existed.
+After the session becomes `ready`, `tell` can carry a known fact as another request. It
+does not resolve the earlier emission. `ask`, `tell`, `wait`, `result --wait`, `result --list`,
+and timeline retain their output and waiting behavior. Full context attachments are unchanged;
+compact context attachments also report `Questions: N emitted` when retained emissions exist. Bridge has no
+transport that answers a question, and an emission does not end `wait` or `result --wait` early.
+
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
-one usage line when the provider reported usage, result text, and error. List rows show event id,
+one usage line when the provider reported usage, each emitted question title and its options
+with control characters escaped, result text, and error. List rows show event id,
 request state, request id or `legacy`, and elapsed time. See the
 [JSON field reference](#json-field-reference).
 
@@ -1198,6 +1243,7 @@ Use these options only with commands whose synopsis lists them:
 | `--detach` | Off. Return after launch/delivery acceptance, without waiting for a result. |
 | `--json` | Off. Select structured output, except commands that always print JSON. |
 | `--context-result SESSION/REQUEST` | None; up to eight attachments on `ask` or `tell`. |
+| `--context-mode full\|compact` | `full`; `compact` attaches an excerpt of 4,096 + 1,024 Unicode scalar characters with the retrieval command and records `mode`, `attached_chars`, `omitted_chars`. |
 
 `--timeout-secs` defaults to 900 for `ask`, `tell`, `reopen`, and `result --wait`, and to 120 per
 `self-test` command. For `close-session`, it defaults to 60 and accepts 1 through 3600.
@@ -1228,6 +1274,20 @@ attach fewer or smaller results if you exceed that limit. Bridge does not trunca
 make them fit. Results are appended as delimited reference material and their provenance is saved as
 `context_sources`. For older records without a request receipt, `SESSION/EVENT` is accepted instead.
 This is reference material, not a resume of the source conversation.
+
+`--context-mode full` is the default and keeps the attachment output unchanged. `compact`
+keeps messages of at most 5,120 Unicode scalar characters whole; longer messages retain the
+first 4,096 and last 1,024, separated by a visible elision with the omitted count and the exact
+`tabcli result SESSION --request REQUEST` retrieval command (`--event EVENT` for legacy events).
+Each compact block reports attached/total/omitted characters and completed state, plus the
+number of recorded question emissions when available. Compact never changes which Results
+are attachable: the whole original message still undergoes the same validation. Its rendered
+excerpt, including the elision line, counts toward the 256 KiB attachment budget, allowing
+long results that exceed the full-text byte budget. No mode silently shortens text to fit.
+Both modes record `mode`, `attached_chars`, and `omitted_chars` on each context source;
+`full` records the whole character count and zero omitted. Old receipts omit these fields.
+An explicit mode requires at least one `--context-result`; repeated, empty and unknown modes
+are rejected before reading sessions. `reopen` accepts neither attachment option.
 
 Successful commands normally exit 0; parsing, execution, and I/O failures exit nonzero and print an
 error on stderr. Check the exit behaviour in each command section: a successful observation can
@@ -1261,6 +1321,12 @@ Request states reported by `result` are `completed`, `failed`, `cancelled`, `pen
 `recovery_required`, and `unavailable`; a waiting read can report `busy` when it times out without a
 consistent observation. `cancelled` occurs only for a correlated provider interruption (see
 [cancel](#cancel)). `accepted` is the detached command acknowledgement, not a published result.
+A follow-up or initial prompt that Bridge refused before anything was sent (a preparation, budget,
+hold or transport refusal) is `failed`: Bridge records a failure event for the receipt whose
+`error` is the refusal text and whose `provenance` is `delivery_not_sent`, with no provider
+session or turn id. `unresolved` is a receipt without any event: a refusal recorded by an earlier
+Bridge release, a reopened-conversation refusal, or a claim-stage race. Bridge never infers a
+refusal from `status.error` and never repairs such receipts.
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
 
@@ -1510,6 +1576,10 @@ carry the same usage fields. A record written by this version can carry `usage` 
 journaled completion as not published, so do not downgrade `tabcli` while a session it has
 written is open.
 
+Ordinary single-result JSON can also have `question_emissions` and `question_observation`,
+as described in [result](#result). These optional fields are omitted from waited and listed
+results and do not alter the completion event or journal schema.
+
 ### wait
 
 Fields: `schema_version`, `ok`, `ended`, `remaining`, and `timed_out`. `ended` is null on
@@ -1553,8 +1623,10 @@ Fields: `schema_version`, `ok`, `session`, `request_id`, `session_state`, `sessi
 
 `requests[]` contains `result` summaries without the result body, plus `derived_from: "result"`,
 `result_command` (the command to query that request as JSON), and `delivery`. `delivery` is
-`"completion_recorded"` when a published completion is read, otherwise `"unknown"`.
-`delivery: "unknown"` does not mean that nothing was sent.
+`"completion_recorded"` when a published completion is read, `"refused_not_sent"` when the
+recorded event is Bridge's delivery refusal (`provenance: "delivery_not_sent"`, nothing was sent),
+otherwise `"unknown"`. `delivery: "unknown"` does not mean that nothing was sent. A refusal
+event's entry has `stage: "delivery_refusal"`; a provider completion's has `stage: "completion"`.
 
 ### search
 

@@ -43,7 +43,7 @@ pub(super) mod macos;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod unsupported;
 #[cfg(target_os = "windows")]
-mod windows;
+pub(in crate::native) mod windows;
 
 // Platform-only pure decisions live beside their platform module and compile on every
 // target, so that their tests run on every target; the platform modules remain gated.
@@ -52,8 +52,10 @@ mod windows;
 mod macos_selection;
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[path = "windows/budget.rs"]
-mod windows_budget;
+pub(in crate::native) mod windows_budget;
 
+#[cfg(windows)]
+pub(in crate::native) use crate::native::console_control::StaleDialogClaim;
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
@@ -62,8 +64,6 @@ use macos as platform;
 use unsupported as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
-#[cfg(windows)]
-pub(in crate::native) use windows::StaleDialogClaim;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -409,7 +409,7 @@ pub(super) fn send_file(
 ) -> TerminalSendResult {
     #[cfg(windows)]
     {
-        windows::send_file(session, prompt_path, deadline)
+        crate::native::console_control::send_file(session, prompt_path, deadline)
     }
     #[cfg(target_os = "macos")]
     {
@@ -430,7 +430,12 @@ pub(super) fn send_file_text_only(
     deadline: Instant,
 ) -> std::result::Result<usize, TerminalSendFailure> {
     #[cfg(windows)]
-    return windows::send_file_text_only(session, prompt_path, expected_claim, deadline);
+    return crate::native::console_control::send_file_text_only(
+        session,
+        prompt_path,
+        expected_claim,
+        deadline,
+    );
     #[cfg(not(windows))]
     {
         let _ = (session, prompt_path, expected_claim, deadline);
@@ -499,7 +504,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
     #[cfg(target_os = "macos")]
     return macos::read_screen(macos::INSTALLED, session, deadline);
     #[cfg(windows)]
-    return windows::read_screen(session, deadline);
+    return crate::native::console_control::read_screen(session, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (session, deadline);
@@ -523,7 +528,9 @@ pub(super) fn guarded_dialog_input(
         macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
     }
     #[cfg(windows)]
-    return windows::guarded_dialog_input(directory, session, input, deadline);
+    return crate::native::console_control::guarded_dialog_input(
+        directory, session, input, deadline,
+    );
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (directory, session, input, deadline);
@@ -550,7 +557,11 @@ pub(super) fn close_session_until(
     {
         macos::close_session_until(macos::INSTALLED, directory, session, deadline)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        crate::native::console_control::close_session_until(directory, session, deadline)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         platform::close_session_until(directory, session, deadline)
     }
@@ -588,15 +599,12 @@ pub(super) struct WindowsSessionRecords<'a> {
 
 #[cfg(target_os = "windows")]
 pub(super) fn windows_console_control(
-    action: ConsoleControlAction,
+    action: crate::native::console_control::ResolvedAction,
     session: &TerminalSession,
     records: &WindowsSessionRecords<'_>,
 ) -> Result<()> {
     windows::console_control(action, session, records)
 }
-
-#[cfg(target_os = "windows")]
-pub(super) use windows::ConsoleControlAction;
 
 #[cfg(target_os = "windows")]
 pub(super) use windows::ownership::{windows_console_handle_path, windows_console_root_never_ran};
@@ -669,7 +677,7 @@ pub(super) fn validate_terminal_send_budget(
 }
 
 #[cfg(all(test, windows))]
-pub(in crate::native) use windows::with_stale_helper;
+pub(in crate::native) use crate::native::console_control::with_in_process_helper;
 
 #[cfg(test)]
 mod tests {

@@ -4,7 +4,7 @@
 //! the wait and the emission happen, the delivery-error hook selection and the extras.
 use super::super::delivery::test_support::Fixture;
 use super::super::reopen::{
-    ResumedFrom, refuse_follow_up_to_shared_conversation, reopen_refusal_gate,
+    ReopenGate, ResumedFrom, refuse_follow_up_to_shared_conversation, reopen_refusal_gate,
 };
 use super::super::session::{CoreRecord, Store, hold};
 use super::*;
@@ -560,7 +560,7 @@ fn tell_refusal_after_the_claim_leaves_the_request_id_and_gate_on_the_report() {
     );
     drop(claim);
     let gate = outcome.as_ref().err().and_then(reopen_refusal_gate);
-    assert_eq!(gate, Some("reopen-verification-failed"));
+    assert_eq!(gate, Some(ReopenGate::ReopenVerificationFailed));
     assert_eq!(report.address(), Some((SESSION, request_id.as_str())));
     assert!(format!("{:#}", outcome.unwrap_err()).starts_with(&format!(
         "follow-up to reopened session {SESSION} was refused before delivery"

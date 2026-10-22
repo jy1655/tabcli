@@ -1,4 +1,5 @@
 //! Read-only Session observations within a workspace and a shared scan budget.
+use super::search::{IncompleteReason, SEARCH_TIME_BUDGET, SearchScope};
 use super::*;
 use crate::native::args::{option_value, set_flag_once, set_once, workspace_scope};
 use crate::native::clock::SystemClock;
@@ -6,6 +7,7 @@ use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::origin::{ObservationCache, OriginEnvironment, OriginObservation};
+use agent_bridge::PUBLIC_COMMAND;
 use observation::judgment::{
     self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
     ResultCandidate, Turn,
@@ -129,11 +131,22 @@ fn attention(
     }
     if !closed {
         flags.extend(owner_flag(owner));
+        if observed
+            .questions
+            .as_ref()
+            .is_some_and(|q| !q.items.is_empty())
+        {
+            flags.push("question_emitted");
+        }
     }
     // Status unions its own two reads with the Observation's unreadable parts (D12).
     if !judgments.unreadable.is_empty()
         || observed.latest.is_err()
         || observed.active.as_ref().is_some_and(Result::is_err)
+        || observed
+            .questions
+            .as_ref()
+            .is_some_and(|q| q.observation == QuestionObservation::Unreadable)
     {
         flags.push("records_partially_unreadable");
     }
@@ -203,6 +216,9 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
         "owner": owner, "attention": flags, "derived_from": "observation", "result_command": command,
     });
     session::hold::add_fields(&mut value, &observation.evidence.held);
+    if let Some(questions) = &observed.questions {
+        question_observation(&mut value, questions);
+    }
     if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = json!(residual);
     }

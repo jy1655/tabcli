@@ -1,4 +1,5 @@
 //! Query waits: one consistent read per session per pass, without lifecycle changes.
+use super::request::RequestState;
 use super::*;
 use crate::native::args::{option_value, parse_timeout, set_flag_once, set_once};
 use crate::native::session::primitives::valid_session_id;
@@ -138,24 +139,17 @@ fn observe_with_owner(
     session: &str,
     observers: &judgment::Observers<'_>,
 ) -> Result<(Value, bool)> {
-    let mut observation = snapshot.observe_result(reader, selector)?;
-    if observation.state.ends_wait() {
+    let observation = snapshot.observe_result(reader, selector)?;
+    if observation.state().ends_wait() {
         return Ok((observation.value(), true));
     }
     let judgment = judgment::owner(&SessionEvidence::read_owner(reader), session, observers);
     let owner = judgment.observation();
-    if judgment.gone() {
-        observation.state = RequestState::Unresolved;
-        observation.error = Some(
-            "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request".to_owned()
-        );
-    } else if snapshot.status.state.ended() {
-        observation.state = RequestState::Unresolved;
-    }
+    let observation = observation.with_owner(&judgment, snapshot.status.state.ended());
     let mut value = observation.value();
     value["owner_process_alive"] = json!(owner.process_alive);
     value["owner"] = json!(owner);
-    Ok((value, observation.state.ends_wait()))
+    Ok((value, observation.state().ends_wait()))
 }
 
 struct Outcome {
@@ -239,7 +233,12 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
 }
 
 /// The legacy result caller retains its timeout envelope and last good observation.
-pub(super) fn one(root: &Path, session: &str, request: &str, timeout: Duration) -> Result<Value> {
+pub(in crate::native) fn one(
+    root: &Path,
+    session: &str,
+    request: &str,
+    timeout: Duration,
+) -> Result<Value> {
     let outcome = poll(
         root,
         &[Address {

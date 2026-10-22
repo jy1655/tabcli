@@ -2,6 +2,7 @@
 //! hook when Codex supplies one. Stop candidates never supply completion authority/text.
 use super::correlation::begins_with_bridge_prompt;
 use super::lifecycle::{Binding, read_binding};
+use super::questions::Questions;
 use super::{PendingCodexTurn, correlated_response, read_pending_turn};
 use crate::native::provider::{ActiveWatcher, CompletionWatcher};
 use crate::native::session::primitives::unix_ms;
@@ -99,6 +100,7 @@ struct Cursor {
     partial: Vec<u8>,
     meta_seen: bool,
     accepted: bool,
+    questions: Questions,
     suspended: Option<&'static str>,
 }
 impl Cursor {
@@ -114,6 +116,7 @@ impl Cursor {
             partial: Vec::new(),
             meta_seen: false,
             accepted: false,
+            questions: Questions::default(),
             suspended: None,
         }
     }
@@ -184,6 +187,8 @@ impl Cursor {
                     let value: Value = serde_json::from_str(text).map_err(|_| "invalid_json")?;
                     if let Some(terminal) = self.record(&value)? {
                         self.verify()?;
+                        #[cfg(test)]
+                        tests::at_read_checkpoint(tests::ReadCheckpoint::AfterTerminalVerify);
                         return Ok(Some(terminal));
                     }
                 } else {
@@ -255,6 +260,7 @@ impl Cursor {
         if kind != "event_msg" || payload["turn_id"].as_str() != Some(&binding.turn_id) {
             return Ok(None);
         }
+        self.questions.notice(payload, binding, self.accepted);
         match payload["type"].as_str() {
             Some("turn_aborted") => {
                 let reason = payload["reason"].as_str().ok_or("invalid_schema")?;
@@ -321,6 +327,18 @@ impl Cursor {
         }
         .map(|()| true)
     }
+    fn flush_questions(&mut self, directory: &Path, terminal_verified: bool) -> Observation<()> {
+        if self.accepted && self.questions.dirty() {
+            if !terminal_verified {
+                self.verify()?;
+            }
+            #[cfg(test)]
+            tests::at_read_checkpoint(tests::ReadCheckpoint::BeforeQuestionLock);
+            self.questions
+                .flush(directory, self.binding.as_ref().unwrap());
+        }
+        Ok(())
+    }
 }
 struct Terminal {
     outcome: std::result::Result<String, String>,
@@ -383,7 +401,11 @@ impl Observer {
             cursor.suspend(directory, "binding_conflict");
             return;
         }
-        match cursor.read(drain) {
+        let read = cursor.read(drain).and_then(|terminal| {
+            cursor.flush_questions(directory, terminal.is_some())?;
+            Ok(terminal)
+        });
+        match read {
             Ok(Some(terminal)) => {
                 match cursor.settle(directory, terminal) {
                     Err(_) => cursor.suspend(directory, "publication_error"),

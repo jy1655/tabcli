@@ -113,3 +113,15 @@ pub(in crate::native) struct RecordedReopenRefusal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) cleanup_detail: Option<String>,
 }
+
+// The record a winning reopen leaves in its closed source. `reopened_by` is filled once the
+// new session exists; until then the marker still excludes every other reopen attempt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(in crate::native) struct ReopenMarker {
+    pub(in crate::native) schema: u32,
+    pub(in crate::native) claim: String,
+    pub(in crate::native) provider_session_id: String,
+    #[serde(default)]
+    pub(in crate::native) reopened_by: Option<String>,
+    pub(in crate::native) created_unix_ms: u128,
+}

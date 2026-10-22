@@ -270,9 +270,17 @@ prune them.
 A dead owner does not prove that its surface closed (#69). Inspect the session and use `tabcli
 close-session SESSION --explicit` to close a retained surface. Repair first checks whether a
 completed result needs publication. On macOS, Terminal.app, Ghostty, WezTerm, and Warp keep handles
-for surfaces that can outlive their owner; they also keep a pending close intent. Those records do
-not grant permission to signal another process. Windows repair can close the managed console whose
-owner exited, using the same close checks. Missing or unreadable evidence can stop repair. Run
+for surfaces that can outlive their owner. Terminal.app, WezTerm, and Warp record a close intent
+before their live-owner close operation. An interrupted close can resume only when the intent
+matches the same session, surface, and owner record, and that owner's recorded incarnation is
+proven gone. Those records do not grant permission to signal another process.
+
+Ghostty currently records no close intent. Its retained handle does not enable an intent-based
+retry after the owner ends. Without separate failed-start close authority or proof that the surface
+is absent, Bridge refuses the close and retains the handle. Check the named surface in Ghostty.
+
+Windows repair can close the managed console whose owner exited, using the same close checks.
+Missing or unreadable evidence can stop repair. Run
 `sessions` to attempt repair. Use `inspect`, timeline, `result`, `search`, or `doctor` when you want
 to read the records without changing them.
 

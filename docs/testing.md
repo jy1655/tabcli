@@ -30,9 +30,10 @@ before changing the implementation.
 
 `src/native/clock.rs` is the one clock seam of the native module: `Clock` (`now`, `sleep`),
 the production `SystemClock`, and the test-only `FakeClock`, whose `sleep` advances the
-simulated instant and whose shared handle lets a hook or a log reader move it from outside. A
-test injects it wherever a wait is bounded: the workspace trust wait, Agy's readiness gate and
-receipt wait, the Claude messenger, the Codex queue's bounded send, the Origin observation
+simulated instant and whose shared handle lets a hook or a log reader move it from outside.
+Tests inject it into the workspace trust wait, Agy's readiness gate and receipt wait, the Claude
+messenger, the Codex queue's bounded send, legacy Codex submission polling, Windows console
+input drain, the Origin observation
 environment (which also carries the process attester), the macOS launch binding wait, and the
 close scope. The close deadline stays an ambient scope by design, because record primitives and
 the AppleScript diagnostics read it without a parameter; the scope's clock is a field of that
@@ -44,6 +45,13 @@ reproduction rule above needs: the fault budget, the sync log and sync failures,
 read log, the record replace retry hook, the close interruption points, enumeration injection,
 the snapshot checkpoints, the Origin checkpoints and receipt counter, and the Windows termination
 log. They stay thread-local test hooks beside the code they observe.
+
+The console helper's in-process adapter uses the production argv decoder, session and
+provider resolution, payload decoder, input dispatcher, and reply interpretation. Its fake process
+and Win32 effects do not prove real attachment or OS behavior. The owner fixtures likewise call
+the production ordered verifier with lazy process and TTY observers; they do not run the macOS
+observers on Windows. The [October 19 follow-up](verification/2026-10-19-architecture-review-follow-up.md)
+records the nine candidate dispositions and the separate verification limits.
 
 An I/O context carried on `Store` and `Reader` was proposed as the next step and declined on
 2026-10-17. Its propagation cost is the reason: every `open_unchecked` call would carry it, and

@@ -37,124 +37,131 @@ pub(super) struct Resolved {
     pub(super) consent: Option<consent::Assessment>,
 }
 
-pub(super) trait StartSource {
-    fn resolve(&mut self, deadline: Instant) -> Result<Resolved>;
-    // Creates the session and records the assessment with it (`record_consent`) before
-    // anything else binds to the session.
-    fn create(
-        &mut self,
-        spec: SessionSpec,
-        consent: Option<&consent::Assessment>,
-    ) -> Result<CreatedSession>;
-    fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()>;
-    // A failure between create and the launch, when the session exists but no provider
-    // process does: the source settles what it reserved for the session (`mark_start_failed`
-    // at least) and returns the error to report.
-    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error;
-    fn launch_failed(
-        &self,
-        created: &CreatedSession,
-        initial_claim: &mut turn::Claim,
-        error: anyhow::Error,
-    ) -> anyhow::Error;
-    fn delivery_failed(
-        &self,
-        directory: &Path,
-        id: &str,
-        error: anyhow::Error,
-        deadline: Instant,
-    ) -> anyhow::Error;
-    fn result_extra(&self) -> Result<ResultExtra>;
+// Resolution and creation are completed before the shared Initial prompt operation.
+// The source-specific value returned by create cannot exist without its Session.
+impl Resolved {
+    pub(super) fn create_with<T>(
+        self,
+        create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<(CreatedSession, T)>,
+    ) -> Result<(Prepared, T)> {
+        let provider = self.spec.provider;
+        let (created, source) = create(self.spec, self.consent.as_ref())?;
+        Ok((
+            Prepared {
+                created,
+                provider,
+                terminal_kind: self.terminal_kind,
+                context_sources: self.context_sources,
+            },
+            source,
+        ))
+    }
 }
 
-pub(super) struct FreshSource(pub(super) AskRequest);
+pub(super) struct Prepared {
+    pub(super) created: CreatedSession,
+    pub(super) provider: FirstPartyCli,
+    pub(super) terminal_kind: terminal::TerminalKind,
+    pub(super) context_sources: Vec<requests::ContextSource>,
+}
 
-impl StartSource for FreshSource {
-    fn resolve(&mut self, deadline: Instant) -> Result<Resolved> {
-        let request = &self.0;
-        // Attached results are resolved and pinned before any session, claim, receipt, terminal,
-        // or delivery exists, so a failed resolution changes nothing.
-        let attached = context::resolve(&request.context_results)?;
-        let terminal_kind = terminal::select(request.terminal)?;
-        let workspace = request.workspace.canonicalize().with_context(|| {
-            format!(
-                "workspace does not exist or cannot be resolved: {}",
-                request.workspace.display()
-            )
-        })?;
-        if !workspace.is_dir() {
-            bail!("workspace is not a directory: {}", workspace.display());
-        }
-        let root = Reader::state_root()?;
-        admission::check(&root, &workspace)?;
-        let provider_path = resolve_provider(request.provider)?;
-        let provider_version =
-            check_provider_version_until(request.provider, &provider_path, Some(deadline))?;
-        let requested_title = request.title.clone().unwrap_or_else(|| {
-            let workspace_name = workspace
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("workspace");
-            format!("{} · {workspace_name}", request.provider.as_str())
-        });
-        let title = sanitize_title(&requested_title)?;
-        let consent = consent::assess(&root, &request.workspace)?;
-        Ok(Resolved {
-            spec: SessionSpec {
-                provider: request.provider,
-                provider_path,
-                provider_version,
-                workspace,
-                title,
-                model: request.model.clone(),
-                effort: request.effort.clone(),
-                yolo: request.yolo,
-                prompt: attached.prompt_with_attachments(&request.prompt),
-            },
-            terminal_kind,
-            context_sources: attached.sources,
-            consent: Some(consent),
-        })
-    }
+pub(super) enum Failure<'a> {
+    Preparing(anyhow::Error),
+    Launch {
+        claim: &'a mut turn::Claim,
+        error: anyhow::Error,
+    },
+    Delivery {
+        error: anyhow::Error,
+        deadline: Instant,
+    },
+}
 
-    fn create(
-        &mut self,
-        mut spec: SessionSpec,
-        consent: Option<&consent::Assessment>,
-    ) -> Result<CreatedSession> {
-        spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
-        let created = create_session(spec)?;
-        record_consent(&created, consent)?;
-        Ok(created)
+// The real variation after creation: result fields, holder gates, and the treatment
+// of a failed phase. Resolution, creation, and final settlement belong to the source.
+pub(super) trait InitialSource {
+    fn result_extra(&self) -> Result<ResultExtra>;
+    fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()>;
+    fn failed(&self, created: &CreatedSession, failure: Failure<'_>) -> anyhow::Error;
+}
+
+pub(super) struct FreshSource;
+
+impl InitialSource for FreshSource {
+    fn result_extra(&self) -> Result<ResultExtra> {
+        Ok(ResultExtra::new())
     }
 
     fn gate(&self, _: &Path, _: delivery::Gate, _: Instant) -> Result<()> {
         Ok(())
     }
-    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error {
-        mark_start_failed(created, &error);
-        error
+
+    fn failed(&self, created: &CreatedSession, failure: Failure<'_>) -> anyhow::Error {
+        match failure {
+            Failure::Preparing(error) => {
+                mark_start_failed(created, &error);
+                error
+            }
+            Failure::Launch { error, .. } | Failure::Delivery { error, .. } => error,
+        }
     }
-    fn delivery_failed(
-        &self,
-        _: &Path,
-        _: &str,
-        error: anyhow::Error,
-        _: Instant,
-    ) -> anyhow::Error {
-        error
+}
+
+fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
+    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
+    // or delivery exists, so a failed resolution changes nothing.
+    let attached = context::resolve(&request.context_results)?;
+    let terminal_kind = terminal::select(request.terminal)?;
+    let workspace = request.workspace.canonicalize().with_context(|| {
+        format!(
+            "workspace does not exist or cannot be resolved: {}",
+            request.workspace.display()
+        )
+    })?;
+    if !workspace.is_dir() {
+        bail!("workspace is not a directory: {}", workspace.display());
     }
-    fn launch_failed(
-        &self,
-        _: &CreatedSession,
-        _: &mut turn::Claim,
-        error: anyhow::Error,
-    ) -> anyhow::Error {
-        error
-    }
-    fn result_extra(&self) -> Result<ResultExtra> {
-        Ok(ResultExtra::new())
-    }
+    let root = Reader::state_root()?;
+    admission::check(&root, &workspace)?;
+    let provider_path = resolve_provider(request.provider)?;
+    let provider_version =
+        check_provider_version_until(request.provider, &provider_path, Some(deadline))?;
+    let requested_title = request.title.clone().unwrap_or_else(|| {
+        let workspace_name = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        format!("{} · {workspace_name}", request.provider.as_str())
+    });
+    let title = sanitize_title(&requested_title)?;
+    let consent = consent::assess(&root, &request.workspace)?;
+    Ok(Resolved {
+        spec: SessionSpec {
+            provider: request.provider,
+            provider_path,
+            provider_version,
+            workspace,
+            title,
+            model: request.model.clone(),
+            effort: request.effort.clone(),
+            yolo: request.yolo,
+            prompt: attached.prompt_with_attachments(&request.prompt),
+        },
+        terminal_kind,
+        context_sources: attached.sources,
+        consent: Some(consent),
+    })
+}
+
+// Delegation framing and consent recording precede any source provenance binding.
+pub(super) fn create_with_consent(
+    mut spec: SessionSpec,
+    assessment: Option<&consent::Assessment>,
+) -> Result<CreatedSession> {
+    spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
+    let created = create_session(spec)?;
+    record_consent(&created, assessment)?;
+    Ok(created)
 }
 
 // Marks a session that failed between its creation and its launch, so that nothing takes
@@ -190,91 +197,107 @@ pub(super) fn record_consent(
     })
 }
 
-// Single-use protocol: resolve (with the consent assessment), create (which records it),
-// extra and claim (a failure there is `start_failed`), then launch.
-pub(super) fn start(
+// The deadline includes resolution and creation. Once a Session exists, run owns the
+// Claim, address, launch, consent, and Initial prompt ordering through one operation.
+pub(super) struct Start {
     options: StartOptions,
-    source: &mut dyn StartSource,
-    report: &mut TurnReport,
-) -> Result<()> {
-    let StartOptions {
-        timeout,
-        detach,
-        json,
-    } = options;
-    let deadline = checked_deadline_from(Instant::now(), timeout)?;
-    let Resolved {
-        spec,
-        terminal_kind,
-        context_sources,
-        consent: assessment,
-    } = source.resolve(deadline)?;
-    let provider = spec.provider;
-    let created = source.create(spec, assessment.as_ref())?;
-    // Between create and the launch the session exists and no provider process does. A
-    // failure here is settled by the source: the session is marked failed, and a reopen
-    // records a launch-phase refusal that releases the source marker (#245).
-    let (result_extra, mut initial_claim) = match source.result_extra().and_then(|extra| {
-        turn::claim(&Store::open_unchecked(&created.directory), &context_sources)
+    deadline: Instant,
+}
+
+impl Start {
+    pub(super) fn new(options: StartOptions) -> Result<Self> {
+        let deadline = checked_deadline_from(Instant::now(), options.timeout)?;
+        Ok(Self { options, deadline })
+    }
+
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(super) fn run(
+        &self,
+        prepared: &Prepared,
+        source: &dyn InitialSource,
+        report: &mut TurnReport,
+    ) -> Result<()> {
+        let created = &prepared.created;
+        let provider = prepared.provider;
+        let deadline = self.deadline;
+        let (result_extra, mut initial_claim) = match source.result_extra().and_then(|extra| {
+            turn::claim(
+                &Store::open_unchecked(&created.directory),
+                &prepared.context_sources,
+            )
             .map(|claim| (extra, claim))
-    }) {
-        Ok(prepared) => prepared,
-        Err(error) => return Err(source.start_failed(&created, error)),
-    };
-    let expected_claim_token = initial_claim.token().to_owned();
-    let receipt = initial_claim.receipt().clone();
-    report.addressed(created.id.clone(), receipt.request_id.clone());
-    let terminal_session = match launch::launcher::start(
-        &created,
-        terminal_kind,
-        &mut initial_claim,
-        &expected_claim_token,
-        deadline,
-    ) {
-        Ok(surface) => surface,
-        Err(error) => return Err(source.launch_failed(&created, &mut initial_claim, error)),
-    };
-    // A trust response is separate from model input. Only verified consent and an
-    // adapter-recognized exact workspace dialog may produce one guarded response.
-    consent::complete_launch(
-        &created.directory,
-        provider,
-        &terminal_session,
-        &expected_claim_token,
-        deadline,
-    )?;
-    // The existing delivery paths own rollback/uncertainty after confirmed startup.
-    initial_claim.startup_confirmed();
-    let mut gate = |gate| source.gate(&created.directory, gate, deadline);
-    turn_run::run(
-        report,
-        initial_claim,
-        delivery::Turn::Initial { gate: &mut gate },
-        &turn_run::TurnRun {
-            facts: turn_run::SessionFacts {
-                id: &created.id,
-                directory: &created.directory,
-                provider,
-                provider_path: &created.manifest.provider_path,
-                surface: &terminal_session,
+        }) {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(source.failed(created, Failure::Preparing(error))),
+        };
+        let expected_claim_token = initial_claim.token().to_owned();
+        let receipt = initial_claim.receipt().clone();
+        report.addressed(created.id.clone(), receipt.request_id.clone());
+        let terminal_session = match launch::launcher::start(
+            created,
+            prepared.terminal_kind,
+            &mut initial_claim,
+            &expected_claim_token,
+            deadline,
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                return Err(source.failed(
+                    created,
+                    Failure::Launch {
+                        claim: &mut initial_claim,
+                        error,
+                    },
+                ));
+            }
+        };
+        // Consent failure is neither a launcher failure nor a Delivery failure.
+        consent::complete_launch(
+            &created.directory,
+            provider,
+            &terminal_session,
+            &expected_claim_token,
+            deadline,
+        )?;
+        initial_claim.startup_confirmed();
+        let mut gate = |gate| source.gate(&created.directory, gate, deadline);
+        turn_run::run(
+            report,
+            initial_claim,
+            delivery::Turn::Initial { gate: &mut gate },
+            &turn_run::TurnRun {
+                facts: turn_run::SessionFacts {
+                    id: &created.id,
+                    directory: &created.directory,
+                    provider,
+                    provider_path: &created.manifest.provider_path,
+                    surface: &terminal_session,
+                },
+                timing: turn_run::Timing {
+                    deadline,
+                    requested: self.options.timeout,
+                },
+                output: turn_run::Output {
+                    detach: self.options.detach,
+                    json: self.options.json,
+                },
+                extra: &result_extra,
+                baseline: 0,
             },
-            timing: turn_run::Timing {
-                deadline,
-                requested: timeout,
+            |error| {
+                source
+                    .failed(created, Failure::Delivery { error, deadline })
+                    .context(format!(
+                        "failed to deliver the initial prompt to {} session {}",
+                        provider.as_str(),
+                        created.id
+                    ))
             },
-            output: turn_run::Output { detach, json },
-            extra: &result_extra,
-            baseline: 0,
-        },
-        |error| {
-            let error = source.delivery_failed(&created.directory, &created.id, error, deadline);
-            error.context(format!(
-                "failed to deliver the initial prompt to {} session {}",
-                provider.as_str(),
-                created.id
-            ))
-        },
-    )
+        )
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +327,7 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut workspace = None;
     let mut parsed = CommonStartOptions::default();
     let mut context_results = Vec::new();
+    let mut context_mode = None;
     let mut index = 0;
     while index < options.len() {
         if parse_common_start_option(options, &mut index, &mut parsed)? {
@@ -315,6 +339,11 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
                 PathBuf::from(option_value(options, &mut index, "--workspace")?),
                 "--workspace",
             )?,
+            "--context-mode" => set_once(
+                &mut context_mode,
+                context::parse_mode(option_value(options, &mut index, "--context-mode")?)?,
+                "--context-mode",
+            )?,
             "--context-result" => context::push_option(
                 &mut context_results,
                 option_value(options, &mut index, "--context-result")?,
@@ -323,6 +352,7 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         }
         index += 1;
     }
+    context::apply_mode(&mut context_results, context_mode)?;
     let CommonStartOptions {
         prompt,
         prompt_file,
@@ -375,5 +405,10 @@ fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
         detach: request.detach,
         json: request.json,
     };
-    session_start::start(options, &mut session_start::FreshSource(request), report)
+    let start = Start::new(options)?;
+    let resolved = resolve_fresh(&request, start.deadline())?;
+    let (prepared, ()) = resolved.create_with(|spec, consent| {
+        create_with_consent(spec, consent).map(|created| (created, ()))
+    })?;
+    start.run(&prepared, &FreshSource, report)
 }

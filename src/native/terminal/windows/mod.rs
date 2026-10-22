@@ -1,12 +1,13 @@
 pub(in crate::native) mod ownership;
 
-use crate::native::session::{Reader, RecordStore, Store};
+use crate::native::clock::{Clock, SystemClock};
+use crate::native::console_control::{self, ResolvedAction, WindowLookup};
+use crate::native::session::{Reader, Store};
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -27,16 +28,15 @@ use windows_sys::Win32::{
     },
     System::Threading::{
         CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-        CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
-        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ResumeThread,
-        STARTF_USESHOWWINDOW, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, ResumeThread, STARTF_USESHOWWINDOW, STARTUPINFOEXW, STARTUPINFOW,
+        TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     },
 };
 
-use super::{CloseOutcome, ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity};
+use super::{ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity};
 
 mod focus;
 mod process;
@@ -199,56 +199,6 @@ where
         crate::native::session::launch::log(&Store::open_unchecked(directory), &summary);
     }
     Ok(session)
-}
-
-// A control helper that attaches to the started console and reports the window that
-// hosts it. Best effort, like everything about the foreground: a helper that cannot be
-// started, fails, or is too late reports nothing, and the launch goes on.
-struct WindowLookup {
-    helper: Option<std::process::Child>,
-}
-
-impl WindowLookup {
-    fn start(session: &TerminalSession, timeout: Duration) -> Self {
-        use std::os::windows::process::CommandExt;
-        let helper = console_helper_command("window", session, None)
-            .ok()
-            .and_then(|mut command| {
-                command
-                    .arg(timeout.as_millis().max(1).to_string())
-                    // The helper needs no console of its own, and must never be given a
-                    // window that would itself come to the front.
-                    .creation_flags(DETACHED_PROCESS)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .ok()
-            });
-        Self { helper }
-    }
-
-    fn poll(&mut self) -> Option<isize> {
-        let status = self.helper.as_mut()?.try_wait().ok().flatten()?;
-        let output = self.helper.take()?.wait_with_output().ok()?;
-        if !status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<isize>()
-            .ok()
-            .filter(|window| *window != 0)
-    }
-}
-
-impl Drop for WindowLookup {
-    fn drop(&mut self) {
-        // Not waited for: the launch has no time to spare for a helper that is too late.
-        if let Some(mut helper) = self.helper.take() {
-            let _ = helper.kill();
-        }
-    }
 }
 
 // The surface that holds the suspended PowerShell root of a managed console: a tab that
@@ -616,326 +566,8 @@ pub(super) fn powershell_executable() -> Result<PathBuf> {
         .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")
 }
 
-pub(super) fn send_file(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> super::TerminalSendResult {
-    let prompt_path = prompt_path
-        .to_str()
-        .context("prompt path is not valid UTF-8")
-        .map_err(super::TerminalSendFailure::not_sent)?;
-    run_console_send_helper(session, prompt_path, deadline, None).map(|_| ())
-}
-
-pub(super) fn send_file_text_only(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    expected_claim: &str,
-    deadline: Instant,
-) -> std::result::Result<usize, super::TerminalSendFailure> {
-    let payload = (|| -> Result<_> {
-        let input = GuardedTextInput {
-            text: std::fs::read_to_string(prompt_path)?,
-            expected_claim: Some(expected_claim.to_owned()),
-            expires_unix_ms: Some(
-                crate::native::session::primitives::unix_ms()
-                    + deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis(),
-            ),
-        };
-        dialog_input_file(
-            prompt_path.parent().context("missing payload directory")?,
-            session,
-            &input,
-        )
-    })()
-    .map_err(super::TerminalSendFailure::not_sent)?;
-    let path = payload
-        .path()
-        .to_str()
-        .context("payload path is not UTF-8")
-        .map_err(super::TerminalSendFailure::not_sent)?;
-    let output = run_console_send_helper(session, path, deadline, Some(0))?;
-    parse_text_only_output(&output)
-}
-
-fn parse_text_only_output(output: &[u8]) -> std::result::Result<usize, super::TerminalSendFailure> {
-    parse_text_only_count(output).map_err(super::TerminalSendFailure::delivery_uncertain)
-}
-
-fn parse_text_only_count(output: &[u8]) -> Result<usize> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Written {
-        schema: u32,
-        written_chars: usize,
-    }
-    let line = std::str::from_utf8(output)?.trim();
-    if line.lines().count() != 1 {
-        bail!("expected one Windows console text-only result line");
-    }
-    let value: Written =
-        serde_json::from_str(line).context("invalid Windows console text-only result")?;
-    if value.schema != 1 {
-        bail!("invalid Windows console text-only result schema");
-    }
-    Ok(value.written_chars)
-}
-
-fn console_output_until(
-    command: &mut Command,
-    deadline: Instant,
-    label: &str,
-) -> Result<std::process::Output> {
-    #[cfg(test)]
-    if let Some(output) = tests::helper_output(command) {
-        return output.map_err(super::TerminalSendFailure::into_error);
-    }
-    crate::native::process_env::command_output_until(command, deadline, label)
-}
-
-#[cfg(test)]
-pub(in crate::native) use tests::with_stale_helper;
-
-pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
-    let mut command = console_helper_command("screen", session, None)?;
-    let output = console_output_until(&mut command, deadline, "managed console screen")?;
-    if !output.status.success() {
-        bail!("{}", console_helper_failure_message(&output));
-    }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
-// The helper child still resolves the session by id under its own inherited root.
-// Do not publish an input file that it could resolve in a different session directory.
-fn dialog_input_file(
-    directory: &Path,
-    session: &TerminalSession,
-    input: &impl serde::Serialize,
-) -> Result<tempfile::NamedTempFile> {
-    use std::io::Write;
-    let id = session
-        .managed_session_id
-        .as_deref()
-        .context("missing managed session identity")?;
-    if directory.file_name().and_then(|name| name.to_str()) != Some(id) {
-        bail!("managed session identity does not match the supplied session directory");
-    }
-    let supplied = Reader::session_directory_in(
-        directory
-            .parent()
-            .context("session directory has no parent")?,
-        id,
-    )?;
-    let helper = Reader::session_directory(id)?;
-    if supplied.canonicalize()? != helper.canonicalize()? {
-        bail!("supplied session directory disagrees with the console helper state root");
-    }
-    let mut file = tempfile::Builder::new()
-        .prefix("pending-prompt-")
-        .suffix(".txt")
-        .tempfile_in(directory)?;
-    RecordStore::set_file_private(file.as_file())?;
-    file.write_all(&serde_json::to_vec(input)?)?;
-    file.flush()?;
-    Ok(file)
-}
-
-#[derive(Debug)]
-pub(in crate::native) struct StaleDialogClaim;
-
-impl std::fmt::Display for StaleDialogClaim {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("stale claim at guarded submission")
-    }
-}
-
-impl std::error::Error for StaleDialogClaim {}
-
-pub(super) fn guarded_dialog_input(
-    directory: &Path,
-    session: &TerminalSession,
-    input: &super::GuardedDialogInput,
-    deadline: Instant,
-) -> Result<bool> {
-    let file = dialog_input_file(directory, session, input)?;
-    let mut command = console_helper_command(
-        "dialog",
-        session,
-        Some(file.path().to_str().context("dialog path is not UTF-8")?),
-    )?;
-    command.arg(
-        deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .max(1)
-            .to_string(),
-    );
-    let output = console_output_until(&mut command, deadline, "managed console dialog input")?;
-    if !output.status.success() {
-        bail!("{}", console_helper_failure_message(&output));
-    }
-    match String::from_utf8_lossy(&output.stdout).trim() {
-        "sent" => Ok(true),
-        "changed" => Ok(false),
-        "stale" => Err(StaleDialogClaim.into()),
-        _ => bail!("unexpected managed console dialog result"),
-    }
-}
-
-pub(super) fn close_session_until(
-    _directory: &Path,
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<CloseOutcome> {
-    match run_console_helper("close", session, None, deadline) {
-        Ok(()) => Ok(CloseOutcome::Closed),
-        Err(error)
-            if super::windows_budget::windows_console_helper_reports_missing(
-                &error.to_string(),
-            ) =>
-        {
-            Ok(CloseOutcome::Missing)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn run_console_send_helper(
-    session: &TerminalSession,
-    input: &str,
-    deadline: Instant,
-    submit_count: Option<usize>,
-) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
-    let mut command = console_helper_command("send", session, Some(input))
-        .map_err(super::TerminalSendFailure::not_sent)?;
-    let timeout = super::windows_budget::remaining_send_budget_at(deadline, Instant::now())
-        .map_err(super::TerminalSendFailure::not_sent)?;
-    let timeout_ms = u64::try_from(timeout.as_millis())
-        .context("Windows console timeout is too large")
-        .map_err(super::TerminalSendFailure::not_sent)?;
-    command.arg(timeout_ms.max(1).to_string());
-    if let Some(count) = submit_count {
-        command.arg(count.to_string());
-    }
-    run_console_send_command(&mut command, deadline)
-}
-
-fn run_console_send_command(
-    command: &mut Command,
-    deadline: Instant,
-) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
-    #[cfg(test)]
-    if let Some(output) = tests::helper_output(command) {
-        return classify_send_output(output?);
-    }
-    let output = crate::native::process_env::command_output_until_classified(
-        command,
-        deadline,
-        "Windows console control helper",
-    )
-    .map_err(|failure| {
-        if failure.process_started() {
-            super::TerminalSendFailure::delivery_uncertain(failure.into_error())
-        } else {
-            super::TerminalSendFailure::not_sent(failure.into_error())
-        }
-    })?;
-    classify_send_output(output)
-}
-
-fn classify_send_output(
-    output: std::process::Output,
-) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
-    if output.status.success() {
-        return Ok(output.stdout);
-    }
-    let message = console_helper_failure_message(&output);
-    let error = anyhow::anyhow!(message);
-    if super::windows_budget::windows_console_helper_reports_send_not_started(&error.to_string()) {
-        Err(super::TerminalSendFailure::not_sent(error))
-    } else {
-        Err(super::TerminalSendFailure::delivery_uncertain(error))
-    }
-}
-
-fn run_console_helper(
-    action: &str,
-    session: &TerminalSession,
-    input: Option<&str>,
-    deadline: Instant,
-) -> Result<()> {
-    let mut command = console_helper_command(action, session, input)?;
-    run_console_helper_command(&mut command, deadline)
-}
-
-fn run_console_helper_command(command: &mut Command, deadline: Instant) -> Result<()> {
-    let output = crate::native::process_env::command_output_until(
-        command,
-        deadline,
-        "Windows console control helper",
-    )?;
-    if output.status.success() {
-        return Ok(());
-    }
-    bail!("{}", console_helper_failure_message(&output))
-}
-
-fn console_helper_command(
-    action: &str,
-    session: &TerminalSession,
-    input: Option<&str>,
-) -> Result<Command> {
-    let executable = std::env::current_exe().context("failed to locate the current executable")?;
-    let managed_session_id = session
-        .managed_session_id
-        .as_deref()
-        .context("Windows console handle is missing its managed session binding")?;
-    let mut command = crate::native::process_env::helper_command(executable);
-    let state_dir_env = crate::native::session::primitives::STATE_DIR_ENV;
-    if let Some(root) = std::env::var_os(state_dir_env) {
-        command.env(state_dir_env, root);
-    }
-    command.args(["native-console-control", action, managed_session_id]);
-    if let Some(input) = input {
-        let input_name = Path::new(input)
-            .file_name()
-            .context("prompt path has no file name")?;
-        command.arg(input_name);
-    }
-    Ok(command)
-}
-
-fn console_helper_failure_message(output: &std::process::Output) -> String {
-    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if message.is_empty() {
-        "Windows console control helper failed".to_owned()
-    } else {
-        message
-    }
-}
-
-pub(in crate::native) enum ConsoleControlAction {
-    Screen,
-    Send {
-        input: PathBuf,
-        submit_count: usize,
-        newline: ConsoleNewline,
-        timeout: Duration,
-    },
-    Dialog {
-        input: PathBuf,
-    },
-    Window {
-        timeout: Duration,
-    },
-    Close,
-}
-
 pub(super) fn console_control(
-    action: ConsoleControlAction,
+    action: ResolvedAction,
     session: &TerminalSession,
     records: &super::WindowsSessionRecords<'_>,
 ) -> Result<()> {
@@ -947,7 +579,7 @@ pub(super) fn console_control(
         .windows_process_identity
         .as_ref()
         .context("Windows console handle is missing its process identity")?;
-    let close_requested = matches!(action, ConsoleControlAction::Close);
+    let close_requested = matches!(action, ResolvedAction::Close);
     // Read before anything is ended: a close that cannot tell the host of a tab from the
     // session's processes ends nothing and says why.
     let recorded_host = match close_requested {
@@ -959,16 +591,14 @@ pub(super) fn console_control(
         Err(error) => {
             // The root is gone, and with it the session. The host of its tab has nothing
             // left to wait for.
-            if close_requested
-                && super::windows_budget::windows_console_helper_reports_missing(&error.to_string())
-            {
+            if close_requested && console_control::helper_reports_missing(&error.to_string()) {
                 end_tab_host(recorded_host.as_ref())?;
             }
             return Err(error);
         }
     };
     let window_deadline = match action {
-        ConsoleControlAction::Window { timeout } => Some(
+        ResolvedAction::Window { timeout } => Some(
             Instant::now()
                 .checked_add(timeout)
                 .context("Windows console window timeout is too large")?,
@@ -991,7 +621,7 @@ pub(super) fn console_control(
             if close_requested {
                 end_tab_host(recorded_host.as_ref())?;
             }
-            bail!("console process is no longer available");
+            bail!("{}", console_control::MISSING_PROCESS);
         }
         if attach_deadline.is_none_or(|deadline| Instant::now() >= deadline) {
             if close_requested && records.root_never_ran {
@@ -1011,11 +641,12 @@ pub(super) fn console_control(
     let mut console_processes = Vec::new();
     let mut tab_host = None;
     let result = match action {
-        ConsoleControlAction::Screen => {
-            println!("{}", serde_json::to_string(&attached_screen()?)?);
+        ResolvedAction::Screen => {
+            let screen = attached_screen()?;
+            print!("{}", console_control::screen_output(&screen)?);
             Ok(())
         }
-        ConsoleControlAction::Dialog { input: path } => {
+        ResolvedAction::Dialog { input: path } => {
             let payload = crate::native::session::RecordReader::at(&path).raw_bytes()?;
             dispatch_attached_input(
                 records.directory,
@@ -1028,26 +659,16 @@ pub(super) fn console_control(
                 },
                 || unreachable!("dialog has no drain"),
                 &mut std::io::stdout().lock(),
-                Instant::now,
+                &mut SystemClock,
             )
         }
-        ConsoleControlAction::Send {
+        ResolvedAction::Send {
             input: path,
             submit_count,
             newline,
             timeout,
         } => {
-            if !super::windows_budget::windows_console_submit_delays_fit(submit_count, timeout) {
-                bail!(
-                    "Windows console submission delays do not fit inside the remaining turn timeout"
-                );
-            }
-            let deadline = Instant::now()
-                .checked_add(timeout)
-                .context("Windows console input timeout is too large")?;
-            let input = crate::native::session::RecordReader::at(&path)
-                .raw_text()
-                .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
+            let (input, deadline) = read_send_payload(&path, submit_count, timeout)?;
             if submit_count == 0 {
                 let handle = open_console_input(GENERIC_READ | GENERIC_WRITE)?;
                 dispatch_attached_input(
@@ -1058,15 +679,15 @@ pub(super) fn console_control(
                     |chunk| write_console_chunk(handle.as_raw_handle(), chunk),
                     || console_pending_count(handle.as_raw_handle()),
                     &mut std::io::stdout().lock(),
-                    Instant::now,
+                    &mut SystemClock,
                 )
             } else {
                 write_console_input(&input, submit_count, newline, deadline)
             }
         }
-        ConsoleControlAction::Window { .. } => loop {
+        ResolvedAction::Window { .. } => loop {
             if let Some(window) = focus::attached_console_host_window() {
-                println!("{window}");
+                print!("{}", console_control::window_output(window));
                 break Ok(());
             }
             if window_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1076,7 +697,7 @@ pub(super) fn console_control(
             }
             std::thread::sleep(CONSOLE_WINDOW_POLL);
         },
-        ConsoleControlAction::Close => {
+        ResolvedAction::Close => {
             console_processes = attached_console_processes()?;
             tab_host = tab_host_among(&console_processes, recorded_host.as_ref());
             let window = unsafe { GetConsoleWindow() };
@@ -1237,13 +858,21 @@ fn screen_row(cells: &[u16], read: u32) -> Result<String> {
     Ok(String::from_utf16(characters)?)
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct GuardedTextInput {
-    text: String,
-    #[serde(default)]
-    expected_claim: Option<String>,
-    #[serde(default)]
-    expires_unix_ms: Option<u128>,
+pub(in crate::native) fn read_send_payload(
+    path: &Path,
+    submit_count: usize,
+    timeout: Duration,
+) -> Result<(String, Instant)> {
+    if !super::windows_budget::windows_console_submit_delays_fit(submit_count, timeout) {
+        bail!("{}", console_control::SUBMIT_DELAYS_EXHAUSTED);
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("Windows console input timeout is too large")?;
+    let input = crate::native::session::RecordReader::at(path)
+        .raw_text()
+        .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
+    Ok((input, deadline))
 }
 
 // Screen capture, attachment and drain waits are outside this section. Each write
@@ -1281,8 +910,8 @@ fn guarded_text_write_with(
     })?;
     match result {
         Some(count) => Ok(count),
-        None if !previously_attempted => bail!("Windows console claim stale before any input"),
-        None => bail!("Windows console claim stale after input dispatch"),
+        None if !previously_attempted => bail!("{}", console_control::STALE_BEFORE_INPUT),
+        None => bail!("{}", console_control::STALE_AFTER_INPUT),
     }
 }
 
@@ -1290,14 +919,19 @@ fn guarded_key_with(
     input: &super::GuardedDialogInput,
     actual: &str,
     write: impl FnOnce(super::DialogKey) -> Result<bool>,
-) -> Result<&'static str> {
+) -> Result<console_control::DialogReply> {
+    use console_control::DialogReply;
     match dialog_decision(&input.screen, actual) {
-        DialogDecision::Changed => Ok("changed"),
-        DialogDecision::Send => Ok(if write(input.key)? { "sent" } else { "stale" }),
+        DialogDecision::Changed => Ok(DialogReply::Changed),
+        DialogDecision::Send => Ok(if write(input.key)? {
+            DialogReply::Sent
+        } else {
+            DialogReply::Stale
+        }),
     }
 }
 
-enum AttachedInput {
+pub(in crate::native) enum AttachedInput {
     Dialog,
     Text {
         newline: ConsoleNewline,
@@ -1307,7 +941,7 @@ enum AttachedInput {
 
 // Shared post-attachment dispatch. Tests replace only screen and console operations.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_attached_input(
+pub(in crate::native) fn dispatch_attached_input(
     directory: &Path,
     payload: &[u8],
     action: AttachedInput,
@@ -1315,11 +949,11 @@ fn dispatch_attached_input(
     mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
     pending: impl FnMut() -> Result<u32>,
     output: &mut impl std::io::Write,
-    now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> Result<()> {
     match action {
         AttachedInput::Dialog => {
-            let input: super::GuardedDialogInput = serde_json::from_slice(payload)?;
+            let input = console_control::decode_dialog_payload(payload)?;
             let outcome = guarded_key_with(&input, &screen()?, |key| {
                 dispatch_with_claim(
                     directory,
@@ -1332,12 +966,11 @@ fn dispatch_attached_input(
                 )
                 .map(|v| v.is_some())
             })?;
-            writeln!(output, "{outcome}")?;
+            console_control::write_dialog_reply(output, outcome)?;
             Ok(())
         }
         AttachedInput::Text { newline, deadline } => {
-            let input: GuardedTextInput =
-                serde_json::from_slice(payload).context("invalid text-only console payload")?;
+            let input = console_control::decode_text_payload(payload)?;
             let mut attempted = false;
             write_text_only_with(
                 &input.text,
@@ -1359,7 +992,7 @@ fn dispatch_attached_input(
                 },
                 pending,
                 output,
-                now,
+                clock,
             )
         }
     }
@@ -1610,7 +1243,7 @@ fn write_console_input(
                 || console_pending_count(handle),
                 deadline - delay,
                 Duration::from_millis(50),
-                Instant::now,
+                &mut SystemClock,
             )?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if delay >= remaining {
@@ -1644,24 +1277,20 @@ fn write_text_only_with(
     mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
     pending: impl FnMut() -> Result<u32>,
     output: &mut impl std::io::Write,
-    mut now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> Result<()> {
     let records = build_console_input_records(input, 0, newline);
     for chunk in records.chunks(1024) {
-        if now() >= deadline {
+        if clock.now() >= deadline {
             bail!("Windows console input timed out during text delivery");
         }
         check_written_count(write(chunk)?, chunk.len())?;
     }
-    wait_for_console_input_drain_with(pending, deadline, Duration::from_millis(50), &mut now)?;
-    if now() >= deadline {
+    wait_for_console_input_drain_with(pending, deadline, Duration::from_millis(50), clock)?;
+    if clock.now() >= deadline {
         bail!("Windows console input drain exceeded the deadline");
     }
-    writeln!(
-        output,
-        "{}",
-        serde_json::json!({"schema": 1, "written_chars": input.chars().count()})
-    )?;
+    console_control::write_text_count(output, input.chars().count())?;
     Ok(())
 }
 
@@ -1669,13 +1298,14 @@ fn wait_for_console_input_drain_with(
     mut pending: impl FnMut() -> Result<u32>,
     deadline: Instant,
     poll: Duration,
-    mut now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> Result<()> {
-    while now() < deadline {
+    while clock.now() < deadline {
         if pending()? == 0 {
             return Ok(());
         }
-        std::thread::sleep(poll.min(deadline.saturating_duration_since(now())));
+        let remaining = deadline.saturating_duration_since(clock.now());
+        clock.sleep(poll.min(remaining));
     }
     bail!("Windows console input was not consumed before the submission Return")
 }

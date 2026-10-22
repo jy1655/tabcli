@@ -161,7 +161,7 @@ fn the_trust_wait_ends_when_the_session_has_ended() {
 #[test]
 fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     use super::super::super::super::consent;
-    use super::super::super::super::doctor::Availability;
+    use super::super::super::super::diagnostics::Availability;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let workspace = root.join("workspace");

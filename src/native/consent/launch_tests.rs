@@ -1,8 +1,37 @@
+use super::launch_dialog::{DialogSurface, LaunchDialog, complete_launch};
+use super::record::{SESSION_FILE, assess_with, observe, record, with_record};
+use super::store::{Trust, native_key};
 use super::tests::{Fixture, session, setup, trust_pi};
-use super::*;
+use crate::native::clock::Clock;
 use crate::native::clock::FakeClock;
+use crate::native::session::{Reader, RecordStore, Store};
 use crate::native::session::{SessionState, primitives::write_json_atomic, update_status};
+use crate::native::{provider, terminal};
+use agent_bridge::FirstPartyCli;
+use anyhow::{Result, bail};
 use std::cell::Cell;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+struct ScriptedSurface<S, D> {
+    screen: S,
+    dispatch: D,
+}
+
+impl<S, D> DialogSurface for ScriptedSurface<S, D>
+where
+    S: FnMut() -> Result<String>,
+    D: FnMut(&terminal::GuardedDialogInput) -> Result<bool>,
+{
+    fn screen(&mut self, _deadline: Instant) -> Result<String> {
+        (self.screen)()
+    }
+
+    fn answer(&mut self, input: &terminal::GuardedDialogInput, _deadline: Instant) -> Result<bool> {
+        (self.dispatch)(input)
+    }
+}
 
 struct Harness {
     _home: tempfile::TempDir,
@@ -54,7 +83,11 @@ impl Harness {
             deadline: clock.now() + timeout,
             manifest,
         }
-        .complete(&self.stores.env, clock, screen, dispatch)
+        .complete(
+            &self.stores.env,
+            clock,
+            &mut ScriptedSurface { screen, dispatch },
+        )
     }
 
     fn screen(&self) -> String {
@@ -105,7 +138,7 @@ fn launch_dialog_settle_boundary_and_pending_intent_precede_one_response() {
                 calls.set(calls.get() + 1);
                 assert_eq!(now.get() - start, Duration::from_secs(1));
                 assert_eq!(
-                    observe(&h.directory)["applied"],
+                    observe(&h.directory).value()["applied"],
                     "workspace-dialog-response-pending"
                 );
                 assert_eq!(input.screen, h.screen());
@@ -122,7 +155,7 @@ fn launch_dialog_settle_boundary_and_pending_intent_precede_one_response() {
             result.unwrap();
             assert_eq!(calls.get(), 1);
             assert_eq!(
-                observe(&h.directory)["applied"],
+                observe(&h.directory).value()["applied"],
                 "provider-workspace-dialog"
             );
         }
@@ -253,7 +286,7 @@ fn launch_dialog_ended_session_wins_over_shared_store_initially_and_after_input(
         );
         assert_eq!(calls.get(), usize::from(after_input));
         assert_ne!(
-            observe(&h.directory)["applied"],
+            observe(&h.directory).value()["applied"],
             "provider-workspace-dialog"
         );
     }
@@ -291,7 +324,7 @@ fn launch_dialog_rechecks_close_revoke_and_deadline_after_blocking_observation()
             .to_string();
         assert_eq!(calls.get(), 0, "{change}: {error}");
         assert!(error.contains("no response sent"), "{change}: {error}");
-        assert!(observe(&h.directory)["applied"].is_null());
+        assert!(observe(&h.directory).value()["applied"].is_null());
     }
 }
 
@@ -336,7 +369,7 @@ fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
             assert_eq!(now.get() - start, Duration::from_millis(1500));
         }
         assert_eq!(
-            observe(&h.directory)["applied"],
+            observe(&h.directory).value()["applied"],
             "workspace-dialog-response-pending"
         );
     }
@@ -397,7 +430,7 @@ fn launch_dialog_read_error_is_not_input() {
         .unwrap_err();
     assert!(error.to_string().contains("screen unreadable"));
     assert!(error.to_string().contains("no response sent"));
-    assert!(observe(&h.directory)["applied"].is_null());
+    assert!(observe(&h.directory).value()["applied"].is_null());
 }
 
 #[test]
@@ -447,43 +480,54 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         let now = clock.shared();
         let expiry_floor = crate::native::session::primitives::unix_ms() + 3000;
         let screen = h.screen();
-        terminal::with_stale_helper(&directory, 1, change, &screen, || {
-            let error = LaunchDialog {
-                directory: &directory,
-                target: FirstPartyCli::Claude,
-                session: &surface,
-                expected_claim: claim.token(),
-                deadline: start + Duration::from_secs(3),
-                manifest,
-            }
-            .complete(
-                &h.stores.env,
-                &mut clock,
-                || Ok(screen.clone()),
-                |input| {
-                    assert_eq!(input.expected_claim.as_deref(), Some(claim.token()));
-                    assert_eq!(now.get() - start, Duration::from_secs(1));
-                    let expiry = input.expires_unix_ms.unwrap();
-                    assert!(
-                        (expiry_floor..=crate::native::session::primitives::unix_ms() + 3000)
-                            .contains(&expiry),
-                        "original expiry {expiry} vs {expiry_floor}"
-                    );
-                    terminal::guarded_dialog_input(
-                        &directory,
-                        &surface,
-                        input,
-                        Instant::now() + Duration::from_secs(3),
-                    )
-                },
-            )
-            .unwrap_err();
-            assert!(format!("{error:#}").contains("stale"), "{error:#}");
-            let detail = format!("{error:#}");
-            if !detail.contains("no response sent") || detail.contains("possible response") {
-                failures.push(format!("{change}: {detail}"));
-            }
-        });
+        terminal::with_in_process_helper(
+            &directory,
+            &surface,
+            FirstPartyCli::Claude,
+            1,
+            change,
+            &screen,
+            || {
+                let error = LaunchDialog {
+                    directory: &directory,
+                    target: FirstPartyCli::Claude,
+                    session: &surface,
+                    expected_claim: claim.token(),
+                    deadline: start + Duration::from_secs(3),
+                    manifest,
+                }
+                .complete(
+                    &h.stores.env,
+                    &mut clock,
+                    &mut ScriptedSurface {
+                        screen: || Ok(screen.clone()),
+                        dispatch: |input: &terminal::GuardedDialogInput| {
+                            assert_eq!(input.expected_claim.as_deref(), Some(claim.token()));
+                            assert_eq!(now.get() - start, Duration::from_secs(1));
+                            let expiry = input.expires_unix_ms.unwrap();
+                            assert!(
+                                (expiry_floor
+                                    ..=crate::native::session::primitives::unix_ms() + 3000)
+                                    .contains(&expiry),
+                                "original expiry {expiry} vs {expiry_floor}"
+                            );
+                            terminal::guarded_dialog_input(
+                                &directory,
+                                &surface,
+                                input,
+                                Instant::now() + Duration::from_secs(3),
+                            )
+                        },
+                    },
+                )
+                .unwrap_err();
+                assert!(format!("{error:#}").contains("stale"), "{error:#}");
+                let detail = format!("{error:#}");
+                if !detail.contains("no response sent") || detail.contains("possible response") {
+                    failures.push(format!("{change}: {detail}"));
+                }
+            },
+        );
         claim.retain();
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

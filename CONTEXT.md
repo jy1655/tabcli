@@ -30,16 +30,16 @@ _Avoid_: snapshot, inspector
 **Observation**:
 The read-only account of one session that a Reader yields: its recorded lifecycle, the
 active request and its state, its published results, and what those records imply. A query
-renders its Judgments rather than deriving its own; owner and surface facts are added to it on
-request.
+renders its Judgments rather than deriving its own; owner, surface, and Reopen marker facts are
+observed only on request, including the named Session when a marker refers to one.
 _Avoid_: view, summary, status report, listing row, snapshot (an internal read, not the account)
 
 **Judgment**:
 What an Observation concludes from its Records and, on request, from the owner and surface: owner
 binding and liveness, the turn, Claim without Receipt, recovery required, the request index, the
-residual surface, Hold, Cancel, the surface record and its presence, the unreadable parts, and the
-next `result` address. The Observation decides each once; every renderer (status, doctor, inspect,
-wait) maps a judgment to its own vocabulary and derives none of its own.
+residual surface, Hold, Cancel, the surface record and its presence, the unreadable parts, Reopen
+marker eligibility, and the next `result` address. The Observation decides each once; every renderer
+(status, doctor, inspect, wait) maps a judgment to its own vocabulary and derives none of its own.
 _Avoid_: flag, check, attention, reason (renderer vocabularies)
 
 **Store**:
@@ -87,6 +87,23 @@ _Avoid_: output, response, answer
 The act of putting a prompt in front of the provider. Its outcome is sent, not sent, or
 uncertain; an uncertain delivery is never retried blindly.
 _Avoid_: send, submit, paste (these name transports, not the act)
+
+**Question emission**:
+Request-scoped evidence that a provider emitted a structured question, retained independently
+of a Result or Close without implying a pending question or an answer.
+Emissions can be incomplete, absence is unknown, and a later Follow-up creates another
+Request without resolving an earlier emission.
+_Avoid_: needs input, unanswered, waiting for an answer
+
+**Context attachment**:
+The copy of a recorded Result that `--context-result` places in a later Request's prompt as
+reference material, never as instructions.
+_Avoid_: context injection, memory
+
+**Compact attachment**:
+A Context attachment reduced to a bounded excerpt, a visible elision and the command that
+retrieves the full Result.
+_Avoid_: summary (it is not summarised), truncation (the elision is declared and the whole Result stays retrievable)
 
 **Transport**:
 The provider-chosen way to deliver an initial prompt or follow-up, including the evidence
@@ -196,6 +213,16 @@ _Avoid_: restart, unclose
 **Reopen marker**:
 The record in a closed source session that identifies the reopen holding or consuming it.
 _Avoid_: resume lock, continuation token
+
+**Reopen reservation**:
+One attempt's exclusive hold on a closed source Session. Creating the new Session consumes
+that hold; a refused launch releases it only when its provider is verified gone or never spawned.
+_Avoid_: provider conversation lock, resume lease
+
+**Reopen gate**:
+The named reason a Reopen or input to a reopened Session is refused, retained separately
+from the explanation for that particular refusal.
+_Avoid_: error code, failure phase
 
 ### Trust
 

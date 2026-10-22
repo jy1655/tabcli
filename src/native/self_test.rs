@@ -5,7 +5,7 @@ use crate::native::session::primitives::{
     STATE_DIR_ENV, require_valid_session_id, valid_session_id,
 };
 use crate::native::session::{Reader, RecordStore, Store};
-use crate::native::{AskRequest, NativeCommand, doctor, process_env, session_start};
+use crate::native::{AskRequest, NativeCommand, diagnostics, process_env, session_start};
 use agent_bridge::PUBLIC_COMMAND;
 use agent_bridge::{checked_deadline_from, terminal_safe_text};
 use anyhow::{Context, Result, bail};
@@ -497,7 +497,7 @@ fn orchestrate(
             );
             if current.outcome == Outcome::TimedOut
                 && let Some(detail) =
-                    doctor::result_timeout_detail(ask.provider, session, request_id, |args| {
+                    diagnostics::result_timeout_detail(ask.provider, session, request_id, |args| {
                         let diagnosis = operations.call(args, COMMAND_MARGIN);
                         diagnosis.ok.then_some(diagnosis.value)
                     })

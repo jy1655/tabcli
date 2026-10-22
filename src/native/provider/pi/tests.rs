@@ -9,7 +9,9 @@ use std::fs;
 
 #[test]
 fn declared_transports_preserve_framing_and_pending_cleanup() {
-    for facts in [PiInitialPaste.facts(), PiPaste.facts()] {
+    let initial_transport = PiInitialPaste::new();
+    let follow_up_transport = PiPaste::new();
+    for facts in [initial_transport.facts(), follow_up_transport.facts()] {
         let input = facts.surface.unwrap();
         assert_eq!(input.submit_count, 1);
         assert_eq!(input.newline, terminal::ConsoleNewline::LineFeed);
@@ -20,34 +22,36 @@ fn declared_transports_preserve_framing_and_pending_cleanup() {
         serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
     )
     .unwrap();
-    let initial =
+    let pending = claim_pending_turn(directory.path());
+    let mut initial =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
-    install_pending_turn(directory.path(), initial.claim_token).unwrap();
+    initial.claim_token = &pending.claim_token;
+    let prepared = initial_transport.prepare(&initial).unwrap();
     let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
-    let prepared = PiInitialPaste.prepare(&initial).unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
     );
     assert!(prepared.correlation_id.is_none());
-    PiInitialPaste.discard_prepared(&initial, Some(&prepared));
+    initial_transport.discard_prepared(&initial, Some(&prepared));
     assert_eq!(
         std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
         before
     );
-    let follow =
+    let mut follow =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
-    let prepared = PiPaste.prepare(&follow).unwrap();
+    follow.claim_token = &pending.claim_token;
+    let prepared = follow_up_transport.prepare(&follow).unwrap();
     let pending = read_pending_turn(directory.path()).unwrap().unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_correlated_prompt(follow.prompt, &pending, cfg!(windows)).unwrap()
     );
     assert!(prepared.correlation_id.is_none());
-    PiPaste.discard_prepared(&follow, Some(&prepared));
+    follow_up_transport.discard_prepared(&follow, Some(&prepared));
     assert!(!directory.path().join(PENDING_TURN_FILE).exists());
-    PiPaste.prepare(&follow).unwrap();
-    PiPaste.discard_prepared(&follow, None);
+    follow_up_transport.prepare(&follow).unwrap();
+    follow_up_transport.discard_prepared(&follow, None);
     assert!(!directory.path().join(PENDING_TURN_FILE).exists());
 }
 
@@ -160,7 +164,7 @@ fn the_pi_home_is_trust_json_under_the_agent_dir_or_the_user_home() {
 
 #[test]
 fn diagnostics_describe_pi_owned_fallback_without_claiming_live_delivery() {
-    use super::super::super::doctor::{Availability, Context};
+    use super::super::super::diagnostics::{Availability, Context};
     use super::NativeProviderAdapter;
     let checks = super::ADAPTER.diagnose(Context {
         directory: None,
@@ -370,6 +374,7 @@ fn cancel_support_requires_schema_two_and_current_claim() {
         write_json_atomic(
             &directory.path().join(STARTUP_READY_FILE),
             &StartupReady {
+                input_ack_schema: None,
                 schema,
                 claim_token: token.into(),
                 session_id: session.into(),
@@ -401,26 +406,31 @@ fn cancel_support_requires_schema_two_and_current_claim() {
 #[test]
 fn cancel_accepted_cleanup_is_owned_by_pending_turn_lifecycle() {
     let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
     let accepted = directory.path().join("pi-cancel-accepted.json");
-    install_pending_turn(directory.path(), "1-2-3").unwrap();
+    let first = claim_pending_turn(directory.path());
     write_json_atomic(
         &accepted,
-        &serde_json::json!({"schema":1,"claim_token":"1-2-3"}),
+        &serde_json::json!({"schema":1,"claim_token":first.claim_token}),
     )
     .unwrap();
-    install_pending_turn(directory.path(), "4-5-6").unwrap();
+    store
+        .record(crate::native::session::CoreRecord::TurnClaim)
+        .remove()
+        .unwrap();
+    let next = claim_pending_turn(directory.path());
     assert!(!accepted.exists());
     write_json_atomic(
         &accepted,
-        &serde_json::json!({"schema":1,"claim_token":"4-5-6"}),
+        &serde_json::json!({"schema":1,"claim_token":next.claim_token}),
     )
     .unwrap();
-    cancel_pending_turn(directory.path(), "1-2-3").unwrap();
+    cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
     assert!(
         accepted.exists(),
         "stale rollback cannot remove the new claim's record"
     );
-    cancel_pending_turn(directory.path(), "4-5-6").unwrap();
+    cancel_pending_turn(directory.path(), &next.claim_token).unwrap();
     assert!(!accepted.exists());
 }
 
@@ -432,6 +442,7 @@ fn cancel_support_survives_follow_up_and_delivery_rollback_without_upgrading_leg
         write_json_atomic(
             &directory.path().join(STARTUP_READY_FILE),
             &StartupReady {
+                input_ack_schema: None,
                 schema,
                 claim_token: pending.claim_token,
                 session_id: "native".into(),
@@ -708,9 +719,9 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         assert!(extension.contains("agent_settled"), "{label}");
                         let observed = crate::native::consent::observe(&directory);
                         if consent {
-                            assert_eq!(observed["applied"], APPLIED_MARKER, "{label}");
+                            assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
                         } else {
-                            assert!(observed.is_null(), "{label}: {observed}");
+                            assert!(observed.value().is_null(), "{label}: {observed:?}");
                         }
                     }
                 }
@@ -839,6 +850,7 @@ fn usage_extension_reports_pi_usage_beside_every_outcome_in_node() {
                 write_json_atomic(
                     &dir.join(STARTUP_READY_FILE),
                     &StartupReady {
+                        input_ack_schema: None,
                         schema: 2,
                         claim_token: pending.claim_token.clone(),
                         session_id: name.into(),

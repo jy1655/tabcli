@@ -56,6 +56,21 @@ pub(in crate::native) mod test_support {
         SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
         with_publication_read_log, with_sync_failure, with_sync_log, write_event,
     };
+
+    /// A minimal manifest for a session fixture, named after its directory. Every
+    /// session has one; a delivery refusal records an event that names the provider
+    /// from it, so a fixture that settles a refusal needs it.
+    pub(in crate::native) fn write_test_manifest(directory: &std::path::Path, provider: &str) {
+        super::Store::open_unchecked(directory)
+            .record(super::CoreRecord::Manifest)
+            .write_json(&serde_json::json!({
+                "schema": 1, "id": directory.file_name().unwrap().to_str().unwrap(),
+                "provider": provider, "provider_path": provider, "provider_version": "0.159.3",
+                "workspace": directory, "title": "fixture", "model": null,
+                "effort": null, "yolo": false, "created_unix_ms": 1
+            }))
+            .unwrap();
+    }
 }
 
 /// A read-only view. Opening a view performs no recovery or record mutation.
@@ -209,7 +224,35 @@ impl Reader {
         self.private(TERMINAL_TOMBSTONE_FILE).json()
     }
     pub(in crate::native) fn provider_process(&self) -> Result<ProviderProcessRecord> {
-        self.private(PROVIDER_PROCESS_FILE).json()
+        let path = self.private(PROVIDER_PROCESS_FILE).path;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        record::provider_process(&text)
+            .with_context(|| format!("invalid JSON in {}", path.display()))
+    }
+    pub(in crate::native) fn provider_process_if_present(
+        &self,
+    ) -> Result<Option<ProviderProcessRecord>> {
+        let record = self.record(CoreRecord::ProviderProcess);
+        record
+            .text()?
+            .map(|text| {
+                record::provider_process(&text)
+                    .with_context(|| format!("invalid JSON in {}", record.path().display()))
+            })
+            .transpose()
+    }
+    pub(in crate::native) fn reopen_marker_if_present(
+        &self,
+    ) -> Result<Option<schema::ReopenMarker>> {
+        let record = self.record(CoreRecord::ReopenMarker);
+        record
+            .text()?
+            .map(|text| {
+                record::reopen_marker(&text)
+                    .with_context(|| format!("invalid JSON in {}", record.path().display()))
+            })
+            .transpose()
     }
     pub(in crate::native) fn lock_shared(&self) -> Result<Option<File>> {
         let directory = self.directory();

@@ -161,7 +161,7 @@ pub(super) fn emit_session_result_with(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let request_id = &receipt.request_id;
-    let (elapsed, elapsed_reason) = query::observed_elapsed(Some(receipt), event);
+    let (elapsed, elapsed_reason) = query::request::observed_elapsed(Some(receipt), event);
     let mut value = envelope::ok(
         serde_json::json!({
                 "session": id,

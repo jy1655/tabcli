@@ -142,6 +142,19 @@ and other logs also live in provider-specific records. Prompts and results can c
 from your input or the provider's work; do not publish a session directory without reviewing
 it. The [contributor record map](architecture.md#session-records) lists the lifecycle records.
 
+Pi on native Windows also retains `pi-input-accepted-<claim>.json`. It contains the claim,
+Pi session id, submitted frame's SHA-256 and UTF-8 byte length, and the `agent_start` signal.
+The pending Pi record holds the expected fingerprint. These records contain no prompt copy
+and grant no result, input, or cancellation authority. Close retains them with the session.
+
+For Codex, `codex-questions-<claim>.json` retains structured question ids, titles, and options,
+Request identity, and an incompleteness flag. The complete serialized record is limited to
+64 KiB. It uses the same private record writer and remains after completion and close until
+the session records are removed. Question strings can contain sensitive data. The record
+contains no copied prompt, transcript, transcript path, timestamps, or tool output. Queries
+validate it against the selected Receipt without opening provider history or writing records.
+A missing record is unknown, and an unreadable record changes no result or delivery authority.
+
 Bridge reads its own JSON records (`manifest.json`, `status.json`, `closed.json`,
 `turn.completion.json`, `launch.json` and the receipts under `requests/`) through one decoder
 per record, in every command. The decoder takes the bytes as strict UTF-8, so a record with

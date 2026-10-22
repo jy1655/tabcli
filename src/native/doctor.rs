@@ -1,10 +1,11 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
 use super::args::{option_value, set_flag_once, set_once};
+use super::diagnostics::{Availability, Check, Context};
 use super::query::observation::judgment::{
     self, ActiveHandle, BoundOwner, Cancel, Hold, OwnerJudgment, ResultCandidate, Surface,
     SurfacePresence, SurfaceSource, Turn,
 };
-use super::query::observation::{Observation, SessionEvidence};
+use super::query::observation::{Observation, PartialObservation, SessionEvidence};
 use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
 use crate::native::clock::SystemClock;
 use crate::native::process_env;
@@ -18,7 +19,6 @@ use crate::native::session::{Reader, SessionState};
 use agent_bridge::PUBLIC_COMMAND;
 use agent_bridge::{FirstPartyCli, cli_version_is_supported, terminal_safe_text};
 use anyhow::{Result, bail};
-use serde::Serialize;
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::io::Read;
@@ -31,55 +31,6 @@ use std::{fs, thread};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
-
-// A provider owns which observation can explain a timed-out result and whether it
-// needs an explicit probe. The caller owns the bound on executing the command.
-pub(super) struct ResultTimeoutDiagnostic {
-    pub(super) probe: bool,
-    pub(super) detail: for<'a> fn(&'a TimeoutCheck, &str) -> Option<&'a str>,
-}
-
-// A row from the child doctor's JSON, including sparse or malformed observations.
-// Read each field independently so an unrelated row cannot hide a later diagnosis.
-pub(super) struct TimeoutCheck {
-    pub(super) id: Option<String>,
-    pub(super) reason_code: Option<String>,
-    pub(super) request_id: Option<String>,
-    pub(super) detail: Option<String>,
-}
-
-impl TimeoutCheck {
-    fn from_row(row: &Value) -> Self {
-        Self {
-            id: row["id"].as_str().map(str::to_owned),
-            reason_code: row["reason_code"].as_str().map(str::to_owned),
-            request_id: row["evidence"]["request_id"].as_str().map(str::to_owned),
-            detail: row["detail"].as_str().map(str::to_owned),
-        }
-    }
-}
-
-pub(super) fn result_timeout_detail(
-    provider: FirstPartyCli,
-    session: &str,
-    request_id: &str,
-    mut observe: impl FnMut(&[String]) -> Option<Value>,
-) -> Option<String> {
-    let diagnostic = provider::result_timeout_diagnostic(provider)?;
-    let mut args = vec!["doctor".to_owned(), session.to_owned()];
-    if diagnostic.probe {
-        args.push("--probe".to_owned());
-    }
-    args.push("--json".to_owned());
-    let report = observe(&args)?;
-    if report["session"] != session {
-        return None;
-    }
-    report["checks"].as_array()?.iter().find_map(|row| {
-        let check = TimeoutCheck::from_row(row);
-        (diagnostic.detail)(&check, request_id).map(str::to_owned)
-    })
-}
 
 #[derive(Debug)]
 pub(crate) struct DoctorRequest {
@@ -121,71 +72,6 @@ pub(super) fn parse_args(args: &[String]) -> Result<NativeCommand> {
         bail!("doctor requires either one session id or --provider <codex|claude|agy|pi>");
     }
     Ok(NativeCommand::Doctor(request))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum Availability {
-    Available,
-    Unavailable,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-pub(super) struct Check {
-    pub(super) id: &'static str,
-    pub(super) availability: Availability,
-    pub(super) reason_code: &'static str,
-    observed_unix_ms: u128,
-    detail: String,
-    next_action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_command: Option<Vec<String>>,
-    evidence: Value,
-}
-
-impl Check {
-    pub(super) fn new(
-        id: &'static str,
-        availability: Availability,
-        reason_code: &'static str,
-        detail: impl Into<String>,
-        next_action: impl Into<String>,
-    ) -> Self {
-        Self {
-            id,
-            availability,
-            reason_code,
-            observed_unix_ms: unix_ms(),
-            detail: detail.into(),
-            next_action: next_action.into(),
-            next_command: None,
-            evidence: Value::Null,
-        }
-    }
-
-    pub(super) fn evidence(mut self, evidence: Value) -> Self {
-        self.evidence = evidence;
-        self
-    }
-
-    fn command(mut self, arguments: Vec<String>) -> Self {
-        self.next_command = Some(arguments);
-        self
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct Context<'a> {
-    pub(super) directory: Option<&'a Path>,
-    pub(super) manifest: Option<&'a SessionManifest>,
-    pub(super) executable: Option<&'a Path>,
-    pub(super) current_version: Option<&'a str>,
-    pub(super) workspace: &'a Path,
-    pub(super) probe: bool,
-    pub(super) deadline: Instant,
-    // The caller's environment, from which an adapter locates its home for a row.
-    pub(super) environment: &'a consent::Environment,
 }
 
 pub(super) fn run(request: DoctorRequest) -> Result<()> {
@@ -415,15 +301,15 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         checks.push(Check::new("workspace", availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
         if let Some(directory) = &directory {
             let consent = consent::observe(directory);
-            consent_state = consent["state"].clone();
-            let availability = if consent["state"] == "verified" {
+            consent_state = consent.value()["state"].clone();
+            let availability = if consent.state() == Some(consent::ConsentState::Verified) {
                 Available
             } else {
                 Unknown
             };
             checks.push(Check::new("workspace_consent", availability, "recorded_workspace_consent",
                 "Launch-time workspace consent and its provider-owned source. This is historical evidence, not a new trust grant.",
-                "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent));
+                "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent.into_value()));
         }
         let environment = consent::Environment::current();
         checks.extend(provider::diagnose(
@@ -582,22 +468,16 @@ pub(super) fn record_checks(
             };
             checks.push(Check::new("session_records", Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
             unknown_session_checks(id, reason, checks);
-            let cancel = reader
-                .lock_shared()
-                .and_then(|lock| super::session::cancel::observe(reader, lock.is_some()));
-            cancel_check(&judgment::cancel_record(&cancel), id, checks);
+            let PartialObservation {
+                manifest,
+                evidence,
+                cancel,
+                surface,
+                hold,
+            } = PartialObservation::read(reader, id);
+            cancel_check(&cancel, id, checks);
             unobserved_origin_check(id, checks);
-            // No Snapshot: the evidence-only judgments, with the stored state unknown.
-            let evidence = match reader.lock_shared() {
-                Ok(lock) => SessionEvidence::read(
-                    reader,
-                    super::session::hold::observe(reader, lock.is_some()),
-                ),
-                Err(error) => SessionEvidence::read(reader, Err(error)),
-            };
-            let surface = judgment::surface(&evidence.surface, id);
-            let hold = judgment::hold(&evidence.held, evidence.close_tombstone.as_ref(), None);
-            (reader.manifest().ok(), evidence, surface, hold)
+            (manifest, evidence, surface, hold)
         }
     };
     owner_check(evidence.judge_owner(id), checks);
@@ -1167,119 +1047,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod timeout_tests {
-    use super::*;
-
-    #[test]
-    fn agy_timeout_predicate_requires_only_reason_and_matching_request() {
-        let diagnostic = provider::result_timeout_diagnostic(FirstPartyCli::Agy).unwrap();
-        assert!(!diagnostic.probe);
-        let row = json!({
-            "reason_code": "agy_tool_confirmation_observed",
-            "evidence": {"request_id": "request-current"},
-            "detail": "approval needed"
-        });
-        let check = TimeoutCheck::from_row(&row);
-        assert_eq!(
-            (diagnostic.detail)(&check, "request-current"),
-            Some("approval needed")
-        );
-        assert_eq!((diagnostic.detail)(&check, "request-other"), None);
-        for (field, value) in [
-            ("reason_code", json!("other")),
-            ("reason_code", json!(17)),
-            ("evidence", json!({"request_id": 17})),
-            ("evidence", Value::Null),
-            ("detail", json!(17)),
-        ] {
-            let mut changed = row.clone();
-            changed[field] = value;
-            assert_eq!(
-                (diagnostic.detail)(&TimeoutCheck::from_row(&changed), "request-current"),
-                None
-            );
-        }
-        let mut unrelated = row;
-        unrelated["id"] = json!("unrelated");
-        unrelated["availability"] = json!("available");
-        assert_eq!(
-            (diagnostic.detail)(&TimeoutCheck::from_row(&unrelated), "request-current"),
-            Some("approval needed")
-        );
-    }
-
-    #[test]
-    fn pi_timeout_predicate_requires_only_credentials_id() {
-        let diagnostic = provider::result_timeout_diagnostic(FirstPartyCli::Pi).unwrap();
-        assert!(diagnostic.probe);
-        for availability in ["available", "unavailable", "unknown"] {
-            let row = json!({
-                "id": "pi_provider_credentials", "detail": "credentials observation",
-                "availability": availability, "reason_code": "unrelated",
-                "evidence": {"request_id": "request-other"}
-            });
-            let check = TimeoutCheck::from_row(&row);
-            assert_eq!(
-                (diagnostic.detail)(&check, "request-current"),
-                Some("credentials observation")
-            );
-        }
-        for row in [
-            json!({"id": "other", "detail": "ignored"}),
-            json!({"id": 17, "detail": "ignored"}),
-            json!({"id": "pi_provider_credentials", "detail": false}),
-            json!({"detail": "ignored"}),
-        ] {
-            assert_eq!(
-                (diagnostic.detail)(&TimeoutCheck::from_row(&row), "request-current"),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn timeout_rows_preserve_sparse_matches_and_first_matching_detail() {
-        for (provider, row) in [
-            (
-                FirstPartyCli::Agy,
-                json!({"reason_code": "agy_tool_confirmation_observed", "evidence": {"request_id": "request-current"}, "detail": "first"}),
-            ),
-            (
-                FirstPartyCli::Pi,
-                json!({"id": "pi_provider_credentials", "detail": "first"}),
-            ),
-        ] {
-            let mut missing_detail = row.clone();
-            missing_detail["detail"] = json!(3);
-            let mut later = row.clone();
-            later["detail"] = json!("second");
-            assert_eq!(
-                result_timeout_detail(provider, "session-owned", "request-current", |_| Some(
-                    json!({
-                        "session": "session-owned",
-                        "checks": [null, 7, [], {}, missing_detail, row, later]
-                    })
-                )),
-                Some("first".to_owned())
-            );
-        }
-    }
-
-    #[test]
-    fn codex_and_claude_timeout_diagnostics_do_not_observe() {
-        for provider in [FirstPartyCli::Codex, FirstPartyCli::Claude] {
-            assert!(provider::result_timeout_diagnostic(provider).is_none());
-            assert_eq!(
-                result_timeout_detail(provider, "session-owned", "request-current", |_| panic!(
-                    "no diagnostic may run"
-                )),
-                None
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod attestation_tests {
     use super::*;
     use crate::native::process_identity::{Attested, Gone, ProcessObservation};
@@ -1331,7 +1098,7 @@ mod attestation_tests {
             records,
             evidence,
             resumed_from: Ok(None),
-            workspace_consent: Value::Null,
+            workspace_consent: consent::SessionConsentObservation::default(),
             judgments,
         }
     }
@@ -1350,13 +1117,13 @@ mod attestation_tests {
 
     #[test]
     fn doctor_maps_each_judgment_to_its_documented_check() {
-        use crate::native::query::RequestState;
         use crate::native::query::observation::judgment::tests::{
             CLAIM, SESSION, receipt, snapshot,
         };
         use crate::native::query::observation::judgment::{
             CancelState, Ended, IndexIncomplete, SurfacePresence,
         };
+        use crate::native::query::request::RequestState;
         use crate::native::terminal::TerminalKind;
         use ControlAttestation::*;
 

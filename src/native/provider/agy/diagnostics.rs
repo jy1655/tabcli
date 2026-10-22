@@ -19,8 +19,11 @@ pub(super) fn workspace_trust_check(
     workspace: &Path,
     env: &super::super::super::consent::Environment,
     directory: &Path,
-) -> super::super::super::doctor::Check {
-    use super::super::super::doctor::{Availability::*, Check};
+) -> super::super::super::diagnostics::Check {
+    use super::super::super::diagnostics::{
+        Availability::{Available, Unavailable, Unknown},
+        Check,
+    };
     // A caller without a user home has no store to observe; the row says so and the
     // doctor command goes on.
     let home = match super::Home::resolve(env) {
@@ -83,15 +86,17 @@ pub(super) fn workspace_trust_check(
     )
 }
 
-pub(super) fn input_receipt_check(directory: Option<&Path>) -> super::super::super::doctor::Check {
+pub(super) fn input_receipt_check(
+    directory: Option<&Path>,
+) -> super::super::super::diagnostics::Check {
     input_receipt_check_for_platform(directory, cfg!(windows))
 }
 
 fn input_receipt_check_for_platform(
     directory: Option<&Path>,
     windows: bool,
-) -> super::super::super::doctor::Check {
-    use super::super::super::doctor::{Availability::Unknown, Check};
+) -> super::super::super::diagnostics::Check {
+    use super::super::super::diagnostics::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
     const NEXT_ACTION: &str = "Observation only. A gated paste (the Windows initial prompt, every macOS follow-up) first waits until Agy's own trust store lists the exact workspace and this session's agy.log shows the workspace customization load (agy_workspace_trust), then for CLI startup completed and a 3.5 s quiet period without reload, redraw, or hooks lines. The Windows console also requires a Full redraw completed after startup. Neither platform waits for the trust reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line): Agy logs it only when a trust dialog is approved, so it never comes once the trust evidence holds. The log evidence is re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), and the paste follows the read that passed the gate with that read's length as the receipt offset; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let redraw_required = windows;
@@ -203,8 +208,8 @@ pub(super) fn parse_tool_confirmation(line: &str) -> Option<&str> {
 pub(super) fn tool_confirmation_check(
     directory: &Path,
     env: &super::super::super::consent::Environment,
-) -> super::super::super::doctor::Check {
-    use super::super::super::doctor::{Availability::Unknown, Check};
+) -> super::super::super::diagnostics::Check {
+    use super::super::super::diagnostics::{Availability::Unknown, Check};
     let observation =
         brain_root(env).and_then(|brain| pending_tool_confirmation(directory, &brain));
     let (reason, detail, evidence) = match observation {

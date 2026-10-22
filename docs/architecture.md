@@ -93,11 +93,27 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `Checks` so the tail is tested at its own interface with the shared fake Transport.
 - `src/native/turn_report.rs` keeps `TurnReport`: address-aware failure finishing. Callers call
   `TurnReport::finish` outside the Turn run, with their own extra fields.
-- `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
+- `src/native/session_start.rs` owns the original start deadline and the Initial prompt
+  operation for an already prepared Session. Fresh and Reopen resolution and creation finish
+  before that operation; their explicit `InitialSource` implementations supply result fields,
+  holder gates, and phase-specific failure handling. Consent failure remains separate from
+  launcher and Delivery failures.
+- `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's
+  integration with `reopen/reservation.rs`, which owns source reservations, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
-  shape. Reopen creates the new Session
-  and records its provenance before finalizing the source marker. Launch and delivery keep
-  their existing holder-check timing; provider adapters supply the holder evidence.
+  shape. Reopen creates the new Session and records its provenance before finalizing the source
+  marker. The resulting `ReopenAttempt` owns settlement after the Initial prompt operation,
+  including failures before a Request address exists. Launch and delivery keep their existing
+  holder-check timing; provider adapters supply the holder evidence.
+  `Reservation::claim` rechecks the closed source under its lock, and consuming `finalize`
+  leaves its marker in place; an unfinalized Drop releases only its own marker. Settlement
+  preserves the durable refusal re-read and checks provider-process evidence before release.
+  `reopen/gate.rs` owns typed `ReopenGate` reasons, their unchanged JSON spellings and
+  recognition through error context. `reopen/reservation/marker.rs` observes the marker,
+  its named Session and refused-launch cleanup once,
+  then maps that Judgment to command eligibility or doctor diagnostics. Only these callers
+  request the cross-session observation. The command repeats it under the source lock before
+  replacing a stale marker; doctor never acquires mutation authority.
 - `src/providers/` defines the CLI identities, minimum versions, and model, effort, and bypass
   argument mappings. The native adapters call these mappings when they build their complete
   command; shared launch code no longer does.
@@ -113,16 +129,25 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
+  Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
+  Its internal runtime supplies console dispatch, Record observations and the existing Clock;
+  tests substitute that runtime while retaining the real Record readers and delivery settlement.
   It uses the session seam and terminal operations. Keep provider schemas and transport selection
   in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
   orchestration.
+- `src/native/console_control.rs` owns the Windows helper's argv, payload, reply, and failure
+  protocol; its private client owns process invocation, private payload lifetime, and asynchronous
+  window lookup. Command parsing builds an opaque `ConsoleControlRequest`; after session and
+  surface verification, provider facts resolve it to an action for the Windows executor. The
+  in-process test adapter uses the same decoder, provider resolution, and reply interpretation.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
-  and close. Native command parsing builds a `ConsoleControlRequest`; after session verification,
-  the Windows adapter executes a typed `ConsoleControlAction` with resolved input and timing.
+  and close. Windows retains console attachment, Win32 effects, and lifecycle-locked input dispatch.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types, control
   proof and the owner-teardown action, and the platform adapters keep the surface close.
+  The macOS owner wrapper reads the record and calls the same ordered verifier as portable tests;
+  live-process and TTY observations are lazy so that an earlier refusal prevents later OS reads.
   `session::owner` owns process observation and
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
@@ -144,7 +169,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   terminal selection live in portable children of their platform modules (`windows/budget.rs`,
   `macos/selection.rs`), compiled and tested on every target.
 - `src/native/session/` owns durable record schemas, record access, and durability.
-  `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
+  `schema` defines the shared manifest, event, provider-process, reopen-marker and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
   helpers. `close::budget` owns the close deadline scope and its optional test clock. `requests`
   binds public requests to claims and events; `turn` owns delivery settlement, completion and
@@ -168,7 +193,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   source (read once, strict, bounded, whole-map recheck) and Origin's budgeted source
   (per-record cap, byte and time allowance, selective reads, no Snapshot). Every other reader
   of those Records (the lifecycle paths, reopen provenance, the Claude projection) calls the
-  same decoders while keeping its own missing-record policy and error context. Then `reads.rs`
+  same decoders while keeping its own missing-record policy and error context. The auxiliary
+  reopen-marker, reopen-refusal and provider-process shape decoders also live here, preserving
+  their historical serde policy; the Snapshot timestamp rule is not added to those records.
+  Reopen still judges refusal validity and release authority after decoding. Then `reads.rs`
   for event reads and read budgets, `primitives.rs` for filesystem durability and
   private-record permissions, and `owner.rs` for read-only attestation of the recorded owner.
   Owner attestation separates incarnation birth from recorded TTY/process-group control,
@@ -196,10 +224,20 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   publication rules. Queries get a `Reader`,
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
-  Request observation precedes JSON rendering. Context attachment resolution uses the same
+  `query/request.rs` owns the Request observation, which precedes JSON rendering.
+  `with_owner` is the only adjustment of that observation, and only `wait` applies it.
+  `query/search.rs` owns search with its budgets.
+  Context attachment resolution uses the same
   observation and requires strict event decoding, an exact event name, and verifiable provenance;
-  it does not reconstruct Request meaning from command JSON. Timeline retains its cached strict
+  it does not reconstruct Request meaning from command JSON. Compact rendering in `context.rs`
+  is deterministic over the resolved message and the retained question emissions, read under
+  the same Snapshot, and its mode and counts are recorded on the receipt. Timeline retains its cached strict
   reads, and search retains its cumulative byte budget.
+  Codex lifecycle diagnostics read the typed Request state and event identity, release the
+  Snapshot's shared lock, then perform their existing strict event reread for provenance.
+  `query::observation::PartialObservation` owns doctor's fallback when no Snapshot can be read:
+  Cancel and Hold retain separate lock attempts and failure scopes, with the best-effort manifest
+  read after both. Rendering partial evidence does not repair it or grant control authority.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
   its own lock-free listing after its optional repair. The Observation's judgments live in
@@ -220,21 +258,30 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `doctor`, `consent`, and `self_test`, retain their separate formats. The `sessions` array and
   `settings` output are also separate and are not wrapped in an envelope.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
-  optional bounded probes. Providers choose which observation can explain a result timeout;
-  `doctor` assembles that read and `self_test` bounds its execution. A diagnostic report is not
+  optional bounded probes. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
+  `ResultTimeoutDiagnostic`) lives in `src/native/diagnostics.rs`; provider adapters and the
+  Reopen marker observation depend on it rather than on the command. `probe` stays in
+  `doctor` for now. Providers choose which observation can explain a result timeout;
+  `diagnostics` assembles that read and `self_test` bounds its execution. A diagnostic report is not
   proof of successful delivery. The report states its scope using the check inputs and existing
   observations.
 - `src/native/self_test.rs` runs the explicit public self-test through bounded commands, checks
   initial and follow-up results, and closes only its own sessions. It uses the ordinary state
   root unless isolation is requested; it is not called implicitly by another command.
-- `src/native/consent.rs` reads exact-workspace trust evidence, maintains Bridge consent, and
-  coordinates its application through provider and terminal adapters, consuming their declared
-  `LaunchTrust` facts for launch trust policy. It snapshots the caller's environment once per
-  boundary and asks each adapter for a workspace's trust against the adapter's own home, or the
-  recorded source store for a recheck; it knows no provider path. Provider stores are still read
-  through consent's store reader and never written by Bridge. It also owns the one trust wait,
-  which checks the ended-session rule first and serves the Codex paste gate and the Agy delivery
-  gate with their own readiness and messages.
+- `src/native/consent.rs` preserves the public consent path and re-exports four concerns:
+  `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
+  `consent/record.rs` owns Bridge's consent Record and command; `consent/launch_dialog.rs`
+  coordinates launch dialogs through its `DialogSurface` seam and the provider and terminal
+  adapters, consuming their declared `LaunchTrust` facts; and `consent/wait.rs` owns the one
+  trust wait. Consent snapshots the caller's environment once per boundary and asks each
+  adapter for a workspace's trust against the adapter's own home, or the recorded source store
+  for a recheck; it knows no provider path. Provider stores are still read through consent's
+  store reader and never written by Bridge. The wait checks the ended-session rule first and
+  serves the Codex paste gate and the Agy delivery gate with their own readiness and messages.
+  Its `SessionConsentObservation` preserves the raw diagnostic JSON while exposing known state
+  and applied-marker accessors. Unknown or damaged diagnostic records are not authorization;
+  the strict consent record and current-source revalidation remain separate. Doctor retains its
+  later normal-path consent reread.
 - `src/native/settings.rs` owns user preferences for surface creation and one launch admission
   preference, `codex-memory-workspace`. A preference cannot grant or remove close authority over
   an existing session or surface.
