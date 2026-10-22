@@ -480,14 +480,14 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         let now = clock.shared();
         let expiry_floor = crate::native::session::primitives::unix_ms() + 3000;
         let screen = h.screen();
-        terminal::with_in_process_helper(
+        crate::native::console_control::with_in_process_helper(
             &directory,
             &surface,
             FirstPartyCli::Claude,
             1,
             change,
             &screen,
-            || {
+            |client| {
                 let error = LaunchDialog {
                     directory: &directory,
                     target: FirstPartyCli::Claude,
@@ -511,7 +511,7 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
                                     .contains(&expiry),
                                 "original expiry {expiry} vs {expiry_floor}"
                             );
-                            terminal::guarded_dialog_input(
+                            client.guarded_dialog_input(
                                 &directory,
                                 &surface,
                                 input,

@@ -158,6 +158,11 @@ _Avoid_: stop, kill; abort and interrupt are provider API names only.
 The terminal tab, window, pane, or console in which a session's provider runs.
 _Avoid_: terminal (the application), screen
 
+**Console client**:
+The caller-side link to a managed Windows Surface. It prepares addressed requests and
+interprets the console helper's replies; it does not establish authority over the Surface.
+_Avoid_: console owner, input policy
+
 **Owner**:
 The Bridge process that launched a session and is attested as controlling its surface.
 _Avoid_: parent, launcher process

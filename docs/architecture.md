@@ -131,7 +131,13 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   orchestration.
 - `src/native/console_control.rs` owns the Windows helper's argv, payload, reply, and failure
   protocol; its private client owns process invocation, private payload lifetime, and asynchronous
-  window lookup. Command parsing builds an opaque `ConsoleControlRequest`; after session and
+  window lookup. `Client<H: HelperProcess>` owns the dependency for send, text-only send, screen,
+  guarded dialog/submit, and close. Production constructs it with `installed()`; each test gives
+  its client its own helper, with no thread-local selection inside the process adapter.
+  Codex's Windows paste holds one client across its text, screen and submit operations; its
+  portable recognizer/protocol tests still run on every platform. `WindowLookup` retains its
+  separate asynchronous child, polling and Drop cleanup.
+  Command parsing builds an opaque `ConsoleControlRequest`; after session and
   surface verification, provider facts resolve it to an action for the Windows executor. The
   in-process test adapter uses the same decoder, provider resolution, and reply interpretation.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
