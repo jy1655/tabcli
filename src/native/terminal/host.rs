@@ -162,7 +162,7 @@ pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
         HostCommand::Ghostty => {
             #[cfg(target_os = "macos")]
             {
-                super::macos::ghostty::run_host()
+                super::macos::ghostty::host::run_host()
             }
             #[cfg(not(target_os = "macos"))]
             {

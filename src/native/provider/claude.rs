@@ -7,27 +7,22 @@ use crate::native::delivery::Readiness;
 use crate::native::delivery::{self, Transport};
 #[cfg(test)]
 use crate::native::session::SessionState;
-use crate::native::session::turn;
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record};
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, record};
 use agent_bridge::{
     FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
 };
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::time::Instant;
+use std::{ffi::OsString, path::Path};
 
 use super::super::terminal;
 
 mod messenger;
 mod registry;
+mod trust;
+mod turn;
 
 use messenger::{ClaudeMessage, run_message_guard, run_message_receipt};
 
@@ -40,11 +35,8 @@ use registry::{
 
 pub(super) static ADAPTER: ClaudeAdapter = ClaudeAdapter;
 
-static CROSS_SESSION_TURN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
 pub(super) struct ClaudeAdapter;
 
-const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 // Drop caller-session markers from managed and messenger launches, preserving user configuration; nested children have no inbox.
 // Remove when Claude stops deriving identity from inherited markers; see docs/verification/2026-10-11-macos-0.4.1.md.
 // The two CODEX_COMPANION_ names are set by the Claude Code Codex plugin's SessionStart hook
@@ -68,82 +60,6 @@ const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
     "CODEX_COMPANION_SESSION_ID",
     "CODEX_COMPANION_TRANSCRIPT_PATH",
 ];
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PendingCrossSessionTurn {
-    schema: u32,
-    request_id: String,
-    marker: String,
-}
-
-impl PendingCrossSessionTurn {
-    fn new(request_id: &str) -> Result<Self> {
-        if !(request_id.starts_with("claude-turn-")
-            && request_id.len() <= 128
-            && request_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
-        {
-            bail!("invalid Claude cross-session turn id")
-        }
-        Ok(Self {
-            schema: 1,
-            request_id: request_id.to_owned(),
-            marker: format!("<!-- agent-bridge-claude-turn:{request_id} -->"),
-        })
-    }
-}
-
-struct PendingTurnFile {
-    path: PathBuf,
-    retained: bool,
-}
-
-impl PendingTurnFile {
-    fn retain(mut self) {
-        self.retained = true;
-    }
-}
-
-impl Drop for PendingTurnFile {
-    fn drop(&mut self) {
-        if !self.retained {
-            let _ = RecordStore::at(&self.path).remove();
-        }
-    }
-}
-
-fn new_cross_session_turn_id() -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_nanos();
-    Ok(format!(
-        "claude-turn-{now}-{}-{}",
-        std::process::id(),
-        CROSS_SESSION_TURN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-// Claude's home has two defaults. Without `CLAUDE_CONFIG_DIR` the trust store is
-// `<home>/.claude.json` and the session registry `<home>/.claude/sessions`; a non-empty
-// override holds both, `<override>/.claude.json` and `<override>/sessions`, and is kept
-// as spelled, relative or not. An empty override is unset for both (the registry always
-// read it so; the trust store read it as the relative `.claude.json` through 0.4.12).
-fn config_dir_override(env: &super::super::consent::Environment) -> Option<PathBuf> {
-    env.claude_config_dir
-        .as_deref()
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-}
-
-// The trust store requires the user home even when the override names the store.
-fn trust_store(env: &super::super::consent::Environment) -> Result<PathBuf> {
-    let home = super::super::consent::user_home(env)?;
-    Ok(config_dir_override(env)
-        .unwrap_or_else(|| PathBuf::from(home))
-        .join(".claude.json"))
-}
 
 impl NativeProviderAdapter for ClaudeAdapter {
     fn result_timeout_diagnostic(
@@ -183,7 +99,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
     }
 
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
-        claude_trust_prompt_key(screen, workspace)
+        trust::dialog_key(screen, workspace)
     }
     fn workspace_trust(
         &self,
@@ -191,47 +107,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         env: &super::super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::super::consent::Trust> {
-        use super::super::consent::{self, Evidence, Trust};
-        require_exact_claude_trust_scope(workspace)?;
-        let store = match store {
-            Some(store) => store.to_path_buf(),
-            None => trust_store(env)?,
-        };
-        let Some(text) = consent::read_store(&store)? else {
-            return Ok(Trust::Absent);
-        };
-        let config: serde_json::Value = serde_json::from_str(&text)?;
-        let config = config
-            .as_object()
-            .context("Claude config is not an object")?;
-        let Some(projects) = config.get("projects") else {
-            return Ok(Trust::Absent);
-        };
-        let projects = projects
-            .as_object()
-            .context("Claude projects is not an object")?;
-        let native = consent::native_key(workspace)?;
-        let key = if cfg!(windows) {
-            native.replace('\\', "/")
-        } else {
-            native.clone()
-        };
-        let entry = projects.get(&key).or_else(|| projects.get(&native));
-        let entry = entry
-            .map(|v| {
-                v.as_object()
-                    .context("Claude project trust entry is not an object")
-            })
-            .transpose()?;
-        match entry.and_then(|v| v.get("hasTrustDialogAccepted")) {
-            Some(serde_json::Value::Bool(true)) => Ok(Trust::Trusted(Evidence {
-                provider: "claude".into(),
-                store,
-                key,
-            })),
-            Some(serde_json::Value::Bool(false)) | None => Ok(Trust::Absent),
-            _ => bail!("unknown Claude workspace trust value"),
-        }
+        trust::workspace_trust(workspace, env, store)
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
@@ -389,91 +265,6 @@ impl ReopenSupport for ClaudeReopen {
             live_process_creation_time,
         )
     }
-}
-
-// Claude exposes no documented process-local trust switch. Use only its exact
-// startup workspace dialog; no config write, permission dialog, or generic Enter
-// fallback. Delete when Claude ships an official trust launch option.
-fn claude_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
-    require_exact_claude_trust_scope(workspace).ok()?;
-    let lines: Vec<_> = screen
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let start = lines.iter().rposition(|s| *s == "Accessing workspace:")?;
-    let lines = &lines[start..];
-    let native = super::super::consent::native_key(workspace).ok()?;
-    let key = if cfg!(windows) {
-        native.replace('\\', "/")
-    } else {
-        native.clone()
-    };
-    if lines.len() < 8
-        || (lines[1] != native && lines[1] != key)
-        || *lines.last()? != "Enter to confirm · Esc to cancel"
-    {
-        return None;
-    }
-    let guide = lines.iter().position(|s| *s == "Security guide")?;
-    if guide < 4
-        || guide + 4 != lines.len()
-        || lines[guide - 1] != "Claude Code'll be able to read, edit, and execute files here."
-    {
-        return None;
-    }
-    let safety = lines[2..guide - 1].join(" ");
-    if safety
-        != "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first."
-    {
-        return None;
-    }
-    match (lines[guide + 1], lines[guide + 2]) {
-        ("❯ No, exit", "Yes, I trust this folder") => Some(terminal::DialogKey::DownEnter),
-        ("No, exit", "❯ Yes, I trust this folder") => Some(terminal::DialogKey::Enter),
-        _ => None,
-    }
-}
-
-fn git_workspace_command(workspace: &Path) -> Result<std::process::Command> {
-    let mut command = crate::native::process_env::helper_command("git");
-    command
-        .arg("-C")
-        .arg(super::super::consent::native_key(workspace)?)
-        .args(["rev-parse", "--show-toplevel"]);
-    Ok(command)
-}
-
-fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
-    // Claude saves Git-subdirectory approval at the root; exact child consent cannot authorize it.
-    // Let Git resolve worktrees/nested roots; failed lookup leaves Claude's dialog untouched.
-    let mut has_git_ancestor = false;
-    for parent in workspace.ancestors().skip(1) {
-        if parent.join(".git").try_exists()? {
-            has_git_ancestor = true;
-            break;
-        }
-    }
-    if !has_git_ancestor {
-        return Ok(());
-    }
-    let mut command = git_workspace_command(workspace)?;
-    let output = crate::native::process_env::command_output_until(
-        &mut command,
-        Instant::now() + Duration::from_secs(2),
-        "Claude workspace trust scope",
-    )?;
-    if !output.status.success() {
-        bail!("cannot verify Claude's Git workspace trust scope; use its own trust dialog");
-    }
-    let root = PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end_matches(['\r', '\n']))
-        .canonicalize()?;
-    if root != workspace {
-        bail!(
-            "Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog"
-        );
-    }
-    Ok(())
 }
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
@@ -661,18 +452,6 @@ fn resumed_conversation_holders_check(
     })
 }
 
-fn correlated_response<'a>(message: &'a str, pending: &PendingCrossSessionTurn) -> Result<&'a str> {
-    let trimmed = message.trim_end();
-    let body = trimmed
-        .strip_suffix(&pending.marker)
-        .context("Claude response did not end with the expected turn marker")?
-        .trim_end();
-    if body.is_empty() {
-        bail!("Claude correlated response contained no assistant text")
-    }
-    Ok(body)
-}
-
 fn managed_session_name(directory: &Path) -> Result<String> {
     let recipient = directory
         .file_name()
@@ -696,104 +475,17 @@ fn handle_hook(directory: &Path, payload: &serde_json::Value) -> Result<()> {
         .get("hook_event_name")
         .and_then(serde_json::Value::as_str)
     {
-        Some("StopFailure") => handle_stop_failure(directory, payload),
-        Some("Stop") => handle_correlated_stop(directory, payload),
+        Some("StopFailure") => turn::on_stop_failure(
+            &crate::native::session::Store::open_unchecked(directory),
+            payload,
+        ),
+        Some("Stop") => turn::on_stop(
+            &crate::native::session::Store::open_unchecked(directory),
+            payload,
+        ),
         Some(event) => bail!("unsupported Claude hook event: {event}"),
         None => bail!("Claude hook payload has no hook_event_name"),
     }
-}
-
-fn handle_correlated_stop(directory: &Path, payload: &serde_json::Value) -> Result<()> {
-    let Some(pending_text) = Reader::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .text()?
-    else {
-        return handle_uncorrelated_stop(directory, payload);
-    };
-    let pending: PendingCrossSessionTurn =
-        serde_json::from_str(&pending_text).context("failed to parse the pending Claude turn")?;
-    let valid_pending = matches!(
-        PendingCrossSessionTurn::new(&pending.request_id),
-        Ok(expected) if expected.schema == pending.schema && expected.marker == pending.marker
-    );
-    if !valid_pending {
-        bail!("Agent Bridge rejected invalid Claude turn correlation state")
-    }
-    let Some(message) = claude_string(payload, "last_assistant_message") else {
-        return Ok(());
-    };
-    let Ok(message) = correlated_response(message, &pending) else {
-        return Ok(());
-    };
-    turn::Report::for_claim(
-        &Store::open_unchecked(directory),
-        agent_bridge::FirstPartyCli::Claude,
-        None,
-    )
-    .complete(
-        message,
-        claude_owned_string(payload, "session_id"),
-        Some(pending.request_id),
-    )
-    .context("failed to record the correlated Claude result")
-}
-
-fn handle_uncorrelated_stop(directory: &Path, payload: &serde_json::Value) -> Result<()> {
-    let message = claude_string(payload, "last_assistant_message")
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .context("Claude Stop hook payload has no assistant result")?;
-    turn::Report::initial(
-        &Store::open_unchecked(directory),
-        agent_bridge::FirstPartyCli::Claude,
-    )
-    .complete(message, claude_owned_string(payload, "session_id"), None)
-}
-
-fn handle_stop_failure(directory: &Path, payload: &serde_json::Value) -> Result<()> {
-    if Reader::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .text()?
-        .is_some()
-    {
-        // SendMessage does not return the target prompt identity that would let
-        // Agent Bridge bind this failure to the delivered request. Leave the
-        // pending turn claimed instead of attributing an unrelated failure.
-        return Ok(());
-    }
-    let error = payload
-        .get("error")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown Claude API error");
-    let detail = payload
-        .get("error_details")
-        .and_then(serde_json::Value::as_str)
-        .filter(|detail| !detail.trim().is_empty());
-    let error = detail.map_or_else(
-        || format!("Claude turn failed: {error}"),
-        |detail| format!("Claude turn failed: {error}: {detail}"),
-    );
-    turn::Report::initial(
-        &Store::open_unchecked(directory),
-        agent_bridge::FirstPartyCli::Claude,
-    )
-    .fail(&error, claude_owned_string(payload, "session_id"), None)?;
-    Ok(())
-}
-
-fn install_pending_turn(directory: &Path, request_id: &str) -> Result<PendingTurnFile> {
-    let pending = PendingCrossSessionTurn::new(request_id)?;
-    let path = Reader::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .path()
-        .to_owned();
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .write_json(&pending)?;
-    Ok(PendingTurnFile {
-        path,
-        retained: false,
-    })
 }
 
 pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
