@@ -1,3 +1,4 @@
+#[cfg(any(windows, test))]
 mod paste;
 use super::PendingCodexTurn;
 use super::correlation::correlated_prompt;
@@ -56,6 +57,7 @@ pub(super) fn send_initial_prompt(
             .map_err(terminal::TerminalSendFailure::not_sent)?
             .is_some_and(|mode| mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
         {
+            #[cfg(windows)]
             return paste::send(session, &directory, prompt_path, deadline);
         }
     }

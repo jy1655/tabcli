@@ -46,7 +46,9 @@ read log, the record replace retry hook, the close interruption points, enumerat
 the snapshot checkpoints, the Origin checkpoints and receipt counter, and the Windows termination
 log. They stay thread-local test hooks beside the code they observe.
 
-The console helper's in-process adapter uses the production argv decoder, session and
+The console client owns an explicitly supplied `HelperProcess`; the installed adapter never
+selects test behavior. Tests can keep two independent clients in the same scope. The console
+helper's in-process adapter uses the production argv decoder, session and
 provider resolution, payload decoder, input dispatcher, and reply interpretation. Its fake process
 and Win32 effects do not prove real attachment or OS behavior. The owner fixtures likewise call
 the production ordered verifier with lazy process and TTY observers; they do not run the macOS
