@@ -1,4 +1,4 @@
-use super::super::delivery::{complete_log_lines, glog_timestamp, strip_terminal_noise};
+use super::super::log::{complete_log_lines, glog_timestamp, strip_terminal_noise};
 use super::super::receipt::{ReceiptEvidence, observe_input_receipt};
 use super::super::test_support::{
     FakeClock, HOOKS_LOADED, REAL_DEFERRED_RELOAD_STARTUP, REAL_MACOS_INITIAL_TURN,

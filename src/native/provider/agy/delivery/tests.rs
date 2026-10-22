@@ -22,20 +22,23 @@ use std::time::{Duration, Instant};
 fn paste_preparation_requires_trust_correlation_and_readiness_in_order() {
     let tmp = tempfile::tempdir().unwrap();
     let readiness_reads = std::cell::Cell::new(0);
-    let readiness = || {
+    let readiness = |_: &mut ()| {
         readiness_reads.set(readiness_reads.get() + 1);
         Ok(26060)
     };
     assert!(
         PreparedTerminalTurn::prepare_with(
             tmp.path(),
-            || bail!("session ended during trust wait"),
+            &mut (),
+            |_| bail!("session ended during trust wait"),
             readiness
         )
         .is_err()
     );
     assert_eq!(readiness_reads.get(), 0);
-    assert!(PreparedTerminalTurn::prepare_with(tmp.path(), || Ok(()), readiness).is_err());
+    assert!(
+        PreparedTerminalTurn::prepare_with(tmp.path(), &mut (), |_| Ok(()), readiness).is_err()
+    );
     assert_eq!(
         readiness_reads.get(),
         0,
@@ -43,7 +46,8 @@ fn paste_preparation_requires_trust_correlation_and_readiness_in_order() {
     );
     install_pending_turn(tmp.path(), "1-2-3").unwrap();
     assert!(
-        PreparedTerminalTurn::prepare_with(tmp.path(), || Ok(()), || bail!("not ready")).is_err()
+        PreparedTerminalTurn::prepare_with(tmp.path(), &mut (), |_| Ok(()), |_| bail!("not ready"))
+            .is_err()
     );
     assert!(!tmp.path().join("agy-input-1-2-3.json").exists());
 }
@@ -56,11 +60,12 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
         let order = std::cell::RefCell::new(Vec::new());
         let prepared = PreparedTerminalTurn::prepare_with(
             tmp.path(),
-            || {
+            &mut (),
+            |_| {
                 order.borrow_mut().push("trust");
                 Ok(())
             },
-            || {
+            |_| {
                 order.borrow_mut().push("ready-read");
                 Ok(26060)
             },
@@ -68,7 +73,8 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
         .unwrap();
         let result = prepared.deliver(
             "iterm2",
-            || {
+            &mut (),
+            |_| {
                 order.borrow_mut().push("paste");
                 match failure {
                     "not-sent" => Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
@@ -80,7 +86,7 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
                     _ => Ok(()),
                 }
             },
-            |pending, offset| {
+            |_, pending, offset| {
                 order.borrow_mut().push("receipt");
                 assert_eq!(offset, 26060);
                 assert_eq!(pending.claim_token, "1-2-3");
@@ -117,11 +123,12 @@ fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         &pending,
         26060,
         "apple-terminal",
-        || {
+        &mut (),
+        |_| {
             sends.set(sends.get() + 1);
             Ok(())
         },
-        || {
+        |_| {
             Err(terminal::TerminalSendFailure::delivery_uncertain(
                 anyhow::anyhow!("no HandleUserInput receipt"),
             ))
@@ -145,11 +152,12 @@ fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         &pending,
         10,
         "iterm2",
-        || {
+        &mut (),
+        |_| {
             sends.set(sends.get() + 1);
             Ok(())
         },
-        || Ok(()),
+        |_| Ok(()),
     )
     .unwrap();
     assert_eq!(sends.get(), 2);
@@ -160,12 +168,13 @@ fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         &pending,
         10,
         "iterm2",
-        || {
+        &mut (),
+        |_| {
             Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
                 "deadline"
             )))
         },
-        || {
+        |_| {
             confirms.set(confirms.get() + 1);
             Ok(())
         },
