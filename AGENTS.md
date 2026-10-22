@@ -587,9 +587,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - Finish every release with local build cleanup after publication verification, installation
   (if requested), and all checks. Follow `docs/releasing.md#local-build-cleanup`: preserve
   evidence outside `target/`, ensure no build or live session depends on its binaries, then
-  run `cargo clean --target-dir ./target` from the checkout root. Clean only this checkout's
-  build output, never other worktrees, installed binaries, session records or global Cargo
-  caches. Report reclaimed space, or the concrete dependency that deferred cleanup.
+  run `cargo --config 'build.build-dir="./target"' clean --target-dir ./target` from the
+  checkout root. Clean only this checkout's build output, never other worktrees, installed
+  binaries, session records, a separately configured build directory or global Cargo caches.
+  Report reclaimed space, or the dependency or verification gap that deferred cleanup.
 - Tests requiring authenticated CLIs and visible terminal surfaces remain manual live
   tests; do not represent ignored live tests as runtime verification.
 - A claim about Windows behavior is not verified until its `cfg(windows)` test has run on the
