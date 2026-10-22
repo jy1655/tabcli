@@ -1,8 +1,37 @@
+use super::launch_dialog::{DialogSurface, LaunchDialog, complete_launch};
+use super::record::{SESSION_FILE, assess_with, observe, record, with_record};
+use super::store::{Trust, native_key};
 use super::tests::{Fixture, session, setup, trust_pi};
-use super::*;
+use crate::native::clock::Clock;
 use crate::native::clock::FakeClock;
+use crate::native::session::{Reader, RecordStore, Store};
 use crate::native::session::{SessionState, primitives::write_json_atomic, update_status};
+use crate::native::{provider, terminal};
+use agent_bridge::FirstPartyCli;
+use anyhow::{Result, bail};
 use std::cell::Cell;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+struct ScriptedSurface<S, D> {
+    screen: S,
+    dispatch: D,
+}
+
+impl<S, D> DialogSurface for ScriptedSurface<S, D>
+where
+    S: FnMut() -> Result<String>,
+    D: FnMut(&terminal::GuardedDialogInput) -> Result<bool>,
+{
+    fn screen(&mut self, _deadline: Instant) -> Result<String> {
+        (self.screen)()
+    }
+
+    fn answer(&mut self, input: &terminal::GuardedDialogInput, _deadline: Instant) -> Result<bool> {
+        (self.dispatch)(input)
+    }
+}
 
 struct Harness {
     _home: tempfile::TempDir,
@@ -54,7 +83,11 @@ impl Harness {
             deadline: clock.now() + timeout,
             manifest,
         }
-        .complete(&self.stores.env, clock, screen, dispatch)
+        .complete(
+            &self.stores.env,
+            clock,
+            &mut ScriptedSurface { screen, dispatch },
+        )
     }
 
     fn screen(&self) -> String {
@@ -466,22 +499,25 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
                 .complete(
                     &h.stores.env,
                     &mut clock,
-                    || Ok(screen.clone()),
-                    |input| {
-                        assert_eq!(input.expected_claim.as_deref(), Some(claim.token()));
-                        assert_eq!(now.get() - start, Duration::from_secs(1));
-                        let expiry = input.expires_unix_ms.unwrap();
-                        assert!(
-                            (expiry_floor..=crate::native::session::primitives::unix_ms() + 3000)
-                                .contains(&expiry),
-                            "original expiry {expiry} vs {expiry_floor}"
-                        );
-                        terminal::guarded_dialog_input(
-                            &directory,
-                            &surface,
-                            input,
-                            Instant::now() + Duration::from_secs(3),
-                        )
+                    &mut ScriptedSurface {
+                        screen: || Ok(screen.clone()),
+                        dispatch: |input: &terminal::GuardedDialogInput| {
+                            assert_eq!(input.expected_claim.as_deref(), Some(claim.token()));
+                            assert_eq!(now.get() - start, Duration::from_secs(1));
+                            let expiry = input.expires_unix_ms.unwrap();
+                            assert!(
+                                (expiry_floor
+                                    ..=crate::native::session::primitives::unix_ms() + 3000)
+                                    .contains(&expiry),
+                                "original expiry {expiry} vs {expiry_floor}"
+                            );
+                            terminal::guarded_dialog_input(
+                                &directory,
+                                &surface,
+                                input,
+                                Instant::now() + Duration::from_secs(3),
+                            )
+                        },
                     },
                 )
                 .unwrap_err();

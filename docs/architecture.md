@@ -259,14 +259,16 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/self_test.rs` runs the explicit public self-test through bounded commands, checks
   initial and follow-up results, and closes only its own sessions. It uses the ordinary state
   root unless isolation is requested; it is not called implicitly by another command.
-- `src/native/consent.rs` reads exact-workspace trust evidence, maintains Bridge consent, and
-  coordinates its application through provider and terminal adapters, consuming their declared
-  `LaunchTrust` facts for launch trust policy. It snapshots the caller's environment once per
-  boundary and asks each adapter for a workspace's trust against the adapter's own home, or the
-  recorded source store for a recheck; it knows no provider path. Provider stores are still read
-  through consent's store reader and never written by Bridge. It also owns the one trust wait,
-  which checks the ended-session rule first and serves the Codex paste gate and the Agy delivery
-  gate with their own readiness and messages.
+- `src/native/consent.rs` preserves the public consent path and re-exports four concerns:
+  `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
+  `consent/record.rs` owns Bridge's consent Record and command; `consent/launch_dialog.rs`
+  coordinates launch dialogs through its `DialogSurface` seam and the provider and terminal
+  adapters, consuming their declared `LaunchTrust` facts; and `consent/wait.rs` owns the one
+  trust wait. Consent snapshots the caller's environment once per boundary and asks each
+  adapter for a workspace's trust against the adapter's own home, or the recorded source store
+  for a recheck; it knows no provider path. Provider stores are still read through consent's
+  store reader and never written by Bridge. The wait checks the ended-session rule first and
+  serves the Codex paste gate and the Agy delivery gate with their own readiness and messages.
   Its `SessionConsentObservation` preserves the raw diagnostic JSON while exposing known state
   and applied-marker accessors. Unknown or damaged diagnostic records are not authorization;
   the strict consent record and current-source revalidation remain separate. Doctor retains its
