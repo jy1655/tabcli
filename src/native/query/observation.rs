@@ -1,4 +1,5 @@
 //! One Session's recorded facts, partial read failures, and timed judgments.
+use super::request::{RequestObservation, RequestState, observed_elapsed};
 use super::*;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session;
@@ -6,6 +7,7 @@ use crate::native::session::origin;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
 use crate::native::terminal::ownership::NativeSessionOwner;
 use judgment::{Cancel, CancelState, Hold, Judgments, OwnerJudgment, Surface, SurfacePresence};
+use serde::Serialize;
 use std::cell::OnceCell;
 use std::fs::File;
 

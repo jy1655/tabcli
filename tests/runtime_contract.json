@@ -251,7 +251,7 @@
   "src/native/provider_process.rs": {
     "AGENT_BRIDGE_BATCH_ARG_": 1
   },
-  "src/native/query.rs": {
+  "src/native/query/search.rs": {
     "AGENT_BRIDGE_TEST_SEARCH_AIDS": 1
   },
   "src/native/self_test.rs": {

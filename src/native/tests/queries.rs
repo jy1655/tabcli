@@ -586,7 +586,7 @@ fn enumeration_faults_keep_search_and_listing_error_policies() {
         })]
     };
     let value = with_entries(kind("session-z"), || {
-        query::search_value_in(root.path(), &search)
+        query::search::search_value_in(root.path(), &search)
     })
     .unwrap();
     assert_eq!(
@@ -594,7 +594,7 @@ fn enumeration_faults_keep_search_and_listing_error_policies() {
         serde_json::json!([{"session": null, "reason": "session entry session-z: failed to read its file type: kind fault"}])
     );
     let value = with_entries(kind("invalid"), || {
-        query::search_value_in(root.path(), &search)
+        query::search::search_value_in(root.path(), &search)
     })
     .unwrap();
     assert_eq!(value["incomplete"], false);
@@ -606,7 +606,7 @@ fn enumeration_faults_keep_search_and_listing_error_policies() {
         assert_eq!(error.to_string(), "kind fault");
     }
     let error = with_entries(vec![Err(std::io::Error::other("entry fault"))], || {
-        query::search_value_in(root.path(), &search)
+        query::search::search_value_in(root.path(), &search)
     })
     .unwrap_err();
     assert_eq!(

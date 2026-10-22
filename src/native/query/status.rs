@@ -1,4 +1,5 @@
 //! Read-only Session observations within a workspace and a shared scan budget.
+use super::search::{IncompleteReason, SEARCH_TIME_BUDGET, SearchScope};
 use super::*;
 use crate::native::args::{option_value, set_flag_once, set_once, workspace_scope};
 use crate::native::clock::SystemClock;
@@ -6,6 +7,7 @@ use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::origin::{ObservationCache, OriginEnvironment, OriginObservation};
+use agent_bridge::PUBLIC_COMMAND;
 use observation::judgment::{
     self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
     ResultCandidate, Turn,

@@ -1779,7 +1779,7 @@ fn size_policy_drops_usage_before_it_fails_a_message_that_fits_on_its_own() {
 
 #[test]
 fn size_policy_publishes_a_bare_event_at_the_limit_before_it_fails() {
-    use crate::native::query::reported_usage;
+    use crate::native::query::request::reported_usage;
     use crate::native::session::schema::USAGE_OMITTED_SIZE;
     let without_usage = event("fits");
     let bare = serde_json::to_vec_pretty(&without_usage).unwrap().len() as u64;
