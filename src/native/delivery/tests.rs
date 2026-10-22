@@ -1,4 +1,5 @@
-use super::super::session::{CoreRecord, Store, hold, update_status};
+use super::super::query;
+use super::super::session::{CoreRecord, Store, hold, requests, update_status};
 use super::test_support::*;
 use super::*;
 use agent_bridge::FirstPartyCli;
@@ -34,7 +35,9 @@ fn follow_up_sent_keeps_no_initial_prompt_and_status_working() {
 fn not_sent_rolls_back_claim_with_reason_and_cancels_prepared() {
     let mut f = Fixture::new();
     f.fake.result = "not sent";
-    assert!(f.follow(f.claim(false)).is_err());
+    let claim = f.claim(false);
+    let token = claim.token().to_owned();
+    assert!(f.follow(claim).is_err());
     assert_eq!(f.store.status().unwrap().state, SessionState::Ready);
     assert_eq!(
         f.store.status().unwrap().error.as_deref(),
@@ -42,6 +45,51 @@ fn not_sent_rolls_back_claim_with_reason_and_cancels_prepared() {
     );
     assert!(turn::current_claim_token(&f.store).unwrap().is_none());
     assert_eq!(f.calls().last(), Some(&"discard some"));
+    // Changed deliberately: the adapter's NotSent is settled as the receipt's failed event
+    // by shared settlement; the adapter itself still only returns `Outcome::NotSent`.
+    assert_refused_request(&f.store, &token, "send cause");
+}
+
+/// The refusal is settled in shared delivery settlement, with the refusal text and
+/// `delivery_not_sent` provenance; no adapter writes it.
+fn assert_refused_request(store: &Store, claim_token: &str, error: &str) {
+    let receipt = requests::for_claim(store, claim_token).unwrap().unwrap();
+    let event = store.event_strict(&receipt.event_file).unwrap();
+    assert_eq!(event.error.as_deref(), Some(error));
+    assert_eq!(
+        event.provenance.as_deref(),
+        Some(turn::DELIVERY_NOT_SENT_PROVENANCE)
+    );
+    assert_eq!(store.events().unwrap().len(), 1);
+    let result = query::request_result(store, &receipt.request_id).unwrap();
+    assert_eq!(result["request_state"], "failed");
+    assert_eq!(result["error"], error);
+}
+
+#[test]
+fn initial_not_sent_fails_the_session_and_records_the_refusal() {
+    let mut f = Fixture::new();
+    f.fake.result = "not sent";
+    let claim = f.claim(true);
+    let token = claim.token().to_owned();
+    let error = deliver_with(
+        claim,
+        Turn::Initial {
+            gate: &mut |_| Ok(()),
+        },
+        f.context(),
+        &f.fake,
+        &f.checks,
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), "send cause");
+    assert_eq!(f.store.status().unwrap().state, SessionState::Failed);
+    assert_eq!(
+        f.store.status().unwrap().error.as_deref(),
+        Some("send cause")
+    );
+    assert!(turn::current_claim_token(&f.store).unwrap().is_none());
+    assert_refused_request(&f.store, &token, "send cause");
 }
 #[test]
 fn uncertain_keeps_claim_working_with_error_and_never_cancels() {
@@ -61,10 +109,14 @@ fn prepare_failure_is_not_sent_without_working_write() {
     let mut f = Fixture::new();
     f.fake.prepare_fails = true;
     let claim = f.claim(false);
+    let token = claim.token().to_owned();
     let generation = f.store.status().unwrap().generation;
     assert!(f.follow(claim).is_err());
     assert_eq!(f.store.status().unwrap().generation, generation + 1);
     assert_eq!(f.calls(), ["prepare", "discard none"]);
+    // Changed deliberately: a refusal before `begin_delivery` is recorded as well, with
+    // the one status write that publishes the rollback.
+    assert_refused_request(&f.store, &token, "prepare cause");
 }
 #[test]
 fn ownership_failure_precedes_begin_delivery_for_surface_transport() {
@@ -86,6 +138,16 @@ fn budget_failure_names_transport_and_is_not_sent() {
         "provider follow-up transport fake cannot start inside its remaining total timeout: budget cause"
     );
     assert!(turn::current_claim_token(&f.store).unwrap().is_none());
+    // The recorded error is the bare cause: context is added only after settlement.
+    let receipt = &requests::list(&f.store).unwrap().receipts[0];
+    assert_eq!(
+        f.store
+            .event_strict(&receipt.event_file)
+            .unwrap()
+            .error
+            .as_deref(),
+        Some("budget cause")
+    );
 }
 #[test]
 fn begin_delivery_refused_when_claim_replaced_cancels_prepared() {

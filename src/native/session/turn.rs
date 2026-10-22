@@ -25,6 +25,10 @@ use std::{
 
 pub(in crate::native) static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Provenance of a Bridge-owned failure event that records a delivery refusal: nothing was
+/// sent to the provider, and the event's error is the refusal text.
+pub(in crate::native) const DELIVERY_NOT_SENT_PROVENANCE: &str = "delivery_not_sent";
+
 #[derive(Debug, Deserialize, Serialize)]
 pub(in crate::native) struct PendingTurnCompletion {
     pub(in crate::native) schema: u32,
@@ -364,7 +368,10 @@ fn bound_pending_completion(
 }
 
 /// The final delivery fact after the adapter has decided whether a fallback is safe.
-/// Settlement never sends input or publishes a provider result.
+/// Settlement never sends input or publishes a provider result. The one event it records
+/// is a refusal: a Bridge-owned failure event with [`DELIVERY_NOT_SENT_PROVENANCE`] whose
+/// error is the refusal text, evidence that nothing was sent for that receipt. The
+/// request reads `failed` from it where a receipt without an event reads `unresolved`.
 pub(in crate::native) enum Delivery<'a> {
     Sent,
     NotSent(&'a anyhow::Error),
@@ -419,14 +426,12 @@ impl Claim {
             Delivery::NotSent(error) => {
                 let error = terminal_safe_text(&format!("{error:#}"), true);
                 let _lock = Store::open_unchecked(directory).lock()?;
-                // A completion journal may have outlived its sender. Publish it before
-                // deciding whether this refusal still owns any state to roll back.
-                recover_pending_completion_locked(directory, &self.path)?;
-                rollback_turn_claim_token_with_error_locked(
+                settle_delivery_refusal_locked(
+                    directory,
                     &self.path,
                     &self.token,
                     self.rollback_state.clone().unwrap_or(SessionState::Failed),
-                    Some(error),
+                    error,
                 )?;
                 Ok(())
             }
@@ -492,6 +497,65 @@ impl Claim {
     pub(in crate::native) fn retain(mut self) {
         self.retained = true;
     }
+}
+
+/// Settles a delivery refusal under the lifecycle lock the caller already holds: the
+/// refusal becomes the receipt's failed event, journaled through the same durable
+/// completion machinery as a provider result, and the claim is released with the status
+/// rolled back to `state` carrying the refusal text. Returns whether this claim was still
+/// the installed one.
+///
+/// Not `Report::fail`: that report rejects the `Claimed` and `AwaitingInitialInput`
+/// states a refusal before `begin_delivery` settles from (preparation, budget and hold
+/// failures), always publishes `Ready` where an initial refusal keeps `Failed`, releases
+/// the claim itself and takes the lifecycle lock again. The order here is the one every
+/// late-report protection relies on: a pending completion that outlived its sender is
+/// recovered first and wins; a claim another turn now holds, or no claim, records nothing
+/// and changes nothing; a close tombstone or closed status records nothing. Only then is
+/// the refusal journaled, with `created_unix_ms`, and recovered to its event, status and
+/// claim release in that order. A journal write that fails leaves the claim installed:
+/// nothing falls through to a release.
+fn settle_delivery_refusal_locked(
+    directory: &Path,
+    claim_path: &Path,
+    claim_token: &str,
+    state: SessionState,
+    error: String,
+) -> Result<bool> {
+    // A completion journal may have outlived its sender. Publish it before deciding
+    // whether this refusal still owns any state to settle.
+    recover_pending_completion_locked(directory, claim_path)?;
+    if read_claim_token(directory)?.as_deref() != Some(claim_token) {
+        return Ok(false);
+    }
+    let store = Store::open_unchecked(directory);
+    if store.closed_if_present()?.is_some() || store.status()?.state == SessionState::Closed {
+        return Ok(false);
+    }
+    // The event names the session's provider as the monitor-failure event does; the
+    // refusal itself carries no provider identity, so reopen keeps an older turn's.
+    let provider = store.manifest()?.provider;
+    let event = SessionEvent {
+        provenance: Some(DELIVERY_NOT_SENT_PROVENANCE.to_owned()),
+        cancelled: false,
+        provider,
+        message: String::new(),
+        error: Some(error.clone()),
+        provider_session_id: None,
+        turn_id: None,
+        created_unix_ms: Some(unix_ms()),
+        usage: None,
+        usage_error: None,
+    };
+    commit_provider_completion_with_status_locked(
+        directory,
+        claim_path,
+        claim_token,
+        event,
+        Some(error),
+        state,
+    )?;
+    Ok(true)
 }
 
 /// Compare-and-set status write on behalf of one turn: the status changes only while the

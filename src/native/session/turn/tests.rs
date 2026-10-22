@@ -8,11 +8,14 @@ use crate::native::session::primitives::{
     with_sync_failure, write_json_atomic, write_private,
 };
 use crate::native::session::state::update_status_with_residual;
+use crate::native::session::test_support::write_test_manifest;
 use crate::native::session::{Reader, Store};
 use crate::native::session::{launch, turn};
 use crate::native::terminal;
 use std::fs;
 
+// Every fixture carries a manifest: a delivery refusal records an event that names the
+// session's provider from it, as the monitor-failure event does.
 fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
     let directory = tempfile::Builder::new()
         .prefix("session-")
@@ -20,8 +23,26 @@ fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
         .unwrap();
     let store = Store::open_unchecked(directory.path());
     fs::create_dir(store.record(CoreRecord::Events).path()).unwrap();
+    write_test_manifest(directory.path(), "codex");
     update_status(store.directory(), state, None, None).unwrap();
     (directory, store)
+}
+
+fn refusal_event(store: &Store, claim_token: &str, error: &str) -> SessionEvent {
+    let receipt = requests::for_claim(store, claim_token).unwrap().unwrap();
+    let event = store.event_strict(&receipt.event_file).unwrap();
+    assert_eq!(
+        event.provenance.as_deref(),
+        Some(DELIVERY_NOT_SENT_PROVENANCE)
+    );
+    assert_eq!(event.provider, "codex");
+    assert_eq!(event.message, "");
+    assert_eq!(event.error.as_deref(), Some(error));
+    assert!(!event.cancelled);
+    assert!(event.provider_session_id.is_none());
+    assert!(event.turn_id.is_none());
+    assert!(event.created_unix_ms.is_some());
+    event
 }
 
 fn event(message: &str) -> SessionEvent {
@@ -64,6 +85,8 @@ fn journal_comparison_requires_exact_bytes_inside_the_read_limit() {
     }
 }
 
+// Unchanged with the refusal event: a late NotSent whose claim a completion already won
+// records nothing, because the refusal journal is written only for the installed claim.
 #[test]
 fn delivery_settlement_regression_late_not_sent_preserves_newer_turn() {
     let (_directory, store) = fixture(SessionState::Working);
@@ -102,12 +125,200 @@ fn delivery_settlement_regression_not_sent_keeps_failure_reason() {
             turn::Delivery::NotSent(delivery_error)
         });
     };
+    let token = claim.token().to_owned();
     drop(claim);
     let status = store.status().unwrap();
     assert_eq!(status.state, SessionState::Ready);
     assert_eq!(status.error.as_deref(), Some("delivery refused"));
     assert!(current_claim_token(&store).unwrap().is_none());
-    assert!(store.events().unwrap().is_empty());
+    // Changed deliberately: a refusal now journals a failed event for the receipt, so the
+    // request reads `failed` instead of `unresolved` (reopen gate, PR #260 verifier).
+    assert_eq!(store.events().unwrap().len(), 1);
+    refusal_event(&store, &token, "delivery refused");
+}
+
+#[test]
+fn not_sent_follow_up_settles_as_a_failed_request_in_every_reader() {
+    let (directory, store) = fixture(SessionState::Ready);
+    let id = directory.path().file_name().unwrap().to_str().unwrap();
+    let root = directory.path().parent().unwrap();
+    let (mut claimed, baseline) = claim_ready(&store, id, &[]).unwrap();
+    let token = claimed.token().to_owned();
+    let request = claimed.receipt().request_id.clone();
+    claimed.begin_delivery().unwrap();
+    claimed
+        .settle_delivery(Delivery::NotSent(&anyhow::anyhow!(
+            "transport refused: nothing was sent"
+        )))
+        .unwrap();
+    drop(claimed);
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Ready);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("transport refused: nothing was sent")
+    );
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert!(!store.record(CoreRecord::Completion).path().exists());
+    let event = refusal_event(&store, &token, "transport refused: nothing was sent");
+    // The synchronous follow-up waiter observes the refusal as the turn's failure.
+    let waited = turn::wait(
+        &store,
+        baseline,
+        None,
+        Some(&token),
+        std::time::Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{waited:#}"), "transport refused: nothing was sent");
+    let result = query::request_result(&store, &request).unwrap();
+    assert_eq!(result["request_state"], "failed");
+    assert_eq!(result["error"], "transport refused: nothing was sent");
+    assert_eq!(result["event_id"], event_file_of(&store, &token));
+    assert!(result["provider_session_id"].is_null());
+    let waited = query::wait_one(root, id, &request, Duration::from_secs(5)).unwrap();
+    assert_eq!(waited["request_state"], "failed");
+    assert_eq!(waited["error"], "transport refused: nothing was sent");
+    let inspected = query::inspect_value(&store, id).unwrap();
+    assert_eq!(inspected["requests"][0]["request_id"], request);
+    assert_eq!(inspected["requests"][0]["active"], false);
+    assert!(inspected["requests"][0]["bridge_observed_elapsed_ms"].is_number());
+    assert_eq!(inspected["turn_claimed"], false);
+    assert_eq!(inspected["recorded_events"], 1);
+    assert_eq!(inspected["latest_result"]["request_state"], "failed");
+    assert_eq!(
+        inspected["latest_result"]["error"],
+        "transport refused: nothing was sent"
+    );
+    let timeline = query::timeline_value(&store, id, Some(&request)).unwrap();
+    assert_eq!(timeline["requests"][0]["request_state"], "failed");
+    assert_eq!(timeline["requests"][0]["delivery"], "refused_not_sent");
+    assert_eq!(
+        timeline["requests"][0]["error"],
+        "transport refused: nothing was sent"
+    );
+    let entries = timeline["entries"].as_array().unwrap();
+    let refusal = entries
+        .iter()
+        .filter(|e| {
+            e["record_state"] == "observed" && e["source"].as_str().unwrap().starts_with("events/")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(refusal.len(), 1);
+    assert_eq!(refusal[0]["stage"], "delivery_refusal");
+    assert_eq!(
+        refusal[0]["detail"]["provenance"],
+        DELIVERY_NOT_SENT_PROVENANCE
+    );
+    assert_eq!(
+        event.error.as_deref(),
+        Some("transport refused: nothing was sent")
+    );
+    // A refusal is not searchable output: search skips error events.
+    assert!(event.message.is_empty());
+}
+
+fn event_file_of(store: &Store, claim_token: &str) -> String {
+    requests::for_claim(store, claim_token)
+        .unwrap()
+        .unwrap()
+        .event_file
+}
+
+#[test]
+fn not_sent_before_delivery_began_keeps_todays_session_state_and_records_the_event() {
+    // Preparation, budget and hold failures refuse before `begin_delivery`: the claim is
+    // still `Claimed` (follow-up) or `AwaitingInitialInput` (initial), states a provider
+    // completion report would reject.
+    for initial in [false, true] {
+        let (_directory, store) = fixture(if initial {
+            SessionState::AwaitingInitialInput
+        } else {
+            SessionState::Ready
+        });
+        let mut claimed = if initial {
+            claim(&store, &[]).unwrap()
+        } else {
+            claim_ready(&store, "session-test", &[]).unwrap().0
+        };
+        let token = claimed.token().to_owned();
+        let request = claimed.receipt().request_id.clone();
+        claimed
+            .settle_delivery(Delivery::NotSent(&anyhow::anyhow!(
+                "refused before delivery"
+            )))
+            .unwrap();
+        drop(claimed);
+        let status = store.status().unwrap();
+        assert_eq!(
+            status.state,
+            if initial {
+                SessionState::Failed
+            } else {
+                SessionState::Ready
+            }
+        );
+        assert_eq!(status.error.as_deref(), Some("refused before delivery"));
+        assert!(current_claim_token(&store).unwrap().is_none());
+        assert_eq!(store.events().unwrap().len(), 1);
+        refusal_event(&store, &token, "refused before delivery");
+        let result = query::request_result(&store, &request).unwrap();
+        assert_eq!(result["request_state"], "failed");
+        assert_eq!(result["error"], "refused before delivery");
+        assert_eq!(
+            result["session_state"],
+            if initial { "failed" } else { "ready" }
+        );
+    }
+}
+
+#[test]
+fn an_interrupted_refusal_journal_never_releases_the_claim_and_settles_the_same() {
+    // Every boundary of the refusal journal: a write that stops before the journal exists
+    // leaves the claim installed and nothing recorded; one that stops after it leaves a
+    // journal that recovery publishes to the same failed event.
+    let mut saw_retained_without_journal = false;
+    let mut saw_recoverable_journal = false;
+    for budget in 0..=12 {
+        let (_directory, store) = fixture(SessionState::Ready);
+        let (mut claimed, _) = claim_ready(&store, "session-test", &[]).unwrap();
+        let token = claimed.token().to_owned();
+        claimed.begin_delivery().unwrap();
+        let settled = with_fault_budget(budget, || {
+            claimed.settle_delivery(Delivery::NotSent(&anyhow::anyhow!("refused")))
+        });
+        drop(claimed);
+        if let Err(error) = &settled {
+            assert!(injected_fault(error), "{error:#}");
+            assert_eq!(
+                current_claim_token(&store).unwrap().as_deref(),
+                Some(token.as_str()),
+                "budget {budget}"
+            );
+            if store.record(CoreRecord::Completion).path().exists() {
+                saw_recoverable_journal = true;
+            } else {
+                saw_retained_without_journal = true;
+                assert!(store.events().unwrap().is_empty(), "budget {budget}");
+                assert_eq!(store.status().unwrap().state, SessionState::Working);
+                continue;
+            }
+        }
+        store.converge().unwrap();
+        assert!(
+            current_claim_token(&store).unwrap().is_none(),
+            "budget {budget}"
+        );
+        assert!(!store.record(CoreRecord::Completion).path().exists());
+        assert_eq!(store.events().unwrap().len(), 1, "budget {budget}");
+        refusal_event(&store, &token, "refused");
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Ready);
+        assert_eq!(status.error.as_deref(), Some("refused"));
+    }
+    assert!(saw_retained_without_journal);
+    assert!(saw_recoverable_journal);
 }
 
 #[test]
@@ -198,11 +409,18 @@ fn delivery_outcomes_keep_claims_and_receipts_distinct_from_results() {
                 requests::list(&store).unwrap().receipts[0].request_id,
                 request
             );
-            assert!(store.events().unwrap().is_empty());
+            // Changed deliberately: only a refusal records an event, the receipt's failed
+            // result; Sent and Uncertain still leave the result to the provider.
+            assert_eq!(
+                store.events().unwrap().len(),
+                usize::from(outcome == "not_sent")
+            );
         }
     }
 }
 
+// Unchanged with the refusal event: the completion winner and its successor keep their
+// records, and the late refusal adds no event.
 #[test]
 fn delivery_reports_after_completion_never_resurrect_or_mutate_a_turn() {
     for successor in [false, true] {
@@ -236,6 +454,8 @@ fn delivery_reports_after_completion_never_resurrect_or_mutate_a_turn() {
     }
 }
 
+// Unchanged with the refusal event: a close (committed or interrupted) ends the claim
+// before the refusal is journaled, so no event is recorded after the tombstone.
 #[test]
 fn delivery_settlement_after_close_preserves_the_tombstone() {
     for interrupted in [false, true] {
@@ -299,6 +519,8 @@ fn delivery_settlement_after_close_preserves_the_tombstone() {
     }
 }
 
+// Unchanged with the refusal event: the recovered completion is the receipt's result and
+// the refusal journals nothing after it.
 #[test]
 fn delivery_refusal_recovers_a_completion_before_rolling_back() {
     let (_directory, store) = fixture(SessionState::Working);
@@ -316,6 +538,7 @@ fn delivery_refusal_recovers_a_completion_before_rolling_back() {
         store.event_strict(&pending.event_file).unwrap(),
         event("completed")
     );
+    assert_eq!(store.events().unwrap().len(), 1);
 }
 
 #[test]
@@ -530,17 +753,7 @@ fn retained_claim_stays_exclusive_until_report_completes() {
 }
 
 fn hold_fixture(state: SessionState) -> (tempfile::TempDir, Store) {
-    let (directory, store) = fixture(state);
-    store
-        .record(CoreRecord::Manifest)
-        .write_json(&serde_json::json!({
-            "schema": 1, "id": directory.path().file_name().unwrap().to_str().unwrap(),
-            "provider": "codex", "provider_path": "codex", "provider_version": "0.159.3",
-            "workspace": directory.path(), "title": "hold fixture", "model": null,
-            "effort": null, "yolo": false, "created_unix_ms": 1
-        }))
-        .unwrap();
-    (directory, store)
+    fixture(state)
 }
 
 fn assert_hold_receipt_unresolved(store: &Store) {
@@ -548,6 +761,14 @@ fn assert_hold_receipt_unresolved(store: &Store) {
     assert_eq!(receipts.len(), 1);
     let value = crate::native::query::request_result(store, &receipts[0].request_id).unwrap();
     assert_eq!(value["request_state"], "unresolved");
+}
+
+fn assert_hold_receipt_failed(store: &Store, error: &str) {
+    let receipts = requests::list(store).unwrap().receipts;
+    assert_eq!(receipts.len(), 1);
+    let value = crate::native::query::request_result(store, &receipts[0].request_id).unwrap();
+    assert_eq!(value["request_state"], "failed");
+    assert_eq!(value["error"], error);
 }
 
 // H8: each callback is outside the lifecycle lock, so the production writer can run.
@@ -609,8 +830,10 @@ fn hold_after_claimed_before_delivery_rolls_back_with_reason() {
         Some(error.to_string().as_str())
     );
     assert!(current_claim_token(&store).unwrap().is_none());
-    assert_hold_receipt_unresolved(&store);
-    assert!(store.events().unwrap().is_empty());
+    // Changed deliberately: the hold refusal is a NotSent settlement, now recorded as the
+    // receipt's failed result instead of an unresolved receipt.
+    assert_hold_receipt_failed(&store, &error.to_string());
+    assert_eq!(store.events().unwrap().len(), 1);
 }
 
 #[test]
@@ -668,6 +891,8 @@ fn hold_delivery_refusal_does_not_claim_successful_rollback_on_io_failure() {
         session::with_fault_budget(0, || claimed.settle_delivery(Delivery::NotSent(&error)));
     assert!(failed.is_err());
     drop(claimed);
+    // Unchanged in substance: a refusal journal that fails before it exists releases
+    // nothing and records nothing; the claim stays with its receipt.
     assert_eq!(store.status().unwrap().state, SessionState::Claimed);
     assert_eq!(
         current_claim_token(&store).unwrap().as_deref(),
@@ -675,6 +900,14 @@ fn hold_delivery_refusal_does_not_claim_successful_rollback_on_io_failure() {
     );
     assert_eq!(requests::list(&store).unwrap().receipts.len(), 1);
     assert!(store.events().unwrap().is_empty());
+    assert!(!store.record(CoreRecord::Completion).path().exists());
+    // The receipt is still the installed claim's: the request reads `pending`.
+    let value = query::request_result(
+        &store,
+        &requests::list(&store).unwrap().receipts[0].request_id,
+    )
+    .unwrap();
+    assert_eq!(value["request_state"], "pending");
 }
 
 #[test]

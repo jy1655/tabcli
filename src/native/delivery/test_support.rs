@@ -114,6 +114,8 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_unchecked(dir.path());
         fs::create_dir(store.record(CoreRecord::Events).path()).unwrap();
+        // A refusal event names the session's provider from the manifest.
+        crate::native::session::test_support::write_test_manifest(dir.path(), "codex");
         let calls = Calls::default();
         Self {
             _dir: dir,
