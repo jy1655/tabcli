@@ -117,7 +117,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
                 SessionState::Failed,
                 None,
                 Some(launch::RESIDUAL_SURFACE_MARKER.to_owned()),
-                typed.then_some(launch::ResidualSurface::Unverified),
+                typed.then_some(ResidualSurface::Unverified),
             )
             .unwrap();
             store
@@ -143,14 +143,14 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             assert!(refusal.is_err());
             assert_eq!(
                 store.status().unwrap().residual_surface(),
-                Some(launch::ResidualSurface::Unverified)
+                Some(ResidualSurface::Unverified)
             );
             assert!(store.record(CoreRecord::Terminal).path().exists());
             // A normal status change cannot erase the typed or migrated legacy fact.
             update_status(directory.path(), SessionState::Failed, None, None).unwrap();
             assert_eq!(
                 store.status().unwrap().residual_surface(),
-                Some(launch::ResidualSurface::Unverified)
+                Some(ResidualSurface::Unverified)
             );
             close(
                 &store,
@@ -160,10 +160,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             )
             .unwrap();
             let closed = store.status().unwrap();
-            assert_eq!(
-                closed.residual_surface,
-                Some(launch::ResidualSurface::Cleared)
-            );
+            assert_eq!(closed.residual_surface, Some(ResidualSurface::Cleared));
             assert_eq!(closed.residual_surface(), None);
             store.converge().unwrap();
             close(
