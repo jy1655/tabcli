@@ -128,7 +128,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Claude's cross-session messenger (the follow-up Transport, the Windows initial transport, and
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
-  adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
+  messenger keeps its per-request protocol, executed-input proof and retry evidence. Claude's
+  Turn identity and Stop correlation live in `claude/turn.rs`, and trust reads with the injected
+  Git scope check live in `claude/trust.rs`; the adapter keeps launch, resume, the hook router,
+  Reopen and doctor.
   Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
   settlement remains in `codex/transcript.rs`.
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
