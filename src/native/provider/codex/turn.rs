@@ -34,6 +34,7 @@ fn record_name(prefix: &str, token: &str) -> Result<String> {
     Ok(format!("{prefix}{token}.json"))
 }
 
+#[cfg(any(windows, test))]
 pub(super) fn read_binding(directory: &Path, token: &str) -> Result<Option<Binding>> {
     binding(&Reader::open_unchecked(directory), token)
 }
