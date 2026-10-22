@@ -129,6 +129,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
+  Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
+  settlement remains in `codex/transcript.rs`.
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
   Its internal runtime supplies console dispatch, Record observations and the existing Clock;
   tests substitute that runtime while retaining the real Record readers and delivery settlement.
@@ -137,7 +139,13 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   orchestration.
 - `src/native/console_control.rs` owns the Windows helper's argv, payload, reply, and failure
   protocol; its private client owns process invocation, private payload lifetime, and asynchronous
-  window lookup. Command parsing builds an opaque `ConsoleControlRequest`; after session and
+  window lookup. `Client<H: HelperProcess>` owns the dependency for send, text-only send, screen,
+  guarded dialog/submit, and close. Production constructs it with `installed()`; each test gives
+  its client its own helper, with no thread-local selection inside the process adapter.
+  Codex's Windows paste holds one client across its text, screen and submit operations; its
+  portable recognizer/protocol tests still run on every platform. `WindowLookup` retains its
+  separate asynchronous child, polling and Drop cleanup.
+  Command parsing builds an opaque `ConsoleControlRequest`; after session and
   surface verification, provider facts resolve it to an action for the Windows executor. The
   in-process test adapter uses the same decoder, provider resolution, and reply interpretation.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,

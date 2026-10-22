@@ -1,15 +1,15 @@
 //! Append-only Codex rollout observation. Replace with an addressed, terminal first-party
 //! hook when Codex supplies one. Stop candidates never supply completion authority/text.
 use super::correlation::begins_with_bridge_prompt;
-use super::lifecycle::{Binding, read_binding};
 use super::questions::Questions;
-use super::{PendingCodexTurn, correlated_response, read_pending_turn};
+use super::turn::{Binding, ObserverRecord, binding, pending, write_observer};
+use super::{PendingCodexTurn, correlated_response};
 use crate::native::provider::{ActiveWatcher, CompletionWatcher};
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{Reader, Store, turn};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -27,7 +27,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CHUNK_BYTES: usize = 256 * 1024;
 const LINE_BYTES: usize = 8 * 1024 * 1024;
 const ERROR_CHARS: usize = 4096;
-const OBSERVER_PREFIX: &str = "codex-observer-";
 const COMPLETE_SOURCE: &str = "codex_transcript_task_complete";
 const ABORT_SOURCE: &str = "codex_transcript_turn_aborted";
 type Observation<T> = std::result::Result<T, &'static str>;
@@ -123,11 +122,18 @@ impl Cursor {
     fn diagnostic(&self, directory: &Path, state: &str, reason: Option<&str>) {
         // State changes only. A diagnostic write failure grants no reporting authority
         // and does not terminate the session loop or cause a repeated write each poll.
-        let _ = Store::open_unchecked(directory)
-            .private(&format!("{OBSERVER_PREFIX}{}.json", self.claim))
-            .write_json(&json!({"schema":1,"claim_token":self.claim,"state":state,
-                "reason":reason,"transcript_path":self.binding.as_ref().map(|b| &b.transcript_path),
-                "offset":self.offset,"observed_unix_ms":unix_ms()}));
+        let _ = write_observer(
+            &Store::open_unchecked(directory),
+            &ObserverRecord {
+                schema: 1,
+                claim_token: self.claim.clone(),
+                state: state.into(),
+                reason: reason.map(str::to_owned),
+                transcript_path: self.binding.as_ref().map(|b| b.transcript_path.clone()),
+                offset: self.offset,
+                observed_unix_ms: unix_ms(),
+            },
+        );
     }
     fn suspend(&mut self, directory: &Path, reason: &'static str) {
         self.suspended = Some(reason);
@@ -372,7 +378,7 @@ impl Observer {
         if cursor.suspended.is_some() {
             return;
         }
-        let binding = match read_binding(directory, &token) {
+        let binding = match binding(&Reader::open_unchecked(directory), &token) {
             Ok(binding) => binding,
             Err(_) => {
                 cursor.suspend(directory, "binding_conflict");
@@ -385,7 +391,7 @@ impl Observer {
                 return;
             };
             cursor.binding = Some(binding);
-            cursor.pending = match read_pending_turn(directory) {
+            cursor.pending = match pending(&Reader::open_unchecked(directory)) {
                 Ok(Some(pending)) if pending.claim_token == token => Some(pending),
                 _ => {
                     cursor.suspend(directory, "binding_conflict");

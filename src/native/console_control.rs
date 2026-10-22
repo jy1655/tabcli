@@ -15,10 +15,7 @@ use std::{ffi::OsString, path::PathBuf, str::FromStr};
 #[cfg(windows)]
 mod client;
 #[cfg(windows)]
-pub(in crate::native) use client::{
-    WindowLookup, close_session_until, guarded_dialog_input, read_screen, send_file,
-    send_file_text_only,
-};
+pub(in crate::native) use client::{Client, HelperProcess, WindowLookup, installed};
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct ConsoleControlRequest {
