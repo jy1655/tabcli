@@ -57,6 +57,10 @@ class IntegrationsTest(unittest.TestCase):
 
     def test_archives_are_reproducible_and_relocatable(self):
         subject.build(self.root, self.output)
+        # Simulate a Git CRLF checkout even when the local checkout uses LF.
+        for path in (self.root / "integrations/shared").rglob("*"):
+            if path.is_file():
+                path.write_bytes(path.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
         other = Path(self.scratch.name) / "other"
         subject.build(self.root, other)
         for path in self.output.iterdir():
@@ -70,7 +74,7 @@ class IntegrationsTest(unittest.TestCase):
             package = base / "plugin" if host in ("claude", "codex") else base
             self.assertTrue((package / subject.HOSTS[host]).is_file())
             self.assertEqual((package / "skills/agent-bridge/SKILL.md").read_bytes(),
-                             (self.root / "integrations/shared/skills/agent-bridge/SKILL.md").read_bytes())
+                             (self.root / "integrations/shared/skills/agent-bridge/SKILL.md").read_text(encoding="utf-8").encode("utf-8"))
             if host in ("claude", "codex"):
                 name, _ = subject.catalog(host, "./plugin")
                 entry = json.loads((base / name).read_text(encoding="utf-8"))["plugins"][0]
