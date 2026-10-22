@@ -16,10 +16,7 @@ use windows_sys::Win32::{
     },
 };
 
-pub(in crate::native::terminal) fn set_private_permissions(
-    path: &Path,
-    directory: bool,
-) -> Result<()> {
+pub(in crate::native) fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
     let system_directory = system_directory()?;
     let whoami = system_directory.join("whoami.exe");
     let whoami_output = crate::native::process_env::helper_command(&whoami)

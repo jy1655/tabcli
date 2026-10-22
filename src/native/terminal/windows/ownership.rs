@@ -1,5 +1,4 @@
 use crate::native::session::{self, CoreRecord, Reader, launch};
-use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -25,7 +24,7 @@ pub(in crate::native) fn verified_windows_native_owner(
         .windows_process_identity
         .as_ref()
         .context("Windows native-session owner is missing its process identity")?;
-    terminal::verify_windows_process_identity(owner.pid, identity)
+    super::verify_process_identity(owner.pid, identity.creation_time, &identity.executable_path)
         .context("Windows native-session owner identity changed")
 }
 

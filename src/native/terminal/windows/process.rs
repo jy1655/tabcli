@@ -52,9 +52,7 @@ pub(super) fn open_verified_control_process(
     Ok(handle)
 }
 
-pub(in crate::native::terminal) fn query_process_identity(
-    pid: u32,
-) -> Result<WindowsProcessIdentity> {
+pub(in crate::native) fn query_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return Err(std::io::Error::last_os_error())

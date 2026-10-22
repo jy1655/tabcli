@@ -520,7 +520,7 @@ repair settles the records without resending a prompt or guessing ownership of a
   owns a distinct open protocol, as Warp does. Keep screen and presence scripts in the adapter.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal
-  paths in `src/native/terminal/linux/mod.rs`. Then read the process-identity code under the
+  paths in `src/native/terminal/refusing.rs`. Then read the process-identity code under the
   existing platform directories, private-record permissions in
   `src/native/session/primitives.rs`, and trust-store checks in `src/native/consent.rs`. Implement
   those checks along with terminal operations before claiming support. Linux currently refuses
