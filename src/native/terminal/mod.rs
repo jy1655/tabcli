@@ -47,9 +47,14 @@ pub(in crate::native) mod windows;
 
 // Platform-only pure decisions live beside their platform module and compile on every
 // target, so that their tests run on every target; the platform modules remain gated.
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos/dialog.rs"]
+mod macos_dialog;
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 #[path = "macos/selection.rs"]
 mod macos_selection;
+#[cfg(target_os = "macos")]
+pub(in crate::native) use macos_dialog::DialogPrecheckRefusal;
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[path = "windows/budget.rs"]
 pub(in crate::native) mod windows_budget;
@@ -524,8 +529,9 @@ pub(super) fn guarded_dialog_input(
 ) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        let _ = directory;
-        macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
+        macos_dialog::dispatch(directory, input, deadline, || {
+            macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
+        })
     }
     #[cfg(windows)]
     return crate::native::console_control::guarded_dialog_input(

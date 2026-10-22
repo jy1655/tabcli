@@ -237,6 +237,8 @@ impl LaunchDialog<'_> {
                     .map_err(|error| {
                         #[cfg(windows)]
                         let attempted = attempted && !error.is::<terminal::StaleDialogClaim>();
+                        #[cfg(target_os = "macos")]
+                        let attempted = attempted && !error.is::<terminal::DialogPrecheckRefusal>();
                         launch_dialog_error(error, attempted)
                     })?;
                     if !responded {
