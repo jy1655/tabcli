@@ -511,7 +511,9 @@ end sendKey
 -- The flow.
 on guardedAnswer(targetSession, expectedScreen, keyName)
     set screenText to my screenOf(targetSession)
-    if screenText is not expectedScreen then return "changed"
+    considering case
+        if screenText is not expectedScreen then return "changed"
+    end considering
     my sendKey(targetSession, keyName)
     return "sent"
 end guardedAnswer

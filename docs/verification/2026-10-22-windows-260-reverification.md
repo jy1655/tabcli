@@ -51,7 +51,20 @@ claim/close fencing, timeout retention, unrelated outcomes and read-only inspect
 The corrected binary's full-suite and native runtime results follow. Final CI
 checks and their tested merge identity are tracked on PR #283.
 
-## Corrected Windows verification: observed regression passes
+## Integration after the Claude module extraction
+
+While the corrected head's CI ran, #284 merged as main `33b7bd1` and moved Claude's
+pending identity and trust interpretation into `claude/turn.rs` and `claude/trust.rs`.
+The integration keeps that extraction: `ClaudeTurn` owns the unchanged legacy schema
+and native schema 2, native installation/read validation, and request-scoped cleanup.
+Completion uses its interface for pending identity and keeps its immutable binding,
+candidate, continuation and publication policy. The messenger still installs the
+exact guarded payload once before its attempts; it does not restore Stop completion
+on native-mode sessions. Literal pins follow their new owner and existing protocol tests
+exercise the same bytes. The final integration's source identity and rerun results are
+recorded on PR #283; the live evidence below belongs specifically to `49bb9d1`.
+
+## Corrected Windows verification at 49bb9d1: observed regression passes
 
 Source **`49bb9d1`**, `cargo build --release --locked`, reports 0.4.23. Executable
 SHA-256: `5fe8345b2174d550628a6695a8102e6106ba6c7b8d9ee154a84fd0fa65d5fc25`.

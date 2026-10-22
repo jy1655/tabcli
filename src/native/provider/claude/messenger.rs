@@ -17,13 +17,12 @@
 // 4. A messenger never inherits Claude Code session markers; a `claude` that does treats
 //    itself as a nested child and registers no cross-session inbox.
 //
-// The adapter keeps launch, resume, trust, hook completion, Reopen, doctor and the turn
-// identity the messenger installs before a send; what the messenger needs of them it
-// imports by name.
+// Turn identity and Stop correlation live in turn; this module keeps the per-request
+// messenger protocol, executed-input proof, retry evidence and clock injection.
 
 use super::{
-    CLAUDE_CODE_SESSION_MARKERS, PendingCrossSessionTurn, claude_owned_string, claude_string,
-    completion, managed_session_name, new_cross_session_turn_id,
+    CLAUDE_CODE_SESSION_MARKERS, claude_owned_string, claude_string, completion,
+    managed_session_name, turn,
 };
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::{
@@ -114,7 +113,8 @@ struct MessengerFiles {
 
 impl MessengerFiles {
     fn for_request(directory: &Path, request_id: &str) -> Result<Self> {
-        let request_id = PendingCrossSessionTurn::new(request_id)?.request_id;
+        let turn = turn::ClaudeTurn::new(request_id)?;
+        let request_id = turn.id();
         let path = |kind: &str| directory.join(format!("claude-message-{kind}.{request_id}.json"));
         Ok(Self {
             guard: path("guard"),
@@ -208,7 +208,7 @@ impl Transport for ClaudeMessage {
     fn prepare(&self, _: &TurnContext<'_>) -> Result<Prepared> {
         Ok(Prepared {
             prompt: String::new(),
-            correlation_id: Some(new_cross_session_turn_id()?),
+            correlation_id: Some(turn::new_cross_session_turn_id()?),
         })
     }
     fn send(&self, turn: &TurnContext<'_>, prepared: &Prepared, _: Option<&Path>) -> Outcome {
@@ -262,9 +262,9 @@ fn cross_session_message_plan(
     prompt: &str,
 ) -> Result<CrossSessionMessagePlan> {
     let recipient = managed_session_name(directory)?;
-    let pending = PendingCrossSessionTurn::new(request_id)?;
+    let pending = turn::ClaudeTurn::new(request_id)?;
     let files = MessengerFiles::for_request(directory, request_id)?;
-    let reference = cross_session_reference(&pending.request_id);
+    let reference = cross_session_reference(pending.id());
     let envelope = CrossSessionEnvelope {
         recipient: recipient.clone(),
         summary: CROSS_SESSION_SUMMARY.to_owned(),
@@ -275,7 +275,7 @@ fn cross_session_message_plan(
         input: SendMessageInput {
             to: recipient,
             summary: CROSS_SESSION_SUMMARY.to_owned(),
-            message: cross_session_target_message(prompt, &pending),
+            message: pending.target_message(prompt),
         },
     };
     let stdin = serde_json::to_string(&envelope)?;
@@ -307,16 +307,6 @@ fn cross_session_message_plan(
 
 fn cross_session_reference(request_id: &str) -> String {
     format!("{CROSS_SESSION_REFERENCE_PREFIX}{request_id}")
-}
-
-pub(super) fn cross_session_target_message(
-    prompt: &str,
-    pending: &PendingCrossSessionTurn,
-) -> String {
-    format!(
-        "{prompt}\n\n[Agent Bridge Claude turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
-        pending.marker
-    )
 }
 
 pub(super) fn run_message_guard(request: &[String]) -> Result<()> {
@@ -390,11 +380,11 @@ fn read_message_guard(files: &MessengerFiles, request_id: &str) -> Result<Messag
         .context("Claude message guard file is missing")?;
     let guard: MessageGuard =
         serde_json::from_str(&guard_text).context("invalid Claude message guard JSON")?;
-    let pending = PendingCrossSessionTurn::new(request_id)?;
+    let pending = turn::ClaudeTurn::new(request_id)?;
     if guard.input.to != managed_session_name(directory)?
         || guard.input.summary != CROSS_SESSION_SUMMARY
-        || guard.reference != cross_session_reference(&pending.request_id)
-        || !guard.input.message.ends_with(&pending.marker)
+        || guard.reference != cross_session_reference(pending.id())
+        || !guard.input.message.ends_with(pending.marker())
     {
         bail!("Claude message guard identity is invalid");
     }

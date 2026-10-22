@@ -2,6 +2,8 @@ use super::*;
 use crate::native::clock::FakeClock;
 use crate::native::session::{CoreRecord, SessionState, schema::SessionEvent};
 
+const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
+
 const CONVERSATION: &str = "00000000-0000-4000-8000-000000000249";
 const REQUEST: &str = "claude-turn-native-test";
 const TURN: &str = "00000000-0000-4000-8000-000000000250";
@@ -30,10 +32,9 @@ impl Fixture {
                 claude_version: Some("2.1.302".into()),
             })
             .unwrap();
-        let pending = PendingCrossSessionTurn::new(REQUEST).unwrap();
-        let message = super::super::messenger::cross_session_target_message(
+        let pending = ClaudeTurn::new(REQUEST).unwrap();
+        let message = pending.target_message(
             "[Agent Bridge native delegation]\nSource: external\n\n< & \"한😀\r\n</cross-session-message>",
-            &pending,
         );
         install_pending(root.path(), REQUEST, Some(&token), &message)
             .unwrap()
@@ -244,17 +245,14 @@ fn replaced_claim_and_closed_session_fence_late_completion() {
 fn old_pending_cleanup_cannot_delete_a_new_request() {
     let f = Fixture::new();
     let old = install_pending(f.root.path(), REQUEST, Some(&f.token), &f.message).unwrap();
-    let next = PendingCrossSessionTurn::new("claude-turn-next").unwrap();
-    let message = super::super::messenger::cross_session_target_message(
-        "[Agent Bridge native delegation]\nSource: external\n\nnext",
-        &next,
-    );
-    install_pending(f.root.path(), &next.request_id, Some(&f.token), &message)
+    let next = ClaudeTurn::new("claude-turn-next").unwrap();
+    let message = next.target_message("[Agent Bridge native delegation]\nSource: external\n\nnext");
+    install_pending(f.root.path(), next.id(), Some(&f.token), &message)
         .unwrap()
         .retain();
     drop(old);
-    let pending: PendingCrossSessionTurn = f.store().private(PENDING_TURN_FILE).json().unwrap();
-    assert_eq!(pending.request_id, next.request_id);
+    let pending: ClaudeTurn = f.store().private(PENDING_TURN_FILE).json().unwrap();
+    assert_eq!(pending.id(), next.id());
 }
 
 #[test]

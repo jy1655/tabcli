@@ -1,7 +1,12 @@
+use super::turn::ClaudeTurn;
+const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
+use crate::native::session::{Store, turn};
+use std::{path::PathBuf, time::Duration};
+
 #[test]
 fn git_probe_drops_caller_session_environment() {
     crate::native::process_env::tests::assert_helper_environment(
-        &super::git_workspace_command(std::path::Path::new("/workspace")).unwrap(),
+        &super::trust::git_workspace_command(std::path::Path::new("/workspace")).unwrap(),
         &[],
     );
 }
@@ -156,15 +161,12 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
         "Accessing workspace:\n{key}\nQuick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.\nClaude Code'll be able to read, edit, and execute files here.\nSecurity guide\n❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel"
     );
     assert_eq!(
-        claude_trust_prompt_key(&screen, &workspace),
+        trust::dialog_key(&screen, &workspace),
         Some(terminal::DialogKey::DownEnter)
     );
+    assert_eq!(trust::dialog_key(&screen, &workspace.join("child")), None);
     assert_eq!(
-        claude_trust_prompt_key(&screen, &workspace.join("child")),
-        None
-    );
-    assert_eq!(
-        claude_trust_prompt_key(&(screen.clone() + "\nAllow Bash?"), &workspace),
+        trust::dialog_key(&(screen.clone() + "\nAllow Bash?"), &workspace),
         None
     );
     // Claude 2.1.284 shows cwd but persists this dialog's decision at the
@@ -186,7 +188,7 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
         child_key
     };
     let child_screen = screen.replace(&key, &child_key);
-    assert_eq!(claude_trust_prompt_key(&child_screen, &child), None);
+    assert_eq!(trust::dialog_key(&child_screen, &child), None);
     assert!(ADAPTER.workspace_trust(&child, &env, None).is_err());
     assert!(matches!(
         ADAPTER.workspace_trust(&workspace, &env, None).unwrap(),
@@ -202,7 +204,7 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
             .success()
     );
     assert_eq!(
-        claude_trust_prompt_key(&child_screen, &child),
+        trust::dialog_key(&child_screen, &child),
         Some(terminal::DialogKey::DownEnter)
     );
     std::fs::write(&store, b"{\"projects\":[]}").unwrap();
@@ -223,7 +225,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
     };
     // Unset: two different parents.
     assert_eq!(
-        trust_store(&environment(None)).unwrap(),
+        trust::trust_store(&environment(None)).unwrap(),
         home.path().join(".claude.json")
     );
     assert_eq!(
@@ -233,7 +235,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
     // A non-empty override holds both and is kept as spelled, relative or not.
     let custom = home.path().join("custom-claude");
     assert_eq!(
-        trust_store(&environment(custom.to_str())).unwrap(),
+        trust::trust_store(&environment(custom.to_str())).unwrap(),
         custom.join(".claude.json")
     );
     assert_eq!(
@@ -241,7 +243,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
         custom.join("sessions")
     );
     assert_eq!(
-        trust_store(&environment(Some("relative"))).unwrap(),
+        trust::trust_store(&environment(Some("relative"))).unwrap(),
         Path::new("relative").join(".claude.json")
     );
     assert_eq!(
@@ -250,7 +252,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
     );
     // An empty override is unset for both.
     assert_eq!(
-        trust_store(&environment(Some(""))).unwrap(),
+        trust::trust_store(&environment(Some(""))).unwrap(),
         home.path().join(".claude.json")
     );
     assert_eq!(
@@ -268,7 +270,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
         custom.join("sessions")
     );
     assert_eq!(
-        trust_store(&override_only).unwrap_err().to_string(),
+        trust::trust_store(&override_only).unwrap_err().to_string(),
         "no user home for workspace trust lookup"
     );
     assert_eq!(
@@ -284,7 +286,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
         ..Default::default()
     };
     assert_eq!(
-        trust_store(&empty_home).unwrap(),
+        trust::trust_store(&empty_home).unwrap(),
         PathBuf::from("").join(".claude.json")
     );
     assert_eq!(
@@ -296,7 +298,7 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
         ..Default::default()
     };
     assert_eq!(
-        trust_store(&profile_only).unwrap(),
+        trust::trust_store(&profile_only).unwrap(),
         home.path().join(".claude.json")
     );
 }
@@ -341,11 +343,11 @@ fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_jso
         .1
         .strip_suffix("\n</cross-session-message>")
         .unwrap();
-    let pending = PendingCrossSessionTurn::new(MOD_REQUEST).unwrap();
+    let pending = ClaudeTurn::new(MOD_REQUEST).unwrap();
     Store::open_unchecked(directory.path())
         .private(PENDING_TURN_FILE)
         .write_json(&serde_json::json!({
-            "schema": 1, "request_id": pending.request_id, "marker": pending.marker,
+            "schema": 1, "request_id": pending.id(), "marker": pending.marker(),
             "claim_token": token, "expected_message": expected,
         }))
         .unwrap();
@@ -819,7 +821,10 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
 #[test]
 fn legacy_pending_turn_writer_preserves_schema_one_json() {
     let directory = tempfile::tempdir().unwrap();
-    let _pending_file = install_pending_turn(directory.path(), "claude-turn-safe123").unwrap();
+    let _pending_file = ClaudeTurn::new("claude-turn-safe123")
+        .unwrap()
+        .install(&Store::open_unchecked(directory.path()))
+        .unwrap();
     let written: serde_json::Value = Reader::open_unchecked(directory.path())
         .private(PENDING_TURN_FILE)
         .json()
@@ -838,7 +843,7 @@ fn legacy_pending_turn_writer_preserves_schema_one_json() {
 fn pending_turn_ids_require_the_bounded_ascii_claude_prefix() {
     let maximum = format!("claude-turn-{}", "a".repeat(128 - "claude-turn-".len()));
     for valid in ["claude-turn-", "claude-turn-Ab09-1", maximum.as_str()] {
-        assert!(PendingCrossSessionTurn::new(valid).is_ok(), "{valid:?}");
+        assert!(ClaudeTurn::new(valid).is_ok(), "{valid:?}");
     }
     for invalid in [
         "",
@@ -852,28 +857,23 @@ fn pending_turn_ids_require_the_bounded_ascii_claude_prefix() {
         "claude-turn-한글",
         &format!("{maximum}a"),
     ] {
-        assert!(
-            PendingCrossSessionTurn::new(invalid).is_err(),
-            "{invalid:?}"
-        );
+        assert!(ClaudeTurn::new(invalid).is_err(), "{invalid:?}");
     }
 }
 
 #[test]
 fn correlated_response_requires_the_exact_final_turn_marker() {
-    let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
-    let exact = format!("completed response\n\n{}", pending.marker);
+    let pending = super::turn::ClaudeTurn::new("claude-turn-safe123").unwrap();
+    let exact = format!("completed response\n\n{}", pending.marker());
     assert_eq!(
-        correlated_response(&exact, &pending).unwrap(),
+        pending.correlated_response(&exact).unwrap(),
         "completed response"
     );
-    assert!(correlated_response("completed response", &pending).is_err());
+    assert!(pending.correlated_response("completed response").is_err());
     assert!(
-        correlated_response(
-            "completed response\n<!-- agent-bridge-claude-turn:other -->",
-            &pending,
-        )
-        .is_err()
+        pending
+            .correlated_response("completed response\n<!-- agent-bridge-claude-turn:other -->")
+            .is_err()
     );
 }
 
@@ -955,16 +955,16 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
         legacy_json,
     )
     .unwrap();
-    let pending: PendingCrossSessionTurn = Reader::open_unchecked(directory.path())
+    let pending: ClaudeTurn = Reader::open_unchecked(directory.path())
         .private(PENDING_TURN_FILE)
         .json()
         .unwrap();
-    assert!(pending.claim_token.is_none());
-    assert!(pending.expected_message.is_none());
+    assert!(serde_json::to_value(&pending).unwrap()["claim_token"].is_null());
+    assert!(pending.expected_message().is_none());
     let payload = serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": "claude-session-id",
-        "last_assistant_message": format!("correlated result\n\n{}", pending.marker),
+        "last_assistant_message": format!("correlated result\n\n{}", pending.marker()),
     });
 
     handle_hook(directory.path(), &payload).unwrap();
@@ -979,7 +979,7 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
         Some("claude-session-id")
     );
     assert_eq!(event.turn_id.as_deref(), Some("claude-turn-safe123"));
-    assert!(directory.path().join(PENDING_TURN_FILE).is_file());
+    assert!(directory.path().join("claude-pending-turn.json").is_file());
     assert!(
         !directory
             .path()
@@ -1060,9 +1060,9 @@ fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
-    let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
+    let pending = super::turn::ClaudeTurn::new("claude-turn-safe123").unwrap();
     crate::native::session::primitives::write_private(
-        &directory.path().join(PENDING_TURN_FILE),
+        &directory.path().join("claude-pending-turn.json"),
         &serde_json::to_vec_pretty(&pending).unwrap(),
     )
     .unwrap();
@@ -1079,7 +1079,7 @@ fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
             .unwrap()
             .is_empty()
     );
-    assert!(directory.path().join(PENDING_TURN_FILE).is_file());
+    assert!(directory.path().join("claude-pending-turn.json").is_file());
     assert!(
         directory
             .path()
@@ -1096,9 +1096,9 @@ fn stop_failure_does_not_claim_an_uncorrelated_pending_turn() {
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
-    let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
+    let pending = super::turn::ClaudeTurn::new("claude-turn-safe123").unwrap();
     crate::native::session::primitives::write_private(
-        &directory.path().join(PENDING_TURN_FILE),
+        &directory.path().join("claude-pending-turn.json"),
         &serde_json::to_vec_pretty(&pending).unwrap(),
     )
     .unwrap();
@@ -1116,7 +1116,7 @@ fn stop_failure_does_not_claim_an_uncorrelated_pending_turn() {
             .unwrap()
             .is_empty()
     );
-    assert!(directory.path().join(PENDING_TURN_FILE).is_file());
+    assert!(directory.path().join("claude-pending-turn.json").is_file());
     assert!(
         directory
             .path()

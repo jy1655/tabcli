@@ -1,6 +1,5 @@
-use super::{
-    PENDING_TURN_FILE, PendingCrossSessionTurn, PendingTurnFile, valid_claude_conversation_id,
-};
+use super::turn::{self as claude_turn, ClaudeTurn, Installed};
+use super::valid_claude_conversation_id;
 use crate::native::clock::Clock;
 use crate::native::session::{Reader, Store, primitives::unix_ms, turn};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
@@ -175,23 +174,6 @@ pub(super) fn settings(executable: &Path, windows: bool) -> Value {
     }
 }
 
-fn require_current(directory: &Path, token: &str) -> Result<()> {
-    let reader = Reader::open_unchecked(directory);
-    if !turn::valid_turn_claim_token(token)
-        || turn::current_claim_token(&reader)?.as_deref() != Some(token)
-        || reader.closed_if_present()?.is_some()
-        || !matches!(
-            reader.status()?.state,
-            crate::native::session::SessionState::Working
-                | crate::native::session::SessionState::Running
-                | crate::native::session::SessionState::ResumePending
-        )
-    {
-        bail!("Claude completion delivery refused: this claim or session is no longer current");
-    }
-    Ok(())
-}
-
 pub(super) fn admit(
     directory: &Path,
     token: &str,
@@ -208,7 +190,7 @@ pub(super) fn admit(
         return Ok(());
     }
     loop {
-        require_current(directory, token)?;
+        claude_turn::require_current(&Reader::open_unchecked(directory), token)?;
         let remaining = deadline.checked_duration_since(clock.now()).filter(|remaining| !remaining.is_zero())
             .context("Claude completion module readiness was not observed before the delivery deadline; inspect module load, plugin trust and provider policy; no message was sent")?;
         if let Some(ready) = Reader::open_unchecked(directory)
@@ -232,29 +214,19 @@ pub(super) fn install_pending(
     request_id: &str,
     token: Option<&str>,
     expected_message: &str,
-) -> Result<PendingTurnFile> {
+) -> Result<Installed> {
+    let pending = ClaudeTurn::new(request_id)?;
+    let store = Store::open_unchecked(directory);
     if !native_mode(directory)? {
-        return super::install_pending_turn(directory, request_id);
+        return pending.install(&store);
     }
     let token = token.context("Claude native completion requires the delivery claim")?;
-    let mut pending = PendingCrossSessionTurn::new(request_id)?;
     if start_wire_size(expected_message)? > MAX_WIRE_BYTES {
         bail!(
             "Claude request exceeds the 4 MiB native completion wire budget; no message was sent"
         );
     }
-    let store = Store::open_unchecked(directory);
-    let _lock = store.lock()?;
-    require_current(directory, token)?;
-    pending.schema = 2;
-    pending.claim_token = Some(token.into());
-    pending.expected_message = Some(expected_message.into());
-    store.private(PENDING_TURN_FILE).write_json(&pending)?;
-    Ok(PendingTurnFile {
-        path: directory.join(PENDING_TURN_FILE),
-        request_id: request_id.into(),
-        retained: false,
-    })
+    pending.install_native(&store, token, expected_message)
 }
 
 fn start_wire_size(expected: &str) -> Result<usize> {
@@ -410,30 +382,10 @@ fn select_continuation(
     }))
 }
 
-fn read_pending(reader: &Reader, token: &str) -> Result<PendingCrossSessionTurn> {
-    let pending: PendingCrossSessionTurn = reader.private(PENDING_TURN_FILE).json()?;
-    let expected = PendingCrossSessionTurn::new(&pending.request_id)?;
-    if pending.schema != 2
-        || pending.marker != expected.marker
-        || pending.claim_token.as_deref() != Some(token)
-        || !pending.expected_message.as_deref().is_some_and(|text| {
-            text.starts_with("[Agent Bridge native delegation]\nSource: ")
-                && text.ends_with(&pending.marker)
-        })
-    {
-        bail!("Claude native pending record does not identify the current framed request");
-    }
-    Ok(pending)
-}
-
-fn binding_matches_request(
-    binding: &Binding,
-    pending: &PendingCrossSessionTurn,
-    token: &str,
-) -> bool {
+fn binding_matches_request(binding: &Binding, pending: &ClaudeTurn, token: &str) -> bool {
     binding.schema == 1
         && binding.claim == token
-        && binding.correlation_id == pending.request_id
+        && binding.correlation_id == pending.id()
         && valid_claude_conversation_id(&binding.conversation)
         && valid_identity(&binding.turn_id)
 }
@@ -454,7 +406,7 @@ pub(super) fn observe_candidate(reader: &Reader, token: &str) -> Option<Value> {
         else {
             return Ok(None);
         };
-        let pending = read_pending(reader, token)?;
+        let pending = claude_turn::read_native(reader, token)?;
         let binding: Binding = reader
             .private(&format!("claude-mod-bound-{token}.json"))
             .json()?;
@@ -538,10 +490,10 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
     let Some(token) = turn::current_claim_token(&store)? else {
         return Ok(());
     };
-    if let Err(error) = require_current(directory, &token) {
+    if let Err(error) = claude_turn::require_current(&store, &token) {
         return diagnostic(directory, event, &format!("{error:#}"));
     }
-    let pending = match read_pending(&store, &token) {
+    let pending = match claude_turn::read_native(&store, &token) {
         Ok(pending) => pending,
         Err(error) => return diagnostic(directory, event, &format!("{error:#}")),
     };
@@ -553,7 +505,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
     let proposed = Binding {
         schema: 1,
         claim: token.clone(),
-        correlation_id: pending.request_id.clone(),
+        correlation_id: pending.id().to_owned(),
         conversation: conversation.into(),
         turn_id: turn_id.into(),
     };
@@ -572,13 +524,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             .get("text")
             .and_then(Value::as_str)
             .is_some_and(|text| {
-                exact_frame(
-                    text,
-                    pending
-                        .expected_message
-                        .as_deref()
-                        .expect("validated pending"),
-                )
+                exact_frame(text, pending.expected_message().expect("validated pending"))
             })
         {
             return diagnostic(
@@ -628,7 +574,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             )),
         }
     } else if event == "turn.complete" {
-        outcome(data, &pending.marker)
+        outcome(data, pending.marker())
     } else {
         Err(anyhow::anyhow!("unsupported Claude module event"))
     };
@@ -673,12 +619,16 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
     let report = turn::Report::for_claim(&store, FirstPartyCli::Claude, Some(&token))
         .with_provenance(Some(provenance));
     match outcome {
-        Outcome::Answer { text, .. } => {
-            report.complete(&text, Some(conversation.into()), Some(pending.request_id))
-        }
-        Outcome::Failed(error) => {
-            report.fail(&error, Some(conversation.into()), Some(pending.request_id))
-        }
+        Outcome::Answer { text, .. } => report.complete(
+            &text,
+            Some(conversation.into()),
+            Some(pending.id().to_owned()),
+        ),
+        Outcome::Failed(error) => report.fail(
+            &error,
+            Some(conversation.into()),
+            Some(pending.id().to_owned()),
+        ),
     }
 }
 

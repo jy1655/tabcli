@@ -1,7 +1,7 @@
 use super::*;
-use crate::native::provider::claude::PENDING_TURN_FILE;
+const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 #[cfg(unix)]
-use crate::native::provider::claude::PendingCrossSessionTurn;
+use crate::native::provider::claude::turn::ClaudeTurn;
 #[cfg(windows)]
 use std::process::Command;
 use std::time::Instant;
@@ -672,7 +672,7 @@ const timer = setInterval(() => {
         };
         let executed = send_message_hook_payload("PostToolUse", &input.message);
         record_message_receipt(&files, TEST_REQUEST, &executed).unwrap();
-        let pending: PendingCrossSessionTurn = Reader::open_unchecked(&observed_directory)
+        let pending: serde_json::Value = Reader::open_unchecked(&observed_directory)
             .private(PENDING_TURN_FILE)
             .json()
             .unwrap();
@@ -702,16 +702,15 @@ const timer = setInterval(() => {
     );
     let (pending, executed) = observer.join().unwrap();
     sent.unwrap();
-    assert_eq!(pending.schema, 2);
-    assert_eq!(pending.claim_token.as_deref(), Some(token.as_str()));
+    assert_eq!(pending["schema"], 2);
+    assert_eq!(pending["claim_token"].as_str(), Some(token.as_str()));
     assert_eq!(
-        pending.expected_message.as_deref(),
+        pending["expected_message"].as_str(),
         executed["tool_input"]["message"].as_str()
     );
     assert!(
-        pending
-            .expected_message
-            .as_ref()
+        pending["expected_message"]
+            .as_str()
             .unwrap()
             .starts_with(prompt)
     );
@@ -730,8 +729,8 @@ fn cross_session_process_never_receives_the_payload() {
     let root = tempfile::tempdir().unwrap();
     let directory = managed_session_directory(root.path());
     let executable = root.path().join("fake-claude");
-    let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
-    let expected_message = cross_session_target_message("follow-up secret", &pending);
+    let pending = ClaudeTurn::new("claude-turn-safe123").unwrap();
+    let expected_message = pending.target_message("follow-up secret");
     std::fs::write(
         &executable,
         format!(
