@@ -7,6 +7,7 @@ use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
 use crate::native::session::{
     self, CoreRecord, Reader, RecordReader, RecordStore, SessionState, Store, record,
 };
+#[cfg(any(windows, test))]
 use crate::native::terminal;
 use agent_bridge::process_is_alive;
 use anyhow::{Context, Result, bail};
