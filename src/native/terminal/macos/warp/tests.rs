@@ -761,7 +761,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
     // Doctor must observe this Reader's directory, not the process-global root.
     // Keep a valid, present handle and binding at the global root in every case.
     use crate::native::query::observation::judgment::SurfacePresence;
-    use crate::native::{doctor, query::observation::SessionEvidence, session::Store};
+    use crate::native::{diagnostics, doctor, query::observation::SessionEvidence, session::Store};
     Store::open_unchecked(&global)
         .write_terminal(&session())
         .unwrap();
@@ -793,19 +793,19 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
         match state {
             "present" => {
                 assert_eq!(*presence, SurfacePresence::Present);
-                assert_eq!(check.availability, doctor::Availability::Available);
+                assert_eq!(check.availability, diagnostics::Availability::Available);
                 assert_eq!(check.reason_code, "terminal_surface_present");
             }
             "absent" => {
                 assert_eq!(*presence, SurfacePresence::Missing);
-                assert_eq!(check.availability, doctor::Availability::Unavailable);
+                assert_eq!(check.availability, diagnostics::Availability::Unavailable);
                 assert_eq!(check.reason_code, "terminal_surface_missing");
             }
             _ => {
                 let SurfacePresence::Unverified(reason) = presence else {
                     panic!("{state}: {presence:?}")
                 };
-                assert_eq!(check.availability, doctor::Availability::Unknown);
+                assert_eq!(check.availability, diagnostics::Availability::Unknown);
                 assert_eq!(check.reason_code, "terminal_surface_unverified");
                 if state == "mismatched" {
                     assert!(

@@ -190,7 +190,9 @@ impl Transport for CodexQueue {
 const APPLIED_MARKER: &str = "codex-config-override";
 
 impl NativeProviderAdapter for CodexAdapter {
-    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
+    fn result_timeout_diagnostic(
+        &self,
+    ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {
         None
     }
 
@@ -279,8 +281,8 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn diagnose(
         &self,
-        context: super::super::doctor::Context<'_>,
-    ) -> Vec<super::super::doctor::Check> {
+        context: super::super::diagnostics::Context<'_>,
+    ) -> Vec<super::super::diagnostics::Check> {
         diagnose_codex(context)
     }
 

@@ -16,6 +16,7 @@ mod consent;
 mod console_control;
 mod context;
 mod delivery;
+mod diagnostics;
 mod doctor;
 mod envelope;
 mod hold;

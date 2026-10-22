@@ -232,7 +232,7 @@ use std::time::Instant;
 
 #[test]
 fn diagnostics_keep_launch_version_and_unprobed_daemon_observations_explicit() {
-    use crate::native::doctor::{Availability, Context};
+    use crate::native::diagnostics::{Availability, Context};
     for (version, expected) in [
         (Some("0.148.0"), Availability::Unavailable),
         (Some("0.153.2"), Availability::Available),
@@ -291,7 +291,7 @@ fn diagnostics_keep_launch_version_and_unprobed_daemon_observations_explicit() {
 #[cfg(any(unix, windows))]
 #[test]
 fn diagnostic_daemon_availability_describes_the_optional_shared_server() {
-    use crate::native::doctor::Availability::*;
+    use crate::native::diagnostics::Availability::{Available, Unavailable, Unknown};
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
@@ -343,7 +343,7 @@ fn diagnostic_daemon_availability_describes_the_optional_shared_server() {
 #[cfg(unix)]
 #[test]
 fn successful_model_result_does_not_mark_mcp_connected() {
-    use crate::native::doctor::{Availability, Context};
+    use crate::native::diagnostics::{Availability, Context};
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-codexqueue");
     std::fs::create_dir(&directory).unwrap();
@@ -455,7 +455,7 @@ fn notify_payload_budget_classifies_by_host_and_remaining_budget() {
         NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS, NOTIFY_COMMAND_LINE_LIMIT_UNITS,
         classify_notify_payload_budget, notify_payload_budget,
     };
-    use crate::native::doctor::Availability::*;
+    use crate::native::diagnostics::Availability::{Available, Unavailable};
     assert_eq!(NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS, 4_096);
     let short = notify_payload_budget("short", 100);
     let near = notify_payload_budget(
@@ -499,7 +499,7 @@ fn notify_payload_budget_classifies_by_host_and_remaining_budget() {
 
 #[test]
 fn notify_payload_check_reads_the_pending_initial_prompt_and_reports_unknown_otherwise() {
-    use crate::native::doctor::{Availability, Context};
+    use crate::native::diagnostics::{Availability, Context};
     use crate::native::session::{CoreRecord, Store};
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-codexbudget");
