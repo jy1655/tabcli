@@ -1,4 +1,21 @@
-use super::*;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+#[cfg(any(test, windows))]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::{thread, time::Duration};
+
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{Context, Result};
+use serde::Serialize;
+
+#[cfg(all(test, windows))]
+use super::close_io_test;
+use crate::native::session::close;
+#[cfg(windows)]
+use crate::native::terminal;
 
 pub(in crate::native) fn remove_file_if_present(path: &Path) -> Result<()> {
     close::budget::check()?;

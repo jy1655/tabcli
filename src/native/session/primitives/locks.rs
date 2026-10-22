@@ -1,4 +1,15 @@
-use super::*;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+
+#[cfg(test)]
+use super::close_io_test;
+use super::durable::set_private_file_permissions;
+use crate::native::session::close;
+use crate::native::session::names::{STATUS_LOCK_FILE, TURN_CLAIM_LOCK_FILE};
 
 fn lock_for_close_or_block(file: &File, name: &'static str) -> Result<()> {
     #[cfg(test)]
