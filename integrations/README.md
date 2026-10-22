@@ -27,6 +27,8 @@ regular files under one versioned root, including the license and skill referenc
 verifier compares the complete member list, sizes, file types, bytes, and checksum sidecars
 against the shared source; it never extracts unverified archives. Text is normalized to LF
 so a Windows checkout produces the same artifacts as a Unix checkout.
+The generator refuses non-portable resource/archive names and linked source paths, including
+symlink or junction ancestors inside the source root.
 
 `integration.json` records the host, release version, supported platforms, and minimum CLI
 version. Agy's documented strict manifest schema has no version property, so its version

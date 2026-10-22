@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import sys
 import tomllib
+import unicodedata
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +25,36 @@ def json_bytes(value):
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+def portable_path(name, prefix=None):
+    """Validate raw POSIX components before any path normalization."""
+    parts = name.split("/")
+    if (any(part in ("", ".", "..") for part in parts)
+            or "\\" in name or ":" in name
+            or any(unicodedata.category(char) == "Cc" for char in name)
+            or PurePosixPath(name).is_absolute()
+            or (prefix is not None and (len(parts) < 2 or parts[0] != prefix))):
+        raise ValueError(f"non-portable package path: {name!r}")
+
+
+def source_path(root, path):
+    """Reject links in the source tree, but not ancestors of the canonical root."""
+    relative = path.relative_to(root)
+    root = root.resolve()
+    path = root / relative
+    if not path.is_relative_to(root):
+        raise ValueError(f"path escapes source root: {path}")
+    current = root
+    for part in path.relative_to(root).parts:
+        current = current / part
+        if current.is_symlink() or getattr(current, "is_junction", lambda: False)():
+            raise ValueError(f"linked source path: {current}")
+    if not path.resolve().is_relative_to(root):
+        raise ValueError(f"path escapes source root: {path}")
+    return path
+
+
 def version(root):
-    with (root / "Cargo.toml").open("rb") as source:
+    with source_path(root, root / "Cargo.toml").open("rb") as source:
         value = tomllib.load(source)["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
         raise ValueError(f"unsupported release version: {value!r}")
@@ -40,6 +69,7 @@ def regular_files(directory):
         raise ValueError(f"missing directory: {directory}")
     files = {}
     for path in sorted(directory.iterdir()):
+        portable_path(path.name)
         if (path.is_symlink() or getattr(path, "is_junction", lambda: False)()
                 or not path.resolve().is_relative_to(directory.resolve())):
             raise ValueError(f"linked resource is not allowed: {path}")
@@ -108,9 +138,8 @@ def validate_manifest(host, manifest, release):
 
 def packages(root):
     release = version(root)
-    if (root / "LICENSE").is_symlink():
-        raise ValueError("license must be a regular file inside the source root")
-    source = root / "integrations/shared/skills"
+    license_path = source_path(root, root / "LICENSE")
+    source = source_path(root, root / "integrations/shared/skills")
     shared = {f"skills/{name}": path.read_text(encoding="utf-8").encode("utf-8")
               for name, path in regular_files(source).items()}
     skill = shared["skills/agent-bridge/SKILL.md"].decode("utf-8")
@@ -134,14 +163,13 @@ def packages(root):
     result = {}
     for host, manifest_path in HOSTS.items():
         template = root / f"integrations/manifests/{host}.json"
-        if template.is_symlink():
-            raise ValueError(f"linked manifest: {template}")
+        source_path(root, template)
         manifest = json.loads(template.read_text(encoding="utf-8").replace("@VERSION@", release))
         validate_manifest(host, manifest, release)
         result[host] = {
             **shared,
             manifest_path: json_bytes(manifest),
-            "LICENSE": (root / "LICENSE").read_text(encoding="utf-8").encode("utf-8"),
+            "LICENSE": license_path.read_text(encoding="utf-8").encode("utf-8"),
             "integration.json": json_bytes({
                 "schema": 1, "host": host, "version": release,
                 "tabcli_min_version": MIN_TABCLI,
@@ -179,14 +207,14 @@ def check(root):
     actual_names = set()
     for host in HOSTS:
         actual_names.update(f"integrations/{host}/{name}"
-                            for name in regular_files(root / f"integrations/{host}"))
+                            for name in regular_files(source_path(root, root / f"integrations/{host}")))
     for host in ("claude", "codex"):
         name, _ = catalog(host, f"./integrations/{host}")
         actual_names.add(name)
     if actual_names != set(expected):
         raise ValueError(f"unexpected/missing generated files: {sorted(actual_names ^ set(expected))}")
     for name, content in expected.items():
-        path = root / name
+        path = source_path(root, root / name)
         if path.is_symlink() or not path.is_file() or path.read_text(encoding="utf-8").encode("utf-8") != content:
             raise ValueError(f"generated content differs: {name}; run python scripts/integrations.py generate")
 
@@ -210,8 +238,11 @@ def build(root, output):
     output.mkdir(parents=True, exist_ok=False)
     for host, contents in packages(root).items():
         archive = output / archive_name(root, host)
+        members = archive_contents(root, host, contents)
+        for name in members:
+            portable_path(name, archive.stem)
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-            for name, content in sorted(archive_contents(root, host, contents).items()):
+            for name, content in sorted(members.items()):
                 info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
                 info.create_system = 3
                 info.external_attr = 0o100644 << 16
@@ -241,6 +272,9 @@ def verify(root, output, allow_cli_assets=False):
         expected = archive_contents(root, host, contents)
         with zipfile.ZipFile(archive) as bundle:
             names = bundle.namelist()
+            # ZipInfo.filename truncates at NUL; validate the original header name.
+            for name in [*(info.orig_filename for info in bundle.infolist()), *expected]:
+                portable_path(name, archive.stem)
             if len(names) != len(set(names)) or set(names) != set(expected):
                 raise ValueError(f"archive members differ: {archive.name}")
             for info in bundle.infolist():

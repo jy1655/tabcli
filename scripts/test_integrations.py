@@ -28,6 +28,96 @@ class IntegrationsTest(unittest.TestCase):
         subject.generate(self.root)
         self.output = Path(self.scratch.name) / "dist"
 
+    def assert_source_refused(self, offending):
+        for action in ("generate", "check", "build", "verify"):
+            with self.subTest(action=action):
+                args = (self.root, self.output) if action in ("build", "verify") else (self.root,)
+                with self.assertRaises(ValueError) as caught:
+                    getattr(subject, action)(*args)
+                self.assertIn(offending, str(caught.exception).replace("\\\\", "\\"))
+
+    def assert_name_refused(self, name):
+        subject.build(self.root, self.output)
+        directory = self.root / "integrations/shared/skills/agent-bridge"
+        seed = directory / "name-fixture.tmp"
+        seed.write_text("unsafe resource", encoding="utf-8")
+        # Rename a file, not an NTFS stream; the extended Windows path also prevents
+        # normalization of traversal components or a rooted name before the OS sees it.
+        destination = str(directory.resolve()) + os.sep + name
+        if sys.platform == "win32":
+            destination = "\\\\?\\" + destination
+        try:
+            os.rename(seed, destination)
+        except OSError as error:
+            self.skipTest(f"filesystem refuses {name!r}: {error}")
+        self.assert_source_refused(name)
+
+    def test_backslash_traversal_source_name_is_rejected(self):
+        self.assert_name_refused(r"..\..\..\..\outside.txt")
+
+    def test_drive_source_name_is_rejected(self):
+        self.assert_name_refused("C:evil.txt")
+
+    def test_rooted_backslash_source_name_is_rejected(self):
+        self.assert_name_refused(r"\evil.txt")
+
+    def test_portable_path_rejects_raw_unsafe_components(self):
+        for name in ("", "/absolute", "a//b", "a/./b", "a/../b", "a/", "a\x00b",
+                     "a\x1fb", "a\x7fb", "a\x85b", r"a\b", "a:b"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                subject.portable_path(name)
+        with self.assertRaises(ValueError):
+            subject.portable_path("other/file", "package")
+        subject.portable_path("package/skills/file.md", "package")
+
+    def assert_linked_source_refused(self, name, junction=False):
+        subject.build(self.root, self.output)
+        source = self.root / name
+        external = Path(self.scratch.name) / "external"
+        shutil.move(source, external)
+        if junction:
+            import _winapi
+            _winapi.CreateJunction(str(external), str(source))
+        else:
+            try:
+                os.symlink(external, source, target_is_directory=external.is_dir())
+            except OSError as error:
+                self.skipTest(f"symlink creation unavailable: {error}")
+        self.assert_source_refused(str(Path(name)))
+
+    def test_shared_ancestor_symlink_is_rejected(self):
+        self.assert_linked_source_refused("integrations/shared")
+
+    def test_manifests_ancestor_symlink_is_rejected(self):
+        self.assert_linked_source_refused("integrations/manifests")
+
+    def test_integrations_ancestor_symlink_is_rejected(self):
+        self.assert_linked_source_refused("integrations")
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows junction API")
+    def test_shared_ancestor_junction_is_rejected(self):
+        self.assert_linked_source_refused("integrations/shared", junction=True)
+
+    def test_other_source_reads_reject_links(self):
+        # Isolated fixtures keep each link independent of earlier refusals.
+        for name in ("Cargo.toml", "LICENSE", "integrations/claude",
+                     "integrations/claude/integration.json", ".agents", ".claude-plugin/marketplace.json"):
+            with self.subTest(name=name):
+                source = self.root / name
+                external = Path(self.scratch.name) / "external-read"
+                shutil.move(source, external)
+                try:
+                    try:
+                        os.symlink(external, source, target_is_directory=external.is_dir())
+                    except OSError as error:
+                        self.skipTest(f"symlink creation unavailable: {error}")
+                    with self.assertRaisesRegex(ValueError, "linked"):
+                        subject.check(self.root)
+                finally:
+                    if source.is_symlink():
+                        source.unlink()
+                    shutil.move(external, source)
+
     def test_checked_in_packages_are_current(self):
         subject.check(subject.ROOT)
 

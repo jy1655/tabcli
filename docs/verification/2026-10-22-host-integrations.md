@@ -116,3 +116,39 @@ failure cases remain distinct from the packaging tests; no synthetic test is cal
 
 Task-local raw command/model logs are outside the checkout under
 `D:/Dev/agent-bridge-worktrees/issue-285-evidence/`; they are not packaged or published.
+
+
+## Mac-side review fixes (2026-10-23)
+
+- Resource names could carry Windows traversal or drive syntax into every expected ZIP.
+  The common portable-path check now rejects unsafe raw components during collection and
+  validates every final ZIP member under its package prefix before writing or comparison.
+  `test_backslash_traversal_source_name_is_rejected`, `test_drive_source_name_is_rejected`,
+  `test_rooted_backslash_source_name_is_rejected` exercise all four commands;
+  `test_portable_path_rejects_raw_unsafe_components` covers empty/dot/control components.
+- Linked ancestors of shared resources and manifests could escape the checkout. Source reads
+  now check every component below the canonical root for symlinks/junctions and resolved
+  containment. The shared/manifests/integrations ancestor symlink tests exercise all four
+  commands, `test_other_source_reads_reject_links` covers the other inputs and catalogs,
+  and `test_shared_ancestor_junction_is_rejected` is Windows-only.
+- The old build-to-publish policy slice included two intervening jobs. Job slices now end at
+  the next job key; `release_jobs_build_and_publish_the_validated_commit` and
+  `release_dependencies_and_integration_rehearsal_reject_job_local_mutations` reject isolated
+  checkout/dependency changes and rehearsal condition/upload changes in the real workflow.
+  Existing tag-object, immutable-release and nonpublication assertions remain in place.
+
+These are local input/policy regressions, not authenticated host or publication evidence.
+The Windows junction test and Ubuntu exact Bash verifier require their respective runners;
+cross-target Clippy does not execute them.
+
+Mac verification: Python 3.12 discovery ran 21 tests (19 passed; the Ubuntu Bash verifier
+and Windows junction case skipped). `check`, `build`, and final `verify` passed. Serial
+`cargo test --all-targets --all-features -- --test-threads=1` passed with 1,414 passed,
+0 failed and 6 ignored; all-feature Clippy passed for both the host and
+`x86_64-pc-windows-msvc`, as did formatting and diff whitespace checks. In the actual
+checkout, the exact backslash-traversal filename and an external `integrations/shared`
+symlink each made `generate`, `check`, `build`, and `verify` exit 1. Both fixtures were
+removed/restored; all 24 checked-in host package files remained byte-identical.
+A read-only Codex re-review of the fix commit found no remaining defect and reproduced
+both original cases as refused; CI and the non-publishing Release rehearsal for the pushed
+head are linked from the pull request.
