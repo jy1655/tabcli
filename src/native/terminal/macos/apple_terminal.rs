@@ -852,7 +852,8 @@ where
     }
 }
 // Stable creation-time handle only. A compare-and-send is one automation call;
-// an intervening repaint or changed selection sends no keys. Never targets front tab.
+// a changed captured screen sends no keys. This is not atomic with repaint or provider
+// consumption after that comparison. Never targets front tab.
 pub(in crate::native) const SCREEN_SCRIPT: &str = r#"
 on run argv
     set wantedTty to item 1 of argv
@@ -897,7 +898,9 @@ end sendKey
 -- The flow.
 on guardedAnswer(w, wantedTty, targetTab, expectedScreen, keyName)
     set screenText to my screenOf(w, wantedTty)
-    if screenText is not expectedScreen then return "changed"
+    considering case
+        if screenText is not expectedScreen then return "changed"
+    end considering
     my sendKey(targetTab, keyName)
     return "sent"
 end guardedAnswer

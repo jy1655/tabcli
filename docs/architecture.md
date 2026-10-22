@@ -128,7 +128,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Claude's cross-session messenger (the follow-up Transport, the Windows initial transport, and
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
-  adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
+  messenger keeps its per-request protocol, executed-input proof and retry evidence. Claude's
+  Turn identity and Stop correlation live in `claude/turn.rs`, and trust reads with the injected
+  Git scope check live in `claude/trust.rs`; the adapter keeps launch, resume, the hook router,
+  Reopen and doctor.
   Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
   settlement remains in `codex/transcript.rs`.
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
@@ -450,7 +453,15 @@ is not authority over the same apparent identity after a restart.
 The terminal seam passes the session directory to verification, presence, close (including
 owned and dead-owner close). Adapters read their session records
 from that directory. Warp requires the handle's managed session id to match the supplied
-private directory. macOS guarded input uses the surface handle. Windows guarded input
+private directory. macOS guarded input checks the current Claim, ended state and original
+expiry under the lifecycle lock, then releases it before AppleScript. A busy lifecycle or
+unreadable evidence refuses the response before automation. This is a precheck, not an
+atomic check-and-write: retirement or repaint can occur before key consumption. iTerm2 and
+Terminal.app compare their captured screen considering case in the same automation call
+that sends the key. Both platforms mark a proven pre-write refusal with the terminal's
+`StaleDialogClaim` error; consent reports no response sent only for that typed evidence.
+An automation error retains possible-response uncertainty and never retries input.
+Windows guarded input
 receives the directory and requires it to match the helper
 child's state-root lookup; the child still resolves the session by id under its own root.
 
