@@ -1,9 +1,10 @@
-use super::delivery::{complete_log_lines, glog_timestamp, read_log_bytes};
+use super::delivery::read_log_bytes;
+use super::log::{complete_log_lines, glog_timestamp};
 use super::{
     ADAPTER, AGY_LOG_FILE, HOOKS_LOADED_SOURCE, STARTUP_POLL_INTERVAL, TRUST_RECOVERY,
     TRUST_STORE_MISSING,
 };
-use crate::native::clock::{Clock, SystemClock};
+use crate::native::clock::Clock;
 use crate::native::consent::{self, TrustReadiness};
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::session::Reader;
@@ -91,10 +92,11 @@ pub(super) fn workspace_trust_missing(
 
 // The gate takes the caller's environment once per delivery; the user home is required
 // after the manifest, as before.
-pub(super) fn wait_for_workspace_trust(
+pub(super) fn wait_for_workspace_trust<C: Clock>(
     directory: &Path,
     deadline: Instant,
     env: &consent::Environment,
+    clock: &mut C,
 ) -> Result<()> {
     let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
     consent::user_home(env)?;
@@ -102,7 +104,7 @@ pub(super) fn wait_for_workspace_trust(
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
-    wait_for_workspace_trust_evidence(directory, deadline, &mut SystemClock, &mut || {
+    wait_for_workspace_trust_evidence(directory, deadline, clock, &mut || {
         workspace_trust_missing(&workspace, env, &log_path)
     })
 }

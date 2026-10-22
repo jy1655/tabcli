@@ -1,4 +1,5 @@
-use super::super::delivery::{glog_timestamp, input_receipt_window_end};
+use super::super::delivery::input_receipt_window_end;
+use super::super::log::glog_timestamp;
 use super::super::readiness::SKILLS_RELOAD_MARKER;
 use super::super::test_support::{
     FakeClock, REAL_MACOS_INITIAL_TURN, REAL_STARTUP_RELOAD_AFTER_STARTUP,

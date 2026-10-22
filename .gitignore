@@ -4,3 +4,4 @@
 
 # 로컬 전용 작업 노트 (TODO.local.md 등)
 *.local.md
+__pycache__/

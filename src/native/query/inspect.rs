@@ -118,7 +118,7 @@ mod tests {
     use crate::native::process_identity::{Attested, Gone, ProcessObservation};
     use crate::native::query::observation::judgment::tests::attestation;
     use crate::native::query::observation::judgment::{self, OwnerJudgment};
-    use crate::native::session::launch::ResidualSurface;
+    use crate::native::session::ResidualSurface;
     use crate::native::session::owner::ControlAttestation::{NotRecorded, Verified};
     use crate::native::session::owner::OwnerAttestation;
     use crate::native::tests::seed_close_fixture;

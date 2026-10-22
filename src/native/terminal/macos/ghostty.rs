@@ -1932,7 +1932,7 @@ mod tests {
             before.error = after.error.clone();
             assert_eq!(
                 after.residual_surface,
-                Some(launch::ResidualSurface::Unverified)
+                Some(crate::native::session::ResidualSurface::Unverified)
             );
             before.residual_surface = after.residual_surface;
             assert_eq!(

@@ -4,7 +4,7 @@ use crate::native::session;
 use crate::native::session::primitives::with_sync_log;
 use crate::native::session::primitives::{EventsDirectory, unix_ms};
 use crate::native::session::state::{
-    SessionState, SessionStatus, update_status, update_status_with_residual,
+    ResidualSurface, SessionState, SessionStatus, update_status, update_status_with_residual,
 };
 
 use super::owner::{OwnerAttestation, attest_owner};
@@ -538,9 +538,7 @@ where
         consume_terminal_handle(store, Some(terminal.kind.as_str()), close_error.as_deref());
     // Only this path has the adapter's positive close/absence result. No-handle
     // close, repair, and replay of a consumed handle cannot clear the observation.
-    let cleared = status
-        .residual_surface()
-        .map(|_| launch::ResidualSurface::Cleared);
+    let cleared = status.residual_surface().map(|_| ResidualSurface::Cleared);
     let close_result =
         mark_session_closed_with_residual_locked(store, &claim_path, close_error, cleared);
     consume_result?;
@@ -754,7 +752,7 @@ fn mark_session_closed_with_residual_locked(
     store: &Store,
     claim_path: &Path,
     error: Option<String>,
-    residual_surface: Option<launch::ResidualSurface>,
+    residual_surface: Option<ResidualSurface>,
 ) -> Result<()> {
     let directory = store.directory();
     // Repair can reach this after consumption but before the closed tombstone.
