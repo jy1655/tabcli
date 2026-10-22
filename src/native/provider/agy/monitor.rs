@@ -1,5 +1,5 @@
-use super::delivery::complete_log_lines;
 use super::diagnostics::{only_user_input_carries, parse_tool_confirmation};
+use super::log::complete_log_lines;
 use super::receipt::{parse_input_receipt, receipt_matches};
 use super::{
     FULL_TRANSCRIPT_FILE, PendingAgyTurn, TRANSCRIPT_FILE, correlated_response, read_pending_turn,
