@@ -129,6 +129,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
+  Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
+  settlement remains in `codex/transcript.rs`.
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
   Its internal runtime supplies console dispatch, Record observations and the existing Clock;
   tests substitute that runtime while retaining the real Record readers and delivery settlement.

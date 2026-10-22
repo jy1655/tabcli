@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::session::turn;
 
 // The session watcher waits without a Claim or binding. Starting and stopping on an
 // absent session directory must leave it absent and publish no observation records.

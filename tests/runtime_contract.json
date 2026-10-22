@@ -151,14 +151,8 @@
   },
   "src/native/provider/codex/mod.rs": {
     "codex_notify": 1,
-    "const PENDING_TURN_FILE: &str = \"codex-pending-turn.json\";": 1,
-    "marker: format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\"),": 1,
-    "agent-bridge-codex-turn": 1,
-    "codex-pending-turn.json": 1,
     "last-assistant-message": 1,
-    "thread-id": 1,
-    "struct PendingCodexTurn {\n    schema: u32,\n    claim_token: String,\n    marker: String,\n    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's\n    // notify payload estimate (#127). The macOS launch argument and the queue message\n    // deliver that text; the Windows console paste can drop a non-BMP character (#147),\n    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14\n    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    framed_prompt_chars: Option<u64>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    framed_prompt_units: Option<u64>,\n}": 1,
-    "impl PendingCodexTurn {\n    fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\"),\n            framed_prompt_chars: None,\n            framed_prompt_units: None,\n        })\n    }\n": 1
+    "thread-id": 1
   },
   "src/native/provider/codex/hooks.rs": {
     "const FILE: &str = \"codex-launch-mode.json\";": 1,
@@ -490,14 +484,7 @@
     "{WARP_HOST_COMMAND} requires an absolute session directory": 1,
     "{WARP_HOST_COMMAND} requires a valid attempt token": 1
   },
-  "src/native/provider/codex/lifecycle.rs": {
-    "const BINDING_PREFIX: &str = \"codex-turn-\";": 1,
-    "const CANDIDATE_PREFIX: &str = \"codex-candidate-\";": 1,
-    "const NOTIFY_PREFIX: &str = \"codex-notify-\";": 1,
-    "const DIAGNOSTIC_PREFIX: &str = \"codex-binding-conflict-\";": 1
-  },
   "src/native/provider/codex/transcript.rs": {
-    "const OBSERVER_PREFIX: &str = \"codex-observer-\";": 1,
     "const COMPLETE_SOURCE: &str = \"codex_transcript_task_complete\";": 1,
     "const ABORT_SOURCE: &str = \"codex_transcript_turn_aborted\";": 1,
     "const LINE_BYTES: usize = 8 * 1024 * 1024;": 1,
@@ -506,14 +493,27 @@
   },
   "src/native/provider/codex/diagnose/lifecycle.rs": {
     "codex_lifecycle": 2,
-    "session_records": 1,
-    "codex-candidate-": 1,
-    "codex-observer-": 2
+    "session_records": 1
   },
   "src/native/provider/codex/diagnose/hook_trust.rs": {
     "hooks/list": 6,
     "codex_hook_trust": 5,
     "normalization drift": 2,
     "const TIMEOUT: Duration = Duration::from_secs(10);": 1
+  },
+  "src/native/provider/codex/turn.rs": {
+    "const PENDING_TURN_FILE: &str = \"codex-pending-turn.json\";": 1,
+    "format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\")": 1,
+    "agent-bridge-codex-turn": 1,
+    "codex-pending-turn.json": 1,
+    "struct PendingCodexTurn {\n    pub(super) schema: u32,\n    pub(super) claim_token: String,\n    pub(super) marker: String,\n    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's\n    // notify payload estimate (#127). The macOS launch argument and the queue message\n    // deliver that text; the Windows console paste can drop a non-BMP character (#147),\n    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14\n    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub(super) framed_prompt_chars: Option<u64>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub(super) framed_prompt_units: Option<u64>,\n}": 1,
+    "impl PendingCodexTurn {\n    pub(super) fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: marker(claim_token),\n            framed_prompt_chars: None,\n            framed_prompt_units: None,\n        })\n    }\n": 1,
+    "const BINDING_PREFIX: &str = \"codex-turn-\";": 1,
+    "const CANDIDATE_PREFIX: &str = \"codex-candidate-\";": 1,
+    "const NOTIFY_PREFIX: &str = \"codex-notify-\";": 1,
+    "const DIAGNOSTIC_PREFIX: &str = \"codex-binding-conflict-\";": 1,
+    "const OBSERVER_PREFIX: &str = \"codex-observer-\";": 1,
+    "codex-candidate-": 1,
+    "codex-observer-": 2
   }
 }
