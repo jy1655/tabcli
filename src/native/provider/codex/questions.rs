@@ -1,71 +1,15 @@
-use super::lifecycle::{Binding, current_claim, read_binding};
+use super::turn::{
+    Binding, QuestionRecordRef as RecordRef, binding as read_binding, current_claim,
+    question_fits as fits, question_name as name, questions as record,
+};
 use crate::native::provider::{
     EmittedQuestion, QuestionEmission, QuestionEmissions, QuestionObservation,
 };
 use crate::native::session::{Reader, RecordStore, Store, requests};
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize, ser::SerializeSeq};
+use anyhow::Result;
+use serde::{Serialize, ser::SerializeSeq};
 use serde_json::Value;
-use std::{io::Write, path::Path};
-
-const QUESTION_RECORD_BYTES: u64 = 64 * 1024;
-
-#[derive(Deserialize, Serialize)]
-struct Record {
-    schema: u32,
-    request_id: String,
-    claim_token: String,
-    items: Vec<QuestionEmission>,
-    incomplete: bool,
-}
-
-#[derive(Serialize)]
-struct RecordRef<'a> {
-    schema: u32,
-    request_id: &'a str,
-    claim_token: &'a str,
-    items: &'a [QuestionEmission],
-    incomplete: bool,
-}
-
-fn name(token: &str) -> String {
-    format!("codex-questions-{token}.json")
-}
-
-fn valid_item(item: &QuestionEmission) -> bool {
-    !item.id.is_empty()
-        && !item.questions.is_empty()
-        && item.questions.iter().all(|q| {
-            !q.title.trim().is_empty()
-                && q.options.as_ref().is_none_or(|options| {
-                    !options.is_empty() && options.iter().all(|s| !s.trim().is_empty())
-                })
-        })
-}
-
-fn record(reader: &Reader, receipt: &requests::Receipt) -> Result<Option<Record>> {
-    let Some(bytes) = reader
-        .private(&name(&receipt.claim_token))
-        .timeline(QUESTION_RECORD_BYTES)?
-    else {
-        return Ok(None);
-    };
-    let record: Record = serde_json::from_slice(&bytes)?;
-    if record.schema != 1
-        || record.request_id != receipt.request_id
-        || record.claim_token != receipt.claim_token
-        || !record.items.iter().all(valid_item)
-        || !fits(&record)
-        || record
-            .items
-            .iter()
-            .enumerate()
-            .any(|(i, item)| record.items[..i].iter().any(|p| p.id == item.id))
-    {
-        bail!("invalid Codex question record");
-    }
-    Ok(Some(record))
-}
+use std::path::Path;
 
 pub(in crate::native::provider) fn read(
     reader: &Reader,
@@ -86,23 +30,6 @@ pub(in crate::native::provider) fn read(
             observation: QuestionObservation::Unreadable,
         }),
     }
-}
-
-struct SizeLimit(u64);
-impl Write for SizeLimit {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_sub(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("question record limit"))?;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-fn fits(value: &impl Serialize) -> bool {
-    serde_json::to_writer_pretty(SizeLimit(QUESTION_RECORD_BYTES), value).is_ok()
 }
 
 #[derive(Serialize)]
@@ -246,8 +173,8 @@ impl Questions {
     fn publish(&mut self, directory: &Path, binding: &Binding) -> Result<()> {
         let store = Store::open_unchecked(directory);
         let _lock = store.lock()?;
-        if !current_claim(directory, &binding.claim_token)?
-            || read_binding(directory, &binding.claim_token)?.as_ref() != Some(binding)
+        if !current_claim(&store, &binding.claim_token)?
+            || read_binding(&store, &binding.claim_token)?.as_ref() != Some(binding)
         {
             self.retired = true;
             return Ok(());

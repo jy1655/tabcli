@@ -41,7 +41,7 @@ fn lifecycle_doctor_records_current_and_last_claim_without_mutation() {
         "/opt/tabcli"
     });
     super::super::hooks::prepare(&dir, exe).unwrap();
-    let binding = super::super::lifecycle::Binding {
+    let binding = super::super::turn::Binding {
         schema: 1,
         claim_token: token.clone(),
         thread_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
