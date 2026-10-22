@@ -252,20 +252,79 @@ fn release_publication_requires_repository_immutable_releases() {
     assert!(!guard_step.contains("GH_TOKEN: ${{ github.token }}"));
 }
 
-fn release_workflow_job<'a>(workflow: &'a str, job: &str, next_job: &str) -> &'a str {
-    let start = workflow
-        .find(&format!("\n  {job}:\n"))
-        .unwrap_or_else(|| panic!("release workflow has no {job} job"));
-    let end = workflow
-        .find(&format!("\n  {next_job}:\n"))
-        .unwrap_or_else(|| panic!("release workflow has no {next_job} job"));
+fn release_workflow_job<'a>(workflow: &'a str, job: &str) -> &'a str {
+    let jobs = workflow.find("\njobs:\n").expect("workflow has no jobs");
+    let start = jobs
+        + workflow[jobs..]
+            .find(&format!("\n  {job}:\n"))
+            .unwrap_or_else(|| panic!("release workflow has no {job} job"))
+        + 1;
+    let mut end = start;
+    for (index, line) in workflow[start..].split_inclusive('\n').enumerate() {
+        let text = line.trim_end_matches('\n');
+        let job_key = text
+            .strip_prefix("  ")
+            .and_then(|key| key.strip_suffix(':'));
+        if index > 0
+            && job_key.is_some_and(|key| {
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            })
+        {
+            break;
+        }
+        end += line.len();
+    }
     &workflow[start..end]
+}
+
+fn release_uses_validated_checkouts(workflow: &str) -> bool {
+    ["test", "build", "integrations", "publish"]
+        .iter()
+        .all(|job| {
+            release_workflow_job(workflow, job)
+                .contains("ref: ${{ needs.validate.outputs.commit }}")
+        })
+}
+
+fn release_builds_wait_for_validation_and_tests(workflow: &str) -> bool {
+    release_workflow_job(workflow, "test").contains("\n    needs: validate\n")
+        && ["build", "integrations"].iter().all(|job| {
+            release_workflow_job(workflow, job).contains("\n    needs: [validate, test]\n")
+        })
+}
+
+fn release_publish_waits_for_all_artifacts(workflow: &str) -> bool {
+    release_workflow_job(workflow, "publish")
+        .contains("\n    needs: [validate, build, integrations]\n")
+}
+
+fn release_integration_rehearsal_is_isolated(workflow: &str) -> bool {
+    let rehearsal = release_workflow_job(workflow, "integration-rehearsal");
+    rehearsal.contains("\n    if: github.event_name == 'workflow_dispatch'\n")
+        && !rehearsal.contains("upload-artifact")
+        && !release_workflow_job(workflow, "publish")
+            .lines()
+            .filter(|line| line.starts_with("    needs:"))
+            .any(|line| line.contains("integration-rehearsal"))
+}
+
+fn mutate_release_job(workflow: &str, job: &str, old: &str, new: &str) -> String {
+    let original = release_workflow_job(workflow, job);
+    assert_eq!(
+        original.matches(old).count(),
+        1,
+        "mutation must change exactly one line in {job}"
+    );
+    workflow.replacen(original, &original.replacen(old, new, 1), 1)
 }
 
 #[test]
 fn release_validation_checks_the_annotated_tag_on_the_remote() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
-    let validate = release_workflow_job(&workflow, "validate", "test");
+    let validate = release_workflow_job(&workflow, "validate");
 
     // actions/checkout rewrites the local tag ref to the commit, so only the remote still
     // holds the tag object, and the check must not depend on a second fetch.
@@ -291,15 +350,17 @@ fn release_jobs_build_and_publish_the_validated_commit() {
             .count(),
         1
     );
-    for (job, next_job) in [("test", "build"), ("build", "publish")] {
-        assert!(
-            release_workflow_job(&workflow, job, next_job)
-                .contains("ref: ${{ needs.validate.outputs.commit }}"),
-            "{job} does not check out the validated commit"
+    assert!(release_uses_validated_checkouts(&workflow));
+    for job in ["test", "build", "integrations", "publish"] {
+        let mutated = mutate_release_job(
+            &workflow,
+            job,
+            "ref: ${{ needs.validate.outputs.commit }}",
+            "ref: ${{ github.sha }}",
         );
+        assert!(!release_uses_validated_checkouts(&mutated), "{job}");
     }
-    let publish = &workflow[workflow.find("\n  publish:\n").unwrap()..];
-    assert!(publish.contains("ref: ${{ needs.validate.outputs.commit }}"));
+    let publish = release_workflow_job(&workflow, "publish");
     assert_eq!(
         publish
             .matches("VALIDATED_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}")
@@ -311,7 +372,7 @@ fn release_jobs_build_and_publish_the_validated_commit() {
 #[test]
 fn release_stops_before_building_when_immutable_releases_cannot_be_confirmed() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
-    let validate = release_workflow_job(&workflow, "validate", "test");
+    let validate = release_workflow_job(&workflow, "validate");
     let gate = validate
         .find("- name: Require immutable releases before building")
         .expect("release validation has no early immutable-release gate");
@@ -322,13 +383,57 @@ fn release_stops_before_building_when_immutable_releases_cannot_be_confirmed() {
     assert!(gate_step.contains("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"));
     assert!(!gate_step.contains("GH_TOKEN: ${{ github.token }}"));
     assert!(
-        release_workflow_job(&workflow, "test", "build").contains("\n    needs: validate\n"),
+        release_workflow_job(&workflow, "test").contains("\n    needs: validate\n"),
         "tests must not spend runners before the gate has passed"
     );
     assert!(
-        release_workflow_job(&workflow, "build", "publish").contains("needs: [validate, test]"),
+        release_workflow_job(&workflow, "build").contains("needs: [validate, test]"),
         "artifacts must not be built before the gate has passed"
     );
+}
+
+#[test]
+fn release_dependencies_and_integration_rehearsal_reject_job_local_mutations() {
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    assert!(release_builds_wait_for_validation_and_tests(&workflow));
+    for (job, needs) in [
+        ("test", "    needs: validate\n"),
+        ("build", "    needs: [validate, test]\n"),
+        ("integrations", "    needs: [validate, test]\n"),
+    ] {
+        let mutated = mutate_release_job(&workflow, job, needs, "");
+        assert!(
+            !release_builds_wait_for_validation_and_tests(&mutated),
+            "{job}"
+        );
+    }
+    assert!(release_publish_waits_for_all_artifacts(&workflow));
+    let mutated = mutate_release_job(
+        &workflow,
+        "publish",
+        "needs: [validate, build, integrations]",
+        "needs: [validate, build]",
+    );
+    assert!(!release_publish_waits_for_all_artifacts(&mutated));
+
+    assert!(release_integration_rehearsal_is_isolated(&workflow));
+    for (old, new) in [
+        ("    if: github.event_name == 'workflow_dispatch'\n", ""),
+        (
+            "    steps:\n",
+            "    steps:\n      - uses: actions/upload-artifact@fixture\n",
+        ),
+    ] {
+        let mutated = mutate_release_job(&workflow, "integration-rehearsal", old, new);
+        assert!(!release_integration_rehearsal_is_isolated(&mutated));
+    }
+    let mutated = mutate_release_job(
+        &workflow,
+        "publish",
+        "needs: [validate, build, integrations]",
+        "needs: [validate, build, integrations, integration-rehearsal]",
+    );
+    assert!(!release_integration_rehearsal_is_isolated(&mutated));
 }
 
 #[test]
@@ -361,13 +466,7 @@ fn release_rehearsal_never_publishes() {
 #[test]
 fn release_artifact_job_is_isolated_from_mutable_terminal_app_installs() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
-    let build = workflow
-        .find("\n  build:\n")
-        .expect("release workflow has no build job");
-    let publish = workflow
-        .find("\n  publish:\n")
-        .expect("release workflow has no publish job");
-    let build_job = &workflow[build..publish];
+    let build_job = release_workflow_job(&workflow, "build");
 
     assert!(
         build_job.contains("needs: [validate, test]"),

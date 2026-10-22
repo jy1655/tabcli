@@ -41,6 +41,7 @@ use reads::*;
 /// these names only through this facade.
 #[cfg(test)]
 pub(in crate::native) mod test_support {
+    pub(in crate::native) mod lifecycle;
     #[cfg(target_os = "macos")]
     pub(in crate::native) use super::names::TERMINAL_CLOSE_INTENT_FILE;
     pub(in crate::native) use super::names::{
@@ -625,7 +626,7 @@ pub(in crate::native) use owner::{OwnerObservation, observe_owner};
 // Terminal ownership callbacks, which exist only where a surface owner is attested.
 #[cfg(any(target_os = "macos", windows))]
 pub(in crate::native) use owner::observe_owner_record;
-pub(in crate::native) use state::{SessionState, SessionStatus, update_status};
+pub(in crate::native) use state::{ResidualSurface, SessionState, SessionStatus, update_status};
 pub(in crate::native) mod launch;
 
 impl Store {
