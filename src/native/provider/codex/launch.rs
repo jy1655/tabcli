@@ -1,3 +1,5 @@
+mod lexical;
+use lexical::{COMPOSER_ROW, contains_hook_review_label};
 mod paste;
 use super::PendingCodexTurn;
 use super::correlation::correlated_prompt;
@@ -73,8 +75,6 @@ pub(super) fn send_initial_prompt(
     Ok(())
 }
 
-// Empty chat composer: prompt glyph plus Codex's placeholder; see docs/verification/2026-10-02-windows.md.
-const COMPOSER_ROW: &str = "› Ask Codex to do anything";
 const COMPOSER_POLL: Duration = Duration::from_secs(1);
 
 // The launch record, never mutable settings or a current probe, selects this gate.
@@ -103,7 +103,7 @@ fn initial_readiness_with(
             );
         }
         if clock.now() >= deadline {
-            let picker = if hook_picker_present(&last_screen) {
+            let picker = if contains_hook_review_label(&last_screen) {
                 " The last screen contained Review hooks or Trust all and continue (hook-review picker); Bridge never answers this picker."
             } else {
                 ""
@@ -133,14 +133,10 @@ fn initial_readiness_with(
     }
 }
 
-fn hook_picker_present(screen: &str) -> bool {
-    screen.contains("Review hooks") || screen.contains("Trust all and continue")
-}
-
 // Require a known empty composer with no dialog; blank/loading screens prove nothing.
 // This is input readiness, not shared consent; see docs/verification/2026-10-02-windows.md.
 fn composer_is_ready(screen: &str) -> bool {
-    if hook_picker_present(screen) {
+    if contains_hook_review_label(screen) {
         return false;
     }
     legacy_composer_is_ready(screen)

@@ -293,6 +293,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 
 ## Session lifecycle
 
+Codex's `launch/lexical.rs` holds its pinned screen labels, numbered-label decoding and
+confirmation-hint lexemes. Initial readiness, legacy submission and addressed draft
+acceptance retain separate predicates. In particular, a hook-review label anywhere vetoes
+injected readiness, while the same unnumbered words inside an addressed draft are content.
+The paste module owns the span, footer, overlay and rendered-cardinality policies.
+
 A launch creates a private session directory, records its manifest and initial request, and binds
 one newly created surface. The wrapper records its owner and provider spawn evidence. Depending
 on the provider, initial delivery is a launch argument or occurs after readiness in the running
