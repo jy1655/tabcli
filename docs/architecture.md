@@ -170,6 +170,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
+  Ghostty's frame host, its replaceable fallback for the missing surface identity, lives in
+  `terminal/macos/ghostty/host.rs`.
   iTerm2 and Terminal.app carry an internal Automation dependency. Osascript owns execution,
   deadlines and delivery-failure classification; scripts, arguments, ordering and close
   authority remain adapter-owned. Tests inject recording or script-executing Automation
