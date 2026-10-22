@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::reopen::*;
 use crate::native::session::close as session_close;
 #[cfg(windows)]
 use crate::native::session::launch;
@@ -40,18 +41,18 @@ mod launch_failure;
 #[cfg(windows)]
 mod launch_recovery;
 
-fn test_launch_refusal(gate: &str) -> RecordedReopenRefusal {
+fn test_launch_refusal(gate: ReopenGate) -> RecordedReopenRefusal {
     RecordedReopenRefusal {
-        schema: if gate == REOPEN_LAUNCH_FAILED_GATE {
+        schema: if gate == ReopenGate::LaunchFailed {
             3
         } else {
             2
         },
         phase: "launch".to_owned(),
-        gate: gate.to_owned(),
+        gate: gate.as_str().to_owned(),
         detail: String::new(),
         created_unix_ms: 1,
-        claim_token: (gate == REOPEN_LAUNCH_FAILED_GATE).then(|| "fixture-launch".to_owned()),
+        claim_token: (gate == ReopenGate::LaunchFailed).then(|| "fixture-launch".to_owned()),
         cleanup: None,
         cleanup_detail: None,
     }
@@ -76,7 +77,7 @@ fn creation_binds_both_sessions_or_releases_the_source_reservation() {
         let mut created_directory = None;
         let result = create_reopened_session(&directory, source_id, &source, || {
             // The source must already exclude another Reopen before creation starts.
-            assert!(claim_reopen_marker(&directory, source_id, REOPEN_TEST_CONVERSATION).is_err());
+            assert!(Reservation::claim(&directory, source_id, REOPEN_TEST_CONVERSATION).is_err());
             if failure == Some("create") {
                 bail!("injected creation failure");
             }
@@ -132,7 +133,7 @@ fn creation_binds_both_sessions_or_releases_the_source_reservation() {
             let mut after = snapshot_directory(&directory);
             after.remove(CoreRecord::ReopenMarker.name());
             assert_eq!(after, before);
-            assert!(claim_reopen_marker(&directory, source_id, REOPEN_TEST_CONVERSATION).is_err());
+            assert!(Reservation::claim(&directory, source_id, REOPEN_TEST_CONVERSATION).is_err());
         }
     }
 }
@@ -354,7 +355,7 @@ fn concurrent_reopen_of_one_closed_session_admits_exactly_one_winner_and_leaves_
     let attempts = (0..8)
         .map(|_| {
             let source = source.clone();
-            thread::spawn(move || claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION))
+            thread::spawn(move || Reservation::claim(&source, id, REOPEN_TEST_CONVERSATION))
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -367,7 +368,7 @@ fn concurrent_reopen_of_one_closed_session_admits_exactly_one_winner_and_leaves_
         let error = loser.as_ref().unwrap_err();
         assert_eq!(
             reopen_refusal_gate(error),
-            Some("already-reopened"),
+            Some(ReopenGate::AlreadyReopened),
             "{error:#}"
         );
     }
@@ -384,14 +385,20 @@ fn concurrent_reopen_of_one_closed_session_admits_exactly_one_winner_and_leaves_
     assert_eq!(marker.reopened_by.as_deref(), Some("session-reopennew1"));
     assert_eq!(marker.provider_session_id, REOPEN_TEST_CONVERSATION);
 
-    let refused = claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap_err();
-    assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+    let refused = Reservation::claim(&source, id, REOPEN_TEST_CONVERSATION).unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&refused),
+        Some(ReopenGate::AlreadyReopened)
+    );
     assert!(
         format!("{refused:#}").contains("already reopened as session-reopennew1"),
         "{refused:#}"
     );
     let refused = inspect_reopen_source(&source, id).unwrap_err();
-    assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+    assert_eq!(
+        reopen_refusal_gate(&refused),
+        Some(ReopenGate::AlreadyReopened)
+    );
 }
 
 #[test]
@@ -406,17 +413,17 @@ fn reopen_marker_is_released_when_the_new_session_is_never_created() {
         true,
     );
     {
-        let _claim = claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap();
+        let _claim = Reservation::claim(&source, id, REOPEN_TEST_CONVERSATION).unwrap();
         assert!(source.join(REOPEN_MARKER_FILE).is_file());
         assert_eq!(
             reopen_refusal_gate(
-                &claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap_err()
+                &Reservation::claim(&source, id, REOPEN_TEST_CONVERSATION).unwrap_err()
             ),
-            Some("already-reopened")
+            Some(ReopenGate::AlreadyReopened)
         );
     }
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
-    let claim = claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize("session-reopennew2").unwrap();
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
 }
@@ -440,7 +447,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
     let error = inspect_reopen_source(&open, "session-reopenopen").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("source-not-closed"),
+        Some(ReopenGate::SourceNotClosed),
         "{error:#}"
     );
     assert!(format!("{error:#}").contains("is ready"));
@@ -456,7 +463,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
     let error = inspect_reopen_source(&lingering, "session-reopenclaim").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("source-not-converged"),
+        Some(ReopenGate::SourceNotConverged),
         "{error:#}"
     );
 
@@ -465,7 +472,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
     let error = inspect_reopen_source(&no_identity, "session-reopennoid").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("source-identity-missing"),
+        Some(ReopenGate::SourceIdentityMissing),
         "{error:#}"
     );
 
@@ -474,7 +481,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
     let error = inspect_reopen_source(&only_failed, "session-reopenfail").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("source-identity-missing"),
+        Some(ReopenGate::SourceIdentityMissing),
         "{error:#}"
     );
 
@@ -492,7 +499,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
     let error = inspect_reopen_source(&unresolved, "session-reopenunres").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("request-unresolved"),
+        Some(ReopenGate::RequestUnresolved),
         "{error:#}"
     );
     assert!(format!("{error:#}").contains(&receipt.request_id));
@@ -722,7 +729,7 @@ fn reopen_refuses_a_source_whose_events_path_is_not_a_directory() {
     let error = inspect_reopen_source(&source, "session-reopenevfile").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("request-unresolved"),
+        Some(ReopenGate::RequestUnresolved),
         "{error:#}"
     );
     let rendered = format!("{error:#}");
@@ -736,7 +743,7 @@ fn reopen_refuses_a_source_whose_events_path_is_not_a_directory() {
     let error = inspect_reopen_source(&source, "session-reopenevfile").unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("request-unresolved"),
+        Some(ReopenGate::RequestUnresolved),
         "{error:#}"
     );
     let rendered = format!("{error:#}");
@@ -756,7 +763,7 @@ fn reopened_session_close_consumes_only_its_own_handle_and_leaves_the_source_tom
         true,
     );
     let new_id = "session-reopennew3";
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     let new = root.path().join(new_id);
     fs::create_dir(&new).unwrap();
@@ -1053,7 +1060,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
         let error = inspect_reopen_source(&source, id).unwrap_err();
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some("request-unresolved"),
+            Some(ReopenGate::RequestUnresolved),
             "{label}: {error:#}"
         );
         assert!(
@@ -1085,7 +1092,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
     let error = inspect_reopen_source(&source, id).unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("request-unresolved"),
+        Some(ReopenGate::RequestUnresolved),
         "{error:#}"
     );
     assert!(format!("{error:#}").contains(&latest_event), "{error:#}");
@@ -1098,7 +1105,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
     let error = inspect_reopen_source(&source, id).unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("request-unresolved"),
+        Some(ReopenGate::RequestUnresolved),
         "{error:#}"
     );
     assert!(format!("{error:#}").contains("event-9-9.json"), "{error:#}");
@@ -1127,7 +1134,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
         let error = inspect_reopen_source(&source, id).unwrap_err();
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some("request-unresolved"),
+            Some(ReopenGate::RequestUnresolved),
             "{label}: {error:#}"
         );
         assert!(
@@ -1137,7 +1144,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
         let error = latest_provider_event_identity(&source, FirstPartyCli::Claude, id).unwrap_err();
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some("request-unresolved"),
+            Some(ReopenGate::RequestUnresolved),
             "{label}: {error:#}"
         );
     }
@@ -1166,17 +1173,20 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
     assert_eq!(read_reopen_refusal_gate(directory.path()), None);
     let error = record_reopen_refusal(
         directory.path(),
-        REOPEN_LAUNCH_GATE,
+        ReopenGate::ProviderUnsupported,
         "a holder registered after the initial scan".to_owned(),
     );
-    assert_eq!(reopen_refusal_gate(&error), Some("provider-unsupported"));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ProviderUnsupported)
+    );
     assert!(
         format!("{error:#}").starts_with("reopen refused (provider-unsupported): a holder"),
         "{error:#}"
     );
     assert_eq!(
-        read_reopen_refusal_gate(directory.path()).as_deref(),
-        Some("provider-unsupported")
+        read_reopen_refusal_gate(directory.path()),
+        Some(ReopenGate::ProviderUnsupported)
     );
     let record: RecordedReopenRefusal =
         read_json(&directory.path().join(REOPEN_REFUSAL_FILE)).unwrap();
@@ -1213,7 +1223,7 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
     fs::remove_file(directory.path().join(REOPEN_REFUSAL_FILE)).unwrap();
     let error = record_reopen_refusal(
         directory.path(),
-        REOPEN_LAUNCH_GATE,
+        ReopenGate::ProviderUnsupported,
         "a holder registered after the initial scan".to_owned(),
     );
 
@@ -1232,7 +1242,10 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
         error,
         crate::native::session::close::budget::close_deadline(),
     );
-    assert_eq!(reopen_refusal_gate(&passed), Some("provider-unsupported"));
+    assert_eq!(
+        reopen_refusal_gate(&passed),
+        Some(ReopenGate::ProviderUnsupported)
+    );
     assert_eq!(snapshot_directory(directory.path()), before);
 
     // A session without a resumed_from has no conversation to check at either boundary.
@@ -1253,7 +1266,10 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
 
     // The close outcome is reported only after it is known; the detected refusal itself
     // never claims a closure.
-    for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
+    for gate in [
+        ReopenGate::ReopenConflict,
+        ReopenGate::ReopenVerificationFailed,
+    ] {
         let detected = reopen_refusal(gate, "detected; no prompt was delivered".to_owned());
         let mut closed_with = None;
         let reported = close_surface_after_reopen_verification_failure_with(
@@ -1332,10 +1348,10 @@ fn reopen_lifecycle_interleavings_each_admit_one_outcome_and_keep_the_source_tom
             let new_id = new_id.clone();
             let root = root.path().to_owned();
             thread::spawn(move || {
-                let mut claim: Option<ReopenMarkerClaim> = None;
+                let mut claim: Option<Reservation> = None;
                 for step in command_receiver {
                     let outcome = match step {
-                        Claim => claim_reopen_marker(&source, &source_id, REOPEN_TEST_CONVERSATION)
+                        Claim => Reservation::claim(&source, &source_id, REOPEN_TEST_CONVERSATION)
                             .map(|held| claim = Some(held)),
                         Create => (|| {
                             let new = root.join(&new_id);
@@ -1400,7 +1416,7 @@ fn reopen_lifecycle_interleavings_each_admit_one_outcome_and_keep_the_source_tom
                     );
                 }
                 RivalClaim => {
-                    match claim_reopen_marker(&source, &source_id, REOPEN_TEST_CONVERSATION) {
+                    match Reservation::claim(&source, &source_id, REOPEN_TEST_CONVERSATION) {
                         Ok(rival) => {
                             // Only a rival that runs before the claim can win; it releases
                             // its hold immediately so the scripted claim still proceeds.
@@ -1410,7 +1426,7 @@ fn reopen_lifecycle_interleavings_each_admit_one_outcome_and_keep_the_source_tom
                         Err(error) => {
                             assert_eq!(
                                 reopen_refusal_gate(&error),
-                                Some("already-reopened"),
+                                Some(ReopenGate::AlreadyReopened),
                                 "order {index}: {error:#}"
                             );
                             rival_refusals += 1;
@@ -1439,8 +1455,11 @@ fn reopen_lifecycle_interleavings_each_admit_one_outcome_and_keep_the_source_tom
             source_id
         );
         let refused =
-            claim_reopen_marker(&source, &source_id, REOPEN_TEST_CONVERSATION).unwrap_err();
-        assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+            Reservation::claim(&source, &source_id, REOPEN_TEST_CONVERSATION).unwrap_err();
+        assert_eq!(
+            reopen_refusal_gate(&refused),
+            Some(ReopenGate::AlreadyReopened)
+        );
         assert!(source.join(CLOSED_STATUS_FILE).is_file(), "order {index}");
         let tombstone: serde_json::Value =
             read_json(&source.join(TERMINAL_TOMBSTONE_FILE)).unwrap();
@@ -1541,7 +1560,10 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
     let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     let error = result.unwrap_err();
-    assert_eq!(reopen_refusal_gate(&error), Some("provider-unsupported"));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ProviderUnsupported)
+    );
     assert!(
         format!("{error:#}").contains(&format!("live Claude Code process {}", std::process::id())),
         "{error:#}"
@@ -1566,8 +1588,8 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
         "{status:?}"
     );
     assert_eq!(
-        read_reopen_refusal_gate(&directory).as_deref(),
-        Some("provider-unsupported")
+        read_reopen_refusal_gate(&directory),
+        Some(ReopenGate::ProviderUnsupported)
     );
     provider::claude::override_session_registry_for_test(None);
 }
@@ -1623,7 +1645,10 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     .unwrap_err();
     let _ = foreign.kill();
     let _ = foreign.wait();
-    assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ReopenConflict)
+    );
     assert!(
         format!("{error:#}").contains(&foreign.id().to_string()),
         "{error:#}"
@@ -1635,8 +1660,8 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     );
     assert!(!format!("{error:#}").contains("closed"), "{error:#}");
     assert_eq!(
-        read_reopen_refusal_gate(&directory).as_deref(),
-        Some("reopen-conflict")
+        read_reopen_refusal_gate(&directory),
+        Some(ReopenGate::ReopenConflict)
     );
     let record: RecordedReopenRefusal = read_json(&directory.join(REOPEN_REFUSAL_FILE)).unwrap();
     assert!(!record.detail.contains("closed"), "{}", record.detail);
@@ -1666,7 +1691,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     let new_id = "session-reopennew13";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
     let resumed_from = read_resumed_from(&new).unwrap().unwrap();
-    let marker = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let marker = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     marker.finalize(new_id).unwrap();
     let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
 
@@ -1723,12 +1748,15 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     {
         let _ = foreign.kill();
         let _ = foreign.wait();
-        assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some(ReopenGate::ReopenConflict)
+        );
     }
     #[cfg(not(windows))]
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("reopen-verification-failed")
+        Some(ReopenGate::ReopenVerificationFailed)
     );
     let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "ready");
@@ -1761,7 +1789,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
         "the reopen marker was released by a follow-up refusal"
     );
     assert!(
-        claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).is_err(),
+        Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).is_err(),
         "a second reopen was admitted"
     );
 
@@ -1770,12 +1798,15 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     // release the marker; the provider process the launch recorded must be verified gone.
     let recorded = record_reopen_refusal(
         &new,
-        REOPEN_CONFLICT_GATE,
+        ReopenGate::ReopenConflict,
         "held by another live process; no prompt was delivered".to_owned(),
     );
-    assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
+    assert_eq!(
+        reopen_refusal_gate(&recorded),
+        Some(ReopenGate::ReopenConflict)
+    );
     let (outcome, gate) = settle_reopen_outcome(&source, &new, Err(uncertain()));
-    assert_eq!(gate.as_deref(), Some("reopen-conflict"));
+    assert_eq!(gate, Some(ReopenGate::ReopenConflict));
     let text = format!("{:#}", outcome.unwrap_err());
     assert!(
         text.starts_with(&format!(
@@ -1786,7 +1817,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
     write_provider_process_record(&new, new_id, 0);
     let (outcome, gate) = settle_reopen_outcome(&source, &new, Err(uncertain()));
-    assert_eq!(gate.as_deref(), Some("reopen-conflict"));
+    assert_eq!(gate, Some(ReopenGate::ReopenConflict));
     assert_eq!(
         format!("{:#}", outcome.unwrap_err()),
         format!("{:#}", uncertain())
@@ -1812,12 +1843,16 @@ fn settlement_rechecks_replaced_session_directories_without_touching_outside_rec
             true,
         );
         let child = write_reopen_launch_session(root.path(), child_id, Path::new("claude"));
-        claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION)
+        Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION)
             .unwrap()
             .finalize(child_id)
             .unwrap();
         update_status(&child, SessionState::Failed, None, None).unwrap();
-        record_reopen_refusal(&child, REOPEN_LAUNCH_GATE, "pre-spawn refusal".into());
+        record_reopen_refusal(
+            &child,
+            ReopenGate::ProviderUnsupported,
+            "pre-spawn refusal".into(),
+        );
         let replaced = if target { &child } else { &source };
         let replaced_id = if target { child_id } else { source_id };
         let relocated = outside.path().join("records");
@@ -1828,7 +1863,7 @@ fn settlement_rechecks_replaced_session_directories_without_touching_outside_rec
         let before_source = snapshot_directory(&source);
         let outcome = if typed {
             Err(reopen_refusal(
-                REOPEN_LAUNCH_GATE,
+                ReopenGate::ProviderUnsupported,
                 "original refusal".into(),
             ))
         } else {
@@ -1845,7 +1880,7 @@ fn settlement_rechecks_replaced_session_directories_without_touching_outside_rec
         );
         let detail = format!("{:#}", outcome.unwrap_err());
         if typed {
-            assert_eq!(gate.as_deref(), Some(REOPEN_LAUNCH_GATE));
+            assert_eq!(gate, Some(ReopenGate::ProviderUnsupported));
             assert!(
                 detail.contains("refusing non-directory Agent Bridge session"),
                 "{detail}"
@@ -2011,7 +2046,10 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
         ResumedHolderCheck::BeforeInitialDelivery,
     )
     .unwrap_err();
-    assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ReopenConflict)
+    );
     assert!(
         format!("{error:#}").contains(&foreign.id().to_string()),
         "{error:#}"
@@ -2043,7 +2081,10 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
         &SessionState::Ready,
     )
     .unwrap_err();
-    assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ReopenConflict)
+    );
     assert!(
         format!("{error:#}").starts_with(&format!(
             "follow-up to reopened session {id} was refused before delivery: reopen refused (reopen-conflict)"
@@ -2107,7 +2148,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
     drop(claim);
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("reopen-verification-failed"),
+        Some(ReopenGate::ReopenVerificationFailed),
         "{error:#}"
     );
     assert!(
@@ -2177,7 +2218,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         provider::claude::override_session_registry_for_test(Some(registry.clone()));
         let new_id = "session-reopennew10";
         let new = root.path().join(new_id);
-        let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+        let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
         claim.finalize(new_id).unwrap();
         let source_before = snapshot_directory(&source);
         fs::create_dir(&new).unwrap();
@@ -2216,7 +2257,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         .unwrap_err();
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some("reopen-verification-failed"),
+            Some(ReopenGate::ReopenVerificationFailed),
             "{label}: {error:#}"
         );
         if cfg!(windows) {
@@ -2230,8 +2271,8 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
             "{label}: {error:#}"
         );
         assert_eq!(
-            read_reopen_refusal_gate(&new).as_deref(),
-            Some("reopen-verification-failed"),
+            read_reopen_refusal_gate(&new),
+            Some(ReopenGate::ReopenVerificationFailed),
             "{label}"
         );
 
@@ -2260,7 +2301,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         drop(initial_claim);
         assert_eq!(
             reopen_refusal_gate(&reported),
-            Some("reopen-verification-failed")
+            Some(ReopenGate::ReopenVerificationFailed)
         );
         let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
         if close_succeeds {
@@ -2350,7 +2391,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         let outcome = release_reopen_marker_after_refusal(
             &source,
             &new,
-            REOPEN_VERIFICATION_FAILED_GATE,
+            ReopenGate::ReopenVerificationFailed,
             Err(anyhow::anyhow!("refused")),
         );
         let outcome = outcome.unwrap_err();
@@ -2415,12 +2456,12 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                 for refused in [
                     inspect_reopen_source(&source, source_id)
                         .expect_err("gate admitted a retained marker"),
-                    claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION)
+                    Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION)
                         .expect_err("claim admitted a retained marker"),
                 ] {
                     assert_eq!(
                         reopen_refusal_gate(&refused),
-                        Some("already-reopened"),
+                        Some(ReopenGate::AlreadyReopened),
                         "{label}: {record:?}"
                     );
                     let text = format!("{refused:#}");
@@ -2463,7 +2504,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                 "{label}"
             );
         }
-        let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+        let next = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
         drop(next);
         assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
         assert_eq!(snapshot_directory(&source), expected, "{label}");
@@ -2483,19 +2524,21 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         root.path().to_owned(),
         false,
     );
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     update_status(&new, SessionState::Ready, None, None).unwrap();
     let outcome =
-        release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap_err();
+        release_reopen_marker_after_refusal(&source, &new, ReopenGate::ProviderUnsupported, Ok(()))
+            .unwrap_err();
     assert!(format!("{outcome:#}").contains("is ready"), "{outcome:#}");
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
     update_status(&new, SessionState::Failed, None, Some("refused".to_owned())).unwrap();
     // A post-spawn gate with no verified cleanup retains the marker; the refusal record is
     // absent here (its write failed when the refusal was decided), so only the retention
     // itself is observable.
-    let outcome = release_reopen_marker_after_refusal(&source, &new, REOPEN_CONFLICT_GATE, Ok(()))
-        .unwrap_err();
+    let outcome =
+        release_reopen_marker_after_refusal(&source, &new, ReopenGate::ReopenConflict, Ok(()))
+            .unwrap_err();
     assert!(
         format!("{outcome:#}").contains("may still hold the conversation"),
         "{outcome:#}"
@@ -2511,8 +2554,13 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         Some("refused".to_owned()),
     )
     .unwrap();
-    let outcome = release_reopen_marker_after_refusal(&source, &other, REOPEN_LAUNCH_GATE, Ok(()))
-        .unwrap_err();
+    let outcome = release_reopen_marker_after_refusal(
+        &source,
+        &other,
+        ReopenGate::ProviderUnsupported,
+        Ok(()),
+    )
+    .unwrap_err();
     assert!(
         format!("{outcome:#}").contains("not the refused session"),
         "{outcome:#}"
@@ -2522,7 +2570,8 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
     // still running retains the marker whatever gate the refusal names.
     write_provider_process_record(&new, new_id, std::process::id());
     let outcome =
-        release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap_err();
+        release_reopen_marker_after_refusal(&source, &new, ReopenGate::ProviderUnsupported, Ok(()))
+            .unwrap_err();
     assert!(
         format!("{outcome:#}").contains(&format!(
             "provider process {} of refused session {new_id} is still running",
@@ -2533,10 +2582,12 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
     fs::remove_file(new.join(PROVIDER_PROCESS_FILE)).unwrap();
     // The pre-spawn gate recorded no process: nothing can hold the conversation.
-    release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap();
+    release_reopen_marker_after_refusal(&source, &new, ReopenGate::ProviderUnsupported, Ok(()))
+        .unwrap();
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
     // Releasing an already released marker is not an error.
-    release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap();
+    release_reopen_marker_after_refusal(&source, &new, ReopenGate::ProviderUnsupported, Ok(()))
+        .unwrap();
     provider::claude::override_session_registry_for_test(None);
 }
 
@@ -2564,14 +2615,14 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
             ("gate", inspect_reopen_source(&source, source_id).err()),
             (
                 "claim",
-                claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).err(),
+                Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).err(),
             ),
         ] {
             let refused =
                 refused.unwrap_or_else(|| panic!("the {label} admitted the marker: {expected}"));
             assert_eq!(
                 reopen_refusal_gate(&refused),
-                Some("already-reopened"),
+                Some(ReopenGate::AlreadyReopened),
                 "{label}: {refused:#}"
             );
             assert_eq!(
@@ -2616,7 +2667,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
         assert_eq!(checks[0].reason_code, "reopen_marker_reconcilable");
         assert_eq!(snapshot_directory(&source), before);
         let stale: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
-        let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+        let next = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
         let marker: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
         assert_eq!(marker.reopened_by, None);
         assert_ne!(marker.claim, stale.claim);
@@ -2633,7 +2684,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     // it closed the new surface or settled the marker.
     let new_id = "session-reopennew14";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     write_json_atomic(
         &new.join(TERMINAL_HANDLE_FILE),
@@ -2643,10 +2694,13 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     update_status(&new, SessionState::AwaitingInitialInput, None, None).unwrap();
     let recorded = record_reopen_refusal(
         &new,
-        REOPEN_CONFLICT_GATE,
+        ReopenGate::ReopenConflict,
         "held by pid 4242; no prompt was delivered".to_owned(),
     );
-    assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
+    assert_eq!(
+        reopen_refusal_gate(&recorded),
+        Some(ReopenGate::ReopenConflict)
+    );
     expect_refused(&format!(
         "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: refused session {new_id} is awaiting-initial-input with no provider process record (provider-process.json), so the provider process it spawned cannot be verified gone"
     ));
@@ -2676,7 +2730,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     // surface is reported alongside.
     write_provider_process_record(&new, new_id, 0);
     assert_eq!(
-        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_CONFLICT_GATE))
+        refused_launch_cleanup(&new, &test_launch_refusal(ReopenGate::ReopenConflict))
             .unwrap()
             .to_string(),
         "provider process 0 is verified gone (it has exited) and the refused session's surface was closed"
@@ -2688,7 +2742,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     // whatever else happens to the session.
     let new_id = "session-reopennew16";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     let plain = format!("session {source_id} was already reopened as {new_id}");
     expect_refused(&plain);
@@ -2718,10 +2772,13 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     fs::remove_file(new.join(REOPEN_REFUSAL_FILE)).unwrap();
     let recorded = record_reopen_refusal(
         &new,
-        REOPEN_LAUNCH_GATE,
+        ReopenGate::ProviderUnsupported,
         "a holder registered after the initial scan".to_owned(),
     );
-    assert_eq!(reopen_refusal_gate(&recorded), Some("provider-unsupported"));
+    assert_eq!(
+        reopen_refusal_gate(&recorded),
+        Some(ReopenGate::ProviderUnsupported)
+    );
     reconcile();
 
     // A post-launch refusal whose parent died before the close: the marker is retained
@@ -2729,12 +2786,12 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     // process is verified gone.
     let new_id = "session-reopennew17";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     update_status(&new, SessionState::AwaitingInitialInput, None, None).unwrap();
     record_reopen_refusal(
         &new,
-        REOPEN_VERIFICATION_FAILED_GATE,
+        ReopenGate::ReopenVerificationFailed,
         "could not verify; no prompt was delivered".to_owned(),
     );
     let prefix = format!(
@@ -2752,16 +2809,18 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     ));
     // A record that cannot be read leaves the launch unverifiable rather than gone.
     fs::write(new.join(PROVIDER_PROCESS_FILE), "not json").unwrap();
-    let unverifiable =
-        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE))
-            .unwrap_err();
+    let unverifiable = refused_launch_cleanup(
+        &new,
+        &test_launch_refusal(ReopenGate::ReopenVerificationFailed),
+    )
+    .unwrap_err();
     assert!(
         format!("{unverifiable:#}").contains("invalid JSON"),
         "{unverifiable:#}"
     );
     assert_eq!(
         reopen_refusal_gate(&inspect_reopen_source(&source, source_id).unwrap_err()),
-        Some("already-reopened")
+        Some(ReopenGate::AlreadyReopened)
     );
     write_provider_process_record(&new, new_id, 0);
     reconcile();
@@ -2825,7 +2884,7 @@ fn recorded_provider_process_is_verified_from_the_record_until_it_exits() {
     update_status(&directory, SessionState::AwaitingInitialInput, None, None).unwrap();
     record_reopen_refusal(
         &directory,
-        REOPEN_CONFLICT_GATE,
+        ReopenGate::ReopenConflict,
         "held by pid 4242; no prompt was delivered".to_owned(),
     );
     Store::open_unchecked(&directory)
@@ -2834,7 +2893,7 @@ fn recorded_provider_process_is_verified_from_the_record_until_it_exits() {
             "schema":1,"claim_token":"fixture-launch","deadline_unix_ms":1,"phase":"spawned"
         }))
         .unwrap();
-    for gate in REOPEN_POST_CREATION_GATES {
+    for gate in ReopenGate::POST_CREATION {
         assert_eq!(
             refused_launch_cleanup(&directory, &test_launch_refusal(gate)).unwrap(),
             RefusedLaunchCleanup::Pending(format!(
@@ -2850,7 +2909,7 @@ fn recorded_provider_process_is_verified_from_the_record_until_it_exits() {
         observe_provider_process(&record),
         ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
     );
-    for gate in REOPEN_POST_CREATION_GATES {
+    for gate in ReopenGate::POST_CREATION {
         let cleanup = refused_launch_cleanup(&directory, &test_launch_refusal(gate)).unwrap();
         assert_eq!(
             cleanup,
@@ -2890,7 +2949,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     let source_before = snapshot_directory(&source);
     let new_id = "session-reopennew18";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     write_json_atomic(
         &new.join(TERMINAL_HANDLE_FILE),
@@ -2904,7 +2963,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     update_status(&new, SessionState::AwaitingInitialInput, None, None).unwrap();
     let refusal = record_reopen_refusal(
         &new,
-        REOPEN_CONFLICT_GATE,
+        ReopenGate::ReopenConflict,
         "held by pid 4242; no prompt was delivered".to_owned(),
     );
     // The parent closed the surface (the console is gone) and the wrapper died with it;
@@ -2941,8 +3000,9 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     );
     let retained = format!("the refused launch may still hold the conversation: {condition}");
     // Settlement by the parent retains the marker and notes why.
-    let outcome = release_reopen_marker_after_refusal(&source, &new, REOPEN_CONFLICT_GATE, Ok(()))
-        .unwrap_err();
+    let outcome =
+        release_reopen_marker_after_refusal(&source, &new, ReopenGate::ReopenConflict, Ok(()))
+            .unwrap_err();
     assert!(format!("{outcome:#}").ends_with(&retained), "{outcome:#}");
     let record: RecordedReopenRefusal = read_json(&new.join(REOPEN_REFUSAL_FILE)).unwrap();
     assert_eq!(record.cleanup.as_deref(), Some("pending"));
@@ -2951,9 +3011,12 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
     for refused in [
         inspect_reopen_source(&source, source_id).unwrap_err(),
-        claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap_err(),
+        Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap_err(),
     ] {
-        assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+        assert_eq!(
+            reopen_refusal_gate(&refused),
+            Some(ReopenGate::AlreadyReopened)
+        );
         assert_eq!(
             format!("{refused:#}"),
             format!(
@@ -2971,7 +3034,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     provider.kill().unwrap();
     provider.wait().unwrap();
     assert_eq!(
-        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_CONFLICT_GATE))
+        refused_launch_cleanup(&new, &test_launch_refusal(ReopenGate::ReopenConflict))
             .unwrap()
             .to_string(),
         format!(
@@ -2980,7 +3043,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
         )
     );
     inspect_reopen_source(&source, source_id).unwrap();
-    let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let next = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     let marker: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
     assert_eq!(marker.reopened_by, None);
     drop(next);
@@ -3074,12 +3137,12 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
     let source_before = snapshot_directory(&source);
     let new_id = "session-reopennew19";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     update_status(&new, SessionState::Failed, None, Some("refused".to_owned())).unwrap();
     record_reopen_refusal(
         &new,
-        REOPEN_VERIFICATION_FAILED_GATE,
+        ReopenGate::ReopenVerificationFailed,
         "could not verify; no prompt was delivered".to_owned(),
     );
     let pid = std::process::id();
@@ -3103,8 +3166,11 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
 
     record(identity.clone());
     assert_eq!(
-        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE))
-            .unwrap(),
+        refused_launch_cleanup(
+            &new,
+            &test_launch_refusal(ReopenGate::ReopenVerificationFailed)
+        )
+        .unwrap(),
         RefusedLaunchCleanup::Pending(format!(
             "provider process {pid} of refused session {new_id} is still running"
         ))
@@ -3138,9 +3204,11 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
         ),
     ] {
         record(reused);
-        let cleanup =
-            refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE))
-                .unwrap();
+        let cleanup = refused_launch_cleanup(
+            &new,
+            &test_launch_refusal(ReopenGate::ReopenVerificationFailed),
+        )
+        .unwrap();
         assert_eq!(
             cleanup,
             RefusedLaunchCleanup::ProviderProcessGone {
@@ -3159,7 +3227,7 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
         );
         inspect_reopen_source(&source, source_id).unwrap();
     }
-    let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let next = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     drop(next);
     assert_eq!(snapshot_directory(&source), source_before);
 }
@@ -3181,12 +3249,12 @@ fn uninspectable_provider_process_retains_the_marker() {
     );
     let new_id = "session-reopennew20";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     update_status(&new, SessionState::Failed, None, Some("refused".to_owned())).unwrap();
     record_reopen_refusal(
         &new,
-        REOPEN_CONFLICT_GATE,
+        ReopenGate::ReopenConflict,
         "held by pid 4242; no prompt was delivered".to_owned(),
     );
     let system_pid = 4;
@@ -3207,7 +3275,8 @@ fn uninspectable_provider_process_retains_the_marker() {
         },
     )
     .unwrap();
-    let cleanup = refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_CONFLICT_GATE)).unwrap();
+    let cleanup =
+        refused_launch_cleanup(&new, &test_launch_refusal(ReopenGate::ReopenConflict)).unwrap();
     assert_eq!(
         cleanup,
         RefusedLaunchCleanup::Pending(format!(
@@ -3216,7 +3285,10 @@ fn uninspectable_provider_process_retains_the_marker() {
     );
     assert!(!cleanup.releases_marker());
     let refused = inspect_reopen_source(&source, source_id).unwrap_err();
-    assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+    assert_eq!(
+        reopen_refusal_gate(&refused),
+        Some(ReopenGate::AlreadyReopened)
+    );
     assert!(
         format!("{refused:#}").contains("could not be verified"),
         "{refused:#}"
@@ -3226,7 +3298,10 @@ fn uninspectable_provider_process_retains_the_marker() {
 
 #[test]
 fn close_deadline_reopen_refusals_preserve_conversation_warning() {
-    for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
+    for gate in [
+        ReopenGate::ReopenConflict,
+        ReopenGate::ReopenVerificationFailed,
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let error = close_surface_after_reopen_verification_failure(
             directory.path(),
@@ -3269,7 +3344,10 @@ fn reopen_refuses_a_journal_before_examining_request_results() {
         } else {
             CoreRecord::Completion.name()
         };
-        assert_eq!(reopen_refusal_gate(&error), Some("source-not-converged"));
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some(ReopenGate::SourceNotConverged)
+        );
         assert_eq!(
             error.to_string(),
             format!(
@@ -3293,7 +3371,7 @@ fn inspection_error_with_dead_provider_pid_retains_reopen_marker() {
     );
     let new_id = "session-reopennewb1";
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
-    claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION)
+    Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION)
         .unwrap()
         .finalize(new_id)
         .unwrap();
@@ -3316,7 +3394,7 @@ fn inspection_error_with_dead_provider_pid_retains_reopen_marker() {
     };
     let cleanup = refused_launch_cleanup_with(
         &new,
-        &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE),
+        &test_launch_refusal(ReopenGate::ReopenVerificationFailed),
         observe,
     )
     .unwrap();
@@ -3368,7 +3446,7 @@ fn unsupported_reopen_getter_preserves_holder_gates_and_none_bypass() {
             .unwrap_err();
             assert_eq!(
                 reopen_refusal_gate(&error),
-                Some(REOPEN_VERIFICATION_FAILED_GATE)
+                Some(ReopenGate::ReopenVerificationFailed)
             );
             let detail = format!(
                 "could not verify that the reopened {} conversation {} has no other live holder: {reason:#}; no prompt was delivered",
@@ -3388,7 +3466,10 @@ fn unsupported_reopen_getter_preserves_holder_gates_and_none_bypass() {
                 .unwrap();
                 assert_eq!(record["schema"], 2);
                 assert_eq!(record["phase"], "launch");
-                assert_eq!(record["gate"], REOPEN_VERIFICATION_FAILED_GATE);
+                assert_eq!(
+                    record["gate"],
+                    ReopenGate::ReopenVerificationFailed.as_str()
+                );
                 assert_eq!(record["detail"], detail);
             }
         }
@@ -3438,7 +3519,7 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
             assert_eq!(format!("{mapped:#}"), format!("{error:#}"));
             assert_eq!(
                 reopen_refusal_gate(&mapped),
-                Some(REOPEN_VERIFICATION_FAILED_GATE)
+                Some(ReopenGate::ReopenVerificationFailed)
             );
         }
         provider::claude::override_session_registry_for_test(None);
@@ -3458,7 +3539,7 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
         );
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some(REOPEN_VERIFICATION_FAILED_GATE)
+            Some(ReopenGate::ReopenVerificationFailed)
         );
         assert_eq!(
             error.to_string(),
@@ -3472,7 +3553,10 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
                     .unwrap();
             assert_eq!(record["schema"], 2);
             assert_eq!(record["phase"], "launch");
-            assert_eq!(record["gate"], REOPEN_VERIFICATION_FAILED_GATE);
+            assert_eq!(
+                record["gate"],
+                ReopenGate::ReopenVerificationFailed.as_str()
+            );
             assert_eq!(record["detail"], detail);
         }
     }
@@ -3569,7 +3653,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "native::reopen::tests::a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source",
+                "native::reopen::reservation::tests::a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -3589,17 +3673,17 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
     let created_directory = adapter.prepared.created.directory.clone();
     fs::create_dir(created_directory.join(CoreRecord::TurnClaim.name())).unwrap();
     assert!(
-        claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION).is_err(),
+        Reservation::claim(&source_directory, &source_id, REOPEN_TEST_CONVERSATION).is_err(),
         "the marker is consumed while the launch is prepared"
     );
     let mut report = TurnReport::new(false, serde_json::Map::new());
     let (outcome, gate) = adapter.run(&start_operation(), &mut report);
     let error = outcome.unwrap_err();
-    assert_eq!(gate.as_deref(), Some(REOPEN_START_FAILED_GATE));
-    assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_START_FAILED_GATE));
+    assert_eq!(gate, Some(ReopenGate::StartFailed));
+    assert_eq!(reopen_refusal_gate(&error), Some(ReopenGate::StartFailed));
     assert!(report.address().is_none());
     let refusal = read_reopen_launch_refusal(&created_directory).unwrap();
-    assert_eq!(refusal.gate, REOPEN_START_FAILED_GATE);
+    assert_eq!(refusal.gate, ReopenGate::StartFailed.as_str());
     assert!(
         refusal
             .detail
@@ -3621,7 +3705,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
     assert_eq!(
         refused_launch_cleanup(
             &created_directory,
-            &test_launch_refusal(REOPEN_START_FAILED_GATE)
+            &test_launch_refusal(ReopenGate::StartFailed)
         )
         .unwrap(),
         RefusedLaunchCleanup::NoProcessSpawned
@@ -3638,7 +3722,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
             .unwrap()
             .is_none()
     );
-    let second = claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION)
+    let second = Reservation::claim(&source_directory, &source_id, REOPEN_TEST_CONVERSATION)
         .expect("a second reopen of the source is admitted");
     drop(second);
 
@@ -3673,16 +3757,16 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
     .unwrap();
     record_reopen_refusal(
         &died.directory,
-        REOPEN_START_FAILED_GATE,
+        ReopenGate::StartFailed,
         "died before the release".to_owned(),
     );
     let stale = verify_reopen_source_is_closed(&died_source, died_id)
         .unwrap()
         .expect("the consumed marker names a reconcilable refusal");
     assert_eq!(stale.refused_session, died.id);
-    assert_eq!(stale.gate, REOPEN_START_FAILED_GATE);
+    assert_eq!(stale.gate, ReopenGate::StartFailed.as_str());
     assert_eq!(stale.cleanup, RefusedLaunchCleanup::NoProcessSpawned);
-    let admitted = claim_reopen_marker(&died_source, died_id, REOPEN_TEST_CONVERSATION)
+    let admitted = Reservation::claim(&died_source, died_id, REOPEN_TEST_CONVERSATION)
         .expect("the next reopen releases the stale marker and is admitted");
     drop(admitted);
 }
@@ -3696,7 +3780,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "native::reopen::tests::reopened_source_creation_extra_and_failure_joints",
+                "native::reopen::reservation::tests::reopened_source_creation_extra_and_failure_joints",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -3758,13 +3842,19 @@ fn reopened_source_creation_extra_and_failure_joints() {
     let error = close_surface_after_reopen_verification_failure(
         &created.directory,
         &created.id,
-        reopen_refusal("provider-unsupported", "unsupported".into()),
+        reopen_refusal(ReopenGate::ProviderUnsupported, "unsupported".into()),
         Instant::now(),
     );
-    assert_eq!(reopen_refusal_gate(&error), Some("provider-unsupported"));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ProviderUnsupported)
+    );
     assert_eq!(snapshot_directory(&created.directory), before);
     // No terminal exists. A typed refusal still survives the close helper's error context.
-    for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
+    for gate in [
+        ReopenGate::ReopenConflict,
+        ReopenGate::ReopenVerificationFailed,
+    ] {
         let missing = root.join("session-missing");
         let error = close_surface_after_reopen_verification_failure(
             &missing,
@@ -3811,11 +3901,11 @@ fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
         assert_eq!(format!("{error:#}"), format!("{expected:#}"));
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some(REOPEN_VERIFICATION_FAILED_GATE)
+            Some(ReopenGate::ReopenVerificationFailed)
         );
         assert_eq!(
-            read_reopen_refusal_gate(&directory).as_deref(),
-            Some(REOPEN_VERIFICATION_FAILED_GATE)
+            read_reopen_refusal_gate(&directory),
+            Some(ReopenGate::ReopenVerificationFailed)
         );
     }
 }
@@ -3839,7 +3929,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "native::reopen::tests::a_memory_workspace_source_is_refused_before_creation_without_touching_the_source",
+                "native::reopen::reservation::tests::a_memory_workspace_source_is_refused_before_creation_without_touching_the_source",
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -3878,7 +3968,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
     if cfg!(windows) {
         assert_eq!(
             reopen_refusal_gate(&error),
-            Some(REOPEN_WORKSPACE_REFUSED_GATE)
+            Some(ReopenGate::WorkspaceRefused)
         );
         let detail = format!("{error:#}");
         assert!(
@@ -3890,7 +3980,10 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
             "{detail}"
         );
     } else {
-        assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_LAUNCH_GATE));
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some(ReopenGate::ProviderUnsupported)
+        );
     }
     assert_eq!(snapshot_directory(&directory), before);
     assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());

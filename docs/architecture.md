@@ -98,13 +98,19 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   before that operation; their explicit `InitialSource` implementations supply result fields,
   holder gates, and phase-specific failure handling. Consent failure remains separate from
   launcher and Delivery failures.
-- `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
+- `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's
+  integration with `reopen/reservation.rs`, which owns source reservations, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
   shape. Reopen creates the new Session and records its provenance before finalizing the source
   marker. The resulting `ReopenAttempt` owns settlement after the Initial prompt operation,
   including failures before a Request address exists. Launch and delivery keep their existing
   holder-check timing; provider adapters supply the holder evidence.
-  `reopen/marker.rs` observes the marker, its named Session and refused-launch cleanup once,
+  `Reservation::claim` rechecks the closed source under its lock, and consuming `finalize`
+  leaves its marker in place; an unfinalized Drop releases only its own marker. Settlement
+  preserves the durable refusal re-read and checks provider-process evidence before release.
+  `reopen/gate.rs` owns typed `ReopenGate` reasons, their unchanged JSON spellings and
+  recognition through error context. `reopen/reservation/marker.rs` observes the marker,
+  its named Session and refused-launch cleanup once,
   then maps that Judgment to command eligibility or doctor diagnostics. Only these callers
   request the cross-session observation. The command repeats it under the source lock before
   replacing a stale marker; doctor never acquires mutation authority.
@@ -163,7 +169,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   terminal selection live in portable children of their platform modules (`windows/budget.rs`,
   `macos/selection.rs`), compiled and tested on every target.
 - `src/native/session/` owns durable record schemas, record access, and durability.
-  `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
+  `schema` defines the shared manifest, event, provider-process, reopen-marker and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
   helpers. `close::budget` owns the close deadline scope and its optional test clock. `requests`
   binds public requests to claims and events; `turn` owns delivery settlement, completion and
@@ -187,7 +193,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   source (read once, strict, bounded, whole-map recheck) and Origin's budgeted source
   (per-record cap, byte and time allowance, selective reads, no Snapshot). Every other reader
   of those Records (the lifecycle paths, reopen provenance, the Claude projection) calls the
-  same decoders while keeping its own missing-record policy and error context. Then `reads.rs`
+  same decoders while keeping its own missing-record policy and error context. The auxiliary
+  reopen-marker, reopen-refusal and provider-process shape decoders also live here, preserving
+  their historical serde policy; the Snapshot timestamp rule is not added to those records.
+  Reopen still judges refusal validity and release authority after decoding. Then `reads.rs`
   for event reads and read budgets, `primitives.rs` for filesystem durability and
   private-record permissions, and `owner.rs` for read-only attestation of the recorded owner.
   Owner attestation separates incarnation birth from recorded TTY/process-group control,

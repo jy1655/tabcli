@@ -39,7 +39,7 @@ fn refusal(token: &str) -> Value {
 fn interrupted(root: &Path) -> (PathBuf, PathBuf, String) {
     let source = source(root);
     let child = write_reopen_launch_session(root, CHILD, Path::new("claude"));
-    claim_reopen_marker(&source, SOURCE, REOPEN_TEST_CONVERSATION)
+    Reservation::claim(&source, SOURCE, REOPEN_TEST_CONVERSATION)
         .unwrap()
         .finalize(CHILD)
         .unwrap();
@@ -112,7 +112,7 @@ fn interrupted_fence_recovers_only_its_claim_on_real_reopen() {
     let changed = snapshot_directory(&child);
     assert_eq!(
         reopen_refusal_gate(&run_reopen(request()).unwrap_err()),
-        Some("already-reopened")
+        Some(ReopenGate::AlreadyReopened)
     );
     assert_eq!(snapshot_directory(&child), changed);
     fs::write(child.join(TURN_CLAIM_FILE), token.as_bytes()).unwrap();
@@ -120,7 +120,7 @@ fn interrupted_fence_recovers_only_its_claim_on_real_reopen() {
     let error = run_reopen(request()).unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("launch-failed"),
+        Some(ReopenGate::LaunchFailed),
         "{error:#}"
     );
     assert_eq!(
@@ -156,7 +156,7 @@ fn failed_fence_retry_preserves_refusal_gate_and_evidence() {
     let error = run_reopen(request()).unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("already-reopened"),
+        Some(ReopenGate::AlreadyReopened),
         "{error:#}"
     );
     let detail = format!("{error:#}");
@@ -189,8 +189,8 @@ fn failed_fence_retry_keeps_source_admission_precedence() {
     )
     .unwrap();
     for (state, gate) in [
-        (SessionState::Ready, "source-not-closed"),
-        (SessionState::Closed, "source-not-converged"),
+        (SessionState::Ready, ReopenGate::SourceNotClosed),
+        (SessionState::Closed, ReopenGate::SourceNotConverged),
     ] {
         let store = Store::open_unchecked(&source);
         let mut status = store.status().unwrap();
@@ -230,7 +230,7 @@ fn failed_refusal_write_keeps_typed_gate_and_marker() {
     let error = run_reopen(request()).unwrap_err();
     assert_eq!(
         reopen_refusal_gate(&error),
-        Some("launch-failed"),
+        Some(ReopenGate::LaunchFailed),
         "{error:#}"
     );
     assert!(format!("{error:#}").contains(FAILURE));
@@ -238,7 +238,7 @@ fn failed_refusal_write_keeps_typed_gate_and_marker() {
     assert!(source.join(REOPEN_MARKER_FILE).exists());
     assert_eq!(
         reopen_refusal_gate(&run_reopen(request()).unwrap_err()),
-        Some("already-reopened")
+        Some(ReopenGate::AlreadyReopened)
     );
 }
 
@@ -269,7 +269,7 @@ fn decoder_and_receipt_mismatch_never_release() {
             .unwrap();
         assert_eq!(
             reopen_refusal_gate(&inspect_reopen_source(&source, SOURCE).unwrap_err()),
-            Some("already-reopened"),
+            Some(ReopenGate::AlreadyReopened),
             "{record}"
         );
     }
@@ -331,18 +331,21 @@ fn specific_wrapper_refusal_wins_in_both_orders() {
     terminal::launch_failure_test_support::inject(|directory| {
         record_reopen_refusal(
             directory,
-            REOPEN_LAUNCH_GATE,
+            ReopenGate::ProviderUnsupported,
             "specific wrapper refusal".into(),
         );
         anyhow::anyhow!(FAILURE)
     });
     let error = run_reopen(request()).unwrap_err();
-    assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_LAUNCH_GATE));
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::ProviderUnsupported)
+    );
     assert!(format!("{error:#}").contains(FAILURE));
     let child = created(&root);
     assert_eq!(read_reopen_launch_refusal(&child).unwrap().schema, 2);
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
-    let marker = claim_reopen_marker(&source, SOURCE, REOPEN_TEST_CONVERSATION).unwrap();
+    let marker = Reservation::claim(&source, SOURCE, REOPEN_TEST_CONVERSATION).unwrap();
     marker
         .finalize(child.file_name().unwrap().to_str().unwrap())
         .unwrap();
@@ -350,7 +353,11 @@ fn specific_wrapper_refusal_wins_in_both_orders() {
         .record(CoreRecord::ReopenRefusal)
         .write_json(&refusal("token"))
         .unwrap();
-    record_reopen_refusal(&child, REOPEN_LAUNCH_GATE, "late wrapper refusal".into());
+    record_reopen_refusal(
+        &child,
+        ReopenGate::ProviderUnsupported,
+        "late wrapper refusal".into(),
+    );
     assert!(inspect_reopen_source(&source, SOURCE).is_ok());
 }
 
@@ -400,7 +407,7 @@ fn spawn_commits_before_failure_preserves_live_states_then_releases_on_exit() {
             error
         });
         let error = run_reopen(request()).unwrap_err();
-        assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+        assert_eq!(reopen_refusal_gate(&error), Some(ReopenGate::LaunchFailed));
         let marker: ReopenMarker = Reader::open_unchecked(&source)
             .record(CoreRecord::ReopenMarker)
             .json()
@@ -414,7 +421,7 @@ fn spawn_commits_before_failure_preserves_live_states_then_releases_on_exit() {
         assert!(inspect_reopen_source(&source, SOURCE).is_ok());
         fail_next();
         let error = run_reopen(request()).unwrap_err();
-        assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+        assert_eq!(reopen_refusal_gate(&error), Some(ReopenGate::LaunchFailed));
         assert!(!source.join(REOPEN_MARKER_FILE).exists());
     }
 }
@@ -427,7 +434,7 @@ fn launch_failed_waits_for_in_progress_spawn_and_preserves_committed_live_state(
         let root = tempfile::tempdir().unwrap();
         let source = source(root.path());
         let child = write_reopen_launch_session(root.path(), CHILD, Path::new("claude"));
-        claim_reopen_marker(&source, SOURCE, REOPEN_TEST_CONVERSATION)
+        Reservation::claim(&source, SOURCE, REOPEN_TEST_CONVERSATION)
             .unwrap()
             .finalize(CHILD)
             .unwrap();
@@ -492,7 +499,7 @@ fn launch_failed_waits_for_in_progress_spawn_and_preserves_committed_live_state(
         );
         releaser.join().unwrap();
         let process = worker.join().unwrap();
-        assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+        assert_eq!(reopen_refusal_gate(&error), Some(ReopenGate::LaunchFailed));
         assert!(format!("{error:#}").contains(FAILURE));
         assert_eq!(store.status().unwrap().state, expected);
         assert_eq!(
@@ -514,7 +521,7 @@ fn launch_failed_waits_for_in_progress_spawn_and_preserves_committed_live_state(
         );
         assert_eq!(
             reopen_refusal_gate(&inspect_reopen_source(&source, SOURCE).unwrap_err()),
-            Some("already-reopened")
+            Some(ReopenGate::AlreadyReopened)
         );
         assert_eq!(snapshot_directory(&source), before_source);
         drop(process);
@@ -572,7 +579,7 @@ fn concurrent_reopens_reserve_safe_generic_failure_once() {
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
-                claim_reopen_marker(&source, SOURCE, REOPEN_TEST_CONVERSATION)
+                Reservation::claim(&source, SOURCE, REOPEN_TEST_CONVERSATION)
             })
         })
         .collect();
@@ -625,8 +632,8 @@ fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop
     let mut report = TurnReport::new(false, serde_json::Map::new());
     let (outcome, gate) = attempt.run(&start_operation(), &mut report);
     let error = outcome.unwrap_err();
-    assert_eq!(gate.as_deref(), Some("launch-failed"));
-    assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+    assert_eq!(gate, Some(ReopenGate::LaunchFailed));
+    assert_eq!(reopen_refusal_gate(&error), Some(ReopenGate::LaunchFailed));
     assert!(format!("{error:#}").contains(&original), "{error:#}");
     let (_, request_id) = report.address().unwrap();
     assert_ne!(

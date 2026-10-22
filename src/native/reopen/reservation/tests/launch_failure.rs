@@ -434,7 +434,7 @@ fn reproduce(test_name: &str, fault: Fault) {
         println!("next reopen={second:#}");
         assert_ne!(
             reopen_refusal_gate(&second),
-            Some("already-reopened"),
+            Some(ReopenGate::AlreadyReopened),
             "a failed launcher with safe cleanup must leave the source reopenable"
         );
         assert!(
@@ -449,7 +449,10 @@ fn reproduce(test_name: &str, fault: Fault) {
         let before_retry = snapshot_directory(&source);
         let second = run_reopen(request()).unwrap_err();
         println!("next reopen={second:#}");
-        assert_eq!(reopen_refusal_gate(&second), Some("already-reopened"));
+        assert_eq!(
+            reopen_refusal_gate(&second),
+            Some(ReopenGate::AlreadyReopened)
+        );
         assert_eq!(snapshot_directory(&source), before_retry);
         println!("retention guard passed for {fault:?}");
     }
@@ -467,8 +470,8 @@ fn reproduce(test_name: &str, fault: Fault) {
     }
     assert_eq!(reader.status().unwrap().state, SessionState::Failed);
     if !fault.releases_source() {
-        assert_ne!(refusal.gate, REOPEN_START_FAILED_GATE);
-        assert_ne!(refusal.gate, REOPEN_LAUNCH_GATE);
+        assert_ne!(refusal.gate, ReopenGate::StartFailed.as_str());
+        assert_ne!(refusal.gate, ReopenGate::ProviderUnsupported.as_str());
     }
     drop(process);
 }

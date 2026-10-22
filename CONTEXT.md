@@ -214,6 +214,16 @@ _Avoid_: restart, unclose
 The record in a closed source session that identifies the reopen holding or consuming it.
 _Avoid_: resume lock, continuation token
 
+**Reopen reservation**:
+One attempt's exclusive hold on a closed source Session. Creating the new Session consumes
+that hold; a refused launch releases it only when its provider is verified gone or never spawned.
+_Avoid_: provider conversation lock, resume lease
+
+**Reopen gate**:
+The named reason a Reopen or input to a reopened Session is refused, retained separately
+from the explanation for that particular refusal.
+_Avoid_: error code, failure phase
+
 ### Trust
 
 **Workspace trust**:
