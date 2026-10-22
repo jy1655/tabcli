@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.23](0.4.23.md) (2026-10-22): Adds `--context-mode compact`, a bounded Context attachment with a declared elision and retrieval command, recorded on the receipt (#273); moves the Request observation and search, the diagnostic vocabulary and the consent concerns into their own modules with no behaviour change (#271, #274, #275)
 - [0.4.22](0.4.22.md) (2026-10-22): Settles a delivery refused before sending as the request's failed event, so a refused follow-up no longer blocks `reopen` (#268); requires local build cleanup after every release (#267)
 - [0.4.21](0.4.21.md) (2026-10-20): Consolidates the Windows console helper's encoding, replies and failure classification, exposes typed consent and request observations to diagnostics, and exercises the production owner verifier in tests; no delivery or completion behavior changes (#265)
 - [0.4.20](0.4.20.md) (2026-10-19): Requires Pi-owned receipts for native Windows input delivery (#254); exposes historical Codex question emissions in ordinary result, status, and inspect queries (#189)
