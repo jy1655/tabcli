@@ -181,6 +181,7 @@ impl Fake {
     fn new() -> (Self, turn::Claim, String) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("events")).unwrap();
+        crate::native::session::test_support::write_test_manifest(root.path(), "codex");
         update_status(root.path(), SessionState::Working, None, None).unwrap();
         let claim = turn::claim(&Store::open_unchecked(root.path()), &[]).unwrap();
         let token = claim.token().to_owned();

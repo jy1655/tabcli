@@ -538,6 +538,17 @@ launch, observe, continue, and close without replacing the capabilities those CL
   model time or billing time, and do not collect provider usage from a signal that the
   provider does not document as usage. Usage a query shows is what the event records
   (`usage`, or `usage_reason` with the bounded `usage_error`); never estimate or total it.
+- A delivery refusal (`Delivery::NotSent`) is settled by `settle_delivery_refusal_locked`
+  as the receipt's failed event: Bridge-owned evidence of what was not sent, with
+  `provenance: "delivery_not_sent"`, the refusal text as `error`, the session's provider
+  from the manifest and no provider session or turn id. It is journaled through the same
+  completion machinery under the one lifecycle lock, after a pending completion is
+  recovered and only for the installed claim of a session that is not closed; a failed
+  journal write leaves the claim installed. Every query reads it as `failed`; the timeline
+  marks it `stage: delivery_refusal` and `delivery: refused_not_sent`; reopen accepts it.
+  Historical receipts without an event stay `unresolved`: never infer a refusal from
+  `status.error`, never repair such a receipt, and the reopened-conversation refusal in
+  `reopen.rs` still leaves one on purpose.
 - The self-test runs in the ordinary state root by default and in a private directory
   only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
   installed setup as it is. It closes only what it created, bounds every command it

@@ -56,6 +56,21 @@ pub(in crate::native) mod test_support {
         SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
         with_publication_read_log, with_sync_failure, with_sync_log, write_event,
     };
+
+    /// A minimal manifest for a session fixture, named after its directory. Every
+    /// session has one; a delivery refusal records an event that names the provider
+    /// from it, so a fixture that settles a refusal needs it.
+    pub(in crate::native) fn write_test_manifest(directory: &std::path::Path, provider: &str) {
+        super::Store::open_unchecked(directory)
+            .record(super::CoreRecord::Manifest)
+            .write_json(&serde_json::json!({
+                "schema": 1, "id": directory.file_name().unwrap().to_str().unwrap(),
+                "provider": provider, "provider_path": provider, "provider_version": "0.159.3",
+                "workspace": directory, "title": "fixture", "model": null,
+                "effort": null, "yolo": false, "created_unix_ms": 1
+            }))
+            .unwrap();
+    }
 }
 
 /// A read-only view. Opening a view performs no recovery or record mutation.

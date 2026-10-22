@@ -277,7 +277,8 @@ The native-queue follow-up has a send-side limit of its own on native Windows. `
 client or writing its pending-turn record, Bridge measures the prepared command line, including
 the launcher, arguments and Windows quoting, in UTF-16 units (excluding the terminating NUL).
 At 32,767 units or more it refuses delivery with the measured size, limit and remedy; nothing
-is sent, the request is recorded as unresolved and the session returns to `ready` (issue #251).
+is sent, the request is recorded as `failed` with that refusal (`provenance: "delivery_not_sent"`)
+and the session returns to `ready` (issue #251).
 Shorten the follow-up and pass long material by path in the workspace. Codex's inner hop from
 `codex.ps1` to `node` is unmeasured and can still fail below Bridge's limit. The lifecycle-hook
 route does not change this send-side limit; the console-pasted initial prompt has no such limit

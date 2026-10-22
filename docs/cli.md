@@ -318,7 +318,9 @@ Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsuppor
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
 SESSION --explicit` on the source, then inspect it again. `request-unresolved` and
 `source-identity-missing` mean Bridge cannot verify the recorded results or find a conversation to
-resume; inspect the source and use a new `ask` if that evidence is unavailable.
+resume; inspect the source and use a new `ask` if that evidence is unavailable. A follow-up that
+Bridge refused before sending is a recorded `failed` request (`delivery_not_sent`) and does not
+block reopen; a receipt without any event does.
 
 `workspace-refused` is the launch admission of [`ask`](#ask) applied to the source's workspace. It
 runs after the platform and provider check, so `provider-unsupported` still comes first, and before
@@ -1302,6 +1304,12 @@ Request states reported by `result` are `completed`, `failed`, `cancelled`, `pen
 `recovery_required`, and `unavailable`; a waiting read can report `busy` when it times out without a
 consistent observation. `cancelled` occurs only for a correlated provider interruption (see
 [cancel](#cancel)). `accepted` is the detached command acknowledgement, not a published result.
+A follow-up or initial prompt that Bridge refused before anything was sent (a preparation, budget,
+hold or transport refusal) is `failed`: Bridge records a failure event for the receipt whose
+`error` is the refusal text and whose `provenance` is `delivery_not_sent`, with no provider
+session or turn id. `unresolved` is a receipt without any event: a refusal recorded by an earlier
+Bridge release, a reopened-conversation refusal, or a claim-stage race. Bridge never infers a
+refusal from `status.error` and never repairs such receipts.
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
 
@@ -1598,8 +1606,10 @@ Fields: `schema_version`, `ok`, `session`, `request_id`, `session_state`, `sessi
 
 `requests[]` contains `result` summaries without the result body, plus `derived_from: "result"`,
 `result_command` (the command to query that request as JSON), and `delivery`. `delivery` is
-`"completion_recorded"` when a published completion is read, otherwise `"unknown"`.
-`delivery: "unknown"` does not mean that nothing was sent.
+`"completion_recorded"` when a published completion is read, `"refused_not_sent"` when the
+recorded event is Bridge's delivery refusal (`provenance: "delivery_not_sent"`, nothing was sent),
+otherwise `"unknown"`. `delivery: "unknown"` does not mean that nothing was sent. A refusal
+event's entry has `stage: "delivery_refusal"`; a provider completion's has `stage: "completion"`.
 
 ### search
 

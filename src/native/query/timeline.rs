@@ -3,7 +3,7 @@ use super::*;
 use crate::native::session::EventsDirectory;
 use crate::native::session::record::{self, Cached, CachedRecords as Records};
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
-use crate::native::session::turn::valid_turn_claim_token;
+use crate::native::session::turn::{self, valid_turn_claim_token};
 use crate::native::session::{CoreRecord, Reader};
 use agent_bridge::PUBLIC_COMMAND;
 use serde::de::DeserializeOwned;
@@ -333,6 +333,7 @@ fn request_summaries(
     {
         let event_source = format!("events/{}", receipt.event_file);
         let mut completion_recorded = false;
+        let mut refused = false;
         let result = match before.get(&event_source) {
             Some(Err(error)) if snapshot.published(&receipt.event_file) => {
                 Err(anyhow::anyhow!("{error}"))
@@ -340,6 +341,7 @@ fn request_summaries(
             _ => snapshot.result_with(&Selector::Request(receipt.request_id.clone()), |name| {
                 let event = event(before, snapshot, name)?;
                 completion_recorded = event.is_some();
+                refused = event.as_ref().is_some_and(is_delivery_refusal);
                 Ok(event)
             }),
         };
@@ -350,7 +352,11 @@ fn request_summaries(
                     "{PUBLIC_COMMAND} result {id} --request {} --json",
                     receipt.request_id
                 ));
-                result["delivery"] = json!(if completion_recorded {
+                // A refusal event is Bridge's record that nothing was sent; it is not a
+                // provider completion.
+                result["delivery"] = json!(if refused {
+                    "refused_not_sent"
+                } else if completion_recorded {
                     "completion_recorded"
                 } else {
                     "unknown"
@@ -369,6 +375,11 @@ fn request_summaries(
         summaries.push(summary);
     }
     summaries
+}
+
+/// A Bridge-owned refusal event: nothing was sent for its receipt (`delivery_not_sent`).
+fn is_delivery_refusal(event: &SessionEvent) -> bool {
+    event.provenance.as_deref() == Some(turn::DELIVERY_NOT_SENT_PROVENANCE)
 }
 
 fn render_events(
@@ -405,7 +416,11 @@ fn render_events(
                 receipt,
                 Some(name),
                 Entry {
-                    stage: "completion",
+                    stage: if is_delivery_refusal(&event) {
+                        "delivery_refusal"
+                    } else {
+                        "completion"
+                    },
                     time: event.created_unix_ms,
                     source: &source,
                     state: "observed",

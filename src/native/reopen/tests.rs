@@ -478,6 +478,8 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
         "{error:#}"
     );
 
+    // Unchanged: a receipt without an event (a refusal recorded by an earlier Bridge, or a
+    // reopened-conversation refusal) is never inferred to be a refusal; it stays unresolved.
     let unresolved = write_closed_reopen_source(
         root.path(),
         "session-reopenunres",
@@ -2295,10 +2297,27 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
             !new.join(TURN_CLAIM_FILE).exists(),
             "{label}: claim not released"
         );
-        // The receipt survives with its outcome unresolved: nothing was delivered.
+        // Changed deliberately: the after-launch holder check refuses the initial delivery
+        // through shared settlement (`Outcome::NotSent`), so the receipt now carries the
+        // refusal as its failed event; nothing was delivered.
         let result = query::request_result(&Reader::open_unchecked(&new), &request_id).unwrap();
-        assert_eq!(result["request_state"], "unresolved", "{label}: {result}");
-        assert_eq!(result["result"], serde_json::Value::Null, "{label}");
+        assert_eq!(result["request_state"], "failed", "{label}: {result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("reopen refused (reopen-verification-failed)"),
+            "{label}: {result}"
+        );
+        assert_eq!(
+            Reader::open_unchecked(&new)
+                .event_strict(result["event_id"].as_str().unwrap())
+                .unwrap()
+                .provenance
+                .as_deref(),
+            Some(turn::DELIVERY_NOT_SENT_PROVENANCE),
+            "{label}"
+        );
 
         // The source is untouched except for its marker. Only a refusal whose recorded
         // provider process is verified gone releases it. A closed surface is not that
@@ -3883,4 +3902,79 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
         sessions,
         vec![std::ffi::OsString::from("session-start-source")]
     );
+}
+
+// A follow-up refused before anything was sent settles as the receipt's failed event, so
+// the reopen receipt gate accepts the closed session and resumes the older completed turn's
+// conversation; the refusal carries no provider identity and erases none.
+#[test]
+fn a_refused_follow_up_is_a_recorded_failure_that_reopen_accepts() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-reopenrefused";
+    let directory = root.path().join(id);
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    write_reopen_test_manifest(
+        &directory,
+        id,
+        "claude",
+        PathBuf::from("/opt/provider"),
+        root.path().to_owned(),
+        true,
+    );
+    write_json_atomic(
+        &directory.join(TERMINAL_HANDLE_FILE),
+        &reopen_test_terminal(id),
+    )
+    .unwrap();
+    update_status(&directory, SessionState::Running, None, None).unwrap();
+    let store = Store::open_unchecked(&directory);
+    let first = turn::claim(&store, &[]).unwrap();
+    let first_token = first.token().to_owned();
+    first.retain();
+    turn::Report::for_claim(&store, FirstPartyCli::Claude, Some(&first_token))
+        .complete(
+            "done",
+            Some(REOPEN_TEST_CONVERSATION.to_owned()),
+            Some("turn-1".to_owned()),
+        )
+        .unwrap();
+    let completed_event = requests::for_claim(&store, &first_token)
+        .unwrap()
+        .unwrap()
+        .event_file;
+    let (mut follow_up, _) = turn::claim_ready(&store, id, &[]).unwrap();
+    let refused_request = follow_up.receipt().request_id.clone();
+    let refused_event = follow_up.receipt().event_file.clone();
+    follow_up.begin_delivery().unwrap();
+    follow_up
+        .settle_delivery(turn::Delivery::NotSent(&anyhow::anyhow!(
+            "follow-up refused before delivery"
+        )))
+        .unwrap();
+    drop(follow_up);
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    session_close::close(
+        &store,
+        None,
+        session_close::budget::close_deadline(),
+        |_| Ok(terminal::CloseOutcome::Closed.into()),
+    )
+    .unwrap();
+    let refused = store.event_strict(&refused_event).unwrap();
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("follow-up refused before delivery")
+    );
+    assert_eq!(
+        refused.provenance.as_deref(),
+        Some(turn::DELIVERY_NOT_SENT_PROVENANCE)
+    );
+    let result = query::request_result(&store, &refused_request).unwrap();
+    assert_eq!(result["request_state"], "failed");
+    let source = inspect_reopen_source(&directory, id).unwrap();
+    assert_eq!(source.provider, FirstPartyCli::Claude);
+    assert_eq!(source.provider_session_id, REOPEN_TEST_CONVERSATION);
+    assert_eq!(source.event_id, completed_event);
+    assert_ne!(source.event_id, refused_event);
 }

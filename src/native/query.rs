@@ -587,6 +587,10 @@ fn observe_snapshot_until(
 #[cfg(test)]
 pub(super) use super::session::observe_owner;
 
+/// The public `wait` of one request address, for tests of settlement paths.
+#[cfg(test)]
+pub(in crate::native) use wait::one as wait_one;
+
 /// Ordinary `result --request`, with question fields, outside wait, failure envelopes and the doctor.
 pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
     Ok(observe_snapshot(reader)?

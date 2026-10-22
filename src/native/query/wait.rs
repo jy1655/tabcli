@@ -239,7 +239,12 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
 }
 
 /// The legacy result caller retains its timeout envelope and last good observation.
-pub(super) fn one(root: &Path, session: &str, request: &str, timeout: Duration) -> Result<Value> {
+pub(in crate::native) fn one(
+    root: &Path,
+    session: &str,
+    request: &str,
+    timeout: Duration,
+) -> Result<Value> {
     let outcome = poll(
         root,
         &[Address {
