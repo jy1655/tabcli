@@ -208,8 +208,8 @@ trait NativeProviderAdapter: Sync {
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey>;
-    fn result_timeout_diagnostic(&self) -> Option<super::doctor::ResultTimeoutDiagnostic>;
-    fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
+    fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
+    fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
     // Caller-environment variables removed from every short-lived provider query the
     // bridge runs (version preflight, doctor probes). Each adapter states its own list;
     // there is no shared default.
@@ -268,14 +268,14 @@ pub(super) fn workspace_trust_key(
 
 pub(super) fn diagnose(
     provider: FirstPartyCli,
-    context: super::doctor::Context<'_>,
-) -> Vec<super::doctor::Check> {
+    context: super::diagnostics::Context<'_>,
+) -> Vec<super::diagnostics::Check> {
     adapter(provider).diagnose(context)
 }
 
 pub(super) fn result_timeout_diagnostic(
     provider: FirstPartyCli,
-) -> Option<super::doctor::ResultTimeoutDiagnostic> {
+) -> Option<super::diagnostics::ResultTimeoutDiagnostic> {
     adapter(provider).result_timeout_diagnostic()
 }
 

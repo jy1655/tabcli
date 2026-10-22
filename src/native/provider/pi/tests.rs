@@ -164,7 +164,7 @@ fn the_pi_home_is_trust_json_under_the_agent_dir_or_the_user_home() {
 
 #[test]
 fn diagnostics_describe_pi_owned_fallback_without_claiming_live_delivery() {
-    use super::super::super::doctor::{Availability, Context};
+    use super::super::super::diagnostics::{Availability, Context};
     use super::NativeProviderAdapter;
     let checks = super::ADAPTER.diagnose(Context {
         directory: None,

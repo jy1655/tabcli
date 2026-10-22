@@ -67,8 +67,8 @@ pub(super) fn notify_payload_budget_from_sizes(
 pub(super) fn classify_notify_payload_budget(
     budget: &NotifyPayloadBudget,
     windows: bool,
-) -> (crate::native::doctor::Availability, &'static str) {
-    use crate::native::doctor::Availability::*;
+) -> (crate::native::diagnostics::Availability, &'static str) {
+    use crate::native::diagnostics::Availability::{Available, Unavailable};
     if !windows {
         (Available, "codex_notify_payload_no_limit")
     } else if budget.escaped_units.saturating_add(budget.envelope_units) >= budget.limit_units {
@@ -99,8 +99,11 @@ fn notify_payload_evidence(
 const NOTIFY_PAYLOAD_DETAIL: &str = "This request may still depend on notify (no binding observed or lifecycle hooks were not recorded as injected). Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can be larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the payload, so text with many quotation marks is undercounted. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
 const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending while the session is working after a long turn, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl) and close-session the session; never resend an uncertain turn. Otherwise keep delivered prompts and requested answers short on native Windows: put long material in workspace files and ask for a file-based report.";
 
-fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Check {
-    use crate::native::doctor::{Availability::*, Check};
+fn notify_payload_check(directory: Option<&Path>) -> crate::native::diagnostics::Check {
+    use crate::native::diagnostics::{
+        Availability::{Available, Unknown},
+        Check,
+    };
     let Some(directory) = directory else {
         return Check::new(
             "codex_notify_payload_budget",
@@ -211,9 +214,13 @@ fn pending_prompt(directory: &Path, pending: &super::PendingCodexTurn) -> Result
 }
 
 pub(super) fn diagnose_codex(
-    context: crate::native::doctor::Context<'_>,
-) -> Vec<crate::native::doctor::Check> {
-    use crate::native::doctor::{self, Availability::*, Check};
+    context: crate::native::diagnostics::Context<'_>,
+) -> Vec<crate::native::diagnostics::Check> {
+    use crate::native::diagnostics::{
+        Availability::{Available, Unavailable, Unknown},
+        Check,
+    };
+    use crate::native::doctor;
     let mut checks = Vec::new();
     let version = context
         .manifest
@@ -328,8 +335,11 @@ pub(super) fn diagnose_codex(
 fn diagnose_daemon_output(
     output: &std::process::Output,
     version: &str,
-) -> crate::native::doctor::Check {
-    use crate::native::doctor::{Availability::*, Check};
+) -> crate::native::diagnostics::Check {
+    use crate::native::diagnostics::{
+        Availability::{Available, Unavailable, Unknown},
+        Check,
+    };
     // An optional server observation, not a delivery gate. A failed probe is not proof of absence.
     let classified = classify_codex_daemon_probe(
         output.status.success(),

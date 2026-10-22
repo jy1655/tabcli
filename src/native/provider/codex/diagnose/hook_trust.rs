@@ -1,6 +1,6 @@
 //! Current-installation probe, never evidence that a managed session ran a hook.
 use super::super::{ADAPTER, hooks};
-use crate::native::doctor::{Availability, Check, Context};
+use crate::native::diagnostics::{Availability, Check, Context};
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::{process_env, provider_process};
 use anyhow::{Context as _, Result, bail};

@@ -232,8 +232,10 @@ impl Transport for AgyPaste {
 }
 
 impl NativeProviderAdapter for AgyAdapter {
-    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
-        Some(super::super::doctor::ResultTimeoutDiagnostic {
+    fn result_timeout_diagnostic(
+        &self,
+    ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {
+        Some(super::super::diagnostics::ResultTimeoutDiagnostic {
             probe: false,
             detail: |check, request_id| {
                 (check.reason_code.as_deref() == Some(AGY_TOOL_CONFIRMATION_OBSERVED)
@@ -316,9 +318,9 @@ impl NativeProviderAdapter for AgyAdapter {
 
     fn diagnose(
         &self,
-        context: super::super::doctor::Context<'_>,
-    ) -> Vec<super::super::doctor::Check> {
-        use super::super::doctor::{Availability::Unknown, Check};
+        context: super::super::diagnostics::Context<'_>,
+    ) -> Vec<super::super::diagnostics::Check> {
+        use super::super::diagnostics::{Availability::Unknown, Check};
         let mut checks = vec![
             Check::new(
                 "agy_follow_up",

@@ -98,7 +98,7 @@ fn credential_status_shapes_are_bounded_to_known_fields_and_exit_codes() {
 
 #[test]
 fn ready_credentials_preserve_auth_type_as_evidence_only() {
-    use crate::native::doctor::Availability;
+    use crate::native::diagnostics::Availability;
     for auth_type in [Some("future_scheme"), None] {
         let output = serde_json::json!({
             "status": "ready", "provider": "openai", "authType": auth_type
@@ -133,7 +133,7 @@ fn model_provider_requires_a_qualified_id_without_guessing() {
 
 #[test]
 fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
-    use crate::native::doctor;
+    use crate::native::diagnostics;
     use crate::native::session::schema::SessionManifest;
     let mut manifest = SessionManifest {
         schema: 1,
@@ -148,7 +148,7 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
         yolo: false,
         created_unix_ms: 1,
     };
-    let base = doctor::Context {
+    let base = diagnostics::Context {
         directory: None,
         manifest: None,
         executable: Some(Path::new("pi")),
@@ -174,7 +174,7 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
     for model in [None, Some("unqualified".into())] {
         manifest.model = model;
         let check = credential_diagnosis(
-            doctor::Context {
+            diagnostics::Context {
                 manifest: Some(&manifest),
                 ..base
             },
@@ -192,7 +192,7 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
     manifest.model = Some("openai/gpt-4o-mini".into());
     for (probe, executable) in [(false, base.executable), (true, None)] {
         let check = credential_diagnosis(
-            doctor::Context {
+            diagnostics::Context {
                 manifest: Some(&manifest),
                 probe,
                 executable,
@@ -200,7 +200,7 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
             },
             |_, _, _, _| panic!("must not run"),
         );
-        assert_eq!(check.availability, doctor::Availability::Unknown);
+        assert_eq!(check.availability, diagnostics::Availability::Unknown);
         let check = serde_json::to_value(check).unwrap();
         assert_eq!(
             check["evidence"],
@@ -214,7 +214,7 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
         let mut calls = Vec::new();
         let mut deadlines = Vec::new();
         let check = credential_diagnosis(
-            doctor::Context {
+            diagnostics::Context {
                 manifest: Some(&manifest),
                 ..base
             },
@@ -238,11 +238,11 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
             },
         );
         let expected = if credentials_missing {
-            doctor::Availability::Unavailable
+            diagnostics::Availability::Unavailable
         } else if resolved == "openai" {
-            doctor::Availability::Available
+            diagnostics::Availability::Available
         } else {
-            doctor::Availability::Unknown
+            diagnostics::Availability::Unknown
         };
         assert_eq!(check.availability, expected);
         assert_eq!(

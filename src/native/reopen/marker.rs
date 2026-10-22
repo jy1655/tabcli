@@ -4,7 +4,7 @@ use super::{
     RecordedReopenRefusal, RefusedLaunchCleanup, ReopenMarker, read_reopen_launch_refusal,
     refused_launch_cleanup, reopen_refusal, valid_session_id,
 };
-use crate::native::doctor::{Availability, Check};
+use crate::native::diagnostics::{Availability, Check};
 use crate::native::session::{CoreRecord, Reader};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};

@@ -10,9 +10,9 @@ use std::{
 // official prompt-rejection or completion signal identifying the submitted request
 // before the agent turn starts. Configuration is not authentication acceptance.
 pub(super) fn credential_diagnosis(
-    context: crate::native::doctor::Context<'_>,
+    context: crate::native::diagnostics::Context<'_>,
     mut probe: impl FnMut(&Path, &[&str], &Path, Instant) -> Result<std::process::Output>,
-) -> crate::native::doctor::Check {
+) -> crate::native::diagnostics::Check {
     let target = (
         context.manifest.and_then(|m| m.model.as_deref()),
         context.executable,
@@ -60,7 +60,7 @@ pub(super) fn credential_diagnosis(
         deadline,
     );
     let resolution = parse_credentials(&provider, resolved, target);
-    if resolution.availability == crate::native::doctor::Availability::Unknown {
+    if resolution.availability == crate::native::diagnostics::Availability::Unknown {
         return resolution;
     }
     parse_credentials(
@@ -103,8 +103,8 @@ fn credential_check(
     auth_type: Option<&str>,
     exit_code: Option<i32>,
     target: (Option<&str>, Option<&Path>),
-) -> crate::native::doctor::Check {
-    use crate::native::doctor::{Availability, Check};
+) -> crate::native::diagnostics::Check {
+    use crate::native::diagnostics::{Availability, Check};
     let (availability, code) = match status {
         "ready" => (Availability::Available, "pi_provider_credentials_ready"),
         "not_ready" => (
@@ -123,7 +123,7 @@ fn parse_credentials(
     provider: &str,
     output: Result<std::process::Output>,
     target: (Option<&str>, Option<&Path>),
-) -> crate::native::doctor::Check {
+) -> crate::native::diagnostics::Check {
     let output = match output {
         Ok(output) => output,
         Err(error) => {

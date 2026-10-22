@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 #[test]
 fn diagnostics_describe_agy_owned_fallback_without_claiming_live_delivery() {
-    use super::super::super::super::doctor::{Availability, Context};
+    use super::super::super::super::diagnostics::{Availability, Context};
     use super::super::NativeProviderAdapter;
     let checks = super::super::ADAPTER.diagnose(Context {
         directory: None,
@@ -36,7 +36,7 @@ fn diagnostics_describe_agy_owned_fallback_without_claiming_live_delivery() {
 
 #[test]
 fn doctor_reports_startup_readiness_and_the_pending_receipt_without_recovery() {
-    use super::super::super::super::doctor::Availability;
+    use super::super::super::super::diagnostics::Availability;
     let check = input_receipt_check(None);
     assert_eq!(check.id, "agy_input_receipt");
     assert_eq!(check.availability, Availability::Unknown);

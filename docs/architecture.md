@@ -249,8 +249,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `doctor`, `consent`, and `self_test`, retain their separate formats. The `sessions` array and
   `settings` output are also separate and are not wrapped in an envelope.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
-  optional bounded probes. Providers choose which observation can explain a result timeout;
-  `doctor` assembles that read and `self_test` bounds its execution. A diagnostic report is not
+  optional bounded probes. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
+  `ResultTimeoutDiagnostic`) lives in `src/native/diagnostics.rs`; provider adapters and the
+  Reopen marker observation depend on it rather than on the command. `probe` stays in
+  `doctor` for now. Providers choose which observation can explain a result timeout;
+  `diagnostics` assembles that read and `self_test` bounds its execution. A diagnostic report is not
   proof of successful delivery. The report states its scope using the check inputs and existing
   observations.
 - `src/native/self_test.rs` runs the explicit public self-test through bounded commands, checks

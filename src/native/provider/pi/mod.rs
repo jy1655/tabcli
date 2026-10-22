@@ -217,8 +217,10 @@ impl Home {
 }
 
 impl NativeProviderAdapter for PiAdapter {
-    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
-        Some(super::super::doctor::ResultTimeoutDiagnostic {
+    fn result_timeout_diagnostic(
+        &self,
+    ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {
+        Some(super::super::diagnostics::ResultTimeoutDiagnostic {
             probe: true,
             // Credential configuration belongs to the session, not a submitted request.
             detail: |check, _request_id| {
@@ -316,9 +318,9 @@ impl NativeProviderAdapter for PiAdapter {
 
     fn diagnose(
         &self,
-        context: super::super::doctor::Context<'_>,
-    ) -> Vec<super::super::doctor::Check> {
-        use super::super::doctor::{Availability::Unknown, Check};
+        context: super::super::diagnostics::Context<'_>,
+    ) -> Vec<super::super::diagnostics::Check> {
+        use super::super::diagnostics::{Availability::Unknown, Check};
         vec![
             Check::new(
                 "pi_follow_up",
