@@ -1832,6 +1832,129 @@ fn size_policy_publishes_a_bare_event_at_the_limit_before_it_fails() {
 }
 
 #[test]
+fn report_producers_preserve_text_and_require_matching_cancel_intent() {
+    session::tests::with_fixed_time(|| {
+        let text = "a\r\u{1b}[0m\n\t";
+        // Expected text is independent of terminal_safe_text and EventOutcome.
+        for (kind, intent, expected_message, expected_error, expected_cancelled) in [
+            ("complete", "absent", text, None, false),
+            ("fail", "absent", "", Some("a\\r\\u{1b}[0m\n\t"), false),
+            (
+                "cancelled",
+                "matching",
+                "",
+                Some("cancelled: a\\r\\u{1b}[0m\n\t"),
+                true,
+            ),
+            ("cancelled", "absent", "", Some("a\\r\\u{1b}[0m\n\t"), false),
+            (
+                "cancelled",
+                "different",
+                "",
+                Some("a\\r\\u{1b}[0m\n\t"),
+                false,
+            ),
+        ] {
+            let (_directory, store) = fixture(SessionState::Working);
+            let claimed = claim(&store, &[]).unwrap();
+            let receipt = claimed.receipt().clone();
+            if intent != "absent" {
+                let token = if intent == "matching" {
+                    claimed.token()
+                } else {
+                    "1-2-3"
+                };
+                assert!(intent == "matching" || token != claimed.token());
+                store
+                    .record(CoreRecord::Cancel)
+                    .write_json(&serde_json::json!({
+                        "schema": 1,
+                        "request_id": receipt.request_id,
+                        "claim_token": token,
+                        "created_unix_ms": 1
+                    }))
+                    .unwrap();
+            }
+            let report = Report::for_claim(&store, FirstPartyCli::Pi, Some(claimed.token()))
+                .with_provenance(Some("signal"))
+                .with_usage(Some(sample_usage()), None);
+            let provider_session_id = Some("provider-session".to_owned());
+            let turn_id = Some("provider-turn".to_owned());
+            match kind {
+                "complete" => report.complete(text, provider_session_id, turn_id),
+                "fail" => report.fail(text, provider_session_id, turn_id),
+                _ => report.cancelled(text, provider_session_id, turn_id),
+            }
+            .unwrap();
+            let expected = SessionEvent {
+                cancelled: expected_cancelled,
+                provider: "pi".into(),
+                message: expected_message.into(),
+                error: expected_error.map(str::to_owned),
+                provider_session_id: Some("provider-session".into()),
+                turn_id: Some("provider-turn".into()),
+                created_unix_ms: Some(123456789),
+                provenance: Some("signal".into()),
+                usage: Some(sample_usage()),
+                usage_error: None,
+            };
+            assert_eq!(
+                store.event_strict(&receipt.event_file).unwrap(),
+                expected,
+                "{kind}/{intent}"
+            );
+            let status = store.status().unwrap();
+            assert_eq!(status.state, SessionState::Ready, "{kind}/{intent}");
+            assert_eq!(status.error.as_deref(), expected_error, "{kind}/{intent}");
+            assert!(current_claim_token(&store).unwrap().is_none());
+        }
+    });
+}
+
+#[test]
+fn outcome_constructor_preserves_event_bytes_without_preparing_text() {
+    // Independent wire expectations: do not build these through the constructor or
+    // replace the raw legacy/recovery fixtures elsewhere with EventOutcome values.
+    for (outcome, provenance, usage_error, expected) in [
+        (
+            EventOutcome::Success("answer\n\u{1b}".into()),
+            None,
+            None,
+            r#"{"provider":"pi","message":"answer\n\u001b","error":null,"provider_session_id":"session","turn_id":"turn","created_unix_ms":123}"#,
+        ),
+        (
+            EventOutcome::Failure("failure\n\u{1b}".into()),
+            None,
+            None,
+            r#"{"provider":"pi","message":"","error":"failure\n\u001b","provider_session_id":"session","turn_id":"turn","created_unix_ms":123}"#,
+        ),
+        (
+            EventOutcome::ConfirmedCancelled("caller-prepared detail".into()),
+            Some("signal".into()),
+            Some("usage unavailable".into()),
+            r#"{"cancelled":true,"provider":"pi","message":"","error":"caller-prepared detail","provider_session_id":"session","turn_id":"turn","created_unix_ms":123,"provenance":"signal","usage_error":"usage unavailable"}"#,
+        ),
+    ] {
+        let event = outcome.into_event(
+            provenance,
+            "pi".into(),
+            Some("session".into()),
+            Some("turn".into()),
+            123,
+            Usage {
+                usage: None,
+                usage_error,
+            },
+        );
+        assert_eq!(serde_json::to_string(&event).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<SessionEvent>(expected).unwrap(),
+            event
+        );
+    }
+}
+
+#[test]
 fn journal_predicate_accepts_legacy_event_bytes_and_round_trips_usage() {
     // An event this binary writes without usage has the bytes an older writer produced:
     // no usage field appears, so an old journal and its old event read as Committed.
