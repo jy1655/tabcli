@@ -503,12 +503,12 @@ fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
 /// Called before old dead-owner repair. A new launch with an uncertain spawn must not
 /// be silently closed/released by the legacy owner-only repair path.
 pub(in crate::native) fn repair(store: &Store) -> Result<bool> {
-    repair_with_owner(store, super::observe_owner)
+    repair_with_owner(store, super::owner::attest_recorded_owner)
 }
 
 fn repair_with_owner(
     store: &Store,
-    observe: impl FnOnce(&Reader) -> super::OwnerObservation,
+    observe: impl FnOnce(&Reader) -> Result<Option<super::owner::OwnerAttestation>>,
 ) -> Result<bool> {
     let Some(record) = read(store)? else {
         return Ok(false);
@@ -531,19 +531,25 @@ fn repair_with_owner(
         return Ok(false);
     }
     if status.state == SessionState::Launching {
-        let owner = observe(store);
         if unix_ms() >= record.deadline_unix_ms {
             fail_locked(
                 store,
                 &record,
                 "provider launch timed out before startup was confirmed",
             )?;
-        } else if owner.process_alive == Some(false) || owner.identity_matches == Some(false) {
-            fail_locked(
-                store,
-                &record,
-                "native launch wrapper exited before startup was confirmed",
-            )?;
+        } else if let Some(owner) = observe(store)? {
+            use crate::native::process_identity::ProcessObservation;
+            match owner.process {
+                ProcessObservation::Gone(_) => fail_locked(
+                    store,
+                    &record,
+                    "native launch wrapper exited before startup was confirmed",
+                )?,
+                ProcessObservation::Unknown(reason) => {
+                    bail!("cannot verify native launch wrapper: {reason}");
+                }
+                ProcessObservation::Live(_) => {}
+            }
         }
     } else if status.state == SessionState::Failed {
         fail_locked(
@@ -829,8 +835,10 @@ mod tests {
         let (directory, _) = fixture();
         let store = Store::open_unchecked(directory.path());
         assert!(
-            repair_with_owner(&store, |_| super::super::owner::tests::reused_observation())
-                .unwrap()
+            repair_with_owner(&store, |_| Ok(Some(
+                super::super::owner::tests::reused_attestation()
+            )))
+            .unwrap()
         );
         assert_eq!(store.status().unwrap().state, SessionState::Failed);
         assert!(
@@ -841,6 +849,92 @@ mod tests {
                 .unwrap()
                 .contains("wrapper exited")
         );
+    }
+
+    #[test]
+    fn launch_repair_requires_process_death_not_projected_bools() {
+        use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+        use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
+        let mut failures = Vec::new();
+        for pid_alive in [false, true] {
+            for (case, process, control, dead, unknown) in [
+                (
+                    "unknown",
+                    ProcessObservation::Unknown("inspection denied".into()),
+                    ControlAttestation::NotRecorded,
+                    false,
+                    true,
+                ),
+                (
+                    "live changed control",
+                    ProcessObservation::Live(Attested::Incarnation),
+                    ControlAttestation::Changed("TTY changed".into()),
+                    false,
+                    false,
+                ),
+                (
+                    "live unknown control",
+                    ProcessObservation::Live(Attested::Incarnation),
+                    ControlAttestation::Unknown("control denied".into()),
+                    false,
+                    false,
+                ),
+                (
+                    "live incarnation",
+                    ProcessObservation::Live(Attested::Incarnation),
+                    ControlAttestation::Verified,
+                    false,
+                    false,
+                ),
+                (
+                    "exited",
+                    ProcessObservation::Gone(Gone::Exited),
+                    ControlAttestation::NotRecorded,
+                    true,
+                    false,
+                ),
+                (
+                    "reused",
+                    ProcessObservation::Gone(Gone::Reused("birth changed".into())),
+                    ControlAttestation::NotRecorded,
+                    true,
+                    false,
+                ),
+                (
+                    "legacy",
+                    crate::native::process_identity::classify::<()>(
+                        42,
+                        None,
+                        || pid_alive,
+                        || panic!("pid-only record"),
+                    ),
+                    ControlAttestation::NotRecorded,
+                    !pid_alive,
+                    false,
+                ),
+            ] {
+                let (directory, token) = fixture();
+                let store = Store::open_unchecked(directory.path());
+                let before = fs::read(directory.path().join(STATUS_FILE)).unwrap();
+                let a = OwnerAttestation {
+                    process,
+                    control,
+                    pid_alive: Some(pid_alive),
+                };
+                let result = repair_with_owner(&store, |_| Ok(Some(a)));
+                let state = store.status().unwrap().state;
+                let unchanged = fs::read(directory.path().join(STATUS_FILE)).unwrap() == before
+                    && turn::current_claim_token(&store).unwrap().as_deref()
+                        == Some(token.as_str());
+                if result.is_err() != unknown
+                    || (state == SessionState::Failed) != dead
+                    || (!dead && !unchanged)
+                {
+                    failures.push(format!("{case}, raw alive={pid_alive}: result={result:?}, state={state}, unchanged={unchanged}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     fn child_command() -> Command {
@@ -861,6 +955,78 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    #[test]
+    fn launch_repair_missing_unreadable_owner_and_deadline_are_distinct() {
+        let (directory, token) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let before = fs::read(directory.path().join(STATUS_FILE)).unwrap();
+        assert!(
+            repair(&store).unwrap(),
+            "a wrapper may not have registered yet"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(STATUS_FILE)).unwrap(),
+            before
+        );
+        store
+            .record(CoreRecord::Owner)
+            .write_json(&"broken")
+            .unwrap();
+        assert!(repair(&store).is_err());
+        assert_eq!(
+            fs::read(directory.path().join(STATUS_FILE)).unwrap(),
+            before
+        );
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+        let mut record = read(&store).unwrap().unwrap();
+        record.deadline_unix_ms = 0;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&record)
+            .unwrap();
+        assert!(
+            repair(&store).unwrap(),
+            "timeout does not need owner evidence"
+        );
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        assert!(status.error.unwrap().contains("launch timed out"));
+        assert!(turn::current_claim_token(&store).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_repair_observes_an_exited_windows_incarnation() {
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let mut child = child_command().spawn().unwrap();
+        let pid = child.id();
+        let identity = terminal::observe_windows_process_identity(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        store
+            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
+                pid,
+                windows_process_identity: Some(identity.unwrap().expect("live child identity")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(repair(&store).unwrap());
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        assert!(
+            store
+                .status()
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("wrapper exited")
+        );
+        assert!(turn::current_claim_token(&store).unwrap().is_none());
     }
 
     #[test]

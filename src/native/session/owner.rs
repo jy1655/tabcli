@@ -5,7 +5,6 @@ use crate::native::process_identity::{Attested, Gone, ProcessObservation, classi
 use crate::native::terminal::ownership::NativeProcessIdentity;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use agent_bridge::process_is_alive;
-#[cfg(any(target_os = "macos", windows))]
 use anyhow::Result;
 use serde::Serialize;
 
@@ -16,27 +15,28 @@ pub(in crate::native) struct OwnerObservation {
     pub(in crate::native) error: Option<String>,
 }
 
+// Reopen fixtures inspect this diagnostic projection. Production
+// lifecycle decisions use the typed attestation below, never these two booleans.
+#[cfg(test)]
 pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
-    let directory = reader.directory();
-    let owner = match RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Owner)
-            .path(),
-    )
-    .optional_json::<NativeSessionOwner>()
-    {
-        Ok(Some(owner)) => owner,
-        Ok(None) => return OwnerObservation::default(),
-        Err(error) => {
-            return OwnerObservation {
-                error: Some(format!("{error:#}")),
-                ..OwnerObservation::default()
-            };
-        }
-    };
-    observe_owner_record(&owner)
+    match attest_recorded_owner(reader) {
+        Ok(Some(owner)) => OwnerObservation::from(&owner),
+        Ok(None) => OwnerObservation::default(),
+        Err(error) => OwnerObservation {
+            error: Some(format!("{error:#}")),
+            ..OwnerObservation::default()
+        },
+    }
 }
 
+/// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
+pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
+    Ok(RecordReader::at(reader.record(CoreRecord::Owner).path())
+        .optional_json::<NativeSessionOwner>()?
+        .map(|owner| attest_owner(&owner)))
+}
+
+#[cfg(any(target_os = "macos", windows))]
 pub(in crate::native) fn observe_owner_record(owner: &NativeSessionOwner) -> OwnerObservation {
     OwnerObservation::from(&attest_owner(owner))
 }

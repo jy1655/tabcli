@@ -357,6 +357,7 @@ fn legacy_and_birth_only_observations_skip_control_and_read_pid_once() {
     }
 }
 
+#[cfg(any(target_os = "macos", windows))]
 pub(in crate::native) fn reused_observation() -> OwnerObservation {
     OwnerObservation::from(&reused_attestation())
 }
