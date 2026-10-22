@@ -124,6 +124,14 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features -- --test-threads=1
+      - name: Validate host integration packages
+        if: hashFiles('scripts/integrations.py') != ''
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Test host integration packages
+        if: hashFiles('scripts/integrations.py') != ''
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
 
   build:
     needs: [validate, test]
@@ -220,8 +228,48 @@ jobs:
             ${{ matrix.archive }}.sha256
           if-no-files-found: error
 
+  integrations:
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Build and verify integrations from the validated release source
+        if: hashFiles('scripts/integrations.py') != ''
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Package validated integrations
+        if: hashFiles('scripts/integrations.py') != ''
+        run: python scripts/integrations.py build --output integration-dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: hashFiles('scripts/integrations.py') != ''
+        with:
+          name: integrations
+          path: integration-dist/*
+          if-no-files-found: error
+
+  # Existing tags predate integrations. Exercise the candidate packager separately
+  # during a rehearsal, without mixing candidate files into validated release assets.
+  integration-rehearsal:
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - run: python scripts/integrations.py build --output integration-dist
+
   publish:
-    needs: [validate, build]
+    needs: [validate, build, integrations]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -234,6 +282,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Set up Python for integration asset verification
+        if: hashFiles('scripts/integrations.py') != ''
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
       - name: Verify downloaded release assets
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
@@ -241,11 +294,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ -f scripts/integrations.py ]; then
+            python scripts/integrations.py verify --output dist --allow-cli-assets
+            asset_count=12
+          else
+            asset_count=4
+          fi
           cd dist
-          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "4"
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "$asset_count"
           macos="$PACKAGE-$RELEASE_VERSION-aarch64-apple-darwin.tar.gz"
           windows="$PACKAGE-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
-          test "$(find . -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)" = "$(printf '%s\n' "$macos" "$macos.sha256" "$windows" "$windows.sha256" | LC_ALL=C sort)"
+          if [ "$asset_count" = 4 ]; then
+            test "$(find . -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)" = "$(printf '%s\n' "$macos" "$macos.sha256" "$windows" "$windows.sha256" | LC_ALL=C sort)"
+          fi
           sha256sum -c ./*.sha256
           case "$PACKAGE" in
             tabcli) notices="THIRD_PARTY_NOTICES.md " ;;

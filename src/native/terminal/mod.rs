@@ -36,12 +36,10 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "linux")]
-mod linux;
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-mod unsupported;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod refusing;
 #[cfg(target_os = "windows")]
 pub(in crate::native) mod windows;
 
@@ -69,12 +67,10 @@ impl std::fmt::Display for StaleDialogClaim {
 
 impl std::error::Error for StaleDialogClaim {}
 
-#[cfg(target_os = "linux")]
-use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use unsupported as platform;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use refusing as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
@@ -552,34 +548,19 @@ pub(super) struct WindowsSessionRecords<'a> {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn windows_console_control(
-    action: crate::native::console_control::ResolvedAction,
-    session: &TerminalSession,
-    records: &WindowsSessionRecords<'_>,
-) -> Result<()> {
-    windows::console_control(action, session, records)
-}
+pub(super) use windows::console_control as windows_console_control;
 
 #[cfg(target_os = "windows")]
 pub(super) use windows::ownership::{windows_console_handle_path, windows_console_root_never_ran};
 
 #[cfg(target_os = "windows")]
-pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
-    windows::powershell_executable()
-}
+pub(super) use windows::powershell_executable as windows_powershell_executable;
 
 #[cfg(all(target_os = "windows", test))]
-pub(super) fn windows_console_launch_command_line(
-    powershell: &Path,
-    command: &str,
-) -> Result<String> {
-    windows::console_launch_command_line(powershell, command)
-}
+pub(super) use windows::console_launch_command_line as windows_console_launch_command_line;
 
 #[cfg(windows)]
-pub(super) fn windows_set_private_permissions(path: &Path, directory: bool) -> Result<()> {
-    windows::set_private_permissions(path, directory)
-}
+pub(super) use windows::set_private_permissions as windows_set_private_permissions;
 
 #[cfg(windows)]
 pub(in crate::native) use windows::observe_process_identity as observe_windows_process_identity;
@@ -591,17 +572,7 @@ mod windows_incarnation;
 pub(in crate::native) use windows_incarnation::WindowsIncarnation;
 
 #[cfg(windows)]
-pub(super) fn windows_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
-    windows::query_process_identity(pid)
-}
-
-#[cfg(windows)]
-pub(super) fn verify_windows_process_identity(
-    pid: u32,
-    identity: &WindowsProcessIdentity,
-) -> Result<()> {
-    windows::verify_process_identity(pid, identity.creation_time, &identity.executable_path)
-}
+pub(super) use windows::query_process_identity as windows_process_identity;
 
 #[cfg(unix)]
 pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {

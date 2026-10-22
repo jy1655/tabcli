@@ -7,10 +7,10 @@ use crate::native::session::primitives::{
     injected_fault, injected_sync_failure, lock_turn_claim, read_json, with_fault_budget,
     with_sync_failure, write_json_atomic, write_private,
 };
-use crate::native::session::state::update_status_with_residual;
+use crate::native::session::state::{ResidualSurface, update_status_with_residual};
 use crate::native::session::test_support::write_test_manifest;
+use crate::native::session::turn;
 use crate::native::session::{Reader, Store};
-use crate::native::session::{launch, turn};
 use crate::native::terminal;
 use std::fs;
 
@@ -468,7 +468,7 @@ fn delivery_settlement_after_close_preserves_the_tombstone() {
                 SessionState::Working,
                 None,
                 Some("unverified surface".to_owned()),
-                Some(launch::ResidualSurface::Unverified),
+                Some(ResidualSurface::Unverified),
             )
             .unwrap();
             if interrupted {

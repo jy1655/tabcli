@@ -327,11 +327,15 @@
     "AGENT_BRIDGE_NATIVE_STATE_DIR": 1,
     "AGENT_BRIDGE_NATIVE_SESSION_DIR": 1,
     "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,
-    ".prefix(\".agent-bridge-\")": 1,
+    "event-{}-{}.json": 1,
+    "manifest.json": 1
+  },
+  "src/native/session/primitives/durable.rs": {
+    ".prefix(\".agent-bridge-\")": 1
+  },
+  "src/native/session/primitives/state_root.rs": {
     ".prefix(\"session-\")": 1,
     "home.join(\".agent-bridge\").join(\"native-sessions\")": 1,
-    "event-{}-{}.json": 1,
-    "manifest.json": 1,
     "native-session": 1
   },
   "src/native/session/requests.rs": {
@@ -362,15 +366,11 @@
     "const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;": 1
   },
   "src/native/terminal/macos/ghostty.rs": {
-    "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
-    "ghostty-start.sh": 2,
     "Terminal surface model is not available": 1,
     "\"not-ready\"": 4,
-    "\"queued\"": 2,
+    "\"queued\"": 1,
     "\"missing\"": 12,
-    "\"closed\"": 1,
-    "{HOST_COMMAND}": 1,
-    "const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;": 1
+    "\"closed\"": 1
   },
   "src/native/terminal/macos/iterm2.rs": {
     "AB_SCREEN_BEGIN": 1,
@@ -519,5 +519,12 @@
     "const OBSERVER_PREFIX: &str = \"codex-observer-\";": 1,
     "codex-candidate-": 1,
     "codex-observer-": 2
+  },
+  "src/native/terminal/macos/ghostty/host.rs": {
+    "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
+    "ghostty-start.sh": 2,
+    "{HOST_COMMAND}": 1,
+    "const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;": 1,
+    "\"queued\"": 1
   }
 }

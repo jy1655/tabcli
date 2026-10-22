@@ -43,12 +43,13 @@ mod process;
 pub(in crate::native) use process::observe_process_identity;
 mod security;
 mod tab;
+pub(in crate::native) use process::query_process_identity;
+pub(super) use process::verify_process_identity;
 use process::{
     open_verified_control_process, query_process_identity_from_handle,
     verify_control_process_identity,
 };
-pub(super) use process::{query_process_identity, verify_process_identity};
-pub(super) use security::set_private_permissions;
+pub(in crate::native) use security::set_private_permissions;
 pub(super) use tab::run_host as run_console_host;
 
 pub(super) fn surface_present(
@@ -472,7 +473,10 @@ fn console_command_line(command: &str) -> String {
 // The whole command line of the console root. The command is passed to PowerShell as one
 // quoted `-Command` argument, so neither it nor the executable path may hold a double
 // quote: it would end the argument.
-pub(super) fn console_launch_command_line(powershell: &Path, command: &str) -> Result<String> {
+pub(in crate::native) fn console_launch_command_line(
+    powershell: &Path,
+    command: &str,
+) -> Result<String> {
     if command.contains('"') {
         bail!("Windows console launch command contains an unsupported double quote");
     }
@@ -560,13 +564,13 @@ fn resolve_executable_from_path(name: &str, path: &OsStr) -> Result<PathBuf> {
     bail!("{name} was not found on an absolute PATH entry")
 }
 
-pub(super) fn powershell_executable() -> Result<PathBuf> {
+pub(in crate::native) fn powershell_executable() -> Result<PathBuf> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;
     resolve_executable_from_path("pwsh.exe", &path)
         .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")
 }
 
-pub(super) fn console_control(
+pub(in crate::native) fn console_control(
     action: ResolvedAction,
     session: &TerminalSession,
     records: &super::WindowsSessionRecords<'_>,

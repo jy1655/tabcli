@@ -1,5 +1,6 @@
 use super::*;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+use crate::native::session::ResidualSurface;
 use crate::native::session::owner::ControlAttestation::{self, *};
 use crate::native::session::owner::tests::reused_attestation;
 use crate::native::session::primitives::{write_json_atomic, write_private};
@@ -156,7 +157,7 @@ fn status_maps_each_judgment_to_its_documented_output() {
     });
     assert_eq!(flags(&observed, None), ["request_index_incomplete"]);
     observed.observation.judgments.request_index = None;
-    observed.observation.judgments.residual_surface = Some(launch::ResidualSurface::Unverified);
+    observed.observation.judgments.residual_surface = Some(ResidualSurface::Unverified);
     assert_eq!(flags(&observed, None), ["residual_surface_unverified"]);
     observed.observation.judgments.residual_surface = None;
     for (ended, expected) in [
@@ -284,7 +285,7 @@ fn status_maps_each_judgment_to_its_documented_output() {
         unreadable: 1,
         error: None,
     });
-    judgments.residual_surface = Some(launch::ResidualSurface::Unverified);
+    judgments.residual_surface = Some(ResidualSurface::Unverified);
     judgments.ended = Ended::Failed;
     assert_eq!(
         attention(&observed, &owner_rows[0].0, &origin(Some(true))),
@@ -335,7 +336,7 @@ fn status_maps_each_judgment_to_its_documented_output() {
     records.receipts.push(receipt(CLAIM));
     let mut observed = in_memory(records);
     observed.observation.judgments.recovery_required = true;
-    observed.observation.judgments.residual_surface = Some(launch::ResidualSurface::Unverified);
+    observed.observation.judgments.residual_surface = Some(ResidualSurface::Unverified);
     observed.observation.judgments.surface = Surface::Unreadable {
         source: SurfaceSource::ActiveHandle,
         reason: "x".into(),
