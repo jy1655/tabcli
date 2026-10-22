@@ -677,6 +677,18 @@ end run
                 ),
                 format!("changed;read={read_target};")
             );
+            assert_eq!(
+                replay(
+                    script,
+                    "Trust this directory?",
+                    key,
+                    read_parameters,
+                    read_arguments,
+                    target_arguments
+                ),
+                format!("changed;read={read_target};"),
+                "a case-only repaint must not receive either key sequence"
+            );
         }
     }
 }
