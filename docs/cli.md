@@ -318,9 +318,10 @@ Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsuppor
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
 SESSION --explicit` on the source, then inspect it again. `request-unresolved` and
 `source-identity-missing` mean Bridge cannot verify the recorded results or find a conversation to
-resume; inspect the source and use a new `ask` if that evidence is unavailable. A follow-up that
-Bridge refused before sending is a recorded `failed` request (`delivery_not_sent`) and does not
-block reopen; a receipt without any event does.
+resume; inspect the source and use a new `ask` if that evidence is unavailable. A request that this
+release settled as `Delivery::NotSent` is a recorded `failed` request (`delivery_not_sent`) and does
+not block reopen. A receipt without any event does: one recorded by an earlier release, or a
+reopened-conversation follow-up refusal, which still leaves such a receipt.
 
 `workspace-refused` is the launch admission of [`ask`](#ask) applied to the source's workspace. It
 runs after the platform and provider check, so `provider-unsupported` still comes first, and before
