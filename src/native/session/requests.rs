@@ -21,6 +21,12 @@ pub(crate) struct ContextSource {
     pub(crate) event_id: String,
     pub(crate) provider: String,
     pub(crate) created_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attached_chars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) omitted_chars: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -338,6 +344,9 @@ mod tests {
             event_id: "event-9.json".to_owned(),
             provider: "codex".to_owned(),
             created_unix_ms: 42,
+            mode: None,
+            attached_chars: None,
+            omitted_chars: None,
         };
         let legacy_event = ContextSource {
             request_id: None,
@@ -365,6 +374,34 @@ mod tests {
         let mut broken = stored.clone();
         broken.context_sources[0].session = "../escape".to_owned();
         assert!(validate(&broken).is_err());
+    }
+
+    #[test]
+    fn context_source_optional_fields_preserve_old_json_and_round_trip_both_modes() {
+        let old = serde_json::json!({"session":"session-old","request_id":"request-old",
+            "event_id":"event-1.json","provider":"codex","created_unix_ms":1});
+        let source: ContextSource = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(source.mode, None);
+        assert_eq!(source.attached_chars, None);
+        assert_eq!(source.omitted_chars, None);
+        assert_eq!(serde_json::to_value(&source).unwrap(), old);
+        for (mode, attached, omitted) in [("full", 6000, 0), ("compact", 5120, 880)] {
+            let mut source = source.clone();
+            source.mode = Some(mode.into());
+            source.attached_chars = Some(attached);
+            source.omitted_chars = Some(omitted);
+            let directory = tempfile::tempdir().unwrap();
+            create(
+                &Store::open_unchecked(directory.path()),
+                "1-2-3",
+                &[source.clone()],
+            )
+            .unwrap();
+            let stored = for_claim(&Reader::open_unchecked(directory.path()), "1-2-3")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.context_sources, vec![source]);
+        }
     }
 
     #[test]

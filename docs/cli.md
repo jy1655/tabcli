@@ -82,7 +82,7 @@ Start a new provider conversation when you do not want to continue an existing s
 tabcli ask PROVIDER [--workspace PATH] (--prompt TEXT | --prompt-file PATH)
     [--title NAME] [--model MODEL] [--effort EFFORT] [--terminal TERMINAL]
     [--yolo] [--timeout-secs N] [--detach] [--json]
-    [--context-result SESSION/REQUEST]...
+    [--context-result SESSION/REQUEST]... [--context-mode <full|compact>]
 ```
 
 ```sh
@@ -172,7 +172,7 @@ Use `tell` for the next prompt in a session whose previous request has finished.
 
 ```text
 tabcli tell SESSION (--prompt TEXT | --prompt-file PATH)
-    [--timeout-secs N] [--detach] [--json] [--context-result SESSION/REQUEST]...
+    [--timeout-secs N] [--detach] [--json] [--context-result SESSION/REQUEST]... [--context-mode <full|compact>]
 ```
 
 See the command and output in the [opening workflow](#command-reference).
@@ -599,7 +599,8 @@ optional evidence. `"unreadable"` means the retained record could not be validat
 Absence of either field is unknown; it does not prove that no question existed.
 After the session becomes `ready`, `tell` can carry a known fact as another request. It
 does not resolve the earlier emission. `ask`, `tell`, `wait`, `result --wait`, `result --list`,
-timeline, and context attachments retain their output and waiting behavior. Bridge has no
+and timeline retain their output and waiting behavior. Full context attachments are unchanged;
+compact context attachments also report `Questions: N emitted` when retained emissions exist. Bridge has no
 transport that answers a question, and an emission does not end `wait` or `result --wait` early.
 
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
@@ -1242,6 +1243,7 @@ Use these options only with commands whose synopsis lists them:
 | `--detach` | Off. Return after launch/delivery acceptance, without waiting for a result. |
 | `--json` | Off. Select structured output, except commands that always print JSON. |
 | `--context-result SESSION/REQUEST` | None; up to eight attachments on `ask` or `tell`. |
+| `--context-mode full\|compact` | `full`; `compact` attaches an excerpt of 4,096 + 1,024 Unicode scalar characters with the retrieval command and records `mode`, `attached_chars`, `omitted_chars`. |
 
 `--timeout-secs` defaults to 900 for `ask`, `tell`, `reopen`, and `result --wait`, and to 120 per
 `self-test` command. For `close-session`, it defaults to 60 and accepts 1 through 3600.
@@ -1272,6 +1274,20 @@ attach fewer or smaller results if you exceed that limit. Bridge does not trunca
 make them fit. Results are appended as delimited reference material and their provenance is saved as
 `context_sources`. For older records without a request receipt, `SESSION/EVENT` is accepted instead.
 This is reference material, not a resume of the source conversation.
+
+`--context-mode full` is the default and keeps the attachment output unchanged. `compact`
+keeps messages of at most 5,120 Unicode scalar characters whole; longer messages retain the
+first 4,096 and last 1,024, separated by a visible elision with the omitted count and the exact
+`tabcli result SESSION --request REQUEST` retrieval command (`--event EVENT` for legacy events).
+Each compact block reports attached/total/omitted characters and completed state, plus the
+number of recorded question emissions when available. Compact never changes which Results
+are attachable: the whole original message still undergoes the same validation. Its rendered
+excerpt, including the elision line, counts toward the 256 KiB attachment budget, allowing
+long results that exceed the full-text byte budget. No mode silently shortens text to fit.
+Both modes record `mode`, `attached_chars`, and `omitted_chars` on each context source;
+`full` records the whole character count and zero omitted. Old receipts omit these fields.
+An explicit mode requires at least one `--context-result`; repeated, empty and unknown modes
+are rejected before reading sessions. `reopen` accepts neither attachment option.
 
 Successful commands normally exit 0; parsing, execution, and I/O failures exit nonzero and print an
 error on stderr. Check the exit behaviour in each command section: a successful observation can
