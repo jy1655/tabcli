@@ -1,5 +1,5 @@
 //! Historical session evidence only; never effective live configuration.
-use super::super::{codex_version, hooks, lifecycle};
+use super::super::{codex_version, hooks, turn as codex_turn};
 use crate::native::diagnostics::{Availability, Check};
 use crate::native::query::Selector;
 use crate::native::query::request::RequestState;
@@ -71,13 +71,13 @@ fn claim_evidence(directory: &Path, evidence: &mut Value) -> Result<()> {
             bail!("invalid claim token");
         }
         evidence["claim_token"] = json!(token);
-        evidence["input_hook_observed"] = match lifecycle::read_binding(directory, token) {
+        evidence["input_hook_observed"] = match codex_turn::binding(&reader, token) {
             Ok(Some(binding)) => observed(binding),
             Ok(None) => absent(),
             Err(error) => unreadable(error),
         };
-        evidence["stop_candidate_observed"] = sidecar(&reader, "codex-candidate-", token);
-        evidence["observer"] = sidecar(&reader, "codex-observer-", token);
+        evidence["stop_candidate_observed"] = sidecar(codex_turn::candidate(&reader, token));
+        evidence["observer"] = sidecar(codex_turn::observer(&reader, token));
     }
     // Never substitute an older result or the observer's claim of settlement.
     if let Some(receipt) = last {
@@ -89,31 +89,10 @@ fn claim_evidence(directory: &Path, evidence: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn sidecar(reader: &Reader, prefix: &str, token: &str) -> Value {
-    let result = (|| -> Result<Option<Value>> {
-        let value = reader
-            .private(&format!("{prefix}{token}.json"))
-            .optional_json::<Value>()?;
-        if let Some(value) = &value {
-            if value["schema"] != 1
-                || value["claim_token"] != token
-                || !value["observed_unix_ms"].is_u64()
-            {
-                bail!("invalid claim-addressed observation");
-            }
-            if prefix == "codex-observer-"
-                && (!matches!(
-                    value["state"].as_str(),
-                    Some("armed" | "suspended" | "settled")
-                ) || !(value["reason"].is_null() || value["reason"].is_string()))
-            {
-                bail!("invalid observer state");
-            }
-        }
-        Ok(value)
-    })();
+fn sidecar(result: Result<Option<codex_turn::Sidecar>>) -> Value {
     match result {
-        Ok(Some(mut value)) => {
+        Ok(Some(record)) => {
+            let mut value = serde_json::to_value(record).expect("sidecar is JSON representable");
             value
                 .as_object_mut()
                 .unwrap()

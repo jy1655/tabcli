@@ -7,7 +7,7 @@ use crate::native::session::test_support::{TERMINAL_CLOSING_FILE, TERMINAL_HANDL
 use std::{fs, time::Instant};
 
 #[cfg(windows)]
-struct InProcessHelper {
+pub(in crate::native) struct InProcessHelper {
     directory: PathBuf,
     phase: usize,
     change: &'static str,
@@ -18,11 +18,6 @@ struct InProcessHelper {
 }
 
 #[cfg(windows)]
-thread_local! {
-    static IN_PROCESS_HELPER: std::cell::RefCell<Option<InProcessHelper>> = const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(windows)]
 pub(in crate::native) fn with_in_process_helper(
     directory: &Path,
     session: &terminal::TerminalSession,
@@ -30,7 +25,7 @@ pub(in crate::native) fn with_in_process_helper(
     phase: usize,
     change: &'static str,
     screen: &str,
-    run: impl FnOnce(),
+    run: impl FnOnce(&mut client::Client<InProcessHelper>),
 ) {
     use crate::native::session::{CoreRecord, Store};
     let store = Store::open_unchecked(directory);
@@ -70,37 +65,13 @@ pub(in crate::native) fn with_in_process_helper(
 }
 
 #[cfg(windows)]
-fn with_helper<T>(helper: InProcessHelper, run: impl FnOnce() -> T) -> (T, InProcessHelper) {
-    IN_PROCESS_HELPER.with(|slot| {
-        assert!(slot.borrow().is_none());
-        *slot.borrow_mut() = Some(helper);
-    });
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            IN_PROCESS_HELPER.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-    let _reset = Reset;
-    let result = run();
-    let helper = IN_PROCESS_HELPER.with(|slot| slot.borrow_mut().take().unwrap());
-    (result, helper)
-}
-
-#[cfg(windows)]
-pub(super) fn helper_output(
-    command: &mut std::process::Command,
-    deadline: Instant,
-    label: &str,
-) -> Option<
-    std::result::Result<std::process::Output, crate::native::process_env::CommandOutputFailure>,
-> {
-    use super::client::HelperProcess;
-    IN_PROCESS_HELPER.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .map(|helper| helper.output(command, deadline, label))
-    })
+fn with_helper<T>(
+    helper: InProcessHelper,
+    run: impl FnOnce(&mut client::Client<InProcessHelper>) -> T,
+) -> (T, InProcessHelper) {
+    let mut client = client::Client::new(helper);
+    let result = run(&mut client);
+    (result, client.into_helper())
 }
 
 #[cfg(windows)]
@@ -508,14 +479,18 @@ fn process_start_evidence_and_prewrite_refusals_classify_delivery() {
             })
         }
     }
-    let mut command = std::process::Command::new("unused-by-adapter");
+    let session = serde_json::from_value(serde_json::json!({
+        "terminal":"windows-console", "session_id":"1", "managed_session_id":"session-failure"
+    }))
+    .unwrap();
     for started in [false, true] {
-        let failure = client::run_console_send_with(
-            &mut FailedProcess { started },
-            &mut command,
-            Instant::now(),
-        )
-        .unwrap_err();
+        let failure = client::Client::new(FailedProcess { started })
+            .send_file(
+                &session,
+                Path::new("pending-prompt-source.txt"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
         assert_eq!(failure.delivery_may_have_occurred(), started);
         assert_eq!(
             failure.error().to_string(),
@@ -726,14 +701,15 @@ fn in_process_delivery_uses_the_actual_provider_newline_and_payload_reply_codecs
                 refused: false,
                 written: Vec::new(),
             },
-            || {
-                let count = terminal::send_file_text_only(
-                    &session,
-                    &prompt,
-                    claim.token(),
-                    Instant::now() + Duration::from_secs(5),
-                )
-                .unwrap();
+            |client| {
+                let count = client
+                    .send_file_text_only(
+                        &session,
+                        &prompt,
+                        claim.token(),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .unwrap();
                 assert_eq!(count, 5);
             },
         );
@@ -774,6 +750,179 @@ fn in_process_delivery_uses_the_actual_provider_newline_and_payload_reply_codecs
 
 #[cfg(windows)]
 #[test]
+fn client_operations_use_the_owned_helper_and_retire_private_payloads() {
+    use crate::native::{consent, process_env::CommandOutputFailure};
+    use std::{
+        os::windows::process::ExitStatusExt,
+        process::{Command, Output},
+    };
+    let Some(root) = isolated_root(
+        "native::console_control::tests::client_operations_use_the_owned_helper_and_retire_private_payloads",
+        "AB_CONSOLE_CLIENT",
+    ) else {
+        return;
+    };
+    let (directory, session) = session_fixture(&root, "session-client", "codex");
+    let prompt = directory.join("pending-prompt-source.txt");
+    crate::native::session::RecordStore::at(&prompt)
+        .write_private("a\n한😀\n".as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let expiry = crate::native::session::primitives::unix_ms() + 30_000;
+    struct Replies {
+        directory: PathBuf,
+        deadline: Instant,
+        screen: &'static str,
+        calls: Vec<&'static str>,
+        payloads: Vec<PathBuf>,
+    }
+    impl client::HelperProcess for Replies {
+        fn output(
+            &mut self,
+            command: &mut Command,
+            deadline: Instant,
+            _: &str,
+        ) -> std::result::Result<Output, CommandOutputFailure> {
+            assert_eq!(deadline, self.deadline);
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(args[0], "native-console-control");
+            let (id, request) = decode_arguments(&args[1..]).unwrap();
+            assert_eq!(id, "session-client");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            match request.operation {
+                Operation::Send {
+                    input_name,
+                    timeout,
+                    mode,
+                } => {
+                    assert!(!timeout.is_zero() && timeout <= Duration::from_secs(30));
+                    let path = self.directory.join(input_name);
+                    let text = consent::read_store(&path).unwrap().unwrap();
+                    if mode == SendMode::ProviderDefault {
+                        self.calls.push("send");
+                        assert_eq!(text, "a\n한😀\n");
+                    } else {
+                        self.calls.push("text");
+                        assert_eq!(mode, SendMode::TextOnly);
+                        let input = decode_text_payload(text.as_bytes()).unwrap();
+                        assert_eq!(input.text, "a\n한😀\n");
+                        assert_eq!(input.expected_claim.as_deref(), Some("1-2-3"));
+                        assert!(
+                            input.expires_unix_ms.unwrap()
+                                > crate::native::session::primitives::unix_ms()
+                        );
+                        write_text_count(&mut stdout, 5).unwrap();
+                        self.payloads.push(path);
+                    }
+                }
+                Operation::Screen => {
+                    self.calls.push("screen");
+                    stdout = screen_output(self.screen).unwrap().into_bytes();
+                }
+                Operation::Dialog {
+                    input_name,
+                    timeout,
+                } => {
+                    self.calls.push("dialog");
+                    assert!(!timeout.is_zero() && timeout <= Duration::from_secs(30));
+                    let path = self.directory.join(input_name);
+                    let text = consent::read_store(&path).unwrap().unwrap();
+                    let input = decode_dialog_payload(text.as_bytes()).unwrap();
+                    assert_eq!(input.screen, self.screen);
+                    assert_eq!(input.expected_claim.as_deref(), Some("1-2-3"));
+                    assert!(
+                        input.expires_unix_ms.unwrap()
+                            > crate::native::session::primitives::unix_ms()
+                    );
+                    write_dialog_reply(&mut stdout, DialogReply::Sent).unwrap();
+                    self.payloads.push(path);
+                }
+                Operation::Close => {
+                    self.calls.push("close");
+                    stderr = format!("Error: {MISSING_PROCESS}\n").into_bytes();
+                }
+                Operation::Window { .. } => panic!("window lookup has its own asynchronous child"),
+            }
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(u32::from(!stderr.is_empty())),
+                stdout,
+                stderr,
+            })
+        }
+    }
+    let replies = |screen| Replies {
+        directory: directory.clone(),
+        deadline,
+        screen,
+        calls: Vec::new(),
+        payloads: Vec::new(),
+    };
+    let mut first = client::Client::new(replies("first screen"));
+    let mut second = client::Client::new(replies("second screen"));
+    first.send_file(&session, &prompt, deadline).unwrap();
+    assert_eq!(
+        first
+            .send_file_text_only(&session, &prompt, "1-2-3", deadline)
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        second.read_screen(&session, deadline).unwrap(),
+        "second screen"
+    );
+    assert_eq!(
+        first.read_screen(&session, deadline).unwrap(),
+        "first screen"
+    );
+    assert!(
+        first
+            .guarded_dialog_input(
+                &directory,
+                &session,
+                &terminal::GuardedDialogInput {
+                    expected_claim: Some("1-2-3".into()),
+                    expires_unix_ms: Some(expiry),
+                    screen: "first screen".into(),
+                    key: terminal::DialogKey::DownEnter,
+                },
+                deadline
+            )
+            .unwrap()
+    );
+    assert!(
+        first
+            .submit_if_unchanged(
+                &directory,
+                &session,
+                "first screen",
+                Some("1-2-3"),
+                deadline
+            )
+            .unwrap()
+    );
+    assert!(matches!(
+        first
+            .close_session_until(&directory, &session, deadline)
+            .unwrap(),
+        terminal::CloseOutcome::Missing
+    ));
+    let first = first.into_helper();
+    assert_eq!(
+        first.calls,
+        ["send", "text", "screen", "dialog", "dialog", "close"]
+    );
+    assert_eq!(second.into_helper().calls, ["screen"]);
+    assert_eq!(first.payloads.len(), 3);
+    assert!(first.payloads.iter().all(|path| !path.exists()));
+    assert!(prompt.exists(), "the caller owns the source prompt");
+}
+
+#[cfg(windows)]
+#[test]
 fn close_deadline_console_helper_is_bounded() {
     let powershell = terminal::windows_powershell_executable().unwrap();
     let mut command = std::process::Command::new(&powershell);
@@ -784,9 +933,9 @@ fn close_deadline_console_helper_is_bounded() {
         "Start-Sleep -Seconds 30",
     ]);
     let started = Instant::now();
-    let error =
-        client::run_console_helper_command(&mut command, started + Duration::from_millis(100))
-            .unwrap_err();
+    let error = client::installed()
+        .run_console_helper_command(&mut command, started + Duration::from_millis(100))
+        .unwrap_err();
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     // The timeout error alone does not prove the bound: a helper that failed to end the
     // command would report it too, after waiting for the 30 s sleep. 25 s proves that the
@@ -807,9 +956,9 @@ fn close_deadline_console_helper_is_bounded() {
     // deadline, so the deadline must not expire first. PowerShell did not print within
     // 10 s on a loaded `windows-latest` runner (#180). The command exits at once, so the
     // test never waits this long.
-    let error =
-        client::run_console_helper_command(&mut command, Instant::now() + Duration::from_secs(120))
-            .unwrap_err();
+    let error = client::installed()
+        .run_console_helper_command(&mut command, Instant::now() + Duration::from_secs(120))
+        .unwrap_err();
     assert_eq!(error.to_string(), "own close timeout");
 }
 
@@ -861,14 +1010,15 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     let other_root = tempfile::tempdir().unwrap();
     let other = other_root.path().join("session-dialog");
     fs::create_dir(&other).unwrap();
-    let error = terminal::submit_if_unchanged(
-        &other,
-        &handle,
-        &input.screen,
-        None,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap_err();
+    let error = client::installed()
+        .submit_if_unchanged(
+            &other,
+            &handle,
+            &input.screen,
+            None,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
     assert!(error.to_string().contains("helper state root"), "{error:#}");
     for id in [None, Some("session-other".into())] {
         let mut wrong = handle.clone();
@@ -883,7 +1033,8 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
         assert!(error.to_string().contains("managed session"), "{error:#}");
     }
     assert_eq!(
-        terminal::submit_if_unchanged(&directory, &handle, &input.screen, None, Instant::now())
+        client::installed()
+            .submit_if_unchanged(&directory, &handle, &input.screen, None, Instant::now())
             .unwrap_err()
             .to_string(),
         "managed console dialog input timed out before it started"
@@ -932,7 +1083,8 @@ fn text_only_launcher_classifies_start_and_exit_failures() {
     let mut missing = std::process::Command::new(root.path().join("missing.exe"));
     let deadline = Instant::now() + Duration::from_secs(120);
     assert!(
-        !client::run_console_send_command(&mut missing, deadline)
+        !client::installed()
+            .run_console_send_command(&mut missing, deadline)
             .unwrap_err()
             .delivery_may_have_occurred()
     );
@@ -940,7 +1092,8 @@ fn text_only_launcher_classifies_start_and_exit_failures() {
         crate::native::process_env::helper_command(std::env::var_os("ComSpec").unwrap());
     failed.args(["/d", "/c", "exit 1"]);
     assert!(
-        client::run_console_send_command(&mut failed, deadline)
+        client::installed()
+            .run_console_send_command(&mut failed, deadline)
             .unwrap_err()
             .delivery_may_have_occurred()
     );

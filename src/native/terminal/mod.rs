@@ -422,7 +422,7 @@ pub(super) fn send_file(
 ) -> TerminalSendResult {
     #[cfg(windows)]
     {
-        crate::native::console_control::send_file(session, prompt_path, deadline)
+        crate::native::console_control::installed().send_file(session, prompt_path, deadline)
     }
     #[cfg(target_os = "macos")]
     {
@@ -432,66 +432,6 @@ pub(super) fn send_file(
     {
         // Unsupported-platform stubs never send, so not_sent is accurate.
         platform::send_file(session, prompt_path, deadline).map_err(TerminalSendFailure::not_sent)
-    }
-}
-
-// Raw Windows operations for the provider-owned paste protocol in R2.
-pub(super) fn send_file_text_only(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    expected_claim: &str,
-    deadline: Instant,
-) -> std::result::Result<usize, TerminalSendFailure> {
-    #[cfg(windows)]
-    return crate::native::console_control::send_file_text_only(
-        session,
-        prompt_path,
-        expected_claim,
-        deadline,
-    );
-    #[cfg(not(windows))]
-    {
-        let _ = (session, prompt_path, expected_claim, deadline);
-        Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
-            "managed text-only input unsupported on this platform"
-        )))
-    }
-}
-
-pub(super) fn submit_if_unchanged(
-    directory: &Path,
-    session: &TerminalSession,
-    expected_screen: &str,
-    expected_claim: Option<&str>,
-    deadline: Instant,
-) -> Result<bool> {
-    #[cfg(windows)]
-    return guarded_dialog_input(
-        directory,
-        session,
-        &GuardedDialogInput {
-            expected_claim: expected_claim.map(str::to_owned),
-            expires_unix_ms: Some(
-                crate::native::session::primitives::unix_ms()
-                    + deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis(),
-            ),
-            screen: expected_screen.to_owned(),
-            key: DialogKey::Enter,
-        },
-        deadline,
-    );
-    #[cfg(not(windows))]
-    {
-        let _ = (
-            directory,
-            session,
-            expected_screen,
-            expected_claim,
-            deadline,
-        );
-        bail!("managed dialog input unsupported on this platform");
     }
 }
 
@@ -517,7 +457,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
     #[cfg(target_os = "macos")]
     return macos::read_screen(macos::INSTALLED, session, deadline);
     #[cfg(windows)]
-    return crate::native::console_control::read_screen(session, deadline);
+    return crate::native::console_control::installed().read_screen(session, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (session, deadline);
@@ -542,9 +482,8 @@ pub(super) fn guarded_dialog_input(
         })
     }
     #[cfg(windows)]
-    return crate::native::console_control::guarded_dialog_input(
-        directory, session, input, deadline,
-    );
+    return crate::native::console_control::installed()
+        .guarded_dialog_input(directory, session, input, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (directory, session, input, deadline);
@@ -573,7 +512,8 @@ pub(super) fn close_session_until(
     }
     #[cfg(windows)]
     {
-        crate::native::console_control::close_session_until(directory, session, deadline)
+        crate::native::console_control::installed()
+            .close_session_until(directory, session, deadline)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -689,9 +629,6 @@ pub(super) fn validate_terminal_send_budget(
         Ok(())
     }
 }
-
-#[cfg(all(test, windows))]
-pub(in crate::native) use crate::native::console_control::with_in_process_helper;
 
 #[cfg(test)]
 mod tests {

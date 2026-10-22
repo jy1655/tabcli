@@ -11,7 +11,7 @@ use std::{
 };
 use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
 
-pub(super) trait HelperProcess {
+pub(in crate::native) trait HelperProcess {
     fn output(
         &mut self,
         command: &mut Command,
@@ -20,7 +20,7 @@ pub(super) trait HelperProcess {
     ) -> std::result::Result<Output, CommandOutputFailure>;
 }
 
-struct ProcessHelper;
+pub(in crate::native) struct ProcessHelper;
 
 impl HelperProcess for ProcessHelper {
     fn output(
@@ -29,12 +29,30 @@ impl HelperProcess for ProcessHelper {
         deadline: Instant,
         label: &str,
     ) -> std::result::Result<Output, CommandOutputFailure> {
-        #[cfg(test)]
-        if let Some(output) = super::tests::helper_output(command, deadline, label) {
-            return output;
-        }
         crate::native::process_env::command_output_until_classified(command, deadline, label)
     }
+}
+
+/// Owns the helper dependency for every synchronous console operation. Tests use the
+/// same client with a local helper; the installed adapter always starts a process.
+pub(in crate::native) struct Client<H> {
+    helper: H,
+}
+
+impl<H> Client<H> {
+    pub(in crate::native) const fn new(helper: H) -> Self {
+        Self { helper }
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_helper(self) -> H {
+        self.helper
+    }
+}
+
+// Each production caller owns a client; no mutable global helper is shared.
+pub(in crate::native) const fn installed() -> Client<ProcessHelper> {
+    Client::new(ProcessHelper)
 }
 
 pub(in crate::native) struct WindowLookup {
@@ -83,163 +101,199 @@ impl Drop for WindowLookup {
     }
 }
 
-pub(in crate::native) fn send_file(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> TerminalSendResult {
-    let prompt_path = prompt_path
-        .to_str()
-        .context("prompt path is not valid UTF-8")
-        .map_err(TerminalSendFailure::not_sent)?;
-    run_console_send_helper(session, prompt_path, deadline, SendMode::ProviderDefault).map(|_| ())
-}
-
-pub(in crate::native) fn send_file_text_only(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    expected_claim: &str,
-    deadline: Instant,
-) -> std::result::Result<usize, TerminalSendFailure> {
-    let payload = (|| -> Result<_> {
-        let input = GuardedTextInput {
-            text: std::fs::read_to_string(prompt_path)?,
-            expected_claim: Some(expected_claim.to_owned()),
-            expires_unix_ms: Some(
-                crate::native::session::primitives::unix_ms()
-                    + deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis(),
-            ),
-        };
-        dialog_input_file(
-            prompt_path.parent().context("missing payload directory")?,
-            session,
-            &input,
-        )
-    })()
-    .map_err(TerminalSendFailure::not_sent)?;
-    let path = payload
-        .path()
-        .to_str()
-        .context("payload path is not UTF-8")
-        .map_err(TerminalSendFailure::not_sent)?;
-    let output = run_console_send_helper(session, path, deadline, SendMode::TextOnly)?;
-    parse_text_only_output(&output)
-}
-
-pub(in crate::native) fn read_screen(
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<String> {
-    let mut command = request_command(session, Operation::Screen)?;
-    let output = ProcessHelper
-        .output(&mut command, deadline, "managed console screen")
-        .map_err(CommandOutputFailure::into_error)?;
-    if !output.status.success() {
-        bail!("{}", helper_failure_message(&output));
+impl<H: HelperProcess> Client<H> {
+    pub(in crate::native) fn send_file(
+        &mut self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        let prompt_path = prompt_path
+            .to_str()
+            .context("prompt path is not valid UTF-8")
+            .map_err(TerminalSendFailure::not_sent)?;
+        self.run_console_send_helper(session, prompt_path, deadline, SendMode::ProviderDefault)
+            .map(|_| ())
     }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
 
-pub(in crate::native) fn guarded_dialog_input(
-    directory: &Path,
-    session: &TerminalSession,
-    input: &terminal::GuardedDialogInput,
-    deadline: Instant,
-) -> Result<bool> {
-    let file = dialog_input_file(directory, session, input)?;
-    let path = file.path().to_str().context("dialog path is not UTF-8")?;
-    let (mut command, id) = helper_command(session)?;
-    let input_name = input_name(path)?;
-    let timeout = wire_timeout(deadline.saturating_duration_since(Instant::now()));
-    command.args(encode_arguments(
-        &id,
-        &ConsoleControlRequest {
-            operation: Operation::Dialog {
-                input_name,
-                timeout,
+    pub(in crate::native) fn send_file_text_only(
+        &mut self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        expected_claim: &str,
+        deadline: Instant,
+    ) -> std::result::Result<usize, TerminalSendFailure> {
+        let payload = (|| -> Result<_> {
+            let input = GuardedTextInput {
+                text: std::fs::read_to_string(prompt_path)?,
+                expected_claim: Some(expected_claim.to_owned()),
+                expires_unix_ms: Some(
+                    crate::native::session::primitives::unix_ms()
+                        + deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                ),
+            };
+            dialog_input_file(
+                prompt_path.parent().context("missing payload directory")?,
+                session,
+                &input,
+            )
+        })()
+        .map_err(TerminalSendFailure::not_sent)?;
+        let path = payload
+            .path()
+            .to_str()
+            .context("payload path is not UTF-8")
+            .map_err(TerminalSendFailure::not_sent)?;
+        let output = self.run_console_send_helper(session, path, deadline, SendMode::TextOnly)?;
+        parse_text_only_output(&output)
+    }
+
+    pub(in crate::native) fn read_screen(
+        &mut self,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<String> {
+        let mut command = request_command(session, Operation::Screen)?;
+        let output = self
+            .helper
+            .output(&mut command, deadline, "managed console screen")
+            .map_err(CommandOutputFailure::into_error)?;
+        if !output.status.success() {
+            bail!("{}", helper_failure_message(&output));
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    pub(in crate::native) fn guarded_dialog_input(
+        &mut self,
+        directory: &Path,
+        session: &TerminalSession,
+        input: &terminal::GuardedDialogInput,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let file = dialog_input_file(directory, session, input)?;
+        let path = file.path().to_str().context("dialog path is not UTF-8")?;
+        let (mut command, id) = helper_command(session)?;
+        let input_name = input_name(path)?;
+        let timeout = wire_timeout(deadline.saturating_duration_since(Instant::now()));
+        command.args(encode_arguments(
+            &id,
+            &ConsoleControlRequest {
+                operation: Operation::Dialog {
+                    input_name,
+                    timeout,
+                },
             },
-        },
-    ));
-    let output = ProcessHelper
-        .output(&mut command, deadline, "managed console dialog input")
-        .map_err(CommandOutputFailure::into_error)?;
-    if !output.status.success() {
-        bail!("{}", helper_failure_message(&output));
+        ));
+        let output = self
+            .helper
+            .output(&mut command, deadline, "managed console dialog input")
+            .map_err(CommandOutputFailure::into_error)?;
+        if !output.status.success() {
+            bail!("{}", helper_failure_message(&output));
+        }
+        decode_dialog_reply(&output.stdout)
     }
-    decode_dialog_reply(&output.stdout)
-}
 
-pub(in crate::native) fn close_session_until(
-    _directory: &Path,
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<CloseOutcome> {
-    let mut command = request_command(session, Operation::Close)?;
-    match run_console_helper_command(&mut command, deadline) {
-        Ok(()) => Ok(CloseOutcome::Closed),
-        Err(error) if helper_reports_missing(&error.to_string()) => Ok(CloseOutcome::Missing),
-        Err(error) => Err(error),
+    pub(in crate::native) fn close_session_until(
+        &mut self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        let mut command = request_command(session, Operation::Close)?;
+        match self.run_console_helper_command(&mut command, deadline) {
+            Ok(()) => Ok(CloseOutcome::Closed),
+            Err(error) if helper_reports_missing(&error.to_string()) => Ok(CloseOutcome::Missing),
+            Err(error) => Err(error),
+        }
     }
-}
 
-fn run_console_send_helper(
-    session: &TerminalSession,
-    input: &str,
-    deadline: Instant,
-    mode: SendMode,
-) -> std::result::Result<Vec<u8>, TerminalSendFailure> {
-    let (mut command, id) = helper_command(session).map_err(TerminalSendFailure::not_sent)?;
-    let input_name = input_name(input).map_err(TerminalSendFailure::not_sent)?;
-    let timeout = terminal::windows_budget::remaining_send_budget_at(deadline, Instant::now())
-        .map_err(TerminalSendFailure::not_sent)?;
-    let timeout_ms = u64::try_from(timeout.as_millis())
-        .context("Windows console timeout is too large")
-        .map_err(TerminalSendFailure::not_sent)?;
-    let request = ConsoleControlRequest {
-        operation: Operation::Send {
-            input_name,
-            timeout: Duration::from_millis(timeout_ms.max(1)),
-            mode,
-        },
-    };
-    command.args(encode_arguments(&id, &request));
-    run_console_send_command(&mut command, deadline)
-}
-
-pub(super) fn run_console_send_command(
-    command: &mut Command,
-    deadline: Instant,
-) -> std::result::Result<Vec<u8>, TerminalSendFailure> {
-    run_console_send_with(&mut ProcessHelper, command, deadline)
-}
-
-pub(super) fn run_console_send_with(
-    process: &mut impl HelperProcess,
-    command: &mut Command,
-    deadline: Instant,
-) -> std::result::Result<Vec<u8>, TerminalSendFailure> {
-    let output = process
-        .output(command, deadline, "Windows console control helper")
-        .map_err(|failure| {
-            if failure.process_started() {
-                TerminalSendFailure::delivery_uncertain(failure.into_error())
-            } else {
-                TerminalSendFailure::not_sent(failure.into_error())
-            }
-        })?;
-    classify_send_output(output)
-}
-
-pub(super) fn run_console_helper_command(command: &mut Command, deadline: Instant) -> Result<()> {
-    let output = ProcessHelper
-        .output(command, deadline, "Windows console control helper")
-        .map_err(CommandOutputFailure::into_error)?;
-    if output.status.success() {
-        return Ok(());
+    fn run_console_send_helper(
+        &mut self,
+        session: &TerminalSession,
+        input: &str,
+        deadline: Instant,
+        mode: SendMode,
+    ) -> std::result::Result<Vec<u8>, TerminalSendFailure> {
+        let (mut command, id) = helper_command(session).map_err(TerminalSendFailure::not_sent)?;
+        let input_name = input_name(input).map_err(TerminalSendFailure::not_sent)?;
+        let timeout = terminal::windows_budget::remaining_send_budget_at(deadline, Instant::now())
+            .map_err(TerminalSendFailure::not_sent)?;
+        let timeout_ms = u64::try_from(timeout.as_millis())
+            .context("Windows console timeout is too large")
+            .map_err(TerminalSendFailure::not_sent)?;
+        let request = ConsoleControlRequest {
+            operation: Operation::Send {
+                input_name,
+                timeout: Duration::from_millis(timeout_ms.max(1)),
+                mode,
+            },
+        };
+        command.args(encode_arguments(&id, &request));
+        self.run_console_send_command(&mut command, deadline)
     }
-    bail!("{}", helper_failure_message(&output))
+
+    pub(super) fn run_console_send_command(
+        &mut self,
+        command: &mut Command,
+        deadline: Instant,
+    ) -> std::result::Result<Vec<u8>, TerminalSendFailure> {
+        let output = self
+            .helper
+            .output(command, deadline, "Windows console control helper")
+            .map_err(|failure| {
+                if failure.process_started() {
+                    TerminalSendFailure::delivery_uncertain(failure.into_error())
+                } else {
+                    TerminalSendFailure::not_sent(failure.into_error())
+                }
+            })?;
+        classify_send_output(output)
+    }
+
+    pub(super) fn run_console_helper_command(
+        &mut self,
+        command: &mut Command,
+        deadline: Instant,
+    ) -> Result<()> {
+        let output = self
+            .helper
+            .output(command, deadline, "Windows console control helper")
+            .map_err(CommandOutputFailure::into_error)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        bail!("{}", helper_failure_message(&output))
+    }
+
+    pub(in crate::native) fn submit_if_unchanged(
+        &mut self,
+        directory: &Path,
+        session: &TerminalSession,
+        expected_screen: &str,
+        expected_claim: Option<&str>,
+        deadline: Instant,
+    ) -> Result<bool> {
+        self.guarded_dialog_input(
+            directory,
+            session,
+            &terminal::GuardedDialogInput {
+                expected_claim: expected_claim.map(str::to_owned),
+                expires_unix_ms: Some(
+                    crate::native::session::primitives::unix_ms()
+                        + deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                ),
+                screen: expected_screen.to_owned(),
+                key: terminal::DialogKey::Enter,
+            },
+            deadline,
+        )
+    }
 }
 
 fn helper_command(session: &TerminalSession) -> Result<(Command, String)> {

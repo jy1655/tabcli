@@ -1,11 +1,17 @@
 //! Bounded best-effort Windows console fallback, pinned to Codex 0.163.0.
 //! Counts are rendered cardinality, not content receipts. No concurrent input is assumed.
+#[cfg(windows)]
 use crate::native::clock::{Clock, SystemClock};
-use crate::native::session::{Reader, RecordStore, turn};
+#[cfg(windows)]
+use crate::native::console_control;
+#[cfg(windows)]
+use crate::native::session::RecordStore;
+use crate::native::session::{Reader, turn};
 use crate::native::terminal::{self, TerminalSendFailure as Failure, TerminalSendResult};
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use std::io::Write;
 use std::{
-    io::Write,
     path::Path,
     time::{Duration, Instant},
 };
@@ -498,13 +504,16 @@ fn run(
     result.map_err(|error| Failure::delivery_uncertain(anyhow::anyhow!("{error:#}. {RECOVERY}")))
 }
 
-struct Console<'a> {
+#[cfg(windows)]
+struct Console<'a, H> {
+    client: &'a mut console_control::Client<H>,
     session: &'a terminal::TerminalSession,
     directory: &'a Path,
     claim: &'a str,
     deadline: Instant,
 }
-impl Input for Console<'_> {
+#[cfg(windows)]
+impl<H: console_control::HelperProcess> Input for Console<'_, H> {
     fn now(&mut self) -> Instant {
         Instant::now()
     }
@@ -522,7 +531,7 @@ impl Input for Console<'_> {
         Ok(())
     }
     fn screen(&mut self) -> Result<String> {
-        terminal::read_screen(self.session, self.deadline)
+        self.client.read_screen(self.session, self.deadline)
     }
     fn text(&mut self, text: &str) -> std::result::Result<usize, Failure> {
         let file = (|| -> Result<_> {
@@ -537,10 +546,11 @@ impl Input for Console<'_> {
             Ok(file)
         })()
         .map_err(Failure::not_sent)?;
-        terminal::send_file_text_only(self.session, file.path(), self.claim, self.deadline)
+        self.client
+            .send_file_text_only(self.session, file.path(), self.claim, self.deadline)
     }
     fn submit(&mut self, screen: &str) -> Result<bool> {
-        terminal::submit_if_unchanged(
+        self.client.submit_if_unchanged(
             self.directory,
             self.session,
             screen,
@@ -553,6 +563,7 @@ impl Input for Console<'_> {
     }
 }
 
+#[cfg(windows)]
 pub(super) fn send(
     session: &terminal::TerminalSession,
     directory: &Path,
@@ -567,8 +578,10 @@ pub(super) fn send(
     let claim = turn::current_claim_token(&Reader::open_unchecked(directory))
         .and_then(|c| c.context("no current Codex claim"))
         .map_err(Failure::not_sent)?;
+    let mut client = console_control::installed();
     run(
         &mut Console {
+            client: &mut client,
             session,
             directory,
             claim: &claim,

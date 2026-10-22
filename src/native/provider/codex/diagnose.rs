@@ -137,7 +137,7 @@ fn notify_payload_check(directory: Option<&Path>) -> crate::native::diagnostics:
     };
     if matches!(super::hooks::read_launch_mode(directory), Ok(Some(mode)) if mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
         && matches!(
-            super::lifecycle::read_binding(directory, &pending.claim_token),
+            super::turn::binding(&Reader::open_unchecked(directory), &pending.claim_token),
             Ok(Some(_))
         )
     {

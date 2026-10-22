@@ -170,7 +170,7 @@ fn binding_publication_rechecks_live_claim_after_barrier_ordered_release() {
         );
         worker_barrier.wait();
         worker_barrier.wait();
-        publish_binding(&directory, &pending, &payload).unwrap();
+        publish_binding(&Store::open_unchecked(&directory), &pending, &payload).unwrap();
     });
     barrier.wait();
     let store = Store::open_unchecked(root.path());
@@ -344,4 +344,175 @@ fn established_thread_accepts_binding_and_stale_stop_does_not_touch_next_claim()
     install_pending_turn(root.path(), next.token()).unwrap();
     ADAPTER.handle_hook(root.path(), &stop_payload()).unwrap();
     assert!(record(root.path(), CANDIDATE_PREFIX, next.token()).is_none());
+}
+
+// Objects copied from HEAD's lifecycle.rs/transcript.rs json! writers, with a fixed
+// clock. Compare Values to pin keys, nulls and types independently of field ordering.
+#[test]
+fn candidate_record_round_trip_matches_original_writer() {
+    for message in [None, Some("candidate 한국어😀".to_owned())] {
+        let expected = json!({"schema":1,"claim_token":"1-2-3","thread_id":THREAD,
+            "turn_id":"turn-1","last_assistant_message":message,"stop_hook_active":false,
+            "observed_unix_ms":123});
+        let record = Candidate {
+            schema: 1,
+            claim_token: "1-2-3".into(),
+            thread_id: THREAD.into(),
+            turn_id: "turn-1".into(),
+            last_assistant_message: message,
+            stop_hook_active: false,
+            observed_unix_ms: 123,
+        };
+        let decoded: Candidate = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+        assert_eq!(serde_json::to_value(&record).unwrap(), expected);
+        let root = tempfile::tempdir().unwrap();
+        Store::open_unchecked(root.path())
+            .private(&record_name(CANDIDATE_PREFIX, "1-2-3").unwrap())
+            .write_json(&record)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                candidate(&Reader::open_unchecked(root.path()), "1-2-3")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn notify_record_round_trip_matches_original_writer() {
+    for message in [None, Some("answer".to_owned())] {
+        let expected = json!({"schema":1,"claim_token":"1-2-3","thread_id":THREAD,
+            "turn_id":"turn-1","last_assistant_message":message,"input_messages_matched":true,
+            "observed_unix_ms":123});
+        let record = Notify {
+            schema: 1,
+            claim_token: "1-2-3".into(),
+            thread_id: THREAD.into(),
+            turn_id: "turn-1".into(),
+            last_assistant_message: message,
+            input_messages_matched: true,
+            observed_unix_ms: 123,
+        };
+        let decoded: Notify = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+        assert_eq!(serde_json::to_value(&record).unwrap(), expected);
+        let root = tempfile::tempdir().unwrap();
+        Store::open_unchecked(root.path())
+            .private(&record_name(NOTIFY_PREFIX, "1-2-3").unwrap())
+            .write_json(&record)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                observations::notify(&Reader::open_unchecked(root.path()), "1-2-3")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn binding_conflict_record_round_trip_matches_original_writer() {
+    let expected = json!({"schema":1,"claim_token":"1-2-3","reason":"binding_conflict",
+        "thread_id":THREAD,"turn_id":"turn-1","transcript_path":"rollout.jsonl","observed_unix_ms":123});
+    let record = BindingConflict {
+        schema: 1,
+        claim_token: "1-2-3".into(),
+        reason: "binding_conflict".into(),
+        thread_id: THREAD.into(),
+        turn_id: "turn-1".into(),
+        transcript_path: "rollout.jsonl".into(),
+        observed_unix_ms: 123,
+    };
+    let decoded: BindingConflict = serde_json::from_value(expected.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+    assert_eq!(serde_json::to_value(&record).unwrap(), expected);
+    let root = tempfile::tempdir().unwrap();
+    Store::open_unchecked(root.path())
+        .private(&record_name(DIAGNOSTIC_PREFIX, "1-2-3").unwrap())
+        .write_json(&record)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            observations::binding_conflict(&Reader::open_unchecked(root.path()), "1-2-3")
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn observer_record_round_trip_matches_original_writer() {
+    for (state, reason, path) in [
+        ("armed", None, Some("rollout.jsonl")),
+        (
+            "suspended",
+            Some("observation_unavailable: read_error"),
+            None,
+        ),
+        ("settled", None, Some("rollout.jsonl")),
+    ] {
+        let expected = json!({"schema":1,"claim_token":"1-2-3","state":state,
+            "reason":reason,"transcript_path":path,"offset":42,"observed_unix_ms":123});
+        let record = ObserverRecord {
+            schema: 1,
+            claim_token: "1-2-3".into(),
+            state: state.into(),
+            reason: reason.map(str::to_owned),
+            transcript_path: path.map(str::to_owned),
+            offset: 42,
+            observed_unix_ms: 123,
+        };
+        let decoded: ObserverRecord = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+        assert_eq!(serde_json::to_value(&record).unwrap(), expected);
+        let root = tempfile::tempdir().unwrap();
+        write_observer(&Store::open_unchecked(root.path()), &record).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                observer(&Reader::open_unchecked(root.path()), "1-2-3")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn diagnostic_decoders_keep_legacy_leniency_and_unknown_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let reader = Reader::open_unchecked(root.path());
+    let store = Store::open_unchecked(root.path());
+    for (prefix, value) in [
+        (
+            CANDIDATE_PREFIX,
+            json!({"schema":1,"claim_token":"1-2-3","observed_unix_ms":1,"thread_id":42,"future":true}),
+        ),
+        (
+            OBSERVER_PREFIX,
+            json!({"schema":1,"claim_token":"1-2-3","observed_unix_ms":1,"state":"armed","offset":"unknown","future":true}),
+        ),
+    ] {
+        store
+            .private(&record_name(prefix, "1-2-3").unwrap())
+            .write_json(&value)
+            .unwrap();
+        let read = if prefix == CANDIDATE_PREFIX {
+            candidate(&reader, "1-2-3")
+        } else {
+            observer(&reader, "1-2-3")
+        };
+        assert_eq!(serde_json::to_value(read.unwrap().unwrap()).unwrap(), value);
+    }
 }
