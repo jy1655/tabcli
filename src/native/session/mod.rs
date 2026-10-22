@@ -41,6 +41,7 @@ use reads::*;
 /// these names only through this facade.
 #[cfg(test)]
 pub(in crate::native) mod test_support {
+    pub(in crate::native) mod lifecycle;
     #[cfg(target_os = "macos")]
     pub(in crate::native) use super::names::TERMINAL_CLOSE_INTENT_FILE;
     pub(in crate::native) use super::names::{
