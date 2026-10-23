@@ -653,10 +653,17 @@ const timer = setInterval(() => {
         let deadline = Instant::now() + Duration::from_secs(10);
         let envelope_path = observed_directory.join("messenger-envelope.json");
         while !envelope_path.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "controlled messenger did not receive stdin"
-            );
+            if Instant::now() >= deadline {
+                let files: Vec<String> = std::fs::read_dir(&observed_directory)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|entry| entry.ok())
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                panic!("controlled messenger did not receive stdin; session files: {files:?}");
+            }
             thread::sleep(Duration::from_millis(10));
         }
         let envelope: CrossSessionEnvelope =
@@ -700,7 +707,10 @@ const timer = setInterval(() => {
         },
         Some(&token),
     );
-    let (pending, executed) = observer.join().unwrap();
+    let (pending, executed) = match observer.join() {
+        Ok(observed) => observed,
+        Err(_) => panic!("the controlled messenger observer failed; messenger result: {sent:?}"),
+    };
     sent.unwrap();
     assert_eq!(pending["schema"], 2);
     assert_eq!(pending["claim_token"].as_str(), Some(token.as_str()));
