@@ -327,7 +327,10 @@ const MOD_CONVERSATION: &str = "00000000-0000-4000-8000-000000000249";
 const MOD_REQUEST: &str = "claude-turn-1000000000000000000-10000-1";
 
 fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_json::Value) {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir()
+        .unwrap();
     std::fs::create_dir(directory.path().join("events")).unwrap();
     crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
@@ -357,6 +360,81 @@ fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_jso
         ).unwrap();
     }
     (directory, token, start["event"].clone())
+}
+
+#[test]
+fn fresh_macos_launch_ignores_draft_stop_until_native_completion() {
+    let (directory, token, start) = mod_regression_fixture(false);
+    launch_preflight(directory.path());
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: directory.path(),
+            workspace: directory.path(),
+            title: "macOS completion regression",
+            prompt: "initial request",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        false,
+    )
+    .unwrap();
+    let expected = start["text"]
+        .as_str()
+        .unwrap()
+        .split_once(">\n")
+        .unwrap()
+        .1
+        .strip_suffix("\n</cross-session-message>")
+        .unwrap();
+    completion::install_pending(directory.path(), MOD_REQUEST, Some(&token), expected)
+        .unwrap()
+        .retain();
+    handle_hook(directory.path(), &serde_json::json!({"agent_bridge_claude_mod":1,"event":"turn.start","conversation":MOD_CONVERSATION,"data":start})).unwrap();
+    let stop: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
+    handle_hook(directory.path(), &stop["event"]).unwrap();
+    let reader = Reader::open_unchecked(directory.path());
+    assert_eq!(
+        reader.events().unwrap().len(),
+        0,
+        "fresh macOS launch published a draft Stop before native completion"
+    );
+    assert_eq!(
+        turn::current_claim_token(&reader).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    assert!(completion::native_mode(directory.path()).unwrap());
+    assert_eq!(
+        plan.initial_prompt,
+        InitialPromptDisposition::AwaitingDelivery
+    );
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument == "initial request")
+    );
+    let complete: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-complete.json")).unwrap();
+    handle_hook(directory.path(), &serde_json::json!({"agent_bridge_claude_mod":1,"event":"turn.complete","conversation":MOD_CONVERSATION,"data":complete["event"]})).unwrap();
+    let event = turn::wait(
+        &Store::open_unchecked(directory.path()),
+        0,
+        Some(MOD_REQUEST),
+        Some(&token),
+        Instant::now() + Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(event.message, "PROBE-FINAL");
+    assert_eq!(event.turn_id.as_deref(), Some(MOD_REQUEST));
+    assert_eq!(
+        event.provenance.as_deref(),
+        Some("claude_mod_turn_complete")
+    );
+    assert_eq!(reader.events().unwrap().len(), 1);
 }
 
 #[test]
