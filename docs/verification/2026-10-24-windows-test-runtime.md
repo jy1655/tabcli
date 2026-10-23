@@ -89,6 +89,23 @@ entire command, including 7.38s incremental compilation, took 177.99s. The basel
 command took 455.59s, including 10.42s incremental compilation. Host Clippy, all-feature
 Linux and Windows cross-target Clippy, rustfmt, diff checks and language lint passed.
 
-Hosted comparisons are added after both Windows runs finish. Authenticated provider behavior
-is outside this performance change; earlier PR #304 runtime evidence continues to identify
-only its recorded candidate and conditions.
+Both post-change hosted runs passed all seven CI jobs, including native Windows, macOS,
+Linux, MSRV, both release builds and integration packaging. They use the unchanged Windows
+workflow and serial command; the PR and squash-merged main commits have identical source trees.
+
+| Hosted Windows run | Source | Test step including compilation | Main unit executable |
+| --- | --- | ---: | ---: |
+| [Original #304 baseline](https://github.com/jy1655/tabcli/actions/runs/39972324974/job/120477940989) | `b417126` | 21m57s | 1,209.89 s |
+| [Same-day main baseline](https://github.com/jy1655/tabcli/actions/runs/39980836467/job/120507378007) | `df6afc3` | 15m11s | 809.68 s |
+| [#306 PR](https://github.com/jy1655/tabcli/actions/runs/39980993825/job/120507906489) | `176898f` | 12m11s | 631.57 s |
+| [#306 main push](https://github.com/jy1655/tabcli/actions/runs/39983292196/job/120515871420) | `8aae856` | 10m38s | 541.41 s |
+
+Test compilation in the same-day baseline and two after runs was 54.76s, 54.55s and 53.31s,
+respectively. The after steps are 20% and 30% shorter than the same-day baseline, and 44%
+and 52% shorter than the original reported baseline. The baseline variation is material;
+these are hosted observations, not a guarantee of a fixed percentage. All 1,117 pre-existing
+main unit tests remain, with three new native security tests. No test was disabled or
+parallelized. The synthetic-origin fixture and its remaining filesystem cost are unchanged.
+
+Authenticated provider behavior is outside this performance change; earlier PR #304 runtime
+evidence continues to identify only its recorded candidate and conditions.
