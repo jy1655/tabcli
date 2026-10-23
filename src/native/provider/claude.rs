@@ -25,6 +25,8 @@ mod registry;
 mod trust;
 mod turn;
 
+pub(super) use completion::question_emissions;
+
 pub(super) fn completion_observation(reader: &Reader, token: &str) -> Option<serde_json::Value> {
     completion::observe_candidate(reader, token)
 }

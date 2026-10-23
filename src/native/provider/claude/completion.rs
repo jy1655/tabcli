@@ -23,6 +23,9 @@ const MAX_MODE_BYTES: usize = 32;
 const MAX_TURN_BYTES: usize = 128;
 const MODULE: &str = include_str!("completion.js");
 
+mod questions;
+pub(in crate::native::provider) use questions::read as question_emissions;
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
@@ -536,6 +539,9 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             event,
             "unbound Claude event has no marked completion evidence",
         );
+    }
+    if event == "question.emissions" {
+        return questions::publish(&store, &binding, data);
     }
     let outcome = if event == "oversize" {
         match data

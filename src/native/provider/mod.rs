@@ -44,10 +44,13 @@ pub(super) fn question_emissions(
     locked: bool,
     receipt: &super::session::requests::Receipt,
 ) -> Option<QuestionEmissions> {
-    if provider == "codex" && locked {
-        codex::questions::read(reader, receipt)
-    } else {
-        None
+    if !locked {
+        return None;
+    }
+    match provider {
+        "codex" => codex::questions::read(reader, receipt),
+        "claude" => claude::question_emissions(reader, receipt),
+        _ => None,
     }
 }
 

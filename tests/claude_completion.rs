@@ -29,6 +29,9 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         "continuation",
         "continuation_retry_after",
         "continuation_oversize",
+        "questions",
+        "questions_oversize",
+        "questions_retry",
     ]
     .iter()
     .enumerate()
@@ -38,6 +41,11 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         fs::create_dir_all(directory.join("events")).unwrap();
         let token = format!("100-200-{index}");
         fs::write(directory.join("turn.claim"), &token).unwrap();
+        fs::create_dir(directory.join("requests")).unwrap();
+        support::write(
+            &directory.join("requests").join(format!("{token}.json")),
+            &support::receipt(&format!("request-mod{index}"), &token, "event-result.json"),
+        );
         support::write(
             &directory.join("manifest.json"),
             &support::manifest(
@@ -107,6 +115,14 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
             }
         );
         assert!(!directory.join("turn.claim").exists());
+        if scenario.starts_with("questions") {
+            let record: Value = serde_json::from_slice(
+                &fs::read(directory.join(format!("claude-questions-{token}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record["items"].as_array().unwrap().len(), 1);
+            assert_eq!(record["incomplete"], scenario.ends_with("oversize"));
+        }
         if *scenario == "oversize" {
             assert!(event["error"].as_str().unwrap().contains("not truncated"));
         } else {

@@ -356,6 +356,23 @@ the official `turn.complete`. Stored results retain Claude's conversation identi
 request correlation id; the official turn id stays in the adapter's immutable binding.
 Bridge removes the marker only when it ends the answer.
 
+The same module observes completed main-loop `turn.step` responses from the engine and
+retains structured `AskUserQuestion` emissions only for the original bound turn. It passes
+every streamed chunk and the step's result through unchanged. The official step carries
+the turn id; ordinary `tool.call` and classic hooks do not. Each emission's `step:N/tool:M`
+id identifies the step and the call's original position within that response. These ids
+are observation cursors, not an endpoint for answering a dialog.
+
+The Claude-owned `claude-questions-<claim>.json` retains question text and option labels
+within a 64 KiB budget. Incomplete or conflicting evidence preserves the prior prefix and
+marks it incomplete. Publication verifies the current claim and immutable binding under
+the lifecycle lock; reads use the selected historical receipt under the query's lock.
+`result`, `status`, `inspect` and `wait --questions` use the same contracts as Codex emissions.
+Nothing marks a question pending or answered, changes permissions, or releases the claim.
+Other plugins, subagents, legacy sessions and unbound continuation turns supply no evidence.
+See the [official module reference](https://code.claude.com/docs/en/plugins/mods/reference)
+and [Claude question verification](verification/2026-10-23-claude-question-emissions.md).
+
 A normal nonempty bound answer without that marker is retained as a candidate. It does not
 release the claim or become a result. A later main-loop completion in the same conversation
 can finish it only with that candidate, the still-current request and a valid nonempty answer

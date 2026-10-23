@@ -97,6 +97,18 @@ launch, observe, continue, and close without replacing the capabilities those CL
   wires; admission counts escaping and bounded peer-header overhead. An oversized bound final
   fails without truncation; an unbound oversized signal has no marker and cannot settle the
   request. This route adds no cancellation API or usage mapping.
+- The native module observes structured `AskUserQuestion` emissions in a completed main-loop
+  `turn.step` response from the engine. The event supplies the official turn id and step
+  index; do not infer a turn from `tool.call`, which lacks that identity. Pass streamed
+  chunks and the response unchanged. Capture the conversation before awaiting the step,
+  then require the exact original immutable binding and current Claim under the lifecycle
+  lock. A continuation not yet attributed at completion supplies no question authority.
+  One Claude-owned 64 KiB record preserves a prefix and monotone incompleteness; a duplicate
+  step/tool position is idempotent and conflicting content marks it incomplete. Historical
+  reads use the selected Receipt under the query's lock. Emitted means neither shown,
+  pending, executed nor answered, and no query changes the Claim or permits a pending tell.
+  Only question text and option labels are projected; no answer or permission is supplied.
+  Replace this observation path when Claude offers a verified addressed question lifecycle.
 - An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
   version inference. Its pending Stop completion remains readable, but new tells on both
   platforms are refused. Windows supports close/reopen recovery. On macOS, inspect the
