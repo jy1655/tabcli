@@ -15,8 +15,8 @@ pub(in crate::native) struct OwnerObservation {
     pub(in crate::native) error: Option<String>,
 }
 
-// Reopen fixtures inspect this diagnostic projection. Production
-// lifecycle decisions use the typed attestation below, never these two booleans.
+// Reopen fixtures inspect this diagnostic projection. Launch repair uses the
+// typed attestation below rather than these lossy diagnostic booleans.
 #[cfg(test)]
 pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
     match attest_recorded_owner(reader) {
