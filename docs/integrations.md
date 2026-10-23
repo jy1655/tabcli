@@ -10,9 +10,9 @@ The skill guides the assistant; it does not guarantee anything after the assista
 host exits, crashes or loses context, sessions it opened may remain open or lose their owner.
 Inspect their state and close task-owned sessions with `tabcli close-session SESSION --explicit`.
 
-Version 0.4.23 was published without integrations. Release assets for the integrations start
-with the next release; until then, install from a source checkout that contains `integrations/`.
-In the commands below, `X.Y.Z` is a release that includes them. Recorded host checks are in
+Release assets for the integrations start with 0.4.24; releases up to 0.4.23 have none. In the
+commands below, `X.Y.Z` is a release that includes them, 0.4.24 or later. A source checkout that
+contains `integrations/` also works. Recorded host checks are in
 [the 2026-10-22 host integration record](verification/2026-10-22-host-integrations.md).
 
 ## Hosts and target providers
@@ -439,7 +439,7 @@ run. Checked on native Windows so far:
 Not yet checked:
 
 - macOS for every host;
-- installs from the repository pinned to a released tag (none yet contains the integrations).
+- installs from the repository pinned to a released tag.
 
 [claude-plugins]: https://code.claude.com/docs/en/discover-plugins
 [codex-plugins]: https://developers.openai.com/plugins/build/plugins

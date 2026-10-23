@@ -35,6 +35,35 @@ claim replacement, timeout retention and interruption between identity selection
 retry, an oversized unbound completion and read-only candidate inspection. These fixtures do
 not prove provider parentage; authenticated background ask/tell evidence is recorded separately.
 
+## Language lint
+
+Public documentation, source comments and default plugin metadata use English. Run from the
+repository root with Python 3.9 or newer:
+
+```sh
+python3 scripts/check_language.py
+```
+
+CI runs this check on Linux, macOS and Windows. It inspects tracked and non-ignored new text
+files, reports `file:line` for non-ASCII letters or combining accents, and exits nonzero on
+findings or an invalid policy. Punctuation, arrows and emoji are allowed. JSON and JSON-compatible
+YAML quoted strings are also decoded so Unicode escapes cannot hide a translated display name.
+This is a character check, not a classifier for foreign words written entirely in ASCII.
+
+`.language-lint.json` contains the exceptions and a reason for each: the Korean README,
+unchanged upstream notices, two historical Korean verification reports, and Unicode test/fixture
+paths. Unicode examples in production files have exact-line exceptions, so the rest of each file
+is checked. The policy itself contains those Unicode examples. An unused exception fails the
+check and must be removed or updated with its fixture.
+
+Use a translation path or an exact-line exception for a legitimate new example; keep public
+plugin metadata under the default rule. Review exception changes as part of the diff.
+The checker tests run with the existing Python suite:
+
+```sh
+python3.12 -m unittest discover -s scripts -p 'test_*.py' -v
+```
+
 ## Simulated time and the race hooks
 
 `src/native/clock.rs` is the one clock seam of the native module: `Clock` (`now`, `sleep`),

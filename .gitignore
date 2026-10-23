@@ -2,6 +2,6 @@
 /.agent-bridge-review-prompts/
 *.log
 
-# 로컬 전용 작업 노트 (TODO.local.md 등)
+# Local-only working notes (for example, TODO.local.md)
 *.local.md
 __pycache__/

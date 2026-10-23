@@ -96,12 +96,12 @@ def catalog(host, source):
     if host == "claude":
         return ".claude-plugin/marketplace.json", json_bytes({
             "name": "agent-bridge", "owner": {"name": "jy1655"},
-            "description": "코딩 에이전트 위임과 작업용 세션 관리를 위한 에이전트 브리지",
+            "description": "Agent Bridge for coding agent delegation and task session management.",
             "plugins": [{"name": "agent-bridge", "source": source}],
         })
     if host == "codex":
         return ".agents/plugins/marketplace.json", json_bytes({
-            "name": "agent-bridge", "interface": {"displayName": "에이전트 브리지"},
+            "name": "agent-bridge", "interface": {"displayName": "Agent Bridge"},
             "plugins": [{
                 "name": "agent-bridge", "source": {"source": "local", "path": source},
                 "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},

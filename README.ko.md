@@ -5,7 +5,7 @@
 `tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 눈에 보이는 터미널 탭이나 창에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS와 Windows에서 직접 실행하는 환경을 지원합니다. WSL 안의 Linux 프로세스를 포함해 Linux는 지원하지 않으며 Warp 지원은 제한적입니다.
 
 전역 에이전트 지침을 직접 작성하지 않고 위임하려면 Claude Code, Codex, Agy, Pi용
-[에이전트 브리지 통합 패키지](docs/integrations.md)를 설치하세요. 네 패키지는 동일한
+[에이전트 브리지 플러그인](#에이전트-플러그인-설치)을 설치하세요. 네 패키지는 동일한
 워크플로 스킬을 포함하며 이미 설치한 `tabcli`를 사용합니다.
 
 ## 세션 실행해 보기
@@ -98,17 +98,17 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`을 사용합니다.
 
-0.4.23 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
+0.4.24 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
 ```sh
-shasum -a 256 -c tabcli-0.4.23-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.23-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.24-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.24-aarch64-apple-darwin.tar.gz
 ```
 
 Windows에서는 PowerShell에서 실행합니다.
 
 ```powershell
-$archive = "tabcli-0.4.23-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.24-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -120,12 +120,62 @@ Expand-Archive $archive -DestinationPath .\tabcli
 소스에서 설치하려면 Rust 1.97.1 이상과 Cargo가 필요합니다.
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.23 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.24 --locked
 ```
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.
 
 첫 실행 전에 사용할 에이전트 CLI를 설치하고 로그인한 뒤, 해당 프로젝트의 작업 디렉터리 신뢰 질문을 처리합니다. iTerm2, Terminal.app, Ghostty 연동은 macOS Automation을 사용합니다. 실행 중 Apple Events 권한 오류가 나면 [macOS 승인 확인 절차](docs/macos-permissions.md)를 따릅니다. Windows에서 직접 실행할 때는 cmd에서 호출하더라도 `PATH`에 PowerShell 7(`pwsh.exe`)이 있어야 합니다.
+
+## 에이전트 플러그인 설치
+
+먼저 [`tabcli`를 설치](#설치)한 뒤, 저장소 버전의 플러그인을 설치합니다. macOS 터미널 또는 Windows PowerShell에서 실행하세요.
+
+```sh
+git clone --depth 1 https://github.com/jy1655/tabcli.git tabcli-integrations
+cd tabcli-integrations
+```
+
+사용할 AI의 명령만 실행하세요.
+
+**Codex**
+
+```sh
+codex plugin marketplace add "$(pwd)"
+codex plugin add agent-bridge@agent-bridge --json
+```
+
+**Claude Code**
+
+```sh
+claude plugin marketplace add "$(pwd)"
+claude plugin install agent-bridge@agent-bridge
+```
+
+**Agy**
+
+```sh
+agy plugin install "$(pwd)/integrations/agy"
+```
+
+**Pi**
+
+```sh
+pi install "$(pwd)/integrations/pi"
+```
+
+설치 후 **새 AI 세션을 열고**, 해당 명령으로 스킬을 호출하세요.
+
+| AI | 대화창에서 입력 |
+| --- | --- |
+| Codex | `$agent-bridge` |
+| Claude Code | `/agent-bridge:agent-bridge` |
+| Agy | `/agent-bridge` |
+| Pi | `/skill:agent-bridge` |
+
+이어서 "Codex에게 이 프로젝트 리뷰를 맡기고, 결과 확인 후 만든 세션을 닫아 줘"처럼 요청하면 됩니다.
+
+`tabcli-integrations` 디렉터리는 유지하세요. [압축 파일 설치·업데이트·제거·권한 안내](docs/integrations.md)에서 자세한 내용을 확인할 수 있습니다.
 
 ## 일상적인 사용
 
@@ -168,6 +218,7 @@ Bridge는 모델 클라이언트나 샌드박스가 아닙니다. 직접 실행�
 ## 문서
 
 - [CLI 명령](docs/cli.md): 명령, 출력과 오류 복구 절차입니다.
+- [에이전트 플러그인](docs/integrations.md): 호스트별 설치, 스킬 호출, 업데이트와 제거 방법입니다.
 - [터미널](docs/terminals.md): 화면 생성 위치, 설정, 소유권과 검증 범위입니다.
 - [에이전트 CLI](docs/providers.md): CLI 요구 사항, 전달 경로와 결과 처리 방식입니다.
 - [보안과 데이터](docs/security-and-data.md): 권한, 작업 디렉터리 신뢰와 보관되는 기록입니다.
