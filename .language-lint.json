@@ -40,6 +40,14 @@
     {
       "path": "src/**/fixtures/**",
       "reason": "Recorded input fixtures preserve original Unicode payloads."
+    },
+    {
+      "path": "src/native/provider/claude/completion/continuation_tests.rs",
+      "reason": "Claude continuation tests preserve multilingual prompts and answers."
+    },
+    {
+      "path": "src/native/provider/claude/completion_test.mjs",
+      "reason": "Claude completion module tests preserve multilingual provider payloads."
     }
   ],
   "allowed_lines": [
