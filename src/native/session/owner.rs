@@ -36,11 +36,6 @@ pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttes
         .map(|owner| attest_owner(&owner)))
 }
 
-#[cfg(any(target_os = "macos", windows))]
-pub(in crate::native) fn observe_owner_record(owner: &NativeSessionOwner) -> OwnerObservation {
-    OwnerObservation::from(&attest_owner(owner))
-}
-
 #[derive(Debug)]
 pub(in crate::native) struct OwnerAttestation {
     pub process: ProcessObservation,

@@ -435,11 +435,7 @@ fn damaged_teardown_refuses(path: &str) {
             TestObservation::on_records(dir.path(), "session-owner123", &surface, deadline)
                 .with_presence(|| Ok(false))
                 .with_evidence(terminal::close_evidence(surface.kind))
-                .with_owner_record(|_| session::OwnerObservation {
-                    process_alive: Some(false),
-                    identity_matches: Some(false),
-                    error: None,
-                })
+                .with_owner_record(|_| test_owner_attestation(false))
                 .with_pid_alive(|_| false)
                 .with_mac_owner_live(|_| test_owner_attestation(false))
                 .with_resumable(|| {

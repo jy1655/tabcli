@@ -10,6 +10,8 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use super::{CloseObservation, Production, TerminalCloseAuthority, decide};
 #[cfg(any(target_os = "macos", windows))]
+use crate::native::session::owner::OwnerAttestation;
+#[cfg(any(target_os = "macos", windows))]
 use crate::native::session::{OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalSession;
 #[cfg(any(target_os = "macos", windows))]
@@ -164,7 +166,7 @@ pub(in crate::native) struct TestObservation<'a> {
     surface_present: Member<'a, dyn FnMut() -> Result<bool> + 'a>,
     ownership_proof: Member<'a, dyn FnMut() -> Result<()> + 'a>,
     #[cfg(any(target_os = "macos", windows))]
-    owner_record: Member<'a, dyn FnMut(&NativeSessionOwner) -> OwnerObservation + 'a>,
+    owner_record: Member<'a, dyn FnMut(&NativeSessionOwner) -> OwnerAttestation + 'a>,
     #[cfg(target_os = "macos")]
     pid_alive: Member<'a, dyn FnMut(u32) -> bool + 'a>,
     #[cfg(target_os = "macos")]
@@ -378,7 +380,7 @@ impl<'a> TestObservation<'a> {
     #[cfg(any(target_os = "macos", windows))]
     pub(in crate::native) fn with_owner_record(
         self,
-        f: impl FnMut(&NativeSessionOwner) -> OwnerObservation + 'a,
+        f: impl FnMut(&NativeSessionOwner) -> OwnerAttestation + 'a,
     ) -> Self {
         *self.owner_record.borrow_mut() = Some(Box::new(f));
         self
@@ -514,13 +516,13 @@ impl CloseObservation for TestObservation<'_> {
     }
 
     #[cfg(any(target_os = "macos", windows))]
-    fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerObservation {
+    fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
         let call = self.begin("owner-record");
         let result = match self.owner_record.borrow_mut().as_mut() {
             Some(f) => f(owner),
             None => self.production("owner-record").observe_owner_record(owner),
         };
-        self.finish(call, &result);
+        self.finish(call, &OwnerObservation::from(&result));
         result
     }
 

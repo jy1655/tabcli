@@ -21,18 +21,18 @@ use super::ownership::{
     owner_group_gone, teardown_absent_owner_with, terminate_owned_foreground_group_until,
 };
 #[cfg(target_os = "macos")]
-use crate::native::process_identity::{Gone, ProcessObservation};
+use crate::native::process_identity::Gone;
+#[cfg(any(target_os = "macos", windows))]
+use crate::native::process_identity::ProcessObservation;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::session::SessionStatus;
 use crate::native::session::close::budget::close_remaining;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use crate::native::session::owner::{OwnerAttestation, attest_owner};
 #[cfg(target_os = "macos")]
 use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", windows))]
-use crate::native::session::{
-    CoreRecord, OwnerObservation, Reader, SessionState, launch, observe_owner_record,
-};
+use crate::native::session::{CoreRecord, Reader, SessionState, launch};
 #[cfg(target_os = "macos")]
 use agent_bridge::process_is_alive;
 #[cfg(target_os = "macos")]
@@ -75,7 +75,7 @@ pub(in crate::native) trait CloseObservation {
     fn surface_present(&self) -> Result<bool>;
     fn ownership_proof(&self) -> Result<()>;
     #[cfg(any(target_os = "macos", windows))]
-    fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerObservation;
+    fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation;
     #[cfg(target_os = "macos")]
     fn pid_alive(&self, pid: u32) -> bool;
     #[cfg(target_os = "macos")]
@@ -171,8 +171,8 @@ impl CloseObservation for Production<'_> {
     }
 
     #[cfg(any(target_os = "macos", windows))]
-    fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerObservation {
-        observe_owner_record(owner)
+    fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
+        attest_owner(owner)
     }
 
     #[cfg(target_os = "macos")]
@@ -250,8 +250,7 @@ pub(in crate::native) fn decide(
                 let observed = observation.observe_owner_record(&owner);
                 if status.state == SessionState::Failed
                     && owner.managed_session_id.as_deref() == Some(expected_session_id)
-                    && (observed.process_alive == Some(false)
-                        || observed.identity_matches == Some(false))
+                    && matches!(observed.process, ProcessObservation::Gone(_))
                 {
                     session.verify_managed_session(expected_session_id)?;
                     return Ok(TerminalCloseAuthority::SurfaceOnly);
@@ -481,9 +480,145 @@ mod tests;
 
 #[cfg(all(test, any(windows, target_os = "macos")))]
 mod projected_authority_tests {
-    use super::test_support::TestObservation;
+    use super::test_support::{RecordValues, TestObservation};
     use super::*;
+    use crate::native::process_identity::{Attested, Gone};
     use crate::native::session::launch;
+    use crate::native::session::owner::ControlAttestation;
+
+    fn assert_failed_start_route(attestation: impl Fn() -> OwnerAttestation, surface_only: bool) {
+        for kind in [
+            terminal::TerminalKind::Iterm2,
+            terminal::TerminalKind::Ghostty,
+            terminal::TerminalKind::WindowsConsole,
+        ] {
+            for proof_succeeds in [false, true] {
+                let surface = TerminalSession {
+                    kind,
+                    id: "4242".into(),
+                    tab_id: None,
+                    window_id: None,
+                    managed_session_id: Some("session-test".into()),
+                    windows_process_identity: None,
+                    wezterm_mux: None,
+                };
+                let observation = TestObservation::from_values(RecordValues {
+                    owner: Some(NativeSessionOwner {
+                        pid: 4242,
+                        managed_session_id: Some("session-test".into()),
+                        ..Default::default()
+                    }),
+                    state: SessionState::Failed,
+                    launch: Some(launch::Record {
+                        schema: 1,
+                        claim_token: "claim-test".into(),
+                        deadline_unix_ms: 1,
+                        phase: launch::Phase::Spawning,
+                    }),
+                })
+                .with_owner_record(|_| attestation())
+                .with_presence(|| Ok(true))
+                .with_proof(|| {
+                    if proof_succeeds {
+                        Ok(())
+                    } else {
+                        bail!("injected full ownership proof failure")
+                    }
+                });
+                #[cfg(target_os = "macos")]
+                let observation = observation
+                    .with_evidence(terminal::close_evidence(kind))
+                    .with_mac_owner_live(|_| OwnerAttestation {
+                        process: ProcessObservation::Live(Attested::Incarnation),
+                        control: ControlAttestation::Verified,
+                        pid_alive: Some(true),
+                    });
+                let result = observation.decide(
+                    "session-test",
+                    &surface,
+                    crate::native::session::close::budget::close_deadline(),
+                );
+                let mut calls = vec![];
+                #[cfg(target_os = "macos")]
+                calls.push("teardown-intent");
+                calls.extend(["owner-present", "launch", "status", "owner", "owner-record"]);
+                if !surface_only {
+                    #[cfg(target_os = "macos")]
+                    calls.extend(["resumable", "owner", "mac-live"]);
+                    calls.push("proof");
+                    #[cfg(target_os = "macos")]
+                    if !proof_succeeds {
+                        calls.push("presence");
+                    }
+                }
+                assert_eq!(
+                    observation.calls(),
+                    calls,
+                    "{kind:?}, {:?}, proof succeeds {proof_succeeds}: {result:?}",
+                    attestation()
+                );
+                if surface_only {
+                    assert_eq!(result.unwrap(), TerminalCloseAuthority::SurfaceOnly);
+                } else if proof_succeeds {
+                    assert_eq!(result.unwrap(), TerminalCloseAuthority::LiveOwner);
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "injected full ownership proof failure"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_start_typed_evidence_selects_shortcut_or_fresh_proof() {
+        for control in [
+            (|| ControlAttestation::Verified) as fn() -> ControlAttestation,
+            || ControlAttestation::NotRecorded,
+            || ControlAttestation::Changed("owner TTY changed".into()),
+            || ControlAttestation::Unknown("control inspection failed".into()),
+        ] {
+            assert_failed_start_route(
+                || OwnerAttestation {
+                    process: ProcessObservation::Live(Attested::Incarnation),
+                    control: control(),
+                    pid_alive: Some(true),
+                },
+                false,
+            );
+        }
+        assert_failed_start_route(
+            || OwnerAttestation {
+                process: ProcessObservation::Live(Attested::PidOnly),
+                control: ControlAttestation::NotRecorded,
+                pid_alive: Some(true),
+            },
+            false,
+        );
+        for pid_alive in [Some(false), Some(true), None] {
+            assert_failed_start_route(
+                || OwnerAttestation {
+                    process: ProcessObservation::Unknown("owner identity inspection failed".into()),
+                    control: ControlAttestation::NotRecorded,
+                    pid_alive,
+                },
+                false,
+            );
+        }
+        assert_failed_start_route(
+            || OwnerAttestation {
+                process: ProcessObservation::Gone(Gone::Exited),
+                control: ControlAttestation::NotRecorded,
+                pid_alive: Some(false),
+            },
+            true,
+        );
+        assert_failed_start_route(
+            crate::native::session::owner::tests::reused_attestation,
+            true,
+        );
+    }
 
     #[test]
     fn r1_c6_windows_surface_failed_start_consumes_mismatch_projection() {
@@ -515,7 +650,7 @@ mod projected_authority_tests {
         let observation =
             TestObservation::on_records(root.path(), "session-test", &surface, deadline)
                 .with_presence(|| panic!("projection does not inspect surface"))
-                .with_owner_record(|_| crate::native::session::owner::tests::reused_observation())
+                .with_owner_record(|_| crate::native::session::owner::tests::reused_attestation())
                 .with_proof(|| panic!("failed-start route"));
         #[cfg(target_os = "macos")]
         let observation = observation
