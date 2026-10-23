@@ -17,7 +17,11 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn minimum_version(&self) -> Version {
-        Version::new(2, 1, 234)
+        Version::new(2, 1, 302)
+    }
+
+    fn version_is_supported(&self, version: &Version) -> bool {
+        version.pre.is_empty() && version >= &self.minimum_version()
     }
 
     fn yolo_args(&self) -> &'static [&'static str] {

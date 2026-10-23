@@ -193,7 +193,7 @@ Session policy:
   --context-mode compact attaches a bounded excerpt with visible elision and the
   command to retrieve the full result; the default full keeps the complete text.
 
-  Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
+  Supported CLI minimums: Codex 0.147.0, Claude stable 2.1.302, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
   inspect --timeline reads preserved request, launch, completion and close evidence.
   --request filters request entries; session diagnostics remain separate. Unknown

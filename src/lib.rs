@@ -97,7 +97,7 @@ pub fn cli_version_is_supported(cli: FirstPartyCli, output: &str) -> Result<bool
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not parse a semantic version from {output:?}"))?;
 
-    Ok(installed >= cli.minimum_version())
+    Ok(provider_adapter(cli).version_is_supported(&installed))
 }
 
 pub fn provider_launch_args(cli: FirstPartyCli, yolo: bool) -> Vec<&'static str> {
