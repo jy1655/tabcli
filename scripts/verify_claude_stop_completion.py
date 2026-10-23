@@ -42,19 +42,13 @@ def write_json(path, value):
 
 
 def run_json(command, output, name, environment=None, timeout=110):
-    try:
+    stdout_path = output / (name + ".json")
+    with (stdout_path.open("w", encoding="utf-8") as stdout,
+          (output / (name + ".stderr")).open("w", encoding="utf-8") as stderr):
         result = subprocess.run(
-            command, env=environment, text=True, capture_output=True, timeout=timeout
+            command, env=environment, text=True, stdout=stdout, stderr=stderr, timeout=timeout
         )
-    except subprocess.TimeoutExpired as error:
-        for suffix, value in ((".json", error.stdout), (".stderr", error.stderr)):
-            if isinstance(value, bytes):
-                value = value.decode("utf-8", errors="replace")
-            (output / (name + suffix)).write_text(value or "", encoding="utf-8")
-        raise
-    (output / (name + ".json")).write_text(result.stdout, encoding="utf-8")
-    (output / (name + ".stderr")).write_text(result.stderr, encoding="utf-8")
-    value = json.loads(result.stdout)
+    value = json.loads(stdout_path.read_text(encoding="utf-8"))
     return value, result.returncode
 
 

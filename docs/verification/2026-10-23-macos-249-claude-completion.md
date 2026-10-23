@@ -23,7 +23,8 @@ Claude installation, and the usual workspace trust prerequisites.
 It does not inherit the ordinary Bridge root's settings or consent records.
 Claude's own configuration and authentication still apply. Cleanup discovers
 owned sessions from the private root even if launch JSON never returns, skips
-symlinked session directories, and preserves partial timeout output. It never
+symlinked session directories, and writes subprocess output directly to files so
+already-written output survives timeout or interruption. It never
 enumerates or closes sessions in the user's ordinary Bridge root.
 
 A private launcher in the probe's output directory adds an ordinary configured
@@ -115,8 +116,10 @@ The first runs above used the ordinary Bridge state root. After the probe's
 failure-cleanup review, both baseline and candidate were repeated using the
 committed private-root implementation, with the same draft/final outcomes and
 confirmed closure. A fault-injection test first reproduced skipped cleanup after
-launch timeout. The four passing Python tests cover timeout, malformed JSON,
-interruption, unrelated-session preservation and partial timeout output:
+launch timeout. The five passing Python tests cover timeout, malformed JSON,
+interruption, unrelated-session preservation and output preservation. A real
+SIGINT probe first reproduced lost flushed output; writing subprocess streams
+directly to task-owned files fixed that diagnostic gap without changing cleanup:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_verify_claude_stop_completion
@@ -157,8 +160,8 @@ actual module readiness remain separate gates.
 Public admission, doctor and help regressions failed before that correction and
 passed afterward. The final local Rust suite passed **1,488**, with **6 ignored**.
 Both Clippy configurations, Linux and MSVC cross-target Clippy, formatting, diff
-and language checks passed again. Python 3.12 discovery ran **39 tests**, with
-**2 skipped**, including the four new cleanup tests. CI and independent shipping
+and language checks passed again. Python 3.12 discovery ran **40 tests**, with
+**2 skipped**, including the five new probe tests. CI and independent shipping
 verification belong to their exact PR head and are tracked on the PR; the
 authenticated observations above remain explicitly attributed to `7c69580`.
 
