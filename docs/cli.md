@@ -615,9 +615,11 @@ Absence of these fields is unknown; it does not prove that no question existed.
 After the session becomes `ready`, `tell` can carry a known fact as another request. It
 does not resolve the earlier emission.
 
-When a request has ended, waited `ask`, `tell` and `reopen`, `result --wait`, and default
-`wait` read the record once and add only `question_emitted`, `question_emission_count`, and
-any `question_observation` diagnostic, without question content. Human output then prints
+Successful waited `ask`, `tell` and `reopen` read the record once and add only
+`question_emitted`, `question_emission_count`, and any `question_observation` diagnostic,
+without question content. `result --wait` and default `wait` do the same for any ended
+request. After a failed `ask`/`tell`/`reopen` wait, use `result --request` to inspect the
+retained questions. Human output then prints
 `question emissions retained: N` and the `result --request` command that shows them. A
 count says that emissions were retained; it does not say that a question is pending, was
 shown, or was answered. A pending poll without `--questions` reads no question record, and

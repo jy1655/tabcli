@@ -238,8 +238,9 @@ They do not block the ordinary result. No record is backfilled after the claim e
 
 Ordinary `result` exposes `question_emissions` during the turn and afterward. `status`
 reports presence for its active or latest-result request, and ordinary `inspect` reports
-per-request presence. An ended request's waited `ask`/`tell`, `result --wait` and default
-`wait` output adds only a retained-emission count. Absence is unknown. Emission never means
+per-request presence. Successful waited `ask`/`tell`/`reopen`, and an ended request's
+`result --wait` and default `wait` output add only a retained-emission count. After a failed
+`ask`/`tell`/`reopen` wait, use `result --request` to inspect it. Absence is unknown. Emission never means
 that a question is still pending or has been answered. A Ready `tell` is a new request,
 without a resolution receipt.
 Codex registers the tool only for a root session with its question configuration on and a

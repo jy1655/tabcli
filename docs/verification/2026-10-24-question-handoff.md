@@ -35,6 +35,10 @@ Linux and Windows cross-target Clippy, rustfmt, diff and language checks passed.
 integration skill was regenerated for all four hosts; generation/check and Python package
 tests passed.
 
+Independent Claude review found no request-selection, locking, wake or exit-status defect.
+Its documentation finding was addressed: waited `ask`/`tell`/`reopen` add presence only on
+success; a failed ending's retained evidence is available through the ordinary result queries.
+
 New tests exercise real Claim, Report, Receipt and Snapshot records through completed query
 outputs and the actual Turn runner's plain/JSON output. They check read-only behavior,
 request selection, retained counts, closed history, unchanged pending default waits, and
