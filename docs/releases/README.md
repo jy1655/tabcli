@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.24](0.4.24.md) (2026-10-23): Ships the host integrations as release assets: one `agent-bridge` skill packaged for Claude Code, Codex, Agy and Pi (#288, #285); checks the macOS guarded dialog response against the request's claim and expiry before automation (#279); closes the 2026-10-22 architecture review's module moves with no behaviour change (#276, #278, #280, #281, #284, #286, #287, #289 to #294)
 - [0.4.23](0.4.23.md) (2026-10-22): Adds `--context-mode compact`, a bounded Context attachment with a declared elision and retrieval command, recorded on the receipt (#273); moves the Request observation and search, the diagnostic vocabulary and the consent concerns into their own modules with no behaviour change (#271, #274, #275)
 - [0.4.22](0.4.22.md) (2026-10-22): Settles a delivery refused before sending as the request's failed event, so a refused follow-up no longer blocks `reopen` (#268); requires local build cleanup after every release (#267)
 - [0.4.21](0.4.21.md) (2026-10-20): Consolidates the Windows console helper's encoding, replies and failure classification, exposes typed consent and request observations to diagnostics, and exercises the production owner verifier in tests; no delivery or completion behavior changes (#265)
