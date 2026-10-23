@@ -145,7 +145,32 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     store
         .private("claude-mod/hooks/register.js")
         .write_private(MODULE.as_bytes())?;
-    Ok(vec!["--plugin-dir".into(), plugin.into_os_string()])
+    store
+        .private("claude-mod/hooks/report.js")
+        .write_private(include_bytes!("report.js"))?;
+    // Claude 2.1.309 permits only one module per plugin. Keep optional question
+    // observation in its own plugin so a module policy refusal preserves completion.
+    let questions = directory.join("claude-question-mod");
+    std::fs::create_dir_all(questions.join(".claude-plugin"))?;
+    std::fs::create_dir_all(questions.join("hooks"))?;
+    store.private("claude-question-mod/.claude-plugin/plugin.json").write_json(&json!({
+        "name":"agent-bridge-questions", "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
+    }))?;
+    store
+        .private("claude-question-mod/hooks/hooks.json")
+        .write_json(&json!({"modules":["./register.js"]}))?;
+    store
+        .private("claude-question-mod/hooks/register.js")
+        .write_private(include_bytes!("questions.js"))?;
+    store
+        .private("claude-question-mod/hooks/report.js")
+        .write_private(include_bytes!("report.js"))?;
+    Ok(vec![
+        "--plugin-dir".into(),
+        plugin.into_os_string(),
+        "--plugin-dir".into(),
+        questions.into_os_string(),
+    ])
 }
 
 pub(super) fn settings(_executable: &Path) -> Value {
@@ -526,6 +551,9 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
     let Some(binding) = binding.filter(|binding| {
         binding_matches_request(binding, &pending, &token) && binding.conversation == conversation
     }) else {
+        if event == "question.emissions" {
+            return Ok(());
+        }
         return diagnostic(
             directory,
             event,
@@ -533,15 +561,19 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
         );
     };
     let bound = binding == proposed;
+    if event == "question.emissions" {
+        return if bound {
+            questions::publish(&store, &binding, data)
+        } else {
+            Ok(())
+        };
+    }
     if !bound && event != "turn.complete" {
         return diagnostic(
             directory,
             event,
             "unbound Claude event has no marked completion evidence",
         );
-    }
-    if event == "question.emissions" {
-        return questions::publish(&store, &binding, data);
     }
     let outcome = if event == "oversize" {
         match data

@@ -592,10 +592,16 @@ Free-text questions use `options: null`. For example:
 
 Codex evidence requires a request bound through injected hooks; a notify-settled unbound
 request cannot have it. Claude evidence requires the original turn's native completion binding
-and a newly loaded Bridge module that observes completed main-loop model steps. It includes
+and a newly loaded optional Bridge plugin that observes completed main-loop model steps.
+It reads only the final engine/core trace return with `stopReason: tool_use`; missing trace
+evidence is unknown. It includes
 only the model's `AskUserQuestion` question text and option labels. Its `step:N/tool:M` id
 names the provider step and the call's position, not an addressed answer endpoint. It does
 not report questions from subagents, other plugins, or an unbound continuation turn.
+A repeated model step, an unfinished/refused question response, or a lower hook's rewrite
+marks the observation incomplete. Hooks above Bridge can change the response afterward;
+an emission does not establish that a dialog appeared or the tool ran. Refusing the optional
+question plugin does not remove the separate completion plugin.
 
 These fields report emission, without changing request state, result text, or exit status.
 `question_observation: "incomplete"` means Bridge retained a limited prefix or rejected

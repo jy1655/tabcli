@@ -576,7 +576,9 @@ fn both_platforms_select_native_mode_from_the_recorded_stable_version_only() {
                     prepared.unwrap(),
                     vec![
                         OsString::from("--plugin-dir"),
-                        directory.join("claude-mod").into_os_string()
+                        directory.join("claude-mod").into_os_string(),
+                        OsString::from("--plugin-dir"),
+                        directory.join("claude-question-mod").into_os_string()
                     ]
                 );
                 let mode: LaunchMode = store.private(MODE_FILE).json().unwrap();
@@ -590,7 +592,30 @@ fn both_platforms_select_native_mode_from_the_recorded_stable_version_only() {
                         "macos_stable_2_1_302_or_newer"
                     }
                 );
-                assert!(directory.join("claude-mod/hooks/register.js").is_file());
+                for (plugin, module) in [
+                    ("claude-mod", MODULE),
+                    ("claude-question-mod", include_str!("../questions.js")),
+                ] {
+                    assert_eq!(
+                        store
+                            .private(&format!("{plugin}/hooks/hooks.json"))
+                            .json::<Value>()
+                            .unwrap(),
+                        json!({"modules":["./register.js"]})
+                    );
+                    for (name, expected) in [
+                        ("register.js", module),
+                        ("report.js", include_str!("../report.js")),
+                    ] {
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                directory.join(plugin).join("hooks").join(name)
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                    }
+                }
                 assert!(prepare(&directory, !windows).is_err());
             } else {
                 assert!(!directory.join("claude-mod").exists());

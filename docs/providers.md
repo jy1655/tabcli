@@ -356,8 +356,12 @@ the official `turn.complete`. Stored results retain Claude's conversation identi
 request correlation id; the official turn id stays in the adapter's immutable binding.
 Bridge removes the marker only when it ends the answer.
 
-The same module observes completed main-loop `turn.step` responses from the engine and
-retains structured `AskUserQuestion` emissions only for the original bound turn. It passes
+An optional question plugin observes completed main-loop `turn.step` responses and
+retains structured `AskUserQuestion` emissions only for the original bound turn. It is
+separate from the completion plugin, so a policy refusing question observation can leave
+completion active; Claude 2.1.309 accepts one hooks module per plugin. Evidence comes only
+from the final `next.trace` engine/core return with `stopReason: tool_use`. An absent or
+short trace supplies no evidence. The module passes
 every streamed chunk and the step's result through unchanged. The official step carries
 the turn id; ordinary `tool.call` and classic hooks do not. Each emission's `step:N/tool:M`
 id identifies the step and the call's original position within that response. These ids
@@ -365,7 +369,12 @@ are observation cursors, not an endpoint for answering a dialog.
 
 The Claude-owned `claude-questions-<claim>.json` retains question text and option labels
 within a 64 KiB budget. Incomplete or conflicting evidence preserves the prior prefix and
-marks it incomplete. Publication verifies the current claim and immutable binding under
+marks it incomplete. A repeated model step, a non-tool-use response carrying a question,
+or a lower hook's rewrite also marks incompleteness. Hooks above Bridge can still change
+or discard the response after observation, so this does not prove a dialog was displayed
+or a tool executed. The helper has two 5-second attempts; a failure logs unavailable
+observation and leaves ordinary tool execution intact. Stream overhead and dialog delay
+have not been benchmarked. Publication verifies the current claim and immutable binding under
 the lifecycle lock; reads use the selected historical receipt under the query's lock.
 `result`, `status`, `inspect` and `wait --questions` use the same contracts as Codex emissions.
 Nothing marks a question pending or answered, changes permissions, or releases the claim.

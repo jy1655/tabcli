@@ -219,6 +219,8 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
             "session-safe123",
             "--plugin-dir",
             directory.join("claude-mod").to_str().unwrap(),
+            "--plugin-dir",
+            directory.join("claude-question-mod").to_str().unwrap(),
         ]
     );
     assert_eq!(

@@ -11,6 +11,17 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         include_str!("../src/native/provider/claude/completion.js"),
     )
     .unwrap();
+    fs::write(root.path().join("package.json"), r#"{"type":"module"}"#).unwrap();
+    fs::write(
+        root.path().join("report.js"),
+        include_str!("../src/native/provider/claude/report.js"),
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("questions.mjs"),
+        include_str!("../src/native/provider/claude/questions.js"),
+    )
+    .unwrap();
     let harness = root.path().join("test.mjs");
     fs::write(
         &harness,
@@ -120,8 +131,11 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
                 &fs::read(directory.join(format!("claude-questions-{token}.json"))).unwrap(),
             )
             .unwrap();
-            assert_eq!(record["items"].as_array().unwrap().len(), 1);
-            assert_eq!(record["incomplete"], scenario.ends_with("oversize"));
+            assert_eq!(
+                record["items"].as_array().unwrap().len(),
+                if *scenario == "questions" { 2 } else { 1 }
+            );
+            assert_eq!(record["incomplete"], *scenario != "questions_retry");
         }
         if *scenario == "oversize" {
             assert!(event["error"].as_str().unwrap().contains("not truncated"));

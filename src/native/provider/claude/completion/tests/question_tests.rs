@@ -118,9 +118,11 @@ fn claude_questions_require_original_turn_and_never_follow_a_new_claim() {
     assert!(observe(&f).is_none());
     f.send("question.emissions", questions(0, "original"));
     f.complete("unmarked interim");
+    let before = snapshot(f.root.path());
     let mut continuation = questions(1, "unbound continuation");
     continuation["turnId"] = json!("next-turn");
     f.send("question.emissions", continuation);
+    assert_eq!(snapshot(f.root.path()), before);
     assert_eq!(observe(&f).unwrap().items.len(), 1);
     f.complete_marked("done");
     let before = snapshot(f.root.path());
@@ -166,6 +168,7 @@ fn claude_questions_preserve_prefix_on_replay_conflict_invalid_and_oversized_ite
     invalid["items"][0]["questions"][0]["multiSelect"] = Value::Null;
     f.send("question.emissions", invalid);
     f.send("question.emissions", questions(2, "valid after malformed"));
+    f.send("question.emissions", questions(1, "out of order"));
     let observation = observe(&f).unwrap();
     assert_eq!(observation.items.len(), 2);
     assert_eq!(observation.items[0].questions[0].title, "first");
@@ -211,4 +214,113 @@ fn claude_questions_damaged_records_do_not_change_completion_and_unlocked_reads_
         f.store().private(&path).json::<Value>().unwrap(),
         json!("broken record")
     );
+}
+
+#[test]
+fn claude_questions_ignore_closed_and_legacy_sessions() {
+    for closed in [false, true] {
+        let f = Fixture::new();
+        f.start();
+        if closed {
+            crate::native::session::update_status(f.root.path(), SessionState::Closed, None, None)
+                .unwrap();
+        } else {
+            f.store().private(MODE_FILE).remove().unwrap();
+        }
+        let before = snapshot(f.root.path());
+        f.send("question.emissions", questions(0, "ignored"));
+        assert_eq!(snapshot(f.root.path()), before);
+        assert!(observe(&f).is_none());
+    }
+}
+
+#[test]
+fn claude_questions_malformed_envelopes_retain_no_emissions() {
+    for (field, value) in [
+        ("step", Value::Null),
+        ("step", json!(-1)),
+        ("step", json!(0.5)),
+        ("items", json!({})),
+        ("incomplete", Value::Null),
+    ] {
+        let f = Fixture::new();
+        f.start();
+        let mut data = questions(0, "invalid envelope");
+        data[field] = value;
+        f.send("question.emissions", data);
+        let observation = observe(&f).unwrap();
+        assert!(observation.items.is_empty());
+        assert!(matches!(
+            observation.observation,
+            provider::QuestionObservation::Incomplete
+        ));
+        f.retained();
+        f.complete_marked("completion is independent");
+        assert_eq!(f.events()[0].message, "completion is independent");
+    }
+}
+
+#[test]
+fn claude_questions_limit_includes_the_entire_pretty_encoded_record() {
+    for extra in [0, 1] {
+        let f = Fixture::new();
+        f.start();
+        f.send("question.emissions", questions(0, "x"));
+        let path = format!("claude-questions-{}.json", f.token);
+        let baseline = f.store().private(&path).text().unwrap().unwrap().len();
+        f.store().private(&path).remove().unwrap();
+        f.send(
+            "question.emissions",
+            questions(0, &"x".repeat(65536 - baseline + 1 + extra)),
+        );
+        let observation = observe(&f).unwrap();
+        if extra == 0 {
+            assert_eq!(
+                f.store().private(&path).text().unwrap().unwrap().len(),
+                65536
+            );
+            assert_eq!(observation.items.len(), 1);
+            assert!(matches!(
+                observation.observation,
+                provider::QuestionObservation::Complete
+            ));
+        } else {
+            assert!(observation.items.is_empty());
+            assert!(matches!(
+                observation.observation,
+                provider::QuestionObservation::Incomplete
+            ));
+            assert_eq!(
+                f.store().private(&path).json::<Value>().unwrap()["full"],
+                true
+            );
+        }
+        f.retained();
+    }
+}
+
+#[test]
+fn claude_questions_reject_mismatched_historical_identity_and_invalid_prefix() {
+    let f = Fixture::new();
+    f.start();
+    f.send("question.emissions", questions(0, "first"));
+    let path = format!("claude-questions-{}.json", f.token);
+    let saved: Value = f.store().private(&path).json().unwrap();
+    for pointer in ["/request_id", "/binding/claim", "/items/0/id", "/full"] {
+        let mut damaged = saved.clone();
+        *damaged.pointer_mut(pointer).unwrap() = if pointer == "/full" {
+            json!(true)
+        } else {
+            json!("other")
+        };
+        f.store().private(&path).write_json(&damaged).unwrap();
+        let before = snapshot(f.root.path());
+        assert!(matches!(
+            observe(&f).unwrap().observation,
+            provider::QuestionObservation::Unreadable
+        ));
+        assert_eq!(snapshot(f.root.path()), before);
+    }
+    f.complete_marked("completion is independent");
+    assert_eq!(f.events()[0].message, "completion is independent");
 }

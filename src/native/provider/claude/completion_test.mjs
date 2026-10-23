@@ -20,8 +20,8 @@ const $ = {
   ui: { log: text => logs.push(text) },
   process: { run: async (argv, init) => {
     assert.deepEqual(argv, [executable, "native-hook", "claude"]);
-    assert.equal(init.timeoutMs, 30000);
     const wire = JSON.parse(init.stdin);
+    assert.equal(init.timeoutMs, wire.event === "question.emissions" ? 5000 : 30000);
     calls.push({ event: wire.event, bytes: Buffer.byteLength(init.stdin), stdin: init.stdin });
     if (wire.event === "turn.complete") {
       completeAttempts++;
@@ -44,7 +44,7 @@ const $ = {
 };
 const { register } = await import(pathToFileURL(modulePath).href);
 register((name, fn) => { assert(!handlers.has(name)); handlers.set(name, fn); });
-assert.deepEqual([...handlers.keys()], ["session.start", "turn.start", "turn.step", "turn.complete"]);
+assert.deepEqual([...handlers.keys()], ["session.start", "turn.start", "turn.complete"]);
 let nextCalls = 0;
 async function fire(name, e) {
   const sentinel = { name };
@@ -60,31 +60,43 @@ const peerBody = pending.expected_message.replace(/<(\/?cross-session-message)>/
 const start = { turnId, text: `<cross-session-message from="uds:\\\\.\\pipe\\LOCAL\\sender" from-name="sender" from-mode="prompting">\n${peerBody}\n</cross-session-message>` };
 await fire("turn.start", start);
 if (scenario.startsWith("questions")) {
+  const questionHandlers = new Map();
+  const { register: registerQuestions } = await import(new URL("./questions.mjs", pathToFileURL(modulePath)).href);
+  registerQuestions((name, fn) => questionHandlers.set(name, fn));
+  assert.deepEqual([...questionHandlers.keys()], ["turn.complete", "turn.step"]);
   const question = { question: "Which baseline? 한😀", header: "Baseline", multiSelect: true,
     options: [{ label: "Current", description: "Current baseline" }, { label: "Previous", description: "Previous baseline" }] };
   async function step({ index = 0, agentId, origin = { plugin: "engine", tier: "core" },
-      broken = false, mismatch = false, cancel = false, clear = false, large = false } = {}) {
+      broken = false, mismatch = false, cancel = false, clear = false, large = false,
+      empty = false, noTrace = false, rewritten = false, stopReason = "tool_use", sessionFailure = false } = {}) {
     const e = { turnId, index, model: "fixture", messageCount: 1 };
     if (agentId !== undefined) e.agentId = agentId;
-    const chunks = [{ kind: "text", index: 0, text: "Question follows" },
-      { kind: "tool", index: 1, id: "toolu-question", name: "AskUserQuestion" }];
-    const response = { turnId: mismatch ? "foreign" : turnId, index, answer: "Question follows", stopReason: "tool_use",
+    const chunks = [{ kind: "text", index: 0, text: "Question follows", ref: 1 },
+      { kind: "tool", index: 1, id: "toolu-question", name: "AskUserQuestion", ref: 2 },
+      { kind: "engine", ref: 3 }, { kind: "input", index: 1, json: "{}", ref: 4 }];
+    const core = { turnId: mismatch ? "foreign" : turnId, index, answer: "Question follows", stopReason,
       toolUses: [{ name: "Read", input: {} }, { name: "AskUserQuestion", input: { questions: [
         large ? { ...question, question: "x".repeat(max + 1) } : question,
       ] } }], usage: null };
+    if (empty) core.toolUses = [];
+    const response = rewritten ? { ...core, toolUses: [] } : core;
     const error = new Error("model step aborted");
     const next = async function* (received) {
       assert.equal(received, e);
       for (const chunk of chunks) yield chunk;
       if (broken) throw error;
       if (clear) $.session.id = async () => "00000000-0000-4000-8000-000000000999";
+      next.trace = noTrace ? [] : [{ plugin: "engine", tier: "core", returned: core }];
       return response;
     };
     next.origin = origin;
-    const stream = handlers.get("turn.step")($, e, next);
+    if (sessionFailure) $.session.id = async () => { throw new Error("unavailable"); };
+    const stream = questionHandlers.get("turn.step")($, e, next);
     assert.equal((await stream.next()).value, chunks[0]);
     if (cancel) { await stream.return(); return; }
     assert.equal((await stream.next()).value, chunks[1]);
+    assert.equal((await stream.next()).value, chunks[2]);
+    assert.equal((await stream.next()).value, chunks[3]);
     if (broken) { await assert.rejects(stream.next(), actual => actual === error); return; }
     const final = await stream.next();
     assert.equal(final.done, true);
@@ -94,9 +106,12 @@ if (scenario.startsWith("questions")) {
   const before = calls.length;
   for (const agentId of ["child", "", null]) await step({ agentId });
   await step({ origin: { plugin: "another-plugin", tier: "user" } });
-  await step({ broken: true });
-  await step({ mismatch: true });
-  await step({ cancel: true });
+  await step({ index: 10, broken: true });
+  await step({ index: 11, mismatch: true });
+  await step({ index: 12, cancel: true });
+  await step({ index: 13, empty: true });
+  await step({ index: 14, noTrace: true });
+  await step({ index: 15, sessionFailure: true });
   assert.equal(calls.length, before);
   if (scenario === "questions_oversize") {
     await step({ large: true });
@@ -108,9 +123,15 @@ if (scenario.startsWith("questions")) {
   await step({ index: 1, clear: true });
   const claim = fs.readFileSync(`${directory}/turn.claim`, "utf8").trim();
   const recordPath = `${directory}/claude-questions-${claim}.json`;
-  const record = fs.readFileSync(recordPath);
-  await step({ index: 1 });
-  assert.deepEqual(fs.readFileSync(recordPath), record);
+  let record = fs.readFileSync(recordPath);
+  if (scenario !== "questions_retry") {
+    await step({ index: 1, empty: true });
+    assert.equal(JSON.parse(fs.readFileSync(recordPath)).incomplete, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(recordPath)).items, JSON.parse(record).items);
+    record = fs.readFileSync(recordPath);
+    await step({ index: 1 });
+    assert.deepEqual(fs.readFileSync(recordPath), record);
+  }
   assert.equal(fs.readdirSync(`${directory}/events`).length, 0);
   assert.equal(fs.readFileSync(`${directory}/turn.claim`, "utf8").trim(), claim);
   const receipt = JSON.parse(fs.readFileSync(`${directory}/requests/${claim}.json`, "utf8"));
@@ -128,6 +149,29 @@ if (scenario.startsWith("questions")) {
   assert.equal(wait(["--questions", "--after-question", observation.question.after_question]).timed_out, true);
   assert.equal(wait([]).timed_out, true);
   assert.deepEqual(fs.readFileSync(recordPath), record);
+  if (scenario === "questions") {
+    for (const [index, stopReason] of [[2, null], [3, "refusal"]]) {
+      const before = calls.length;
+      await step({ index, stopReason });
+      assert.equal(calls.length, before + 1);
+      const wire = JSON.parse(calls.at(-1).stdin);
+      assert.equal(wire.event, "question.emissions");
+      assert.equal(wire.data.incomplete, true);
+      assert.deepEqual(wire.data.items, []);
+    }
+    const before = calls.length;
+    await step({ index: 4, rewritten: true });
+    assert.equal(calls.length, before + 1);
+    const wire = JSON.parse(calls.at(-1).stdin);
+    assert.equal(wire.event, "question.emissions");
+    assert.equal(wire.data.incomplete, true);
+    assert.deepEqual(wire.data.items, [{ index: 1, questions: [question] }]);
+    const after = JSON.parse(fs.readFileSync(recordPath));
+    assert.equal(after.incomplete, true);
+    assert.equal(after.items.length, 2);
+    assert.equal(after.items[1].id, "step:4/tool:1");
+    assert.equal(after.items.some(item => /step:[23]\//.test(item.id)), false);
+  }
 }
 let answer = "한😀\n".repeat(15000);
 assert(answer.length > 32767);

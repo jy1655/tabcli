@@ -1330,6 +1330,8 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
             OsString::from("session-reopenplan"),
             OsString::from("--plugin-dir"),
             session.join("claude-mod").into_os_string(),
+            OsString::from("--plugin-dir"),
+            session.join("claude-question-mod").into_os_string(),
         ]
     );
     assert_no_op_watcher(plan.watcher);
@@ -1523,6 +1525,8 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                     expected.extend([
                         OsString::from("--plugin-dir"),
                         directory.join("claude-mod").into_os_string(),
+                        OsString::from("--plugin-dir"),
+                        directory.join("claude-question-mod").into_os_string(),
                     ]);
                     assert_eq!(plan.arguments, expected, "{label}");
                     assert_eq!(
@@ -1578,6 +1582,8 @@ fn resume_plan_is_the_complete_command_for_every_policy() {
                     OsString::from("session-reopenplan"),
                     OsString::from("--plugin-dir"),
                     session.join("claude-mod").into_os_string(),
+                    OsString::from("--plugin-dir"),
+                    session.join("claude-question-mod").into_os_string(),
                 ]);
                 assert_eq!(plan.arguments, expected, "{label}");
                 assert_eq!(
