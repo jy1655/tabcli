@@ -52,12 +52,14 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - Use the official `ListAgents` and `SendMessage` path on every supported Agent Bridge
   platform. Do not restore the removed native-Windows `--print --resume` supervisor or
   silently fall back to terminal input when official messaging is unavailable.
-- New native Windows launches and reopens select `native_v1` completion before spawn from
-  the recorded stable Claude version, at least 2.1.302, and load Bridge's session-local
+- New macOS and native Windows launches, plus Windows reopens, select `native_v1` completion
+  before spawn from the recorded stable Claude version, at least 2.1.302, and load Bridge's session-local
   completion module through Claude's official `--plugin-dir` flag.
   Actual `session.start` readiness is required before input; a version or plugin
   flag is no proof that the module ran. Missing readiness refuses delivery without a
-  Stop fallback or a provider trust/policy override. macOS keeps legacy completion.
+  Stop fallback or a provider trust/policy override. Initial and follow-up prompts use
+  `ListAgents` and `SendMessage`; argv carries no initial prompt and new settings add no
+  classic Bridge Stop hooks. The version floor establishes eligibility, not runtime readiness.
 - Native completion observes only main-loop `turn.start` and `turn.complete`. Bind the
   whole expected message inside one anchored peer envelope to the live claim under the
   lifecycle lock, permitting only Claude's reversible insertion of one backslash after an
@@ -96,8 +98,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   fails without truncation; an unbound oversized signal has no marker and cannot settle the
   request. This route adds no cancellation API or usage mapping.
 - An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
-  version inference. Its pending Stop completion remains readable, but new Windows tells
-  are refused with close/reopen recovery. Pending cleanup checks its request id under the
+  version inference. Its pending Stop completion remains readable, but new tells on both
+  platforms are refused. Windows supports close/reopen recovery. On macOS, inspect the
+  result and terminal, close when appropriate, then start a fresh `ask` with needed context;
+  macOS reopen remains unsupported. Pending cleanup checks its request id under the
   lifecycle lock so an older sender cannot delete a successor's record. The module reports
   through existing native-hook stdin and core Report; at most one identical helper-wire
   repeat is allowed after the helper fails to start or exits nonzero, never another SendMessage.
@@ -113,6 +117,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Marker omission was supported by that earlier build; the background-continuation regression
   and revised marker requirement are recorded in
   `docs/verification/2026-10-22-windows-260-reverification.md`.
+- macOS Claude 2.1.309 checks for configured Stop blocking, disabled readiness, ordinary
+  permissions and background continuation are recorded with exact binary identities in
+  `docs/verification/2026-10-23-macos-249-claude-completion.md`; they do not verify the 2.1.302 floor.
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.

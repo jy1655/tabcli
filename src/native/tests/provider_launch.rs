@@ -141,8 +141,7 @@ fn session_metadata_titles_drop_control_characters_and_are_bounded() {
 // workspace, with the adapter's environment removals applied and Bridge's session
 // variables set. Claude's removal list is non-empty, so a dropped list is observable; an
 // inherited CLAUDE_CODE_CHILD_SESSION is the marker that would stop the managed session
-// from registering its inbox (issue #42). The spawned process is recorded, the accepted
-// prompt is removed and the session runs before the provider exits, and the exit settles.
+// from registering its inbox (issue #42).
 #[cfg(unix)]
 #[test]
 fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
@@ -154,16 +153,16 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
         &provider,
         concat!(
             "#!/bin/sh\n",
-            "if [ \"$1\" = \"--version\" ]; then printf '2.1.234 (Claude Code)\\n'; exit 0; fi\n",
+            "if [ \"$1\" = \"--version\" ]; then printf '2.1.302 (Claude Code)\\n'; exit 0; fi\n",
             "printf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
             "pwd > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/cwd.txt\"\n",
             "env > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/env.txt\"\n",
             "i=0\n",
-            "until grep -q '\"running\"' \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status.json\" 2>/dev/null; do\n",
+            "until grep -q '\"awaiting-initial-input\"' \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status.json\" 2>/dev/null; do\n",
             "  i=$((i + 1)); [ \"$i\" -gt 500 ] && exit 3; sleep 0.01\n",
             "done\n",
             "cp \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status.json\" \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status-at-run.json\"\n",
-            "[ -e \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/initial-prompt.txt\" ] && exit 4\n",
+            "[ -e \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/initial-prompt.txt\" ] || exit 4\n",
             "exit 0\n",
         ),
     )
@@ -182,7 +181,7 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
             id: "session-safe123".to_owned(),
             provider: "claude".to_owned(),
             provider_path: provider,
-            provider_version: "2.1.234 (Claude Code)".to_owned(),
+            provider_version: "2.1.302 (Claude Code)".to_owned(),
             workspace: workspace.clone(),
             title: "Claude test".to_owned(),
             model: Some("Fable5".to_owned()),
@@ -218,7 +217,8 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
             directory.join("claude-settings.json").to_str().unwrap(),
             "--name",
             "session-safe123",
-            "claude prompt",
+            "--plugin-dir",
+            directory.join("claude-mod").to_str().unwrap(),
         ]
     );
     assert_eq!(
@@ -258,8 +258,11 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
     assert_ne!(record.pid, 0);
     assert!(record.spawned_unix_ms > 0);
     let at_run: SessionStatus = read_json(&directory.join("status-at-run.json")).unwrap();
-    assert_eq!(at_run.state.as_str(), "running");
-    assert!(!directory.join("initial-prompt.txt").exists());
+    assert_eq!(at_run.state, SessionState::AwaitingInitialInput);
+    assert_eq!(
+        fs::read(directory.join("initial-prompt.txt")).unwrap(),
+        b"claude prompt"
+    );
     let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "exited");
     let log = fs::read_to_string(directory.join("launch.log")).unwrap();

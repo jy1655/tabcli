@@ -544,8 +544,11 @@ fn fence_prevents_admitted_and_legacy_spawns() {
         tx.send(directory.to_owned()).unwrap();
         anyhow::anyhow!(FAILURE)
     });
-    run_reopen(request()).unwrap_err();
-    let child = rx.recv().unwrap();
+    let error = run_reopen(request()).unwrap_err();
+    assert!(format!("{error:#}").contains(FAILURE), "{error:#}");
+    let child = rx
+        .try_recv()
+        .expect("launch-failure hook must report its session before reopen returns");
     for legacy in [false, true] {
         let store = Store::open_unchecked(&child);
         if legacy {

@@ -29,7 +29,7 @@ Omit `--model` and `--effort` to use the provider's defaults. Bridge forwards th
 | CLI | Minimum launch version | `--model` | `--effort` | `--yolo` forwards |
 | --- | --- | --- | --- | --- |
 | `codex` | 0.147.0 | `--model` | `-c model_reasoning_effort="VALUE"` | See below |
-| `claude` | 2.1.234 | `--model` | `--effort` | `--dangerously-skip-permissions` |
+| `claude` | 2.1.302 stable | `--model` | `--effort` | `--dangerously-skip-permissions` |
 | `agy` | 1.1.12 | `--model` | `--effort` | `--dangerously-skip-permissions` |
 | `pi` | 0.84.1 | `--model` | `--thinking` | `--approve` |
 
@@ -305,16 +305,18 @@ interruption completion, and verified follow-up resumption.
 
 ## Claude Code
 
-Install and sign in to `claude` 2.1.234 or newer. Resolve workspace trust in Claude before launch,
+Install and sign in to stable `claude` 2.1.302 or newer. Resolve workspace trust in Claude before launch,
 or use [existing workspace consent](security-and-data.md#workspace-trust-and-consent).
-New native Windows launches and reopens require stable Claude Code 2.1.302 or newer and load a
-session-local Bridge completion module through Claude's official `--plugin-dir` flag. Bridge
+New macOS and native Windows launches, plus Windows reopens, require a recorded stable Claude
+Code 2.1.302 or newer and load a session-local Bridge completion module through Claude's official
+`--plugin-dir` flag. Bridge
 waits for that module to report readiness before sending the initial prompt. Disabled hooks
-(`disableAllHooks: true`, verified), unresolved plugin trust or provider policy can withhold
+(`disableAllHooks: true`, observed on Windows and macOS), unresolved plugin trust or provider policy can withhold
 readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
+The version floor establishes launch eligibility, not proof that the module ran.
 
-The macOS initial prompt is a launch argument. On native Windows, Bridge delivers it after launch
-through Claude's official cross-session messaging. Every follow-up uses that messaging path too:
+On both platforms, Bridge delivers the initial prompt after launch through Claude's official
+cross-session messaging. The prompt is absent from argv. Every follow-up uses that messaging path too:
 a separate, nonpersistent Claude messenger model turn calls `ListAgents` to find your session
 and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session markers so a
 launch from inside Claude does not create a nested session with an undiscoverable inbox; the list
@@ -332,7 +334,7 @@ must find the exact live local session. A recent version or saved inbound settin
 those conditions. If delivery fails, run `tabcli doctor <session>` and read the messaging
 checks. Bridge does not substitute terminal input.
 
-A proven not-sent follow-up releases its claim and restores `ready`. A proven not-sent Windows
+A proven not-sent follow-up releases its claim and restores `ready`. A proven not-sent
 initial delivery leaves the session `failed`; close it and start a new session. An uncertain
 delivery keeps a still-pending request claimed. The initial-delivery error says
 `could not be confirmed`; the follow-up error says `could not confirm delivery`. Do not repeat
@@ -341,7 +343,7 @@ request, or explicitly close the session if you decide to abandon it.
 
 The messenger model sees a per-request reference, not your follow-up text. A `PreToolUse` hook
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
-what ran. On new Windows sessions, Bridge's completion module forwards Claude's official
+what ran. On new sessions, Bridge's completion module forwards Claude's official
 `turn.start` and `turn.complete` events. Bridge binds the complete addressed prompt at
 `turn.start` to the current claim. A normal answer completes the request only with the
 exact delegation marker at its suffix.
@@ -371,7 +373,8 @@ claim and write the latest rejection reason to `claude-mod-diagnostic.json` in t
 directory. A message delivered into an unrelated running turn without its own exact start
 cannot be correlated. Combined queued input that differs from the exact addressed frame also
 stays unbound. A retained claim prevents another tell; inspect the result and terminal, then
-close and reopen if you abandon it. These running-turn and combined-input limits follow from
+close it if you abandon it. On macOS, start a fresh `ask` with the needed context; native Windows
+also supports `reopen`. These running-turn and combined-input limits follow from
 exact matching and have not been driven live. Native completion wires are limited to 4 MiB of
 UTF-8 JSON. Admission includes framing and escaping overhead; an oversized bound answer fails
 without truncation. An unbound interruption, error, refusal, empty answer or oversized signal
@@ -379,10 +382,14 @@ has no sufficient attribution and leaves the request pending.
 See the [October 22 regression and fix record](verification/2026-10-22-windows-260-reverification.md)
 and the [earlier owner verification](verification/2026-10-19-windows-249-claude-native-completion.md)
 for observations and limits. The earlier build's marker-omission behavior is superseded here.
+The [October 23 macOS record](verification/2026-10-23-macos-249-claude-completion.md)
+covers a configured blocking Stop hook, disabled readiness and ordinary permissions on 2.1.309.
 
-macOS and existing sessions retain legacy Stop completion, including its limitation when another
-Stop hook continues the turn. Legacy pending requests can finish after a binary upgrade, but new
-Windows tells into those sessions are refused; close and reopen to use native completion.
+An absent completion-mode record or explicit `legacy_stop` remains readable, including its
+limitation when another Stop hook continues the turn. Legacy pending requests can finish after
+a binary upgrade, but new tells into those sessions are refused on both platforms. Inspect the
+result and terminal, then close when appropriate. On macOS, start a fresh `ask` with the needed
+context; on native Windows, close and reopen to use native completion.
 Legacy `StopFailure` cannot identify a pending cross-session request and leaves its claim held.
 Do not downgrade the binary or `AGENT_BRIDGE_EXECUTABLE` while native-mode Claude sessions
 remain open; older binaries cannot interpret their completion protocol.

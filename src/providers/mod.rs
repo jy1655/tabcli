@@ -19,6 +19,9 @@ pub trait ProviderAdapter: Sync {
     fn cli(&self) -> FirstPartyCli;
     fn command(&self) -> &'static str;
     fn minimum_version(&self) -> Version;
+    fn version_is_supported(&self, version: &Version) -> bool {
+        version >= &self.minimum_version()
+    }
     fn yolo_args(&self) -> &'static [&'static str];
     fn model_args(&self, model: &str) -> Vec<String>;
     fn effort_args(&self, effort: &str) -> Result<Vec<String>>;

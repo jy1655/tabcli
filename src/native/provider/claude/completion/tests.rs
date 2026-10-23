@@ -257,113 +257,112 @@ fn old_pending_cleanup_cannot_delete_a_new_request() {
 
 #[test]
 fn readiness_is_runtime_evidence_and_never_replaces_the_claim_or_deadline() {
-    let f = Fixture::new();
-    let now = Instant::now();
-    let mut clock = FakeClock::new(now);
-    let error = admit(
-        f.root.path(),
-        &f.token,
-        now + Duration::from_millis(150),
-        true,
-        &mut clock,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("readiness was not observed"));
-    f.send("session.start", json!({}));
-    let mut clock = FakeClock::new(now);
-    admit(
-        f.root.path(),
-        &f.token,
-        now + Duration::from_secs(1),
-        true,
-        &mut clock,
-    )
-    .unwrap();
-    assert!(admit(f.root.path(), &f.token, now, true, &mut clock).is_err());
-    assert!(
+    for windows in [false, true] {
+        let f = Fixture::new();
+        let now = Instant::now();
+        let mut clock = FakeClock::new(now);
+        let error = admit(
+            f.root.path(),
+            &f.token,
+            now + Duration::from_millis(150),
+            windows,
+            &mut clock,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("readiness was not observed"));
+        f.send("session.start", json!({}));
+        let mut clock = FakeClock::new(now);
         admit(
             f.root.path(),
-            "999-999-999",
+            &f.token,
             now + Duration::from_secs(1),
-            true,
-            &mut clock
+            windows,
+            &mut clock,
         )
-        .is_err()
-    );
-    f.store()
-        .private(READY_FILE)
-        .write_json(&json!({"schema":1,"revision":2,"conversation":CONVERSATION}))
         .unwrap();
-    assert!(
-        admit(
-            f.root.path(),
-            &f.token,
-            now + Duration::from_secs(1),
-            true,
-            &mut clock
-        )
-        .is_err()
-    );
-    crate::native::session::update_status(f.root.path(), SessionState::Closed, None, None).unwrap();
-    assert!(
-        admit(
-            f.root.path(),
-            &f.token,
-            now + Duration::from_secs(1),
-            true,
-            &mut clock
-        )
-        .is_err()
-    );
+        assert!(admit(f.root.path(), &f.token, now, windows, &mut clock).is_err());
+        assert!(
+            admit(
+                f.root.path(),
+                "999-999-999",
+                now + Duration::from_secs(1),
+                windows,
+                &mut clock
+            )
+            .is_err()
+        );
+        f.store()
+            .private(READY_FILE)
+            .write_json(&json!({"schema":1,"revision":2,"conversation":CONVERSATION}))
+            .unwrap();
+        assert!(
+            admit(
+                f.root.path(),
+                &f.token,
+                now + Duration::from_secs(1),
+                windows,
+                &mut clock
+            )
+            .is_err()
+        );
+        crate::native::session::update_status(f.root.path(), SessionState::Closed, None, None)
+            .unwrap();
+        assert!(
+            admit(
+                f.root.path(),
+                &f.token,
+                now + Duration::from_secs(1),
+                windows,
+                &mut clock
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
-fn legacy_windows_refuses_new_input_while_macos_preserves_its_route() {
+fn legacy_sessions_refuse_new_input_with_platform_specific_recovery() {
     let f = Fixture::new();
     f.store().private(MODE_FILE).remove().unwrap();
-    let now = Instant::now();
-    let mut clock = FakeClock::new(now);
-    assert!(
-        admit(
-            f.root.path(),
-            &f.token,
-            now + Duration::from_secs(1),
-            true,
-            &mut clock
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("reopen")
-    );
-    admit(
-        f.root.path(),
-        &f.token,
-        now + Duration::from_secs(1),
-        false,
-        &mut clock,
-    )
-    .unwrap();
-    f.store()
-        .private(MODE_FILE)
-        .write_json(&LaunchMode {
-            schema: 1,
-            mode: Mode::LegacyStop,
-            reason: "platform_legacy".into(),
-            claude_version: None,
-        })
-        .unwrap();
-    assert!(
-        admit(
-            f.root.path(),
-            &f.token,
-            now + Duration::from_secs(1),
-            true,
-            &mut clock
-        )
-        .is_err()
-    );
-    assert!(settings(Path::new("bridge"), true).get("hooks").is_none());
-    assert!(settings(Path::new("bridge"), false)["hooks"]["Stop"].is_array());
+    for explicit in [false, true] {
+        if explicit {
+            f.store()
+                .private(MODE_FILE)
+                .write_json(&LaunchMode {
+                    schema: 1,
+                    mode: Mode::LegacyStop,
+                    reason: "platform_legacy".into(),
+                    claude_version: None,
+                })
+                .unwrap();
+        }
+        for windows in [false, true] {
+            let now = Instant::now();
+            let mut clock = FakeClock::new(now);
+            let error = admit(
+                f.root.path(),
+                &f.token,
+                now + Duration::from_secs(1),
+                windows,
+                &mut clock,
+            )
+            .unwrap_err()
+            .to_string();
+            if windows {
+                assert_eq!(
+                    error,
+                    "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
+                );
+            } else {
+                assert!(error.contains("inspect its result and terminal"));
+                assert!(error.contains("close it when appropriate"));
+                assert!(error.contains("fresh ask with the needed context"));
+                assert!(!error.contains("reopen"));
+            }
+            assert_eq!(clock.now(), now);
+            f.retained();
+        }
+    }
 }
 
 #[test]
@@ -508,42 +507,94 @@ fn wire_admission_counts_json_escaping_and_oversize_requires_the_bound_identity(
 }
 
 #[test]
-fn windows_selects_native_mode_from_the_recorded_stable_version_only() {
-    for version in [
-        "2.1.301",
-        "2.1.302-beta.1",
-        "unknown",
-        "2.1.302 (Claude Code)",
-        "2.2.0",
-    ] {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("session-floor");
-        std::fs::create_dir(&directory).unwrap();
-        let store = Store::open_unchecked(&directory);
-        store
-            .write_manifest(&crate::native::session::schema::SessionManifest {
-                schema: 1,
-                id: "session-floor".into(),
-                provider: "claude".into(),
-                provider_path: "unused".into(),
-                provider_version: version.into(),
-                workspace: root.path().into(),
-                title: "version fixture".into(),
-                model: None,
-                effort: None,
-                yolo: true,
-                created_unix_ms: 1,
-            })
-            .unwrap();
-        let eligible = ["2.1.302 (Claude Code)", "2.2.0"].contains(&version);
-        assert_eq!(prepare(&directory, true).is_ok(), eligible, "{version}");
-        assert_eq!(native_mode(&directory).unwrap(), eligible);
-        if eligible {
-            assert!(directory.join("claude-mod/hooks/register.js").is_file());
-            assert!(prepare(&directory, false).is_err());
-        } else {
-            assert!(!directory.join("claude-mod").exists());
-            assert!(!directory.join(MODE_FILE).exists());
+fn both_platforms_select_native_mode_from_the_recorded_stable_version_only() {
+    for windows in [false, true] {
+        for version in [
+            "",
+            "2.1.301",
+            "2.1.302-beta.1",
+            "2.1.309-beta.1",
+            "unknown",
+            "2.1.302",
+            "2.1.302 (Claude Code)",
+            "2.2.0",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("session-floor");
+            std::fs::create_dir(&directory).unwrap();
+            let store = Store::open_unchecked(&directory);
+            store
+                .write_manifest(&crate::native::session::schema::SessionManifest {
+                    schema: 1,
+                    id: "session-floor".into(),
+                    provider: "claude".into(),
+                    provider_path: "unused".into(),
+                    provider_version: version.into(),
+                    workspace: root.path().into(),
+                    title: "version fixture".into(),
+                    model: None,
+                    effort: None,
+                    yolo: true,
+                    created_unix_ms: 1,
+                })
+                .unwrap();
+            let eligible = ["2.1.302", "2.1.302 (Claude Code)", "2.2.0"].contains(&version);
+            let prepared = prepare(&directory, windows);
+            assert_eq!(
+                prepared.is_ok(),
+                eligible,
+                "windows={windows} version={version}"
+            );
+            assert_eq!(native_mode(&directory).unwrap(), eligible);
+            if eligible {
+                assert_eq!(
+                    prepared.unwrap(),
+                    vec![
+                        OsString::from("--plugin-dir"),
+                        directory.join("claude-mod").into_os_string()
+                    ]
+                );
+                let mode: LaunchMode = store.private(MODE_FILE).json().unwrap();
+                assert_eq!(mode.schema, 1);
+                assert_eq!(mode.claude_version.as_deref(), Some(version));
+                assert_eq!(
+                    mode.reason,
+                    if windows {
+                        "windows_stable_2_1_302_or_newer"
+                    } else {
+                        "macos_stable_2_1_302_or_newer"
+                    }
+                );
+                assert!(directory.join("claude-mod/hooks/register.js").is_file());
+                assert!(prepare(&directory, !windows).is_err());
+            } else {
+                assert!(!directory.join("claude-mod").exists());
+                assert!(!directory.join(MODE_FILE).exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_or_malformed_recorded_versions_never_configure_a_launch() {
+    for windows in [false, true] {
+        for manifest in [None, Some(b"{".as_slice()), Some(b"{}".as_slice())] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::open_unchecked(root.path());
+            if let Some(bytes) = manifest {
+                store
+                    .record(CoreRecord::Manifest)
+                    .write_private(bytes)
+                    .unwrap();
+            }
+            assert!(
+                prepare(root.path(), windows)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires the recorded launch version")
+            );
+            assert!(!root.path().join(MODE_FILE).exists());
+            assert!(!root.path().join("claude-mod").exists());
         }
     }
 }

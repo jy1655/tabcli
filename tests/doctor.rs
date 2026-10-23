@@ -588,7 +588,7 @@ fn probe_does_not_hold_the_completion_lifecycle_lock() {
 test "$1" = --version || exit 99
 : > "$AB_DOCTOR_TEST_DIR/probe-started"
 while test ! -f "$AB_DOCTOR_TEST_DIR/probe-release"; do sleep 0.02; done
-printf '2.1.280\n'
+printf '2.1.302\n'
 "#,
     )
     .unwrap();
@@ -916,7 +916,7 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
 fn version_probes_drop_the_adapters_environment_removals() {
     use std::os::unix::fs::PermissionsExt;
     for (provider, expected_version, expected_reason) in [
-        ("claude", "2.1.281 (Claude Code)", "version_supported"),
+        ("claude", "2.1.302 (Claude Code)", "version_supported"),
         (
             "codex",
             "nested CLAUDE_CODE_CHILD_SESSION=1",
@@ -927,7 +927,7 @@ fn version_probes_drop_the_adapters_environment_removals() {
         let executable = fixture.root.path().join("provider");
         fs::write(
             &executable,
-            "#!/bin/sh\nif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.281 (Claude Code)'; fi\n",
+            "#!/bin/sh\nif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.302 (Claude Code)'; fi\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -944,6 +944,38 @@ fn version_probes_drop_the_adapters_environment_removals() {
             version["reason_code"], expected_reason,
             "{provider}: {version}"
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_version_probe_requires_stable_native_completion_version() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (version, availability, reason) in [
+        ("2.1.301", "unavailable", "version_unsupported"),
+        ("2.1.309-beta.1", "unavailable", "version_unsupported"),
+        ("2.1.302", "available", "version_supported"),
+        ("2.1.309", "available", "version_supported"),
+    ] {
+        let fixture = Fixture::new("claude");
+        let executable = fixture.root.path().join("provider");
+        let current = format!("{version} (Claude Code)");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = '--version' ] || exit 99\nprintf '%s' '{current}'\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = entries(&fixture.directory);
+        let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+        let check = check(&value, "provider_version");
+        assert_eq!(check["availability"], availability, "{version}");
+        assert_eq!(check["reason_code"], reason, "{version}");
+        assert_eq!(check["evidence"]["current_version"], current);
+        assert_eq!(entries(&fixture.directory), before);
     }
 }
 

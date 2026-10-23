@@ -47,7 +47,7 @@ fn supported_cli_versions_use_a_minimum_not_an_exact_pin() {
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.148.3").unwrap());
     assert!(!cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.146.9").unwrap());
 
-    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.234 (Claude Code)").unwrap());
+    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.302 (Claude Code)").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.2.0 (Claude Code)").unwrap());
     assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.233 (Claude Code)").unwrap());
 
@@ -58,6 +58,53 @@ fn supported_cli_versions_use_a_minimum_not_an_exact_pin() {
     assert!(cli_version_is_supported(FirstPartyCli::Pi, "0.84.1").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Pi, "pi 0.85.0").unwrap());
     assert!(!cli_version_is_supported(FirstPartyCli::Pi, "pi 0.84.0").unwrap());
+}
+
+#[test]
+fn claude_public_version_admission_rejects_older_stable_releases() {
+    for version in ["2.1.301", "2.1.234"] {
+        assert!(
+            !cli_version_is_supported(FirstPartyCli::Claude, &format!("{version} (Claude Code)"))
+                .unwrap(),
+            "{version}"
+        );
+    }
+}
+
+#[test]
+fn claude_public_version_admission_rejects_prereleases() {
+    for version in ["2.1.309-beta.1", "2.1.302-beta.1", "3.0.0-rc.1"] {
+        assert!(
+            !cli_version_is_supported(FirstPartyCli::Claude, &format!("{version} (Claude Code)"))
+                .unwrap(),
+            "{version}"
+        );
+    }
+}
+
+#[test]
+fn claude_public_version_admission_accepts_stable_floor_and_newer() {
+    for version in ["2.1.302", "2.1.309", "2.2.0", "3.0.0"] {
+        assert!(
+            cli_version_is_supported(FirstPartyCli::Claude, &format!("{version} (Claude Code)"))
+                .unwrap(),
+            "{version}"
+        );
+    }
+}
+
+#[test]
+fn other_providers_keep_accepting_prereleases_above_their_minimum() {
+    for (provider, version) in [
+        (FirstPartyCli::Codex, "codex-cli 0.148.0-beta.1"),
+        (FirstPartyCli::Agy, "agy 1.2.0-beta.1"),
+        (FirstPartyCli::Pi, "pi 0.85.0-beta.1"),
+    ] {
+        assert!(
+            cli_version_is_supported(provider, version).unwrap(),
+            "{version}"
+        );
+    }
 }
 
 #[test]
@@ -1220,6 +1267,7 @@ fn public_identity_in_version_and_help() {
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(text.lines().next(), Some(expected.as_str()));
         if flag == "--help" {
+            assert!(text.contains("Claude stable 2.1.302"));
             assert!(text.contains("tabcli hold <session> [--release] [--json]"));
             assert!(text.contains("tabcli cancel <session> [--json]"));
             assert!(text.contains("tabcli status [--workspace PATH | --all-workspaces]"));
