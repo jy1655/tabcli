@@ -425,6 +425,91 @@ fn r1_c6_reused_projection_qualifies_only_failed_bound_startup_surface() {
     }
 }
 
+fn failed_start_authorities(
+    attestation: impl Fn() -> OwnerAttestation,
+) -> Vec<(terminal::TerminalKind, Result<TerminalCloseAuthority>)> {
+    [Iterm2, Ghostty, WindowsConsole]
+        .into_iter()
+        .map(|kind| {
+            let row = Row::new(kind);
+            let handle = handle(kind, Some(ID.into()));
+            let deadline = session::close::budget::close_deadline();
+            let observation = TestObservation::from_values(RecordValues {
+                owner: row.owner,
+                state: SessionState::Failed,
+                launch: Some(launch::Record {
+                    schema: 1,
+                    claim_token: "claim-failed-start-attestation".into(),
+                    deadline_unix_ms: 1,
+                    phase: launch::Phase::Spawning,
+                }),
+            })
+            .with_owner_record(|_| OwnerObservation::from(&attestation()))
+            .with_mac_owner_live(|_| attestation())
+            .with_presence(|| Ok(true))
+            .with_proof(|| bail!("injected full ownership proof failure"))
+            .with_evidence(terminal::close_evidence(kind));
+            (kind, observation.decide(ID, &handle, deadline))
+        })
+        .collect()
+}
+
+#[test]
+fn failed_start_live_incarnation_with_changed_control_refuses_surface_authority() {
+    let results = failed_start_authorities(|| OwnerAttestation {
+        process: ProcessObservation::Live(crate::native::process_identity::Attested::Incarnation),
+        control: ControlAttestation::Changed("owner TTY changed".into()),
+        pid_alive: Some(true),
+    });
+    assert!(
+        results.iter().all(|(_, result)| result.is_err()),
+        "live owner with changed control must not authorize close: {results:?}"
+    );
+}
+
+#[test]
+fn failed_start_unknown_incarnation_with_false_pid_diagnostic_refuses_surface_authority() {
+    let results = failed_start_authorities(|| OwnerAttestation {
+        process: ProcessObservation::Unknown("owner identity inspection failed".into()),
+        control: ControlAttestation::NotRecorded,
+        pid_alive: Some(false),
+    });
+    assert!(
+        results.iter().all(|(_, result)| result.is_err()),
+        "unknown owner with a false liveness diagnostic must not authorize close: {results:?}"
+    );
+}
+
+#[test]
+fn failed_start_exited_incarnation_allows_bound_surface_authority() {
+    let results = failed_start_authorities(|| OwnerAttestation {
+        process: ProcessObservation::Gone(Gone::Exited),
+        control: ControlAttestation::NotRecorded,
+        pid_alive: Some(false),
+    });
+    assert!(
+        results
+            .iter()
+            .all(|(_, result)| matches!(result, Ok(TerminalCloseAuthority::SurfaceOnly))),
+        "verified exit retains the bound startup surface close policy: {results:?}"
+    );
+}
+
+#[test]
+fn failed_start_reused_incarnation_allows_bound_surface_authority() {
+    let results = failed_start_authorities(|| OwnerAttestation {
+        process: ProcessObservation::Gone(Gone::Reused("different birth".into())),
+        control: ControlAttestation::NotRecorded,
+        pid_alive: Some(true),
+    });
+    assert!(
+        results
+            .iter()
+            .all(|(_, result)| matches!(result, Ok(TerminalCloseAuthority::SurfaceOnly))),
+        "verified reuse retains the bound startup surface close policy: {results:?}"
+    );
+}
+
 #[test]
 fn failed_start_native_identity_dead_or_mismatched_owner_surface_only() {
     for kind in [Iterm2, Ghostty] {
