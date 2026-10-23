@@ -218,8 +218,14 @@ fn observe_with_owner(
         .state()
         .ends_wait()
         .then_some(WakeReason::RequestEnded);
+    // A pending poll without --questions reads no question record; an ending reads it once.
+    let emissions = (questions || reason.is_some())
+        .then(|| observation.questions(reader))
+        .flatten();
+    if let Some(emissions) = &emissions {
+        question_presence(&mut value, emissions);
+    }
     if questions {
-        let emissions = observation.questions(reader);
         // A supplied cursor must name a retained item, even when completion is visible.
         // Guessing past lost evidence could silently skip a question on the next poll.
         let start = match after {
@@ -230,7 +236,6 @@ fn observe_with_owner(
             None => 0,
         };
         if let Some(emissions) = emissions {
-            question_observation(&mut value, &emissions);
             if let Some(last) = emissions.items.last() {
                 let receipt = observation
                     .receipt

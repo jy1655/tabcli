@@ -140,13 +140,14 @@ pub(super) fn run_with(
             facts.id
         )
     })?;
-    emit_session_result_with(
+    emit_session_result(
         output.json,
         facts.id,
         facts.surface,
         facts.provider,
         &receipt,
         Some(&event),
+        &query::finished_question_presence(facts.directory, &receipt.request_id),
         extra,
     )
 }
@@ -158,6 +159,30 @@ pub(super) fn emit_session_result_with(
     provider: FirstPartyCli,
     receipt: &requests::Receipt,
     event: Option<&SessionEvent>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    emit_session_result(
+        json,
+        id,
+        terminal_session,
+        provider,
+        receipt,
+        event,
+        &serde_json::Map::new(),
+        extra,
+    )
+}
+
+/// `questions` holds the query's retained question presence fields; they add no exit condition.
+#[allow(clippy::too_many_arguments)]
+fn emit_session_result(
+    json: bool,
+    id: &str,
+    terminal_session: &terminal::TerminalSession,
+    provider: FirstPartyCli,
+    receipt: &requests::Receipt,
+    event: Option<&SessionEvent>,
+    questions: &serde_json::Map<String, serde_json::Value>,
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let request_id = &receipt.request_id;
@@ -185,7 +210,7 @@ pub(super) fn emit_session_result_with(
         .unwrap()
         .clone(),
     );
-    for (key, field) in extra {
+    for (key, field) in questions.iter().chain(extra) {
         value[key.as_str()] = field.clone();
     }
     envelope::emit(json, &value, || {
@@ -194,6 +219,9 @@ pub(super) fn emit_session_result_with(
             if let Some(field) = field.as_str() {
                 println!("{}: {}", key, terminal_safe_text(field, false));
             }
+        }
+        for line in query::question_lines(&value) {
+            println!("{line}");
         }
         if let Some(event) = event {
             println!();

@@ -307,6 +307,78 @@ fn completed_result_is_waited_for_past_the_claim_ready_baseline() {
 }
 
 #[test]
+fn finished_output_counts_retained_question_emissions() {
+    const CHILD: &str = "AGENT_BRIDGE_TURN_RUN_QUESTION_FIXTURE";
+    if std::env::var_os(CHILD).is_some() {
+        for (label, json) in [("json", true), ("plain", false)] {
+            let f = Fixture::new();
+            let (claim, baseline) = claim_after_one_completed_turn(&f);
+            let receipt = claim.receipt();
+            // The fixture's manifest names Codex, whose adapter owns this record.
+            std::fs::write(
+                f.store
+                    .directory()
+                    .join(format!("codex-questions-{}.json", receipt.claim_token)),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": 1, "request_id": receipt.request_id,
+                    "claim_token": receipt.claim_token, "incomplete": false,
+                    "items": [{"id": "call_a", "questions": [{"title": "Which path?"}]}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            publish_on_send(&f, claim.token().to_owned(), "done", "correlation");
+            let extra = ResultExtra::new();
+            let run = run_fixture(
+                &f,
+                timing(),
+                Output {
+                    detach: false,
+                    json,
+                },
+                &extra,
+                baseline,
+            );
+            let mut report = report();
+            println!("SECTION_BEGIN {label}");
+            run_with(
+                &mut report,
+                claim,
+                Turn::FollowUp { prompt: "prompt" },
+                &run,
+                |_| unreachable!("delivery succeeded"),
+                &f.fake,
+                &f.checks,
+            )
+            .unwrap();
+            println!("SECTION_END");
+        }
+        return;
+    }
+    let sections = capture("finished_output_counts_retained_question_emissions", CHILD);
+    let value = section_json(&sections, "json");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["request_state"], "completed");
+    assert_eq!(value["result"], "done");
+    assert_eq!(value["question_emitted"], true);
+    assert_eq!(value["question_emission_count"], 1);
+    assert!(value.get("question_emissions").is_none());
+    assert!(value.get("question_observation").is_none());
+    let plain = &sections["plain"];
+    let request_id = plain
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("request: "))
+        .unwrap();
+    assert_eq!(
+        plain.as_str(),
+        format!(
+            "session: {SESSION}\nrequest: {request_id}\nquestion emissions retained: 1\n  show them: {PUBLIC_COMMAND} result {SESSION} --request {request_id} --json\n\ndone\n"
+        )
+    );
+}
+
+#[test]
 fn detached_reopen_extra_is_rendered_without_a_result() {
     const CHILD: &str = "AGENT_BRIDGE_TURN_RUN_DETACHED_REOPEN_FIXTURE";
     if std::env::var_os(CHILD).is_some() {

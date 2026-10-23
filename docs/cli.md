@@ -454,8 +454,10 @@ not returned.
 For Codex and Claude, status also reads at most one optional 64 KiB question record per listed session,
 under its existing budget. Attention `question_emitted` means that record has emissions for
 the active request, or for the request behind the latest published result when no claim exists.
-A claim without a readable receipt has no question focus. Closed sessions have no
-`question_emitted` attention. Changing focus does not resolve an older emission.
+A claim without a readable receipt has no question focus. The focus object, `active_request`
+under a claim and otherwise `latest_result`, carries `question_emitted: true` and
+`question_emission_count`, including for a closed session listed with `--all`. Closed sessions
+have no `question_emitted` attention. Changing focus does not resolve an older emission.
 `question_observation` is present only as `incomplete` or `unreadable`; unreadable evidence
 also adds `records_partially_unreadable`. Question content is in `result --request`.
 
@@ -528,8 +530,9 @@ The default inspection also reports `held` as true, false, or null with `hold_er
 Timeline does not include hold history. The default inspection adds `origin` and
 `origin_observation` as in `status`; the timeline has no origin entry.
 
-For Codex and Claude, ordinary JSON inspection adds `question_emitted: true` to a request reference
-when retained emissions exist. It adds `question_observation` only as `incomplete` or
+For Codex and Claude, ordinary JSON inspection adds `question_emitted: true` and
+`question_emission_count` to a request reference when retained emissions exist. It adds
+`question_observation` only as `incomplete` or
 `unreadable`. This reads at most one optional 64 KiB record per request. Retrieve content
 with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
 
@@ -604,18 +607,29 @@ an emission does not establish that a dialog appeared or the tool ran. Refusing 
 question plugin does not remove the separate completion plugin.
 
 These fields report emission, without changing request state, result text, or exit status.
-`question_observation: "incomplete"` means Bridge retained a limited prefix or rejected
-optional evidence. `"unreadable"` means the retained record could not be validated.
-Absence of either field is unknown; it does not prove that no question existed.
+`question_emitted: true` and `question_emission_count` (retained emission items, each with one
+or more questions) accompany the content. `question_observation: "incomplete"` means Bridge
+retained a limited prefix or rejected optional evidence. `"unreadable"` means the retained
+record could not be validated.
+Absence of these fields is unknown; it does not prove that no question existed.
 After the session becomes `ready`, `tell` can carry a known fact as another request. It
-does not resolve the earlier emission. `ask`, `tell`, default `wait`, `result --wait`, `result --list`,
-and timeline retain their output and waiting behavior. Full context attachments are unchanged;
+does not resolve the earlier emission.
+
+When a request has ended, waited `ask`, `tell` and `reopen`, `result --wait`, and default
+`wait` read the record once and add only `question_emitted`, `question_emission_count`, and
+any `question_observation` diagnostic, without question content. Human output then prints
+`question emissions retained: N` and the `result --request` command that shows them. A
+count says that emissions were retained; it does not say that a question is pending, was
+shown, or was answered. A pending poll without `--questions` reads no question record, and
+waiting and exit behavior are unchanged. `result --list` and timeline are unchanged. Full
+context attachments are unchanged;
 compact context attachments also report `Questions: N emitted` when retained emissions exist. Bridge has no
 transport that answers a question. Opt-in [`wait --questions`](#wait) can return an emission
 before completion; default `wait` and `result --wait` continue waiting.
 
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
-one usage line when the provider reported usage, each emitted question title and its options
+one usage line when the provider reported usage, the retained emission count, each emitted
+question title and its options
 with control characters escaped, result text, and error. List rows show event id,
 request state, request id or `legacy`, and elapsed time. See the
 [JSON field reference](#json-field-reference).
@@ -732,7 +746,8 @@ any `question_observation` diagnostic, and `after_question` when there are retai
 Across addresses, input order still selects the first observed condition, whether it is
 an ending or an emission. Every readable address in that pass is validated before selection;
 an invalid receipt or cursor is an error even if an earlier address has a question.
-`result --wait` and `wait` without `--questions` retain their output and exit contracts.
+`result --wait` and `wait` without `--questions` retain their waiting and exit contracts; an
+ended Request adds only the retained-emission count described in [result](#result).
 
 ## search
 
@@ -1424,6 +1439,8 @@ Fields: `ok`, `schema_version`, `session`, `request_id`, `context_sources`, `req
 compatibility field `iterm_session_id`, `result`, `provider_session_id`, `turn_id`,
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`. A detached success has
 `request_state: "accepted"` and a null `result`; a waited success has `request_state: "completed"`.
+For Codex and Claude, a waited success can add `question_emitted`, `question_emission_count`,
+and `question_observation`, as described in [result](#result); it never adds question content.
 
 A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `session`, and `error`, without
 `request_id`; a claim-stage race can leave an unresolved receipt visible through `result --list`.
@@ -1487,6 +1504,7 @@ with `hold_error` when the record cannot be read. A true value adds attention `h
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`.
 `latest_result` is null or contains `event_id`, `request_id`, `request_state`, and
 `created_unix_ms`; it never includes the body. Legacy results can have a null request id.
+The question focus among them can add `question_emitted` and `question_emission_count`.
 `owner` contains nullable `process_alive`, `identity_matches`, and `error`.
 `derived_from: "observation"` marks attention and the request objects as judgments.
 
@@ -1628,9 +1646,10 @@ carry the same usage fields. A record written by this version can carry `usage` 
 journaled completion as not published, so do not downgrade `tabcli` while a session it has
 written is open.
 
-Ordinary single-result JSON can also have `question_emissions` and `question_observation`,
-as described in [result](#result). These optional fields are omitted from `result --wait` and listed
-results and do not alter the completion event or journal schema.
+Ordinary single-result JSON can also have `question_emissions`, `question_emitted`,
+`question_emission_count`, and `question_observation`, as described in [result](#result).
+An ended `result --wait` has only the last three; listed results have none. They do not
+alter the completion event or journal schema.
 
 ### wait
 
@@ -1646,8 +1665,10 @@ remain in `remaining`. `question` contains the selected result observation plus 
 `question_emissions`, and `after_question`. `question_observation` is included when known
 incomplete. An ending return has no `question` field; its `ended` may carry those optional
 question fields, including `question_observation: "unreadable"`. See [wait](#wait) for cursor
-validation and precedence. Without `--questions`, no question record is read and none of
-these fields is added.
+validation and precedence. Either form can add `question_emitted` and
+`question_emission_count` for the whole retained record. Without `--questions`, a pending
+poll reads no question record; an `ended` object adds only those two fields and any
+`question_observation`, never `question_emissions` or `after_question`.
 
 ### doctor
 

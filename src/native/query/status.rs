@@ -218,6 +218,15 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
     session::hold::add_fields(&mut value, &observation.evidence.held);
     if let Some(questions) = &observed.questions {
         question_observation(&mut value, questions);
+        // The count describes the focus Request, closed sessions included; attention does not.
+        let focus = if records.claim.is_some() {
+            "active_request"
+        } else {
+            "latest_result"
+        };
+        if value[focus].is_object() {
+            question_count(&mut value[focus], questions);
+        }
     }
     if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = json!(residual);
