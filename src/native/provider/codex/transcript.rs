@@ -19,10 +19,13 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+mod reduce;
 
-// No whole-file ceiling. Each running poll reads at most 256 KiB; each individual
-// JSONL record (excluding LF) and partial tail is capped at 8 MiB, including unknown
-// records. Shutdown snapshots EOF once and drains that finite prefix in bounded chunks.
+// No whole-file ceiling. Each running poll reads at most 256 KiB; a JSONL record
+// (excluding LF) or partial tail is retained up to 8 MiB. A longer record continues in
+// `reduce` and is skipped only as a validated non-message `response_item`; its in-place
+// reduction and final parse are each at most 8 MiB of work within one poll. Shutdown
+// snapshots EOF once and drains that finite prefix in bounded chunks.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CHUNK_BYTES: usize = 256 * 1024;
 const LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -97,6 +100,7 @@ struct Cursor {
     offset: u64,
     extent: u64,
     partial: Vec<u8>,
+    overflow: Option<reduce::Reducer>,
     meta_seen: bool,
     accepted: bool,
     questions: Questions,
@@ -113,6 +117,7 @@ impl Cursor {
             offset: 0,
             extent: 0,
             partial: Vec::new(),
+            overflow: None,
             meta_seen: false,
             accepted: false,
             questions: Questions::default(),
@@ -139,6 +144,7 @@ impl Cursor {
         self.suspended = Some(reason);
         self.file = None;
         self.partial.clear();
+        self.overflow = None;
         self.diagnostic(
             directory,
             "suspended",
@@ -188,6 +194,10 @@ impl Cursor {
             for byte in bytes {
                 self.offset += 1;
                 if byte == b'\n' {
+                    if let Some(overflow) = self.overflow.take() {
+                        self.skip_oversized(&overflow.finish()?)?;
+                        continue;
+                    }
                     let line = std::mem::take(&mut self.partial);
                     let text = std::str::from_utf8(&line).map_err(|_| "invalid_utf8")?;
                     let value: Value = serde_json::from_str(text).map_err(|_| "invalid_json")?;
@@ -197,15 +207,36 @@ impl Cursor {
                         tests::at_read_checkpoint(tests::ReadCheckpoint::AfterTerminalVerify);
                         return Ok(Some(terminal));
                     }
+                } else if let Some(overflow) = &mut self.overflow {
+                    overflow.push(byte)?;
+                } else if self.partial.len() == LINE_BYTES {
+                    let mut overflow =
+                        reduce::Reducer::from_prefix(std::mem::take(&mut self.partial))?;
+                    overflow.push(byte)?;
+                    self.overflow = Some(overflow);
                 } else {
-                    if self.partial.len() == LINE_BYTES {
-                        return Err("oversized");
-                    }
                     self.partial.push(byte);
                 }
             }
         }
         Ok(None)
+    }
+    /// Past `LINE_BYTES` only a non-message `response_item` after the verified session
+    /// identity is skipped. A cut string reads as `""`, so the discriminators must be
+    /// intact and written once; anything else stays oversized.
+    fn skip_oversized(&self, reduced: &[u8]) -> Observation<()> {
+        let text = std::str::from_utf8(reduced).map_err(|_| "invalid_utf8")?;
+        let record: Value = serde_json::from_str(text).map_err(|_| "invalid_json")?;
+        let payload = &record["payload"];
+        let skip = self.meta_seen
+            && payload["type"]
+                .as_str()
+                .is_some_and(|kind| !kind.is_empty())
+            && record["type"]
+                .as_str()
+                .is_some_and(|kind| unrelated_response_item(kind, payload) == Ok(true))
+            && !reduce::repeated_discriminator(text);
+        if skip { Ok(()) } else { Err("oversized") }
     }
     fn record(&mut self, record: &Value) -> Observation<Option<Terminal>> {
         let binding = self.binding.as_ref().unwrap();
@@ -221,10 +252,10 @@ impl Cursor {
             self.meta_seen = true;
             return Ok(None);
         }
+        if unrelated_response_item(kind, payload)? {
+            return Ok(None);
+        }
         if kind == "response_item" {
-            if payload["type"].as_str().ok_or("invalid_schema")? != "message" {
-                return Ok(None);
-            }
             if payload["role"].as_str().ok_or("invalid_schema")? != "user" {
                 return Ok(None);
             }
@@ -429,6 +460,10 @@ impl Observer {
             Err(reason) => cursor.suspend(directory, reason),
         }
     }
+}
+/// A `response_item` other than a message carries no evidence for this observer.
+fn unrelated_response_item(kind: &str, payload: &Value) -> Observation<bool> {
+    Ok(kind == "response_item" && payload["type"].as_str().ok_or("invalid_schema")? != "message")
 }
 fn bounded(text: &str) -> String {
     text.chars().take(ERROR_CHARS).collect()

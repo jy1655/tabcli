@@ -328,9 +328,19 @@ launch, observe, continue, and close without replacing the capabilities those CL
   hooks and notify of the turn (`tasks/mod.rs:829-866`) and persisted with a flush per
   append but no latency guarantee. The watcher reads the bound file only, from byte zero,
   newline-terminated records with strict UTF-8 and JSON, verifying the file's identity and
-  its largest observed length around every read; replacement, shrink, a read failure, an
-  oversized record or a malformed attribution field suspend that claim with a diagnostic
-  (`codex-observer-<claim>.json`) and are never evidence about the prompt. Acceptance is
+  its largest observed length around every read; replacement, shrink, a read failure, a
+  malformed or oversized record or a malformed attribution field suspend that claim with a
+  diagnostic (`codex-observer-<claim>.json`) and are never evidence about the prompt.
+  A record past 8 MiB is reduced in place, not retained (#269: tool outputs carrying
+  several base64 images, observed up to 50 MB): every string over 4 KiB becomes `""`
+  after its bytes pass serde_json's `String` checks, the whole line passes strict UTF-8,
+  and the reduced record must fit 8 MiB and parse as JSON. Only a non-message
+  `response_item` after the verified `session_meta` is skipped, and only with a non-empty `payload.type` and no repeated
+  top-level `type` or `payload` or `payload.type` (`Value` keeps the last duplicate). Any
+  other record past 8 MiB, a user message with pasted images included, stays `oversized`:
+  cutting it could hide the framed prompt. A fault in cut text suspends with its own reason
+  as soon as it is read. Each running poll reads at most 256 KiB; the reduction at 8 MiB
+  and the final parse are each up to 8 MiB of work within one poll. Acceptance is
   proved by one `user.text` message of the bound turn
   (`payload.internal_chat_message_metadata_passthrough.turn_id`) that carries the framed
   prompt; its absence is proved only by a complete, validated prefix, and then the request

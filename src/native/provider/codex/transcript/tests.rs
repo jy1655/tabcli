@@ -4,6 +4,7 @@ use crate::native::provider::{CompletionWatcher, NativeProviderAdapter};
 use crate::native::session::{Reader, SessionState, Store, turn, update_status};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path};
+mod oversized;
 mod questions;
 const THREAD: &str = "01234567-89ab-cdef-0123-456789abcdef";
 fn fixture() -> (tempfile::TempDir, PendingCodexTurn, Value) {
@@ -200,14 +201,13 @@ fn oversized_tool_output_does_not_hide_completion() {
 }
 
 #[test]
-fn oversized_unrelated_relevant_and_unterminated_lines_suspend() {
-    for kind in ["unknown", "event_msg", "partial"] {
+fn oversized_relevant_lines_suspend_and_an_unterminated_tail_stays_armed() {
+    for kind in ["unknown", "event_msg"] {
         let (root, pending, _, mut observer) = bound();
         let path = root.path().join("rollout.jsonl");
         let huge = "x".repeat(LINE_BYTES + 1);
         let bytes = match kind {
             "event_msg" => complete(json!(huge)),
-            "partial" => huge.into_bytes(),
             _ => line(kind, json!({"text":huge})),
         };
         append(&path, &bytes);
@@ -221,6 +221,26 @@ fn oversized_unrelated_relevant_and_unterminated_lines_suspend() {
             "observation_unavailable: oversized"
         );
     }
+    // A tool output still being written past the limit keeps the claim armed.
+    let (root, pending, _, mut observer) = bound();
+    let path = root.path().join("rollout.jsonl");
+    let mut bytes = line(
+        "response_item",
+        json!({"type":"custom_tool_call_output","output":"x".repeat(LINE_BYTES + CHUNK_BYTES)}),
+    );
+    let rest = bytes.split_off(LINE_BYTES + CHUNK_BYTES / 2);
+    append(&path, &bytes);
+    observer.poll(root.path(), true);
+    assert_pending(root.path(), &pending);
+    assert_eq!(diagnostic(root.path(), &pending)["state"], "armed");
+    let cursor = observer.cursor.as_ref().unwrap();
+    assert_eq!(cursor.offset, std::fs::metadata(&path).unwrap().len());
+    assert!(cursor.partial.is_empty());
+    assert!(cursor.overflow.as_ref().unwrap().retained() <= reduce::ELIDE_BYTES * 2);
+    append(&path, &rest);
+    append(&path, &complete(json!("answer")));
+    observer.poll(root.path(), true);
+    assert_eq!(events(root.path())[0]["message"], "answer");
 }
 #[test]
 fn complete_prefix_requires_one_user_text_with_matching_turn_and_framing() {

@@ -214,8 +214,17 @@ each binding, verifies the session identity and accepted framed user input for t
 and settles only on a matching `task_complete`/`turn_complete` or `turn_aborted`. Null/empty
 answers, provider errors, interruption and proved nonacceptance fail the request. It reads
 strict newline-terminated UTF-8 JSON in bounded chunks, retaining partial tails; replacement,
-truncation or malformed evidence suspends observation and leaves the claim pending. It never
-falls back to notify for a bound claim. Replace this polling reader when Codex supplies an
+truncation or malformed evidence suspends observation and leaves the claim pending.
+Each running poll reads at most 256 KiB, and a record or partial tail is retained up to 8 MiB.
+A longer record is reduced in place: strings over 4 KiB are validated and dropped, and the
+reduced record must parse as JSON within 8 MiB. It is skipped only when it is a non-message
+`response_item`, such as a tool output with images, after the verified session identity, with
+intact and unrepeated discriminators. Any other record over 8 MiB, including a terminal record,
+a user message with pasted images or the session identity, suspends observation as `oversized`.
+The reduction and the final parse of such a record each take up to 8 MiB of work in one poll.
+At 256 KiB per 200 ms poll, processing 50 MB has a polling budget of roughly 40 seconds,
+before I/O and parsing overhead; this is an estimate, not measured latency. It never falls
+back to notify for a bound claim. Replace this polling reader when Codex supplies an
 addressed first-party terminal signal with equivalent identity and settlement semantics.
 
 The same watcher observes Codex's emitted async questions from completed `AgentMessage`

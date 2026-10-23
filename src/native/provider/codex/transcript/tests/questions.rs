@@ -283,6 +283,29 @@ fn emissions_survive_completion_rollout_removal_next_request_and_close() {
 }
 
 #[test]
+fn question_after_an_oversized_tool_output_is_recorded() {
+    let (_root, directory, pending, _, mut observer) = question_fixture();
+    append(
+        &directory.join("rollout.jsonl"),
+        &line(
+            "response_item",
+            json!({"type":"custom_tool_call_output","call_id":"large","output":"x".repeat(LINE_BYTES + 1)}),
+        ),
+    );
+    emit(&directory, simple_item("after_overflow"));
+    append(
+        &directory.join("rollout.jsonl"),
+        &complete(json!("ordinary answer")),
+    );
+    observer.poll(&directory, true);
+    let observed = result(&directory, &pending);
+    assert_eq!(observed["request_state"], "completed");
+    assert_eq!(
+        observed["question_emissions"],
+        json!([{"id":"after_overflow","questions":[{"title":"Which baseline?","options":null}]}])
+    );
+}
+#[test]
 fn acceptance_is_required_without_buffering_and_optional_attribution_cannot_poison_replay() {
     for accepted_later in [false, true] {
         let (root, directory, pending, payload, mut observer) = question_fixture();
