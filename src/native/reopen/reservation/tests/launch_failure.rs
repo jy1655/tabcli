@@ -339,7 +339,7 @@ pub(super) fn isolated_with_output(test_name: &str, check: impl FnOnce(&str)) ->
         }
         write_private(
             &bin.join("claude.cmd"),
-            b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n echo 2.1.281\r\n exit /b 0\r\n)\r\nexit /b 99\r\n",
+            b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n echo 2.1.302\r\n exit /b 0\r\n)\r\nexit /b 99\r\n",
         )
         .unwrap();
         let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());

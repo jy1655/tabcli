@@ -165,6 +165,14 @@ and language checks passed again. Python 3.12 discovery ran **40 tests**, with
 verification belong to their exact PR head and are tracked on the PR; the
 authenticated observations above remain explicitly attributed to `7c69580`.
 
+Windows CI exposed one additional positive-launch fixture that still advertised
+2.1.281. Its shared fake CLI now reports 2.1.302 so the launch-failure and recovery
+tests reach their intended injection point. The fencing test verifies the injected
+failure before consuming the already-queued session address with `try_recv`; an
+earlier preflight refusal now fails immediately instead of waiting indefinitely.
+This changes only the Windows test harness. The PR's final Windows CI execution
+is the evidence for those tests; cross-target Clippy alone is not execution.
+
 ## Protocol and evidence boundaries
 
 New macOS sessions use the existing Claude native completion module and the
