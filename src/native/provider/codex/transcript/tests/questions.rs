@@ -105,6 +105,228 @@ fn simple_item(id: &str) -> Value {
     question_item(id, json!([{"title":"Which baseline?","options":null}]))
 }
 
+#[test]
+fn question_wait_returns_before_completion_without_retiring_the_request() {
+    let (root, directory, pending, _, mut observer) = question_fixture();
+    emit(&directory, simple_item("call_first"));
+    observer.poll(&directory, false);
+    let receipt = request(&directory, &pending);
+    let address = format!("{SESSION}/{}", receipt.request_id);
+    let observed = read_only(root.path(), || {
+        query::wait::test_value_in(
+            root.path(),
+            &[&address, "--questions", "--json"],
+            Duration::ZERO,
+        )
+        .unwrap()
+    });
+    assert_eq!(observed["ok"], true);
+    assert_eq!(observed["ended"], Value::Null);
+    assert_eq!(observed["timed_out"], false);
+    assert_eq!(observed["remaining"], json!([address]));
+    assert_eq!(observed["question"]["request_state"], "pending");
+    assert_eq!(observed["question"]["address"], address);
+    assert_eq!(
+        observed["question"]["question_emissions"][0]["id"],
+        "call_first"
+    );
+    assert_eq!(
+        observed["question"]["after_question"],
+        format!("{address}/call_first")
+    );
+    assert_pending(&directory, &pending);
+}
+
+fn question_wait(root: &Path, address: &str, after: Option<&str>) -> Result<Value> {
+    let mut args = vec![address, "--questions"];
+    if let Some(after) = after {
+        args.extend(["--after-question", after]);
+    }
+    read_only(root, || {
+        query::wait::test_value_in(root, &args, Duration::ZERO)
+    })
+}
+
+#[test]
+fn question_wait_cursor_skips_seen_items_and_delivers_the_next_retained_prefix() {
+    let (root, directory, pending, _, mut observer) = question_fixture();
+    let address = format!("{SESSION}/{}", request(&directory, &pending).request_id);
+    let ordinary_before = read_only(root.path(), || {
+        query::wait::test_value_in(root.path(), &[&address], Duration::ZERO).unwrap()
+    });
+    emit(&directory, simple_item("call/first"));
+    observer.poll(&directory, false);
+    let first = question_wait(root.path(), &address, None).unwrap();
+    let cursor = first["question"]["after_question"].as_str().unwrap();
+    assert_eq!(cursor, format!("{address}/call/first"));
+    assert_eq!(question_wait(root.path(), &address, None).unwrap(), first);
+    assert_eq!(
+        question_wait(root.path(), &address, Some(cursor)).unwrap()["timed_out"],
+        true
+    );
+    let ordinary_after = read_only(root.path(), || {
+        query::wait::test_value_in(root.path(), &[&address], Duration::ZERO).unwrap()
+    });
+    assert_eq!(ordinary_after, ordinary_before);
+    emit(&directory, simple_item("second"));
+    emit(&directory, simple_item("third"));
+    observer.poll(&directory, false);
+    let next = question_wait(root.path(), &address, Some(cursor)).unwrap();
+    let items = next["question"]["question_emissions"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "second");
+    assert_eq!(items[1]["id"], "third");
+    assert_eq!(
+        next["question"]["after_question"],
+        format!("{address}/third")
+    );
+    let unknown = question_wait(root.path(), &address, Some(&format!("{address}/unknown")));
+    assert!(format!("{:#}", unknown.unwrap_err()).contains("readable retained evidence"));
+    assert_pending(&directory, &pending);
+}
+
+#[test]
+fn question_wait_keeps_incompleteness_and_never_wakes_on_missing_or_unreadable_evidence() {
+    let (root, directory, pending, _, mut observer) = question_fixture();
+    let address = format!("{SESSION}/{}", request(&directory, &pending).request_id);
+    assert_eq!(
+        question_wait(root.path(), &address, None).unwrap()["timed_out"],
+        true
+    );
+    emit(&directory, simple_item("first"));
+    emit(&directory, question_item("invalid", json!([{"title":""}])));
+    observer.poll(&directory, false);
+    let value = question_wait(root.path(), &address, None).unwrap();
+    assert_eq!(value["question"]["question_observation"], "incomplete");
+    let cursor = value["question"]["after_question"].as_str().unwrap();
+    std::fs::write(question_path(&directory, &pending), b"invalid").unwrap();
+    assert_eq!(
+        question_wait(root.path(), &address, None).unwrap()["timed_out"],
+        true
+    );
+    assert!(question_wait(root.path(), &address, Some(cursor)).is_err());
+    std::fs::remove_file(question_path(&directory, &pending)).unwrap();
+    assert_eq!(
+        question_wait(root.path(), &address, None).unwrap()["timed_out"],
+        true
+    );
+    assert!(question_wait(root.path(), &address, Some(cursor)).is_err());
+    assert_pending(&directory, &pending);
+}
+
+#[test]
+fn question_wait_completion_wins_for_the_same_request_and_retains_unseen_questions() {
+    let (root, directory, pending, _, mut observer) = question_fixture();
+    let address = format!("{SESSION}/{}", request(&directory, &pending).request_id);
+    emit(&directory, simple_item("first"));
+    observer.poll(&directory, false);
+    let first = question_wait(root.path(), &address, None).unwrap();
+    let cursor = first["question"]["after_question"].as_str().unwrap();
+    emit(&directory, simple_item("last"));
+    append(
+        &directory.join("rollout.jsonl"),
+        &complete(json!("ordinary answer")),
+    );
+    observer.poll(&directory, true);
+    let completed = question_wait(root.path(), &address, Some(cursor)).unwrap();
+    assert_eq!(completed["ok"], true);
+    assert!(completed.get("question").is_none());
+    assert_eq!(completed["remaining"], json!([]));
+    assert_eq!(completed["ended"]["request_state"], "completed");
+    assert_eq!(completed["ended"]["result"], "ordinary answer");
+    assert_eq!(
+        completed["ended"]["question_emissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(completed["ended"]["question_emissions"][0]["id"], "last");
+    assert_eq!(
+        completed["ended"]["after_question"],
+        format!("{address}/last")
+    );
+    update_status(&directory, SessionState::Closed, None, None).unwrap();
+    let closed = question_wait(root.path(), &address, None).unwrap();
+    assert!(closed.get("question").is_none());
+    assert_eq!(
+        closed["ended"]["question_emissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn question_wait_does_not_turn_an_ended_unresolved_request_into_attention() {
+    let (root, directory, pending, _, mut observer) = question_fixture();
+    let address = format!("{SESSION}/{}", request(&directory, &pending).request_id);
+    emit(&directory, simple_item("first"));
+    observer.poll(&directory, false);
+    update_status(&directory, SessionState::Closed, None, None).unwrap();
+    let value = question_wait(root.path(), &address, None).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(value.get("question").is_none());
+    assert_eq!(value["ended"]["request_state"], "unresolved");
+    assert_eq!(value["ended"]["question_emissions"][0]["id"], "first");
+}
+
+#[test]
+fn question_wait_orders_sessions_by_input_and_validates_every_readable_address() {
+    let (root, directory, pending, _, mut observer) = question_fixture();
+    let first_address = format!("{SESSION}/{}", request(&directory, &pending).request_id);
+    emit(&directory, simple_item("first"));
+    observer.poll(&directory, false);
+    let (_other_root, other_directory, other_pending, _, mut other_observer) = question_fixture();
+    emit(&other_directory, simple_item("first"));
+    append(
+        &other_directory.join("rollout.jsonl"),
+        &complete(json!("second answer")),
+    );
+    other_observer.poll(&other_directory, true);
+    drop(other_observer);
+    let other_receipt = request(&other_directory, &other_pending);
+    let other_address = format!("session-other/{}", other_receipt.request_id);
+    let target = root.path().join("session-other");
+    std::fs::rename(&other_directory, &target).unwrap();
+    let manifest = target.join("manifest.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    value["id"] = json!("session-other");
+    crate::native::session::primitives::write_json_atomic(&manifest, &value).unwrap();
+    let wait = |addresses: &[&str]| {
+        read_only(root.path(), || {
+            query::wait::test_value_in(root.path(), addresses, Duration::ZERO)
+        })
+    };
+    let first = wait(&[&first_address, &other_address, "--questions"]).unwrap();
+    assert_eq!(first["question"]["address"], first_address);
+    assert_eq!(first["remaining"], json!([first_address, other_address]));
+    let second = wait(&[&other_address, &first_address, "--questions"]).unwrap();
+    assert_eq!(second["ended"]["address"], other_address);
+    assert_eq!(second["remaining"], json!([first_address]));
+    let cursor = format!("{other_address}/first");
+    let scoped = wait(&[
+        &first_address,
+        &other_address,
+        "--questions",
+        "--after-question",
+        &cursor,
+    ])
+    .unwrap();
+    assert_eq!(scoped["question"]["address"], first_address);
+    assert_eq!(scoped["question"]["question_emissions"][0]["id"], "first");
+    std::fs::remove_file(
+        target
+            .join("requests")
+            .join(format!("{}.json", other_receipt.claim_token)),
+    )
+    .unwrap();
+    let error = wait(&[&first_address, &other_address, "--questions"]).unwrap_err();
+    assert!(format!("{error:#}").contains("no such Bridge request"));
+    assert_pending(&directory, &pending);
+}
+
 fn question_path(directory: &Path, pending: &PendingCodexTurn) -> std::path::PathBuf {
     directory.join(format!("codex-questions-{}.json", pending.claim_token))
 }

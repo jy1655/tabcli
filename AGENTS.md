@@ -434,8 +434,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   successful terminal integrity checkpoint; nonterminal publication verifies separately.
   Queries use the selected historical Receipt under their existing lock. Ordinary single
   `result` shows content; status focuses its active Receipt or existing latest Result's Receipt;
-  ordinary inspect shows per-request presence. Wait, list, timeline, attachments and completion
-  records retain their contracts. Emitted never means pending or answered, absence is
+  ordinary inspect shows per-request presence. Default wait, list, timeline, attachments and
+  completion records retain their contracts. Opt-in `wait --questions` returns unseen retained
+  emissions without settling the Request; its caller-held cursor is observation only.
+  Emitted never means pending or answered, absence is
   unknown, and a later `tell` is another Request, not resolution. Tool availability depends
   on model/configuration and retained history. Replace this provider-owned transcript
   fallback when Codex provides a verified, addressed question event or lifecycle for the

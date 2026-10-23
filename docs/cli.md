@@ -598,10 +598,11 @@ These fields report emission, without changing request state, result text, or ex
 optional evidence. `"unreadable"` means the retained record could not be validated.
 Absence of either field is unknown; it does not prove that no question existed.
 After the session becomes `ready`, `tell` can carry a known fact as another request. It
-does not resolve the earlier emission. `ask`, `tell`, `wait`, `result --wait`, `result --list`,
+does not resolve the earlier emission. `ask`, `tell`, default `wait`, `result --wait`, `result --list`,
 and timeline retain their output and waiting behavior. Full context attachments are unchanged;
 compact context attachments also report `Questions: N emitted` when retained emissions exist. Bridge has no
-transport that answers a question, and an emission does not end `wait` or `result --wait` early.
+transport that answers a question. Opt-in [`wait --questions`](#wait) can return an emission
+before completion; default `wait` and `result --wait` continue waiting.
 
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
 one usage line when the provider reported usage, each emitted question title and its options
@@ -645,6 +646,7 @@ Wait for the first observed wait-ending condition among explicit request address
 
 ```text
 tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
+    [--questions [--after-question SESSION/REQUEST/EMISSION_ID]...]
 ```
 
 ```sh
@@ -681,6 +683,45 @@ snapshot per distinct session and releases its lock before reading the next sess
 
 This command is read-only. It never cancels, repairs, closes, or resends any request. After a
 timeout or uncertain delivery, inspect or wait on the same request; do not repeat its prompt.
+
+With `--questions`, a retained structured question can also return control while its Request
+is pending. Today only Codex requests bound through injected hooks can supply that evidence;
+the tool, model and retained history must actually provide it. No prose is interpreted as a
+question, and absence of evidence does not prove there was no question. Other providers keep
+waiting for the ordinary ending conditions.
+
+```sh
+tabcli wait session-K7m2Qx/request-1791285000000000000-4217-0 --questions --json
+```
+
+A question return exits 0 with `ended: null`, `timed_out: false`, and a `question` object
+containing the selected `address`, the unchanged `request_state: "pending"`,
+`question_emissions`, and an `after_question` cursor. **Exit 0 here means an emission was
+observed, not that the Request completed.** Every address stays in `remaining`, including
+the selected Request. The Claim is unchanged; this return does not permit another `tell`
+while the Request is pending. Bridge does not send an answer or mark the question resolved.
+
+Resume with `--questions --after-question CURSOR`, copying `question.after_question` exactly.
+The cursor has the form `SESSION/REQUEST/EMISSION_ID` and applies only to that address.
+All retained emissions after it are returned together; the new cursor names the last one.
+Omitting the cursor returns the retained prefix again. For several addresses, repeat
+`--after-question` at most once per selected address and carry forward the cursors already
+observed for other addresses. The command stores no acknowledgement or cursor of its own.
+
+An absent or unreadable question record does not wake the caller. A retained incomplete
+prefix can wake it and carries `question_observation: "incomplete"`. A supplied cursor that
+cannot be found in the selected Request's readable retained evidence is an error; Bridge
+does not guess a new position. After a timeout, ordinary `result --request` can expose
+question-observation diagnostics. Each poll reads the optional bounded record under the
+same lifecycle read lock as its Request. This is polling, with no notification latency guarantee.
+
+Within one Request, an ordinary ending condition takes precedence over an emission visible
+in the same observation. The `ended` object then also includes unseen `question_emissions`,
+any `question_observation` diagnostic, and `after_question` when there are retained items.
+Across addresses, input order still selects the first observed condition, whether it is
+an ending or an emission. Every readable address in that pass is validated before selection;
+an invalid receipt or cursor is an error even if an earlier address has a question.
+`result --wait` and `wait` without `--questions` retain their output and exit contracts.
 
 ## search
 
@@ -1577,7 +1618,7 @@ journaled completion as not published, so do not downgrade `tabcli` while a sess
 written is open.
 
 Ordinary single-result JSON can also have `question_emissions` and `question_observation`,
-as described in [result](#result). These optional fields are omitted from waited and listed
+as described in [result](#result). These optional fields are omitted from `result --wait` and listed
 results and do not alter the completion event or journal schema.
 
 ### wait
@@ -1588,6 +1629,14 @@ error correction as `result --request --wait --json`. `remaining` is the input-o
 addresses not selected, including any already ended addresses. Timeout adds top-level `error`;
 other unsuccessful selected results carry their error in `ended.error`. Argument and read errors
 have `ok:false`, `ended:null`, `remaining:[]`, `timed_out:false`, and a top-level `error`.
+
+With `--questions`, a question return adds `question` and keeps `ended:null`; all addresses
+remain in `remaining`. `question` contains the selected result observation plus `address`,
+`question_emissions`, and `after_question`. `question_observation` is included when known
+incomplete. An ending return has no `question` field; its `ended` may carry those optional
+question fields, including `question_observation: "unreadable"`. See [wait](#wait) for cursor
+validation and precedence. Without `--questions`, no question record is read and none of
+these fields is added.
 
 ### doctor
 

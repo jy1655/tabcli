@@ -95,6 +95,11 @@ Emissions can be incomplete, absence is unknown, and a later Follow-up creates a
 Request without resolving an earlier emission.
 _Avoid_: needs input, unanswered, waiting for an answer
 
+**Question cursor**:
+A caller's position in one Request's retained Question emissions, naming the last emission
+already observed. It records neither an answer nor acknowledgement by the provider.
+_Avoid_: answer receipt, resolution, pending question id
+
 **Context attachment**:
 The copy of a recorded Result that `--context-result` places in a later Request's prompt as
 reference material, never as instructions.

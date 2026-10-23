@@ -245,7 +245,9 @@ model whose catalog offers it. Codex keeps the item only under its paginated rol
 its legacy history policy can omit it. Bridge does not infer support from a version,
 parse question-shaped prose, or accept a raw `function_call` as emission evidence.
 Replace this transcript fallback when the same managed TUI exposes a verified official
-addressed question event or lifecycle. Answer handling and parent wake remain deferred.
+addressed question event or lifecycle. `wait --questions` can return retained emissions to a
+waiting caller before completion, with a caller-held cursor for resuming observation.
+Answer handling and unsolicited notification of a caller remain deferred.
 Component verification is recorded in
 [the focused verification note](verification/2026-10-19-codex-question-emissions.md).
 

@@ -38,6 +38,36 @@ pub(crate) struct WaitRequest {
     addresses: Vec<Address>,
     timeout: Duration,
     json: bool,
+    questions: bool,
+    after_questions: Vec<QuestionCursor>,
+}
+
+/// A caller-held observation position, never an answer or a provider acknowledgement.
+#[derive(Debug)]
+struct QuestionCursor {
+    address: Address,
+    id: String,
+}
+
+impl QuestionCursor {
+    fn parse(value: &str) -> Result<Self> {
+        let mut parts = value.splitn(3, '/');
+        let session = parts.next().unwrap_or_default();
+        let request = parts.next().unwrap_or_default();
+        let id = parts.next().filter(|id| !id.is_empty()).with_context(|| {
+            format!("invalid question cursor {value:?}; expected SESSION/REQUEST/EMISSION_ID")
+        })?;
+        Ok(Self {
+            address: Address::parse(&format!("{session}/{request}"))?,
+            id: id.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WakeReason {
+    RequestEnded,
+    QuestionEmitted,
 }
 
 fn error_value(error: &anyhow::Error) -> Value {
@@ -72,10 +102,24 @@ fn parse_options(args: &[String]) -> Result<WaitRequest> {
     let mut addresses = Vec::new();
     let mut timeout = None;
     let mut json = false;
+    let mut questions = false;
+    let mut after_questions: Vec<QuestionCursor> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--json" => set_flag_once(&mut json, "--json")?,
+            "--questions" => set_flag_once(&mut questions, "--questions")?,
+            "--after-question" => {
+                let cursor =
+                    QuestionCursor::parse(option_value(args, &mut index, "--after-question")?)?;
+                if after_questions
+                    .iter()
+                    .any(|prior| prior.address == cursor.address)
+                {
+                    bail!("duplicate --after-question for {}", cursor.address.text());
+                }
+                after_questions.push(cursor);
+            }
             "--timeout-secs" => {
                 let value = option_value(args, &mut index, "--timeout-secs")?;
                 set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
@@ -94,10 +138,23 @@ fn parse_options(args: &[String]) -> Result<WaitRequest> {
     if addresses.is_empty() {
         bail!("wait requires at least one SESSION/REQUEST address")
     }
+    if !questions && !after_questions.is_empty() {
+        bail!("--after-question requires --questions");
+    }
+    for cursor in &after_questions {
+        if !addresses.contains(&cursor.address) {
+            bail!(
+                "--after-question address {} is not being waited on",
+                cursor.address.text()
+            );
+        }
+    }
     Ok(WaitRequest {
         addresses,
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         json,
+        questions,
+        after_questions,
     })
 }
 
@@ -120,13 +177,17 @@ fn observe(
     reader: &Reader,
     selector: &Selector,
     session: &str,
-) -> Result<(Value, bool)> {
+    questions: bool,
+    after: Option<&str>,
+) -> Result<(Value, Option<WakeReason>)> {
     observe_with_owner(
         snapshot,
         reader,
         selector,
         session,
         &judgment::Observers::SYSTEM,
+        questions,
+        after,
     )
 }
 
@@ -138,22 +199,58 @@ fn observe_with_owner(
     selector: &Selector,
     session: &str,
     observers: &judgment::Observers<'_>,
-) -> Result<(Value, bool)> {
-    let observation = snapshot.observe_result(reader, selector)?;
-    if observation.state().ends_wait() {
-        return Ok((observation.value(), true));
+    questions: bool,
+    after: Option<&str>,
+) -> Result<(Value, Option<WakeReason>)> {
+    let mut observation = snapshot.observe_result(reader, selector)?;
+    let mut owner = None;
+    if !observation.state().ends_wait() {
+        let judgment = judgment::owner(&SessionEvidence::read_owner(reader), session, observers);
+        owner = Some(judgment.observation());
+        observation = observation.with_owner(&judgment, snapshot.status.state.ended());
     }
-    let judgment = judgment::owner(&SessionEvidence::read_owner(reader), session, observers);
-    let owner = judgment.observation();
-    let observation = observation.with_owner(&judgment, snapshot.status.state.ended());
     let mut value = observation.value();
-    value["owner_process_alive"] = json!(owner.process_alive);
-    value["owner"] = json!(owner);
-    Ok((value, observation.state().ends_wait()))
+    if let Some(owner) = owner {
+        value["owner_process_alive"] = json!(owner.process_alive);
+        value["owner"] = json!(owner);
+    }
+    let mut reason = observation
+        .state()
+        .ends_wait()
+        .then_some(WakeReason::RequestEnded);
+    if questions {
+        let emissions = observation.questions(reader);
+        // A supplied cursor must name a retained item, even when completion is visible.
+        // Guessing past lost evidence could silently skip a question on the next poll.
+        let start = match after {
+            Some(id) => emissions.as_ref()
+                .and_then(|emissions| emissions.items.iter().position(|item| item.id == id))
+                .map(|index| index + 1)
+                .with_context(|| format!("--after-question emission {id:?} is not in the selected request's readable retained evidence"))?,
+            None => 0,
+        };
+        if let Some(emissions) = emissions {
+            question_observation(&mut value, &emissions);
+            if let Some(last) = emissions.items.last() {
+                let receipt = observation
+                    .receipt
+                    .context("question observation has no Receipt")?;
+                value["after_question"] =
+                    json!(format!("{session}/{}/{}", receipt.request_id, last.id));
+            }
+            if start < emissions.items.len() {
+                value["question_emissions"] = json!(&emissions.items[start..]);
+                if reason.is_none() && observation.state() == RequestState::Pending {
+                    reason = Some(WakeReason::QuestionEmitted);
+                }
+            }
+        }
+    }
+    Ok((value, reason))
 }
 
 struct Outcome {
-    selected: Option<usize>,
+    selected: Option<(usize, WakeReason)>,
     last: Vec<Value>,
 }
 
@@ -164,7 +261,13 @@ struct SessionGroup {
 
 /// Validates directories before polling. Receipts are checked only under a consistent
 /// Snapshot, on every readable pass. Busy means no observation, never a pending result.
-fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome> {
+fn poll(
+    root: &Path,
+    addresses: &[Address],
+    timeout: Duration,
+    questions: bool,
+    after_questions: &[QuestionCursor],
+) -> Result<Outcome> {
     let mut groups: Vec<SessionGroup> = Vec::new();
     for (index, address) in addresses.iter().enumerate() {
         if let Some(group) = groups
@@ -203,19 +306,25 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
                 Err(error) => return Err(error),
             };
             for &index in &group.indices {
-                let (value, ended) = observe(
+                let after = after_questions
+                    .iter()
+                    .find(|cursor| cursor.address == addresses[index])
+                    .map(|cursor| cursor.id.as_str());
+                let (value, reason) = observe(
                     &snapshot,
                     &reader,
                     &selectors[index],
                     &addresses[index].session,
+                    questions,
+                    after,
                 )?;
                 outcome.last[index] = value;
-                if ended {
-                    outcome.selected = Some(
-                        outcome
-                            .selected
-                            .map_or(index, |previous| previous.min(index)),
-                    );
+                if let Some(reason) = reason
+                    && outcome
+                        .selected
+                        .is_none_or(|(previous, _)| index < previous)
+                {
+                    outcome.selected = Some((index, reason));
                 }
             }
             // Drop this session's shared lock before reading the next session.
@@ -246,6 +355,8 @@ pub(in crate::native) fn one(
             request: request.to_owned(),
         }],
         timeout,
+        false,
+        &[],
     )?;
     let mut last = outcome.last.into_iter().next().unwrap();
     if outcome.selected.is_none() {
@@ -257,15 +368,21 @@ pub(in crate::native) fn one(
 }
 
 fn value_in(root: &Path, request: &WaitRequest) -> Result<Value> {
-    let outcome = poll(root, &request.addresses, request.timeout)?;
+    let outcome = poll(
+        root,
+        &request.addresses,
+        request.timeout,
+        request.questions,
+        &request.after_questions,
+    )?;
     let remaining: Vec<_> = request
         .addresses
         .iter()
         .enumerate()
-        .filter(|(index, _)| Some(*index) != outcome.selected)
+        .filter(|(index, _)| Some((*index, WakeReason::RequestEnded)) != outcome.selected)
         .map(|(_, address)| address.text())
         .collect();
-    let Some(index) = outcome.selected else {
+    let Some((index, reason)) = outcome.selected else {
         return Ok(envelope::error(
             &anyhow::anyhow!("waiting timed out; no request was cancelled or resent"),
             json!({"ended": null,
@@ -277,10 +394,20 @@ fn value_in(root: &Path, request: &WaitRequest) -> Result<Value> {
         ));
     };
     let mut ended = outcome.last.into_iter().nth(index).unwrap();
+    ended["address"] = json!(request.addresses[index].text());
+    if reason == WakeReason::QuestionEmitted {
+        return Ok(envelope::ok(
+            json!({
+                "ended": null, "question": ended, "remaining": remaining, "timed_out": false,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ));
+    }
     if ended["request_state"] != "completed" {
         correct_unsuccessful_result(&mut ended);
     }
-    ended["address"] = json!(request.addresses[index].text());
     Ok(envelope::ok(
         json!({"ok": ended["ok"], "ended": ended,
         "remaining": remaining, "timed_out": false})
@@ -288,6 +415,17 @@ fn value_in(root: &Path, request: &WaitRequest) -> Result<Value> {
         .unwrap()
         .clone(),
     ))
+}
+
+#[cfg(test)]
+pub(in crate::native) fn test_value_in(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Value> {
+    let mut request = parse_options(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())?;
+    request.timeout = timeout;
+    value_in(root, &request)
 }
 
 pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
@@ -303,8 +441,16 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
     envelope::emit(request.json, &value, || {
         if !value["ended"].is_null() {
             print_result(&value["ended"], false)?;
+        } else if !value["question"].is_null() {
+            println!("wait returned: question emitted; request remains pending");
+            print_result(&value["question"], false)?;
         } else if let Some(error) = value["error"].as_str() {
             println!("error: {error}");
+        }
+        for selected in [&value["ended"], &value["question"]] {
+            if let Some(cursor) = selected["after_question"].as_str() {
+                println!("after-question: {}", terminal_safe_text(cursor, false));
+            }
         }
         println!(
             "remaining: {}",
@@ -346,6 +492,57 @@ mod tests {
         pid_alive: &|_| panic!("this record is not PID-observed"),
     };
 
+    #[test]
+    fn question_options_require_unique_cursors_for_selected_addresses() {
+        for args in [
+            vec![
+                "session-a/request-1",
+                "--after-question",
+                "session-a/request-1/id",
+            ],
+            vec!["session-a/request-1", "--questions", "--questions"],
+            vec!["session-a/request-1", "--questions", "--after-question"],
+            vec![
+                "session-a/request-1",
+                "--questions",
+                "--after-question",
+                "session-a/request-1/",
+            ],
+            vec![
+                "session-a/request-1",
+                "--questions",
+                "--after-question",
+                "session-b/request-1/id",
+            ],
+            vec![
+                "session-a/request-1",
+                "--questions",
+                "--after-question",
+                "session-a/request-1/id",
+                "--after-question",
+                "session-a/request-1/other",
+            ],
+        ] {
+            assert!(
+                parse_options(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+                    .is_err(),
+                "{args:?}"
+            );
+        }
+        let parsed = parse_options(
+            &[
+                "--after-question",
+                "session-a/request-1/id/with/slashes",
+                "--questions",
+                "session-a/request-1",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(parsed.questions);
+        assert_eq!(parsed.after_questions[0].id, "id/with/slashes");
+    }
+
     /// Observes a pending request of `session-fault` with the given Owner record.
     fn pending_with_owner(owner: Value, observers: &judgment::Observers<'_>) -> (Value, bool) {
         let fixture = seed_close_fixture(JournaledEventState::Absent);
@@ -362,11 +559,13 @@ mod tests {
             &Selector::Request(id),
             "session-fault",
             observers,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(fs::read(directory.join("status.json")).unwrap(), before);
         assert!(directory.join("turn.claim").exists());
-        (value, ended)
+        (value, ended == Some(WakeReason::RequestEnded))
     }
 
     #[test]
@@ -495,9 +694,11 @@ mod tests {
                 attest: &|_| panic!("published Result precedes owner inspection"),
                 pid_alive: &|_| panic!("published Result precedes owner inspection"),
             },
+            false,
+            None,
         )
         .unwrap();
-        assert!(ended);
+        assert_eq!(ended, Some(WakeReason::RequestEnded));
         assert_eq!(value["request_state"], "completed");
         assert!(value.get("owner").is_none());
     }
@@ -651,11 +852,13 @@ mod tests {
                         },
                     ],
                     Duration::ZERO,
+                    false,
+                    &[],
                 )
                 .unwrap()
             },
         );
         assert_eq!(calls.get(), 1);
-        assert_eq!(outcome.selected, Some(0));
+        assert_eq!(outcome.selected, Some((0, WakeReason::RequestEnded)));
     }
 }
