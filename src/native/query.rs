@@ -11,7 +11,7 @@ use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::session::turn::JournaledEventState;
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::session::{Reader, SessionStatus, launch, requests};
-use agent_bridge::{FirstPartyCli, checked_deadline_from, terminal_safe_text};
+use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, checked_deadline_from, terminal_safe_text};
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -24,6 +24,8 @@ use std::{fs, thread};
 
 mod inspect;
 pub(super) mod observation;
+#[cfg(test)]
+mod question_presence_tests;
 pub(super) mod request;
 pub(super) mod search;
 pub(super) mod status;
@@ -171,9 +173,30 @@ impl RequestObservation<'_> {
             if !questions.items.is_empty() {
                 value["question_emissions"] = json!(questions.items);
             }
-            question_observation(&mut value, &questions);
+            question_presence(&mut value, &questions);
         }
         value
+    }
+}
+
+/// Retained question presence of a finished Request for `ask`, `tell` and `reopen`, read under
+/// a fresh locked Snapshot. A failed read adds nothing: absence is unknown, never "none".
+pub(super) fn finished_question_presence(
+    directory: &Path,
+    request_id: &str,
+) -> serde_json::Map<String, Value> {
+    let reader = Reader::open_unchecked(directory);
+    let mut value = json!({});
+    if let Ok(snapshot) = observe_snapshot(&reader)
+        && let Ok(observed) =
+            snapshot.observe_result(&reader, &Selector::Request(request_id.to_owned()))
+        && let Some(questions) = observed.questions(&reader)
+    {
+        question_presence(&mut value, &questions);
+    }
+    match value {
+        Value::Object(fields) => fields,
+        _ => unreachable!(),
     }
 }
 
@@ -290,10 +313,16 @@ fn question_observation(value: &mut Value, questions: &QuestionEmissions) {
     }
 }
 
-fn question_presence(value: &mut Value, questions: &QuestionEmissions) {
+/// How many emissions the Request's retained record holds; neither pending nor answered.
+fn question_count(value: &mut Value, questions: &QuestionEmissions) {
     if !questions.items.is_empty() {
         value["question_emitted"] = json!(true);
+        value["question_emission_count"] = json!(questions.items.len());
     }
+}
+
+fn question_presence(value: &mut Value, questions: &QuestionEmissions) {
+    question_count(value, questions);
     question_observation(value, questions);
 }
 
@@ -324,8 +353,21 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
     })
 }
 
-fn question_lines(value: &Value) -> Vec<String> {
+pub(super) fn question_lines(value: &Value) -> Vec<String> {
     let mut lines = Vec::new();
+    if let Some(count) = value["question_emission_count"].as_u64() {
+        lines.push(format!("question emissions retained: {count}"));
+        if value["question_emissions"].is_null()
+            && let (Some(session), Some(request)) =
+                (value["session"].as_str(), value["request_id"].as_str())
+        {
+            lines.push(format!(
+                "  show them: {PUBLIC_COMMAND} result {} --request {} --json",
+                terminal_safe_text(session, false),
+                terminal_safe_text(request, false)
+            ));
+        }
+    }
     for item in value["question_emissions"].as_array().into_iter().flatten() {
         for question in item["questions"].as_array().into_iter().flatten() {
             if let Some(title) = question["title"].as_str() {

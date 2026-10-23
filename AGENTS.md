@@ -454,8 +454,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   successful terminal integrity checkpoint; nonterminal publication verifies separately.
   Queries use the selected historical Receipt under their existing lock. Ordinary single
   `result` shows content; status focuses its active Receipt or existing latest Result's Receipt;
-  ordinary inspect shows per-request presence. Default wait, list, timeline, attachments and
-  completion records retain their contracts. Opt-in `wait --questions` returns unseen retained
+  ordinary inspect shows per-request presence. Successful waited `ask`/`tell`/`reopen`,
+  and an ended Request's `result --wait` and default wait add only the retained count;
+  after a failed `ask`/`tell`/`reopen` wait, query the Request's result. A pending poll without
+  `--questions` reads no record. List, timeline, attachments and completion records
+  retain their contracts. Opt-in `wait --questions` returns unseen retained
   emissions without settling the Request; its caller-held cursor is observation only.
   Emitted never means pending or answered, absence is
   unknown, and a later `tell` is another Request, not resolution. Tool availability depends

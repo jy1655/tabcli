@@ -71,6 +71,26 @@ Windows Codex's queue still passes its message as a command-line argument even w
 `--prompt-file`. For multiple tasks, `tabcli wait SESSION/REQUEST ... --timeout-secs 60 --json`
 observes exact addresses together. Continue useful independent work between bounded waits.
 
+## When a child emits a question
+
+Codex and Claude children can emit structured questions. Bridge reports that a question was
+emitted, never that it is pending, was shown, or was answered, and it sends no answers.
+Absent question fields do not prove that no question was asked.
+
+- A result with `question_emission_count` retained emissions: read them with
+  `tabcli result SESSION --request REQUEST --json` (`question_emissions`) before accepting the
+  answer as final. The child may have continued on an assumption.
+- If `tabcli --help` lists `wait ... --questions`, add `--questions` to a bounded `wait` to
+  return on an emission while the request is pending. `ended: null` with a `question` object
+  is not completion; pass its `after_question` as `--after-question` on the next wait.
+- Supply a missing fact only with an ordinary `tell` once the request has ended and the
+  session is `ready`. It is a new request and does not resolve the earlier emission. Never
+  send it while the request is pending or type into the managed terminal.
+- A Claude request still pending after an emission may be held by its question dialog. Check
+  the actual terminal surface, or ask the user to: if the dialog is shown, report the request
+  address and ask the user to answer it there; otherwise keep waiting or inspect the request.
+  Do not infer an open dialog from the emission alone.
+
 ## When an operation does not finish
 
 A result timeout is only an observation deadline. It neither cancels the request nor proves

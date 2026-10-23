@@ -1274,15 +1274,22 @@ fn excluded_queries_keep_exact_bytes_and_completion_journal_and_usage_stay_compa
         .ok()
         .unwrap();
     assert_eq!(attachment.1, "ordinary answer");
+    // An ended wait adds the retained count, never content.
     assert!(baseline_wait.get("question_emissions").is_none());
+    assert_eq!(baseline_wait["question_emission_count"], 1);
     assert_eq!(result(&directory, &pending)["usage"]["input_tokens"], 5);
     std::fs::write(question_path(&directory, &pending), b"invalid").unwrap();
+    let mut expected_wait = baseline_wait.clone();
+    let fields = expected_wait.as_object_mut().unwrap();
+    fields.remove("question_emitted");
+    fields.remove("question_emission_count");
+    fields.insert("question_observation".into(), json!("unreadable"));
     assert_eq!(
         cli_result(
             root.path(),
             &[SESSION, "--request", &receipt.request_id, "--wait"]
         ),
-        baseline_wait
+        expected_wait
     );
     assert_eq!(cli_result(root.path(), &[SESSION, "--list"]), baseline_list);
     assert_eq!(
