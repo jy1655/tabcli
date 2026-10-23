@@ -439,7 +439,7 @@ run. Checked on native Windows so far:
 Not yet checked:
 
 - macOS for every host;
-- installs from the repository pinned to a released tag (none yet contains the integrations).
+- installs from the repository pinned to a released tag.
 
 [claude-plugins]: https://code.claude.com/docs/en/discover-plugins
 [codex-plugins]: https://developers.openai.com/plugins/build/plugins
