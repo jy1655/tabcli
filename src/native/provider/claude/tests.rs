@@ -1,3 +1,5 @@
+use super::turn::ClaudeTurn;
+const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 use crate::native::session::{Store, turn};
 use std::{path::PathBuf, time::Duration};
 
@@ -303,6 +305,139 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
 
 use super::*;
 
+fn launch_preflight(directory: &Path) {
+    Store::open_unchecked(directory)
+        .write_manifest(&crate::native::session::schema::SessionManifest {
+            schema: 1,
+            id: directory.file_name().unwrap().to_str().unwrap().into(),
+            provider: "claude".into(),
+            provider_path: "claude".into(),
+            provider_version: "2.1.302 (Claude Code)".into(),
+            workspace: directory.into(),
+            title: "Claude launch fixture".into(),
+            model: None,
+            effort: None,
+            yolo: true,
+            created_unix_ms: 1,
+        })
+        .unwrap();
+}
+
+const MOD_CONVERSATION: &str = "00000000-0000-4000-8000-000000000249";
+const MOD_REQUEST: &str = "claude-turn-1000000000000000000-10000-1";
+
+fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_json::Value) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("events")).unwrap();
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
+        .unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    let token = claim.token().to_owned();
+    claim.retain();
+    let start: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-start.json")).unwrap();
+    let text = start["event"]["text"].as_str().unwrap();
+    let expected = text
+        .split_once(">\n")
+        .unwrap()
+        .1
+        .strip_suffix("\n</cross-session-message>")
+        .unwrap();
+    let pending = ClaudeTurn::new(MOD_REQUEST).unwrap();
+    Store::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .write_json(&serde_json::json!({
+            "schema": 1, "request_id": pending.id(), "marker": pending.marker(),
+            "claim_token": token, "expected_message": expected,
+        }))
+        .unwrap();
+    if native {
+        Store::open_unchecked(directory.path()).private("claude-completion-mode.json").write_json(
+            &serde_json::json!({"schema":1,"mode":"native_v1","reason":"windows_stable_2_1_302_or_newer","claude_version":"2.1.302"})
+        ).unwrap();
+    }
+    (directory, token, start["event"].clone())
+}
+
+#[test]
+fn native_mod_stop_draft_does_not_settle_the_claim() {
+    let (directory, token, _) = mod_regression_fixture(true);
+    let stop: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
+    handle_hook(directory.path(), &stop["event"]).unwrap();
+    assert!(
+        Reader::open_unchecked(directory.path())
+            .events()
+            .unwrap()
+            .is_empty(),
+        "a Stop draft is not a terminal turn"
+    );
+    assert_eq!(
+        turn::current_claim_token(&Reader::open_unchecked(directory.path()))
+            .unwrap()
+            .as_deref(),
+        Some(token.as_str())
+    );
+}
+
+#[test]
+fn native_mod_final_settles_with_the_bridge_wait_identity() {
+    let (directory, token, start) = mod_regression_fixture(true);
+    let mut pending: serde_json::Value = Reader::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .json()
+        .unwrap();
+    pending["schema"] = serde_json::json!(2);
+    Store::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)
+        .unwrap();
+    handle_hook(directory.path(), &serde_json::json!({"agent_bridge_claude_mod":1,"event":"turn.start","conversation":MOD_CONVERSATION,"data":start})).unwrap();
+    let complete: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-complete.json")).unwrap();
+    handle_hook(directory.path(), &serde_json::json!({"agent_bridge_claude_mod":1,"event":"turn.complete","conversation":MOD_CONVERSATION,"data":complete["event"]})).unwrap();
+    let event = turn::wait(
+        &Store::open_unchecked(directory.path()),
+        0,
+        Some(MOD_REQUEST),
+        Some(&token),
+        Instant::now() + Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(event.message, "PROBE-FINAL");
+    assert_eq!(event.turn_id.as_deref(), Some(MOD_REQUEST));
+    assert_eq!(
+        event.provenance.as_deref(),
+        Some("claude_mod_turn_complete")
+    );
+    assert_eq!(
+        Reader::open_unchecked(directory.path())
+            .events()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        turn::current_claim_token(&Reader::open_unchecked(directory.path()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_stop_draft_completion_remains_compatible() {
+    let (directory, _, _) = mod_regression_fixture(false);
+    let stop: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
+    handle_hook(directory.path(), &stop["event"]).unwrap();
+    let paths = Reader::open_unchecked(directory.path()).events().unwrap();
+    assert_eq!(paths.len(), 1);
+    let event: crate::native::session::schema::SessionEvent =
+        RecordReader::at(&paths[0]).json().unwrap();
+    assert_eq!(event.message, "PROBE-DRAFT");
+}
+
 // The watcher of a plan whose completion arrives through the hook alone: starting it on a
 // directory that does not exist succeeds, stopping it succeeds, and the directory is left
 // as it was, so nothing ran.
@@ -504,6 +639,7 @@ fn managed_launch_name_is_the_known_unique_session_id() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-safe123");
     std::fs::create_dir(&directory).unwrap();
+    launch_preflight(&directory);
     let plan = ADAPTER
         .prepare_launch(LaunchContext {
             bridge_executable: Path::new("/opt/agent-bridge"),
@@ -556,6 +692,13 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
     let directory = root.path().join("session-safe123");
     std::fs::create_dir(&directory).unwrap();
     for windows in [false, true] {
+        let directory = directory.join(if windows {
+            "session-windows"
+        } else {
+            "session-macos"
+        });
+        std::fs::create_dir(&directory).unwrap();
+        launch_preflight(&directory);
         let plan = prepare_launch_for_platform(
             LaunchContext {
                 bridge_executable: Path::new("/opt/agent-bridge"),
@@ -647,6 +790,7 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-large123");
     std::fs::create_dir(&directory).unwrap();
+    launch_preflight(&directory);
     let prompt = "x".repeat(64 * 1024);
     let plan = prepare_launch_for_platform(
         LaunchContext {
@@ -672,6 +816,49 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
             .iter()
             .all(|argument| !argument.to_string_lossy().contains(&prompt))
     );
+}
+
+#[test]
+fn legacy_pending_turn_writer_preserves_schema_one_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let _pending_file = ClaudeTurn::new("claude-turn-safe123")
+        .unwrap()
+        .install(&Store::open_unchecked(directory.path()))
+        .unwrap();
+    let written: serde_json::Value = Reader::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .json()
+        .unwrap();
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "schema": 1,
+            "request_id": "claude-turn-safe123",
+            "marker": "<!-- agent-bridge-claude-turn:claude-turn-safe123 -->",
+        })
+    );
+}
+
+#[test]
+fn pending_turn_ids_require_the_bounded_ascii_claude_prefix() {
+    let maximum = format!("claude-turn-{}", "a".repeat(128 - "claude-turn-".len()));
+    for valid in ["claude-turn-", "claude-turn-Ab09-1", maximum.as_str()] {
+        assert!(ClaudeTurn::new(valid).is_ok(), "{valid:?}");
+    }
+    for invalid in [
+        "",
+        "claude-turn",
+        "other-turn-safe123",
+        "claude-turn-safe_123",
+        "claude-turn-safe/123",
+        "claude-turn-safe 123",
+        "claude-turn-safe\n123",
+        "claude-turn-safe\0",
+        "claude-turn-한글",
+        &format!("{maximum}a"),
+    ] {
+        assert!(ClaudeTurn::new(invalid).is_err(), "{invalid:?}");
+    }
 }
 
 #[test]
@@ -762,12 +949,18 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
-    let pending = super::turn::ClaudeTurn::new("claude-turn-safe123").unwrap();
+    let legacy_json = br#"{"schema":1,"request_id":"claude-turn-safe123","marker":"<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"}"#;
     crate::native::session::primitives::write_private(
-        &directory.path().join("claude-pending-turn.json"),
-        &serde_json::to_vec_pretty(&pending).unwrap(),
+        &directory.path().join(PENDING_TURN_FILE),
+        legacy_json,
     )
     .unwrap();
+    let pending: ClaudeTurn = Reader::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .json()
+        .unwrap();
+    assert!(serde_json::to_value(&pending).unwrap()["claim_token"].is_null());
+    assert!(pending.expected_message().is_none());
     let payload = serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": "claude-session-id",
@@ -793,6 +986,70 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
             .join(crate::native::session::test_support::TURN_CLAIM_FILE)
             .exists()
     );
+}
+
+#[test]
+fn legacy_pending_reader_rejects_changed_schema_marker_and_invalid_id() {
+    for (field, value) in [
+        ("schema", serde_json::json!(2)),
+        ("request_id", serde_json::json!("claude-turn-invalid_id")),
+        (
+            "marker",
+            serde_json::json!("<!-- agent-bridge-claude-turn:claude-turn-other -->"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_unchecked(directory.path());
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
+        let claim = turn::claim(&store, &[]).unwrap();
+        let token = claim.token().to_owned();
+        claim.retain();
+        let mut pending = serde_json::json!({
+            "schema": 1,
+            "request_id": "claude-turn-safe123",
+            "marker": "<!-- agent-bridge-claude-turn:claude-turn-safe123 -->",
+        });
+        pending[field] = value;
+        if field == "request_id" {
+            pending["marker"] =
+                serde_json::json!("<!-- agent-bridge-claude-turn:claude-turn-invalid_id -->");
+        }
+        store
+            .private(PENDING_TURN_FILE)
+            .write_json(&pending)
+            .unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "claude-session-id",
+            "last_assistant_message": "result\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->",
+        });
+
+        let error = handle_hook(directory.path(), &payload).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Claude turn correlation state"),
+            "{field}: {error:#}"
+        );
+        let reader = Reader::open_unchecked(directory.path());
+        assert!(reader.events().unwrap().is_empty(), "{field}");
+        assert_eq!(
+            turn::current_claim_token(&reader).unwrap().as_deref(),
+            Some(token.as_str()),
+            "{field}"
+        );
+        assert_eq!(
+            reader
+                .private(PENDING_TURN_FILE)
+                .json::<serde_json::Value>()
+                .unwrap(),
+            pending,
+            "{field}"
+        );
+    }
 }
 
 #[test]
@@ -875,6 +1132,7 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
     let root = tempfile::tempdir().unwrap();
     let session = root.path().join("session-reopenplan");
     std::fs::create_dir(&session).unwrap();
+    launch_preflight(&session);
     let plan = prepare_resume_for_platform(
         ResumeContext {
             bridge_executable: Path::new("/opt/agent-bridge"),
@@ -897,6 +1155,8 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
             settings_path.clone().into_os_string(),
             OsString::from("--name"),
             OsString::from("session-reopenplan"),
+            OsString::from("--plugin-dir"),
+            session.join("claude-mod").into_os_string(),
         ]
     );
     assert_no_op_watcher(plan.watcher);
@@ -917,8 +1177,7 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
     let settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert_eq!(settings["crossSessionInbound"], "accept");
-    assert!(settings["hooks"]["Stop"].is_array());
-    assert!(settings["hooks"]["StopFailure"].is_array());
+    assert!(settings.get("hooks").is_none());
 }
 
 #[test]
@@ -1048,14 +1307,19 @@ fn claude_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<O
 // policy, private settings, managed name, and the prompt last off Windows only.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
-    let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("session-safe123");
-    std::fs::create_dir(&directory).unwrap();
-    let settings_path = directory.join("claude-settings.json");
     for windows in [false, true] {
         for yolo in [false, true] {
             for (model, mapped) in [(None, None), (Some("Fable5"), Some("Fable"))] {
                 for effort in [None, Some("high")] {
+                    let root = tempfile::tempdir().unwrap();
+                    let directory = root.path().join(if windows {
+                        "session-windows"
+                    } else {
+                        "session-macos"
+                    });
+                    std::fs::create_dir(&directory).unwrap();
+                    launch_preflight(&directory);
+                    let settings_path = directory.join("claude-settings.json");
                     let _ = std::fs::remove_file(&settings_path);
                     let plan = prepare_launch_for_platform(
                         LaunchContext {
@@ -1078,8 +1342,18 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         OsString::from("--settings"),
                         settings_path.clone().into_os_string(),
                         OsString::from("--name"),
-                        OsString::from("session-safe123"),
+                        OsString::from(if windows {
+                            "session-windows"
+                        } else {
+                            "session-macos"
+                        }),
                     ]);
+                    if windows {
+                        expected.extend([
+                            OsString::from("--plugin-dir"),
+                            directory.join("claude-mod").into_os_string(),
+                        ]);
+                    }
                     if !windows {
                         expected.push(OsString::from("claude prompt"));
                     }
@@ -1099,10 +1373,15 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())
                             .unwrap();
                     assert_eq!(settings["crossSessionInbound"], "accept", "{label}");
-                    assert_eq!(
-                        settings["hooks"]["Stop"][0]["hooks"][0]["command"], "/opt/agent-bridge",
-                        "{label}"
-                    );
+                    if windows {
+                        assert!(settings.get("hooks").is_none(), "{label}");
+                    } else {
+                        assert_eq!(
+                            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+                            "/opt/agent-bridge",
+                            "{label}"
+                        );
+                    }
                 }
             }
         }
@@ -1113,13 +1392,14 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
 // resume arguments and never a prompt; the reopened session awaits delivery.
 #[test]
 fn resume_plan_is_the_complete_command_for_every_policy() {
-    let root = tempfile::tempdir().unwrap();
-    let session = root.path().join("session-reopenplan");
-    std::fs::create_dir(&session).unwrap();
-    let settings_path = session.join("claude-settings.json");
     for yolo in [false, true] {
         for (model, mapped) in [(None, None), (Some("Fable5"), Some("Fable"))] {
             for effort in [None, Some("max")] {
+                let root = tempfile::tempdir().unwrap();
+                let session = root.path().join("session-reopenplan");
+                std::fs::create_dir(&session).unwrap();
+                launch_preflight(&session);
+                let settings_path = session.join("claude-settings.json");
                 let plan = prepare_resume_for_platform(
                     ResumeContext {
                         bridge_executable: Path::new("/opt/agent-bridge"),
@@ -1141,6 +1421,8 @@ fn resume_plan_is_the_complete_command_for_every_policy() {
                     settings_path.clone().into_os_string(),
                     OsString::from("--name"),
                     OsString::from("session-reopenplan"),
+                    OsString::from("--plugin-dir"),
+                    session.join("claude-mod").into_os_string(),
                 ]);
                 assert_eq!(plan.arguments, expected, "{label}");
                 assert_eq!(

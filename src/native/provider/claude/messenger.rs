@@ -21,7 +21,8 @@
 // messenger protocol, executed-input proof, retry evidence and clock injection.
 
 use super::{
-    CLAUDE_CODE_SESSION_MARKERS, claude_owned_string, claude_string, managed_session_name, turn,
+    CLAUDE_CODE_SESSION_MARKERS, claude_owned_string, claude_string, completion,
+    managed_session_name, turn,
 };
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::{
@@ -29,7 +30,7 @@ use crate::native::delivery::{
 };
 use crate::native::provider::CrossSessionMessageContext;
 use crate::native::provider_process::{ProviderProcessTree, configure_process_tree};
-use crate::native::session::{Reader, RecordReader, RecordStore, Store};
+use crate::native::session::{Reader, RecordReader, RecordStore};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -211,17 +212,30 @@ impl Transport for ClaudeMessage {
         })
     }
     fn send(&self, turn: &TurnContext<'_>, prepared: &Prepared, _: Option<&Path>) -> Outcome {
-        match Messenger::installed().send(CrossSessionMessageContext {
-            bridge_executable: turn.bridge_executable,
-            directory: turn.directory,
-            provider_path: turn.provider_path,
-            correlation_id: prepared
-                .correlation_id
-                .as_deref()
-                .expect("Claude turn identity"),
-            prompt: turn.prompt,
-            deadline: turn.deadline,
-        }) {
+        let mut messenger = Messenger::installed();
+        if let Err(error) = completion::admit(
+            turn.directory,
+            turn.claim_token,
+            turn.deadline,
+            cfg!(windows),
+            &mut messenger.clock,
+        ) {
+            return Outcome::NotSent(error);
+        }
+        match messenger.send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: turn.bridge_executable,
+                directory: turn.directory,
+                provider_path: turn.provider_path,
+                correlation_id: prepared
+                    .correlation_id
+                    .as_deref()
+                    .expect("Claude turn identity"),
+                prompt: turn.prompt,
+                deadline: turn.deadline,
+            },
+            Some(turn.claim_token),
+        ) {
             Ok(()) => Outcome::Sent,
             Err(failure) => {
                 let uncertain = failure.delivery_may_have_occurred();
@@ -501,14 +515,22 @@ impl Messenger<SystemClock> {
 }
 
 impl<C: Clock> Messenger<C> {
-    // One pending owner for the request, installed before the first deadline check and
-    // outside every attempt. It stays only when the payload was delivered or may have been;
-    // any other outcome removes it so the same request can be sent again.
-    fn send(&mut self, context: CrossSessionMessageContext<'_>) -> MessengerResult {
-        let pending = turn::ClaudeTurn::new(context.correlation_id)
-            .and_then(|turn| turn.install(&Store::open_unchecked(context.directory)))
-            .map_err(MessengerFailure::not_sent)?;
-        let result = self.send_with_discovery_retry(context);
+    fn send_for_claim(
+        &mut self,
+        context: CrossSessionMessageContext<'_>,
+        token: Option<&str>,
+    ) -> MessengerResult {
+        let plan =
+            cross_session_message_plan(context.directory, context.correlation_id, context.prompt)
+                .map_err(MessengerFailure::not_sent)?;
+        let pending = completion::install_pending(
+            context.directory,
+            context.correlation_id,
+            token,
+            &plan.guard.input.message,
+        )
+        .map_err(MessengerFailure::not_sent)?;
+        let result = self.send_with_discovery_retry(context, &plan);
         let retain_pending = match &result {
             Ok(()) => true,
             Err(error) => error.delivery_may_have_occurred(),
@@ -526,6 +548,7 @@ impl<C: Clock> Messenger<C> {
     fn send_with_discovery_retry(
         &mut self,
         context: CrossSessionMessageContext<'_>,
+        plan: &CrossSessionMessagePlan,
     ) -> MessengerResult {
         let deadline = context.deadline;
         let mut retry_deadline = None;
@@ -536,7 +559,7 @@ impl<C: Clock> Messenger<C> {
                     "Claude cross-session discovery exhausted the total delivery timeout"
                 )));
             }
-            let result = self.attempt(context);
+            let result = self.attempt(context, plan);
             let should_retry = result
                 .as_ref()
                 .is_err_and(|failure| failure.should_retry_discovery());
@@ -559,11 +582,12 @@ impl<C: Clock> Messenger<C> {
         }
     }
 
-    fn attempt(&mut self, context: CrossSessionMessageContext<'_>) -> MessengerResult {
+    fn attempt(
+        &mut self,
+        context: CrossSessionMessageContext<'_>,
+        plan: &CrossSessionMessagePlan,
+    ) -> MessengerResult {
         let deadline = context.deadline;
-        let plan =
-            cross_session_message_plan(context.directory, context.correlation_id, context.prompt)
-                .map_err(MessengerFailure::not_sent)?;
         let _guard_files = install_message_guard(
             context.bridge_executable,
             context.correlation_id,
@@ -571,9 +595,12 @@ impl<C: Clock> Messenger<C> {
             &plan.files,
         )
         .map_err(MessengerFailure::not_sent)?;
-        let mut command =
-            messenger_command(context.provider_path, context.directory, plan.arguments)
-                .map_err(MessengerFailure::not_sent)?;
+        let mut command = messenger_command(
+            context.provider_path,
+            context.directory,
+            plan.arguments.clone(),
+        )
+        .map_err(MessengerFailure::not_sent)?;
         let mut stdout = tempfile::tempfile()
             .context("failed to create Claude messenger stdout buffer")
             .map_err(MessengerFailure::not_sent)?;
@@ -626,7 +653,7 @@ impl<C: Clock> Messenger<C> {
                 "Claude cross-session messenger timed out before input delivery"
             )));
         }
-        let stdin_payload = plan.stdin;
+        let stdin_payload = plan.stdin.clone();
         let stdin_writer = thread::spawn(move || {
             let mut stdin = stdin;
             stdin.write_all(stdin_payload.as_bytes())

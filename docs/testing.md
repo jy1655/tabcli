@@ -26,6 +26,15 @@ tests remains enabled.
 For a lifecycle or concurrency fix, reproduce the partial transition or race deterministically
 before changing the implementation.
 
+Claude's native completion tests replay an exact addressed start, an unmarked bound interim
+and a marked completion with a different official turn id. They assert a retained claim before
+the final, an unchanged original binding, one result and the original Bridge wait identity.
+The continuation tests cover malformed or missing candidates, unrelated outcomes, close and
+claim replacement, timeout retention and interruption between identity selection and publication.
+`tests/claude_completion.rs` executes the real JS module through native-hook, including helper
+retry, an oversized unbound completion and read-only candidate inspection. These fixtures do
+not prove provider parentage; authenticated background ask/tell evidence is recorded separately.
+
 ## Language lint
 
 Public documentation, source comments and default plugin metadata use English. Run from the

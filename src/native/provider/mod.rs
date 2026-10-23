@@ -51,6 +51,20 @@ pub(super) fn question_emissions(
     }
 }
 
+/// Provider-owned completion evidence, observed only under inspect's existing lock.
+pub(super) fn completion_observation(
+    reader: &super::session::Reader,
+    provider: &str,
+    locked: bool,
+    claim: Option<&str>,
+) -> Option<serde_json::Value> {
+    if provider == "claude" && locked {
+        claim.and_then(|token| claude::completion_observation(reader, token))
+    } else {
+        None
+    }
+}
+
 // The manifest's policy inputs travel with every launch context. Each adapter maps them to
 // its CLI's flags itself through the public mappings; no shared code assembles them.
 pub(super) struct LaunchContext<'a> {

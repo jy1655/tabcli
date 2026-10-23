@@ -129,9 +129,17 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   messenger keeps its per-request protocol, executed-input proof and retry evidence. Claude's
-  Turn identity and Stop correlation live in `claude/turn.rs`, and trust reads with the injected
+  Turn identity, legacy/native pending records and Stop correlation live in `claude/turn.rs`,
+  and trust reads with the injected
   Git scope check live in `claude/trust.rs`; the adapter keeps launch, resume, the hook router,
   Reopen and doctor.
+  Claude's native completion adapter owns the immutable exact-frame binding, the unmarked
+  bound-answer candidate and the selected marked continuation. The two official turn ids stay
+  private; core publication retains the Bridge correlation id. Candidate and selection writes
+  use the lifecycle lock; core Report rechecks the claim at publication. `inspect` asks the
+  adapter for a read-only candidate observation under its existing reader lock, without
+  reconstructing missing records or changing completion. The provider's turn-final event does
+  not prove request finality or parentage; see the explicit marker fallback in [Providers](providers.md).
   Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
   settlement remains in `codex/transcript.rs`.
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.

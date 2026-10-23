@@ -108,8 +108,22 @@ round trip and close are not verified. Choose another terminal for those provide
 
 Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude needs working
 cross-session messaging in its installed backend and configuration, not only a recent version.
+New Windows Claude launches and reopens also require stable 2.1.302 or newer and a Bridge
+completion module that Claude loads and that reports readiness.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- [2026-10-22 Windows, Claude native completion re-verification](docs/verification/2026-10-22-windows-260-reverification.md):
+  the first re-check at `fa50fb8` failed the background-continuation case. The corrected
+  `49bb9d1` binary, with Claude Code 2.1.308, kept the unmarked interims of a background `ask`
+  and `tell` as candidates and published their marked finals with the original Bridge ids.
+  A genuine unmarked final stayed pending after the caller timed out. This verifies the marker
+  protocol, not provider-owned parentage.
+- [2026-10-19 Windows, Claude native completion owner checks](docs/verification/2026-10-19-windows-249-claude-native-completion.md):
+  ask and tell did not publish a blocked Stop draft and later published the final answer,
+  including protected-tag quoting; disabled hooks withheld readiness. Its marker-omission
+  result is superseded by the 2026-10-22 correction: an unmarked bound answer is now kept as
+  a candidate, not published. The record separates the owner's diagnostic-module probes from
+  unverified configured user command hooks.
 - [2026-10-18 Windows, Codex initial paste evidence (0.4.18)](docs/verification/2026-10-18-windows-124-paste-evidence.md):
   injected Codex launches write the body and the claim marker separately, observe the marker,
   write one guarded Return and settle Sent on the claim binding; three live matrices with the

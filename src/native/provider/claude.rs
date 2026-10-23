@@ -19,10 +19,15 @@ use std::{ffi::OsString, path::Path};
 
 use super::super::terminal;
 
+mod completion;
 mod messenger;
 mod registry;
 mod trust;
 mod turn;
+
+pub(super) fn completion_observation(reader: &Reader, token: &str) -> Option<serde_json::Value> {
+    completion::observe_candidate(reader, token)
+}
 
 use messenger::{ClaudeMessage, run_message_guard, run_message_receipt};
 
@@ -307,8 +312,10 @@ fn policy_arguments(
 // so the prompt is the last positional argument and is accepted at spawn; on Windows the
 // cross-session message delivers it after launch and argv carries no prompt.
 fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
+    let completion_arguments = completion::prepare(context.directory, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
-    RecordStore::at(&settings_path).write_json(&hook_settings(context.bridge_executable))?;
+    RecordStore::at(&settings_path)
+        .write_json(&completion::settings(context.bridge_executable, windows))?;
     let mut arguments = policy_arguments(context.yolo, context.model, context.effort)?;
     arguments.extend([
         OsString::from("--settings"),
@@ -316,6 +323,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         OsString::from("--name"),
         OsString::from(managed_session_name(context.directory)?),
     ]);
+    arguments.extend(completion_arguments);
     let initial_prompt =
         InitialPromptDisposition::of(initial_transport_for_platform(windows).as_ref());
     if initial_prompt == InitialPromptDisposition::AcceptedAtSpawn {
@@ -335,8 +343,10 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
 // transport, exactly as a fresh launch does.
 fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Result<ResumePlan> {
     verify_reopen_available_for_platform(context.provider_session_id, windows)?;
+    let completion_arguments = completion::prepare(context.directory, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
-    RecordStore::at(&settings_path).write_json(&hook_settings(context.bridge_executable))?;
+    RecordStore::at(&settings_path)
+        .write_json(&completion::settings(context.bridge_executable, windows))?;
     let mut arguments = policy_arguments(context.yolo, context.model, context.effort)?;
     arguments.extend([
         OsString::from("--resume"),
@@ -346,6 +356,7 @@ fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Res
         OsString::from("--name"),
         OsString::from(managed_session_name(context.directory)?),
     ]);
+    arguments.extend(completion_arguments);
     Ok(ResumePlan {
         arguments,
         initial_prompt: InitialPromptDisposition::of(
@@ -471,6 +482,12 @@ fn claude_owned_string(payload: &serde_json::Value, key: &str) -> Option<String>
 }
 
 fn handle_hook(directory: &Path, payload: &serde_json::Value) -> Result<()> {
+    if payload.get("agent_bridge_claude_mod").is_some() {
+        return completion::receive(directory, payload);
+    }
+    if completion::native_mode(directory)? {
+        return Ok(());
+    }
     match payload
         .get("hook_event_name")
         .and_then(serde_json::Value::as_str)

@@ -4,7 +4,6 @@ const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 use crate::native::provider::claude::turn::ClaudeTurn;
 #[cfg(windows)]
 use std::process::Command;
-#[cfg(unix)]
 use std::time::Instant;
 
 #[test]
@@ -595,6 +594,163 @@ fn cleanup_after_an_early_target_completion_leaves_the_next_request_intact() {
     );
 }
 
+#[test]
+fn native_messenger_pending_matches_the_guard_executed_input() {
+    use crate::native::session::{SessionState, Store, turn};
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = managed_session_directory(root.path());
+    crate::native::session::update_status(&directory, SessionState::Working, None, None).unwrap();
+    let store = Store::open_unchecked(&directory);
+    let claim = turn::claim(&store, &[]).unwrap();
+    let token = claim.token().to_owned();
+    store
+        .private("claude-completion-mode.json")
+        .write_json(&serde_json::json!({
+            "schema":1,"mode":"native_v1","reason":"fixture","claude_version":"2.1.302"
+        }))
+        .unwrap();
+    // Each handoff closes its payload before it creates an empty ready flag, and the reader
+    // waits for the flag: no rename, no partial read. The wrapper and Node record their start
+    // before stdin is read. The fake has no watchdog; the Messenger deadline bounds it.
+    std::fs::write(
+        directory.join("messenger.mjs"),
+        r#"
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const own = path.dirname(fileURLToPath(import.meta.url));
+fs.writeFileSync(path.join(own, 'messenger-node-started.json'), JSON.stringify({ cwd: process.cwd() }));
+fs.writeFileSync('messenger-envelope.json', fs.readFileSync(0, 'utf8'));
+fs.writeFileSync('messenger-envelope.ready', '');
+const timer = setInterval(() => {
+  if (fs.existsSync('messenger-stream.ready')) {
+    clearInterval(timer);
+    process.stdout.write(fs.readFileSync('messenger-stream.jsonl'));
+  }
+}, 10);
+"#,
+    )
+    .unwrap();
+    #[cfg(windows)]
+    let executable = {
+        let path = directory.join("fake-claude.cmd");
+        std::fs::write(
+            &path,
+            "@type nul > \"%~dp0messenger-wrapper-started\"\r\n@node \"%~dp0messenger.mjs\"\r\n",
+        )
+        .unwrap();
+        path
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("fake-claude");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n: > \"$(dirname \"$0\")/messenger-wrapper-started\"\nexec node \"$(dirname \"$0\")/messenger.mjs\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    let session_files = |directory: &Path| {
+        let mut files: Vec<String> = std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        let node = std::fs::read_to_string(directory.join("messenger-node-started.json")).ok();
+        format!("session files: {files:?}; Node start record: {node:?}")
+    };
+    // One absolute deadline, taken before the observer and the send start, bounds both, so
+    // the observer does not expire before the sender's delivery deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let observed_directory = directory.clone();
+    let observer = thread::spawn(move || {
+        while !observed_directory.join("messenger-envelope.ready").exists() {
+            if Instant::now() >= deadline {
+                return Err(
+                    "the controlled messenger published no envelope before the shared deadline; \
+                     this alone does not show that its stdin was missing",
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let envelope: CrossSessionEnvelope = serde_json::from_slice(
+            &std::fs::read(observed_directory.join("messenger-envelope.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope.recipient, "session-safe123");
+        assert_eq!(envelope.message, TEST_REFERENCE);
+        let files = test_files(&observed_directory);
+        let offered = send_message_hook_payload("PreToolUse", &envelope.message);
+        let MessageGuardDecision::Allow(input) =
+            message_guard_decision(&files, TEST_REQUEST, &offered)
+        else {
+            panic!("the real guard refused the controlled messenger reference");
+        };
+        let executed = send_message_hook_payload("PostToolUse", &input.message);
+        record_message_receipt(&files, TEST_REQUEST, &executed).unwrap();
+        let pending: serde_json::Value = Reader::open_unchecked(&observed_directory)
+            .private(PENDING_TURN_FILE)
+            .json()
+            .unwrap();
+        std::fs::write(
+            observed_directory.join("messenger-stream.jsonl"),
+            messenger_trace(TEST_REFERENCE, SEND_SUCCEEDED),
+        )
+        .unwrap();
+        std::fs::write(observed_directory.join("messenger-stream.ready"), b"").unwrap();
+        Ok((pending, executed))
+    });
+    let prompt = "[Agent Bridge native delegation]\nSource: external\n\nLiteral \"한😀\" \\ </cross-session-message>\r\nnext line";
+    let sent = Messenger::installed().send_for_claim(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("unused-bridge"),
+            directory: &directory,
+            provider_path: &executable,
+            correlation_id: TEST_REQUEST,
+            prompt,
+            deadline,
+        },
+        Some(&token),
+    );
+    let (pending, executed) = match observer.join() {
+        Ok(Ok(observed)) => observed,
+        Ok(Err(reason)) => panic!(
+            "{reason}; {}; messenger result: {sent:?}",
+            session_files(&directory)
+        ),
+        Err(_) => panic!(
+            "the controlled messenger observer failed; {}; messenger result: {sent:?}",
+            session_files(&directory)
+        ),
+    };
+    sent.unwrap();
+    assert_eq!(pending["schema"], 2);
+    assert_eq!(pending["claim_token"].as_str(), Some(token.as_str()));
+    assert_eq!(
+        pending["expected_message"].as_str(),
+        executed["tool_input"]["message"].as_str()
+    );
+    assert!(
+        pending["expected_message"]
+            .as_str()
+            .unwrap()
+            .starts_with(prompt)
+    );
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    assert!(store.events().unwrap().is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn cross_session_process_never_receives_the_payload() {
@@ -617,14 +773,17 @@ fn cross_session_process_never_receives_the_payload() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     Messenger::installed()
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap();
 
     let arguments = std::fs::read_to_string(directory.join("argv.txt")).unwrap();
@@ -674,14 +833,17 @@ fn messenger_failure_without_send_is_known_not_delivered() {
         },
     };
     let error = messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(!error.delivery_may_have_occurred());
@@ -705,14 +867,17 @@ fn expired_cross_session_deadline_never_starts_the_messenger() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let error = Messenger::installed()
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now(),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now(),
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(!error.delivery_may_have_occurred());
@@ -814,14 +979,17 @@ fn messenger_timeout_terminates_descendants_before_they_can_act_late() {
         retry: RetryPolicy::installed(),
     };
     let error = messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline,
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline,
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(error.delivery_may_have_occurred());
@@ -923,14 +1091,17 @@ fn messenger_retries_only_a_proven_pre_send_discovery_miss() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     Messenger::installed()
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap();
 
     assert_eq!(
@@ -975,14 +1146,17 @@ fn messenger_retry_window_starts_at_the_first_proven_discovery_miss() {
         },
     };
     messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(2),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+            None,
+        )
         .unwrap();
 
     assert_eq!(
@@ -1025,14 +1199,17 @@ fn only_a_send_reported_as_blocked_is_retried_and_released() {
             },
         };
         let error = messenger
-            .send(CrossSessionMessageContext {
-                bridge_executable: Path::new("/opt/agent-bridge"),
-                directory: &directory,
-                provider_path: &executable,
-                correlation_id: TEST_REQUEST,
-                prompt: "follow-up secret",
-                deadline: Instant::now() + Duration::from_secs(10),
-            })
+            .send_for_claim(
+                CrossSessionMessageContext {
+                    bridge_executable: Path::new("/opt/agent-bridge"),
+                    directory: &directory,
+                    provider_path: &executable,
+                    correlation_id: TEST_REQUEST,
+                    prompt: "follow-up secret",
+                    deadline: Instant::now() + Duration::from_secs(10),
+                },
+                None,
+            )
             .unwrap_err();
 
         let attempts = std::fs::read_to_string(directory.join("attempts")).unwrap();
@@ -1071,14 +1248,17 @@ fn successful_messenger_trace_without_send_is_not_classified_as_delivered() {
         },
     };
     let error = messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(!error.delivery_may_have_occurred());

@@ -307,6 +307,11 @@ interruption completion, and verified follow-up resumption.
 
 Install and sign in to `claude` 2.1.234 or newer. Resolve workspace trust in Claude before launch,
 or use [existing workspace consent](security-and-data.md#workspace-trust-and-consent).
+New native Windows launches and reopens require stable Claude Code 2.1.302 or newer and load a
+session-local Bridge completion module through Claude's official `--plugin-dir` flag. Bridge
+waits for that module to report readiness before sending the initial prompt. Disabled hooks
+(`disableAllHooks: true`, verified), unresolved plugin trust or provider policy can withhold
+readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
 
 The macOS initial prompt is a launch argument. On native Windows, Bridge delivers it after launch
 through Claude's official cross-session messaging. Every follow-up uses that messaging path too:
@@ -336,14 +341,51 @@ request, or explicitly close the session if you decide to abandon it.
 
 The messenger model sees a per-request reference, not your follow-up text. A `PreToolUse` hook
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
-what ran. Claude's `Stop` hook reports the finished result. Cross-session turns carry a
-per-request marker, while an argument-delivered initial turn has its own hook path. Stored
-results retain Claude's conversation identity.
+what ran. On new Windows sessions, Bridge's completion module forwards Claude's official
+`turn.start` and `turn.complete` events. Bridge binds the complete addressed prompt at
+`turn.start` to the current claim. A normal answer completes the request only with the
+exact delegation marker at its suffix.
+Claude can quote protected tags in the peer body by inserting a backslash after `<`;
+the comparison permits only that reversible insertion and admission reserves its wire space.
+If a Stop hook blocks the stop and Claude continues the turn, Bridge publishes nothing until
+the official `turn.complete`. Stored results retain Claude's conversation identity and Bridge's
+request correlation id; the official turn id stays in the adapter's immutable binding.
+Bridge removes the marker only when it ends the answer.
 
-Bridge records `StopFailure` for an argument-delivered initial turn. For a pending cross-session
-turn, it cannot identify which request failed and leaves the claim held. This affects every
-follow-up and the Windows initial prompt. Inspect the original request; do not resend it merely
-because Claude reported an error.
+A normal nonempty bound answer without that marker is retained as a candidate. It does not
+release the claim or become a result. A later main-loop completion in the same conversation
+can finish it only with that candidate, the still-current request and a valid nonempty answer
+ending in the exact marker. Its result has `claude_mod_marked_continuation` provenance; both
+official turn ids remain in private records. This covers an unmarked background interim followed
+by a marked final. It does not establish provider-owned parentage: an unrelated turn repeating
+the same marker can match, and a marked interim can still complete early.
+
+An unmarked genuine final can remain pending indefinitely, including after a caller timeout.
+`tabcli inspect <session>` explains that state; JSON includes `provider_completion` when its
+reader lock and current claim allow the candidate to be read. This query does not retry input,
+repair records or publish results. Inspect the terminal before closing or diagnosing the session.
+
+An official interrupted, API-error, refused or empty final outcome fails the bound request.
+Failure does not prove that no work or tools ran. Malformed or unmatched signals retain the
+claim and write the latest rejection reason to `claude-mod-diagnostic.json` in the session
+directory. A message delivered into an unrelated running turn without its own exact start
+cannot be correlated. Combined queued input that differs from the exact addressed frame also
+stays unbound. A retained claim prevents another tell; inspect the result and terminal, then
+close and reopen if you abandon it. These running-turn and combined-input limits follow from
+exact matching and have not been driven live. Native completion wires are limited to 4 MiB of
+UTF-8 JSON. Admission includes framing and escaping overhead; an oversized bound answer fails
+without truncation. An unbound interruption, error, refusal, empty answer or oversized signal
+has no sufficient attribution and leaves the request pending.
+See the [October 22 regression and fix record](verification/2026-10-22-windows-260-reverification.md)
+and the [earlier owner verification](verification/2026-10-19-windows-249-claude-native-completion.md)
+for observations and limits. The earlier build's marker-omission behavior is superseded here.
+
+macOS and existing sessions retain legacy Stop completion, including its limitation when another
+Stop hook continues the turn. Legacy pending requests can finish after a binary upgrade, but new
+Windows tells into those sessions are refused; close and reopen to use native completion.
+Legacy `StopFailure` cannot identify a pending cross-session request and leaves its claim held.
+Do not downgrade the binary or `AGENT_BRIDGE_EXECUTABLE` while native-mode Claude sessions
+remain open; older binaries cannot interpret their completion protocol.
 
 **Other Claude sessions on the same account can send work to your Bridge-launched session.**
 With `--yolo`, that work runs with skipped permission checks. Do not use that combination if you
@@ -361,11 +403,10 @@ effort, or bypass option from the closed source. Claude applies its own
 [resume rules](https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores)
 and settings; omitting `--yolo` therefore does not prove that bypass is off.
 
-`cancel` is unsupported in this release's Claude integration. The 2.1.296 investigation
-found no documented interrupt operation in `SendMessage`, nor a way for SDK `interrupt()`
-to attach to this running TUI. User interruption does not fire `Stop`. Support needs an
-official addressed interrupt for the existing interactive session and a turn-correlated
-completion signal; starting a separate resumed process does not supply either.
+`cancel` is unsupported in this release's Claude integration. The completion module observes
+interruptions but implements no addressed interruption request. An observed interruption does
+not identify who caused it. Starting a separate resumed process does not cancel the running TUI.
+Support needs an official way to interrupt this running interactive session from outside it.
 
 ## Agy
 

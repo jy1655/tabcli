@@ -153,7 +153,7 @@ fn write_reopen_test_manifest(
             id: id.to_owned(),
             provider: provider.to_owned(),
             provider_path,
-            provider_version: "2.1.281".to_owned(),
+            provider_version: "2.1.302".to_owned(),
             workspace,
             title: id.to_owned(),
             model: with_policy.then(|| "Fable5".to_owned()),
@@ -929,7 +929,7 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     let provider = root.path().join("claude.cmd");
     write_private(
         &provider,
-        b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 2.1.281\r\n  exit /b 0\r\n)\r\necho %*> \"%AGENT_BRIDGE_NATIVE_SESSION_DIR%\\argv.txt\"\r\n",
+        b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 2.1.302\r\n  exit /b 0\r\n)\r\necho %*> \"%AGENT_BRIDGE_NATIVE_SESSION_DIR%\\argv.txt\"\r\n",
     )
     .unwrap();
     let id = "session-reopenlaunch";
@@ -1543,7 +1543,7 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
     let provider_path = root.path().join("claude.cmd");
     write_private(
         &provider_path,
-        b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 2.1.281\r\n  exit /b 0\r\n)\r\necho %*> \"%AGENT_BRIDGE_NATIVE_SESSION_DIR%\\argv.txt\"\r\n",
+        b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 2.1.302\r\n  exit /b 0\r\n)\r\necho %*> \"%AGENT_BRIDGE_NATIVE_SESSION_DIR%\\argv.txt\"\r\n",
     )
     .unwrap();
     // The initial read-only scan sees nobody.

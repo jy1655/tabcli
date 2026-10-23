@@ -1,6 +1,6 @@
 // Claude-owned turn correlation fallback until SendMessage supplies addressed turn identity.
 use super::{claude_owned_string, claude_string};
-use crate::native::session::{Reader, RecordStore, Store, turn as session_turn};
+use crate::native::session::{Reader, RecordReader, RecordStore, Store, turn as session_turn};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +17,10 @@ pub(super) struct ClaudeTurn {
     schema: u32,
     request_id: String,
     marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_message: Option<String>,
 }
 
 impl ClaudeTurn {
@@ -33,12 +37,15 @@ impl ClaudeTurn {
             schema: 1,
             request_id: request_id.to_owned(),
             marker: format!("<!-- agent-bridge-claude-turn:{request_id} -->"),
+            claim_token: None,
+            expected_message: None,
         })
     }
 }
 
 pub(super) struct Installed {
     path: PathBuf,
+    request_id: String,
     retained: bool,
 }
 
@@ -51,7 +58,22 @@ impl Installed {
 impl Drop for Installed {
     fn drop(&mut self) {
         if !self.retained {
-            let _ = RecordStore::at(&self.path).remove();
+            let cleanup = || -> Result<()> {
+                let directory = self
+                    .path
+                    .parent()
+                    .context("Claude pending file has no directory")?;
+                let store = Store::open_unchecked(directory);
+                let _lock = store.lock()?;
+                if RecordReader::at(&self.path)
+                    .optional_json::<ClaudeTurn>()?
+                    .is_some_and(|pending| pending.request_id == self.request_id)
+                {
+                    RecordStore::at(&self.path).remove()?;
+                }
+                Ok(())
+            };
+            let _ = cleanup();
         }
     }
 }
@@ -74,6 +96,9 @@ impl ClaudeTurn {
     }
     pub(super) fn marker(&self) -> &str {
         &self.marker
+    }
+    pub(super) fn expected_message(&self) -> Option<&str> {
+        self.expected_message.as_deref()
     }
     pub(super) fn target_message(&self, prompt: &str) -> String {
         format!(
@@ -99,9 +124,58 @@ impl ClaudeTurn {
         store.private(PENDING_TURN_FILE).write_json(self)?;
         Ok(Installed {
             path,
+            request_id: self.request_id.clone(),
             retained: false,
         })
     }
+
+    pub(super) fn install_native(
+        mut self,
+        store: &Store,
+        token: &str,
+        expected_message: &str,
+    ) -> Result<Installed> {
+        let _lock = store.lock()?;
+        require_current(store, token)?;
+        self.schema = 2;
+        self.claim_token = Some(token.into());
+        self.expected_message = Some(expected_message.into());
+        self.install(store)
+    }
+}
+
+pub(super) fn require_current(reader: &Reader, token: &str) -> Result<()> {
+    if !session_turn::valid_turn_claim_token(token)
+        || session_turn::current_claim_token(reader)?.as_deref() != Some(token)
+        || reader.closed_if_present()?.is_some()
+        || !matches!(
+            reader.status()?.state,
+            crate::native::session::SessionState::Working
+                | crate::native::session::SessionState::Running
+                | crate::native::session::SessionState::ResumePending
+        )
+    {
+        bail!("Claude completion delivery refused: this claim or session is no longer current");
+    }
+    Ok(())
+}
+
+// Native completion and inspect call this under their existing lifecycle lock.
+// This reads identity only; it does not acquire or retire the core claim.
+pub(super) fn read_native(reader: &Reader, token: &str) -> Result<ClaudeTurn> {
+    let pending: ClaudeTurn = reader.private(PENDING_TURN_FILE).json()?;
+    let expected = ClaudeTurn::new(&pending.request_id)?;
+    if pending.schema != 2
+        || pending.marker != expected.marker
+        || pending.claim_token.as_deref() != Some(token)
+        || !pending.expected_message.as_deref().is_some_and(|text| {
+            text.starts_with("[Agent Bridge native delegation]\nSource: ")
+                && text.ends_with(&pending.marker)
+        })
+    {
+        bail!("Claude native pending record does not identify the current framed request");
+    }
+    Ok(pending)
 }
 
 pub(super) fn read(reader: &Reader) -> Result<Option<ClaudeTurn>> {
