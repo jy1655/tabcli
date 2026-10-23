@@ -44,7 +44,7 @@ pub(in crate::native) fn rename_session_file(from: &Path, to: &Path) -> Result<(
 
 // Durable record writes. Every helper below syncs the file it changed and then the
 // directory that holds its entry, so a crash after the helper returns cannot lose the
-// record on a POSIX file system that honours fsync. See README "권한과 세션 경계" for the
+// record on a POSIX file system that honours fsync. See docs/architecture.md for the
 // classification of which records go through these helpers and the platform limits.
 //
 // Under `cfg(test)` three thread-local hooks observe these helpers: `fault_point` refuses

@@ -587,6 +587,8 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 ## Change and Verification Rules
 
+- Public documentation and default plugin metadata use English. Run `python3 scripts/check_language.py`;
+  translations and Unicode fixtures have explicit exceptions described in `docs/testing.md#language-lint`.
 - For provider behavior changes, add or update tests in that provider's adapter and prove
   that unrelated provider adapters do not need modification.
 - For concurrency or lifecycle changes, reproduce the race or partial transition with a

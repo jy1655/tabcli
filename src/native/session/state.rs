@@ -114,7 +114,7 @@ impl SessionState {
     /// increment is the `closed.json` tombstone: once it exists, `update_status` no longer
     /// consults this table and rewrites `status.json` as a copy of the tombstone, so the
     /// tombstone's generation, timestamp, and error are preserved rather than advanced. The
-    /// README section "권한과 세션 경계" carries the same table for operators.
+    /// state-transition section in docs/architecture.md carries the same table for operators.
     ///
     /// | From                    | To                                                 |
     /// | ----------------------- | -------------------------------------------------- |

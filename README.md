@@ -8,7 +8,7 @@ same conversation, and explicitly close the session when you finish. TAB runs on
 Windows; Linux, including Linux processes in WSL, is unsupported, and Warp support is limited.
 
 To delegate from your assistant without writing global instructions, install the
-[Agent Bridge integration](docs/integrations.md) for Claude Code, Codex, Agy, or Pi.
+[Agent Bridge plugin](#install-an-assistant-plugin) for Claude Code, Codex, Agy, or Pi.
 Each package contains the same workflow skill and uses your installed `tabcli`.
 
 ## Try a session
@@ -195,6 +195,56 @@ If launch reports an Apple Events permission error, follow the
 [macOS permission checks](docs/macos-permissions.md). Native Windows requires PowerShell 7
 (`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd.
 
+## Install an assistant plugin
+
+First [install `tabcli`](#install), then install the plugins from this repository. Use a macOS terminal or Windows PowerShell:
+
+```sh
+git clone --depth 1 https://github.com/jy1655/tabcli.git tabcli-integrations
+cd tabcli-integrations
+```
+
+Run only the commands for the AI you use.
+
+**Codex**
+
+```sh
+codex plugin marketplace add "$(pwd)"
+codex plugin add agent-bridge@agent-bridge --json
+```
+
+**Claude Code**
+
+```sh
+claude plugin marketplace add "$(pwd)"
+claude plugin install agent-bridge@agent-bridge
+```
+
+**Agy**
+
+```sh
+agy plugin install "$(pwd)/integrations/agy"
+```
+
+**Pi**
+
+```sh
+pi install "$(pwd)/integrations/pi"
+```
+
+Open a **new AI session**, then invoke the skill:
+
+| AI | Enter in the conversation |
+| --- | --- |
+| Codex | `$agent-bridge` |
+| Claude Code | `/agent-bridge:agent-bridge` |
+| Agy | `/agent-bridge` |
+| Pi | `/skill:agent-bridge` |
+
+Then ask, for example: "Ask Codex to review this project, read the result, and close the session you created."
+
+Keep the `tabcli-integrations` directory. See [archive installation, updates, removal and permissions](docs/integrations.md) for details.
+
 ## Everyday use
 
 Return without waiting for a result with
@@ -279,6 +329,7 @@ it by path. Installing `tabcli` does not update those running sessions' hooks.
 ## Documentation
 
 - [CLI reference](docs/cli.md): commands, output, and recovery steps.
+- [Assistant plugins](docs/integrations.md): installation, invocation, updates and removal for each host.
 - [Terminals](docs/terminals.md): surface selection, settings, ownership, and verification limits.
 - [Providers](docs/providers.md): CLI requirements, delivery paths, and result handling.
 - [Security and data](docs/security-and-data.md): permissions, trust, and local records.
