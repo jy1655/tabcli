@@ -97,6 +97,26 @@ launch, observe, continue, and close without replacing the capabilities those CL
   wires; admission counts escaping and bounded peer-header overhead. An oversized bound final
   fails without truncation; an unbound oversized signal has no marker and cannot settle the
   request. This route adds no cancellation API or usage mapping.
+- An optional native question plugin observes structured `AskUserQuestion` emissions from
+  a completed main-loop `turn.step`. Keep it separate from the completion plugin: Claude
+  2.1.309 permits only one hooks module per plugin, and a policy refusal of question
+  observation must not remove completion readiness. Evidence comes only from the final
+  `next.trace` entry's engine/core return with `stopReason: tool_use`; an absent or short
+  trace supplies no evidence. The event supplies the official turn id and step
+  index; do not infer a turn from `tool.call`, which lacks that identity. Pass streamed
+  chunks and the response unchanged. Capture the conversation before awaiting the step,
+  then require the exact original immutable binding and current Claim under the lifecycle
+  lock. A continuation not yet attributed at completion supplies no question authority.
+  One Claude-owned 64 KiB record preserves a prefix and monotone incompleteness; a duplicate
+  step/tool position is idempotent and conflicting content marks it incomplete. A repeated
+  model step, a non-tool-use response carrying a question, or a lower hook's rewrite also
+  marks incompleteness. Hooks above Bridge can change the output after observation. Historical
+  reads use the selected Receipt under the query's lock. Emitted means neither shown,
+  pending, executed nor answered, and no query changes the Claim or permits a pending tell.
+  Only question text and option labels are projected; no answer or permission is supplied.
+  The question helper gets two 5-second attempts; a failure logs unavailable observation
+  and passes the stream's original response through. This adds no dialog-latency guarantee.
+  Replace this observation path when Claude offers a verified addressed question lifecycle.
 - An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
   version inference. Its pending Stop completion remains readable, but new tells on both
   platforms are refused. Windows supports close/reopen recovery. On macOS, inspect the

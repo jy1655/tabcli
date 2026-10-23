@@ -273,7 +273,7 @@ tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait
 ```
 
 Wait across several requests with `tabcli wait SESSION/REQUEST SESSION/REQUEST --json`.
-Add `--questions` to return on retained Codex question emissions before completion. Resume
+Add `--questions` to return on retained Codex or Claude question emissions before completion. Resume
 with `--after-question` and the returned cursor to skip emissions already seen; this observes
 questions and does not answer them. See [wait](docs/cli.md#wait).
 It returns the first observed wait-ending result and lists the unselected addresses in `remaining`;

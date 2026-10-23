@@ -15,7 +15,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        Self::at(tempfile::tempdir().unwrap())
+    }
+    fn at(root: tempfile::TempDir) -> Self {
         std::fs::create_dir(root.path().join("events")).unwrap();
         crate::native::session::update_status(root.path(), SessionState::Working, None, None)
             .unwrap();
@@ -155,6 +157,29 @@ fn queued_start_needs_no_submission_scope_and_duplicate_events_publish_once() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].message, "final with marker");
     assert_eq!(events[0].turn_id.as_deref(), Some(REQUEST));
+}
+
+#[test]
+fn claude_question_emission_is_retained_without_settling_the_request() {
+    let f = Fixture::new();
+    f.start();
+    f.send(
+        "question.emissions",
+        json!({"turnId":TURN,"step":0,"items":[{"index":0,"questions":[
+            {"question":"Which baseline?","header":"Baseline","multiSelect":false,
+             "options":[{"label":"Current","description":"Current baseline"},
+                        {"label":"Previous","description":"Previous baseline"}]}
+        ]}],"incomplete":false}),
+    );
+    let receipt = crate::native::session::requests::for_claim(&f.store(), &f.token)
+        .unwrap()
+        .unwrap();
+    let observation =
+        crate::native::provider::question_emissions(&f.store(), "claude", true, &receipt)
+            .expect("the bound Claude question must be visible before completion");
+    assert_eq!(observation.items[0].questions[0].title, "Which baseline?");
+    assert_eq!(observation.items[0].id, "step:0/tool:0");
+    f.retained();
 }
 
 #[test]
@@ -551,7 +576,9 @@ fn both_platforms_select_native_mode_from_the_recorded_stable_version_only() {
                     prepared.unwrap(),
                     vec![
                         OsString::from("--plugin-dir"),
-                        directory.join("claude-mod").into_os_string()
+                        directory.join("claude-mod").into_os_string(),
+                        OsString::from("--plugin-dir"),
+                        directory.join("claude-question-mod").into_os_string()
                     ]
                 );
                 let mode: LaunchMode = store.private(MODE_FILE).json().unwrap();
@@ -565,7 +592,30 @@ fn both_platforms_select_native_mode_from_the_recorded_stable_version_only() {
                         "macos_stable_2_1_302_or_newer"
                     }
                 );
-                assert!(directory.join("claude-mod/hooks/register.js").is_file());
+                for (plugin, module) in [
+                    ("claude-mod", MODULE),
+                    ("claude-question-mod", include_str!("../questions.js")),
+                ] {
+                    assert_eq!(
+                        store
+                            .private(&format!("{plugin}/hooks/hooks.json"))
+                            .json::<Value>()
+                            .unwrap(),
+                        json!({"modules":["./register.js"]})
+                    );
+                    for (name, expected) in [
+                        ("register.js", module),
+                        ("report.js", include_str!("../report.js")),
+                    ] {
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                directory.join(plugin).join("hooks").join(name)
+                            )
+                            .unwrap(),
+                            expected
+                        );
+                    }
+                }
                 assert!(prepare(&directory, !windows).is_err());
             } else {
                 assert!(!directory.join("claude-mod").exists());
@@ -642,3 +692,5 @@ fn peer_quoting_preserves_the_whole_body_and_existing_literal_backslashes() {
 
 #[path = "continuation_tests.rs"]
 mod continuation_tests;
+
+mod question_tests;

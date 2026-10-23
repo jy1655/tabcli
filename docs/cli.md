@@ -451,7 +451,7 @@ surface is not probed. At most two result events are decoded per listed session:
 published event and the active request's published event when they differ. Result bodies are
 not returned.
 
-For Codex, status also reads at most one optional 64 KiB question record per listed session,
+For Codex and Claude, status also reads at most one optional 64 KiB question record per listed session,
 under its existing budget. Attention `question_emitted` means that record has emissions for
 the active request, or for the request behind the latest published result when no claim exists.
 A claim without a readable receipt has no question focus. Closed sessions have no
@@ -528,7 +528,7 @@ The default inspection also reports `held` as true, false, or null with `hold_er
 Timeline does not include hold history. The default inspection adds `origin` and
 `origin_observation` as in `status`; the timeline has no origin entry.
 
-For Codex, ordinary JSON inspection adds `question_emitted: true` to a request reference
+For Codex and Claude, ordinary JSON inspection adds `question_emitted: true` to a request reference
 when retained emissions exist. It adds `question_observation` only as `incomplete` or
 `unreadable`. This reads at most one optional 64 KiB record per request. Retrieve content
 with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
@@ -579,8 +579,8 @@ including older events with no receipt. `--request` follows the receipt of that 
 `--wait` defaults to off and requires `--request`; waiting for an unspecified latest turn is
 refused. `--timeout-secs` requires `--wait` and defaults to 900 seconds.
 
-An ordinary single Codex result can include `question_emissions` while the request is still
-`pending`, and retains them after completion or close. Each item has the provider's `id`
+An ordinary single Codex or Claude result can include `question_emissions` while the request is still
+`pending`, and retains them after completion or close. Each item has a provider-scoped `id`
 and `questions`, whose `title` and optional `options` preserve the provider's strings.
 Free-text questions use `options: null`. For example:
 
@@ -590,8 +590,18 @@ Free-text questions use `options: null`. For example:
 ]}]}
 ```
 
-Only a request that Bridge bound through its injected Codex hooks can have this evidence.
-An unbound request settled through notify cannot have it.
+Codex evidence requires a request bound through injected hooks; a notify-settled unbound
+request cannot have it. Claude evidence requires the original turn's native completion binding
+and a newly loaded optional Bridge plugin that observes completed main-loop model steps.
+It reads only the final engine/core trace return with `stopReason: tool_use`; missing trace
+evidence is unknown. It includes
+only the model's `AskUserQuestion` question text and option labels. Its `step:N/tool:M` id
+names the provider step and the call's position, not an addressed answer endpoint. It does
+not report questions from subagents, other plugins, or an unbound continuation turn.
+A repeated model step, an unfinished/refused question response, or a lower hook's rewrite
+marks the observation incomplete. Hooks above Bridge can change the response afterward;
+an emission does not establish that a dialog appeared or the tool ran. Refusing the optional
+question plugin does not remove the separate completion plugin.
 
 These fields report emission, without changing request state, result text, or exit status.
 `question_observation: "incomplete"` means Bridge retained a limited prefix or rejected
@@ -685,7 +695,8 @@ This command is read-only. It never cancels, repairs, closes, or resends any req
 timeout or uncertain delivery, inspect or wait on the same request; do not repeat its prompt.
 
 With `--questions`, a retained structured question can also return control while its Request
-is pending. Today only Codex requests bound through injected hooks can supply that evidence;
+is pending. Codex requests bound through injected hooks and Claude requests bound by the
+native completion module can supply that evidence;
 the tool, model and retained history must actually provide it. No prose is interpreted as a
 question, and absence of evidence does not prove there was no question. Other providers keep
 waiting for the ordinary ending conditions.
