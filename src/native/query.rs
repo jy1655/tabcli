@@ -160,12 +160,14 @@ pub(super) use super::session::snapshot::{
 };
 
 impl RequestObservation<'_> {
+    fn questions(&self, reader: &Reader) -> Option<QuestionEmissions> {
+        self.receipt
+            .and_then(|receipt| question_emissions(reader, self.snapshot, receipt))
+    }
+
     fn value_with_questions(&self, reader: &Reader) -> Value {
         let mut value = self.value();
-        if let Some(questions) = self
-            .receipt
-            .and_then(|receipt| question_emissions(reader, self.snapshot, receipt))
-        {
+        if let Some(questions) = self.questions(reader) {
             if !questions.items.is_empty() {
                 value["question_emissions"] = json!(questions.items);
             }

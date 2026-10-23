@@ -21,6 +21,7 @@ Usage:
   tabcli result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
   tabcli result <session> --request REQUEST --wait [--timeout-secs N] [--json]
   tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
+      [--questions [--after-question SESSION/REQUEST/EMISSION_ID]...]
   tabcli search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
       [--limit N] [--json]
   tabcli doctor <session> [--probe] [--json]
