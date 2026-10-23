@@ -181,6 +181,25 @@ fn invalid_prefix_utf8_json_and_schema_suspend_without_rejection() {
     }
 }
 #[test]
+fn oversized_tool_output_does_not_hide_completion() {
+    let (root, _, _, mut observer) = bound();
+    let path = root.path().join("rollout.jsonl");
+    append(
+        &path,
+        &line(
+            "response_item",
+            json!({"type":"custom_tool_call_output","call_id":"large-tool",
+                "output":"x".repeat(LINE_BYTES + 1)}),
+        ),
+    );
+    append(&path, &complete(json!("answer after large tool output")));
+    observer.poll(root.path(), true);
+    let results = events(root.path());
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["message"], "answer after large tool output");
+}
+
+#[test]
 fn oversized_unrelated_relevant_and_unterminated_lines_suspend() {
     for kind in ["unknown", "event_msg", "partial"] {
         let (root, pending, _, mut observer) = bound();
