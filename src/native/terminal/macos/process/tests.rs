@@ -1,7 +1,7 @@
 //! Process-record tests against real processes of this machine; moved here from
 //! `native/tests/macos.rs` beside the process observer.
 
-use crate::native::terminal::macos::apple_terminal::terminal_app_ancestor;
+use crate::native::terminal::macos::apple_terminal::incarnation::terminal_app_ancestor;
 use crate::native::terminal::macos::process::{macos_process_info, macos_processes_named};
 use crate::native::tests::reaped_child_pid;
 use std::path::Path;

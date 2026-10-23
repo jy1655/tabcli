@@ -175,6 +175,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   screen and presence scripts.
   Ghostty's frame host, its replaceable fallback for the missing surface identity, lives in
   `terminal/macos/ghostty/host.rs`.
+  Terminal.app's app incarnation (its capture from the shell's ancestry, and the liveness and
+  uniqueness recheck in one order around each close transaction and another around an absence
+  observation) lives in `terminal/macos/apple_terminal/incarnation.rs`.
   iTerm2 and Terminal.app carry an internal Automation dependency. Osascript owns execution,
   deadlines and delivery-failure classification; scripts, arguments, ordering and close
   authority remain adapter-owned. Tests inject recording or script-executing Automation

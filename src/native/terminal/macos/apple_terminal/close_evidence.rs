@@ -1,8 +1,9 @@
 //! Terminal.app window and TTY identities are scoped to one app incarnation.
-use super::{
-    record_legacy_terminal_app, require_unique_terminal_app, terminal_app_alive_with,
-    terminal_app_instances, terminal_app_process, terminal_surface_absent, verified_close_tty,
+use super::incarnation::{
+    record_terminal_app_for_close, terminal_app_ended, terminal_app_instances,
+    terminal_app_process, terminal_surface_absent,
 };
+use super::verified_close_tty;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{self, Store};
 use crate::native::terminal;
@@ -67,11 +68,7 @@ where
         let Some(app) = &owner.terminal_app else {
             return Ok(false);
         };
-        let alive = terminal_app_alive_with(app, &self.process_birth)?;
-        if alive {
-            require_unique_terminal_app(app, &(self.terminal_instances)()?)?;
-        }
-        Ok(!alive)
+        terminal_app_ended(app, &self.process_birth, &self.terminal_instances)
     }
 
     fn resumable_authority(
@@ -90,10 +87,9 @@ where
                 "Terminal.app process incarnation was not recorded and its window is not proven gone; no close was sent and the exact surface handle is retained"
             );
         };
-        if !terminal_app_alive_with(app, &self.process_birth)? {
+        if terminal_app_ended(app, &self.process_birth, &self.terminal_instances)? {
             return Ok(ResumableAuthority::Absent);
         }
-        require_unique_terminal_app(app, &(self.terminal_instances)()?)?;
         Ok(ResumableAuthority::SurfaceOnly)
     }
 
@@ -125,14 +121,7 @@ pub(in crate::native::terminal) fn terminate_owner(
     let process_group = verified_terminal_owner_process_group(&owner, &live)?;
     let live_shell = live_native_process_identity(live.parent_pid)?;
     let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
-    record_legacy_terminal_app(directory, &mut owner, terminal_app_process)?;
-    require_unique_terminal_app(
-        owner
-            .terminal_app
-            .as_ref()
-            .context("Terminal.app identity was not recorded")?,
-        &terminal_app_instances()?,
-    )?;
+    record_terminal_app_for_close(directory, &mut owner)?;
     close_remaining(deadline)?;
     session::close::record_terminal_close_intent(
         &Store::open_unchecked(directory),
