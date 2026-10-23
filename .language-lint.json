@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "allowed_paths": [
+    {
+      "path": ".language-lint.json",
+      "reason": "This policy contains the exact approved Unicode fixture lines."
+    },
+    {
+      "path": "README.ko.md",
+      "reason": "Korean translation of the English README."
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.md",
+      "reason": "Preserve upstream author names and copyright notices verbatim."
+    },
+    {
+      "path": "docs/verification/2026-10-03-v0.1.0-focus.md",
+      "reason": "Preserved historical Korean verification record; new reports use English."
+    },
+    {
+      "path": "docs/verification/2026-10-03-v0.1.0-issues.md",
+      "reason": "Preserved historical Korean verification record; new reports use English."
+    },
+    {
+      "path": "tests/**",
+      "reason": "Integration tests and fixtures exercise multilingual input and translated documentation."
+    },
+    {
+      "path": "src/**/tests.rs",
+      "reason": "Unit test modules exercise Unicode text and paths."
+    },
+    {
+      "path": "src/**/tests/**",
+      "reason": "Unit test modules and fixtures exercise Unicode text and paths."
+    },
+    {
+      "path": "src/**/input_tests.rs",
+      "reason": "Pi input acceptance tests exercise Unicode prompts."
+    },
+    {
+      "path": "src/**/fixtures/**",
+      "reason": "Recorded input fixtures preserve original Unicode payloads."
+    }
+  ],
+  "allowed_lines": [
+    {
+      "path": "README.md",
+      "text": "[\ud55c\uad6d\uc5b4](README.ko.md) follows this README; this one is the reference when they differ.",
+      "reason": "Localized navigation label."
+    },
+    {
+      "path": "docs/releases/0.4.15.md",
+      "text": "and the console-window root keyed names by Rust's full Unicode uppercase, which maps `\u00df` to `SS`",
+      "reason": "Quoted Unicode example in an English report."
+    },
+    {
+      "path": "docs/verification/2026-10-01-windows.md",
+      "text": "the workspace `ab-consent-\ud55c\uae00` was read and answered live.",
+      "reason": "Quoted Unicode example in an English report."
+    },
+    {
+      "path": "docs/verification/2026-10-01-windows.md",
+      "text": "| Shared consent, workspace `ab-consent-\ud55c\uae00` | `session-llRuMZ`; `applied=provider-workspace-dialog` | Bridge answered the dialog once; paste 8.1 s after startup; receipt 1.2 s later; `ask` 21 s |",
+      "reason": "Quoted Unicode example in an English report."
+    },
+    {
+      "path": "src/native/context.rs",
+      "text": "for message in [\"x\".repeat(5120), \"x\".repeat(5121), \"\ud55c\ud83d\ude42\".repeat(3001)] {",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/context.rs",
+      "text": "fixture_event(&directory, \"event-1.json\", \"r\u00e9sum\u00e9 \u2014 \u5b8c\u4e86 \u2713\", None);",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/context.rs",
+      "text": "assert!(prompt.contains(\"r\u00e9sum\u00e9 \u2014 \u5b8c\u4e86 \u2713\"), \"{prompt}\");",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/envelope.rs",
+      "text": "\"{\\n  \\\"a\\\": null,\\n  \\\"ok\\\": true,\\n  \\\"schema_version\\\": 1,\\n  \\\"z\\\": \\\"\ud55c\uae00\\\\n\\\\\\\"\\\\\\\\\\\"\\n}\\n\".as_bytes(), || {",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/envelope.rs",
+      "text": "print(&ok(json!({\"z\": \"\ud55c\uae00\\n\\\"\\\\\", \"a\": null}).as_object().unwrap().clone())).unwrap();",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/query.rs",
+      "text": "{\"title\":\"\ud55c\uad6d\uc5b4\ud83d\ude00\\u{1b}]52;clipboard\", \"options\":[\"One\\u{7}\",\"Two\"]}",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/query.rs",
+      "text": "\"question emitted: \ud55c\uad6d\uc5b4\ud83d\ude00\\\\u{1b}]52;clipboard\",",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/session/state.rs",
+      "text": "for value in [\"unknown\", \"future-state\", \"\", \"quoted\\\"state\\n\ud55c\uae00\"] {",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/terminal/macos/ghostty.rs",
+      "text": "let path = Path::new(\"/prompt with 'quotes' \\\"\ud55c\uae00\\\"\");",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/terminal/macos/iterm2.rs",
+      "text": "const ODD_NAME: &str = \"it's a \\\"state\\\" \\\\new \\\\a\\\\t\\\\r\\\\ $$ $$$ ~ ; \ud55c\uae00 \ud83d\ude42\";",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/terminal/windows/tab.rs",
+      "text": "// way. Rust's `to_uppercase` is another rule: it maps `\u00df` to `SS` and merged",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/terminal/windows/tab.rs",
+      "text": "// `AB_REVIEW_SS` and `AB_REVIEW_\u00df`, which Windows keeps apart (#148).",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    },
+    {
+      "path": "src/native/terminal/windows/tab.rs",
+      "text": "Path::new(r\"C:\\Users\\\ud55c\uae00 \uc0ac\uc6a9\uc790\\state's & (x)\\session-1\")",
+      "reason": "Exact Unicode test input/assertion or explanation of Unicode behavior."
+    }
+  ]
+}

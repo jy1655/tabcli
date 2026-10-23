@@ -44,6 +44,8 @@ jobs:
           python-version: '3.12'
       - name: Test host integration packages
         run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Check English source text
+        run: python scripts/check_language.py
       - name: Install macOS terminal apps for AppleScript compile tests
         if: runner.os == 'macOS'
         run: |

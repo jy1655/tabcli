@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
   "interface": {
-    "displayName": "에이전트 브리지"
+    "displayName": "Agent Bridge"
   },
   "plugins": [
     {

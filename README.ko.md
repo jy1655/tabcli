@@ -5,7 +5,7 @@
 `tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 눈에 보이는 터미널 탭이나 창에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS와 Windows에서 직접 실행하는 환경을 지원합니다. WSL 안의 Linux 프로세스를 포함해 Linux는 지원하지 않으며 Warp 지원은 제한적입니다.
 
 전역 에이전트 지침을 직접 작성하지 않고 위임하려면 Claude Code, Codex, Agy, Pi용
-[에이전트 브리지 통합 패키지](docs/integrations.md)를 설치하세요. 네 패키지는 동일한
+[에이전트 브리지 플러그인](#에이전트-플러그인-설치)을 설치하세요. 네 패키지는 동일한
 워크플로 스킬을 포함하며 이미 설치한 `tabcli`를 사용합니다.
 
 ## 세션 실행해 보기
@@ -127,6 +127,56 @@ cargo install --git https://github.com/jy1655/tabcli --tag v0.4.24 --locked
 
 첫 실행 전에 사용할 에이전트 CLI를 설치하고 로그인한 뒤, 해당 프로젝트의 작업 디렉터리 신뢰 질문을 처리합니다. iTerm2, Terminal.app, Ghostty 연동은 macOS Automation을 사용합니다. 실행 중 Apple Events 권한 오류가 나면 [macOS 승인 확인 절차](docs/macos-permissions.md)를 따릅니다. Windows에서 직접 실행할 때는 cmd에서 호출하더라도 `PATH`에 PowerShell 7(`pwsh.exe`)이 있어야 합니다.
 
+## 에이전트 플러그인 설치
+
+먼저 [`tabcli`를 설치](#설치)한 뒤, 저장소 버전의 플러그인을 설치합니다. macOS 터미널 또는 Windows PowerShell에서 실행하세요.
+
+```sh
+git clone --depth 1 https://github.com/jy1655/tabcli.git tabcli-integrations
+cd tabcli-integrations
+```
+
+사용할 AI의 명령만 실행하세요.
+
+**Codex**
+
+```sh
+codex plugin marketplace add "$(pwd)"
+codex plugin add agent-bridge@agent-bridge --json
+```
+
+**Claude Code**
+
+```sh
+claude plugin marketplace add "$(pwd)"
+claude plugin install agent-bridge@agent-bridge
+```
+
+**Agy**
+
+```sh
+agy plugin install "$(pwd)/integrations/agy"
+```
+
+**Pi**
+
+```sh
+pi install "$(pwd)/integrations/pi"
+```
+
+설치 후 **새 AI 세션을 열고**, 해당 명령으로 스킬을 호출하세요.
+
+| AI | 대화창에서 입력 |
+| --- | --- |
+| Codex | `$agent-bridge` |
+| Claude Code | `/agent-bridge:agent-bridge` |
+| Agy | `/agent-bridge` |
+| Pi | `/skill:agent-bridge` |
+
+이어서 "Codex에게 이 프로젝트 리뷰를 맡기고, 결과 확인 후 만든 세션을 닫아 줘"처럼 요청하면 됩니다.
+
+`tabcli-integrations` 디렉터리는 유지하세요. [압축 파일 설치·업데이트·제거·권한 안내](docs/integrations.md)에서 자세한 내용을 확인할 수 있습니다.
+
 ## 일상적인 사용
 
 결과를 기다리지 않고 돌아오려면 `tabcli ask codex --prompt "Review this project." --detach`를 실행합니다. 이후 출력된 세션 ID와 요청 ID로 결과를 기다립니다.
@@ -168,6 +218,7 @@ Bridge는 모델 클라이언트나 샌드박스가 아닙니다. 직접 실행�
 ## 문서
 
 - [CLI 명령](docs/cli.md): 명령, 출력과 오류 복구 절차입니다.
+- [에이전트 플러그인](docs/integrations.md): 호스트별 설치, 스킬 호출, 업데이트와 제거 방법입니다.
 - [터미널](docs/terminals.md): 화면 생성 위치, 설정, 소유권과 검증 범위입니다.
 - [에이전트 CLI](docs/providers.md): CLI 요구 사항, 전달 경로와 결과 처리 방식입니다.
 - [보안과 데이터](docs/security-and-data.md): 권한, 작업 디렉터리 신뢰와 보관되는 기록입니다.
