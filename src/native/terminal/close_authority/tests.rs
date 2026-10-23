@@ -5,7 +5,7 @@
 // forwards the Record accessors to the real Reader and injects only the observations.
 use super::test_support::{Call, RecordValues, TestObservation};
 use super::*;
-use crate::native::session::OwnerObservation;
+use crate::native::process_identity::Attested;
 use crate::native::session::owner::ControlAttestation;
 use crate::native::terminal::ownership::{MacTerminalAppIdentity, test_owner_attestation};
 use std::cell::RefCell;
@@ -81,8 +81,7 @@ struct Row {
     backed: bool,
     surface_binding: Option<String>,
     observation_error: Option<(&'static str, usize)>,
-    observed_alive: Option<bool>,
-    observed_matches: Option<bool>,
+    observed: fn() -> OwnerAttestation,
     pid_alive: bool,
     live: bool,
     proof_error: bool,
@@ -113,8 +112,7 @@ impl Row {
             backed: false,
             surface_binding: Some(ID.into()),
             observation_error: None,
-            observed_alive: Some(false),
-            observed_matches: None,
+            observed: || test_owner_attestation(false),
             pid_alive: false,
             live: false,
             proof_error: false,
@@ -241,11 +239,7 @@ impl Row {
             })
             .with_owner_record(|owner| {
                 assert_eq!(owner.pid, 123);
-                OwnerObservation {
-                    process_alive: self.observed_alive,
-                    identity_matches: self.observed_matches,
-                    error: None,
-                }
+                (self.observed)()
             })
             .with_pid_alive(|pid| {
                 assert_eq!(pid, 123);
@@ -414,13 +408,11 @@ fn r3_absence_then_failed_attestation_writes_nothing() {
 
 #[test]
 fn r1_c6_reused_projection_qualifies_only_failed_bound_startup_surface() {
-    let observed = crate::native::session::owner::tests::reused_observation();
     for kind in [Iterm2, Ghostty] {
         let mut row = Row::new(kind);
         row.state = SessionState::Failed;
         row.phase = Some(launch::Phase::Spawning);
-        row.observed_alive = observed.process_alive;
-        row.observed_matches = observed.identity_matches;
+        row.observed = crate::native::session::owner::tests::reused_attestation;
         row.check(Ok(TerminalCloseAuthority::SurfaceOnly), &FAILED_START);
     }
 }
@@ -444,7 +436,7 @@ fn failed_start_authorities(
                     phase: launch::Phase::Spawning,
                 }),
             })
-            .with_owner_record(|_| OwnerObservation::from(&attestation()))
+            .with_owner_record(|_| attestation())
             .with_mac_owner_live(|_| attestation())
             .with_presence(|| Ok(true))
             .with_proof(|| bail!("injected full ownership proof failure"))
@@ -511,14 +503,16 @@ fn failed_start_reused_incarnation_allows_bound_surface_authority() {
 }
 
 #[test]
-fn failed_start_native_identity_dead_or_mismatched_owner_surface_only() {
+fn failed_start_exited_or_reused_owner_surface_only() {
     for kind in [Iterm2, Ghostty] {
-        for (alive, matches) in [(Some(false), None), (Some(true), Some(false))] {
+        for observed in [
+            (|| test_owner_attestation(false)) as fn() -> OwnerAttestation,
+            crate::native::session::owner::tests::reused_attestation,
+        ] {
             let mut row = Row::new(kind);
             row.state = SessionState::Failed;
             row.phase = Some(launch::Phase::Spawning);
-            row.observed_alive = alive;
-            row.observed_matches = matches;
+            row.observed = observed;
             row.check(Ok(TerminalCloseAuthority::SurfaceOnly), &FAILED_START);
         }
     }
@@ -527,12 +521,22 @@ fn failed_start_native_identity_dead_or_mismatched_owner_surface_only() {
 #[test]
 fn failed_start_live_matching_or_unknown_owner_gains_no_shortcut() {
     for kind in [Iterm2, Ghostty] {
-        for matches in [Some(true), None] {
+        for observed in [
+            (|| OwnerAttestation {
+                process: ProcessObservation::Live(Attested::Incarnation),
+                control: ControlAttestation::Verified,
+                pid_alive: Some(true),
+            }) as fn() -> OwnerAttestation,
+            || OwnerAttestation {
+                process: ProcessObservation::Live(Attested::PidOnly),
+                control: ControlAttestation::NotRecorded,
+                pid_alive: Some(true),
+            },
+        ] {
             let mut row = Row::new(kind);
             row.state = SessionState::Failed;
             row.phase = Some(launch::Phase::Pending);
-            row.observed_alive = Some(true);
-            row.observed_matches = matches;
+            row.observed = observed;
             row.live = true;
             row.proof_error = true;
             row.present = true;
@@ -1373,10 +1377,10 @@ fn second_owner_read_is_fresh_and_its_answer_decides() {
                 ..owner.clone()
             })
         })
-        .with_owner_record(|_| OwnerObservation {
-            process_alive: Some(true),
-            identity_matches: Some(true),
-            error: None,
+        .with_owner_record(|_| OwnerAttestation {
+            process: ProcessObservation::Live(Attested::Incarnation),
+            control: ControlAttestation::Verified,
+            pid_alive: Some(true),
         })
         .with_presence(|| panic!("no surface observation after a refused owner"))
         .with_evidence(terminal::close_evidence(Ghostty))
