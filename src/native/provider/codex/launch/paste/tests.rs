@@ -465,8 +465,8 @@ fn unrelated_provider_routes_keep_send_file_and_single_return_facts() {
     for (source, console_source, dispatch) in [
         (
             include_str!("../../../agy/mod.rs"),
-            include_str!("../../../agy/mod.rs"),
-            "terminal::send_file(session, prompt_path, deadline)",
+            include_str!("../../../agy/delivery.rs"),
+            "terminal::send_file(session, prompt, deadline)",
         ),
         (
             include_str!("../../../pi/mod.rs"),
@@ -541,10 +541,21 @@ fn no_binding_diagnostic_distinguishes_all_final_screen_classes() {
         assert_eq!(io.calls.iter().filter(|c| **c == "submit").count(), 1);
         settle(claim, Err(error));
     }
+    let agy_delivery = include_str!("../../../agy/delivery.rs");
+    let console_io = agy_delivery
+        .split_once("impl Io for ConsoleIo {")
+        .unwrap()
+        .1
+        .split_once("// Only preparation")
+        .unwrap()
+        .0;
+    assert!(console_io.contains("terminal::send_file(session, prompt, deadline)"));
     assert!(
-        include_str!("../../../agy/delivery.rs")
-            .contains("|| terminal::send_file(session, prompt_path, deadline)")
+        agy_delivery.contains("|runtime| runtime.split().1.send(session, prompt_path, deadline)")
     );
+    assert!(!agy_delivery.contains("send_file_text_only"));
+    let agy_transport = include_str!("../../../agy/mod.rs");
+    assert!(agy_transport.contains("&mut *self.runtime.borrow_mut()"));
 }
 
 #[test]
@@ -1190,15 +1201,16 @@ fn real_console_payload_to_helper_seam_fences_late_retirement() {
             let prompt = format!("body\n<!-- agent-bridge-codex-turn:{token} -->");
             let session = serde_json::from_value(serde_json::json!({"terminal":"windows-console", "session_id":"1", "managed_session_id":directory.file_name().unwrap().to_str().unwrap()})).unwrap();
             let deadline = Instant::now() + Duration::from_secs(25);
-            terminal::with_in_process_helper(
+            crate::native::console_control::with_in_process_helper(
                 &directory,
                 &session,
                 agent_bridge::FirstPartyCli::Codex,
                 phase,
                 change,
                 &frame(&prompt),
-                || {
+                |client| {
                     let mut io = Console {
+                        client,
                         session: &session,
                         directory: &directory,
                         claim: &token,

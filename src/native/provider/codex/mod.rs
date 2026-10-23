@@ -9,6 +9,7 @@ mod runner;
 #[cfg(test)]
 mod test_support;
 mod transcript;
+mod turn;
 use self::correlation::{
     codex_input_correlates, codex_owned_string, codex_string, correlated_prompt,
     correlated_response, established_codex_thread,
@@ -23,7 +24,7 @@ use super::{
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
-use crate::native::session::turn;
+use crate::native::session::turn as session_turn;
 use crate::native::session::{Reader, Store};
 use crate::native::terminal;
 use agent_bridge::{
@@ -31,14 +32,15 @@ use agent_bridge::{
 };
 use anyhow::{Context, Result, bail};
 use semver::Version;
-use serde::{Deserialize, Serialize};
 use std::{ffi::OsString, path::Path, time::Duration};
 
 pub(super) static ADAPTER: CodexAdapter = CodexAdapter;
 
 pub(super) struct CodexAdapter;
 
-const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
+#[cfg(test)]
+use self::turn::PENDING_TURN_FILE;
+use self::turn::{PendingCodexTurn, cancel_pending_turn, read_pending_turn, write_pending_turn};
 
 fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
     Ok(codex_version(output)? >= Version::new(0, 149, 0))
@@ -58,43 +60,6 @@ fn codex_version(output: &str) -> Result<Version> {
         })
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not parse a semantic Codex version from {output:?}"))
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct PendingCodexTurn {
-    schema: u32,
-    claim_token: String,
-    marker: String,
-    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's
-    // notify payload estimate (#127). The macOS launch argument and the queue message
-    // deliver that text; the Windows console paste can drop a non-BMP character (#147),
-    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14
-    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    framed_prompt_chars: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    framed_prompt_units: Option<u64>,
-}
-
-impl PendingCodexTurn {
-    fn new(claim_token: &str) -> Result<Self> {
-        validate_claim_token(claim_token)?;
-        Ok(Self {
-            schema: 1,
-            claim_token: claim_token.to_owned(),
-            marker: format!("<!-- agent-bridge-codex-turn:{claim_token} -->"),
-            framed_prompt_chars: None,
-            framed_prompt_units: None,
-        })
-    }
-
-    // Records the framed prompt's sizes before delivery: characters, and UTF-16 units of
-    // its JSON escape, which is how the notify payload carries it in `input-messages`.
-    fn record_framed_prompt(&mut self, framed: &str) {
-        let (chars, units) = diagnose::framed_prompt_sizes(framed);
-        self.framed_prompt_chars = Some(chars);
-        self.framed_prompt_units = Some(units);
-    }
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.
@@ -296,17 +261,17 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
         match codex_string(payload, "hook_event_name") {
-            Some("UserPromptSubmit") => return lifecycle::bind(directory, payload),
-            Some("Stop") => return lifecycle::stop(directory, payload),
+            Some("UserPromptSubmit") => {
+                return turn::bind(&Store::open_unchecked(directory), payload);
+            }
+            Some("Stop") => return turn::stop(&Store::open_unchecked(directory), payload),
             Some(_) => return Ok(()),
             None => {}
         }
-        let pending = read_pending_turn(directory)?;
-        if let Some(pending) = &pending
-            && lifecycle::record_notify(directory, pending, payload)?
-        {
-            return Ok(());
-        }
+        let pending = match turn::notify(&Store::open_unchecked(directory), payload)? {
+            turn::Route::Bound | turn::Route::Stale => return Ok(()),
+            turn::Route::Unbound(pending) => pending,
+        };
         let raw_message = codex_string(payload, "last-assistant-message")
             .map(|message| message.trim())
             .filter(|message| !message.is_empty())
@@ -327,7 +292,7 @@ impl NativeProviderAdapter for CodexAdapter {
         {
             return Ok(());
         }
-        turn::Report::for_claim(
+        session_turn::Report::for_claim(
             &Store::open_unchecked(directory),
             FirstPartyCli::Codex,
             Some(&pending.claim_token),
@@ -383,13 +348,6 @@ pub(super) fn memory_workspace(
     Home::resolve(env)?.memory_workspace()
 }
 
-fn validate_claim_token(claim_token: &str) -> Result<()> {
-    if !turn::valid_turn_claim_token(claim_token) {
-        bail!("invalid Codex turn claim token")
-    }
-    Ok(())
-}
-
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
     if windows {
         Box::new(CodexInitialPaste)
@@ -408,8 +366,9 @@ fn prepare_launch_for_platform(
     windows: bool,
     authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
 ) -> Result<LaunchPlan> {
-    let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
-        .context("Codex launch has no native turn claim")?;
+    let claim_token =
+        session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
+            .context("Codex launch has no native turn claim")?;
     let pending = install_pending_turn_for_prompt(context.directory, &claim_token, context.prompt)?;
     let mut arguments = provider_launch_args(FirstPartyCli::Codex, context.yolo)
         .into_iter()
@@ -485,41 +444,6 @@ fn install_pending_turn_for_prompt(
     pending.record_framed_prompt(&framed);
     write_pending_turn(directory, &pending)?;
     Ok(pending)
-}
-
-fn write_pending_turn(directory: &Path, pending: &PendingCodexTurn) -> Result<()> {
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .write_json(pending)?;
-    Ok(())
-}
-
-fn read_pending_turn(directory: &Path) -> Result<Option<PendingCodexTurn>> {
-    let Some(text) = Reader::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .text()?
-    else {
-        return Ok(None);
-    };
-    let pending: PendingCodexTurn =
-        serde_json::from_str(&text).context("failed to parse the pending Codex turn")?;
-    let expected = PendingCodexTurn::new(&pending.claim_token)?;
-    if pending.schema != expected.schema || pending.marker != expected.marker {
-        bail!("Agent Bridge rejected invalid Codex turn correlation state")
-    }
-    Ok(Some(pending))
-}
-
-fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
-    let Some(pending) = read_pending_turn(directory)? else {
-        return Ok(());
-    };
-    if pending.claim_token != claim_token {
-        return Ok(());
-    }
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .remove()
 }
 
 #[cfg(test)]

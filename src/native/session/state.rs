@@ -1,5 +1,5 @@
 //! Status transitions, diagnostic amendments, and their serialized record.
-use super::{CoreRecord, Store, launch, unix_ms};
+use super::{CoreRecord, Store, unix_ms};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
@@ -14,7 +14,34 @@ pub(in crate::native) struct SessionStatus {
     pub(in crate::native) exit_code: Option<i32>,
     pub(in crate::native) error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(in crate::native) residual_surface: Option<launch::ResidualSurface>,
+    pub(in crate::native) residual_surface: Option<ResidualSurface>,
+}
+
+// Retained for older readers and for reading records written before residual_surface.
+pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
+    "the surface may remain and is not closed by Bridge";
+
+/// Whether cleanup of a surface left by a failed launch has been confirmed. This
+/// observation grants no close authority and does not bind a terminal handle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::native) enum ResidualSurface {
+    Unverified,
+    Cleared,
+}
+
+impl SessionStatus {
+    pub(in crate::native) fn residual_surface(&self) -> Option<ResidualSurface> {
+        if self.residual_surface == Some(ResidualSurface::Cleared) {
+            return None;
+        }
+        self.residual_surface.or_else(|| {
+            self.error
+                .as_deref()
+                .is_some_and(|error| error.contains(RESIDUAL_SURFACE_MARKER))
+                .then_some(ResidualSurface::Unverified)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,7 +114,7 @@ impl SessionState {
     /// increment is the `closed.json` tombstone: once it exists, `update_status` no longer
     /// consults this table and rewrites `status.json` as a copy of the tombstone, so the
     /// tombstone's generation, timestamp, and error are preserved rather than advanced. The
-    /// README section "권한과 세션 경계" carries the same table for operators.
+    /// state-transition section in docs/architecture.md carries the same table for operators.
     ///
     /// | From                    | To                                                 |
     /// | ----------------------- | -------------------------------------------------- |
@@ -168,7 +195,7 @@ pub(in crate::native) fn update_status_with_residual(
     state: SessionState,
     exit_code: Option<i32>,
     error: Option<String>,
-    residual_surface: Option<launch::ResidualSurface>,
+    residual_surface: Option<ResidualSurface>,
 ) -> Result<()> {
     Store::open_unchecked(directory).update_status(state, exit_code, error, residual_surface)
 }
@@ -179,7 +206,7 @@ impl Store {
         state: SessionState,
         exit_code: Option<i32>,
         error: Option<String>,
-        residual_surface: Option<launch::ResidualSurface>,
+        residual_surface: Option<ResidualSurface>,
     ) -> Result<()> {
         let _status_lock = self.lock_status()?;
         let store = self;
@@ -243,7 +270,7 @@ impl Store {
             Some(existing) => format!("{existing}; {message}"),
             None => message.to_owned(),
         });
-        status.residual_surface = Some(launch::ResidualSurface::Unverified);
+        status.residual_surface = Some(ResidualSurface::Unverified);
         if status.state == SessionState::Closed {
             self.record(CoreRecord::Closed).write_json(&status)?;
         }

@@ -45,7 +45,7 @@ pub(super) fn claude_sessions_registry_dir(
     if let Some(registry) = SESSION_REGISTRY_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return Ok(registry);
     }
-    let config_dir = match super::config_dir_override(env) {
+    let config_dir = match super::trust::config_dir_override(env) {
         Some(dir) => dir,
         None => {
             let home = env

@@ -1,0 +1,20 @@
+{
+  "name": "agent-bridge",
+  "interface": {
+    "displayName": "Agent Bridge"
+  },
+  "plugins": [
+    {
+      "name": "agent-bridge",
+      "source": {
+        "source": "local",
+        "path": "./integrations/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

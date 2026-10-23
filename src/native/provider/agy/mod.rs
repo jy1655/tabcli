@@ -1,4 +1,4 @@
-use self::delivery::deliver_terminal_turn;
+use self::delivery::{Console, Io, Runtime, deliver_terminal_turn};
 use self::diagnostics::{input_receipt_check, tool_confirmation_check, workspace_trust_check};
 use self::readiness::ReadinessTiming;
 use crate::native::delivery as native_delivery;
@@ -17,12 +17,14 @@ use agent_bridge::{
 use anyhow::{Context, Result, bail};
 use monitor::AgyMonitor;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod delivery;
 mod diagnostics;
+mod log;
 mod monitor;
 mod readiness;
 mod receipt;
@@ -114,10 +116,11 @@ impl PendingAgyTurn {
 // held lock and a resumable transcript marker.
 const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
 
-fn send_initial_prompt(
+fn send_initial_prompt<R: Runtime>(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
+    runtime: &mut R,
 ) -> terminal::TerminalSendResult {
     if cfg!(windows) {
         deliver_terminal_turn(
@@ -125,12 +128,13 @@ fn send_initial_prompt(
             prompt_path,
             deadline,
             Some(WINDOWS_STARTUP_READINESS_TIMING),
+            runtime,
         )
     } else {
         // Unreachable while the initial Transport is `LAUNCH_ARGUMENT` off
         // Windows; kept as the plain paste so the transport decision stays in one
         // place.
-        terminal::send_file(session, prompt_path, deadline)
+        runtime.split().1.send(session, prompt_path, deadline)
     }
 }
 
@@ -140,15 +144,16 @@ fn terminal_initial_prompt(directory: &Path, prompt: &str) -> Result<String> {
     terminal_correlated_prompt(prompt, &pending, cfg!(windows))
 }
 
-fn send_terminal_follow_up(
+fn send_terminal_follow_up<R: Runtime>(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
+    runtime: &mut R,
 ) -> terminal::TerminalSendResult {
     if cfg!(windows) {
         // The Windows initial paste already waited for startup readiness, so a
         // follow-up only takes its receipt offset and pastes.
-        deliver_terminal_turn(session, prompt_path, deadline, None)
+        deliver_terminal_turn(session, prompt_path, deadline, None, runtime)
     } else {
         // Argument prompts run behind the trust dialog; each macOS follow-up needs trust, readiness
         // and a receipt before it can count as delivered. See AGENTS.md, Current Agy Boundary.
@@ -157,6 +162,7 @@ fn send_terminal_follow_up(
             prompt_path,
             deadline,
             Some(MACOS_FOLLOW_UP_READINESS_TIMING),
+            runtime,
         )
     }
 }
@@ -166,8 +172,17 @@ fn prepare_terminal_follow_up(directory: &Path, prompt: &str, claim_token: &str)
     terminal_correlated_prompt(prompt, &pending, cfg!(windows))
 }
 
-struct AgyInitialPaste;
-impl Transport for AgyInitialPaste {
+struct AgyInitialPaste<R = Console> {
+    runtime: RefCell<R>,
+}
+impl AgyInitialPaste<Console> {
+    fn new() -> Self {
+        Self {
+            runtime: RefCell::new(Console::new()),
+        }
+    }
+}
+impl<R: Runtime> Transport for AgyInitialPaste<R> {
     fn facts(&self) -> TransportFacts {
         TransportFacts {
             name: "terminal-paste-fallback",
@@ -191,6 +206,7 @@ impl Transport for AgyInitialPaste {
             turn.surface,
             file.expect("surface transport has a prompt file"),
             turn.deadline,
+            &mut *self.runtime.borrow_mut(),
         )
         .into()
     }
@@ -198,8 +214,17 @@ impl Transport for AgyInitialPaste {
 }
 
 // Replace this paste fallback when Agy exposes addressed interactive input.
-struct AgyPaste;
-impl Transport for AgyPaste {
+struct AgyPaste<R = Console> {
+    runtime: RefCell<R>,
+}
+impl AgyPaste<Console> {
+    fn new() -> Self {
+        Self {
+            runtime: RefCell::new(Console::new()),
+        }
+    }
+}
+impl<R: Runtime> Transport for AgyPaste<R> {
     fn facts(&self) -> TransportFacts {
         TransportFacts {
             name: "terminal-paste-fallback",
@@ -223,6 +248,7 @@ impl Transport for AgyPaste {
             turn.surface,
             file.expect("surface transport has a prompt file"),
             turn.deadline,
+            &mut *self.runtime.borrow_mut(),
         )
         .into()
     }
@@ -259,7 +285,7 @@ impl NativeProviderAdapter for AgyAdapter {
         initial_transport_for_platform(cfg!(windows))
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
-        Box::new(AgyPaste)
+        Box::new(AgyPaste::new())
     }
 
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
@@ -370,7 +396,7 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
     if windows {
-        Box::new(AgyInitialPaste)
+        Box::new(AgyInitialPaste::new())
     } else {
         Box::new(native_delivery::LAUNCH_ARGUMENT)
     }
@@ -547,3 +573,6 @@ const TRUST_RECOVERY: &str = "If the managed terminal shows the trust dialog, ap
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod transport_tests;

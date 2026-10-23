@@ -15,10 +15,7 @@ use std::{ffi::OsString, path::PathBuf, str::FromStr};
 #[cfg(windows)]
 mod client;
 #[cfg(windows)]
-pub(in crate::native) use client::{
-    WindowLookup, close_session_until, guarded_dialog_input, read_screen, send_file,
-    send_file_text_only,
-};
+pub(in crate::native) use client::{Client, HelperProcess, WindowLookup, installed};
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct ConsoleControlRequest {
@@ -396,23 +393,11 @@ fn parse_text_only_count(output: &[u8]) -> Result<usize> {
 }
 
 #[cfg(windows)]
-#[derive(Debug)]
-pub(in crate::native) struct StaleDialogClaim;
-#[cfg(windows)]
-impl std::fmt::Display for StaleDialogClaim {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("stale claim at guarded submission")
-    }
-}
-#[cfg(windows)]
-impl std::error::Error for StaleDialogClaim {}
-
-#[cfg(windows)]
 fn decode_dialog_reply(output: &[u8]) -> Result<bool> {
     match String::from_utf8_lossy(output).trim() {
         "sent" => Ok(true),
         "changed" => Ok(false),
-        "stale" => Err(StaleDialogClaim.into()),
+        "stale" => Err(terminal::StaleDialogClaim.into()),
         _ => bail!("unexpected managed console dialog result"),
     }
 }

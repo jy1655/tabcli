@@ -1,11 +1,20 @@
 //! Bounded best-effort Windows console fallback, pinned to Codex 0.163.0.
 //! Counts are rendered cardinality, not content receipts. No concurrent input is assumed.
+use super::lexical::{
+    REVIEW_HOOKS, TRUST_ALL_AND_CONTINUE, confirmation_hint, numbered_label, pinned_option,
+};
+#[cfg(windows)]
 use crate::native::clock::{Clock, SystemClock};
-use crate::native::session::{Reader, RecordStore, turn};
+#[cfg(windows)]
+use crate::native::console_control;
+#[cfg(windows)]
+use crate::native::session::RecordStore;
+use crate::native::session::{Reader, turn};
 use crate::native::terminal::{self, TerminalSendFailure as Failure, TerminalSendResult};
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use std::io::Write;
 use std::{
-    io::Write,
     path::Path,
     time::{Duration, Instant},
 };
@@ -49,80 +58,6 @@ fn composer_span(rows: &[&str], tail: &str, workspace: &Path) -> Option<std::ops
         .or_else(|| (start + 1..rows.len()).find(|&i| footer(rows[i], workspace)))?;
     Some(start..end)
 }
-fn numbered_label(text: &str) -> Option<&str> {
-    let (n, label) = text.split_once(". ")?;
-    (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).then_some(label)
-}
-// Pinned startup-hook and trust-directory options, including wrapped label prefixes.
-fn pinned_option(label: &str) -> bool {
-    [
-        "Review hooks",
-        "Trust all and continue",
-        "Continue without trusting",
-        "Trust and continue",
-        "Open existing task",
-        "Open restricted",
-        "Back to Agent Command Center",
-        "Keep current directory",
-        "Quit",
-        "Don't trust",
-    ]
-    .iter()
-    .any(|prefix| label.starts_with(prefix))
-}
-// Fragments survive wrapping and clipped frames; key names come from the keymap.
-// Deliberately also refuses draft lines that look like these confirmation hints.
-fn confirmation_hint(text: &str) -> bool {
-    let text = text.trim().strip_prefix("› ").unwrap_or(text.trim());
-    fn action(value: &str) -> bool {
-        matches!(
-            value,
-            "confirm" | "continue" | "skip" | "quit" | "back" | "cancel"
-        )
-    }
-    fn key_token(value: &str) -> bool {
-        let key = value.rsplit('+').next().unwrap_or(value);
-        key.chars().count() == 1
-            || matches!(
-                key,
-                "enter"
-                    | "esc"
-                    | "escape"
-                    | "tab"
-                    | "space"
-                    | "backspace"
-                    | "delete"
-                    | "insert"
-                    | "home"
-                    | "end"
-                    | "pageup"
-                    | "pagedown"
-                    | "pgup"
-                    | "pgdn"
-                    | "up"
-                    | "down"
-                    | "left"
-                    | "right"
-            )
-            || key
-                .strip_prefix('f')
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-    }
-    fn keyed_action(value: &str) -> bool {
-        value.rsplit_once(' ').is_some_and(|(keys, verb)| {
-            keys.split_whitespace().next().is_some()
-                && keys.split_whitespace().all(key_token)
-                && action(verb)
-        })
-    }
-    // Keep terminal separators too: trimming a wrapped row removes their final space.
-    let separated = (text.contains(" · ") || text.ends_with(" ·"))
-        && text.split('·').any(|part| {
-            let part = part.trim();
-            action(part) || keyed_action(part)
-        });
-    action(text) || separated || keyed_action(text) || text.contains("and create sandbox")
-}
 fn menu_evidence(row: &str) -> bool {
     row.strip_prefix("› ")
         .or_else(|| row.strip_prefix("  "))
@@ -164,9 +99,9 @@ fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
             *r,
             "Hooks need review"
                 | "Trust this folder?"
-                | "Review hooks"
+                | REVIEW_HOOKS
                 | "Trust and continue"
-                | "Trust all and continue"
+                | TRUST_ALL_AND_CONTINUE
                 | "2. Don't trust"
                 | "2. Quit"
                 | "enter confirm · esc skip"
@@ -498,13 +433,16 @@ fn run(
     result.map_err(|error| Failure::delivery_uncertain(anyhow::anyhow!("{error:#}. {RECOVERY}")))
 }
 
-struct Console<'a> {
+#[cfg(windows)]
+struct Console<'a, H> {
+    client: &'a mut console_control::Client<H>,
     session: &'a terminal::TerminalSession,
     directory: &'a Path,
     claim: &'a str,
     deadline: Instant,
 }
-impl Input for Console<'_> {
+#[cfg(windows)]
+impl<H: console_control::HelperProcess> Input for Console<'_, H> {
     fn now(&mut self) -> Instant {
         Instant::now()
     }
@@ -522,7 +460,7 @@ impl Input for Console<'_> {
         Ok(())
     }
     fn screen(&mut self) -> Result<String> {
-        terminal::read_screen(self.session, self.deadline)
+        self.client.read_screen(self.session, self.deadline)
     }
     fn text(&mut self, text: &str) -> std::result::Result<usize, Failure> {
         let file = (|| -> Result<_> {
@@ -537,10 +475,11 @@ impl Input for Console<'_> {
             Ok(file)
         })()
         .map_err(Failure::not_sent)?;
-        terminal::send_file_text_only(self.session, file.path(), self.claim, self.deadline)
+        self.client
+            .send_file_text_only(self.session, file.path(), self.claim, self.deadline)
     }
     fn submit(&mut self, screen: &str) -> Result<bool> {
-        terminal::submit_if_unchanged(
+        self.client.submit_if_unchanged(
             self.directory,
             self.session,
             screen,
@@ -553,6 +492,7 @@ impl Input for Console<'_> {
     }
 }
 
+#[cfg(windows)]
 pub(super) fn send(
     session: &terminal::TerminalSession,
     directory: &Path,
@@ -567,8 +507,10 @@ pub(super) fn send(
     let claim = turn::current_claim_token(&Reader::open_unchecked(directory))
         .and_then(|c| c.context("no current Codex claim"))
         .map_err(Failure::not_sent)?;
+    let mut client = console_control::installed();
     run(
         &mut Console {
+            client: &mut client,
             session,
             directory,
             claim: &claim,

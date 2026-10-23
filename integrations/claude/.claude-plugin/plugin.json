@@ -1,0 +1,12 @@
+{
+  "name": "agent-bridge",
+  "version": "0.4.24",
+  "description": "Delegate work to coding agents, read results, send follow-ups, and close task sessions.",
+  "author": {
+    "name": "jy1655"
+  },
+  "homepage": "https://github.com/jy1655/tabcli",
+  "repository": "https://github.com/jy1655/tabcli",
+  "license": "MIT",
+  "skills": "./skills/"
+}

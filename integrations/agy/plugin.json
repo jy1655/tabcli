@@ -1,0 +1,4 @@
+{
+  "name": "agent-bridge",
+  "description": "Delegate work to coding agents, read results, send follow-ups, and close task sessions."
+}

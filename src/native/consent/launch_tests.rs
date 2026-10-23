@@ -329,6 +329,41 @@ fn launch_dialog_rechecks_close_revoke_and_deadline_after_blocking_observation()
 }
 
 #[test]
+fn launch_dialog_typed_prewrite_refusal_is_distinct_from_dispatch_error() {
+    for refused in [true, false] {
+        let h = Harness::new();
+        let mut clock = FakeClock::new(Instant::now());
+        let calls = Cell::new(0);
+        let error = h
+            .run(
+                FirstPartyCli::Claude,
+                &mut clock,
+                Duration::from_secs(3),
+                || Ok(h.screen()),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    let cause = anyhow::anyhow!("dialog dispatch failed");
+                    Err(if refused {
+                        cause.context(terminal::StaleDialogClaim)
+                    } else {
+                        cause
+                    })
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(calls.get(), 1, "neither error may retry input");
+        assert!(error.contains("dialog dispatch failed"), "{error}");
+        assert_eq!(error.contains("no response sent"), refused, "{error}");
+        assert_eq!(error.contains("possible response"), !refused, "{error}");
+        assert_eq!(
+            observe(&h.directory).value()["applied"],
+            "workspace-dialog-response-pending"
+        );
+    }
+}
+
+#[test]
 fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
     for helper_error in [
         None,
@@ -480,14 +515,14 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         let now = clock.shared();
         let expiry_floor = crate::native::session::primitives::unix_ms() + 3000;
         let screen = h.screen();
-        terminal::with_in_process_helper(
+        crate::native::console_control::with_in_process_helper(
             &directory,
             &surface,
             FirstPartyCli::Claude,
             1,
             change,
             &screen,
-            || {
+            |client| {
                 let error = LaunchDialog {
                     directory: &directory,
                     target: FirstPartyCli::Claude,
@@ -511,7 +546,7 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
                                     .contains(&expiry),
                                 "original expiry {expiry} vs {expiry_floor}"
                             );
-                            terminal::guarded_dialog_input(
+                            client.guarded_dialog_input(
                                 &directory,
                                 &surface,
                                 input,

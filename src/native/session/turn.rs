@@ -77,6 +77,44 @@ fn default_completion_status_state() -> SessionState {
     SessionState::Ready
 }
 
+/// An already-decided outcome. Callers retain authority checks, text preparation,
+/// clock reads and usage policy; this type only encodes the event's outcome fields.
+enum EventOutcome {
+    Success(String),
+    Failure(String),
+    ConfirmedCancelled(String),
+}
+
+impl EventOutcome {
+    fn into_event(
+        self,
+        provenance: Option<String>,
+        provider: String,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        created_unix_ms: u128,
+        usage: Usage,
+    ) -> SessionEvent {
+        let (message, error, cancelled) = match self {
+            Self::Success(message) => (message, None, false),
+            Self::Failure(error) => (String::new(), Some(error), false),
+            Self::ConfirmedCancelled(error) => (String::new(), Some(error), true),
+        };
+        SessionEvent {
+            provenance,
+            cancelled,
+            provider,
+            message,
+            error,
+            provider_session_id,
+            turn_id,
+            created_unix_ms: Some(created_unix_ms),
+            usage: usage.usage,
+            usage_error: usage.usage_error,
+        }
+    }
+}
+
 fn record_provider_result_for_claim_condition(
     report: &Report<'_>,
     message: &str,
@@ -113,24 +151,19 @@ fn record_provider_result_for_claim_condition(
     )? {
         return Ok(());
     }
-    let event = SessionEvent {
-        provenance: report.provenance.map(str::to_owned),
-        cancelled: false,
-        provider: provider.as_str().to_owned(),
-        message: message.to_owned(),
-        error: None,
+    let event = EventOutcome::Success(message.to_owned()).into_event(
+        report.provenance.map(str::to_owned),
+        provider.as_str().to_owned(),
         provider_session_id,
         turn_id,
-        created_unix_ms: Some(unix_ms()),
-        usage: usage.usage,
-        usage_error: usage.usage_error,
-    };
+        unix_ms(),
+        usage,
+    );
     commit_completion_locked(
         directory,
         &claim_path,
         expected_claim_token.context("provider completion has no claim token")?,
         event,
-        None,
     )
 }
 
@@ -154,24 +187,19 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
         );
     };
     let error = terminal_safe_text(error, true);
-    let event = SessionEvent {
-        provenance: None,
-        cancelled: false,
-        provider: provider.as_str().to_owned(),
-        message: String::new(),
-        error: Some(error.clone()),
-        provider_session_id: None,
-        turn_id: None,
-        created_unix_ms: Some(unix_ms()),
-        usage: None,
-        usage_error: None,
-    };
+    let event = EventOutcome::Failure(error).into_event(
+        None,
+        provider.as_str().to_owned(),
+        None,
+        None,
+        unix_ms(),
+        Usage::default(),
+    );
     commit_provider_completion_with_status_locked(
         directory,
         &claim_path,
         &claim_token,
         event,
-        Some(error),
         SessionState::Failed,
     )
 }
@@ -255,14 +283,12 @@ fn commit_completion_locked(
     claim_path: &Path,
     claim_token: &str,
     event: SessionEvent,
-    status_error: Option<String>,
 ) -> Result<()> {
     commit_provider_completion_with_status_locked(
         directory,
         claim_path,
         claim_token,
         event,
-        status_error,
         SessionState::Ready,
     )
 }
@@ -272,7 +298,6 @@ fn commit_provider_completion_with_status_locked(
     claim_path: &Path,
     claim_token: &str,
     event: SessionEvent,
-    status_error: Option<String>,
     status_state: SessionState,
 ) -> Result<()> {
     commit_completion_within_locked(
@@ -280,7 +305,6 @@ fn commit_provider_completion_with_status_locked(
         claim_path,
         claim_token,
         event,
-        status_error,
         status_state,
         EVENT_READ_LIMIT,
     )
@@ -295,10 +319,11 @@ fn commit_completion_within_locked(
     claim_path: &Path,
     claim_token: &str,
     event: SessionEvent,
-    status_error: Option<String>,
     status_state: SessionState,
     event_limit: u64,
 ) -> Result<()> {
+    // Derive both errors before the size policy can replace them together.
+    let status_error = event.error.clone();
     let mut pending =
         PendingTurnCompletion::new_with_status(claim_token, event, status_error, status_state)?;
     // Request indexing must not prevent a provider-verified completion from publishing.
@@ -535,24 +560,19 @@ fn settle_delivery_refusal_locked(
     // The event names the session's provider as the monitor-failure event does; the
     // refusal itself carries no provider identity, so reopen keeps an older turn's.
     let provider = store.manifest()?.provider;
-    let event = SessionEvent {
-        provenance: Some(DELIVERY_NOT_SENT_PROVENANCE.to_owned()),
-        cancelled: false,
+    let event = EventOutcome::Failure(error).into_event(
+        Some(DELIVERY_NOT_SENT_PROVENANCE.to_owned()),
         provider,
-        message: String::new(),
-        error: Some(error.clone()),
-        provider_session_id: None,
-        turn_id: None,
-        created_unix_ms: Some(unix_ms()),
-        usage: None,
-        usage_error: None,
-    };
+        None,
+        None,
+        unix_ms(),
+        Usage::default(),
+    );
     commit_provider_completion_with_status_locked(
         directory,
         claim_path,
         claim_token,
         event,
-        Some(error),
         state,
     )?;
     Ok(true)
@@ -1324,24 +1344,24 @@ impl<'a> Report<'a> {
             error.to_owned()
         };
         let error = terminal_safe_text(&error, true);
-        let event = SessionEvent {
-            provenance: self.provenance.map(str::to_owned),
-            cancelled,
-            provider: provider.as_str().to_owned(),
-            message: String::new(),
-            error: Some(error.clone()),
+        let outcome = if cancelled {
+            EventOutcome::ConfirmedCancelled(error)
+        } else {
+            EventOutcome::Failure(error)
+        };
+        let event = outcome.into_event(
+            self.provenance.map(str::to_owned),
+            provider.as_str().to_owned(),
             provider_session_id,
             turn_id,
-            created_unix_ms: Some(unix_ms()),
-            usage: self.usage.usage.clone(),
-            usage_error: self.usage.usage_error.clone(),
-        };
+            unix_ms(),
+            self.usage.clone(),
+        );
         commit_completion_locked(
             directory,
             &claim_path,
             expected_claim_token.context("provider completion has no claim token")?,
             event,
-            Some(error),
         )
     }
 }

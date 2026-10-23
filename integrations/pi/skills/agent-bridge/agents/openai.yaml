@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Bridge"
+  short_description: "Delegate to coding agents and manage task sessions"
+  default_prompt: "Use $agent-bridge to delegate work to another coding agent, check the result, and close the task sessions."

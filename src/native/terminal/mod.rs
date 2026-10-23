@@ -36,17 +36,18 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "linux")]
-mod linux;
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-mod unsupported;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod refusing;
 #[cfg(target_os = "windows")]
 pub(in crate::native) mod windows;
 
 // Platform-only pure decisions live beside their platform module and compile on every
 // target, so that their tests run on every target; the platform modules remain gated.
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos/dialog.rs"]
+mod macos_dialog;
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 #[path = "macos/selection.rs"]
 mod macos_selection;
@@ -54,14 +55,22 @@ mod macos_selection;
 #[path = "windows/budget.rs"]
 pub(in crate::native) mod windows_budget;
 
-#[cfg(windows)]
-pub(in crate::native) use crate::native::console_control::StaleDialogClaim;
-#[cfg(target_os = "linux")]
-use linux as platform;
+/// A guarded dialog response was refused before any input was dispatched.
+#[derive(Debug)]
+pub(in crate::native) struct StaleDialogClaim;
+
+impl std::fmt::Display for StaleDialogClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale claim at guarded submission")
+    }
+}
+
+impl std::error::Error for StaleDialogClaim {}
+
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use unsupported as platform;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use refusing as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
@@ -409,7 +418,7 @@ pub(super) fn send_file(
 ) -> TerminalSendResult {
     #[cfg(windows)]
     {
-        crate::native::console_control::send_file(session, prompt_path, deadline)
+        crate::native::console_control::installed().send_file(session, prompt_path, deadline)
     }
     #[cfg(target_os = "macos")]
     {
@@ -419,66 +428,6 @@ pub(super) fn send_file(
     {
         // Unsupported-platform stubs never send, so not_sent is accurate.
         platform::send_file(session, prompt_path, deadline).map_err(TerminalSendFailure::not_sent)
-    }
-}
-
-// Raw Windows operations for the provider-owned paste protocol in R2.
-pub(super) fn send_file_text_only(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    expected_claim: &str,
-    deadline: Instant,
-) -> std::result::Result<usize, TerminalSendFailure> {
-    #[cfg(windows)]
-    return crate::native::console_control::send_file_text_only(
-        session,
-        prompt_path,
-        expected_claim,
-        deadline,
-    );
-    #[cfg(not(windows))]
-    {
-        let _ = (session, prompt_path, expected_claim, deadline);
-        Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
-            "managed text-only input unsupported on this platform"
-        )))
-    }
-}
-
-pub(super) fn submit_if_unchanged(
-    directory: &Path,
-    session: &TerminalSession,
-    expected_screen: &str,
-    expected_claim: Option<&str>,
-    deadline: Instant,
-) -> Result<bool> {
-    #[cfg(windows)]
-    return guarded_dialog_input(
-        directory,
-        session,
-        &GuardedDialogInput {
-            expected_claim: expected_claim.map(str::to_owned),
-            expires_unix_ms: Some(
-                crate::native::session::primitives::unix_ms()
-                    + deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis(),
-            ),
-            screen: expected_screen.to_owned(),
-            key: DialogKey::Enter,
-        },
-        deadline,
-    );
-    #[cfg(not(windows))]
-    {
-        let _ = (
-            directory,
-            session,
-            expected_screen,
-            expected_claim,
-            deadline,
-        );
-        bail!("managed dialog input unsupported on this platform");
     }
 }
 
@@ -504,7 +453,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
     #[cfg(target_os = "macos")]
     return macos::read_screen(macos::INSTALLED, session, deadline);
     #[cfg(windows)]
-    return crate::native::console_control::read_screen(session, deadline);
+    return crate::native::console_control::installed().read_screen(session, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (session, deadline);
@@ -524,13 +473,13 @@ pub(super) fn guarded_dialog_input(
 ) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        let _ = directory;
-        macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
+        macos_dialog::dispatch(directory, input, deadline, || {
+            macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
+        })
     }
     #[cfg(windows)]
-    return crate::native::console_control::guarded_dialog_input(
-        directory, session, input, deadline,
-    );
+    return crate::native::console_control::installed()
+        .guarded_dialog_input(directory, session, input, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (directory, session, input, deadline);
@@ -559,7 +508,8 @@ pub(super) fn close_session_until(
     }
     #[cfg(windows)]
     {
-        crate::native::console_control::close_session_until(directory, session, deadline)
+        crate::native::console_control::installed()
+            .close_session_until(directory, session, deadline)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -598,34 +548,19 @@ pub(super) struct WindowsSessionRecords<'a> {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn windows_console_control(
-    action: crate::native::console_control::ResolvedAction,
-    session: &TerminalSession,
-    records: &WindowsSessionRecords<'_>,
-) -> Result<()> {
-    windows::console_control(action, session, records)
-}
+pub(super) use windows::console_control as windows_console_control;
 
 #[cfg(target_os = "windows")]
 pub(super) use windows::ownership::{windows_console_handle_path, windows_console_root_never_ran};
 
 #[cfg(target_os = "windows")]
-pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
-    windows::powershell_executable()
-}
+pub(super) use windows::powershell_executable as windows_powershell_executable;
 
 #[cfg(all(target_os = "windows", test))]
-pub(super) fn windows_console_launch_command_line(
-    powershell: &Path,
-    command: &str,
-) -> Result<String> {
-    windows::console_launch_command_line(powershell, command)
-}
+pub(super) use windows::console_launch_command_line as windows_console_launch_command_line;
 
 #[cfg(windows)]
-pub(super) fn windows_set_private_permissions(path: &Path, directory: bool) -> Result<()> {
-    windows::set_private_permissions(path, directory)
-}
+pub(super) use windows::set_private_permissions as windows_set_private_permissions;
 
 #[cfg(windows)]
 pub(in crate::native) use windows::observe_process_identity as observe_windows_process_identity;
@@ -637,17 +572,7 @@ mod windows_incarnation;
 pub(in crate::native) use windows_incarnation::WindowsIncarnation;
 
 #[cfg(windows)]
-pub(super) fn windows_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
-    windows::query_process_identity(pid)
-}
-
-#[cfg(windows)]
-pub(super) fn verify_windows_process_identity(
-    pid: u32,
-    identity: &WindowsProcessIdentity,
-) -> Result<()> {
-    windows::verify_process_identity(pid, identity.creation_time, &identity.executable_path)
-}
+pub(super) use windows::query_process_identity as windows_process_identity;
 
 #[cfg(unix)]
 pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {
@@ -675,9 +600,6 @@ pub(super) fn validate_terminal_send_budget(
         Ok(())
     }
 }
-
-#[cfg(all(test, windows))]
-pub(in crate::native) use crate::native::console_control::with_in_process_helper;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,13 @@
+{
+  "name": "agent-bridge",
+  "owner": {
+    "name": "jy1655"
+  },
+  "description": "Agent Bridge for coding agent delegation and task session management.",
+  "plugins": [
+    {
+      "name": "agent-bridge",
+      "source": "./integrations/claude"
+    }
+  ]
+}

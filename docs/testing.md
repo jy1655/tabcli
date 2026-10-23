@@ -26,6 +26,35 @@ tests remains enabled.
 For a lifecycle or concurrency fix, reproduce the partial transition or race deterministically
 before changing the implementation.
 
+## Language lint
+
+Public documentation, source comments and default plugin metadata use English. Run from the
+repository root with Python 3.9 or newer:
+
+```sh
+python3 scripts/check_language.py
+```
+
+CI runs this check on Linux, macOS and Windows. It inspects tracked and non-ignored new text
+files, reports `file:line` for non-ASCII letters or combining accents, and exits nonzero on
+findings or an invalid policy. Punctuation, arrows and emoji are allowed. JSON and JSON-compatible
+YAML quoted strings are also decoded so Unicode escapes cannot hide a translated display name.
+This is a character check, not a classifier for foreign words written entirely in ASCII.
+
+`.language-lint.json` contains the exceptions and a reason for each: the Korean README,
+unchanged upstream notices, two historical Korean verification reports, and Unicode test/fixture
+paths. Unicode examples in production files have exact-line exceptions, so the rest of each file
+is checked. The policy itself contains those Unicode examples. An unused exception fails the
+check and must be removed or updated with its fixture.
+
+Use a translation path or an exact-line exception for a legitimate new example; keep public
+plugin metadata under the default rule. Review exception changes as part of the diff.
+The checker tests run with the existing Python suite:
+
+```sh
+python3.12 -m unittest discover -s scripts -p 'test_*.py' -v
+```
+
 ## Simulated time and the race hooks
 
 `src/native/clock.rs` is the one clock seam of the native module: `Clock` (`now`, `sleep`),
@@ -46,7 +75,9 @@ read log, the record replace retry hook, the close interruption points, enumerat
 the snapshot checkpoints, the Origin checkpoints and receipt counter, and the Windows termination
 log. They stay thread-local test hooks beside the code they observe.
 
-The console helper's in-process adapter uses the production argv decoder, session and
+The console client owns an explicitly supplied `HelperProcess`; the installed adapter never
+selects test behavior. Tests can keep two independent clients in the same scope. The console
+helper's in-process adapter uses the production argv decoder, session and
 provider resolution, payload decoder, input dispatcher, and reply interpretation. Its fake process
 and Win32 effects do not prove real attachment or OS behavior. The owner fixtures likewise call
 the production ordered verifier with lazy process and TTY observers; they do not run the macOS
