@@ -4,7 +4,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::native::delivery::Readiness;
-use crate::native::delivery::{self, Transport};
+use crate::native::delivery::Transport;
 #[cfg(test)]
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, record};
@@ -91,7 +91,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
-        initial_transport_for_platform(cfg!(windows))
+        Box::new(ClaudeMessage)
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(ClaudeMessage)
@@ -272,14 +272,6 @@ impl ReopenSupport for ClaudeReopen {
     }
 }
 
-fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
-    if windows {
-        Box::new(ClaudeMessage)
-    } else {
-        Box::new(delivery::LAUNCH_ARGUMENT)
-    }
-}
-
 // The requested policy, in Claude's flags, ahead of every adapter argument: the bypass
 // only when requested, then effort, then model.
 fn policy_arguments(
@@ -308,14 +300,11 @@ fn policy_arguments(
     Ok(arguments)
 }
 
-// The complete launch command. Off Windows the initial transport is the launch argument,
-// so the prompt is the last positional argument and is accepted at spawn; on Windows the
-// cross-session message delivers it after launch and argv carries no prompt.
+// Initial input must wait for the completion module's actual readiness, so argv carries no prompt.
 fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
     let completion_arguments = completion::prepare(context.directory, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
-    RecordStore::at(&settings_path)
-        .write_json(&completion::settings(context.bridge_executable, windows))?;
+    RecordStore::at(&settings_path).write_json(&completion::settings(context.bridge_executable))?;
     let mut arguments = policy_arguments(context.yolo, context.model, context.effort)?;
     arguments.extend([
         OsString::from("--settings"),
@@ -324,14 +313,9 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         OsString::from(managed_session_name(context.directory)?),
     ]);
     arguments.extend(completion_arguments);
-    let initial_prompt =
-        InitialPromptDisposition::of(initial_transport_for_platform(windows).as_ref());
-    if initial_prompt == InitialPromptDisposition::AcceptedAtSpawn {
-        arguments.push(OsString::from(context.prompt));
-    }
     Ok(LaunchPlan {
         arguments,
-        initial_prompt,
+        initial_prompt: InitialPromptDisposition::of(&ClaudeMessage),
         watcher: Box::new(NoWatcher),
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
@@ -345,8 +329,7 @@ fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Res
     verify_reopen_available_for_platform(context.provider_session_id, windows)?;
     let completion_arguments = completion::prepare(context.directory, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
-    RecordStore::at(&settings_path)
-        .write_json(&completion::settings(context.bridge_executable, windows))?;
+    RecordStore::at(&settings_path).write_json(&completion::settings(context.bridge_executable))?;
     let mut arguments = policy_arguments(context.yolo, context.model, context.effort)?;
     arguments.extend([
         OsString::from("--resume"),
@@ -359,9 +342,7 @@ fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Res
     arguments.extend(completion_arguments);
     Ok(ResumePlan {
         arguments,
-        initial_prompt: InitialPromptDisposition::of(
-            initial_transport_for_platform(windows).as_ref(),
-        ),
+        initial_prompt: InitialPromptDisposition::of(&ClaudeMessage),
         watcher: Box::new(NoWatcher),
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
@@ -503,37 +484,6 @@ fn handle_hook(directory: &Path, payload: &serde_json::Value) -> Result<()> {
         Some(event) => bail!("unsupported Claude hook event: {event}"),
         None => bail!("Claude hook payload has no hook_event_name"),
     }
-}
-
-pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
-    let mut settings = serde_json::json!({
-        "hooks": {
-            "Stop": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": executable,
-                    "args": ["native-hook", "claude"],
-                    "timeout": 10
-                }]
-            }],
-            "StopFailure": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": executable,
-                    "args": ["native-hook", "claude"],
-                    "timeout": 10
-                }]
-            }]
-        }
-    });
-    settings
-        .as_object_mut()
-        .expect("Claude settings are an object")
-        .insert(
-            "crossSessionInbound".to_owned(),
-            serde_json::Value::String("accept".to_owned()),
-        );
-    settings
 }
 
 #[cfg(test)]

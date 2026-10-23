@@ -102,14 +102,14 @@ round trip and close are not verified. Choose another terminal for those provide
 | Provider CLI | Minimum launch version |
 | --- | --- |
 | Codex (`codex`) | 0.147.0 |
-| Claude Code (`claude`) | 2.1.234 |
+| Claude Code (`claude`) | 2.1.302 stable |
 | Agy (`agy`) | 1.1.12 |
 | Pi (`pi`) | 0.84.1 |
 
 Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude needs working
 cross-session messaging in its installed backend and configuration, not only a recent version.
-New Windows Claude launches and reopens also require stable 2.1.302 or newer and a Bridge
-completion module that Claude loads and that reports readiness.
+New macOS and Windows Claude launches, plus Windows reopens, require stable 2.1.302 or newer
+and a Bridge completion module that Claude loads and that reports readiness.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
 - [2026-10-22 Windows, Claude native completion re-verification](docs/verification/2026-10-22-windows-260-reverification.md):

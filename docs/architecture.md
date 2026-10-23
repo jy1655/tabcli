@@ -125,7 +125,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   order, the adapter's own arguments, the Initial prompt's place), the environment removals, the
   initial-prompt disposition the wrapper applies after the spawn, and an unstarted completion
   watcher the wrapper starts and stops; `provider/mod.rs` holds only provider-neutral contracts.
-  Claude's cross-session messenger (the follow-up Transport, the Windows initial transport, and
+  Claude's cross-session messenger (the initial and follow-up Transport on both platforms, and
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   messenger keeps its per-request protocol, executed-input proof and retry evidence. Claude's
@@ -134,8 +134,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Git scope check live in `claude/trust.rs`; the adapter keeps launch, resume, the hook router,
   Reopen and doctor.
   Claude's native completion adapter owns the immutable exact-frame binding, the unmarked
-  bound-answer candidate and the selected marked continuation. The two official turn ids stay
-  private; core publication retains the Bridge correlation id. Candidate and selection writes
+  bound-answer candidate and the selected marked continuation. New macOS and Windows launches
+  select native completion from the recorded stable version, load the session-local module,
+  and await its actual readiness before messaging. No initial prompt travels in argv.
+  The two official turn ids stay private; core publication retains the Bridge correlation id.
+  Candidate and selection writes
   use the lifecycle lock; core Report rechecks the claim at publication. `inspect` asks the
   adapter for a read-only candidate observation under its existing reader lock, without
   reconstructing missing records or changing completion. The provider's turn-final event does

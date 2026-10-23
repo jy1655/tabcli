@@ -96,49 +96,31 @@ pub(super) fn native_mode(directory: &Path) -> Result<bool> {
 }
 
 pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> {
-    let version = match Reader::open_unchecked(directory).manifest() {
-        Ok(manifest) => Some(manifest.provider_version),
-        Err(error)
-            if !windows
-                && error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            None
-        }
-        Err(error) => {
-            return Err(error).context("Claude completion requires the recorded launch version");
-        }
-    };
-    if windows {
-        let parsed = version.as_deref().and_then(|value| {
-            value
-                .split_whitespace()
-                .find_map(|word| semver::Version::parse(word).ok())
-        });
-        if !parsed.is_some_and(|version| {
-            version.pre.is_empty() && version >= semver::Version::new(2, 1, 302)
-        }) {
-            bail!(
-                "native Windows Claude completion requires stable Claude Code 2.1.302 or newer; recorded version: {}",
-                version.as_deref().unwrap_or("unknown")
-            );
-        }
+    let version = Reader::open_unchecked(directory)
+        .manifest()
+        .context("Claude completion requires the recorded launch version")?
+        .provider_version;
+    let parsed = version
+        .split_whitespace()
+        .find_map(|word| semver::Version::parse(word).ok());
+    if !parsed
+        .is_some_and(|version| version.pre.is_empty() && version >= semver::Version::new(2, 1, 302))
+    {
+        let platform = if windows { "native Windows" } else { "macOS" };
+        bail!(
+            "{platform} Claude completion requires stable Claude Code 2.1.302 or newer; recorded version: {version}"
+        );
     }
     let mode = LaunchMode {
         schema: 1,
-        mode: if windows {
-            Mode::NativeV1
-        } else {
-            Mode::LegacyStop
-        },
+        mode: Mode::NativeV1,
         reason: if windows {
             "windows_stable_2_1_302_or_newer"
         } else {
-            "platform_legacy"
+            "macos_stable_2_1_302_or_newer"
         }
         .into(),
-        claude_version: version,
+        claude_version: Some(version),
     };
     let store = Store::open_unchecked(directory);
     if let Some(existing) = store.private(MODE_FILE).optional_json::<LaunchMode>()? {
@@ -147,9 +129,6 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
         }
     } else {
         store.private(MODE_FILE).write_json(&mode)?;
-    }
-    if !windows {
-        return Ok(vec![]);
     }
     let plugin = directory.join("claude-mod");
     std::fs::create_dir_all(plugin.join(".claude-plugin"))?;
@@ -166,12 +145,8 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     Ok(vec!["--plugin-dir".into(), plugin.into_os_string()])
 }
 
-pub(super) fn settings(executable: &Path, windows: bool) -> Value {
-    if windows {
-        json!({"crossSessionInbound":"accept"})
-    } else {
-        super::hook_settings(executable)
-    }
+pub(super) fn settings(_executable: &Path) -> Value {
+    json!({"crossSessionInbound":"accept"})
 }
 
 pub(super) fn admit(
@@ -187,7 +162,9 @@ pub(super) fn admit(
                 "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
             );
         }
-        return Ok(());
+        bail!(
+            "Claude session was launched before native per-turn completion; inspect its result and terminal, close it when appropriate, then start a fresh ask with the needed context; no message was sent"
+        );
     }
     loop {
         claude_turn::require_current(&Reader::open_unchecked(directory), token)?;

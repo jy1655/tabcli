@@ -505,15 +505,121 @@ fn native_mod_final_settles_with_the_bridge_wait_identity() {
 
 #[test]
 fn legacy_stop_draft_completion_remains_compatible() {
-    let (directory, _, _) = mod_regression_fixture(false);
-    let stop: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
-    handle_hook(directory.path(), &stop["event"]).unwrap();
-    let paths = Reader::open_unchecked(directory.path()).events().unwrap();
-    assert_eq!(paths.len(), 1);
-    let event: crate::native::session::schema::SessionEvent =
-        RecordReader::at(&paths[0]).json().unwrap();
-    assert_eq!(event.message, "PROBE-DRAFT");
+    for explicit in [false, true] {
+        let (directory, _, _) = mod_regression_fixture(false);
+        if explicit {
+            Store::open_unchecked(directory.path())
+                .private("claude-completion-mode.json")
+                .write_json(&serde_json::json!({
+                    "schema":1,"mode":"legacy_stop","reason":"platform_legacy","claude_version":null
+                }))
+                .unwrap();
+        }
+        let stop: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
+        handle_hook(directory.path(), &stop["event"]).unwrap();
+        let paths = Reader::open_unchecked(directory.path()).events().unwrap();
+        assert_eq!(paths.len(), 1);
+        let event: crate::native::session::schema::SessionEvent =
+            RecordReader::at(&paths[0]).json().unwrap();
+        assert_eq!(event.message, "PROBE-DRAFT");
+        assert_eq!(event.turn_id.as_deref(), Some(MOD_REQUEST));
+        assert_eq!(event.provenance, None);
+    }
+}
+
+#[test]
+fn input_admission_refuses_before_messaging_and_journals_not_sent() {
+    use crate::native::delivery::{Outcome, TurnKind};
+
+    for native in [false, true] {
+        for kind in [TurnKind::Initial, TurnKind::FollowUp] {
+            let directory = tempfile::Builder::new()
+                .prefix("session-")
+                .tempdir()
+                .unwrap();
+            let directory = directory.path();
+            launch_preflight(directory);
+            std::fs::create_dir(directory.join("events")).unwrap();
+            if native {
+                completion::prepare(directory, false).unwrap();
+            }
+            let initial = kind == TurnKind::Initial;
+            let state = if initial {
+                SessionState::Working
+            } else {
+                SessionState::Ready
+            };
+            crate::native::session::update_status(directory, state, None, None).unwrap();
+            let store = Store::open_unchecked(directory);
+            let mut claim = if initial {
+                turn::claim(&store, &[]).unwrap()
+            } else {
+                turn::claim_ready(
+                    &store,
+                    directory.file_name().unwrap().to_str().unwrap(),
+                    &[],
+                )
+                .unwrap()
+                .0
+            };
+            claim.begin_delivery().unwrap();
+            let token = claim.token().to_owned();
+            let surface = serde_json::from_value(serde_json::json!({
+                "terminal":"windows-console","session_id":"unused-surface"
+            }))
+            .unwrap();
+            let mut context = super::super::transport_test_context(directory, &surface, kind);
+            context.claim_token = &token;
+            context.deadline = Instant::now();
+            context.provider_path = Path::new("must-not-start-a-messenger");
+            let prepared = ClaudeMessage.prepare(&context).unwrap();
+            let Outcome::NotSent(error) = ClaudeMessage.send(&context, &prepared, None) else {
+                panic!("unready or legacy sessions must refuse before input");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(if native {
+                    "readiness was not observed"
+                } else if cfg!(windows) {
+                    "close and reopen"
+                } else {
+                    "fresh ask"
+                }),
+                "{message}"
+            );
+            assert!(!directory.join(PENDING_TURN_FILE).exists());
+            assert!(!directory.read_dir().unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("claude-message-")
+            }));
+            claim
+                .settle_delivery(turn::Delivery::NotSent(&error))
+                .unwrap();
+            let events = store.events().unwrap();
+            assert_eq!(events.len(), 1);
+            let event: crate::native::session::schema::SessionEvent =
+                RecordReader::at(&events[0]).json().unwrap();
+            assert_eq!(event.provider, "claude");
+            assert_eq!(event.provenance.as_deref(), Some("delivery_not_sent"));
+            assert_eq!(event.error.as_deref(), Some(message.as_str()));
+            assert!(event.message.is_empty());
+            assert!(event.turn_id.is_none());
+            assert!(event.provider_session_id.is_none());
+            assert!(turn::current_claim_token(&store).unwrap().is_none());
+            assert_eq!(
+                store.status().unwrap().state,
+                if initial {
+                    SessionState::Failed
+                } else {
+                    SessionState::Ready
+                }
+            );
+        }
+    }
 }
 
 // The watcher of a plan whose completion arrives through the hook alone: starting it on a
@@ -827,22 +933,11 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
 }
 
 #[test]
-fn session_settings_capture_inbound_policy_and_completion_hooks() {
-    let settings = hook_settings(Path::new("/opt/Agent Bridge/bin/agent-bridge"));
-    assert_eq!(settings["crossSessionInbound"], "accept");
+fn session_settings_enable_inbound_without_classic_completion_hooks() {
     assert_eq!(
-        settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "/opt/Agent Bridge/bin/agent-bridge"
+        completion::settings(Path::new("unused-bridge")),
+        serde_json::json!({"crossSessionInbound":"accept"})
     );
-    assert_eq!(
-        settings["hooks"]["Stop"][0]["hooks"][0]["args"],
-        serde_json::json!(["native-hook", "claude"])
-    );
-    assert_eq!(
-        settings["hooks"]["StopFailure"][0]["hooks"][0]["args"],
-        serde_json::json!(["native-hook", "claude"])
-    );
-    assert!(settings["hooks"]["PermissionRequest"].is_null());
 }
 
 #[test]
@@ -852,8 +947,8 @@ fn every_platform_uses_the_official_cross_session_path_without_resume_fallback()
         "provider-cross-session-message"
     );
     assert_eq!(
-        delivery::LAUNCH_ARGUMENT.facts().readiness,
-        Readiness::LaunchArgument
+        ADAPTER.initial_transport().facts().name,
+        "provider-cross-session-message"
     );
     assert_eq!(
         ClaudeMessage.facts().readiness,
@@ -1382,7 +1477,7 @@ fn claude_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<O
 }
 
 // The complete launch command for every policy combination and both platform branches:
-// policy, private settings, managed name, and the prompt last off Windows only.
+// policy, private settings, managed name, and the completion module without a prompt.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
     for windows in [false, true] {
@@ -1426,23 +1521,14 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                             "session-macos"
                         }),
                     ]);
-                    if windows {
-                        expected.extend([
-                            OsString::from("--plugin-dir"),
-                            directory.join("claude-mod").into_os_string(),
-                        ]);
-                    }
-                    if !windows {
-                        expected.push(OsString::from("claude prompt"));
-                    }
+                    expected.extend([
+                        OsString::from("--plugin-dir"),
+                        directory.join("claude-mod").into_os_string(),
+                    ]);
                     assert_eq!(plan.arguments, expected, "{label}");
                     assert_eq!(
                         plan.initial_prompt,
-                        if windows {
-                            InitialPromptDisposition::AwaitingDelivery
-                        } else {
-                            InitialPromptDisposition::AcceptedAtSpawn
-                        },
+                        InitialPromptDisposition::AwaitingDelivery,
                         "{label}"
                     );
                     assert_no_op_watcher(plan.watcher);
@@ -1451,15 +1537,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())
                             .unwrap();
                     assert_eq!(settings["crossSessionInbound"], "accept", "{label}");
-                    if windows {
-                        assert!(settings.get("hooks").is_none(), "{label}");
-                    } else {
-                        assert_eq!(
-                            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-                            "/opt/agent-bridge",
-                            "{label}"
-                        );
-                    }
+                    assert!(settings.get("hooks").is_none(), "{label}");
                 }
             }
         }

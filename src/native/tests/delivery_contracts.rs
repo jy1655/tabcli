@@ -82,7 +82,7 @@ fn every_provider_declares_initial_and_follow_up_transports() {
             assert_eq!(input.submit_count, count);
         }
         let initial = provider::initial_transport(provider).facts();
-        if cfg!(windows) {
+        if cfg!(windows) || provider == FirstPartyCli::Claude {
             assert_eq!(
                 initial.readiness,
                 Readiness::AfterLaunch {
