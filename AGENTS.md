@@ -585,6 +585,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   surface. A changed control identity (controlling TTY, process groups) of a live incarnation is
   not a death. A second observation of the same pid is checked against the attested incarnation
   before its control fields are compared; a later snapshot with another birth is reuse (#190).
+- Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
+  launch as an exited wrapper. Live with changed or unknown control is still live; process
+  Unknown or an unreadable owner returns an error without retiring the claim. A missing owner
+  can still be registering. The launch deadline independently fails startup, without calling
+  the owner observer or implying process death.
 - Attestation reads the owner value and OS evidence only and takes no session lock; launch repair
   and close call it under their own lock. Callers (prune, repair, wait, close resume, the
   terminal adapters, reopen, the Claude registry) map the four answers in their own vocabulary
