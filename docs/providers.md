@@ -311,7 +311,7 @@ New macOS and native Windows launches, plus Windows reopens, require a recorded 
 Code 2.1.302 or newer and load a session-local Bridge completion module through Claude's official
 `--plugin-dir` flag. Bridge
 waits for that module to report readiness before sending the initial prompt. Disabled hooks
-(`disableAllHooks: true`, verified on Windows), unresolved plugin trust or provider policy can withhold
+(`disableAllHooks: true`, observed on Windows and macOS), unresolved plugin trust or provider policy can withhold
 readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
 The version floor establishes launch eligibility, not proof that the module ran.
 
@@ -382,6 +382,8 @@ has no sufficient attribution and leaves the request pending.
 See the [October 22 regression and fix record](verification/2026-10-22-windows-260-reverification.md)
 and the [earlier owner verification](verification/2026-10-19-windows-249-claude-native-completion.md)
 for observations and limits. The earlier build's marker-omission behavior is superseded here.
+The [October 23 macOS record](verification/2026-10-23-macos-249-claude-completion.md)
+covers a configured blocking Stop hook, disabled readiness and ordinary permissions on 2.1.309.
 
 An absent completion-mode record or explicit `legacy_stop` remains readable, including its
 limitation when another Stop hook continues the turn. Legacy pending requests can finish after

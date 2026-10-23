@@ -117,6 +117,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Marker omission was supported by that earlier build; the background-continuation regression
   and revised marker requirement are recorded in
   `docs/verification/2026-10-22-windows-260-reverification.md`.
+- macOS Claude 2.1.309 checks for configured Stop blocking, disabled readiness, ordinary
+  permissions and background continuation are recorded with exact binary identities in
+  `docs/verification/2026-10-23-macos-249-claude-completion.md`; they do not verify the 2.1.302 floor.
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.

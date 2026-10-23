@@ -1477,7 +1477,6 @@ fn claude_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<O
 }
 
 // The complete launch command for every policy combination and both platform branches:
-// policy, private settings, managed name, and the completion module without a prompt.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
     for windows in [false, true] {

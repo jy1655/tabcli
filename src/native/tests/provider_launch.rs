@@ -141,8 +141,7 @@ fn session_metadata_titles_drop_control_characters_and_are_bounded() {
 // workspace, with the adapter's environment removals applied and Bridge's session
 // variables set. Claude's removal list is non-empty, so a dropped list is observable; an
 // inherited CLAUDE_CODE_CHILD_SESSION is the marker that would stop the managed session
-// from registering its inbox (issue #42). The spawned process is recorded, the initial
-// prompt stays preserved while the session awaits input, and the provider's exit settles.
+// from registering its inbox (issue #42).
 #[cfg(unix)]
 #[test]
 fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
