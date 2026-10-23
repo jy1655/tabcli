@@ -81,6 +81,8 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 
 Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
+- [2026-10-22 Windows, Claude 네이티브 완료 재검증](docs/verification/2026-10-22-windows-260-reverification.md): `fa50fb8`의 첫 재검증은 백그라운드 이어짐 사례에서 실패했습니다. 수정한 `49bb9d1` 실행 파일은 Claude Code 2.1.308에서 백그라운드 `ask`와 `tell`의 표식 없는 중간 답을 후보로만 두고, 표식이 붙은 최종 답을 원래 Bridge id로 게시했습니다. 표식 없는 실제 최종 답은 호출자 제한 시간이 지난 뒤에도 대기 상태로 남았습니다. 이 검증은 표식 프로토콜을 확인한 것이며 provider가 보장하는 부모 관계를 확인한 것은 아닙니다.
+- [2026-10-19 Windows, Claude 네이티브 완료 소유자 확인](docs/verification/2026-10-19-windows-249-claude-native-completion.md): `ask`와 `tell`은 차단된 Stop 초안을 게시하지 않고 이후 최종 답을 게시했으며, 보호 태그 인용도 확인했습니다. 훅을 끄면 준비 신호가 나오지 않았습니다. 표식 누락 결과는 2026-10-22 수정으로 대체되었습니다. 지금은 표식 없는 바인딩 답을 게시하지 않고 후보로 보관합니다.
 - [2026-10-15 macOS, 배포된 0.4.9](docs/verification/2026-10-15-macos-0.4.9.md): 배포 후 iTerm2에서 네 provider의 self-test를 모두 확인했습니다. Codex·Claude는 기본값, Pi는 명시한 모델, Agy는 `--yolo`를 사용했습니다. 별도 Ghostty 검사는 설치된 실행 파일과 이미 실행 중인 앱을 사용했습니다.
 - [2026-10-07 Windows, 0.2.6](docs/verification/2026-10-07-windows-0.2.6.md): 기본 권한 모드에서 Codex·Claude·Pi의 두 요청과 종료를 확인했습니다. Agy는 도구 승인 대기가 기록된 상태로 초기 결과 제한 시간을 넘겼으며 세션은 종료했습니다.
 - [2026-10-07 macOS, 0.2.5](docs/verification/2026-10-07-macos-0.2.5.md): iTerm2에서 Codex·Claude·Agy·Pi의 초기 요청·후속 요청·종료를 모두 확인했습니다.

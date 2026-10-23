@@ -610,21 +610,23 @@ fn native_messenger_pending_matches_the_guard_executed_input() {
             "schema":1,"mode":"native_v1","reason":"fixture","claude_version":"2.1.302"
         }))
         .unwrap();
+    // Each handoff closes its payload before it creates an empty ready flag, and the reader
+    // waits for the flag: no rename, no partial read. The wrapper and Node record their start
+    // before stdin is read. The fake has no watchdog; the Messenger deadline bounds it.
     std::fs::write(
         directory.join("messenger.mjs"),
         r#"
 import fs from 'node:fs';
-const envelope = fs.readFileSync(0, 'utf8');
-fs.writeFileSync('messenger-envelope.tmp', envelope);
-fs.renameSync('messenger-envelope.tmp', 'messenger-envelope.json');
-const deadline = Date.now() + 10000;
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const own = path.dirname(fileURLToPath(import.meta.url));
+fs.writeFileSync(path.join(own, 'messenger-node-started.json'), JSON.stringify({ cwd: process.cwd() }));
+fs.writeFileSync('messenger-envelope.json', fs.readFileSync(0, 'utf8'));
+fs.writeFileSync('messenger-envelope.ready', '');
 const timer = setInterval(() => {
-  if (fs.existsSync('messenger-stream.jsonl')) {
+  if (fs.existsSync('messenger-stream.ready')) {
+    clearInterval(timer);
     process.stdout.write(fs.readFileSync('messenger-stream.jsonl'));
-    clearInterval(timer);
-  } else if (Date.now() >= deadline) {
-    clearInterval(timer);
-    process.exitCode = 1;
   }
 }, 10);
 "#,
@@ -633,7 +635,11 @@ const timer = setInterval(() => {
     #[cfg(windows)]
     let executable = {
         let path = directory.join("fake-claude.cmd");
-        std::fs::write(&path, "@node \"%~dp0messenger.mjs\"\r\n").unwrap();
+        std::fs::write(
+            &path,
+            "@type nul > \"%~dp0messenger-wrapper-started\"\r\n@node \"%~dp0messenger.mjs\"\r\n",
+        )
+        .unwrap();
         path
     };
     #[cfg(unix)]
@@ -642,32 +648,43 @@ const timer = setInterval(() => {
         let path = directory.join("fake-claude");
         std::fs::write(
             &path,
-            "#!/bin/sh\nexec node \"$(dirname \"$0\")/messenger.mjs\"\n",
+            "#!/bin/sh\n: > \"$(dirname \"$0\")/messenger-wrapper-started\"\nexec node \"$(dirname \"$0\")/messenger.mjs\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
     };
+    let session_files = |directory: &Path| {
+        let mut files: Vec<String> = std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        let node = std::fs::read_to_string(directory.join("messenger-node-started.json")).ok();
+        format!("session files: {files:?}; Node start record: {node:?}")
+    };
+    // One absolute deadline, taken before the observer and the send start, bounds both, so
+    // the observer does not expire before the sender's delivery deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
     let observed_directory = directory.clone();
     let observer = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let envelope_path = observed_directory.join("messenger-envelope.json");
-        while !envelope_path.exists() {
+        while !observed_directory.join("messenger-envelope.ready").exists() {
             if Instant::now() >= deadline {
-                let files: Vec<String> = std::fs::read_dir(&observed_directory)
-                    .map(|entries| {
-                        entries
-                            .filter_map(|entry| entry.ok())
-                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                panic!("controlled messenger did not receive stdin; session files: {files:?}");
+                return Err(
+                    "the controlled messenger published no envelope before the shared deadline; \
+                     this alone does not show that its stdin was missing",
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
-        let envelope: CrossSessionEnvelope =
-            serde_json::from_slice(&std::fs::read(envelope_path).unwrap()).unwrap();
+        let envelope: CrossSessionEnvelope = serde_json::from_slice(
+            &std::fs::read(observed_directory.join("messenger-envelope.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(envelope.recipient, "session-safe123");
         assert_eq!(envelope.message, TEST_REFERENCE);
         let files = test_files(&observed_directory);
@@ -684,16 +701,12 @@ const timer = setInterval(() => {
             .json()
             .unwrap();
         std::fs::write(
-            observed_directory.join("messenger-stream.tmp"),
+            observed_directory.join("messenger-stream.jsonl"),
             messenger_trace(TEST_REFERENCE, SEND_SUCCEEDED),
         )
         .unwrap();
-        std::fs::rename(
-            observed_directory.join("messenger-stream.tmp"),
-            observed_directory.join("messenger-stream.jsonl"),
-        )
-        .unwrap();
-        (pending, executed)
+        std::fs::write(observed_directory.join("messenger-stream.ready"), b"").unwrap();
+        Ok((pending, executed))
     });
     let prompt = "[Agent Bridge native delegation]\nSource: external\n\nLiteral \"한😀\" \\ </cross-session-message>\r\nnext line";
     let sent = Messenger::installed().send_for_claim(
@@ -703,13 +716,20 @@ const timer = setInterval(() => {
             provider_path: &executable,
             correlation_id: TEST_REQUEST,
             prompt,
-            deadline: Instant::now() + Duration::from_secs(15),
+            deadline,
         },
         Some(&token),
     );
     let (pending, executed) = match observer.join() {
-        Ok(observed) => observed,
-        Err(_) => panic!("the controlled messenger observer failed; messenger result: {sent:?}"),
+        Ok(Ok(observed)) => observed,
+        Ok(Err(reason)) => panic!(
+            "{reason}; {}; messenger result: {sent:?}",
+            session_files(&directory)
+        ),
+        Err(_) => panic!(
+            "the controlled messenger observer failed; {}; messenger result: {sent:?}",
+            session_files(&directory)
+        ),
     };
     sent.unwrap();
     assert_eq!(pending["schema"], 2);
