@@ -484,6 +484,56 @@ fn release_dependencies_and_integration_rehearsal_reject_job_local_mutations() {
 }
 
 #[test]
+fn release_downloads_only_named_release_artifacts() {
+    fn scoped_downloads(workflow: &str) -> bool {
+        let publish = release_workflow_job(workflow, "publish");
+        let downloads = publish
+            .split("\n      - ")
+            .filter(|step| step.contains("uses: actions/download-artifact@"))
+            .collect::<Vec<_>>();
+        downloads.len() == 3
+            && [
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "integrations",
+            ]
+            .iter()
+            .all(|name| {
+                downloads
+                    .iter()
+                    .filter(|step| {
+                        step.contains(&format!("\n          name: {name}\n"))
+                            && step.lines().any(|line| line == "          path: dist")
+                            && !step.contains("pattern:")
+                            && !step.contains("merge-multiple:")
+                            && (*name != "integrations"
+                                || step.contains("if: hashFiles('scripts/integrations.py') != ''"))
+                    })
+                    .count()
+                    == 1
+            })
+    }
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    assert!(scoped_downloads(&workflow));
+    for replacement in ["", "          name: '*'\n", "          pattern: '*'\n"] {
+        let mutated = mutate_release_job(
+            &workflow,
+            "publish",
+            "          name: aarch64-apple-darwin\n",
+            replacement,
+        );
+        assert!(!scoped_downloads(&mutated));
+    }
+    let mutated = mutate_release_job(
+        &workflow,
+        "publish",
+        "    steps:\n",
+        "    steps:\n      - uses: actions/download-artifact@fixture\n        with:\n          path: dist\n",
+    );
+    assert!(!scoped_downloads(&mutated));
+}
+
+#[test]
 fn release_rehearsal_never_publishes() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
     assert!(workflow.contains("\n  workflow_dispatch:\n"));
