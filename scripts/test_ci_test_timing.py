@@ -79,6 +79,31 @@ class TimingTests(unittest.TestCase):
             self.assertIsNone(data["returncode"])
             self.assertTrue(data["errors"])
 
+    def test_log_close_failure_preserves_a_failed_child(self):
+        original = Path.open
+        class LateFailure:
+            def __init__(self, handle):
+                self.handle = handle
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.close()
+            def close(self):
+                self.handle.close()
+                raise OSError("injected log close failure")
+        def open_log(path, *args, **kwargs):
+            handle = original(path, *args, **kwargs)
+            return LateFailure(handle) if path.name == "output.log" else handle
+        for exit_code in [0, 23]:
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                 mock.patch.object(Path, "open", open_log):
+                code, _, data = self.record(Path(directory), f"raise SystemExit({exit_code})")
+                self.assertEqual(code, exit_code or 1)
+                self.assertEqual(data["errors"], ["log close: injected log close failure"])
+
     def test_existing_artifact_directory_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

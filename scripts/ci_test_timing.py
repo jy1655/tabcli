@@ -211,7 +211,8 @@ def run(output, cwd, command=None, stream=None, details=None):
     # no completion; output.log is flushed as bytes arrive.
     save_record(output / "timings.json", result)
     begin = time.monotonic()
-    with (output / "output.log").open("wb") as log:
+    log = (output / "output.log").open("wb")
+    try:
         try:
             child = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT)
@@ -237,6 +238,11 @@ def run(output, cwd, command=None, stream=None, details=None):
                 raise
             finally:
                 child.stdout.close()
+    finally:
+        try:
+            log.close()
+        except OSError as error:
+            errors.append(f"log close: {error}")
     elapsed = time.monotonic() - begin
     observation.feed(b"", elapsed, final=True)
     result.update(status="completed" if returncode is not None else "spawn_failed",
