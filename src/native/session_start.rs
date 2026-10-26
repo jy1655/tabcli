@@ -2,6 +2,7 @@
 use super::args::{
     CommonStartOptions, option_value, parse_common_start_option, read_prompt_option, set_once,
 };
+use crate::native::failure_kind::DeliveryUncertain;
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::delegation_source;
 use crate::native::session::{Reader, SessionState, Store, launch, requests, turn, update_status};
@@ -287,16 +288,35 @@ impl Start {
                 extra: &result_extra,
                 baseline: 0,
             },
-            |error| {
-                source
-                    .failed(created, Failure::Delivery { error, deadline })
-                    .context(format!(
-                        "failed to deliver the initial prompt to {} session {}",
-                        provider.as_str(),
-                        created.id
-                    ))
+            |undelivered| {
+                let delivery::Undelivered { error, uncertain } = undelivered;
+                initial_delivery_failure(
+                    source.failed(created, Failure::Delivery { error, deadline }),
+                    uncertain,
+                    provider,
+                    &created.id,
+                )
             },
         )
+    }
+}
+
+// The sentence ask and reopen add to every initial Delivery failure; an uncertain one
+// marks it for the hint without changing its text or the source's error below it.
+pub(super) fn initial_delivery_failure(
+    failed: anyhow::Error,
+    uncertain: bool,
+    provider: FirstPartyCli,
+    session: &str,
+) -> anyhow::Error {
+    let message = format!(
+        "failed to deliver the initial prompt to {} session {session}",
+        provider.as_str()
+    );
+    if uncertain {
+        failed.context(DeliveryUncertain::new(message))
+    } else {
+        failed.context(message)
     }
 }
 

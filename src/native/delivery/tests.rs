@@ -302,6 +302,94 @@ fn follow_up_wording_is_byte_identical_to_0_4_3() {
 }
 
 #[test]
+fn only_an_uncertain_settlement_marks_its_own_context_and_initial_text_is_left_to_the_hook() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    for surface in [false, true] {
+        for result in ["not sent", "uncertain"] {
+            let mut f = Fixture::new();
+            f.fake.surface = surface;
+            f.fake.result = result;
+            let uncertain = result == "uncertain";
+            let undelivered = deliver(
+                f.claim(false),
+                Turn::FollowUp { prompt: "prompt" },
+                f.context(),
+                &f.fake,
+                &f.checks,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(undelivered.uncertain, uncertain, "{surface} {result}");
+            assert_eq!(
+                classify(&undelivered.error),
+                uncertain.then_some(FailureKind::DeliveryUncertain),
+                "{surface} {result}"
+            );
+            // One send, the claim kept only when uncertain, and the cause persisted as before.
+            assert_eq!(f.calls().iter().filter(|call| **call == "send").count(), 1);
+            assert_eq!(
+                turn::current_claim_token(&f.store).unwrap().is_some(),
+                uncertain
+            );
+            assert_eq!(
+                f.store.status().unwrap().error.as_deref(),
+                Some("send cause")
+            );
+
+            let mut f = Fixture::new();
+            f.fake.surface = surface;
+            f.fake.result = result;
+            let mut gate = |_| Ok(());
+            let undelivered = deliver(
+                f.claim(true),
+                Turn::Initial { gate: &mut gate },
+                f.context(),
+                &f.fake,
+                &f.checks,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                undelivered.uncertain, uncertain,
+                "initial {surface} {result}"
+            );
+            assert_eq!(format!("{:#}", undelivered.error), "send cause");
+            assert_eq!(classify(&undelivered.error), None);
+        }
+    }
+    // An exhausted budget is not sent; its class comes from the real remaining-time leaf.
+    let mut f = Fixture::new();
+    f.checks.fail = "timeout";
+    let undelivered = deliver(
+        f.claim(false),
+        Turn::FollowUp { prompt: "prompt" },
+        f.context(),
+        &f.fake,
+        &f.checks,
+    )
+    .err()
+    .unwrap();
+    assert!(!undelivered.uncertain);
+    assert_eq!(
+        format!("{:#}", undelivered.error),
+        "provider follow-up transport fake exhausted its total timeout before delivery: timed out after 30 seconds"
+    );
+    assert_eq!(classify(&undelivered.error), Some(FailureKind::TimedOut));
+    assert!(!f.calls().contains(&"send"));
+}
+
+#[test]
+fn remaining_time_expiry_keeps_its_text_and_is_typed() {
+    let error = remaining_turn_timeout(Instant::now(), Duration::from_secs(30)).unwrap_err();
+    assert_eq!(format!("{error:#}"), "timed out after 30 seconds");
+    assert_eq!(format!("{error:#?}"), "timed out after 30 seconds");
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::TimedOut)
+    );
+}
+
+#[test]
 fn initial_prompt_delay_must_fit_inside_the_original_ask_budget() {
     // Reach the delay-fit check with budget remaining; the 12-second delay
     // still cannot fit, and this check does not sleep.

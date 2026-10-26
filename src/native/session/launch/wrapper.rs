@@ -2,6 +2,7 @@
 //! runs it in the surface. Admission, the fd handoff, the owner record, the version gate,
 //! the provider plan, the spawn with its durable identity and the exit settlement.
 use super::WRAPPER_EXIT_CODE_MARKER;
+use crate::native::failure_kind::Unsupported;
 use crate::native::reopen::{ReopenGate, read_resumed_from, record_reopen_refusal};
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
@@ -337,11 +338,11 @@ pub(in crate::native) fn check_provider_version_until(
     }
     let version = provider_version_text(&output.stdout, &output.stderr);
     if !cli_version_is_supported(provider, &version)? {
-        bail!(
+        bail!(Unsupported::new(format!(
             "{} is too old: found {version:?}, require >= {}",
             provider.as_str(),
             provider.minimum_version()
-        );
+        )));
     }
     Ok(version)
 }

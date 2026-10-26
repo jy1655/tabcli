@@ -62,6 +62,7 @@ fn ok(value: Value) -> Reply {
         ok: true,
         value,
         error: None,
+        local_kind: None,
     }
 }
 fn error(reason: &str) -> Reply {
@@ -69,6 +70,7 @@ fn error(reason: &str) -> Reply {
         ok: false,
         value: Value::Null,
         error: Some(reason.to_owned()),
+        local_kind: None,
     }
 }
 fn accepted(request: &str) -> Reply {
@@ -1260,4 +1262,208 @@ fn admission_resolves_the_workspace_before_any_root_or_command() {
         "{error:#}"
     );
     assert!(!root.exists());
+}
+
+mod connection;
+
+fn hinted(value: Value, reason: Option<&str>) -> Reply {
+    Reply {
+        ok: false,
+        value,
+        error: reason.map(str::to_owned),
+        local_kind: None,
+    }
+}
+
+#[test]
+fn a_recognized_hint_decides_the_class_with_precedence_over_timed_out_and_text() {
+    for (value, reason, expected) in [
+        (
+            json!({"failure_kind": "delivery_uncertain", "timed_out": true}),
+            Some("waiting timed out"),
+            Outcome::NotVerified,
+        ),
+        (
+            json!({"failure_kind": "delivery_uncertain"}),
+            Some("unsupported settings schema 2"),
+            Outcome::NotVerified,
+        ),
+        (
+            json!({"failure_kind": "timed_out"}),
+            Some("could not confirm delivery"),
+            Outcome::TimedOut,
+        ),
+        (
+            json!({"failure_kind": "timed_out"}),
+            Some("unsupported"),
+            Outcome::TimedOut,
+        ),
+        (
+            json!({"failure_kind": "unsupported", "timed_out": true}),
+            Some("gate"),
+            Outcome::TimedOut,
+        ),
+        (
+            json!({"failure_kind": "unsupported"}),
+            Some("may have been accepted; timed out"),
+            Outcome::Unsupported,
+        ),
+        // Hint without an error: the class still comes from the hint, with the default reason.
+        (
+            json!({"failure_kind": "unsupported", "request_state": "pending"}),
+            None,
+            Outcome::Unsupported,
+        ),
+    ] {
+        let reply = hinted(value.clone(), reason);
+        let (outcome, retained) = failure(&reply);
+        assert_eq!(outcome, expected, "{value}");
+        assert_eq!(
+            retained,
+            reason.unwrap_or("command did not provide a verified outcome"),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn absent_unknown_and_malformed_hints_keep_the_wording_classification_exactly() {
+    // The legacy matrix, including its accidental unsupported matches.
+    let reasons = [
+        Some("provider follow-up transport x could not confirm delivery: cause"),
+        Some("Agy input receipt was not confirmed; the console paste may have been accepted"),
+        Some("timed out after 30 seconds"),
+        Some("unsupported settings schema 2 in /tmp/settings.json"),
+        Some("unsupported double quote in the Windows console command"),
+        Some("unsupported CLI fixture"),
+        Some("visible terminal sessions are not supported on this operating system"),
+        Some("codex is too old: found \"codex 0.1\", require >= 0.2"),
+        Some("Codex follow-up is unavailable: no terminal input was sent"),
+        Some("permission refused"),
+        None,
+    ];
+    let hints = [
+        None,
+        Some(json!(null)),
+        Some(json!("not_sent")),
+        Some(json!("Timed_Out")),
+        Some(json!(7)),
+        Some(json!(["timed_out"])),
+        Some(json!({"kind": "unsupported"})),
+    ];
+    for reason in reasons {
+        for hint in &hints {
+            for extra in [
+                json!({}),
+                json!({"timed_out": true}),
+                json!({"request_state": "pending"}),
+            ] {
+                let mut value = extra.clone();
+                if let Some(hint) = hint {
+                    value["failure_kind"] = hint.clone();
+                }
+                let reply = hinted(value.clone(), reason);
+                assert_eq!(
+                    failure(&reply),
+                    legacy_failure(&reply),
+                    "{value} {reason:?}"
+                );
+            }
+        }
+    }
+    // The pinned legacy cases still classify as before when no hint exists.
+    assert_eq!(
+        failure(&error("unsupported settings schema 2")).0,
+        Outcome::Unsupported
+    );
+    assert_eq!(failure(&error("permission refused")).0, Outcome::Failed);
+}
+
+#[test]
+fn a_successful_reply_passes_whatever_hint_it_carries() {
+    for kind in ["delivery_uncertain", "timed_out", "unsupported"] {
+        let mut reply = ok(json!({"ok": true, "failure_kind": kind}));
+        reply.local_kind = Some(crate::native::failure_kind::FailureKind::TimedOut);
+        let step = step("ask", Instant::now(), &reply);
+        assert_eq!(step.outcome, Outcome::Passed);
+        assert!(step.reason.is_none());
+    }
+}
+
+#[test]
+fn an_inspect_hint_during_cleanup_still_leaves_cleanup_not_verified() {
+    let mut inspect = error("inspect failed: timed out after 10 seconds");
+    inspect.value = json!({"failure_kind": "unsupported", "stored_state": "working"});
+    let mut fake = fake([
+        accepted("request-1"),
+        result("request-1", "event-1.json"),
+        accepted("request-2"),
+        result("request-2", "event-2.json"),
+        ok(json!({"ok":true,"session":"session-owned","closed":true})),
+        inspect,
+    ]);
+    let report = run_fake(&mut fake);
+    let cleanup = report.steps.last().unwrap();
+    assert_eq!(cleanup.outcome, Outcome::NotVerified);
+    assert!(
+        cleanup
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("inspect failed: timed out after 10 seconds")
+    );
+}
+
+#[test]
+fn the_self_test_runner_classifies_its_own_deadlines_from_typed_evidence() {
+    use crate::native::failure_kind::FailureKind;
+    let mut installed = Installed {
+        executable: std::env::current_exe().unwrap(),
+        root: PathBuf::from("unused"),
+        isolated: false,
+    };
+    // Before the spawn: the budget is already spent.
+    let reply = installed.call(
+        &arguments(&[
+            "--exact",
+            "native::self_test::tests::nonreturning_command_fixture",
+            "--ignored",
+        ]),
+        Duration::ZERO,
+    );
+    assert!(!reply.ok && reply.value.is_null());
+    assert_eq!(reply.local_kind, Some(FailureKind::TimedOut));
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("self-test --exact command did not return timed out before it started")
+    );
+    assert_eq!(failure(&reply).0, Outcome::TimedOut);
+    // After the spawn: the child is ended at the deadline.
+    let reply = installed.call(
+        &arguments(&[
+            "--exact",
+            "native::self_test::tests::nonreturning_command_fixture",
+            "--ignored",
+        ]),
+        Duration::from_millis(50),
+    );
+    assert_eq!(reply.local_kind, Some(FailureKind::TimedOut));
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("self-test --exact command did not return timed out")
+    );
+    assert_eq!(failure(&reply).0, Outcome::TimedOut);
+    // A start failure is no deadline: the wording classification applies.
+    installed.executable = PathBuf::from("definitely-not-an-agent-bridge-executable");
+    let reply = installed.call(&arguments(&["ask"]), Duration::from_secs(5));
+    assert_eq!(reply.local_kind, None);
+    assert!(
+        reply
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("failed to start self-test ask command did not return")
+    );
+    assert_eq!(failure(&reply), legacy_failure(&reply));
+    assert_eq!(failure(&reply).0, Outcome::Failed);
 }

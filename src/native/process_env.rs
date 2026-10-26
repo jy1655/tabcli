@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use super::failure_kind::TimedOut;
 use super::provider;
 use super::provider_process;
 const BRIDGE_SESSION_VARIABLES: [&str; 4] = [
@@ -120,6 +121,13 @@ impl CommandOutputFailure {
     }
 }
 
+// Both checks before the spawn; the process flags stay false, the error carries the deadline.
+fn not_started_at_deadline(label: &str) -> CommandOutputFailure {
+    CommandOutputFailure::not_started(anyhow::Error::new(TimedOut::new(format!(
+        "{label} timed out before it started"
+    ))))
+}
+
 pub(in crate::native) fn command_output_until(
     command: &mut Command,
     deadline: Instant,
@@ -144,9 +152,7 @@ pub(in crate::native) fn command_output_with_stdin_until_classified(
     label: &str,
 ) -> std::result::Result<Output, CommandOutputFailure> {
     if Instant::now() >= deadline {
-        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
-            "{label} timed out before it started"
-        )));
+        return Err(not_started_at_deadline(label));
     }
     let mut stdout = tempfile::tempfile()
         .with_context(|| format!("failed to create bounded stdout storage for {label}"))
@@ -163,9 +169,7 @@ pub(in crate::native) fn command_output_with_stdin_until_classified(
         .with_context(|| format!("failed to clone bounded stderr storage for {label}"))
         .map_err(CommandOutputFailure::not_started)?;
     if Instant::now() >= deadline {
-        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
-            "{label} timed out before it started"
-        )));
+        return Err(not_started_at_deadline(label));
     }
     let mut child = command
         .stdin(stdin)
@@ -186,8 +190,10 @@ pub(in crate::native) fn command_output_with_stdin_until_classified(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(
-                    CommandOutputFailure::started(anyhow::anyhow!("{label} timed out"))
-                        .ended_at_deadline(),
+                    CommandOutputFailure::started(anyhow::Error::new(TimedOut::new(format!(
+                        "{label} timed out"
+                    ))))
+                    .ended_at_deadline(),
                 );
             }
             Err(error) => {
@@ -255,7 +261,11 @@ pub(super) mod tests {
         assert!(failure.timed_out());
         let error = failure.into_error();
 
-        assert!(format!("{error:#}").contains("test child timed out"));
+        assert_eq!(format!("{error:#}"), "test child timed out");
+        assert_eq!(
+            crate::native::failure_kind::classify(&error),
+            Some(crate::native::failure_kind::FailureKind::TimedOut)
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -273,8 +283,39 @@ pub(super) mod tests {
 
         assert!(!failure.process_started());
         assert!(!failure.timed_out());
-        assert!(
-            format!("{:#}", failure.into_error()).contains("failed to start missing test child")
+        let error = failure.into_error();
+        assert!(format!("{error:#}").contains("failed to start missing test child"));
+        // A spawn failure is no deadline.
+        assert_eq!(crate::native::failure_kind::classify(&error), None);
+    }
+
+    #[test]
+    fn a_deadline_before_the_spawn_is_typed_but_starts_and_ends_nothing() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        let failure = command_output_until_classified(&mut command, Instant::now(), "test child")
+            .unwrap_err();
+        // Existing readers keep both process facts false before a spawn.
+        assert!(!failure.process_started());
+        assert!(!failure.timed_out());
+        let error = failure.into_error();
+        assert_eq!(
+            format!("{error:#}"),
+            "test child timed out before it started"
+        );
+        assert_eq!(
+            format!("{error:#?}"),
+            format!("{:?}", "test child timed out before it started")
+        );
+        assert_eq!(
+            crate::native::failure_kind::classify(&error),
+            Some(crate::native::failure_kind::FailureKind::TimedOut)
+        );
+        // The second check, after the output files exist, builds the same failure.
+        let second = not_started_at_deadline("test child");
+        assert!(!second.process_started() && !second.timed_out());
+        assert_eq!(
+            format!("{:#}", second.into_error()),
+            "test child timed out before it started"
         );
     }
 

@@ -2,6 +2,7 @@
 use super::request::RequestState;
 use super::*;
 use crate::native::args::{option_value, parse_timeout, set_flag_once, set_once};
+use crate::native::failure_kind::FailureKind;
 use crate::native::session::primitives::valid_session_id;
 use observation::{SessionEvidence, judgment};
 
@@ -368,6 +369,8 @@ pub(in crate::native) fn one(
         last["ok"] = json!(false);
         last["timed_out"] = json!(true);
         last["error"] = json!("waiting timed out; the request was not cancelled or resent");
+        // This wait observed its own deadline; the request and its records are unchanged.
+        last["failure_kind"] = json!(FailureKind::TimedOut.as_str());
     }
     Ok(last)
 }
@@ -755,6 +758,28 @@ mod tests {
         assert_eq!(value["timed_out"], true);
         assert!(value.get("owner").is_some());
         assert_eq!(value["session_state"], "working");
+    }
+
+    #[test]
+    fn result_wait_timeout_adds_only_its_own_hint_and_writes_nothing() {
+        use crate::native::reopen::tests::snapshot_directory;
+        let fixture = seed_close_fixture(JournaledEventState::Absent);
+        let reader = Reader::open_unchecked(&fixture.directory);
+        let id = reader.snapshot().unwrap().receipts[0].request_id.clone();
+        fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
+        let root = fixture.directory.parent().unwrap();
+        let before = snapshot_directory(root);
+        let value = one(root, "session-fault", &id, Duration::from_millis(50)).unwrap();
+        assert_eq!(snapshot_directory(root), before);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["timed_out"], true);
+        assert_eq!(
+            value["error"],
+            "waiting timed out; the request was not cancelled or resent"
+        );
+        assert_eq!(value["failure_kind"], "timed_out");
+        assert_eq!(value["request_state"], "pending");
+        assert_eq!(value["request_id"], json!(id));
     }
 
     #[test]

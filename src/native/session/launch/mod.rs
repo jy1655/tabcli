@@ -7,6 +7,7 @@ use crate::native::session::state::{
 
 #[cfg(target_os = "macos")]
 use crate::native::clock::Clock;
+use crate::native::failure_kind::TimedOut;
 use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record, turn};
 use crate::native::terminal;
@@ -507,11 +508,7 @@ fn repair_with_owner(
     }
     if status.state == SessionState::Launching {
         if unix_ms() >= record.deadline_unix_ms {
-            fail_locked(
-                store,
-                &record,
-                "provider launch timed out before startup was confirmed",
-            )?;
+            fail_locked(store, &record, LAUNCH_DEADLINE)?;
         } else if let Some(owner) = observe(store)? {
             use crate::native::process_identity::ProcessObservation;
             match owner.process {
@@ -536,6 +533,8 @@ fn repair_with_owner(
     Ok(true)
 }
 
+const LAUNCH_DEADLINE: &str = "provider launch timed out before startup was confirmed";
+
 pub(in crate::native) fn wait(
     store: &Store,
     surface: &terminal::TerminalSession,
@@ -556,8 +555,9 @@ pub(in crate::native) fn wait(
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let reason = if remaining.is_zero() {
-            Some("provider launch timed out before startup was confirmed")
+        let deadline_reached = remaining.is_zero();
+        let reason = if deadline_reached {
+            Some(LAUNCH_DEADLINE)
         } else if Instant::now() >= next_probe {
             next_probe = Instant::now() + Duration::from_secs(1);
             match terminal::surface_present(
@@ -576,9 +576,13 @@ pub(in crate::native) fn wait(
         };
         if let Some(reason) = reason {
             let Some(_lock) = store.try_lock()? else {
-                bail!(
+                let message = format!(
                     "{reason}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
                 );
+                if deadline_reached {
+                    bail!(TimedOut::new(message));
+                }
+                bail!("{message}");
             };
             let record = read(store)?.context("launch receipt disappeared")?;
             let status: SessionStatus = store.status()?;
@@ -587,7 +591,13 @@ pub(in crate::native) fn wait(
             }
             fail_locked(store, &record, reason)?;
             let status: SessionStatus = store.status()?;
-            bail!("{}", status.error.as_deref().unwrap_or(reason));
+            let message = status.error.as_deref().unwrap_or(reason);
+            // The hint needs this wait's own deadline and that reason as the recorded text;
+            // another writer's status text stays a plain message.
+            if deadline_reached && message == reason {
+                bail!(TimedOut::new(message));
+            }
+            bail!("{message}");
         }
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
@@ -930,6 +940,62 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    #[test]
+    fn only_this_waits_own_recorded_deadline_carries_the_timeout_hint() {
+        use crate::native::failure_kind::{FailureKind, classify};
+        let surface: terminal::TerminalSession = serde_json::from_value(
+            serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+        )
+        .unwrap();
+        // This wait's own deadline, recorded by its own failure write.
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
+        assert_eq!(format!("{error:#?}"), format!("{LAUNCH_DEADLINE:?}"));
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut));
+        assert_eq!(
+            store.status().unwrap().error.as_deref(),
+            Some(LAUNCH_DEADLINE)
+        );
+        // A spawn in progress records other text: it stays a plain message.
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let mut record = read(&store).unwrap().unwrap();
+        record.phase = Phase::Spawning;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&record)
+            .unwrap();
+        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let recorded = store.status().unwrap().error.unwrap();
+        assert_ne!(recorded, LAUNCH_DEADLINE);
+        assert_eq!(format!("{error:#}"), recorded);
+        assert_eq!(classify(&error), None);
+        // The deadline while another holder keeps the lock: its own sentence, nothing written.
+        let (directory, token) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let before = fs::read(directory.path().join(STATUS_FILE)).unwrap();
+        let lock = store.lock().unwrap();
+        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        drop(lock);
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "{LAUNCH_DEADLINE}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
+            )
+        );
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut));
+        assert_eq!(
+            fs::read(directory.path().join(STATUS_FILE)).unwrap(),
+            before
+        );
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
     }
 
     #[test]

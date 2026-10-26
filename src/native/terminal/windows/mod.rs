@@ -2,6 +2,7 @@ pub(in crate::native) mod ownership;
 
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::console_control::{self, ResolvedAction, WindowLookup};
+use crate::native::failure_kind::Unsupported;
 use crate::native::session::{Reader, Store};
 use std::{
     ffi::OsStr,
@@ -87,10 +88,10 @@ const TAB_HOST_EXIT_WAIT: Duration = Duration::from_secs(1);
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     match preferred {
         None | Some(TerminalKind::WindowsConsole) => Ok(TerminalKind::WindowsConsole),
-        Some(kind) => bail!(
+        Some(kind) => bail!(Unsupported::new(format!(
             "{} is not available on Windows; use windows-console",
             kind.display_name()
-        ),
+        ))),
     }
 }
 
@@ -111,7 +112,10 @@ where
         .filter(|candidate| *candidate > Instant::now())
         .context("Windows console startup timeout leaves no room for exact process cleanup")?;
     if kind != TerminalKind::WindowsConsole {
-        bail!("{} is not available on Windows", kind.display_name());
+        bail!(Unsupported::new(format!(
+            "{} is not available on Windows",
+            kind.display_name()
+        )));
     }
     // Both surfaces pass this path as CreateProcessW's application name, which
     // PowerShell uses for PSHOME independently of the command line.

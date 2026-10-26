@@ -439,9 +439,10 @@ fn hold_written_after_the_claim_refuses_before_send_with_the_addressed_error() {
         claim,
         Turn::FollowUp { prompt: "prompt" },
         &run,
-        |error| {
-            hooked.borrow_mut().push(format!("{error:#}"));
-            error
+        |undelivered| {
+            assert!(!undelivered.uncertain);
+            hooked.borrow_mut().push(format!("{:#}", undelivered.error));
+            undelivered.error
         },
         &f.fake,
         &f.checks,
@@ -485,6 +486,11 @@ fn result_wait_timeout_keeps_the_inspect_context_and_skips_the_delivery_hook() {
         format!(
             "session {SESSION} in Windows Console did not return a successful result; use `{PUBLIC_COMMAND} inspect {SESSION}` to inspect its recorded state: timed out after 7 seconds"
         )
+    );
+    // The event wait's own deadline below the run's plain context.
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::TimedOut)
     );
     assert!(f.calls().contains(&"send"));
     assert_eq!(f.store.status().unwrap().state, SessionState::Working);
@@ -561,8 +567,11 @@ fn delivery_error_hook_receives_the_unwrapped_error_once() {
         let extra = ResultExtra::new();
         let run = run_fixture(&f, timing(), waiting_json(), &extra, baseline);
         let seen = RefCell::new(Vec::new());
-        let hook = |error: anyhow::Error| {
+        let uncertain = RefCell::new(Vec::new());
+        let hook = |undelivered: delivery::Undelivered| {
+            let error = undelivered.error;
             seen.borrow_mut().push(format!("{error:#}"));
+            uncertain.borrow_mut().push(undelivered.uncertain);
             error.context(Hooked)
         };
         let mut report = report();
@@ -596,6 +605,12 @@ fn delivery_error_hook_receives_the_unwrapped_error_once() {
             "provider follow-up transport fake failed: failed to type into visible Windows Console session session-test: send cause"
         };
         assert_eq!(seen.borrow().as_slice(), [expected], "{initial} {result}");
+        // The bit is Delivery's own settlement, not a reading of the text.
+        assert_eq!(
+            uncertain.borrow().as_slice(),
+            [result == "uncertain"],
+            "{initial} {result}"
+        );
         assert!(error.downcast_ref::<Hooked>().is_some());
         assert_eq!(format!("{error:#}"), format!("hooked: {expected}"));
         assert_eq!(report.address(), Some((SESSION, request_id.as_str())));

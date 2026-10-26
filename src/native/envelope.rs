@@ -1,4 +1,5 @@
 //! Shared output defaults and rendering; no session reads or writes.
+use super::failure_kind;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
@@ -11,9 +12,13 @@ pub(super) fn ok(fields: Map<String, Value>) -> Value {
     value
 }
 
+/// A typed producer marker adds the optional `failure_kind` hint; command fields still win.
 pub(super) fn error(error: &anyhow::Error, fields: Map<String, Value>) -> Value {
     let mut value =
         json!({"schema_version": SCHEMA_VERSION, "ok": false, "error": format!("{error:#}")});
+    if let Some(kind) = failure_kind::classify(error) {
+        value["failure_kind"] = json!(kind.as_str());
+    }
     value.as_object_mut().unwrap().extend(fields);
     value
 }
@@ -112,6 +117,18 @@ mod tests {
             b"{\n  \"ok\": false,\n  \"schema_version\": 7\n}\n{\n  \"error\": null,\n  \"ok\": true,\n  \"schema_version\": 8\n}\n", || {
                 print(&ok(json!({"ok": false, "schema_version": 7}).as_object().unwrap().clone())).unwrap();
                 print(&error(&anyhow::anyhow!("ignored"), json!({"ok": true, "error": null, "schema_version": 8}).as_object().unwrap().clone())).unwrap();
+            });
+    }
+
+    #[test]
+    fn a_typed_marker_adds_only_the_failure_kind_and_command_fields_still_win() {
+        assert_bytes("a_typed_marker_adds_only_the_failure_kind_and_command_fields_still_win",
+            b"{\n  \"error\": \"outer: timed out after 3 seconds\",\n  \"failure_kind\": \"timed_out\",\n  \"ok\": false,\n  \"schema_version\": 1\n}\n{\n  \"error\": \"outer: timed out after 3 seconds\",\n  \"ok\": false,\n  \"schema_version\": 1\n}\n{\n  \"error\": \"outer: timed out after 3 seconds\",\n  \"failure_kind\": null,\n  \"ok\": false,\n  \"schema_version\": 1\n}\n", || {
+                let typed = anyhow::Error::new(failure_kind::TimedOut::new("timed out after 3 seconds")).context("outer");
+                let plain = anyhow::anyhow!("timed out after 3 seconds").context("outer");
+                print(&error(&typed, Map::new())).unwrap();
+                print(&error(&plain, Map::new())).unwrap();
+                print(&error(&typed, json!({"failure_kind": null}).as_object().unwrap().clone())).unwrap();
             });
     }
 

@@ -19,6 +19,7 @@ mod delivery;
 mod diagnostics;
 mod doctor;
 mod envelope;
+mod failure_kind;
 mod hold;
 mod hook;
 #[cfg(unix)]
