@@ -137,6 +137,69 @@ The release-candidate job packages the executable and license, checks the archiv
 extracts it, and checks the extracted binary's version. This is not an authenticated live test.
 Linux CI checks portable code; Linux managed sessions remain unsupported.
 
+### Windows CI performance observations
+
+Windows CI and Release tests run the same serial Cargo command through
+`scripts/ci_test_timing.py`. It streams combined stdout/stderr, preserves a failed Cargo
+exit status, and uploads `windows-test-timing-ci-windows-latest-<attempt>` or
+`windows-test-timing-release-windows-latest-<attempt>` for 30 days, including after a failed test step.
+No artifact is available if the test step never started; cancellation or runner loss can
+also prevent a final record or upload. Historical release rehearsals whose checked-out tag
+predates the script keep the ordinary serial command.
+Capture setup failures stop the step before Cargo starts. A capture failure after a successful
+Cargo run fails the step; if Cargo itself fails, its failure status takes precedence.
+
+Completed captures contain `output.log`, `timings.json`, and `summary.md`. Before starting Cargo,
+the recorder saves a `running` record with no result; it atomically replaces it after exit.
+An interrupted capture can retain that initial record and the flushed partial log. Neither
+proves completion. Files live under `RUNNER_TEMP`, outside the checkout, and the release
+publisher downloads only its three named binary/integration artifacts.
+
+The JSON records the actual checkout SHA, tree and dirty status, command, Rust/Cargo versions,
+runner OS/architecture, CPU and image information, Cargo's reported compilation duration, each
+libtest suite's stable source identity, reported duration and counts, and test output intervals. Environment capture uses
+an explicit allowlist, not an environment dump. The workflow SHA is retained separately:
+it can differ from the source checked out by a release rehearsal.
+
+The command duration includes compilation. Start-to-result and completion-to-completion output
+intervals include buffering, fixtures, cleanup and harness overhead; they are diagnostic clues, not profiler
+measurement or provider latency. Output whose format the parser does not recognize remains
+in the raw log. Overlong or non-UTF-8 lines are not parsed and are counted diagnostically.
+A Cargo `Finished` or libtest result line whose duration or count is malformed or not
+representable is counted as unparsed; such a result line leaves its suite open. An unexpected
+parser fault stops parsing and is recorded. Neither stops Cargo or changes its exit status,
+the raw log or live output; the comparison treats both as incomplete observations.
+A suite whose parsed test count differs from libtest's result is incomplete for comparison.
+No permissions, durability, test selection, retries or concurrency are changed.
+
+Download two artifacts and compare them with Python 3.12 or newer:
+
+```sh
+python3 -I scripts/ci_test_timing.py compare before/timings.json after/timings.json
+```
+
+The comparison names different or missing runner/toolchain conditions, changed suite counts,
+dirty checkouts, and failed or incomplete runs. Matching metadata still does not control hosted
+load or caches. There is no automatic wall-clock threshold: use repeated comparable samples
+before choosing one. To collect the same evidence locally, run
+`python3 -I scripts/ci_test_timing.py run --output-dir <new-directory-outside-the-checkout>`.
+
+The SID regression guard and these observations address the repeated subprocess cost measured
+in [the Windows CI investigation](verification/2026-10-24-windows-test-runtime.md). Native
+identity and DACL readback tests remain required; performance observations do not replace them.
+
+`tests/windows_security_policy.rs` parses the production security module on every host.
+Its exact dependency allowlist rejects new subprocess APIs, helper indirections, modules,
+attributes and uninspected macros; adversarial mutations include the old `helper_command`
+route. Only the exact external `#[cfg(test)] mod tests;` declaration is exempt, so the
+Windows `whoami` test oracle remains available. Unused exceptions fail too. Update the
+allowlist only after reviewing the dependency and rerunning native Windows tests.
+This is a source boundary, not a process counter or a Rust resolver: it trusts the
+allowlisted items, does not resolve methods or associated items through `Self` or a local
+type alias, and does not detect macro shadowing in ancestor modules. It checks only the
+`security` declaration in its immediate parent: `#[path]` or `cfg` redirection of an ancestor
+module, and re-exports that route callers to another definition, are outside it.
+
 ## Manual live verification
 
 Self-test opens a real surface and makes real model calls. Authenticate the selected CLI,

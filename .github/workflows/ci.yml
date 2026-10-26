@@ -53,7 +53,22 @@ jobs:
           brew install --cask ghostty iterm2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features -- --test-threads=1
+      - name: Run serial tests
+        if: runner.os != 'Windows'
+        run: cargo test --all-targets --all-features -- --test-threads=1
+      - name: Run Windows serial tests with timing
+        if: runner.os == 'Windows'
+        env:
+          TEST_TIMING_DIR: ${{ runner.temp }}/ci-test-timing
+        run: python -I scripts/ci_test_timing.py run --output-dir "$env:TEST_TIMING_DIR"
+      - name: Preserve Windows test timing
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-test-timing-ci-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-test-timing/
+          if-no-files-found: warn
+          retention-days: 30
 
   release-build:
     # Keep these check names stable so that the main ruleset can require them.
