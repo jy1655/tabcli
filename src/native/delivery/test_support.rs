@@ -47,6 +47,10 @@ impl Transport for Fake {
         match self.result {
             "sent" => Outcome::Sent,
             "not sent" => Outcome::NotSent(anyhow::anyhow!("send cause")),
+            // An uncertain send whose cause is the production deadline leaf.
+            "uncertain timeout" => Outcome::Uncertain(
+                remaining_turn_timeout(Instant::now(), Duration::from_secs(30)).unwrap_err(),
+            ),
             _ => Outcome::Uncertain(anyhow::anyhow!("send cause")),
         }
     }

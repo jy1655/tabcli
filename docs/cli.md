@@ -1025,6 +1025,8 @@ A failed command's [`failure_kind`](#failure_kind) hint decides its step outcome
 `delivery_uncertain` is `not_verified`; otherwise `timed_out`, or an existing `timed_out: true`, is
 `timed_out`; `unsupported` is `unsupported`. Without a recognized hint, including from an older
 executable, the step keeps the classification by error wording, request state and `timed_out`.
+That wording classification is unchanged, including its known matches that are not capability
+refusals: an unsupported record schema or a rejected double quote still counts as `unsupported`.
 Cleanup that is not confirmed stays `not_verified` whatever its commands report.
 Split `request_address` at `/` and run `tabcli result SESSION --request REQUEST`. Resolve
 authentication in the provider CLI or answer a trust dialog yourself. If cleanup failed, inspect the
@@ -1460,8 +1462,11 @@ A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `ses
 An optional top-level field of a JSON error object, and of a timed-out `result --wait`. It is a
 diagnostic hint about the failed command, not a delivery record or a request state:
 
-- `delivery_uncertain`: Bridge settled the prompt's delivery as uncertain. The prompt may have
-  reached the provider and the request stays claimed; do not send it again.
+- `delivery_uncertain`: when the command ran, Bridge settled this prompt's delivery as
+  uncertain: the prompt may have reached the provider. It describes that delivery attempt, not the
+  request's current state. Uncertainty alone does not release the claim, but the target may already
+  have completed the request. Read the recorded state with `result` or `inspect`, and do not send
+  the prompt again.
 - `timed_out`: the command observed its own deadline expire. This proves neither delivery nor
   non-delivery.
 - `unsupported`: a provider version floor, the Codex native queue version floor, or a terminal
@@ -1472,10 +1477,10 @@ When more than one applies, `delivery_uncertain` wins over `timed_out`, which wi
 Absence means unknown or not classified, never not sent. No value permits an automatic retry.
 `schema_version` stays 1, and `ok`, `error`, `request_state` and `timed_out` keep their meanings;
 command fields override the hint. The field is not persisted, so `result`, `inspect` and the
-timeline do not report it for a recorded failure. It is also absent wherever an error is only
-text: recorded provider, launch and wrapper failures, helper and terminal-automation output,
-`close-session` stderr, argument errors, and other adapter or platform refusals and deadlines,
-whose wording self-test still classifies.
+timeline do not report it for a recorded failure. Text alone supplies no hint: recorded provider,
+launch and wrapper failures, helper and terminal-automation output, `close-session` stderr,
+argument errors, and other adapter or platform refusals and deadlines. When such text is the
+cause of an uncertain delivery, that delivery still supplies its own `delivery_uncertain`.
 
 ### hold
 
