@@ -5,6 +5,7 @@ use super::{
 };
 use crate::native::clock::Clock;
 use crate::native::delivery::Outcome;
+use crate::native::failure_kind::Unsupported;
 use crate::native::provider::CrossSessionMessageContext;
 use crate::native::session::Reader;
 use agent_bridge::PUBLIC_COMMAND;
@@ -62,10 +63,13 @@ pub(super) fn send_native_queue_message<C: Clock>(
     match codex_version_supports_native_queue(&manifest.provider_version) {
         Ok(true) => {}
         Ok(false) => {
-            return Err(queue_unavailable(anyhow::anyhow!(
-                "Codex {} predates native queue support in 0.149.0",
-                manifest.provider_version
-            )));
+            // Only the version floor is a capability gate; the shared context stays text.
+            return Err(queue_unavailable(anyhow::Error::new(Unsupported::new(
+                format!(
+                    "Codex {} predates native queue support in 0.149.0",
+                    manifest.provider_version
+                ),
+            ))));
         }
         Err(error) => return Err(Outcome::NotSent(error)),
     }

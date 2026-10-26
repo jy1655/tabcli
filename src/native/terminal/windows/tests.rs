@@ -1237,3 +1237,30 @@ fn attached_dispatch_holds_claim_until_write_returns() {
         claim.retain();
     }
 }
+
+#[test]
+fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    assert_eq!(
+        super::select(None).unwrap(),
+        terminal::TerminalKind::WindowsConsole
+    );
+    let refused = super::select(Some(terminal::TerminalKind::Iterm2)).unwrap_err();
+    assert_eq!(
+        format!("{refused:#}"),
+        "iTerm2 is not available on Windows; use windows-console"
+    );
+    assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
+    // The open guard refuses before any process, binding or unbinding.
+    let refused = super::open_bound_tab(
+        terminal::TerminalKind::Iterm2,
+        "command",
+        Path::new("unused"),
+        Instant::now() + Duration::from_secs(30),
+        |_| unreachable!("a refused kind is never bound"),
+        || unreachable!("a refused kind is never unbound"),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{refused:#}"), "iTerm2 is not available on Windows");
+    assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
+}

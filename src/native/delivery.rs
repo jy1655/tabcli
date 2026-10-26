@@ -1,4 +1,5 @@
 //! Delivery owns the ordering and settlement of a claimed Turn. Adapters own Transport.
+use super::failure_kind::{DeliveryUncertain, TimedOut};
 use super::session::{Reader, RecordStore, SessionState, turn};
 use super::terminal;
 use anyhow::{Context, Result, bail};
@@ -198,7 +199,24 @@ impl DeliveryContext<'_> {
     }
 }
 
+/// A failed Delivery and whether its prompt may have reached the provider. Only the Turn
+/// run's hook reads `uncertain`, to mark the context it already adds; nothing persists it.
+pub(in crate::native) struct Undelivered {
+    pub(in crate::native) error: anyhow::Error,
+    pub(in crate::native) uncertain: bool,
+}
+
+impl Undelivered {
+    fn not_uncertain(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            uncertain: false,
+        }
+    }
+}
+
 // Context is added only after settlement: status.error retains the provider/check cause.
+// An uncertain send marks its outermost existing context; the text is unchanged.
 #[derive(Clone, Copy)]
 enum Stage {
     Bare,
@@ -219,11 +237,18 @@ fn follow_up_error(
         Stage::Prepare if facts.surface.is_some() => error.context(format!(
             "failed to prepare input for visible {} session {}", context.surface.kind.display_name(), context.session_id))
             .context(format!("provider follow-up transport {name} failed")),
-        Stage::Send if facts.surface.is_some() => error.context(format!(
-            "failed to type into visible {} session {}", context.surface.kind.display_name(), context.session_id))
-            .context(format!("provider follow-up transport {name} failed")),
-        Stage::Send if uncertain => error.context(format!(
-            "provider follow-up transport {name} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed")),
+        Stage::Send if facts.surface.is_some() => {
+            let error = error.context(format!(
+                "failed to type into visible {} session {}", context.surface.kind.display_name(), context.session_id));
+            let message = format!("provider follow-up transport {name} failed");
+            if uncertain {
+                error.context(DeliveryUncertain::new(message))
+            } else {
+                error.context(message)
+            }
+        }
+        Stage::Send if uncertain => error.context(DeliveryUncertain::new(format!(
+            "provider follow-up transport {name} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed"))),
         Stage::Send => error.context(format!("provider follow-up transport {name} failed")),
         Stage::Remaining if facts.surface.is_some() => error.context(format!(
             "provider follow-up transport {name} exhausted its total timeout before delivery")),
@@ -233,17 +258,32 @@ fn follow_up_error(
     }
 }
 
+// The plain form that delivery/tests.rs drives; the Turn run uses `deliver`.
+#[cfg(test)]
 pub(in crate::native) fn deliver_with(
+    claim: turn::Claim,
+    turn: Turn<'_>,
+    context: DeliveryContext<'_>,
+    transport: &dyn Transport,
+    checks: &dyn Checks,
+) -> Result<Delivered> {
+    deliver(claim, turn, context, transport, checks).map_err(|undelivered| undelivered.error)
+}
+
+/// Deliver the Turn; a failure keeps whether its prompt may have been delivered.
+pub(in crate::native) fn deliver(
     mut claim: turn::Claim,
     mut turn: Turn<'_>,
     context: DeliveryContext<'_>,
     transport: &dyn Transport,
     checks: &dyn Checks,
-) -> Result<Delivered> {
+) -> std::result::Result<Delivered, Undelivered> {
     let facts = transport.facts();
     let initial = matches!(turn, Turn::Initial { .. });
     if initial && facts.readiness == Readiness::LaunchArgument {
-        claim.settle_delivery(turn::Delivery::Sent)?;
+        claim
+            .settle_delivery(turn::Delivery::Sent)
+            .map_err(Undelivered::not_uncertain)?;
         return Ok(Delivered {
             correlation_id: None,
         });
@@ -326,11 +366,13 @@ pub(in crate::native) fn deliver_with(
                 if let Err(error) = claim.complete_initial_delivery() {
                     drop(prompt_file.take());
                     let _ = claim.record_delivery_diagnostic(&error);
-                    return Err(error);
+                    return Err(Undelivered::not_uncertain(error));
                 }
             } else {
                 drop(prompt_file.take());
-                claim.settle_delivery(turn::Delivery::Sent)?;
+                claim
+                    .settle_delivery(turn::Delivery::Sent)
+                    .map_err(Undelivered::not_uncertain)?;
             }
             Ok(Delivered {
                 correlation_id: prepared.and_then(|p| p.correlation_id),
@@ -342,7 +384,7 @@ pub(in crate::native) fn deliver_with(
                 prepared.as_ref(),
             );
             let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-            Err(if initial {
+            Err(Undelivered::not_uncertain(if initial {
                 error
             } else {
                 follow_up_error(
@@ -352,20 +394,24 @@ pub(in crate::native) fn deliver_with(
                     &context.turn_context(initial, &token, &prompt, &executable),
                     false,
                 )
-            })
+            }))
         }
         Outcome::Uncertain(error) => {
             let _ = claim.settle_delivery(turn::Delivery::Uncertain(&error));
-            Err(if initial {
-                error
-            } else {
-                follow_up_error(
-                    error,
-                    stage,
-                    &facts,
-                    &context.turn_context(initial, &token, &prompt, &executable),
-                    true,
-                )
+            Err(Undelivered {
+                // Initial Delivery adds no context; the Turn run's hook marks its own.
+                error: if initial {
+                    error
+                } else {
+                    follow_up_error(
+                        error,
+                        stage,
+                        &facts,
+                        &context.turn_context(initial, &token, &prompt, &executable),
+                        true,
+                    )
+                },
+                uncertain: true,
             })
         }
     }
@@ -410,7 +456,7 @@ pub(in crate::native) fn remaining_turn_timeout(
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
+        .with_context(|| TimedOut::new(format!("timed out after {} seconds", requested.as_secs())))
 }
 
 pub(in crate::native) fn terminal_input_bytes(

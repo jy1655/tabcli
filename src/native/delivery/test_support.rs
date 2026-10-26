@@ -90,7 +90,8 @@ impl Checks for Check {
             f();
         }
         if self.fail == "timeout" {
-            anyhow::bail!("timed out after 30 seconds");
+            // The production leaf: an expired deadline, with its typed deadline marker.
+            return remaining_turn_timeout(Instant::now(), Duration::from_secs(30));
         }
         Ok(Duration::from_secs(20))
     }
@@ -111,7 +112,27 @@ pub(in crate::native) struct Fixture {
 }
 impl Fixture {
     pub(in crate::native) fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::at(tempfile::tempdir().unwrap())
+    }
+    /// The same fixture as a session of `root`, named by its directory, so the addressed
+    /// error output can read its request through the state root.
+    pub(in crate::native) fn in_state_root(root: &Path) -> Self {
+        Self::at(
+            tempfile::Builder::new()
+                .prefix("session-")
+                .tempdir_in(root)
+                .unwrap(),
+        )
+    }
+    pub(in crate::native) fn session_id(&self) -> String {
+        self._dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+    fn at(dir: tempfile::TempDir) -> Self {
         let store = Store::open_unchecked(dir.path());
         fs::create_dir(store.record(CoreRecord::Events).path()).unwrap();
         // A refusal event names the session's provider from the manifest.

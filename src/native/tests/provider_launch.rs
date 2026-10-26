@@ -375,7 +375,16 @@ fn provider_version_check_preserves_output_selection_and_failures() {
             } else {
                 check_provider_version(FirstPartyCli::Agy, &executable)
             }
-            .map_err(|error| error.to_string());
+            .map_err(|error| {
+                // Only the version floor is a capability gate; parse and exit errors are not.
+                assert_eq!(
+                    crate::native::failure_kind::classify(&error)
+                        == Some(crate::native::failure_kind::FailureKind::Unsupported),
+                    error.to_string().contains(" is too old: found "),
+                    "{error:#}"
+                );
+                error.to_string()
+            });
             assert_eq!(
                 actual.as_deref().map_err(String::as_str),
                 expected,

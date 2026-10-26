@@ -1,6 +1,7 @@
 use super::args::{option_value, set_flag_once};
 use super::session_start::parse_ask;
 use super::sessions::{parse as parse_sessions, sessions_in_read_only};
+use crate::native::failure_kind::{self, FailureKind};
 use crate::native::session::primitives::{
     STATE_DIR_ENV, require_valid_session_id, valid_session_id,
 };
@@ -110,6 +111,33 @@ struct Reply {
     ok: bool,
     value: Value,
     error: Option<String>,
+    // The class of this process's own runner failure; a child's hint is in `value`.
+    local_kind: Option<FailureKind>,
+}
+
+// The child's stdout JSON, or its stderr when it exited unsuccessfully without an error field.
+fn reply_from_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Reply {
+    let value: Value = serde_json::from_slice(stdout).unwrap_or(Value::Null);
+    let error = value["error"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| (!success).then(|| String::from_utf8_lossy(stderr).trim().to_owned()));
+    Reply {
+        ok: success && value["ok"] == true,
+        value,
+        error,
+        local_kind: None,
+    }
+}
+
+// No child output: the runner's own failure, classified by its typed evidence, not its text.
+fn reply_from_runner_error(error: &anyhow::Error) -> Reply {
+    Reply {
+        ok: false,
+        value: Value::Null,
+        error: Some(error.to_string()),
+        local_kind: failure_kind::classify(error),
+    }
 }
 
 // Public command execution and ownership discovery are the only runtime-facing operations.
@@ -156,22 +184,9 @@ impl Operations for Installed {
         });
         match output {
             Ok(output) => {
-                let value: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-                let error = value["error"].as_str().map(str::to_owned).or_else(|| {
-                    (!output.status.success())
-                        .then(|| String::from_utf8_lossy(&output.stderr).trim().to_owned())
-                });
-                Reply {
-                    ok: output.status.success() && value["ok"] == true,
-                    value,
-                    error,
-                }
+                reply_from_output(output.status.success(), &output.stdout, &output.stderr)
             }
-            Err(error) => Reply {
-                ok: false,
-                value: Value::Null,
-                error: Some(error.to_string()),
-            },
+            Err(error) => reply_from_runner_error(&error),
         }
     }
 
@@ -229,7 +244,31 @@ fn arguments(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
+// A recognized producer hint decides the class without reading the reason text: delivery
+// uncertainty first, then a deadline (including the existing timed_out), then unsupported.
+// An absent, unknown or malformed hint keeps the wording classification unchanged.
 fn failure(reply: &Reply) -> (Outcome, String) {
+    let Some(kind) = reply
+        .local_kind
+        .or_else(|| FailureKind::from_hint(&reply.value["failure_kind"]))
+    else {
+        return legacy_failure(reply);
+    };
+    let reason = reply
+        .error
+        .clone()
+        .unwrap_or_else(|| "command did not provide a verified outcome".to_owned());
+    let outcome = if kind == FailureKind::DeliveryUncertain {
+        Outcome::NotVerified
+    } else if reply.value["timed_out"] == true || kind == FailureKind::TimedOut {
+        Outcome::TimedOut
+    } else {
+        Outcome::Unsupported
+    };
+    (outcome, reason)
+}
+
+fn legacy_failure(reply: &Reply) -> (Outcome, String) {
     let reason = reply
         .error
         .clone()

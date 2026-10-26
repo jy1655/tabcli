@@ -1291,6 +1291,26 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
             ),
             "{reported:#}"
         );
+        // Start::run adds the same initial Delivery sentence for ask and reopen; marking it
+        // keeps the typed refusal and its gate below.
+        let text = format!("{reported:#}");
+        let marked = crate::native::session_start::initial_delivery_failure(
+            reported,
+            true,
+            agent_bridge::FirstPartyCli::Claude,
+            "session-reopenrefuse",
+        );
+        assert_eq!(reopen_refusal_gate(&marked), Some(gate));
+        assert_eq!(
+            crate::native::failure_kind::classify(&marked),
+            Some(crate::native::failure_kind::FailureKind::DeliveryUncertain)
+        );
+        assert_eq!(
+            format!("{marked:#}"),
+            format!(
+                "failed to deliver the initial prompt to claude session session-reopenrefuse: {text}"
+            )
+        );
         let detected = reopen_refusal(gate, "detected; no prompt was delivered".to_owned());
         let reported = close_surface_after_reopen_verification_failure_with(
             "session-reopenrefuse",

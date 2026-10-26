@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// Compiled into every test build so its refusal is tested on every CI target.
+#[cfg(any(not(any(target_os = "macos", target_os = "windows")), test))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 mod refusing;
 #[cfg(target_os = "windows")]
 pub(in crate::native) mod windows;

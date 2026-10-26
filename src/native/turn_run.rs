@@ -52,7 +52,7 @@ pub(super) fn run(
     claim: turn::Claim,
     turn: Turn<'_>,
     run: &TurnRun<'_>,
-    on_delivery_error: impl FnOnce(anyhow::Error) -> anyhow::Error,
+    on_delivery_error: impl FnOnce(delivery::Undelivered) -> anyhow::Error,
 ) -> Result<()> {
     let transport = match turn {
         Turn::Initial { .. } => provider::initial_transport(run.facts.provider),
@@ -70,16 +70,17 @@ pub(super) fn run(
 }
 
 /// In order: copy the Claim's token and Receipt; address the report; deliver through
-/// `delivery::deliver_with`; on a Delivery error call `on_delivery_error` exactly once with
-/// the unwrapped error and return its result (the caller adds its own context); on
-/// success emit the accepted result (detach) or wait for the Claim-addressed Result and
-/// emit it with the event. Wait and emission errors never reach `on_delivery_error`.
+/// `delivery::deliver`; on a Delivery error call `on_delivery_error` exactly once with
+/// the unwrapped error and its uncertainty, and return its result (the caller adds its
+/// own context); on success emit the accepted result (detach) or wait for the
+/// Claim-addressed Result and emit it with the event. Wait and emission errors never
+/// reach `on_delivery_error`.
 pub(super) fn run_with(
     report: &mut TurnReport,
     claim: turn::Claim,
     turn: Turn<'_>,
     run: &TurnRun<'_>,
-    on_delivery_error: impl FnOnce(anyhow::Error) -> anyhow::Error,
+    on_delivery_error: impl FnOnce(delivery::Undelivered) -> anyhow::Error,
     transport: &dyn Transport,
     checks: &dyn Checks,
 ) -> Result<()> {
@@ -93,7 +94,7 @@ pub(super) fn run_with(
     let claim_token = claim.token().to_owned();
     let receipt = claim.receipt().clone();
     report.addressed(facts.id.to_owned(), receipt.request_id.clone());
-    let delivered = delivery::deliver_with(
+    let delivered = delivery::deliver(
         claim,
         turn,
         DeliveryContext {
@@ -109,7 +110,7 @@ pub(super) fn run_with(
     );
     let expected_turn_id = match delivered {
         Ok(delivered) => delivered.correlation_id,
-        Err(error) => return Err(on_delivery_error(error)),
+        Err(undelivered) => return Err(on_delivery_error(undelivered)),
     };
 
     if output.detach {

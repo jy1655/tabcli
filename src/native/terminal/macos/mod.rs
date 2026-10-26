@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::native::failure_kind::Unsupported;
 use crate::native::settings::MacosOpenMode;
 use anyhow::{Context, Result, bail};
 
@@ -167,7 +168,9 @@ where
             TerminalKind::Ghostty => Ok(&self.ghostty),
             TerminalKind::WezTerm => Ok(&self.wezterm),
             TerminalKind::Warp => Ok(&self.warp),
-            TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+            TerminalKind::WindowsConsole => bail!(Unsupported::new(
+                "Windows Console is only available on Windows"
+            )),
         }
     }
 }
@@ -722,6 +725,11 @@ mod adapter_tests {
         assert_eq!(
             failure.error().to_string(),
             "Windows Console is only available on Windows"
+        );
+        // A real platform gate: the error carries the unsupported hint.
+        assert_eq!(
+            crate::native::failure_kind::classify(failure.error()),
+            Some(crate::native::failure_kind::FailureKind::Unsupported)
         );
         // Warp's send refusal is the adapter's own and separate from its declared ones.
         let failure = send_file(

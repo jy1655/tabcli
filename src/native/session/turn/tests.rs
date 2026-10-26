@@ -28,6 +28,44 @@ fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
     (directory, store)
 }
 
+#[test]
+fn readiness_wait_expiry_keeps_its_text_and_only_its_own_deadline_is_typed() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    let (_directory, store) = fixture(SessionState::Launching);
+    let error = wait_for_status(
+        store.directory(),
+        SessionState::AwaitingInitialInput,
+        Instant::now(),
+        Duration::from_secs(7),
+    )
+    .unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "timed out after 7 seconds waiting for session state {}",
+            SessionState::AwaitingInitialInput
+        )
+    );
+    assert_eq!(classify(&error), Some(FailureKind::TimedOut));
+    // A recorded error of an ended session is text from another writer, not this deadline.
+    update_status(
+        store.directory(),
+        SessionState::Failed,
+        None,
+        Some("provider timed out upstream".to_owned()),
+    )
+    .unwrap();
+    let error = wait_for_status(
+        store.directory(),
+        SessionState::AwaitingInitialInput,
+        Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(7),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), "provider timed out upstream");
+    assert_eq!(classify(&error), None);
+}
+
 fn refusal_event(store: &Store, claim_token: &str, error: &str) -> SessionEvent {
     let receipt = requests::for_claim(store, claim_token).unwrap().unwrap();
     let event = store.event_strict(&receipt.event_file).unwrap();

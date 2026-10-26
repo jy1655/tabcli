@@ -127,8 +127,8 @@ Human output prints `session:`, `request:`, then the result when waiting complet
 success has `request_state: "accepted"` and a null `result`; a waited success has `request_state:
 "completed"`. See the [JSON field reference](#json-field-reference).
 After arguments have been parsed successfully, with `--json`, failures before a request address exists
-print an error object containing only `ok: false`, `error`, and `schema_version`; later failures include
-the request address.
+print an error object containing only `ok: false`, `error`, `schema_version`, and the optional
+[`failure_kind`](#failure_kind) hint; later failures include the request address.
 
 Without `--detach`, exit 0 means Bridge received a successful result. With it, exit 0 means the
 launch and delivery steps succeeded; retrieve the result using the returned request id.
@@ -661,7 +661,8 @@ Without `--wait`, a readable `--request` can exit 0 while reporting `pending`, `
 empty latest/event selection fails. With `--wait`, only `completed` succeeds; a terminal failure,
 unresolved request, required recovery, dead owner, or timeout ends the wait unsuccessfully. If the
 wait times out, query the same request again; do not send its prompt again. The request has not been
-cancelled. `--list` can succeed with no entries. A missing receipt means the request cannot be
+cancelled. A timed-out wait's JSON adds `failure_kind: "timed_out"` beside `timed_out: true`; the
+wait reads and writes no other record to add it. `--list` can succeed with no entries. A missing receipt means the request cannot be
 addressed that way; use event selection for legacy records. `recovery_required` means observation
 cannot publish the completion; `sessions` is the public command that can finish those updates. Run
 it for the session's workspace, then query the request again.
@@ -1020,6 +1021,11 @@ reference](#json-field-reference).
 Exit 0 requires a fully verified round trip and cleanup. Outcomes are `passed`, `failed`,
 `timed_out`, `unsupported`, and `not_verified`. Authentication failures, unsupported delivery, trust
 dialogs, wrong results, or unverified cleanup prevent success. Read the failed step's `reason`.
+A failed command's [`failure_kind`](#failure_kind) hint decides its step outcome when present:
+`delivery_uncertain` is `not_verified`; otherwise `timed_out`, or an existing `timed_out: true`, is
+`timed_out`; `unsupported` is `unsupported`. Without a recognized hint, including from an older
+executable, the step keeps the classification by error wording, request state and `timed_out`.
+Cleanup that is not confirmed stays `not_verified` whatever its commands report.
 Split `request_address` at `/` and run `tabcli result SESSION --request REQUEST`. Resolve
 authentication in the provider CLI or answer a trust dialog yourself. If cleanup failed, inspect the
 reported session and use `close-session SESSION --explicit`; do not rerun the model prompt to test
@@ -1364,7 +1370,9 @@ report a failed request or an unavailable capability. After arguments have been 
 with `--json`, every failure of `ask`, `tell` and `reopen` prints one JSON error object: with the request
 address once a request exists (and the recorded request state when it can be read), and with the fields
 the command already knows before one exists (`session` for `tell`, `source_session` and `gate` for `reopen`). Argument-parsing
-failures of these three commands still report on stderr without a JSON error object.
+failures of these three commands still report on stderr without a JSON error object. A JSON error
+object can add the optional [`failure_kind`](#failure_kind) hint; its other fields and the stderr
+text are unchanged.
 Human result text has terminal control characters escaped.
 The JSON examples in this reference are trimmed excerpts with invented values, not complete response schemas.
 
@@ -1447,6 +1455,28 @@ and `question_observation`, as described in [result](#result); it never adds que
 A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `session`, and `error`, without
 `request_id`; a claim-stage race can leave an unresolved receipt visible through `result --list`.
 
+### failure_kind
+
+An optional top-level field of a JSON error object, and of a timed-out `result --wait`. It is a
+diagnostic hint about the failed command, not a delivery record or a request state:
+
+- `delivery_uncertain`: Bridge settled the prompt's delivery as uncertain. The prompt may have
+  reached the provider and the request stays claimed; do not send it again.
+- `timed_out`: the command observed its own deadline expire. This proves neither delivery nor
+  non-delivery.
+- `unsupported`: a provider version floor, the Codex native queue version floor, or a terminal
+  platform gate refused the operation.
+
+When more than one applies, `delivery_uncertain` wins over `timed_out`, which wins over
+`unsupported`; an existing `timed_out: true` likewise takes precedence over `unsupported`.
+Absence means unknown or not classified, never not sent. No value permits an automatic retry.
+`schema_version` stays 1, and `ok`, `error`, `request_state` and `timed_out` keep their meanings;
+command fields override the hint. The field is not persisted, so `result`, `inspect` and the
+timeline do not report it for a recorded failure. It is also absent wherever an error is only
+text: recorded provider, launch and wrapper failures, helper and terminal-automation output,
+`close-session` stderr, argument errors, and other adapter or platform refusals and deadlines,
+whose wording self-test still classifies.
+
 ### hold
 
 Fields: `schema_version`, `ok`, `session`, `held`, `changed`; malformed intent adds
@@ -1467,7 +1497,8 @@ and `cleanup_sessions`. Steps contain `name`, `outcome`, `elapsed_ms`, `request_
 `event_address`, and `reason`; cleanup entries contain `session`, `session_state`, `outcome`, and
 `reason`. An Agy result timeout can append the same request's tool-confirmation observation
 from `doctor` to the existing step `reason`; a Pi result timeout can append the session's
-provider credential readiness. No field is added. `state_root` is null only when launch admission
+provider credential readiness. No field is added. A step's outcome uses a command's
+[`failure_kind`](#failure_kind) hint as described in [self-test](#self-test). `state_root` is null only when launch admission
 refused an isolated test before its private directory existed; that report has one step,
 `admission`.
 

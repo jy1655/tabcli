@@ -161,6 +161,7 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
             extra: &serde_json::Map::new(),
             baseline,
         },
-        |error| error,
+        // Delivery already marked an uncertain follow-up's own context.
+        |undelivered| undelivered.error,
     )
 }

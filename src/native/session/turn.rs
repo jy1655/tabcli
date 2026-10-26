@@ -1,4 +1,5 @@
 //! Claims, receipts, completion publication and recovery for one session.
+use crate::native::failure_kind::TimedOut;
 use crate::native::session;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::schema::{
@@ -1083,10 +1084,10 @@ pub(in crate::native) fn wait_for_status(
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .with_context(|| {
-                format!(
+                TimedOut::new(format!(
                     "timed out after {} seconds waiting for session state {expected_state}",
                     requested.as_secs()
-                )
+                ))
             })?;
         thread::sleep(remaining.min(Duration::from_millis(50)));
     }
@@ -1143,7 +1144,9 @@ fn wait_for_event_for_turn_until(
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
-            .with_context(|| format!("timed out after {} seconds", requested.as_secs()))?;
+            .with_context(|| {
+                TimedOut::new(format!("timed out after {} seconds", requested.as_secs()))
+            })?;
         thread::sleep(remaining.min(Duration::from_millis(200)));
     }
 }
