@@ -32,6 +32,20 @@ FINISHED = re.compile(r"^\s*Finished (.+) in ((?:(\d+)m )?([0-9.]+)s)$")
 MAX_LINE = 1024 * 1024
 
 
+# Lookalike output can carry numbers that no Cargo or libtest line prints.
+def parsed_count(text):
+    # libtest counts are usize; int() also refuses more than 4300 digits.
+    return int(text) if len(text) <= 20 else None
+
+
+def parsed_seconds(text, minutes="0"):
+    try:
+        value = 60 * float(minutes) + float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
 class Observation:
     """Output arrival intervals include buffering and harness/fixture work."""
 
@@ -40,6 +54,8 @@ class Observation:
         self.discard_line = False
         self.unparsed_long_lines = 0
         self.non_utf8_lines = 0
+        self.unparsed_numbers = 0
+        self.parser_error = None
         self.suites = []
         self.tests = []
         self.compilation = []
@@ -59,11 +75,15 @@ class Observation:
             self.target = running[1].replace("\\", "/")
         finished = FINISHED.match(line)
         if finished:
-            self.compilation.append({
-                "profile": finished[1],
-                "reported_seconds": 60 * int(finished[3] or 0) + float(finished[4]),
-                "observed_at_seconds": elapsed,
-            })
+            reported = parsed_seconds(finished[4], finished[3] or "0")
+            if reported is None:
+                self.unparsed_numbers += 1
+            else:
+                self.compilation.append({
+                    "profile": finished[1],
+                    "reported_seconds": reported,
+                    "observed_at_seconds": elapsed,
+                })
         if re.match(r"^running \d+ tests?$", line):
             self.suite = len(self.suites)
             self.suites.append({"ordinal": self.suite, "target": self.target,
@@ -80,14 +100,31 @@ class Observation:
             self.last_test = elapsed
         result = RESULT.match(line)
         if result and self.suite is not None:
+            counts = [parsed_count(result[group]) for group in [2, 3, 4]]
+            reported = parsed_seconds(result[5])
+            if reported is None or None in counts:
+                # The suite stays open for libtest's own result line.
+                self.unparsed_numbers += 1
+                return
             self.suites[self.suite].update({
-                "outcome": result[1], "passed": int(result[2]), "failed": int(result[3]),
-                "ignored": int(result[4]), "reported_seconds": float(result[5]),
+                "outcome": result[1], "passed": counts[0], "failed": counts[1],
+                "ignored": counts[2], "reported_seconds": reported,
             })
             self.suite = None
             self.last_test = None
 
     def feed(self, data, elapsed, final=False):
+        # Parsing never decides the run: Cargo, its exit status, the raw log and live
+        # output do not depend on it. An unexpected fault stops parsing and is recorded.
+        if self.parser_error is not None:
+            return
+        try:
+            self.parse(data, elapsed, final)
+        except Exception as error:
+            self.parser_error = f"{type(error).__name__}: {error}"[:200]
+            self.buffer = b""
+
+    def parse(self, data, elapsed, final):
         # Only the parser is bounded. The raw log and live output retain every byte.
         for part in data.splitlines(keepends=True):
             newline = part.endswith(b"\n")
@@ -112,7 +149,9 @@ class Observation:
         return {"suites": self.suites, "completed_tests": self.tests,
                 "cargo_finished": self.compilation,
                 "unparsed_long_lines": self.unparsed_long_lines,
-                "non_utf8_lines": self.non_utf8_lines}
+                "non_utf8_lines": self.non_utf8_lines,
+                "unparsed_numbers": self.unparsed_numbers,
+                "parser_error": self.parser_error}
 
 
 def probe(command, cwd, errors):
@@ -237,7 +276,10 @@ def run(output, cwd, command=None, stream=None, details=None):
                 child.wait()
                 raise
             finally:
-                child.stdout.close()
+                try:
+                    child.stdout.close()
+                except OSError as error:
+                    errors.append(f"pipe close: {error}")
     finally:
         try:
             log.close()
@@ -292,9 +334,12 @@ def read_record(path):
     obs = data.get("observation")
     if not isinstance(obs, dict) or not isinstance(obs.get("suites"), list):
         raise ValueError(f"{path}: missing suite observations")
-    for key in ["non_utf8_lines", "unparsed_long_lines"]:
-        if type(obs.get(key)) is not int or obs[key] < 0:
+    # Records from before unparsed_numbers and parser_error could complete only without either.
+    for key, absent in [("non_utf8_lines", None), ("unparsed_long_lines", None), ("unparsed_numbers", 0)]:
+        if type(obs.get(key, absent)) is not int or obs.get(key, absent) < 0:
             raise ValueError(f"{path}: invalid parser diagnostics")
+    if obs.get("parser_error") is not None and not isinstance(obs["parser_error"], str):
+        raise ValueError(f"{path}: invalid parser diagnostics")
     for suite in obs["suites"]:
         if (not isinstance(suite, dict) or "reported_seconds" not in suite
                 or suite["reported_seconds"] is not None and not seconds(suite["reported_seconds"])):
@@ -336,6 +381,7 @@ def compare(before, after):
         obs = data["observation"]
         if (data.get("status") != "completed" or data["errors"] or not obs["suites"]
                 or obs["unparsed_long_lines"] or obs["non_utf8_lines"]
+                or obs.get("unparsed_numbers", 0) or obs.get("parser_error") is not None
                 or any(not suite_complete(s) for s in obs["suites"])
                 or len({s["target"] for s in obs["suites"]}) != len(obs["suites"])):
             mismatches.append(f"{label} incomplete observation")

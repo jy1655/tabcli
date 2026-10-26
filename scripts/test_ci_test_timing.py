@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -104,6 +105,82 @@ class TimingTests(unittest.TestCase):
                 self.assertEqual(code, exit_code or 1)
                 self.assertEqual(data["errors"], ["log close: injected log close failure"])
 
+    def test_pipe_close_failure_preserves_a_failed_child(self):
+        original = subprocess.Popen
+        class ClosingFailure:
+            def __init__(self, pipe):
+                self.pipe = pipe
+            def read1(self, size):
+                return self.pipe.read1(size)
+            def close(self):
+                self.pipe.close()
+                raise OSError("injected pipe close failure")
+        def popen(*args, **kwargs):
+            child = original(*args, **kwargs)
+            child.stdout = ClosingFailure(child.stdout)
+            return child
+        for exit_code in [0, 23]:
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                 mock.patch.object(timing.subprocess, "Popen", popen):
+                code, _, data = self.record(Path(directory), f"raise SystemExit({exit_code})")
+                self.assertEqual(code, exit_code or 1)
+                self.assertEqual(data["status"], "completed")
+                self.assertEqual(data["errors"], ["pipe close: injected pipe close failure"])
+
+    def test_unrepresentable_lookalike_numbers_keep_cargo_and_its_exit(self):
+        huge = b"9" * 5000
+        result = b"test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in %ss\n"
+        lookalikes = {
+            "malformed compile seconds": b"    Finished build in 1.2.3s\n",
+            "overflowing compile minutes": b"    Finished build in " + b"9" * 400 + b"m 1s\n",
+            "nonfinite compile seconds": b"    Finished build in " + huge + b".5s\n",
+            "malformed suite seconds": result % (b"1", b"."),
+            "oversized suite count": result % (huge, b"1.00"),
+            "nonfinite suite seconds": result % (b"1", b"9" * 400),
+        }
+        before = b"     Running tests/sample.rs (target/debug/deps/sample.exe)\nrunning 1 test\n"
+        after = b"test sample ... ok\n" + result % (b"1", b"0.50") + b"output after the lookalike\n"
+        # The pause lets the recorder parse the lookalike while the child is still running.
+        script = ("import os,pathlib,sys,time; parts=[pathlib.Path(p).read_bytes() for p in sys.argv[1:3]]\n"
+                  "os.write(1,parts[0]); time.sleep(.2); os.write(1,parts[1]); raise SystemExit(int(sys.argv[3]))")
+        for (name, lookalike), exit_code in [(item, code) for item in lookalikes.items() for code in [0, 101]]:
+            with self.subTest(name, exit_code=exit_code), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}):
+                root = Path(directory)
+                first, second = root / "first", root / "second"
+                first.write_bytes(before + lookalike)
+                second.write_bytes(after)
+                stream = io.BytesIO()
+                output = root / "timing"
+                code = timing.run(output, root, [sys.executable, "-c", script, str(first), str(second),
+                                                 str(exit_code)], stream, details())
+                self.assertEqual(code, exit_code)
+                self.assertEqual((output / "output.log").read_bytes(), before + lookalike + after)
+                self.assertEqual(stream.getvalue(), before + lookalike + after)
+                data = timing.read_record(output / "timings.json")
+                self.assertEqual((data["status"], data["returncode"], data["errors"]), ("completed", exit_code, []))
+                observation = data["observation"]
+                self.assertEqual((observation["unparsed_numbers"], observation["parser_error"]), (1, None))
+                self.assertEqual(observation["cargo_finished"], [])
+                suite = observation["suites"][0]
+                self.assertEqual((suite["passed"], suite["parsed_tests"], suite["reported_seconds"]), (1, 1, 0.5))
+                self.assertTrue(timing.suite_complete(suite))
+                self.assertIn("after incomplete observation", timing.compare(self.sample(), data))
+
+    def test_unexpected_parser_fault_stops_parsing_without_touching_cargo(self):
+        for exit_code in [0, 101]:
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}), \
+                 mock.patch.object(timing.Observation, "line", side_effect=RuntimeError("injected parser fault")):
+                code, output, data = self.record(
+                    Path(directory), "import os,time; os.write(1,b'running 1 test\\n'); time.sleep(.2); "
+                    f"os.write(1,b'after the fault\\n'); raise SystemExit({exit_code})")
+                self.assertEqual(code, exit_code)
+                self.assertEqual((output / "output.log").read_bytes(), b"running 1 test\nafter the fault\n")
+                self.assertEqual((data["status"], data["returncode"], data["errors"]), ("completed", exit_code, []))
+                self.assertEqual(data["observation"]["parser_error"], "RuntimeError: injected parser fault")
+
     def test_existing_artifact_directory_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -178,6 +255,8 @@ class TimingTests(unittest.TestCase):
             lambda d: d.update(returncode=101),
             lambda d: d["observation"]["suites"][0].update(passed=2),
             lambda d: d["observation"]["suites"][0].update(reported_seconds=None),
+            lambda d: d["observation"].update(unparsed_numbers=1),
+            lambda d: d["observation"].update(parser_error="RuntimeError: fault"),
         ]
         for mutate in mutations:
             after = copy.deepcopy(before)
@@ -244,11 +323,16 @@ class TimingTests(unittest.TestCase):
         self.assertNotIn("unittests src/main.rs:", report)
 
     def test_invalid_records_do_not_produce_comparisons(self):
+        def observation(**fields):
+            data = self.sample()
+            data["observation"].update(fields)
+            return data
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "record.json"
             for value in [None, {}, {**self.sample(), "schema": True},
                           {**self.sample(), "elapsed_seconds": float("nan")},
-                          {**self.sample(), "elapsed_seconds": -1}]:
+                          {**self.sample(), "elapsed_seconds": -1},
+                          observation(unparsed_numbers=-1), observation(parser_error=3)]:
                 path.write_text(json.dumps(value), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     timing.read_record(path)

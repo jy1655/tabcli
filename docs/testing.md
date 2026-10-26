@@ -165,6 +165,10 @@ The command duration includes compilation. Start-to-result and completion-to-com
 intervals include buffering, fixtures, cleanup and harness overhead; they are diagnostic clues, not profiler
 measurement or provider latency. Output whose format the parser does not recognize remains
 in the raw log. Overlong or non-UTF-8 lines are not parsed and are counted diagnostically.
+A Cargo `Finished` or libtest result line whose duration or count is malformed or not
+representable is counted as unparsed; such a result line leaves its suite open. An unexpected
+parser fault stops parsing and is recorded. Neither stops Cargo or changes its exit status,
+the raw log or live output; the comparison treats both as incomplete observations.
 A suite whose parsed test count differs from libtest's result is incomplete for comparison.
 No permissions, durability, test selection, retries or concurrency are changed.
 
@@ -192,7 +196,9 @@ Windows `whoami` test oracle remains available. Unused exceptions fail too. Upda
 allowlist only after reviewing the dependency and rerunning native Windows tests.
 This is a source boundary, not a process counter or a Rust resolver: it trusts the
 allowlisted items, does not resolve methods or associated items through `Self` or a local
-type alias, and does not detect macro shadowing in ancestor modules.
+type alias, and does not detect macro shadowing in ancestor modules. It checks only the
+`security` declaration in its immediate parent: `#[path]` or `cfg` redirection of an ancestor
+module, and re-exports that route callers to another definition, are outside it.
 
 ## Manual live verification
 
