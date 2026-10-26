@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "host": "agy",
-  "version": "0.4.26",
+  "version": "0.4.27",
   "tabcli_min_version": "0.4.22",
   "platforms": [
     "macos",
