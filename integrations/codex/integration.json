@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "host": "codex",
-  "version": "0.4.28",
+  "version": "0.4.29",
   "tabcli_min_version": "0.4.22",
   "platforms": [
     "macos",
