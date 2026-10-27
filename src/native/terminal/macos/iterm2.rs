@@ -219,96 +219,93 @@ end run
 // An unevaluated collection retains ordinal window references, which can follow a
 // different window when another task changes front-to-back order. Tabs and screens
 // can still change; existing exact-session, ownership and screen checks remain required.
+// Every session lookup expands this one traversal inside its own single script; the
+// lines given run for each session whose unique ID is `wantedId`, bound as `targetSession`.
+// What a match does and what follows the traversal stay each script's own policy.
+macro_rules! session_lookup {
+    ($($on_match:literal),+ $(,)?) => {
+        concat!(
+            r#"    tell application id "com.googlecode.iterm2"
+        set observedWindows to get windows
+        repeat with targetWindow in observedWindows
+            repeat with targetTab in tabs of targetWindow
+                repeat with targetSession in sessions of targetTab
+                    if unique ID of targetSession is wantedId then
+"#,
+            $("                        ", $on_match, "\n",)+
+            r#"                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+"#
+        )
+    };
+}
+
 // The scripts below address iTerm2 by bundle identifier, which starts iTerm2 when it is
 // not running. Only the launch may do that: each of these first asks whether iTerm2 is
 // running, because a managed session cannot exist in an application that is not.
-pub(in crate::native) const SEND_FILE_SCRIPT: &str = r#"
+pub(in crate::native) const SEND_FILE_SCRIPT: &str = concat!(
+    r#"
 on run argv
     if application id "com.googlecode.iterm2" is not running then error "Agent Bridge iTerm session not found; iTerm2 is not running"
     set wantedId to item 1 of argv
     set promptPath to item 2 of argv
     set carriageReturn to return
-    tell application id "com.googlecode.iterm2"
-        set observedWindows to get windows
-        repeat with targetWindow in observedWindows
-            repeat with targetTab in tabs of targetWindow
-                repeat with targetSession in sessions of targetTab
-                    if unique ID of targetSession is wantedId then
-                        write targetSession contents of file (POSIX file promptPath)
-                        write targetSession text carriageReturn newline false
-                        return "sent"
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    error "Agent Bridge iTerm session not found"
+"#,
+    session_lookup!(
+        "write targetSession contents of file (POSIX file promptPath)",
+        "write targetSession text carriageReturn newline false",
+        r#"return "sent""#,
+    ),
+    r#"    error "Agent Bridge iTerm session not found"
 end run
-"#;
+"#
+);
 
-pub(in crate::native) const VERIFY_SESSION_SCRIPT: &str = r#"
+pub(in crate::native) const VERIFY_SESSION_SCRIPT: &str = concat!(
+    r#"
 on run argv
     if application id "com.googlecode.iterm2" is not running then error "Agent Bridge iTerm2 ownership proof found iTerm2 not running"
     set wantedId to item 1 of argv
     set matchedTty to missing value
     set matchCount to 0
-    tell application id "com.googlecode.iterm2"
-        set observedWindows to get windows
-        repeat with targetWindow in observedWindows
-            repeat with targetTab in tabs of targetWindow
-                repeat with targetSession in sessions of targetTab
-                    if unique ID of targetSession is wantedId then
-                        set matchedTty to tty of targetSession
-                        set matchCount to matchCount + 1
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    if matchCount is not 1 then error "Agent Bridge iTerm2 ownership proof did not match exactly one session"
+"#,
+    session_lookup!(
+        "set matchedTty to tty of targetSession",
+        "set matchCount to matchCount + 1",
+    ),
+    r#"    if matchCount is not 1 then error "Agent Bridge iTerm2 ownership proof did not match exactly one session"
     if matchedTty is missing value or matchedTty is "" then error "Agent Bridge iTerm2 session has no tty"
     return matchedTty
 end run
-"#;
+"#
+);
 
-pub(in crate::native) const PRESENCE_SCRIPT: &str = r#"
+pub(in crate::native) const PRESENCE_SCRIPT: &str = concat!(
+    r#"
 on run argv
     if application id "com.googlecode.iterm2" is not running then return "missing"
     set wantedId to item 1 of argv
-    tell application id "com.googlecode.iterm2"
-        set observedWindows to get windows
-        repeat with targetWindow in observedWindows
-            repeat with targetTab in tabs of targetWindow
-                repeat with targetSession in sessions of targetTab
-                    if unique ID of targetSession is wantedId then return "present"
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    return "missing"
+"#,
+    session_lookup!(r#"return "present""#),
+    r#"    return "missing"
 end run
-"#;
+"#
+);
 
-pub(in crate::native) const CLOSE_SESSION_SCRIPT: &str = r#"
+pub(in crate::native) const CLOSE_SESSION_SCRIPT: &str = concat!(
+    r#"
 on run argv
     if application id "com.googlecode.iterm2" is not running then return "missing"
     set wantedId to item 1 of argv
-    tell application id "com.googlecode.iterm2"
-        set observedWindows to get windows
-        repeat with targetWindow in observedWindows
-            repeat with targetTab in tabs of targetWindow
-                repeat with targetSession in sessions of targetTab
-                    if unique ID of targetSession is wantedId then
-                        close targetSession
-                        return "closed"
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    return "missing"
+"#,
+    session_lookup!("close targetSession", r#"return "closed""#),
+    r#"    return "missing"
 end run
-"#;
+"#
+);
 
 fn create_tab(
     automation: &dyn Automation,
@@ -481,24 +478,17 @@ pub(super) fn with_automation<R: Automation>(automation: R) -> Adapter<R> {
 }
 // Stable creation-time handle only. A compare-and-send is one automation call;
 // an intervening repaint or changed selection sends no keys. Never targets front tab.
-pub(in crate::native) const SCREEN_SCRIPT: &str = r#"
+pub(in crate::native) const SCREEN_SCRIPT: &str = concat!(
+    r#"
 on run argv
     if application id "com.googlecode.iterm2" is not running then error "managed iTerm2 screen is missing"
     set wantedId to item 1 of argv
-    tell application id "com.googlecode.iterm2"
-        set observedWindows to get windows
-        repeat with w in observedWindows
-            repeat with t in tabs of w
-                repeat with s in sessions of t
-                    if unique ID of s is wantedId then
-                        if (count of argv) is 1 then return "AB_SCREEN_BEGIN" & my screenOf(s) & "AB_SCREEN_END"
-                        return my guardedAnswer(s, item 2 of argv, item 3 of argv)
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    error "managed iTerm2 screen is missing"
+"#,
+    session_lookup!(
+        r#"if (count of argv) is 1 then return "AB_SCREEN_BEGIN" & my screenOf(targetSession) & "AB_SCREEN_END""#,
+        "return my guardedAnswer(targetSession, item 2 of argv, item 3 of argv)",
+    ),
+    r#"    error "managed iTerm2 screen is missing"
 end run
 
 on screenOf(targetSession)
@@ -526,7 +516,8 @@ on guardedAnswer(targetSession, expectedScreen, keyName)
     my sendKey(targetSession, keyName)
     return "sent"
 end guardedAnswer
-"#;
+"#
+);
 impl<R: Automation> MacTerminalAdapter for Adapter<R> {
     fn open_bound_tab(
         &self,
@@ -1021,42 +1012,22 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    #[test]
-    fn session_lookup_keeps_the_observed_window_when_the_front_order_changes() {
-        // The application returns stable window specifiers, but an unmaterialized
-        // `windows` collection can be re-evaluated through its current order.
-        // Reorder that collection at the second tab, before reading its sessions:
-        // the other window has only one tab. No terminal application is addressed.
-        let script = VERIFY_SESSION_SCRIPT
-            .replace("on run argv", "on verify(argv)")
-            .replace("end run", "end verify")
-            .replace(
-                "if application id \"com.googlecode.iterm2\" is not running then",
-                "if false then",
-            )
-            .replace("tell application id \"com.googlecode.iterm2\"", "tell me")
-            .replace(
-                "repeat with targetWindow in windows",
-                "repeat with targetWindow in my unresolvedWindowSpecifiers()",
-            )
-            .replace("get windows", "my evaluatedWindowSpecifiers()")
-            .replace("tabs of", "modelTabs of")
-            .replace("sessions of", "modelSessions of")
-            .replace("unique ID of", "sid of")
-            .replace("tty of", "modelTty of")
-            .replace(
-                "repeat with targetSession in modelSessions of targetTab",
-                "if (sid of item 1 of modelSessions of targetTab) is \"wanted\" then my reorderWindows()\n                repeat with targetSession in modelSessions of targetTab",
-            );
-        let model = r#"
+    // A model of iTerm2's scripting objects for the shipped session lookups. A window is
+    // a record of tabs and a tab holds one session; each command a script sends to a
+    // session is logged with its place (window letter and tab number). iTerm2's `get
+    // windows` answers with window-id specifiers (observed in 3.7.6), which keep their
+    // window when the order changes; an unevaluated collection keeps ordinal addresses.
+    // It addresses nothing of the machine.
+    const LOOKUP_MODEL: &str = r#"
+property modelRunning : true
 property modelWindows : {}
 property reordered : false
+property modelLog : ""
 on unresolvedWindowSpecifiers()
-    -- An unevaluated application collection keeps the window's ordinal address.
     return {a reference to item 1 of my modelWindows, a reference to item 2 of my modelWindows}
 end unresolvedWindowSpecifiers
 on evaluatedWindowSpecifiers()
-    -- iTerm2's `get windows` answers with window-id specifiers, observed in 3.7.6.
+    set modelLog to modelLog & "get windows;"
     return modelWindows
 end evaluatedWindowSpecifiers
 on reorderWindows()
@@ -1064,12 +1035,247 @@ on reorderWindows()
     set reordered to true
     set modelWindows to reverse of modelWindows
 end reorderWindows
-set otherTab to {modelSessions:{{sid:"other", modelTty:"other-tty"}}}
-set wantedTab to {modelSessions:{{sid:"wanted", modelTty:"wanted-tty"}}}
-set modelWindows to {{modelTabs:{otherTab, wantedTab}}, {modelTabs:{otherTab}}}
-return my verify({"wanted"})
+on modelWrite(targetSession, payload)
+    set modelLog to modelLog & "write " & payload & " to " & (place of targetSession) & ";"
+end modelWrite
+on modelClose(targetSession)
+    set modelLog to modelLog & "close " & (place of targetSession) & ";"
+end modelClose
 "#;
-        assert_eq!(osascript(&format!("{model}\n{script}")), "wanted-tty");
+
+    // Two windows, front first; each tab's session is (unique ID, tty).
+    type Layout<'a> = [&'a [(&'a str, Option<&'a str>)]; 2];
+
+    // The other window comes to the front once, when the lookup reaches the first tab
+    // that shows the wanted session and before it reads that tab's sessions. That other
+    // window has only one tab, so an ordinal window reference fails the lookup.
+    const REORDERING: Layout = [
+        &[("other-a", Some("tty-a1")), ("wanted", Some("wanted-tty"))],
+        &[("other-b", Some("tty-b1"))],
+    ];
+
+    // Every production lookup, with the arguments its adapter passes.
+    const LOOKUPS: [(&str, &str, &[&str]); 8] = [
+        ("send", SEND_FILE_SCRIPT, &["wanted", "/tmp/prompt"]),
+        ("verify", VERIFY_SESSION_SCRIPT, &["wanted"]),
+        ("presence", PRESENCE_SCRIPT, &["wanted"]),
+        ("close", CLOSE_SESSION_SCRIPT, &["wanted"]),
+        ("screen", SCREEN_SCRIPT, &["wanted"]),
+        ("enter", SCREEN_SCRIPT, &["wanted", "screen A2", "enter"]),
+        (
+            "down-enter",
+            SCREEN_SCRIPT,
+            &["wanted", "screen A2", "down-enter"],
+        ),
+        ("changed", SCREEN_SCRIPT, &["wanted", "Screen A2", "enter"]),
+    ];
+
+    fn applescript_text(value: &str) -> String {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    // The shipped script with only iTerm2's terms replaced by the model's: each
+    // operation's own policy runs as written, in one script run.
+    fn modeled_lookup(script: &str) -> String {
+        let mut modeled = script.to_owned();
+        for (term, model) in [
+            ("on run argv", "on lookup(argv)"),
+            ("end run", "end lookup"),
+            (
+                "if application id \"com.googlecode.iterm2\" is not running then",
+                "if not modelRunning then",
+            ),
+            ("tell application id \"com.googlecode.iterm2\"", "tell me"),
+            ("get windows", "my evaluatedWindowSpecifiers()"),
+            (" in windows", " in my unresolvedWindowSpecifiers()"),
+            ("tabs of", "modelTabs of"),
+            ("sessions of", "modelSessions of"),
+            ("unique ID of", "sid of"),
+            ("tty of", "modelTty of"),
+            (
+                "write targetSession contents of file (POSIX file promptPath)",
+                "my modelWrite(targetSession, \"file \" & promptPath)",
+            ),
+            (
+                "write targetSession text carriageReturn newline false",
+                "my modelWrite(targetSession, \"return\")",
+            ),
+            (
+                "write targetSession text ((ASCII character 27) & \"[B\" & return) newline false",
+                "my modelWrite(targetSession, \"down return\")",
+            ),
+            (
+                "write targetSession text return newline false",
+                "my modelWrite(targetSession, \"return\")",
+            ),
+            ("close targetSession", "my modelClose(targetSession)"),
+            ("contents of targetSession", "modelScreen of targetSession"),
+        ] {
+            modeled = modeled.replace(term, model);
+        }
+        let reading = "repeat with targetSession in modelSessions of targetTab";
+        assert_eq!(modeled.matches(reading).count(), 1, "{script}");
+        modeled = modeled.replace(
+            reading,
+            &format!(
+                "if (sid of item 1 of modelSessions of targetTab) is wantedId then my reorderWindows()\n{reading}"
+            ),
+        );
+        // Every application term is modeled, so no terminal is addressed.
+        assert!(!modeled.contains("application"), "{modeled}");
+        assert!(!modeled.contains("windows"), "{modeled}");
+        modeled
+    }
+
+    // The answer or error of one lookup on the model, then the model's log.
+    fn lookup_on_model(script: &str, running: bool, layout: Layout, argv: &[&str]) -> String {
+        let windows: Vec<String> = layout
+            .iter()
+            .zip(["A", "B"])
+            .map(|(tabs, letter)| {
+                let tabs: Vec<String> = tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, tty))| {
+                        let place = format!("{letter}{}", index + 1);
+                        format!(
+                            "{{modelSessions:{{{{sid:{}, modelTty:{}, modelScreen:{}, place:{}}}}}}}",
+                            applescript_text(id),
+                            tty.map_or("missing value".into(), applescript_text),
+                            applescript_text(&format!("screen {place}")),
+                            applescript_text(&place),
+                        )
+                    })
+                    .collect();
+                format!("{{modelTabs:{{{}}}}}", tabs.join(", "))
+            })
+            .collect();
+        let argv: Vec<String> = argv.iter().map(|value| applescript_text(value)).collect();
+        osascript(&format!(
+            r#"{LOOKUP_MODEL}
+{}
+on run
+    set modelRunning to {running}
+    set modelWindows to {{{}}}
+    try
+        set answer to my lookup({{{}}})
+    on error message
+        set answer to "error: " & message
+    end try
+    return answer & " [" & modelLog & "]"
+end run
+"#,
+            modeled_lookup(script),
+            windows.join(", "),
+            argv.join(", "),
+        ))
+    }
+
+    fn lookups_on_model(running: bool, layout: Layout) -> Vec<(&'static str, String)> {
+        LOOKUPS
+            .iter()
+            .map(|(name, script, argv)| (*name, lookup_on_model(script, running, layout, argv)))
+            .collect()
+    }
+
+    fn named(expected: [&str; 8]) -> Vec<(&'static str, String)> {
+        LOOKUPS
+            .iter()
+            .zip(expected)
+            .map(|((name, ..), answer)| (*name, answer.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn session_lookup_keeps_the_observed_window_when_the_front_order_changes() {
+        assert_eq!(
+            lookups_on_model(true, REORDERING),
+            named([
+                "sent [get windows;write file /tmp/prompt to A2;write return to A2;]",
+                "wanted-tty [get windows;]",
+                "present [get windows;]",
+                "closed [get windows;close A2;]",
+                "AB_SCREEN_BEGINscreen A2AB_SCREEN_END [get windows;]",
+                "sent [get windows;write return to A2;]",
+                "sent [get windows;write down return to A2;]",
+                "changed [get windows;]",
+            ])
+        );
+        // The same lookups through the ordinal `windows` collection that #310 replaced
+        // follow the reordered window: the model distinguishes the two.
+        let materialized = "set observedWindows to get windows\n        repeat with targetWindow in observedWindows";
+        for (name, script, argv) in LOOKUPS {
+            assert_eq!(script.matches(materialized).count(), 1, "{name}");
+            let ordinal = script.replace(materialized, "repeat with targetWindow in windows");
+            let answer = lookup_on_model(&ordinal, true, REORDERING, argv);
+            assert!(answer.starts_with("error: "), "{name}: {answer}");
+        }
+    }
+
+    #[test]
+    fn session_lookups_keep_their_own_missing_duplicate_and_stopped_policies() {
+        let screen_missing = "error: managed iTerm2 screen is missing [get windows;]";
+        let absent: Layout = [
+            &[("other-a", Some("tty-a1"))],
+            &[("other-b", Some("tty-b1"))],
+        ];
+        assert_eq!(
+            lookups_on_model(true, absent),
+            named([
+                "error: Agent Bridge iTerm session not found [get windows;]",
+                "error: Agent Bridge iTerm2 ownership proof did not match exactly one session [get windows;]",
+                "missing [get windows;]",
+                "missing [get windows;]",
+                screen_missing,
+                screen_missing,
+                screen_missing,
+                screen_missing,
+            ])
+        );
+        // A stopped iTerm2 is never addressed, so it is neither started nor traversed.
+        let screen_stopped = "error: managed iTerm2 screen is missing []";
+        assert_eq!(
+            lookups_on_model(false, REORDERING),
+            named([
+                "error: Agent Bridge iTerm session not found; iTerm2 is not running []",
+                "error: Agent Bridge iTerm2 ownership proof found iTerm2 not running []",
+                "missing []",
+                "missing []",
+                screen_stopped,
+                screen_stopped,
+                screen_stopped,
+                screen_stopped,
+            ])
+        );
+        // Verification scans every window and requires exactly one match; the other
+        // lookups act on the first match in the observed order and stop there.
+        let duplicate: Layout = [
+            &[("other-a", Some("tty-a1")), ("wanted", Some("first-tty"))],
+            &[("wanted", Some("second-tty"))],
+        ];
+        assert_eq!(
+            lookups_on_model(true, duplicate),
+            named([
+                "sent [get windows;write file /tmp/prompt to A2;write return to A2;]",
+                "error: Agent Bridge iTerm2 ownership proof did not match exactly one session [get windows;]",
+                "present [get windows;]",
+                "closed [get windows;close A2;]",
+                "AB_SCREEN_BEGINscreen A2AB_SCREEN_END [get windows;]",
+                "sent [get windows;write return to A2;]",
+                "sent [get windows;write down return to A2;]",
+                "changed [get windows;]",
+            ])
+        );
+        for tty in [Some(""), None] {
+            let untyped: Layout = [
+                &[("other-a", Some("tty-a1")), ("wanted", tty)],
+                &[("other-b", Some("tty-b1"))],
+            ];
+            assert_eq!(
+                lookup_on_model(VERIFY_SESSION_SCRIPT, true, untyped, &["wanted"]),
+                "error: Agent Bridge iTerm2 session has no tty [get windows;]"
+            );
+        }
     }
 
     // A model of iTerm2 3.7.3 and of the foreground for the replay below. It

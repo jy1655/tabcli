@@ -579,6 +579,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/iTerm.app",
         ),
         (
+            "iTerm2 session presence",
+            terminal::macos::iterm2::PRESENCE_SCRIPT,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
             "iTerm2 close session",
             terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
             "iTerm2",

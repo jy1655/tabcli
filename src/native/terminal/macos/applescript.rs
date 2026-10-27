@@ -424,11 +424,7 @@ pub(in crate::native) mod testing {
                     "set matchedTty to tty of targetSession",
                     ItermVerify,
                 ),
-                (
-                    "iTerm2",
-                    "if unique ID of targetSession is wantedId then return \"present\"",
-                    ItermPresence,
-                ),
+                ("iTerm2", "return \"present\"", ItermPresence),
                 ("iTerm2", "close targetSession", ItermClose),
                 ("iTerm2", "on screenOf(targetSession)", ItermScreen),
                 ("Terminal.app", "on soleNewWindowWithTty(", TerminalOpen),
