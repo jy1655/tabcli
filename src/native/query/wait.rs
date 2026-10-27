@@ -2,6 +2,7 @@
 use super::request::RequestState;
 use super::*;
 use crate::native::args::{option_value, parse_timeout, set_flag_once, set_once};
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::failure_kind::FailureKind;
 use crate::native::session::primitives::valid_session_id;
 use observation::{SessionEvidence, judgment};
@@ -273,6 +274,7 @@ fn poll(
     timeout: Duration,
     questions: bool,
     after_questions: &[QuestionCursor],
+    clock: &mut impl Clock,
 ) -> Result<Outcome> {
     let mut groups: Vec<SessionGroup> = Vec::new();
     for (index, address) in addresses.iter().enumerate() {
@@ -288,7 +290,7 @@ fn poll(
             });
         }
     }
-    let deadline = checked_deadline_from(Instant::now(), timeout)?;
+    let deadline = checked_deadline_from(clock.now(), timeout)?;
     // One selector per address, built before polling: the loop only borrows them.
     let selectors: Vec<Selector> = addresses
         .iter()
@@ -339,11 +341,11 @@ fn poll(
         if outcome.selected.is_some() {
             return Ok(outcome);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(clock.now());
         if remaining.is_zero() {
             return Ok(outcome);
         }
-        thread::sleep(remaining.min(Duration::from_millis(100)));
+        clock.sleep(remaining.min(Duration::from_millis(100)));
     }
 }
 
@@ -354,6 +356,16 @@ pub(in crate::native) fn one(
     request: &str,
     timeout: Duration,
 ) -> Result<Value> {
+    one_with(root, session, request, timeout, &mut SystemClock)
+}
+
+fn one_with(
+    root: &Path,
+    session: &str,
+    request: &str,
+    timeout: Duration,
+    clock: &mut impl Clock,
+) -> Result<Value> {
     let outcome = poll(
         root,
         &[Address {
@@ -363,6 +375,7 @@ pub(in crate::native) fn one(
         timeout,
         false,
         &[],
+        clock,
     )?;
     let mut last = outcome.last.into_iter().next().unwrap();
     if outcome.selected.is_none() {
@@ -375,13 +388,14 @@ pub(in crate::native) fn one(
     Ok(last)
 }
 
-fn value_in(root: &Path, request: &WaitRequest) -> Result<Value> {
+fn value_in(root: &Path, request: &WaitRequest, clock: &mut impl Clock) -> Result<Value> {
     let outcome = poll(
         root,
         &request.addresses,
         request.timeout,
         request.questions,
         &request.after_questions,
+        clock,
     )?;
     let remaining: Vec<_> = request
         .addresses
@@ -433,19 +447,20 @@ pub(in crate::native) fn test_value_in(
 ) -> Result<Value> {
     let mut request = parse_options(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())?;
     request.timeout = timeout;
-    value_in(root, &request)
+    value_in(root, &request, &mut SystemClock)
 }
 
 pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
-    let value = match Reader::state_root().and_then(|root| value_in(&root, &request)) {
-        Ok(value) => value,
-        Err(error) => {
-            if request.json {
-                envelope::print(&error_value(&error))?;
+    let value =
+        match Reader::state_root().and_then(|root| value_in(&root, &request, &mut SystemClock)) {
+            Ok(value) => value,
+            Err(error) => {
+                if request.json {
+                    envelope::print(&error_value(&error))?;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     envelope::emit(request.json, &value, || {
         if !value["ended"].is_null() {
             print_result(&value["ended"], false)?;
@@ -487,6 +502,7 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::clock::FakeClock;
     use crate::native::session::primitives::write_json_atomic;
     use crate::native::tests::seed_close_fixture;
 
@@ -494,6 +510,7 @@ mod tests {
     use crate::native::session::owner::tests::reused_attestation;
     use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
     use observation::judgment::tests::attestation;
+    use std::{cell::Cell, rc::Rc};
 
     const UNOBSERVED: judgment::Observers<'static> = judgment::Observers {
         attest: &|_| panic!("this record is not attested"),
@@ -732,28 +749,39 @@ mod tests {
         let reader = Reader::open_unchecked(&fixture.directory);
         let id = reader.snapshot().unwrap().receipts[0].request_id.clone();
         fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
-        let mut calls = 0;
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let calls = Rc::new(Cell::new(0));
+        let observed = calls.clone();
         let value = with_snapshot_hook(
             move |directory| {
-                calls += 1;
-                if calls > 1 {
+                observed.set(observed.get() + 1);
+                if observed.get() == 1 {
+                    // Charge the first read, then let the next pass land at the deadline.
+                    now.set(now.get() + Duration::from_millis(75));
+                } else {
                     let path = directory.join("status.json");
                     let mut status: Value =
                         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                    status["generation"] = json!(100 + calls);
+                    status["generation"] = json!(100 + observed.get());
                     write_json_atomic(&path, &status).unwrap();
                 }
             },
             || {
-                one(
+                one_with(
                     fixture.directory.parent().unwrap(),
                     "session-fault",
                     &id,
                     Duration::from_millis(150),
+                    &mut clock,
                 )
                 .unwrap()
             },
         );
+        assert_eq!(calls.get(), 2, "the busy pass must actually run");
+        assert_eq!(clock.slept, Duration::from_millis(75));
+        assert_eq!(clock.now(), start + Duration::from_millis(150));
         assert_eq!(value["request_state"], "pending");
         assert_eq!(value["timed_out"], true);
         assert!(value.get("owner").is_some());
@@ -769,7 +797,16 @@ mod tests {
         fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
         let root = fixture.directory.parent().unwrap();
         let before = snapshot_directory(root);
-        let value = one(root, "session-fault", &id, Duration::from_millis(50)).unwrap();
+        let mut clock = FakeClock::new(Instant::now());
+        let value = one_with(
+            root,
+            "session-fault",
+            &id,
+            Duration::from_millis(50),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, Duration::from_millis(50));
         assert_eq!(snapshot_directory(root), before);
         assert_eq!(value["ok"], false);
         assert_eq!(value["timed_out"], true);
@@ -796,11 +833,13 @@ mod tests {
                 .join(format!("{}.json", receipt.claim_token));
             drop(snapshot);
             fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
-            let mut calls = 0;
+            let mut clock = FakeClock::new(Instant::now());
+            let calls = Rc::new(Cell::new(0));
+            let observed = calls.clone();
             let result = with_snapshot_hook(
                 move |_| {
-                    calls += 1;
-                    if calls == 2 {
+                    observed.set(observed.get() + 1);
+                    if observed.get() == 2 {
                         if damage {
                             write_json_atomic(&path, &json!({})).unwrap();
                         } else {
@@ -809,20 +848,86 @@ mod tests {
                     }
                 },
                 || {
-                    one(
+                    one_with(
                         fixture.directory.parent().unwrap(),
                         "session-fault",
                         &id,
                         Duration::from_secs(1),
+                        &mut clock,
                     )
                 },
             );
+            assert!(
+                calls.get() >= 2,
+                "the Receipt must change after the first pass"
+            );
+            assert!(!clock.slept.is_zero());
             let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains(if damage {
                 "no readable receipt"
             } else {
                 "no such Bridge request"
             }));
+        }
+    }
+
+    #[test]
+    fn completed_pass_precedes_timeout_in_both_wait_outputs() {
+        use crate::native::reopen::tests::snapshot_directory;
+        for timeout in [Duration::ZERO, Duration::from_millis(50)] {
+            for multi in [false, true] {
+                let fixture = seed_close_fixture(JournaledEventState::Committed);
+                crate::native::session::turn::recover_pending_completion(&fixture.directory)
+                    .unwrap();
+                let request_id = Reader::open_unchecked(&fixture.directory)
+                    .snapshot()
+                    .unwrap()
+                    .receipts[0]
+                    .request_id
+                    .clone();
+                let root = fixture.directory.parent().unwrap();
+                let before = snapshot_directory(root);
+                let start = Instant::now();
+                let mut clock = FakeClock::new(start);
+                let now = clock.shared();
+                let calls = Rc::new(Cell::new(0));
+                let observed = calls.clone();
+                let value = with_snapshot_hook(
+                    move |_| {
+                        observed.set(observed.get() + 1);
+                        // The Result is decoded after this read crosses the deadline.
+                        now.set(start + Duration::from_secs(1));
+                    },
+                    || {
+                        if multi {
+                            let request = WaitRequest {
+                                addresses: vec![Address {
+                                    session: "session-fault".into(),
+                                    request: request_id.clone(),
+                                }],
+                                timeout,
+                                json: true,
+                                questions: false,
+                                after_questions: vec![],
+                            };
+                            value_in(root, &request, &mut clock).unwrap()
+                        } else {
+                            one_with(root, "session-fault", &request_id, timeout, &mut clock)
+                                .unwrap()
+                        }
+                    },
+                );
+                assert_eq!(calls.get(), 1, "even zero timeout observes one full pass");
+                assert!(clock.now() > start + timeout);
+                assert_eq!(clock.slept, Duration::ZERO);
+                assert_eq!(value["ok"], true);
+                assert_ne!(value["timed_out"], true);
+                let ended = if multi { &value["ended"] } else { &value };
+                assert_eq!(ended["request_state"], "completed");
+                assert_eq!(ended["request_id"], request_id);
+                assert_eq!(ended["result"], "late result");
+                assert_eq!(snapshot_directory(root), before, "wait must not write");
+            }
         }
     }
 
@@ -884,6 +989,7 @@ mod tests {
                     Duration::ZERO,
                     false,
                     &[],
+                    &mut FakeClock::new(Instant::now()),
                 )
                 .unwrap()
             },
