@@ -122,6 +122,13 @@ Review and answer prompts yourself; Bridge does not grant system access. After h
 permission prompt, inspect the failed session and close any surface it created before starting
 another. WezTerm uses its official CLI and a verified local GUI connection.
 
+Claude and Agy workspace-trust recognition requires the complete exact path on one screen
+line. A long path wrapped across rows is not an exact match. Use a wider terminal or the
+provider's own trust prompt; Bridge does not guess the wrapped path or approve a different
+dialog. If the launch has already failed, inspect and close that session before starting a
+new one. See the [macOS consent verification](verification/2026-10-27-macos-28-consent.md)
+for the measured layouts and their limits.
+
 Bridge expects Ghostty at `/Applications/Ghostty.app` with the required native scripting commands.
 If you see `Ghostty native scripting dictionary is unavailable` or `Ghostty native scripting lacks
 …`, install a compatible application there or select another terminal. Bridge reads

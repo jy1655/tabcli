@@ -215,6 +215,10 @@ on run argv
 end run
 "#;
 
+// Materialize windows before traversing tabs: iTerm2 returns window-id specifiers.
+// An unevaluated collection retains ordinal window references, which can follow a
+// different window when another task changes front-to-back order. Tabs and screens
+// can still change; existing exact-session, ownership and screen checks remain required.
 // The scripts below address iTerm2 by bundle identifier, which starts iTerm2 when it is
 // not running. Only the launch may do that: each of these first asks whether iTerm2 is
 // running, because a managed session cannot exist in an application that is not.
@@ -225,7 +229,8 @@ on run argv
     set promptPath to item 2 of argv
     set carriageReturn to return
     tell application id "com.googlecode.iterm2"
-        repeat with targetWindow in windows
+        set observedWindows to get windows
+        repeat with targetWindow in observedWindows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
                     if unique ID of targetSession is wantedId then
@@ -248,7 +253,8 @@ on run argv
     set matchedTty to missing value
     set matchCount to 0
     tell application id "com.googlecode.iterm2"
-        repeat with targetWindow in windows
+        set observedWindows to get windows
+        repeat with targetWindow in observedWindows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
                     if unique ID of targetSession is wantedId then
@@ -270,7 +276,8 @@ on run argv
     if application id "com.googlecode.iterm2" is not running then return "missing"
     set wantedId to item 1 of argv
     tell application id "com.googlecode.iterm2"
-        repeat with targetWindow in windows
+        set observedWindows to get windows
+        repeat with targetWindow in observedWindows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
                     if unique ID of targetSession is wantedId then return "present"
@@ -287,7 +294,8 @@ on run argv
     if application id "com.googlecode.iterm2" is not running then return "missing"
     set wantedId to item 1 of argv
     tell application id "com.googlecode.iterm2"
-        repeat with targetWindow in windows
+        set observedWindows to get windows
+        repeat with targetWindow in observedWindows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
                     if unique ID of targetSession is wantedId then
@@ -478,7 +486,8 @@ on run argv
     if application id "com.googlecode.iterm2" is not running then error "managed iTerm2 screen is missing"
     set wantedId to item 1 of argv
     tell application id "com.googlecode.iterm2"
-        repeat with w in windows
+        set observedWindows to get windows
+        repeat with w in observedWindows
             repeat with t in tabs of w
                 repeat with s in sessions of t
                     if unique ID of s is wantedId then
@@ -1010,6 +1019,57 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn session_lookup_keeps_the_observed_window_when_the_front_order_changes() {
+        // The application returns stable window specifiers, but an unmaterialized
+        // `windows` collection can be re-evaluated through its current order.
+        // Reorder that collection at the second tab, before reading its sessions:
+        // the other window has only one tab. No terminal application is addressed.
+        let script = VERIFY_SESSION_SCRIPT
+            .replace("on run argv", "on verify(argv)")
+            .replace("end run", "end verify")
+            .replace(
+                "if application id \"com.googlecode.iterm2\" is not running then",
+                "if false then",
+            )
+            .replace("tell application id \"com.googlecode.iterm2\"", "tell me")
+            .replace(
+                "repeat with targetWindow in windows",
+                "repeat with targetWindow in my unresolvedWindowSpecifiers()",
+            )
+            .replace("get windows", "my evaluatedWindowSpecifiers()")
+            .replace("tabs of", "modelTabs of")
+            .replace("sessions of", "modelSessions of")
+            .replace("unique ID of", "sid of")
+            .replace("tty of", "modelTty of")
+            .replace(
+                "repeat with targetSession in modelSessions of targetTab",
+                "if (sid of item 1 of modelSessions of targetTab) is \"wanted\" then my reorderWindows()\n                repeat with targetSession in modelSessions of targetTab",
+            );
+        let model = r#"
+property modelWindows : {}
+property reordered : false
+on unresolvedWindowSpecifiers()
+    -- An unevaluated application collection keeps the window's ordinal address.
+    return {a reference to item 1 of my modelWindows, a reference to item 2 of my modelWindows}
+end unresolvedWindowSpecifiers
+on evaluatedWindowSpecifiers()
+    -- iTerm2's `get windows` answers with window-id specifiers, observed in 3.7.6.
+    return modelWindows
+end evaluatedWindowSpecifiers
+on reorderWindows()
+    if reordered then return
+    set reordered to true
+    set modelWindows to reverse of modelWindows
+end reorderWindows
+set otherTab to {modelSessions:{{sid:"other", modelTty:"other-tty"}}}
+set wantedTab to {modelSessions:{{sid:"wanted", modelTty:"wanted-tty"}}}
+set modelWindows to {{modelTabs:{otherTab, wantedTab}}, {modelTabs:{otherTab}}}
+return my verify({"wanted"})
+"#;
+        assert_eq!(osascript(&format!("{model}\n{script}")), "wanted-tty");
     }
 
     // A model of iTerm2 3.7.3 and of the foreground for the replay below. It

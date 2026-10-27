@@ -1,6 +1,6 @@
 {
   "name": "tabcli-agent-bridge",
-  "version": "0.4.27",
+  "version": "0.4.28",
   "description": "Delegate work to coding agents, read results, send follow-ups, and close task sessions.",
   "license": "MIT",
   "repository": "https://github.com/jy1655/tabcli",
