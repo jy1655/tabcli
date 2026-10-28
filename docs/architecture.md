@@ -184,8 +184,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
-  Ghostty's frame host, its replaceable fallback for the missing surface identity, lives in
-  `terminal/macos/ghostty/host.rs`.
+  Ghostty's frame host lives in `terminal/macos/ghostty/host.rs`. It proves the bound PTY, carries
+  the session directory only after binding, and discards startup input. Ghostty 1.4.0 adds a
+  scripted `tty` property, which this adapter does not yet consume; replacing the frame must
+  also preserve the launch ordering and input protection, not just identify the PTY.
   Terminal.app's app incarnation (its capture from the shell's ancestry, and the liveness and
   uniqueness recheck in one order around each close transaction and another around an absence
   observation) lives in `terminal/macos/apple_terminal/incarnation.rs`.

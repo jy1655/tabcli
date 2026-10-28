@@ -123,6 +123,12 @@ state (`ioreg -n Root -d1 | grep CGSSessionScreenIsLocked` prints a line only wh
 repeat the launch with the screen unlocked. A launch that times out before a surface handle exists
 sent no prompt; one that times out after the surface exists keeps the handle in the session's records (#86).
 
+Ghostty 1.4.0's [release notes](https://ghostty.org/docs/install/release-notes/1-4-0)
+and [upstream fix](https://github.com/ghostty-org/ghostty/pull/13639) report a fix for initialization of tabs
+created while the session is locked. The [1.4.0 verification](verification/2026-10-28-macos-104-ghostty-1.4.0.md)
+measured unlocked cold/warm launches successfully; locked-screen behavior remains unmeasured.
+Do not treat the 1.3.1 failure as a verified 1.4.0 limitation or the upstream fix as a local pass.
+
 ## Automation timeouts
 
 `<terminal> did not answer before the deadline` means that one AppleScript call to the terminal

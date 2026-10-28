@@ -355,7 +355,7 @@ for the tested binary, CLI versions, settings, and date.
 | --- | --- | --- | --- | --- |
 | macOS | iTerm2 | Implemented | Creation/input/ownership/close | Codex [M12] |
 | macOS | Terminal.app | Implemented | App identity/retry/hidden window | Codex [M12], [M11] |
-| macOS | Ghostty | Implemented | Readiness/input/close/focus | Codex [M12], [M11] |
+| macOS | Ghostty | Implemented | Readiness/input/close/focus | Four providers [G14]; Codex [M12], [M11] |
 | macOS | WezTerm | Implemented | GUI identity/input/close | Codex/Claude [M12]; Agy [M11] |
 | macOS | Warp | Limited | Control/URI/partial launch/close | Not verified |
 | Windows | Terminal tab | Implemented | Host/console/identity/input/focus | Four providers [W02] |
@@ -366,6 +366,10 @@ verified by these records. [M12] uses explicit bypass options; [M11] uses no mod
 bypass override. Pi on WezTerm reached an authentication failure in [M11]; cleanup passed, but that
 was not a successful round trip. Warp had no reachable endpoint in [M11] and was not run in
 [M12]; the Stable build cannot publish one (see the `WarpControlCli` note under requirements).
+
+[G14] verifies Ghostty 1.4.0 on macOS 26.5.2: unlocked Codex cold/warm launches, all four
+providers' ask/tell/close paths, tab/window and sibling-split preservation. It uses existing trust
+and explicit bypass options. Locked-screen behavior and physical typing remain unverified there.
 
 The four providers in [W02] are Codex, Claude, Agy, and Pi. [W01] also records tab surface/focus
 checks. It does not supply a four-provider console-window follow-up matrix. [M12] did not run native
@@ -380,3 +384,5 @@ from authenticated model runs.
 [M11]: verification/2026-10-04-macos-0.1.1.md
 [W02]: verification/2026-10-02-windows.md
 [W01]: verification/2026-10-01-windows.md
+
+[G14]: verification/2026-10-28-macos-104-ghostty-1.4.0.md

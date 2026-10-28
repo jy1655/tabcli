@@ -645,7 +645,8 @@ provider/terminal combinations are not verified.
 
 | Provider/platform | Live evidence | Limitations |
 | --- | --- | --- |
-| Codex/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | codex-cli 0.162.1; iTerm2 and WezTerm self-tests respectively, defaults; installed 0.4.9 also completed two Ghostty 1.3.1 `ask` round trips; no Ghostty cold start (#104) |
+| Four providers/macOS/Ghostty | [2026-10-28 published 0.4.29][ghostty140] | Ghostty 1.4.0; Codex 0.164.0, Claude 2.1.312, Agy 1.4.8, Pi 1.4.0; unlocked cold/warm Codex and all four ask/tell/close paths; existing trust, explicit `--yolo`; no locked-screen test |
+| Codex/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | codex-cli 0.162.1; iTerm2 and WezTerm self-tests respectively, defaults; installed 0.4.9 also completed two Ghostty 1.3.1 `ask` round trips; no Ghostty cold start in that 1.3.1 record |
 | Claude/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | Claude Code 2.1.300/iTerm2 and 2.1.296/WezTerm respectively, defaults; no reopen |
 | Agy/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | Agy 1.3.5/iTerm2 and 1.3.3/WezTerm respectively; `--yolo` |
 | Pi/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | Pi 1.2.0/iTerm2 with `--model openai-codex/gpt-5.6-sol`; Pi 1.0.4/WezTerm with defaults |
@@ -655,12 +656,13 @@ provider/terminal combinations are not verified.
 | Pi/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
 | All/Linux | Not verified | Refusal tests only; no visible-session transport |
 
-The latest Mac record covers all four providers on iTerm2 with the downloaded, published 0.4.9
+The 2026-10-15 Mac record covers all four providers on iTerm2 with the downloaded, published 0.4.9
 binary, after publication; it did not gate the release. Codex and Claude used defaults, Pi selected
 `openai-codex/gpt-5.6-sol`, and Agy used `--yolo`. The 0.4.3 candidate record covers all four in
 WezTerm, including Pi 1.0.4, with defaults for Codex, Claude and Pi and `--yolo` for Agy.
-Terminal.app, WezTerm and Warp were not verified on macOS 0.4.9; the latest record's two Ghostty
-`ask` round trips used the installed 0.4.9 with Ghostty already running, not a cold start (#104).
+Terminal.app, WezTerm and Warp were not verified on macOS 0.4.9; that record's two Ghostty
+`ask` round trips used the installed 0.4.9 with Ghostty already running, not a cold start. The later [Ghostty 1.4.0 record][ghostty140] supplies #104's
+unlocked cold-start measurement at the updated version.
 The Windows 0.4.9 record covers candidate Codex and Claude self-tests, not a downloaded published
 binary. The 0.4.8 record measures Codex newline preservation (with the emoji loss of #147, since
 fixed) and environment
@@ -670,7 +672,7 @@ open. The [daemon-absent Codex queue probe][queue] used a mock model, not an aut
 Warp requires a reachable official Control endpoint and provable surface ownership. It cannot
 submit terminal input, so Agy and Pi follow-ups are unsupported there; choose another terminal
 for those providers. Warp has automated tests. The [0.1.1 check][mac11] returned an empty Warp
-instance list; Warp was not exercised for [0.1.2][mac12] or the latest Mac run (#63, #87).
+instance list; Warp was not exercised for [0.1.2][mac12] or the 0.4.9 and Ghostty 1.4.0 Mac runs (#63, #87).
 Linux is unsupported even where shared code compiles. See [terminal support](terminals.md) for surface-specific constraints.
 
 [mac12]: verification/2026-10-06-macos-0.1.2.md
@@ -682,3 +684,5 @@ Linux is unsupported even where shared code compiles. See [terminal support](ter
 [mac49]: verification/2026-10-15-macos-0.4.9.md
 [win48]: verification/2026-10-12-windows-0.4.8.md
 [win49]: verification/2026-10-12-windows-0.4.9.md
+
+[ghostty140]: verification/2026-10-28-macos-104-ghostty-1.4.0.md
