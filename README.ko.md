@@ -60,7 +60,7 @@ closed session-K7m2Qx
 | --- | --- | --- |
 | macOS / iTerm2 | 구현됨 | Codex, 2026-10-07 |
 | macOS / Terminal.app | 구현됨 | Codex, 2026-10-07 |
-| macOS / Ghostty | 구현됨 | Codex, 2026-10-07 |
+| macOS / Ghostty | 구현됨 | [네 CLI, 1.4.0, 2026-10-28](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md) |
 | macOS / WezTerm | 구현됨 | Codex/Claude/Agy, 2026-10-07 |
 | macOS / Warp | 제한적 | 미검증 |
 | Windows에서 직접 실행 | 구현됨 | 네 CLI 모두, 2026-10-02 |
@@ -81,6 +81,9 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 
 Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. macOS와 Windows의 새 Claude 실행 및 Windows 재열기에는 안정 버전 2.1.302 이상과 실제 준비 신호를 보낸 Bridge 완료 모듈이 필요합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
+- [2026-10-28 Ghostty 1.4.0, 배포된 0.4.29](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md):
+  잠금 해제 상태의 Codex cold/warm 시작, 네 CLI의 요청·후속 요청·종료와 다른 탭·분할 화면 보존을 확인했습니다.
+  기존 신뢰·승인과 명시적 `--yolo`를 사용했습니다. 1.4.0의 잠금 화면 동작은 미검증입니다.
 - [2026-10-22 Windows, Claude 네이티브 완료 재검증](docs/verification/2026-10-22-windows-260-reverification.md): `fa50fb8`의 첫 재검증은 백그라운드 이어짐 사례에서 실패했습니다. 수정한 `49bb9d1` 실행 파일은 Claude Code 2.1.308에서 백그라운드 `ask`와 `tell`의 표식 없는 중간 답을 후보로만 두고, 표식이 붙은 최종 답을 원래 Bridge id로 게시했습니다. 표식 없는 실제 최종 답은 호출자 제한 시간이 지난 뒤에도 대기 상태로 남았습니다. 이 검증은 표식 프로토콜을 확인한 것이며 provider가 보장하는 부모 관계를 확인한 것은 아닙니다.
 - [2026-10-19 Windows, Claude 네이티브 완료 소유자 확인](docs/verification/2026-10-19-windows-249-claude-native-completion.md): `ask`와 `tell`은 차단된 Stop 초안을 게시하지 않고 이후 최종 답을 게시했으며, 보호 태그 인용도 확인했습니다. 훅을 끄면 준비 신호가 나오지 않았습니다. 표식 누락 결과는 2026-10-22 수정으로 대체되었습니다. 지금은 표식 없는 바인딩 답을 게시하지 않고 후보로 보관합니다.
 - [2026-10-15 macOS, 배포된 0.4.9](docs/verification/2026-10-15-macos-0.4.9.md): 배포 후 iTerm2에서 네 provider의 self-test를 모두 확인했습니다. Codex·Claude는 기본값, Pi는 명시한 모델, Agy는 `--yolo`를 사용했습니다. 별도 Ghostty 검사는 설치된 실행 파일과 이미 실행 중인 앱을 사용했습니다.
@@ -89,7 +92,7 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 - [2026-10-07 macOS, 0.2.4](docs/verification/2026-10-07-macos-0.2.4.md): 네 터미널의 Codex와 WezTerm의 Claude·Agy·Pi 왕복, Pi 자격 증명 누락 타임아웃 진단을 확인했습니다.
 - [2026-10-07 macOS, 0.2.3](docs/verification/2026-10-07-macos-0.2.3.md): iTerm2의 Codex, WezTerm의 Pi(로그인된 provider와 자격 증명이 없는 provider, #83의 사유 확인), WezTerm의 Claude와 Agy를 검증했습니다. Warp는 실행하지 않았습니다.
 - [2026-10-07 macOS, 0.2.2](docs/verification/2026-10-07-macos-0.2.2.md): 화면이 잠기지 않은 상태에서 위의 네 터미널의 Codex, WezTerm의 Claude, WezTerm의 Agy(기본 권한 모드와 `--yolo`), 로그인된 provider로 WezTerm의 Pi를 검증했습니다.
-- [2026-10-07 macOS, 0.2.1](docs/verification/2026-10-07-macos-0.2.1.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 CLI 기본값으로 검증했습니다. Agy는 WezTerm에서 `--yolo`로 검증했습니다. 화면이 잠긴 상태에서는 Terminal.app과 Ghostty가 요청부터 종료까지의 과정을 마치지 못했습니다. 기본 권한 모드의 Agy와 Pi는 첫 결과를 기다리다 시간이 초과되어, 성공한 검증에 포함하지 않습니다.
+- [2026-10-07 macOS, 0.2.1](docs/verification/2026-10-07-macos-0.2.1.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 CLI 기본값으로 검증했습니다. Agy는 WezTerm에서 `--yolo`로 검증했습니다. 그 당시 실행에서 화면이 잠긴 상태에서는 Terminal.app과 Ghostty가 요청부터 종료까지의 과정을 마치지 못했습니다. 기본 권한 모드의 Agy와 Pi는 첫 결과를 기다리다 시간이 초과되어, 성공한 검증에 포함하지 않습니다.
 - [2026-10-06 macOS](docs/verification/2026-10-06-macos-0.1.2.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 검증했습니다. 기본 권한 모드 대신 `--yolo`를 사용했습니다.
 - [2026-10-04 macOS](docs/verification/2026-10-04-macos-0.1.1.md): Codex·Claude·Agy를 CLI 기본값으로 검증했습니다. 최근 WezTerm에서 실행한 Pi 검사는 인증에 실패했습니다. 요청부터 후속 요청과 종료까지 성공한 검증에는 포함하지 않습니다.
 - [2026-10-02 Windows](docs/verification/2026-10-02-windows.md): 네 CLI를 검증했습니다. 각 세션이 탭인지 별도 콘솔 창인지는 기록에서 구분하지 않습니다.

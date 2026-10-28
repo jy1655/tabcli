@@ -1,5 +1,6 @@
-// Ghostty supplies no surface identity: prove the bound PTY by its frame and discard other input.
-// Replace this fallback when Ghostty exposes a surface identity or an input API;
+// The frame proves the bound PTY, carries the session after binding, and discards startup input.
+// Ghostty 1.4.0 exposes tty, unused here. Replace the frame only when native capabilities
+// also preserve the session handoff, launch ordering, and input protection;
 // see docs/verification/2026-10-03-v0.1.0-focus.md.
 use super::{QUEUE_COMMAND_SCRIPT, Runner, ownership_proof};
 use crate::native::private_to_user::owned_and_not_accessible_by_others;

@@ -75,7 +75,7 @@ settings, and limitations. These are not checks of every combination on the curr
 | --- | --- | --- |
 | macOS / iTerm2 | Implemented | Codex, 2026-10-07 |
 | macOS / Terminal.app | Implemented | Codex, 2026-10-07 |
-| macOS / Ghostty | Implemented | Codex, 2026-10-07 |
+| macOS / Ghostty | Implemented | [Four providers, 1.4.0, 2026-10-28](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md) |
 | macOS / WezTerm | Implemented | Codex/Claude/Agy, 2026-10-07 |
 | macOS / Warp | Limited | Not verified |
 | Native Windows | Implemented | All four providers, 2026-10-02 |
@@ -112,6 +112,9 @@ New macOS and Windows Claude launches, plus Windows reopens, require stable 2.1.
 and a Bridge completion module that Claude loads and that reports readiness.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- [2026-10-28 Ghostty 1.4.0, published 0.4.29](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md):
+  unlocked Codex cold/warm starts, four-provider ask/tell/close, and sibling preservation;
+  existing trust and explicit `--yolo`. Locked-screen behavior remains unverified on 1.4.0.
 - [2026-10-23 macOS, Claude configured Stop-hook verification](docs/verification/2026-10-23-macos-249-claude-completion.md):
   ask and tell publish the final answer after a configured hook continues the draft.
   The record also covers disabled readiness, ordinary permissions and background continuation.
@@ -156,7 +159,7 @@ See [provider requirements](docs/providers.md) for delivery paths and failure ha
   `--yolo`, and Pi in WezTerm with a logged-in provider, all with the screen unlocked.
 - [2026-10-07 macOS, 0.2.1](docs/verification/2026-10-07-macos-0.2.1.md): Codex in the four terminals
   above and Claude in WezTerm with provider defaults; Agy in WezTerm with `--yolo`. With the
-  screen locked, Terminal.app and Ghostty did not complete a round trip. Agy's default-mode
+  screen locked, Terminal.app and Ghostty did not complete a round trip in that historical run. Agy's default-mode
   attempt and Pi's attempt timed out; they were not round-trip passes.
 - [2026-10-06 macOS](docs/verification/2026-10-06-macos-0.1.2.md): Codex in the four terminals
   above and Claude in WezTerm, using `--yolo`, not default approval modes.
