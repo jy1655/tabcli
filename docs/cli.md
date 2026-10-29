@@ -1792,6 +1792,50 @@ recorded event is Bridge's delivery refusal (`provenance: "delivery_not_sent"`, 
 otherwise `"unknown"`. `delivery: "unknown"` does not mean that nothing was sent. A refusal
 event's entry has `stage: "delivery_refusal"`; a provider completion's has `stage: "completion"`.
 
+### Offline diagnostic summary
+
+`scripts/share_diagnostics.py` is a Python 3.9+ standard-library formatter for an existing
+`doctor --json`, `status --json`, `inspect --json`, or `inspect --timeline --json` response.
+It reads one schema-version-1 JSON object from stdin and writes Markdown by default, or JSON:
+
+```sh
+python3 scripts/share_diagnostics.py < saved-doctor.json
+python3 scripts/share_diagnostics.py --format json < saved-timeline.json
+```
+
+The formatter runs no Bridge or provider command, reads no session directory, uploads nothing,
+and creates no files. To retain stdout, use your shell's exclusive/no-clobber redirection;
+ordinary shell redirection can overwrite an existing file independently of this script.
+Successful formatting exits 0; malformed, unsupported, ambiguous or oversized input exits 2
+without a partial summary. Supplied error text and filenames are not included in diagnostics.
+
+The summary identifies its source shape and public schema version. It retains validated
+public status/reason categories, booleans, scan and array counts, incomplete states, request
+elapsed time, question-emission counts with supplied `incomplete`/`unreadable` observation
+qualifiers, and numeric CLI versions in supported complete forms. An absent question qualifier
+is reported as missing; it is not a claim that observation was complete. A timeline source
+such as `requests/<claim>.json` or `events/<event>` becomes the fixed family
+`requests/*.json` or `events/*`; no filename or identifier is retained.
+Doctor query duration is derived only from valid supplied start/finish timestamps and labeled
+`supplied_doctor_timestamps`; missing or inverted timestamps produce no duration.
+Numeric versions may be plain `1.2.3`, `codex-cli 1.2.3`, `agy version 1.2.3`, or
+`1.2.3 (Claude Code)`; the summary keeps only the numeric portion. Prerelease/build suffixes
+and other version forms are omitted. This does not validate an installed CLI or prove readiness.
+
+Fields outside the explicit allowlist are omitted, including all session/request/event IDs,
+prompts, results, questions/options, errors, details, next actions/commands, titles, paths,
+model/effort strings, arbitrary evidence/environment and unknown extensions. Missing, null,
+invalid and unrecognized allowlisted values are distinguished without copying their content.
+Unknown future category values require a reviewed allowlist update. List positions refer only
+to the supplied input; they are not identifiers and do not correlate separate exports.
+
+Limits are 4 MiB of strict UTF-8 input, 32 nested containers, 100,000 JSON value nodes,
+24 items per projected array and 64 KiB of ASCII output. Omitted array items are counted.
+Integers must be nonnegative and at most `2^53 - 1`; booleans and numeric strings do not
+coerce to integers. Duplicate keys and non-finite numbers are refused. Markdown contains a
+fenced JSON projection with no unvalidated text. See the
+[privacy limits](security-and-data.md#sharing-diagnostic-summaries) before sharing.
+
 ### search
 
 JSON has `schema_version`, `ok`, `query`, `filters`, `limit`, `hits`, `truncated`, `incomplete`,

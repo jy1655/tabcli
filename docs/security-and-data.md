@@ -237,3 +237,24 @@ Provider history needs the provider's own removal procedure. Removing the execut
 from deleting records.
 
 Report a suspected vulnerability using [the security reporting policy](../SECURITY.md).
+
+## Sharing diagnostic summaries
+
+The offline [diagnostic formatter](cli.md#offline-diagnostic-summary) projects saved public
+query JSON onto an explicit allowlist. It does not redact arbitrary text with regular
+expressions. Strings under numeric, boolean, enum or identifier-looking keys are not trusted:
+numeric and boolean fields require their exact JSON types, enums require a known complete
+literal, version strings require a bounded complete numeric form, and all identifiers are
+omitted. Timeline filenames are projected only to fixed `requests/*.json`/`events/*` families;
+unsupported path shapes are omitted. Question-observation qualifiers retain only the exact
+`incomplete` and `unreadable` categories, with no question or option text.
+Unknown keys are never copied. Terminal controls, bidi text and Markdown instructions
+in omitted content therefore do not reach the output. Original JSON and Result bytes are
+not rewritten, and the formatter does not open provider-private records.
+
+This is a deliberately lossy support aid, not an anonymization or authenticity guarantee.
+Validated categories, counts, booleans and numeric versions still disclose those facts; a
+fabricated input can put plausible but false values in those fields. The formatter cannot
+establish who produced the JSON, whether records are complete, or whether runtime behavior
+matches it. Review the projection for your sharing context. Share only the projected stdout
+when appropriate; the original export and session directory can still contain secrets.
