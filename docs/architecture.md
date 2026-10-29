@@ -474,6 +474,7 @@ The native provider contract requires explicit launch configuration, initial del
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every
 provider. There is no default adapter that silently gives all CLIs the same transport. Launch
 plans also state which caller environment markers must be removed.
+Read-only question emissions and completion observations dispatch through the adapter like every other provider operation.
 
 The terminal seam binds a concrete surface to a session and reports whether delivery was known
 not to start or may have occurred. `terminal::ownership` checks the recorded owner against the

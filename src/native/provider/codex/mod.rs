@@ -154,6 +154,19 @@ impl Transport for CodexQueue {
 const APPLIED_MARKER: &str = "codex-config-override";
 
 impl NativeProviderAdapter for CodexAdapter {
+    fn question_emissions(
+        &self,
+        reader: &Reader,
+        receipt: &crate::native::session::requests::Receipt,
+    ) -> Option<super::QuestionEmissions> {
+        questions::read(reader, receipt)
+    }
+
+    fn completion_observation(&self, _reader: &Reader, _claim: &str) -> Option<serde_json::Value> {
+        // Codex has no completion observation today.
+        None
+    }
+
     fn result_timeout_diagnostic(
         &self,
     ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {
