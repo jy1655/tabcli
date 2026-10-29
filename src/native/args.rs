@@ -1,6 +1,6 @@
 //! Argument helpers shared by the native command parsers.
 use super::terminal;
-use agent_bridge::checked_deadline_from;
+use agent_bridge::{checked_deadline_from, validate_terminal_input};
 use anyhow::{Context, Result, bail};
 use std::{
     fs,
@@ -54,7 +54,7 @@ pub(super) fn parse_timeout(value: &str) -> Result<Duration> {
     Ok(timeout)
 }
 
-pub(super) fn read_prompt_option(
+fn read_prompt_option(
     inline: Option<String>,
     file: Option<PathBuf>,
     command: &str,
@@ -83,11 +83,28 @@ pub(super) struct CommonStartOptions {
     pub(super) json: bool,
 }
 
+// Which of the common options a command takes. `ask` and `reopen` shape the session they
+// start; `tell` only follows up on one, so the session-shaping options (`--title`,
+// `--model`, `--effort`, `--terminal`, `--yolo`) are left to it, and it rejects them as
+// unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OptionSet {
+    Start,
+    FollowUp,
+}
+
+impl OptionSet {
+    fn shapes_session(self) -> bool {
+        matches!(self, Self::Start)
+    }
+}
+
 // Consume one common option, leaving unknown tokens untouched for the command.
 pub(super) fn parse_common_start_option(
     options: &[String],
     index: &mut usize,
     parsed: &mut CommonStartOptions,
+    set: OptionSet,
 ) -> Result<bool> {
     match options[*index].as_str() {
         "--prompt" => set_once(
@@ -100,22 +117,22 @@ pub(super) fn parse_common_start_option(
             PathBuf::from(option_value(options, index, "--prompt-file")?),
             "--prompt-file",
         )?,
-        "--title" => set_once(
+        "--title" if set.shapes_session() => set_once(
             &mut parsed.title,
             option_value(options, index, "--title")?.to_owned(),
             "--title",
         )?,
-        "--model" => set_once(
+        "--model" if set.shapes_session() => set_once(
             &mut parsed.model,
             option_value(options, index, "--model")?.to_owned(),
             "--model",
         )?,
-        "--effort" => set_once(
+        "--effort" if set.shapes_session() => set_once(
             &mut parsed.effort,
             option_value(options, index, "--effort")?.to_owned(),
             "--effort",
         )?,
-        "--terminal" => set_once(
+        "--terminal" if set.shapes_session() => set_once(
             &mut parsed.terminal,
             terminal::TerminalKind::from_str(option_value(options, index, "--terminal")?)
                 .map_err(anyhow::Error::msg)?,
@@ -125,13 +142,71 @@ pub(super) fn parse_common_start_option(
             let value = option_value(options, index, "--timeout-secs")?;
             set_once(&mut parsed.timeout, parse_timeout(value)?, "--timeout-secs")?;
         }
-        "--yolo" => set_flag_once(&mut parsed.yolo, "--yolo")?,
+        "--yolo" if set.shapes_session() => set_flag_once(&mut parsed.yolo, "--yolo")?,
         "--detach" => set_flag_once(&mut parsed.detach, "--detach")?,
         "--json" => set_flag_once(&mut parsed.json, "--json")?,
         _ => return Ok(false),
     }
     *index += 1;
     Ok(true)
+}
+
+// The common options once their prompt is read and checked: what `ask`, `reopen` and
+// `tell` build their requests from. The timeout default belongs to the request.
+pub(super) struct ValidatedStartOptions {
+    pub(super) prompt: String,
+    pub(super) title: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) effort: Option<String>,
+    pub(super) terminal: Option<terminal::TerminalKind>,
+    pub(super) yolo: bool,
+    pub(super) timeout: Option<Duration>,
+    pub(super) detach: bool,
+    pub(super) json: bool,
+}
+
+// Reads the prompt and applies the four checks every start command makes, in this order:
+// the prompt is present and not blank, carries no terminal control, and `--model` and
+// `--effort` are not blank when given. `command` names the prompt's owner in its errors.
+// A follow-up has no `--model` or `--effort`, so only its prompt is checked.
+pub(super) fn validate_start_options(
+    parsed: CommonStartOptions,
+    command: &str,
+) -> Result<ValidatedStartOptions> {
+    let CommonStartOptions {
+        prompt,
+        prompt_file,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout,
+        detach,
+        json,
+    } = parsed;
+    let prompt = read_prompt_option(prompt, prompt_file, command)?;
+    if prompt.trim().is_empty() {
+        bail!("--prompt cannot be empty");
+    }
+    validate_terminal_input(&prompt, "--prompt")?;
+    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--model cannot be empty");
+    }
+    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
+    Ok(ValidatedStartOptions {
+        prompt,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout,
+        detach,
+        json,
+    })
 }
 
 // The canonical form of an explicit `--workspace`, the one `sessions`, `search` and `status`

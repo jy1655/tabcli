@@ -3602,12 +3602,12 @@ fn start_source_fixture(root: &Path) -> ResolvedReopen {
         source_id: id.into(),
         source_directory: directory,
         source,
-        start: session_start::Resolved {
+        start: session_start::Resolved::from_parts(
             spec,
-            terminal_kind: terminal::TerminalKind::WindowsConsole,
-            context_sources: Vec::new(),
-            consent: None,
-        },
+            terminal::TerminalKind::WindowsConsole,
+            Vec::new(),
+            None,
+        ),
     }
 }
 
@@ -3630,35 +3630,8 @@ fn start_operation() -> session_start::Start {
     .unwrap()
 }
 
-#[test]
-fn reopened_source_assesses_workspace_consent_for_the_new_session() {
-    // The new session assesses the current workspace exactly as a fresh ask does, as part of
-    // the resolution and before create claims the source marker; the source's assessment is
-    // another session's diagnostic history (#202).
-    let root = tempfile::tempdir().unwrap();
-    let mut spec = start_source_fixture(root.path()).start.spec;
-    spec.workspace = root.path().canonicalize().unwrap();
-    let workspace = spec.workspace.clone();
-    let start = resolved(root.path(), spec, terminal::TerminalKind::WindowsConsole).unwrap();
-    assert!(start.consent.is_some());
-    assert_eq!(start.spec.workspace, workspace);
-    assert_eq!(start.terminal_kind, terminal::TerminalKind::WindowsConsole);
-    assert!(start.context_sources.is_empty());
-    // A workspace that cannot be identified fails the resolution, and the failure leaves the
-    // state root as it was: only the fixture's source session, no shared consent record.
-    let other = tempfile::tempdir().unwrap();
-    let mut missing = start_source_fixture(other.path()).start.spec;
-    missing.workspace = other.path().join("missing");
-    let error = resolved(
-        other.path(),
-        missing,
-        terminal::TerminalKind::WindowsConsole,
-    )
-    .err()
-    .expect("an unidentifiable workspace must fail the resolution");
-    assert_eq!(error.to_string(), "cannot identify workspace");
-    assert_eq!(fs::read_dir(other.path()).unwrap().count(), 1);
-}
+// The reopen row of `session_start::tests::fresh_and_reopen_rows_resolve_through_one_step`
+// covers the new session's own consent assessment of the canonical source workspace (#202).
 
 #[test]
 fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source() {

@@ -601,7 +601,7 @@ fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop
     }
     let root = Reader::state_root().unwrap();
     let mut resolved = start_source_fixture(&root);
-    resolved.start.spec.yolo = true;
+    resolved.start.spec_mut().yolo = true;
     let attempt = resolved.create().unwrap();
     let source = attempt.source_directory.clone();
     let created = &attempt.prepared.created;

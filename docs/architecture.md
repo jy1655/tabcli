@@ -97,7 +97,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   operation for an already prepared Session. Fresh and Reopen resolution and creation finish
   before that operation; their explicit `InitialSource` implementations supply result fields,
   holder gates, and phase-specific failure handling. Consent failure remains separate from
-  launcher and Delivery failures.
+  launcher and Delivery failures. The launchable-spec resolution that `ask` and `reopen`
+  share (`resolve`, fed a `Resolution` of what each supplies) lives here, the common option
+  validation they share lives in `args.rs`, and `tell` parses through the same option helper
+  with the follow-up option set.
 - `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's
   integration with `reopen/reservation.rs`, which owns source reservations, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
