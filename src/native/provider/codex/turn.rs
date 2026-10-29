@@ -137,20 +137,11 @@ pub(super) fn current_claim(reader: &Reader, token: &str) -> Result<bool> {
 
 pub(super) fn stop(store: &Store, payload: &Value) -> Result<()> {
     let _lock = store.lock()?;
+    // This handler discovers the current claim under the lock rather than validating an
+    // expected one, so the Claim-currency guard has nothing to compare.
     let Some(token) = turn::current_claim_token(store)? else {
         return Ok(());
     };
-    if (turn::ClaimCurrency {
-        expected: Some(&token),
-        state: turn::ClaimState::Any,
-        tombstone: turn::ClaimTombstone::Ignored,
-        expires: None,
-    })
-    .check(store)?
-    .is_err()
-    {
-        return Ok(());
-    }
     let Some(binding) = binding(store, &token)? else {
         return Ok(());
     };

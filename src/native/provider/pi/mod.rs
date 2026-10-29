@@ -511,7 +511,9 @@ fn install_pending_turn_bound(
     })
     .run(&store, || {
         store.private(CANCEL_ACCEPTED_FILE).remove()?;
-        // Carry session startup capability to this claim without upgrading legacy evidence.
+        // Startup proves the installed extension's capability for the whole session.
+        // Carry that evidence to a follow-up claim before delivery, including after a
+        // rolled-back delivery; never upgrade a legacy extension's schema.
         startup_ready::carry_forward(&store, claim_token)?;
         store.private(PENDING_TURN_FILE).write_json(&pending)?;
         Ok(pending)
