@@ -4,6 +4,7 @@
 //! and their own early report address; the run repeats that address idempotently.
 use super::delivery::{self, Checks, DeliveryContext, RuntimeChecks, Transport, Turn};
 use super::session_start::ResultExtra;
+use crate::native::query::request::RequestState;
 use crate::native::session::schema::SessionEvent;
 use crate::native::session::{Store, requests, turn};
 use crate::native::turn_report::TurnReport;
@@ -195,7 +196,7 @@ fn emit_session_result(
                 "context_sources": receipt.context_sources,
                 "bridge_observed_elapsed_ms": elapsed,
                 "bridge_observed_elapsed_reason": elapsed_reason,
-                "request_state": if event.is_some() { "completed" } else { "accepted" },
+                "request_state": if event.is_some() { RequestState::Completed } else { RequestState::Accepted },
                 "provider": provider.as_str(),
                 "terminal": terminal_session.kind.as_str(),
                 "terminal_session_id": terminal_session.id,

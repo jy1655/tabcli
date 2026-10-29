@@ -260,6 +260,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
   `query/request.rs` owns the Request observation, which precedes JSON rendering.
+  It owns the Request outcome vocabulary: terminality, success, refusal text, and public
+  `request_state` names.
   `with_owner` is the only adjustment of that observation, and only `wait` applies it.
   `query/search.rs` owns search with its budgets.
   Context attachment resolution uses the same
