@@ -14,72 +14,44 @@ use observation::judgment::{
 };
 use observation::{Observation, QuestionFocus, StatusObservation};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::native) enum AttentionFlag {
-    CancelRequested,
-    ClaimWithoutReceipt,
-    DeliveryUnconfirmed,
-    Held,
-    LaunchFailed,
-    LaunchTimeout,
-    LaunchUncertain,
-    OriginEnded,
-    OwnerExited,
-    OwnerIdentityMismatch,
-    OwnerUnverified,
-    QuestionEmitted,
-    RecordsPartiallyUnreadable,
-    RecoveryRequired,
-    RequestIndexIncomplete,
-    ResidualSurfaceUnverified,
-    SessionExited,
-    SessionFailed,
+macro_rules! attention_flags {
+    ($($variant:ident => $name:literal,)*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(in crate::native) enum AttentionFlag {
+            $($variant,)*
+        }
+
+        impl AttentionFlag {
+            pub(in crate::native) const ALL: &[Self] = &[$(Self::$variant,)*];
+
+            pub(in crate::native) const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
+        }
+    };
 }
 
-impl AttentionFlag {
-    pub(in crate::native) const ALL: &[Self] = &[
-        Self::CancelRequested,
-        Self::ClaimWithoutReceipt,
-        Self::DeliveryUnconfirmed,
-        Self::Held,
-        Self::LaunchFailed,
-        Self::LaunchTimeout,
-        Self::LaunchUncertain,
-        Self::OriginEnded,
-        Self::OwnerExited,
-        Self::OwnerIdentityMismatch,
-        Self::OwnerUnverified,
-        Self::QuestionEmitted,
-        Self::RecordsPartiallyUnreadable,
-        Self::RecoveryRequired,
-        Self::RequestIndexIncomplete,
-        Self::ResidualSurfaceUnverified,
-        Self::SessionExited,
-        Self::SessionFailed,
-    ];
-
-    pub(in crate::native) const fn name(self) -> &'static str {
-        match self {
-            Self::CancelRequested => "cancel_requested",
-            Self::ClaimWithoutReceipt => "claim_without_receipt",
-            Self::DeliveryUnconfirmed => "delivery_unconfirmed",
-            Self::Held => "held",
-            Self::LaunchFailed => "launch_failed",
-            Self::LaunchTimeout => "launch_timeout",
-            Self::LaunchUncertain => "launch_uncertain",
-            Self::OriginEnded => "origin_ended",
-            Self::OwnerExited => "owner_exited",
-            Self::OwnerIdentityMismatch => "owner_identity_mismatch",
-            Self::OwnerUnverified => "owner_unverified",
-            Self::QuestionEmitted => "question_emitted",
-            Self::RecordsPartiallyUnreadable => "records_partially_unreadable",
-            Self::RecoveryRequired => "recovery_required",
-            Self::RequestIndexIncomplete => "request_index_incomplete",
-            Self::ResidualSurfaceUnverified => "residual_surface_unverified",
-            Self::SessionExited => "session_exited",
-            Self::SessionFailed => "session_failed",
-        }
-    }
+attention_flags! {
+    CancelRequested => "cancel_requested",
+    ClaimWithoutReceipt => "claim_without_receipt",
+    DeliveryUnconfirmed => "delivery_unconfirmed",
+    Held => "held",
+    LaunchFailed => "launch_failed",
+    LaunchTimeout => "launch_timeout",
+    LaunchUncertain => "launch_uncertain",
+    OriginEnded => "origin_ended",
+    OwnerExited => "owner_exited",
+    OwnerIdentityMismatch => "owner_identity_mismatch",
+    OwnerUnverified => "owner_unverified",
+    QuestionEmitted => "question_emitted",
+    RecordsPartiallyUnreadable => "records_partially_unreadable",
+    RecoveryRequired => "recovery_required",
+    RequestIndexIncomplete => "request_index_incomplete",
+    ResidualSurfaceUnverified => "residual_surface_unverified",
+    SessionExited => "session_exited",
+    SessionFailed => "session_failed",
 }
 
 impl serde::Serialize for AttentionFlag {
