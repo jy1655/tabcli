@@ -1,4 +1,5 @@
 use super::monitor::HOOK_FAILURE_FILE;
+use super::startup_ready::{STARTUP_READY_FILE, StartupReady};
 use super::test_support::{claim_pending_turn, marked};
 use super::*;
 use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};

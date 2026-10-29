@@ -148,6 +148,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
   Its internal runtime supplies console dispatch, Record observations and the existing Clock;
   tests substitute that runtime while retaining the real Record readers and delivery settlement.
+  Pi's startup-readiness record (its reader, validity floor and carry-forward) lives in
+  `pi/startup_ready.rs`.
   It uses the session seam and terminal operations. Keep provider schemas and transport selection
   in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
   orchestration.

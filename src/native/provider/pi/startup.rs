@@ -1,5 +1,7 @@
 #[cfg(any(windows, test))]
-use super::{STARTUP_READY_FILE, StartupReady, read_pending_turn};
+use super::read_pending_turn;
+#[cfg(any(windows, test))]
+use super::startup_ready::{self, StartupReadiness};
 #[cfg(any(windows, test))]
 use crate::native::session::{Reader, turn};
 use crate::native::terminal;
@@ -52,19 +54,19 @@ fn send_initial_prompt_after_startup(
             {
                 bail!("Pi initial turn is no longer claimed; no initial console input was sent");
             }
-            if let Some(text) = Reader::open_unchecked(directory)
-                .private(STARTUP_READY_FILE)
-                .timeline(4096)?
-            {
-                let ready: StartupReady =
-                    serde_json::from_slice(&text).context("invalid Pi startup receipt; start a new Bridge session; no initial console input was sent")?;
-                if !matches!(ready.schema, 1 | 2)
-                    || ready.claim_token != pending.claim_token
-                    || ready.session_id.trim().is_empty()
-                {
-                    bail!("Pi startup receipt does not identify this initial turn");
+            match startup_ready::read(&Reader::open_unchecked(directory)) {
+                StartupReadiness::Absent => {}
+                StartupReadiness::Unreadable(error) => {
+                    return Err(error.context(
+                        "invalid Pi startup receipt; start a new Bridge session; no initial console input was sent",
+                    ));
                 }
-                return Ok(());
+                StartupReadiness::Present(ready) => {
+                    if !ready.resolves_startup_for(&pending.claim_token) {
+                        bail!("Pi startup receipt does not identify this initial turn");
+                    }
+                    return Ok(());
+                }
             }
             thread::sleep(
                 deadline
