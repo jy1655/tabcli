@@ -42,7 +42,7 @@ fn pending_turn_windows_fingerprint_round_trips_without_changing_core_or_legacy_
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());
     let pending = super::test_support::claim_pending_turn(directory.path());
-    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    super::test_support::stored_state(directory.path(), &SessionState::Working);
     let claim_before = fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
     let status_before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
     let surface = serde_json::from_value(

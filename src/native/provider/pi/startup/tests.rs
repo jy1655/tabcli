@@ -85,3 +85,51 @@ fn stale_malformed_or_cancelled_startup_never_pastes() {
     .unwrap_err();
     assert!(!failure.delivery_may_have_occurred());
 }
+
+#[test]
+fn ended_session_or_tombstone_refuses_the_initial_console_paste_at_once() {
+    use super::super::test_support::stored_state;
+    use crate::native::session::{CoreRecord, SessionState, Store};
+    for case in ["exited", "failed", "closed", "tombstone", "replaced claim"] {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let store = Store::open_unchecked(directory.path());
+        let state = match case {
+            "exited" => SessionState::Exited,
+            "failed" => SessionState::Failed,
+            "closed" => SessionState::Closed,
+            _ => SessionState::Working,
+        };
+        stored_state(directory.path(), &state);
+        if case == "tombstone" {
+            fs::write(
+                store.record(CoreRecord::Closed).path(),
+                b"{\"state\":\"closed\",\"updated_unix_ms\":1}",
+            )
+            .unwrap();
+        }
+        if case == "replaced claim" {
+            fs::write(directory.path().join(TURN_CLAIM_FILE), b"999-999-999").unwrap();
+        }
+        let sent = std::cell::Cell::new(false);
+        // A deadline far away proves the refusal comes from the session, not the clock.
+        let failure = send_initial_prompt_after_startup(
+            directory.path(),
+            Instant::now() + Duration::from_secs(60),
+            || {
+                sent.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!sent.get(), "{case}: no initial console input may be sent");
+        assert!(!failure.delivery_may_have_occurred(), "{case}");
+        let expected = if case == "replaced claim" {
+            "Pi initial turn is no longer claimed; no initial console input was sent"
+        } else {
+            "Pi session ended; no initial console input was sent"
+        };
+        assert_eq!(failure.into_error().to_string(), expected, "{case}");
+        let _ = pending;
+    }
+}
