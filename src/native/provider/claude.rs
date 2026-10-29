@@ -26,12 +26,6 @@ mod registry;
 mod trust;
 mod turn;
 
-pub(super) use completion::question_emissions;
-
-pub(super) fn completion_observation(reader: &Reader, token: &str) -> Option<serde_json::Value> {
-    completion::observe_candidate(reader, token)
-}
-
 use messenger::{ClaudeMessage, run_message_guard, run_message_receipt};
 
 #[cfg(test)]
@@ -70,6 +64,18 @@ const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
 ];
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn question_emissions(
+        &self,
+        reader: &Reader,
+        receipt: &crate::native::session::requests::Receipt,
+    ) -> Option<super::QuestionEmissions> {
+        completion::question_emissions(reader, receipt)
+    }
+
+    fn completion_observation(&self, reader: &Reader, claim: &str) -> Option<serde_json::Value> {
+        completion::observe_candidate(reader, claim)
+    }
+
     fn result_timeout_diagnostic(
         &self,
     ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {

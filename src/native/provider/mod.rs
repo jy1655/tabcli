@@ -8,7 +8,7 @@ mod pi;
 
 use agent_bridge::FirstPartyCli;
 use anyhow::Result;
-use std::{ffi::OsString, fmt::Debug, path::Path, path::PathBuf, time::Instant};
+use std::{ffi::OsString, fmt::Debug, path::Path, path::PathBuf, str::FromStr, time::Instant};
 
 use super::{delivery::Transport, terminal};
 
@@ -47,11 +47,7 @@ pub(super) fn question_emissions(
     if !locked {
         return None;
     }
-    match provider {
-        "codex" => codex::questions::read(reader, receipt),
-        "claude" => claude::question_emissions(reader, receipt),
-        _ => None,
-    }
+    adapter(FirstPartyCli::from_str(provider).ok()?).question_emissions(reader, receipt)
 }
 
 /// Provider-owned completion evidence, observed only under inspect's existing lock.
@@ -61,11 +57,10 @@ pub(super) fn completion_observation(
     locked: bool,
     claim: Option<&str>,
 ) -> Option<serde_json::Value> {
-    if provider == "claude" && locked {
-        claim.and_then(|token| claude::completion_observation(reader, token))
-    } else {
-        None
+    if !locked {
+        return None;
     }
+    adapter(FirstPartyCli::from_str(provider).ok()?).completion_observation(reader, claim?)
 }
 
 // The manifest's policy inputs travel with every launch context. Each adapter maps them to
@@ -211,6 +206,16 @@ pub(super) trait ReopenSupport: Sync {
 }
 
 trait NativeProviderAdapter: Sync {
+    fn question_emissions(
+        &self,
+        reader: &super::session::Reader,
+        receipt: &super::session::requests::Receipt,
+    ) -> Option<QuestionEmissions>;
+    fn completion_observation(
+        &self,
+        reader: &super::session::Reader,
+        claim: &str,
+    ) -> Option<serde_json::Value>;
     fn initial_transport(&self) -> Box<dyn Transport>;
     fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
@@ -352,6 +357,55 @@ fn transport_test_context<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_observations_dispatch_through_adapters() {
+        use crate::native::session::{Reader, Store, requests::Receipt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_unchecked(directory.path());
+        let receipt = Receipt {
+            schema: 1,
+            request_id: "request-1-2-3".into(),
+            claim_token: "1-2-3".into(),
+            event_file: "turn-1-2-3.json".into(),
+            created_unix_ms: Some(1),
+            source: None,
+            context_sources: Vec::new(),
+        };
+        // Malformed private records distinguish an adapter read from an unsupported operation.
+        for name in [
+            "codex-questions-1-2-3.json",
+            "claude-questions-1-2-3.json",
+            "claude-completion-mode.json",
+        ] {
+            store.private(name).write_private(b"{").unwrap();
+        }
+        let reader = Reader::open_unchecked(directory.path());
+        for (provider, questions, completion) in [
+            (FirstPartyCli::Codex.as_str(), true, false),
+            (FirstPartyCli::Claude.as_str(), true, true),
+            (FirstPartyCli::Agy.as_str(), false, false),
+            (FirstPartyCli::Pi.as_str(), false, false),
+            ("unrecognized", false, false),
+        ] {
+            for locked in [true, false] {
+                let observed = question_emissions(&reader, provider, locked, &receipt);
+                assert_eq!(observed.is_some(), locked && questions, "{provider}");
+                if let Some(observed) = observed {
+                    assert!(observed.items.is_empty());
+                    assert!(observed.observation == QuestionObservation::Unreadable);
+                }
+                let observed =
+                    completion_observation(&reader, provider, locked, Some(&receipt.claim_token));
+                assert_eq!(observed.is_some(), locked && completion, "{provider}");
+                if let Some(observed) = observed {
+                    assert_eq!(observed["state"], "unreadable");
+                }
+                assert!(completion_observation(&reader, provider, locked, None).is_none());
+            }
+        }
+    }
 
     #[test]
     fn adapters_declare_launch_trust_facts() {

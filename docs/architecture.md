@@ -191,6 +191,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
+  Shared macOS procedures use one admission function with each host's recorded order,
+  check that a binding names its host, and run close re-probes with adapter-owned actions,
+  budgets and inspection-error policies.
   Ghostty's frame host lives in `terminal/macos/ghostty/host.rs`. It proves the bound PTY, carries
   the session directory only after binding, and discards startup input. Ghostty 1.4.0 adds a
   scripted `tty` property, which this adapter does not yet consume; replacing the frame must
@@ -482,6 +485,7 @@ The native provider contract requires explicit launch configuration, initial del
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every
 provider. There is no default adapter that silently gives all CLIs the same transport. Launch
 plans also state which caller environment markers must be removed.
+Read-only question emissions and completion observations dispatch through the adapter like every other provider operation.
 
 The terminal seam binds a concrete surface to a session and reports whether delivery was known
 not to start or may have occurred. `terminal::ownership` checks the recorded owner against the
