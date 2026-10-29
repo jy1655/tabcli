@@ -669,6 +669,54 @@ fn diagnostics_never_promote_configured_inbound_to_runtime_messaging() {
     }
 }
 
+// The completion rows follow the messaging row; neither a supported current version nor
+// the configured inbound setting makes the completion module ready.
+#[test]
+fn diagnostics_add_completion_rows_that_no_version_or_setting_satisfies() {
+    use super::super::super::diagnostics::{Availability, Context};
+    let environment = crate::native::consent::Environment::default();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("claude-settings.json"),
+        serde_json::json!({"crossSessionInbound":"accept"}).to_string(),
+    )
+    .unwrap();
+    for (scope, reason) in [
+        (None, "session_required"),
+        (Some(directory.path()), "claude_completion_mode_absent"),
+    ] {
+        let checks = ADAPTER.diagnose(Context {
+            directory: scope,
+            manifest: None,
+            executable: None,
+            current_version: Some("2.1.309"),
+            workspace: directory.path(),
+            probe: true,
+            deadline: Instant::now(),
+            environment: &environment,
+        });
+        let ids = checks.iter().map(|check| check.id).collect::<Vec<_>>();
+        let messaging = ids.iter().position(|id| *id == "claude_messaging").unwrap();
+        assert_eq!(
+            ids[messaging..messaging + 3],
+            [
+                "claude_messaging",
+                "claude_completion",
+                "claude_completion_diagnostic"
+            ]
+        );
+        let completion = &checks[messaging + 1];
+        assert_eq!(completion.reason_code, reason);
+        assert_ne!(completion.availability, Availability::Available);
+        assert_eq!(checks[messaging + 2].availability, Availability::Unknown);
+    }
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        1,
+        "doctor created a record"
+    );
+}
+
 // Doctor lists the other live holders of a resumed conversation from the same registry
 // scan the delivery boundaries use, and says nothing for a session that resumed none.
 #[cfg(windows)]

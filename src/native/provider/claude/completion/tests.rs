@@ -267,6 +267,88 @@ fn replaced_claim_and_closed_session_fence_late_completion() {
 }
 
 #[test]
+fn late_old_frames_and_markers_cannot_settle_a_successor_claim() {
+    let f = Fixture::new();
+    f.start();
+    f.complete_marked("first result");
+    let first_event = f.events()[0].message.clone();
+    let store = f.store();
+    let first_event_path = store.events().unwrap().remove(0);
+    let first_event_bytes = std::fs::read(&first_event_path).unwrap();
+    let mut successor = turn::claim(&store, &[]).unwrap();
+    crate::native::session::update_status(f.root.path(), SessionState::Claimed, None, None)
+        .unwrap();
+    successor.begin_delivery().unwrap();
+    let token = successor.token().to_owned();
+    assert_ne!(token, f.token);
+    let pending = ClaudeTurn::new("claude-turn-successor").unwrap();
+    let message = pending
+        .target_message("[Agent Bridge native delegation]\nSource: external\n\nSuccessor input");
+    install_pending(f.root.path(), pending.id(), Some(&token), &message)
+        .unwrap()
+        .retain();
+    successor.retain();
+    let protected = [
+        "turn.claim".to_owned(),
+        "status.json".to_owned(),
+        PENDING_TURN_FILE.to_owned(),
+        format!("requests/{token}.json"),
+        format!("requests/{}.json", f.token),
+        format!("claude-mod-bound-{}.json", f.token),
+    ]
+    .map(|name| {
+        let path = f.root.path().join(name);
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    });
+
+    // An old exact frame is now nonmatching, even if a later answer copies the new marker.
+    f.start();
+    f.complete_marked("late first answer");
+    f.send(
+        "turn.complete",
+        json!({"turnId":TURN,"reason":"answer","isAborted":false,
+            "answer":format!("unrelated answer\n{}",pending.marker())}),
+    );
+    assert_eq!(f.events().len(), 1);
+    assert_eq!(f.events()[0].message, first_event);
+    assert_eq!(std::fs::read(&first_event_path).unwrap(), first_event_bytes);
+    for (path, bytes) in protected {
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+    }
+    for kind in ["bound", "candidate", "continuation"] {
+        assert!(
+            !f.root
+                .path()
+                .join(format!("claude-mod-{kind}-{token}.json"))
+                .exists()
+        );
+    }
+
+    let successor_turn = "00000000-0000-4000-8000-000000000251";
+    f.send(
+        "turn.start",
+        json!({"turnId":successor_turn,"text":f.frame().replacen(&f.message,&message,1)}),
+    );
+    f.send(
+        "turn.complete",
+        json!({"turnId":successor_turn,"reason":"answer","isAborted":false,
+            "answer":format!("successor result\n{}",pending.marker())}),
+    );
+    let events = f.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].message, first_event);
+    assert_eq!(std::fs::read(first_event_path).unwrap(), first_event_bytes);
+    assert_eq!(events[1].message, "successor result");
+    assert_eq!(events[1].turn_id.as_deref(), Some(pending.id()));
+    assert_eq!(
+        events[1].provenance.as_deref(),
+        Some("claude_mod_turn_complete")
+    );
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
 fn old_pending_cleanup_cannot_delete_a_new_request() {
     let f = Fixture::new();
     let old = install_pending(f.root.path(), REQUEST, Some(&f.token), &f.message).unwrap();
@@ -693,4 +775,5 @@ fn peer_quoting_preserves_the_whole_body_and_existing_literal_backslashes() {
 #[path = "continuation_tests.rs"]
 mod continuation_tests;
 
+mod doctor_tests;
 mod question_tests;

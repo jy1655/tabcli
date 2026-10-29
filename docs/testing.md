@@ -35,6 +35,83 @@ claim replacement, timeout retention and interruption between identity selection
 retry, an oversized unbound completion and read-only candidate inspection. These fixtures do
 not prove provider parentage; authenticated background ask/tell evidence is recorded separately.
 
+### Claude inbound module coexistence
+
+Other Claude modules may consume or rewrite inbound input. The deterministic coexistence
+fixtures model possible target events; they do not run `session.receive`, reproduce Ruflo,
+or establish Claude's hook order or the sender-visible outcome of consumption. No production
+delivery or completion policy changes are implied by these tests.
+
+| Fixture | Evidence checked |
+| --- | --- |
+| `native_messenger_success_without_target_turn_keeps_the_claim` | A controlled messenger passes the real guard, executed-input receipt and stream confirmation. With no target turn, the waiter reports a timeout and a second claim is refused. Both preserve every session file, including the claim, pending input, status and receipt, and publish no result. |
+| `coexistence` in `tests/claude_completion.rs` | The real completion module and native-hook reader reject a marked final without a start, a changed body with its marker intact, a removed peer envelope, combined input and an unrelated turn. Each checkpoint preserves the claim, pending record, status and receipt; `result` stays pending and changes no session records. |
+| The same `coexistence` fixture's exact-input control | After those rejections, the unchanged addressed frame and matching marked final publish exactly one result with the original Bridge correlation id. No input is resent. |
+| `late_old_frames_and_markers_cannot_settle_a_successor_claim` | A real successor claim and pending record survive the old request's start/final and an unbound answer copying the successor marker. The successor's own exact frame still completes, and the first result remains unchanged. |
+
+Run these checks from the repository root with Node.js available:
+
+```sh
+cargo test --all-features native_messenger_success_without_target_turn_keeps_the_claim -- --test-threads=1
+cargo test --all-features late_old_frames_and_markers_cannot_settle_a_successor_claim -- --test-threads=1
+cargo test --all-features --test claude_completion -- --test-threads=1
+```
+
+The Node harness invokes the candidate's native-hook binary; it is not a standalone mock
+of Bridge's lifecycle. Its synthetic starts use the same peer framing and protected-tag
+quoting as the existing large-wire fixture. A successful sender and a target completion
+are separate evidence surfaces. A missing target turn alone does not diagnose consumed input.
+The marked-continuation fallback retains its existing limits: these negative fixtures have
+no valid bound-turn candidate, and do not prove parentage when such a candidate exists.
+
+#### Manual diagnostic-plugin recipe (NOT-VERIFIED)
+
+Live coexistence remains **NOT-VERIFIED** until an owner runs a controlled probe against
+the exact installed Claude version and records both sender and receiver evidence. This is
+an optional diagnostic recipe, not an automated gate or permission to change user plugins.
+
+1. Use a task-owned verification directory, a candidate binary with its SHA-256 recorded,
+   and a fresh managed session for each of pass-through, consume and rewrite modes. Record
+   provider version, platform, permission mode and every configured plugin path and hash.
+   Keep existing plugins enabled and provider trust and global settings unchanged.
+2. Implement only a temporary diagnostic plugin using the installed Claude module types.
+   First verify the actual `session.receive` input/result schema. If unavailable, record
+   `NOT-AVAILABLE`; do not invent a handler signature or substitute terminal input. Scope
+   its action to a unique harmless probe nonce; other input must pass through unchanged.
+   Log observed hook entry, invocation of the next handler, and actual return values in
+   a bounded private log (for example, 64 KiB total), marking truncation or failure unknown.
+3. Add that plugin only to the task-owned launch, preserving Bridge's completion plugin.
+   Do not infer runtime ordering from argument order. Instrument observed `turn.start` and
+   `turn.complete` identities/text for the nonce, and the receive hook's actual trace.
+   A configured consume/rewrite mode is not evidence that the hook ran or took effect.
+4. Deliver one probe per fresh session, with one absolute timeout (for example, 60 seconds).
+   Record the sender's actual `ListAgents`/`SendMessage` stream, guard approval and executed
+   input receipt separately from target events. A sender success, timeout or absent target
+   event proves neither consumption nor hook order. Never repeat an uncertain delivery.
+5. At the deadline, read the original request with `result` and `inspect`, then inspect its
+   owned surface. Preserve the pending record, immutable binding if present, diagnostic,
+   receipt and result evidence. Do not edit these records, force completion, send another
+   `tell` while claimed, or use a caller timeout to retire the claim. Close only the probe's
+   session when appropriate; use another fresh session for the next mode.
+6. Record configured mode/order separately from observed receive outcome, observed
+   start/completion identities, sender result and Bridge request state. Missing or truncated
+   observations stay `NOT-VERIFIED`. Preserve eligible evidence under the workspace policy;
+   remove only the task-owned diagnostic plugin after its sessions are closed.
+
+## Offline diagnostic formatter
+
+The offline diagnostic formatter has a focused standard-library suite:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_share_diagnostics.py -v
+```
+
+It covers all supported public query shapes, free-text and misleading typed-field canaries,
+unknown categories, exact version forms, missing/null/invalid distinctions, bounded reads and
+outputs, malformed JSON, duplicate keys, non-finite numbers, Unicode/control/bidi content,
+unchanged input objects/bytes, and the stdin/stdout CLI. These are formatter checks and supply
+no authenticated provider or terminal-runtime evidence.
+
 ## Language lint
 
 Public documentation, source comments and default plugin metadata use English. Run from the
@@ -209,6 +286,11 @@ type alias, and does not detect macro shadowing in ancestor modules. It checks o
 module, and re-exports that route callers to another definition, are outside it.
 
 ## Manual live verification
+
+For controlled comparisons of saved self-test runs, see
+[Compare saved self-test experiments](self-test-comparison.md). The offline comparator
+keeps failed attempts and cleanup outcomes, separates confirmed skipped steps from measured
+times, and requires explicit experiment identities and distinct runs across baselines.
 
 Self-test opens a real surface and makes real model calls. Authenticate the selected CLI,
 review the workspace, and make sure the terminal application answers before starting.

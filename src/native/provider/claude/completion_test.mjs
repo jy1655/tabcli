@@ -58,6 +58,60 @@ async function fire(name, e) {
 await fire("session.start", {});
 const peerBody = pending.expected_message.replace(/<(\/?cross-session-message)>/gi, "<\\$1>");
 const start = { turnId, text: `<cross-session-message from="uds:\\\\.\\pipe\\LOCAL\\sender" from-name="sender" from-mode="prompting">\n${peerBody}\n</cross-session-message>` };
+let reportOffset = 0;
+if (scenario === "coexistence") {
+  // Synthetic target events: these do not emulate session.receive or establish hook order.
+  const claim = fs.readFileSync(`${directory}/turn.claim`, "utf8").trim();
+  const protectedNames = ["turn.claim", "claude-pending-turn.json", "status.json",
+    `requests/${claim}.json`];
+  const protectedBytes = protectedNames.map(name => fs.readFileSync(`${directory}/${name}`));
+  const receipt = JSON.parse(protectedBytes.at(-1));
+  const session = directory.split(/[\\/]/).at(-1);
+  function snapshot(root = directory) {
+    return fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
+      .flatMap(entry => {
+        const path = `${root}/${entry.name}`;
+        return entry.isDirectory() ? [[path, null], ...snapshot(path)] : [[path, fs.readFileSync(path)]];
+      });
+  }
+  function retained(label) {
+    for (const [index, name] of protectedNames.entries()) {
+      assert.deepEqual(fs.readFileSync(`${directory}/${name}`), protectedBytes[index], `${label}: ${name}`);
+    }
+    assert.deepEqual(fs.readdirSync(`${directory}/events`), [], label);
+    for (const kind of ["bound", "candidate", "continuation"]) {
+      assert.equal(fs.existsSync(`${directory}/claude-mod-${kind}-${claim}.json`), false, label);
+    }
+    const before = snapshot();
+    const query = spawnSync(executable, ["result", session, "--request", receipt.request_id, "--json"],
+      { encoding: "utf8", env: process.env });
+    assert.equal(query.status, 0, query.stderr);
+    const result = JSON.parse(query.stdout);
+    assert.equal(result.request_state, "pending", label);
+    assert.equal(result.result, null, label);
+    assert.deepEqual(snapshot(), before, `${label}: result must be read-only`);
+  }
+  retained("no target turn (a possible consumed-input outcome)");
+  await fire("turn.complete", { turnId, reason: "answer", isAborted: false,
+    answer: `marked answer without a target start\n${pending.marker}` });
+  retained("marked answer alone supplies no input binding");
+  const variants = [
+    ["rewritten body with marker intact", start.text.replace("Source: external", "Source: changed")],
+    ["stripped peer envelope", peerBody],
+    ["combined queued input", `${start.text}\nAnother queued input`],
+    ["unrelated turn", "A separate manual request"],
+  ];
+  for (const [index, [label, text]] of variants.entries()) {
+    assert.notEqual(text, start.text, label);
+    const rejectedTurn = `00000000-0000-4000-8000-${String(260 + index).padStart(12, "0")}`;
+    await fire("turn.start", { turnId: rejectedTurn, text });
+    retained(`${label}: start`);
+    await fire("turn.complete", { turnId: rejectedTurn, reason: "answer", isAborted: false,
+      answer: `nonmatching turn copied the pending marker\n${pending.marker}` });
+    retained(`${label}: marked final`);
+  }
+  reportOffset = calls.length;
+}
 await fire("turn.start", start);
 if (scenario.startsWith("questions")) {
   const questionHandlers = new Map();
@@ -209,7 +263,7 @@ if (continuing || scenario === "unmarked") {
 data.answer = answer + suffix;
 if (scenario === "subagent") data.agentId = "child";
 if (scenario !== "unmarked") await fire("turn.complete", data);
-const reports = calls.filter(call => call.event === "turn.complete" || call.event === "oversize");
+const reports = calls.slice(reportOffset).filter(call => call.event === "turn.complete" || call.event === "oversize");
 if (scenario === "subagent") assert.equal(reports.length, 0);
 else if (scenario === "continuation_retry_after") {
   assert.equal(reports.length, 3);

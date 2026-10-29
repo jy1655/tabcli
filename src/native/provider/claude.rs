@@ -189,6 +189,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
                 "Use the official provider's availability diagnostics. Doctor never calls a messenger/model or substitutes terminal injection.",
             ),
         ];
+        checks.extend(completion::doctor_checks(context.directory));
         if let Some(check) = context
             .directory
             .and_then(resumed_conversation_holders_check)

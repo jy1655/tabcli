@@ -560,6 +560,10 @@ fn provider_only_diagnostics_do_not_create_or_scan_a_session_store() {
     );
     assert!(value["session"].is_null());
     assert_eq!(check(&value, "claude_messaging")["availability"], "unknown");
+    for id in ["claude_completion", "claude_completion_diagnostic"] {
+        assert_eq!(check(&value, id)["reason_code"], "session_required");
+        assert_eq!(check(&value, id)["evidence"]["source"], "no_session_scope");
+    }
     // A session relation has no meaning without a session.
     assert!(
         !value["checks"]
@@ -752,6 +756,66 @@ fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_
         check(&outside, "claude_caller_markers")["reason_code"],
         "claude_caller_markers_absent"
     );
+    assert_eq!(entries(fixture.root.path()), before);
+}
+
+#[test]
+fn claude_doctor_reports_completion_records_without_attaching_them_to_a_request() {
+    let fixture = Fixture::new("claude");
+    fixture.claim(None);
+    let legacy = fixture.doctor();
+    assert_eq!(
+        check(&legacy, "claude_completion")["reason_code"],
+        "claude_completion_mode_absent"
+    );
+    assert_eq!(
+        check(&legacy, "claude_completion_diagnostic")["reason_code"],
+        "claude_completion_diagnostic_not_recorded"
+    );
+    write(
+        &fixture.directory.join("claude-completion-mode.json"),
+        &json!({"schema": 1, "mode": "native_v1",
+            "reason": "macos_stable_2_1_302_or_newer", "claude_version": "2.1.302"}),
+    );
+    let pending = fixture.doctor();
+    assert_eq!(
+        check(&pending, "claude_completion")["reason_code"],
+        "claude_completion_readiness_not_observed"
+    );
+    write(
+        &fixture.directory.join("claude-mod-ready.json"),
+        &json!({"schema": 1, "revision": 1, "conversation": "00000000-0000-4000-8000-000000000249"}),
+    );
+    write(
+        &fixture.directory.join("claude-mod-diagnostic.json"),
+        &json!({"schema": 1, "event": "turn.complete", "reason": "unbound \u{1b}[2J completion"}),
+    );
+    let before = entries(fixture.root.path());
+    let value = fixture.doctor();
+    let completion = check(&value, "claude_completion");
+    assert_eq!(completion["availability"], "unknown");
+    assert_eq!(
+        completion["reason_code"],
+        "claude_completion_readiness_recorded"
+    );
+    assert_eq!(completion["evidence"]["source"], "session_records");
+    let diagnostic = check(&value, "claude_completion_diagnostic");
+    assert_eq!(diagnostic["availability"], "unknown");
+    assert_eq!(
+        diagnostic["evidence"]["latest_diagnostic"]["reason"],
+        "unbound \\u{1b}[2J completion"
+    );
+    // A request is pending, but the rejection names none and is not attributed to it.
+    assert!(!diagnostic.to_string().contains("request-exact"));
+
+    let human = fixture.run(&["doctor", "session-doctor"]);
+    assert!(human.status.success());
+    let stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(stdout.contains("[unknown] claude_completion (claude_completion_readiness_recorded)"));
+    assert!(stdout.contains(
+        "[unknown] claude_completion_diagnostic (claude_completion_diagnostic_recorded)"
+    ));
+    assert!(!stdout.contains('\u{1b}'));
     assert_eq!(entries(fixture.root.path()), before);
 }
 

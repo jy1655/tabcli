@@ -23,7 +23,9 @@ const MAX_MODE_BYTES: usize = 32;
 const MAX_TURN_BYTES: usize = 128;
 const MODULE: &str = include_str!("completion.js");
 
+mod diagnose;
 mod questions;
+pub(super) use diagnose::checks as doctor_checks;
 pub(in crate::native::provider) use questions::read as question_emissions;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -46,6 +48,14 @@ struct Ready {
     schema: u32,
     revision: u32,
     conversation: String,
+}
+
+// The latest rejected module signal. It names no request and no time.
+#[derive(Deserialize, Serialize)]
+struct Diagnostic {
+    schema: u32,
+    event: String,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -306,9 +316,11 @@ fn matches_peer_quoted_body(body: &str, expected: &str) -> bool {
 fn diagnostic(directory: &Path, event: &str, reason: &str) -> Result<()> {
     Store::open_unchecked(directory)
         .private(DIAGNOSTIC_FILE)
-        .write_json(&json!({
-            "schema":1,"event":bounded(event),"reason":bounded(reason),
-        }))
+        .write_json(&Diagnostic {
+            schema: 1,
+            event: bounded(event),
+            reason: bounded(reason),
+        })
 }
 
 fn bounded(text: &str) -> String {
