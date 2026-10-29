@@ -319,7 +319,7 @@ impl NativeProviderAdapter for PiAdapter {
                 "Inspect the managed owner and terminal. Live input was not tested; replace this fallback when Pi provides the required native path.",
             ),
             credential_diagnosis(context, |path, args, workspace, deadline| {
-                super::super::doctor::probe(path, args, Some(workspace), &[], deadline)
+                super::super::process_env::probe(path, args, Some(workspace), &[], deadline)
             }),
         ]
     }
