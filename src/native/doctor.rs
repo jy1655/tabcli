@@ -8,6 +8,7 @@ use super::query::observation::judgment::{
 use super::query::observation::{Observation, PartialObservation, SessionEvidence};
 use super::{NativeCommand, consent, provider, query, reopen, terminal};
 use crate::native::clock::SystemClock;
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::process_env::{PROBE_TIMEOUT, probe};
 use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
@@ -87,16 +88,16 @@ struct Diagnosis {
 fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnosis> {
     use Availability::*;
     let mut checks = vec![Check::new(
-        "platform",
+        CheckId::PLATFORM,
         if cfg!(any(target_os = "macos", windows)) {
             Available
         } else {
             Unavailable
         },
         if cfg!(any(target_os = "macos", windows)) {
-            "platform_supported"
+            Reason::PLATFORM_SUPPORTED
         } else {
-            "platform_unsupported"
+            Reason::PLATFORM_UNSUPPORTED
         },
         format!("Managed terminals on {}", std::env::consts::OS),
         "Managed launch and delivery require a supported platform; stored records can still be inspected.",
@@ -108,13 +109,13 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             Ok(directory) => Some(directory),
             Err(error) => {
                 checks.push(Check::new(
-                    "session_records",
+                    CheckId::SESSION_RECORDS,
                     Unavailable,
-                    "session_unavailable",
+                    Reason::SESSION_UNAVAILABLE,
                     format!("{error:#}"),
                     "Check the explicit session id and state directory.",
                 ));
-                unknown_session_checks(id, "session_unavailable", &mut checks);
+                unknown_session_checks(id, Reason::SESSION_UNAVAILABLE, &mut checks);
                 cancel_check(
                     &Cancel::Unreadable("session unavailable".to_owned()),
                     id,
@@ -133,37 +134,39 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     if request.provider.is_some() {
         let selected = terminal::select(None);
         let (availability, reason, evidence) = match selected {
-            Ok(kind) if kind.supported_on_this_platform() => {
-                (Available, "terminal_selected", json!({"terminal": kind}))
-            }
+            Ok(kind) if kind.supported_on_this_platform() => (
+                Available,
+                Reason::TERMINAL_SELECTED,
+                json!({"terminal": kind}),
+            ),
             Ok(kind) => (
                 Unavailable,
-                "terminal_unsupported",
+                Reason::TERMINAL_UNSUPPORTED,
                 json!({"terminal": kind}),
             ),
             Err(error) => (
                 Unavailable,
-                "terminal_selection_failed",
+                Reason::TERMINAL_SELECTION_FAILED,
                 json!({"error": format!("{error:#}")}),
             ),
         };
-        checks.push(Check::new("terminal_selection", availability, reason,
+        checks.push(Check::new(CheckId::TERMINAL_SELECTION, availability, reason,
             "Default terminal selection from the launch adapter; no app was opened or controlled.",
             "An explicit ask --terminal can select another supported host; live surface availability has not been tested.").evidence(evidence));
         #[cfg(windows)]
         checks.push(match terminal::windows_powershell_executable() {
             Ok(path) => Check::new(
-                "powershell",
+                CheckId::POWERSHELL,
                 Available,
-                "powershell_found",
+                Reason::POWERSHELL_FOUND,
                 "PowerShell 7 executable was resolved.",
                 "The managed console is created only by ask.",
             )
             .evidence(json!({"path": path})),
             Err(error) => Check::new(
-                "powershell",
+                CheckId::POWERSHELL,
                 Unavailable,
-                "powershell_unavailable",
+                Reason::POWERSHELL_UNAVAILABLE,
                 format!("{error:#}"),
                 "Install PowerShell 7 and check absolute PATH entries.",
             ),
@@ -201,9 +204,9 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         Some(Ok(provider)) => Some(provider),
         Some(Err(error)) => {
             checks.push(Check::new(
-                "provider",
+                CheckId::PROVIDER,
                 Unknown,
-                "provider_unrecognized",
+                Reason::PROVIDER_UNRECOGNIZED,
                 error,
                 "Inspect the recorded provider; do not guess a replacement.",
             ));
@@ -222,11 +225,11 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         };
         match resolved {
             Ok(path) if path.is_absolute() && path.is_file() && is_executable(&path) => {
-                checks.push(Check::new("provider_executable", Available, "executable_found", "Provider executable found; presence alone does not establish runtime capability.", "Use --probe to read its current version.").evidence(json!({"path": path})));
+                checks.push(Check::new(CheckId::PROVIDER_EXECUTABLE, Available, Reason::EXECUTABLE_FOUND, "Provider executable found; presence alone does not establish runtime capability.", "Use --probe to read its current version.").evidence(json!({"path": path})));
                 executable = Some(path);
             }
             Ok(path) if !path.is_absolute() => {
-                checks.push(Check::new("provider_executable", Unknown, "executable_path_unverified", "The recorded executable path is relative; doctor does not substitute a PATH lookup for it.", "Inspect the original launch configuration.").evidence(json!({"path": path})));
+                checks.push(Check::new(CheckId::PROVIDER_EXECUTABLE, Unknown, Reason::EXECUTABLE_PATH_UNVERIFIED, "The recorded executable path is relative; doctor does not substitute a PATH lookup for it.", "Inspect the original launch configuration.").evidence(json!({"path": path})));
             }
             outcome => {
                 let detail = match outcome {
@@ -236,7 +239,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                     ),
                     Err(error) => format!("{error:#}"),
                 };
-                checks.push(Check::new("provider_executable", Unavailable, "executable_unavailable", detail, "Check the provider installation and PATH; existing sessions retain their recorded executable path."));
+                checks.push(Check::new(CheckId::PROVIDER_EXECUTABLE, Unavailable, Reason::EXECUTABLE_UNAVAILABLE, detail, "Check the provider installation and PATH; existing sessions retain their recorded executable path."));
             }
         }
         if request.probe {
@@ -252,11 +255,11 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                         let version = provider_version_text(&output.stdout, &output.stderr);
                         let (availability, reason) =
                             match cli_version_is_supported(provider, &version) {
-                                Ok(true) => (Available, "version_supported"),
-                                Ok(false) => (Unavailable, "version_unsupported"),
-                                Err(_) => (Unknown, "version_unrecognized"),
+                                Ok(true) => (Available, Reason::VERSION_SUPPORTED),
+                                Ok(false) => (Unavailable, Reason::VERSION_UNSUPPORTED),
+                                Err(_) => (Unknown, Reason::VERSION_UNRECOGNIZED),
                             };
-                        checks.push(Check::new("provider_version", availability, reason, format!("Current CLI version; required minimum {}", provider.minimum_version()), "CLI version is only one gate; inspect the provider-specific checks.").evidence(json!({"current_version": version})));
+                        checks.push(Check::new(CheckId::PROVIDER_VERSION, availability, reason, format!("Current CLI version; required minimum {}", provider.minimum_version()), "CLI version is only one gate; inspect the provider-specific checks.").evidence(json!({"current_version": version})));
                         current_version = Some(version);
                     }
                     outcome => {
@@ -264,34 +267,34 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                             Ok(output) => format!("Version probe exited with {}", output.status),
                             Err(error) => format!("{error:#}"),
                         };
-                        checks.push(Check::new("provider_version", Unknown, "version_probe_failed", detail, "Inspect the provider installation; a failed probe does not prove availability."));
+                        checks.push(Check::new(CheckId::PROVIDER_VERSION, Unknown, Reason::VERSION_PROBE_FAILED, detail, "Inspect the provider installation; a failed probe does not prove availability."));
                     }
                 }
             } else {
                 checks.push(Check::new(
-                    "provider_version",
+                    CheckId::PROVIDER_VERSION,
                     Unknown,
-                    "executable_unavailable",
+                    Reason::EXECUTABLE_UNAVAILABLE,
                     "No unambiguous executable is available for a version probe.",
                     "Inspect the provider_executable check.",
                 ));
             }
         } else {
-            checks.push(Check::new("provider_version", Unknown, "probe_not_requested", "Current CLI version was not queried. A launch-recorded version is historical evidence only.", "Add --probe for bounded local version checks; no model or message is sent.").evidence(json!({"minimum_version": provider.minimum_version().to_string()})));
+            checks.push(Check::new(CheckId::PROVIDER_VERSION, Unknown, Reason::PROBE_NOT_REQUESTED, "Current CLI version was not queried. A launch-recorded version is historical evidence only.", "Add --probe for bounded local version checks; no model or message is sent.").evidence(json!({"minimum_version": provider.minimum_version().to_string()})));
         }
         let workspace = manifest
             .as_ref()
             .map(|m| m.workspace.clone())
             .map_or_else(std::env::current_dir, Ok)?;
         let (availability, reason) = match fs::metadata(&workspace) {
-            Ok(metadata) if metadata.is_dir() => (Available, "workspace_present"),
-            Ok(_) => (Unavailable, "workspace_not_directory"),
+            Ok(metadata) if metadata.is_dir() => (Available, Reason::WORKSPACE_PRESENT),
+            Ok(_) => (Unavailable, Reason::WORKSPACE_NOT_DIRECTORY),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (Unavailable, "workspace_missing")
+                (Unavailable, Reason::WORKSPACE_MISSING)
             }
-            Err(_) => (Unknown, "workspace_unreadable"),
+            Err(_) => (Unknown, Reason::WORKSPACE_UNREADABLE),
         };
-        checks.push(Check::new("workspace", availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
+        checks.push(Check::new(CheckId::WORKSPACE, availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
         if let Some(directory) = &directory {
             let consent = consent::observe(directory);
             consent_state = consent.value()["state"].clone();
@@ -300,7 +303,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             } else {
                 Unknown
             };
-            checks.push(Check::new("workspace_consent", availability, "recorded_workspace_consent",
+            checks.push(Check::new(CheckId::WORKSPACE_CONSENT, availability, Reason::RECORDED_WORKSPACE_CONSENT,
                 "Launch-time workspace consent and its provider-owned source. This is historical evidence, not a new trust grant.",
                 "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent.into_value()));
         }
@@ -455,11 +458,11 @@ pub(super) fn record_checks(
         }
         Err(error) => {
             let reason = if error.is::<query::SnapshotBusy>() {
-                "records_busy"
+                Reason::RECORDS_BUSY
             } else {
-                "records_unreadable"
+                Reason::RECORDS_UNREADABLE
             };
-            checks.push(Check::new("session_records", Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
+            checks.push(Check::new(CheckId::SESSION_RECORDS, Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
             unknown_session_checks(id, reason, checks);
             let PartialObservation {
                 manifest,
@@ -483,22 +486,22 @@ fn cancel_check(cancel: &Cancel, id: &str, checks: &mut Vec<Check>) {
     let (availability, reason, detail) = match cancel {
         Cancel::Absent => (
             Availability::Available,
-            "cancel_absent",
+            Reason::CANCEL_ABSENT,
             "No cancel request is recorded.",
         ),
         Cancel::Unreadable(_) => (
             Availability::Unknown,
-            "cancel_unreadable",
+            Reason::CANCEL_UNREADABLE,
             "The cancel request cannot be read reliably; published results remain independent.",
         ),
         Cancel::Recorded(_) => (
             Availability::Available,
-            "cancel_recorded",
+            Reason::CANCEL_RECORDED,
             "A cancel request is recorded; only a correlated provider result confirms interruption.",
         ),
     };
     checks.push(Check::new(
-        "cancel",
+        CheckId::CANCEL,
         availability,
         reason,
         detail,
@@ -516,31 +519,27 @@ fn origin_check(
 ) {
     let inspect = format!("{PUBLIC_COMMAND} inspect {id} --json");
     let check = match (origin.reference.kind, origin.ended) {
-        (SourceKind::External, _) => Check::new(
-            "origin",
+        (SourceKind::External, _) => Check::new(CheckId::ORIGIN,
             Availability::Available,
-            "origin_external",
+            Reason::ORIGIN_EXTERNAL,
             "The initial request came from outside Agent Bridge; there is no managed origin to observe.",
             "No action is needed.",
         ),
-        (_, Some(false)) => Check::new(
-            "origin",
+        (_, Some(false)) => Check::new(CheckId::ORIGIN,
             Availability::Available,
-            "origin_live",
+            Reason::ORIGIN_LIVE,
             "The origin session's records and its attested owner show it has not ended.",
             "No action is needed.",
         ),
-        (_, Some(true)) if session_closed => Check::new(
-            "origin",
+        (_, Some(true)) if session_closed => Check::new(CheckId::ORIGIN,
             Availability::Available,
-            "origin_ended_session_closed",
+            Reason::ORIGIN_ENDED_SESSION_CLOSED,
             "The origin session has ended, and this session is already closed.",
             "No action is needed.",
         ),
-        (_, Some(true)) => Check::new(
-            "origin",
+        (_, Some(true)) => Check::new(CheckId::ORIGIN,
             Availability::Unavailable,
-            "origin_ended",
+            Reason::ORIGIN_ENDED,
             "The origin session has ended in its records; this session is not closed. This is not evidence of an open surface.",
             "If this session is no longer needed, close it explicitly; the origin observation grants no close authority.",
         )
@@ -550,10 +549,9 @@ fn origin_check(
             id.to_owned(),
             "--explicit".to_owned(),
         ]),
-        (_, None) => Check::new(
-            "origin",
+        (_, None) => Check::new(CheckId::ORIGIN,
             Availability::Unknown,
-            "origin_unverified",
+            Reason::ORIGIN_UNVERIFIED,
             format!(
                 "Whether the origin has ended could not be verified ({}).",
                 origin.reason
@@ -569,16 +567,16 @@ fn origin_check(
 fn hold_check(hold: &Hold, id: &str, checks: &mut Vec<Check>) {
     let check = match hold {
         Hold::NotHeld => Check::new(
-            "hold",
+            CheckId::HOLD,
             Availability::Available,
-            "not_held",
+            Reason::NOT_HELD,
             "No follow-up hold is recorded.",
             "No hold release is needed.",
         ),
         Hold::Held { release_allowed } => Check::new(
-            "hold",
+            CheckId::HOLD,
             Availability::Unavailable,
-            "session_held",
+            Reason::SESSION_HELD,
             "The user's hold refuses follow-ups whose delivery has not begun.",
             if *release_allowed {
                 format!("{PUBLIC_COMMAND} hold {id} --release")
@@ -587,9 +585,9 @@ fn hold_check(hold: &Hold, id: &str, checks: &mut Vec<Check>) {
             },
         ),
         Hold::Unreadable(reason) => Check::new(
-            "hold",
+            CheckId::HOLD,
             Availability::Unknown,
-            "hold_unreadable",
+            Reason::HOLD_UNREADABLE,
             reason.clone(),
             format!("{PUBLIC_COMMAND} inspect {id} --json"),
         ),
@@ -600,16 +598,16 @@ fn hold_check(hold: &Hold, id: &str, checks: &mut Vec<Check>) {
 /// The origin check when no consistent snapshot of this session could be read.
 fn unobserved_origin_check(id: &str, checks: &mut Vec<Check>) {
     checks.push(Check::new(
-        "origin",
+        CheckId::ORIGIN,
         Availability::Unknown,
-        "origin_unverified",
+        Reason::ORIGIN_UNVERIFIED,
         "No consistent session snapshot was available, so the origin was not observed.",
         format!("{PUBLIC_COMMAND} inspect {id} --json"),
     ));
 }
 
-fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check>) {
-    for check_id in ["session_state", "turn", "completion"] {
+fn unknown_session_checks(id: &str, reason: Reason, checks: &mut Vec<Check>) {
+    for check_id in [CheckId::SESSION_STATE, CheckId::TURN, CheckId::COMPLETION] {
         checks.push(Check::new(check_id, Availability::Unknown, reason,
             "No consistent session snapshot was available; missing evidence is not a ready or completed state.",
             format!("{PUBLIC_COMMAND} result {id} --list --json")));
@@ -645,62 +643,70 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
         "active_request_id": active.map(|r| &r.request_id), "active_request_state": request_state,
         "recovery_required": judgments.recovery_required});
     if judgments.claim_without_receipt {
-        checks.push(Check::new("active_request", Unknown, "active_request_unknown", "The active claim has no readable request receipt; its public request identity is unknown.", &result_action));
+        checks.push(Check::new(CheckId::ACTIVE_REQUEST, Unknown, Reason::ACTIVE_REQUEST_UNKNOWN, "The active claim has no readable request receipt; its public request identity is unknown.", &result_action));
     }
     checks.push(Check::new(
-        "session_records",
+        CheckId::SESSION_RECORDS,
         Available,
-        "records_read",
+        Reason::RECORDS_READ,
         "Observed stored state without recovery; this is not a live delivery check.",
         "Use inspect for recorded launch and result details.",
     ));
     checks.push(Check::new(
-        "session_state",
+        CheckId::SESSION_STATE,
         if judgments.lifecycle == Lifecycle::Ready {
             Available
         } else {
             Unavailable
         },
-        "stored_state",
+        Reason::STORED_STATE,
         format!("Stored state: {}", snapshot.status.state),
         &result_action,
     ));
     let (availability, reason, detail) = match &judgments.turn {
-        Turn::LaunchFailed { reason, detail } => (Unavailable, *reason, detail.as_str()),
+        Turn::LaunchFailed { reason, detail } => (
+            Unavailable,
+            Reason::ALL
+                .iter()
+                .copied()
+                .find(|word| word.name() == *reason)
+                .expect("known launch reason"),
+            detail.as_str(),
+        ),
         Turn::DeliveryUnconfirmed => (
             Unknown,
-            "delivery_unconfirmed",
+            Reason::DELIVERY_UNCONFIRMED,
             "A turn remains claimed with an error. Delivery may have occurred; do not resend.",
         ),
         Turn::TurnInProgress => (
             Unavailable,
-            "turn_in_progress",
+            Reason::TURN_IN_PROGRESS,
             "A turn is claimed; wait for the same request result instead of sending another turn.",
         ),
         Turn::NoActiveTurn => (
             Available,
-            "no_active_turn",
+            Reason::NO_ACTIVE_TURN,
             "No active turn claim was observed.",
         ),
     };
     checks.push(Check::new(
-        "turn",
+        CheckId::TURN,
         availability,
         reason,
         detail,
         &result_action,
     ));
     let mut completion = Check::new(
-        "completion",
+        CheckId::COMPLETION,
         if judgments.recovery_required {
             Unavailable
         } else {
             Available
         },
         if judgments.recovery_required {
-            "recovery_required"
+            Reason::RECOVERY_REQUIRED
         } else {
-            "no_pending_completion"
+            Reason::NO_PENDING_COMPLETION
         },
         "Completion journal observation; doctor never publishes or repairs a result.",
         if judgments.recovery_required {
@@ -720,7 +726,7 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
     }
     checks.push(completion);
     if let Some(index) = &judgments.request_index {
-        checks.push(Check::new("request_index", Unknown, "request_index_incomplete", "Some request references could not be read; absence is not proof that no request exists.", "Use an exact event id when known; preserve damaged request records.")
+        checks.push(Check::new(CheckId::REQUEST_INDEX, Unknown, Reason::REQUEST_INDEX_INCOMPLETE, "Some request references could not be read; absence is not proof that no request exists.", "Use an exact event id when known; preserve damaged request records.")
             .evidence(json!({"unreadable_requests": index.unreadable, "error": index.error})));
     }
 }
@@ -740,12 +746,12 @@ fn surface_check(
 pub(in crate::native) fn surface_presence_check(presence: &SurfacePresence) -> Check {
     use Availability::*;
     let (availability, reason, detail) = match presence {
-        SurfacePresence::Present => (Available, "terminal_surface_present", "Recorded terminal surface is present; this does not prove provider readiness or delivery.".to_owned()),
-        SurfacePresence::Missing => (Unavailable, "terminal_surface_missing", "Recorded terminal surface is absent; a provider process may still survive it.".to_owned()),
-        SurfacePresence::Unverified(reason) => (Unknown, "terminal_surface_unverified", format!("Surface presence could not be verified: {reason}")),
+        SurfacePresence::Present => (Available, Reason::TERMINAL_SURFACE_PRESENT, "Recorded terminal surface is present; this does not prove provider readiness or delivery.".to_owned()),
+        SurfacePresence::Missing => (Unavailable, Reason::TERMINAL_SURFACE_MISSING, "Recorded terminal surface is absent; a provider process may still survive it.".to_owned()),
+        SurfacePresence::Unverified(reason) => (Unknown, Reason::TERMINAL_SURFACE_UNVERIFIED, format!("Surface presence could not be verified: {reason}")),
     };
     Check::new(
-        "terminal_surface",
+        CheckId::TERMINAL_SURFACE,
         availability,
         reason,
         detail,
@@ -759,12 +765,12 @@ fn owner_check(owner: &OwnerJudgment, checks: &mut Vec<Check>) {
         OwnerJudgment::Bound(attestation) => {
             // An Unknown attestation is unverified whatever its PID hint (B3).
             let (availability, reason) = match BoundOwner::of(attestation) {
-                BoundOwner::Exited => (Unavailable, "owner_exited"),
+                BoundOwner::Exited => (Unavailable, Reason::OWNER_EXITED),
                 BoundOwner::Reused | BoundOwner::ControlChanged => {
-                    (Unavailable, "owner_identity_mismatch")
+                    (Unavailable, Reason::OWNER_IDENTITY_MISMATCH)
                 }
-                BoundOwner::Verified => (Available, "owner_identity_observed"),
-                BoundOwner::Uncompared | BoundOwner::Unknown => (Unknown, "owner_unverified"),
+                BoundOwner::Verified => (Available, Reason::OWNER_IDENTITY_OBSERVED),
+                BoundOwner::Uncompared | BoundOwner::Unknown => (Unknown, Reason::OWNER_UNVERIFIED),
             };
             (
                 availability,
@@ -776,25 +782,25 @@ fn owner_check(owner: &OwnerJudgment, checks: &mut Vec<Check>) {
         }
         OwnerJudgment::Foreign => (
             Unavailable,
-            "owner_session_mismatch",
+            Reason::OWNER_SESSION_MISMATCH,
             "Owner record belongs to another managed session.".to_owned(),
             Value::Null,
         ),
-        OwnerJudgment::UnboundLegacy { .. } => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(owner.observation())),
+        OwnerJudgment::UnboundLegacy { .. } => (Unknown, Reason::OWNER_UNBOUND_LEGACY, "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(owner.observation())),
         OwnerJudgment::Absent => (
             Unknown,
-            "owner_unverified",
+            Reason::OWNER_UNVERIFIED,
             "No owner record bound to this managed session was observed.".to_owned(),
             Value::Null,
         ),
         OwnerJudgment::Unreadable(error) => (
             Unknown,
-            "owner_unreadable",
+            Reason::OWNER_UNREADABLE,
             error.clone(),
             Value::Null,
         ),
     };
-    checks.push(Check::new("owner", availability, reason, detail, "Inspect the exact request result; do not infer delivery or resend from owner liveness.").evidence(evidence));
+    checks.push(Check::new(CheckId::OWNER, availability, reason, detail, "Inspect the exact request result; do not infer delivery or resend from owner liveness.").evidence(evidence));
 }
 
 fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
@@ -802,12 +808,12 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
     const ACTIVE_NEXT: &str = "Only tell/close revalidate their target surface; this observation grants no control authority.";
     let check = match surface {
         Surface::Closed { consumed } => Check::new(
-            "terminal_record",
+            CheckId::TERMINAL_RECORD,
             if *consumed { Unavailable } else { Unknown },
             if *consumed {
-                "terminal_consumed"
+                Reason::TERMINAL_CONSUMED
             } else {
-                "terminal_tombstone_unreadable"
+                Reason::TERMINAL_TOMBSTONE_UNREADABLE
             },
             "A terminal tombstone is recorded; a consumed handle cannot be reused.",
             "Inspect retained results; doctor does not reopen or delete terminal records.",
@@ -816,19 +822,19 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
             source: SurfaceSource::ClosedTombstone,
             reason,
         } => Check::new(
-            "terminal_record",
+            CheckId::TERMINAL_RECORD,
             Unknown,
-            "terminal_tombstone_unreadable",
+            Reason::TERMINAL_TOMBSTONE_UNREADABLE,
             reason.clone(),
             "Preserve the terminal records and inspect the close attempt.",
         ),
         Surface::Closing { bound } => Check::new(
-            "terminal_record",
+            CheckId::TERMINAL_RECORD,
             if *bound { Unavailable } else { Unknown },
             if *bound {
-                "terminal_close_in_progress"
+                Reason::TERMINAL_CLOSE_IN_PROGRESS
             } else {
-                "terminal_binding_unverified"
+                Reason::TERMINAL_BINDING_UNVERIFIED
             },
             "A claimed close handle remains; the close may still be running or require explicit recovery.",
             "Inspect the prior close attempt. Finishing it requires an explicit close request and ownership verification.",
@@ -837,9 +843,9 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
             source: SurfaceSource::ClosingHandle,
             reason,
         } => Check::new(
-            "terminal_record",
+            CheckId::TERMINAL_RECORD,
             Unknown,
-            "terminal_record_unreadable",
+            Reason::TERMINAL_RECORD_UNREADABLE,
             reason.clone(),
             "Preserve and inspect the close handle.",
         ),
@@ -850,12 +856,12 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
             empty_id,
         } => {
             let (availability, reason) = match ActiveHandle::of(*supported, *bound, *empty_id) {
-                ActiveHandle::Unsupported => (Unavailable, "terminal_unsupported"),
-                ActiveHandle::BindingUnverified => (Unknown, "terminal_binding_unverified"),
-                ActiveHandle::Bound => (Available, "terminal_record_found"),
+                ActiveHandle::Unsupported => (Unavailable, Reason::TERMINAL_UNSUPPORTED),
+                ActiveHandle::BindingUnverified => (Unknown, Reason::TERMINAL_BINDING_UNVERIFIED),
+                ActiveHandle::Bound => (Available, Reason::TERMINAL_RECORD_FOUND),
             };
             Check::new(
-                "terminal_record",
+                CheckId::TERMINAL_RECORD,
                 availability,
                 reason,
                 "Stored terminal metadata only; no live surface control was attempted.",
@@ -864,9 +870,9 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
             .evidence(json!({"terminal": kind}))
         }
         Surface::Missing => Check::new(
-            "terminal_record",
+            CheckId::TERMINAL_RECORD,
             Unavailable,
-            "terminal_record_missing",
+            Reason::TERMINAL_RECORD_MISSING,
             "No active terminal handle is recorded.",
             ACTIVE_NEXT,
         ),
@@ -874,9 +880,9 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
             source: SurfaceSource::ActiveHandle,
             reason,
         } => Check::new(
-            "terminal_record",
+            CheckId::TERMINAL_RECORD,
             Unknown,
-            "terminal_record_unreadable",
+            Reason::TERMINAL_RECORD_UNREADABLE,
             reason.clone(),
             ACTIVE_NEXT,
         ),

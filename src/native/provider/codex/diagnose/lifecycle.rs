@@ -1,5 +1,6 @@
 //! Historical session evidence only; never effective live configuration.
 use super::super::{codex_version, hooks, turn as codex_turn};
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::diagnostics::{Availability, Check};
 use crate::native::query::Selector;
 use crate::native::query::request::RequestState;
@@ -45,8 +46,8 @@ pub(super) fn check(directory: Option<&Path>) -> Check {
             evidence["claim_selection"] = unreadable(error);
         }
     }
-    Check::new("codex_lifecycle", Availability::Unknown,
-        if directory.is_some() { "codex_lifecycle_session_observations" } else { "session_required" },
+    Check::new(CheckId::CODEX_LIFECYCLE, Availability::Unknown,
+        if directory.is_some() { Reason::CODEX_LIFECYCLE_SESSION_OBSERVATIONS } else { Reason::SESSION_REQUIRED },
         "Recorded observations of this session only: injection is not hook execution; a Stop candidate and observer state are not a committed terminal outcome. No field asserts effective live configuration.",
         "Inspect missing or suspended observations and the managed surface. Use --probe separately for current hook trust; never resend uncertain input.")
         .evidence(evidence)

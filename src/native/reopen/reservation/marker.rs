@@ -4,6 +4,7 @@ use super::{
     RecordedReopenRefusal, RefusedLaunchCleanup, ReopenGate, read_reopen_launch_refusal,
     refused_launch_cleanup, reopen_refusal, valid_session_id,
 };
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::diagnostics::{Availability, Check};
 use crate::native::session::{CoreRecord, Reader};
 use anyhow::{Context, Result};
@@ -135,7 +136,7 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
     let judgment = match observation {
         Ok(Judgment::Absent) => return,
         Ok(Judgment::Malformed(error)) | Err(error) => {
-            checks.push(Check::new("reopen_marker", Unknown, "reopen_marker_unreadable", format!("{error:#}"), "reopen treats an unreadable marker as consumed; inspect the marker before any reopen."));
+            checks.push(Check::new(CheckId::REOPEN_MARKER, Unknown, Reason::REOPEN_MARKER_UNREADABLE, format!("{error:#}"), "reopen treats an unreadable marker as consumed; inspect the marker before any reopen."));
             return;
         }
         Ok(judgment) => judgment,
@@ -143,7 +144,7 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
     let next_action = "reopen releases a marker only when the session it names recorded a launch refusal and either no provider process was spawned or the provider process recorded in its provider-process.json is verified gone (pid dead, or alive under another identity); doctor never releases or repairs it.";
     let (id, judgment) = match judgment {
         Judgment::InProgress { claim } => {
-            checks.push(Check::new("reopen_marker", Unavailable, "reopen_in_progress", format!("A reopen of {source} holds the marker and has not recorded its new session yet; a new reopen is refused with gate already-reopened."), next_action).evidence(json!({"claim": claim})));
+            checks.push(Check::new(CheckId::REOPEN_MARKER, Unavailable, Reason::REOPEN_IN_PROGRESS, format!("A reopen of {source} holds the marker and has not recorded its new session yet; a new reopen is refused with gate already-reopened."), next_action).evidence(json!({"claim": claim})));
             return;
         }
         Judgment::Target { id, judgment } => (id, judgment),
@@ -162,7 +163,7 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
             };
             (
                 Unavailable,
-                "reopen_marker_consumed",
+                Reason::REOPEN_MARKER_CONSUMED,
                 format!(
                     "Session {source} was reopened as {id}, {condition}; a new reopen is refused with gate already-reopened."
                 ),
@@ -172,7 +173,7 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
         Target::Refused { record, cleanup } => match cleanup {
             Cleanup::Reconcilable(cleanup) => (
                 Available,
-                "reopen_marker_reconcilable",
+                Reason::REOPEN_MARKER_RECONCILABLE,
                 format!(
                     "The reopen as {id} was refused at launch (gate {}) and {cleanup}; the next reopen of {source} releases the marker and proceeds.",
                     record.gate
@@ -181,7 +182,7 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
             ),
             Cleanup::Retained(cleanup) => (
                 Unavailable,
-                "reopen_marker_retained",
+                Reason::REOPEN_MARKER_RETAINED,
                 format!(
                     "The reopen as {id} was refused at launch (gate {}) but {cleanup}; the marker stays consumed and a new reopen is refused with gate already-reopened until the provider process of {id} is verified gone. Closing its console or the exit of its launch wrapper is not that evidence on its own.",
                     record.gate
@@ -190,7 +191,7 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
             ),
             Cleanup::Unverified(error) => (
                 Unknown,
-                "reopen_marker_unverified",
+                Reason::REOPEN_MARKER_UNVERIFIED,
                 format!(
                     "The reopen as {id} was refused at launch (gate {}) but its records cannot be verified: {error:#}",
                     record.gate
@@ -200,7 +201,14 @@ pub(in crate::native) fn check(reader: &Reader, source: &str, checks: &mut Vec<C
         },
     };
     checks.push(
-        Check::new("reopen_marker", availability, reason, detail, next_action).evidence(json!({
+        Check::new(
+            CheckId::REOPEN_MARKER,
+            availability,
+            reason,
+            detail,
+            next_action,
+        )
+        .evidence(json!({
             "reopened_by": id,
             "gate": refusal.map(|refusal| &refusal.gate),
             "recorded_cleanup": refusal.and_then(|refusal| refusal.cleanup.as_ref()),

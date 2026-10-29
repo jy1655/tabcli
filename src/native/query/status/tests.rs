@@ -826,3 +826,15 @@ fn enumeration_faults_keep_status_reason_identity_and_encounter_order() {
     );
     assert_eq!(reasons[2]["session"], "session-a");
 }
+
+// Keep byte-level expectations while production attention is typed.
+fn attention(
+    observed: &StatusObservation,
+    owner: &OwnerJudgment,
+    origin: &OriginObservation,
+) -> Vec<&'static str> {
+    super::attention(observed, owner, origin)
+        .into_iter()
+        .map(AttentionFlag::name)
+        .collect()
+}

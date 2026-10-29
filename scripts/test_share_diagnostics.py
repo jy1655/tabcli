@@ -4,12 +4,69 @@ import copy
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
 from unittest import mock
 
 import share_diagnostics as share
+
+
+def attention_catalog_flags(catalog):
+    sentences = re.findall(r"Attention flags are ([^.]+)\.", catalog)
+    if len(sentences) != 1:
+        raise ValueError("expected exactly one attention catalog sentence")
+    items = " ".join(sentences[0].split()).split(",")
+    final = items.pop().strip()
+    if final.startswith("and ") and items:
+        final = final[4:]
+    elif " and " in final:
+        preceding, final = final.split(" and ")
+        items.append(preceding)
+    items.append(final)
+    flags = []
+    for item in items:
+        match = re.fullmatch(r"`([a-z][a-z0-9_]*)`", item.strip())
+        if match is None:
+            raise ValueError("every attention catalog item must be a backticked word")
+        flags.append(match[1])
+    return flags
+
+
+class PublicVocabularyTests(unittest.TestCase):
+    def test_allowlists_match_public_vocabulary(self):
+        fixture = json.loads((Path(__file__).resolve().parents[1]
+                              / "tests/fixtures/public_vocabulary.json").read_text(encoding="utf-8"))
+        for actual, key in ((share.ATTENTION, "attention_flags"),
+                            (share.CHECK_IDS, "check_ids"), (share.REASONS, "reasons")):
+            with self.subTest(key=key):
+                self.assertEqual(actual, set(fixture[key]))
+                self.assertEqual(len(fixture[key]), len(set(fixture[key])))
+
+    def test_attention_catalog_matches_public_vocabulary(self):
+        root = Path(__file__).resolve().parents[1]
+        fixture = json.loads((root / "tests/fixtures/public_vocabulary.json").read_text(encoding="utf-8"))
+        catalog = (root / "docs/cli.md").read_text(encoding="utf-8")
+        flags = attention_catalog_flags(catalog)
+        self.assertEqual(set(flags), set(fixture["attention_flags"]))
+        self.assertEqual(len(flags), len(set(flags)))
+
+
+    def test_attention_catalog_rejects_unquoted_addition(self):
+        with self.assertRaisesRegex(ValueError, "backticked word"):
+            attention_catalog_flags("Attention flags are `held`, `origin_ended`, and new_flag.")
+
+    def test_attention_catalog_rejects_unquoted_duplicate(self):
+        with self.assertRaisesRegex(ValueError, "backticked word"):
+            attention_catalog_flags("Attention flags are `held`, `origin_ended`, and held.")
+
+    def test_attention_catalog_accepts_final_conjunction_forms(self):
+        for words in ("`held`, `origin_ended`, and `question_emitted`",
+                      "`held`, `origin_ended` and `question_emitted`"):
+            with self.subTest(words=words):
+                self.assertEqual(attention_catalog_flags("Attention flags are " + words + "."),
+                                 ["held", "origin_ended", "question_emitted"])
 
 
 CANARY = "PRIVATE_CANARY_9f731a"

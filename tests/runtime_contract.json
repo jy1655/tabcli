@@ -504,12 +504,10 @@
     "const POLL_INTERVAL: Duration = Duration::from_millis(200);": 1
   },
   "src/native/provider/codex/diagnose/lifecycle.rs": {
-    "codex_lifecycle": 2,
     "session_records": 1
   },
   "src/native/provider/codex/diagnose/hook_trust.rs": {
     "hooks/list": 6,
-    "codex_hook_trust": 5,
     "normalization drift": 2,
     "const TIMEOUT: Duration = Duration::from_secs(10);": 1
   },
@@ -532,5 +530,9 @@
     "{HOST_COMMAND}": 1,
     "const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;": 1,
     "\"queued\"": 1
+  },
+  "src/native/diagnostics/vocabulary.rs": {
+    "codex_lifecycle": 2,
+    "codex_hook_trust": 4
   }
 }

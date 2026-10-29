@@ -1,3 +1,4 @@
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 mod credentials;
 mod hook;
 mod input;
@@ -33,8 +34,6 @@ use usage::reported_usage;
 pub(super) static ADAPTER: PiAdapter = PiAdapter;
 
 pub(super) struct PiAdapter;
-
-const PI_PROVIDER_CREDENTIALS: &str = "pi_provider_credentials";
 
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
 
@@ -229,7 +228,7 @@ impl NativeProviderAdapter for PiAdapter {
             probe: true,
             // Credential configuration belongs to the session, not a submitted request.
             detail: |check, _request_id| {
-                (check.id.as_deref() == Some(PI_PROVIDER_CREDENTIALS))
+                (check.id.as_deref() == Some(CheckId::PI_PROVIDER_CREDENTIALS.name()))
                     .then_some(check.detail.as_deref())
                     .flatten()
             },
@@ -326,9 +325,9 @@ impl NativeProviderAdapter for PiAdapter {
         use super::super::diagnostics::{Availability::Unknown, Check};
         vec![
             Check::new(
-                "pi_follow_up",
+                CheckId::PI_FOLLOW_UP,
                 Unknown,
-                "pi_terminal_fallback",
+                Reason::PI_TERMINAL_FALLBACK,
                 "Pi owns terminal-paste follow-up and a session completion extension. No verified first-party external input path into a running interactive session is integrated.",
                 "Inspect the managed owner and terminal. Live input was not tested; replace this fallback when Pi provides the required native path.",
             ),

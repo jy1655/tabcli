@@ -1,4 +1,4 @@
-use super::PI_PROVIDER_CREDENTIALS;
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use anyhow::Result;
 use serde::Deserialize;
 use std::{
@@ -106,14 +106,20 @@ fn credential_check(
 ) -> crate::native::diagnostics::Check {
     use crate::native::diagnostics::{Availability, Check};
     let (availability, code) = match status {
-        "ready" => (Availability::Available, "pi_provider_credentials_ready"),
+        "ready" => (
+            Availability::Available,
+            Reason::PI_PROVIDER_CREDENTIALS_READY,
+        ),
         "not_ready" => (
             Availability::Unavailable,
-            "pi_provider_credentials_not_ready",
+            Reason::PI_PROVIDER_CREDENTIALS_NOT_READY,
         ),
-        _ => (Availability::Unknown, "pi_provider_credentials_unknown"),
+        _ => (
+            Availability::Unknown,
+            Reason::PI_PROVIDER_CREDENTIALS_UNKNOWN,
+        ),
     };
-    Check::new(PI_PROVIDER_CREDENTIALS, availability, code,
+    Check::new(CheckId::PI_PROVIDER_CREDENTIALS, availability, code,
         format!("Pi provider credentials {status}{}: {reason}", provider.map(|p| format!(" for {p}")).unwrap_or_default()),
         "Inspect Pi's authentication setup. This observation does not fail, cancel, or resend a request.")
         .evidence(serde_json::json!({"status": status, "provider": provider, "authType": auth_type, "exit_code": exit_code, "model": target.0, "executable": target.1}))

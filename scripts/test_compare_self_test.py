@@ -11,6 +11,15 @@ from unittest import mock
 import compare_self_test as comparison
 
 
+class PublicVocabularyTests(unittest.TestCase):
+    def test_self_test_vocabulary_matches_fixture(self):
+        fixture = json.loads((Path(__file__).resolve().parents[1]
+                              / "tests/fixtures/public_vocabulary.json").read_text(encoding="utf-8"))
+        self.assertEqual(comparison.OUTCOMES, tuple(fixture["self_test_outcomes"]))
+        self.assertEqual(comparison.STEPS, tuple(fixture["self_test_steps"]))
+        self.assertEqual(comparison.SKIP_REASON, fixture["self_test_skip_reason"])
+
+
 def report(index=0, result="passed", milliseconds=100):
     return {
         "schema_version": 1, "bridge_version": "0.4.29", "provider": "claude",

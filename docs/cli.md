@@ -1598,7 +1598,7 @@ Attention flags are `cancel_requested`, `held`, `delivery_unconfirmed`, `launch_
 `launch_uncertain`, `claim_without_receipt`, `recovery_required`, `owner_exited`,
 `owner_identity_mismatch`, `owner_unverified`, `records_partially_unreadable`,
 `request_index_incomplete`, `residual_surface_unverified`, `session_failed`, `session_exited`,
-and `origin_ended`. No flag supplies repair or close authority.
+`origin_ended`, and `question_emitted`. No flag supplies repair or close authority.
 
 ### Origin observation
 

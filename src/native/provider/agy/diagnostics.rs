@@ -8,6 +8,7 @@ use super::{
     AGY_LOG_FILE, FULL_TRANSCRIPT_FILE, TRANSCRIPT_FILE, TRUST_RECOVERY, TRUST_STORE_MISSING,
     read_pending_turn,
 };
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::session::{Reader, SessionState};
 use anyhow::Result;
 use std::path::Path;
@@ -27,9 +28,9 @@ pub(super) fn workspace_trust_check(
         Ok(home) => home,
         Err(error) => {
             return Check::new(
-                "agy_workspace_trust",
+                CheckId::AGY_WORKSPACE_TRUST,
                 Unknown,
-                "agy_trust_store_unlocated",
+                Reason::AGY_TRUST_STORE_UNLOCATED,
                 format!("{error:#}"),
                 "Inspect the managed terminal; doctor never answers the dialog.",
             );
@@ -45,22 +46,22 @@ pub(super) fn workspace_trust_check(
     let (availability, reason, detail) = match workspace_trust_missing(workspace, env, &log_path) {
         Ok(None) => (
             Available,
-            "agy_workspace_trusted",
+            Reason::AGY_WORKSPACE_TRUSTED,
             "Agy's own trust store lists this exact workspace and this session's agy.log shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer.".to_owned(),
         ),
         Ok(Some(TRUST_STORE_MISSING)) => (
             Unavailable,
-            "agy_workspace_untrusted",
+            Reason::AGY_WORKSPACE_UNTRUSTED,
             format!("Agy's own trust store does not list this exact workspace, and Agy keeps its workspace-trust dialog over the composer until such a workspace is approved. {WITHHELD}"),
         ),
         Ok(Some(_)) => (
             Unknown,
-            "agy_session_trust_unverified",
+            Reason::AGY_SESSION_TRUST_UNVERIFIED,
             format!("Agy's own trust store lists this exact workspace, but this session's agy.log does not show that this session loaded the workspace customizations. Either this session still shows its own workspace-trust dialog, as it does after the workspace was approved in another session, or the log is missing or no longer holds that line. {WITHHELD}"),
         ),
         Err(error) => (
             Unknown,
-            "agy_trust_evidence_unreadable",
+            Reason::AGY_TRUST_EVIDENCE_UNREADABLE,
             format!("Agy's trust store or this session's agy.log could not be read, so the dialog state is unobserved: {error:#}"),
         ),
     };
@@ -72,7 +73,7 @@ pub(super) fn workspace_trust_check(
         )
     };
     Check::new(
-        "agy_workspace_trust",
+        CheckId::AGY_WORKSPACE_TRUST,
         availability,
         reason,
         detail,
@@ -94,7 +95,7 @@ fn input_receipt_check_for_platform(
     windows: bool,
 ) -> super::super::super::diagnostics::Check {
     use super::super::super::diagnostics::{Availability::Unknown, Check};
-    const CHECK_ID: &str = "agy_input_receipt";
+    const CHECK_ID: CheckId = CheckId::AGY_INPUT_RECEIPT;
     const NEXT_ACTION: &str = "Observation only. A gated paste (the Windows initial prompt, every macOS follow-up) first waits until Agy's own trust store lists the exact workspace and this session's agy.log shows the workspace customization load (agy_workspace_trust), then for CLI startup completed and a 3.5 s quiet period without reload, redraw, or hooks lines. The Windows console also requires a Full redraw completed after startup. Neither platform waits for the trust reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line): Agy logs it only when a trust dialog is approved, so it never comes once the trust evidence holds. The log evidence is re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), and the paste follows the read that passed the gate with that read's length as the receipt offset; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let redraw_required = windows;
     let startup_markers = if windows {
@@ -106,7 +107,7 @@ fn input_receipt_check_for_platform(
         return Check::new(
             CHECK_ID,
             Unknown,
-            "agy_log_unavailable",
+            Reason::AGY_LOG_UNAVAILABLE,
             "No session was given, so no agy.log startup readiness or input receipt can be observed.",
             NEXT_ACTION,
         );
@@ -121,7 +122,7 @@ fn input_receipt_check_for_platform(
             return Check::new(
                 CHECK_ID,
                 Unknown,
-                "agy_log_missing",
+                Reason::AGY_LOG_MISSING,
                 "The session has no agy.log yet; startup readiness and input receipts are unobserved.",
                 NEXT_ACTION,
             )
@@ -131,7 +132,7 @@ fn input_receipt_check_for_platform(
             return Check::new(
                 CHECK_ID,
                 Unknown,
-                "agy_log_unreadable",
+                Reason::AGY_LOG_UNREADABLE,
                 format!("{error:#}"),
                 NEXT_ACTION,
             )
@@ -158,15 +159,15 @@ fn input_receipt_check_for_platform(
     };
     let (reason, detail) = match (startup.markers_observed(redraw_required), last) {
         (false, _) => (
-            "agy_startup_markers_missing",
+            Reason::AGY_STARTUP_MARKERS_MISSING,
             format!("agy.log does not yet show the startup markers ({startup_markers}); {gate_rule}."),
         ),
         (true, None) => (
-            "agy_no_input_receipt",
+            Reason::AGY_NO_INPUT_RECEIPT,
             "agy.log shows the startup markers but no HandleUserInput receipt.".to_owned(),
         ),
         (true, Some(_)) => (
-            "agy_input_receipt_observed",
+            Reason::AGY_INPUT_RECEIPT_OBSERVED,
             "agy.log shows the startup markers and at least one HandleUserInput receipt; the evidence states whether any receipt carries the complete pending turn marker.".to_owned(),
         ),
     };
@@ -198,26 +199,26 @@ pub(super) fn tool_confirmation_check(
         brain_root(env).and_then(|brain| pending_tool_confirmation(directory, &brain));
     let (reason, detail, evidence) = match observation {
         Ok(Some((tool, request_id))) => (
-            super::AGY_TOOL_CONFIRMATION_OBSERVED,
+            Reason::AGY_TOOL_CONFIRMATION_OBSERVED,
             format!(
                 "This session's {AGY_LOG_FILE} shows the pending turn waiting for user approval of {tool} in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open."
             ),
             serde_json::json!({"log": directory.join(AGY_LOG_FILE), "tool": tool, "request_id": request_id}),
         ),
         Ok(None) => (
-            "agy_tool_confirmation_unobserved",
+            Reason::AGY_TOOL_CONFIRMATION_UNOBSERVED,
             format!(
                 "No tool confirmation is attributable to the pending turn in this session's {AGY_LOG_FILE}."
             ),
             serde_json::Value::Null,
         ),
         Err(error) => (
-            "agy_tool_confirmation_unverified",
+            Reason::AGY_TOOL_CONFIRMATION_UNVERIFIED,
             format!("The pending turn's tool confirmation could not be verified: {error:#}"),
             serde_json::Value::Null,
         ),
     };
-    Check::new("agy_tool_confirmation", Unknown, reason, detail,
+    Check::new(CheckId::AGY_TOOL_CONFIRMATION, Unknown, reason, detail,
         "Observation only. Review any approval prompt in the managed terminal yourself; Bridge does not approve, resend, or release the turn claim.")
         .evidence(evidence)
 }

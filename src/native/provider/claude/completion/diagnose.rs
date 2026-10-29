@@ -5,6 +5,7 @@ use super::{
     DIAGNOSTIC_FILE, Diagnostic, LaunchMode, MODE_FILE, Mode, READY_FILE, REVISION, Ready,
     valid_claude_conversation_id,
 };
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::diagnostics::{
     Availability::{self, Unavailable, Unknown},
     Check,
@@ -217,7 +218,7 @@ const KEEP_RECORDS: &str = "Keep the records; doctor repairs, deletes and rewrit
 const SAME_BINARY: &str = "Use the Bridge binary that launched this session; do not downgrade the binary or AGENT_BRIDGE_EXECUTABLE while native-mode Claude sessions remain open.";
 const LEGACY_RECOVERY: &str = "Inspect the result and terminal, then close when appropriate. On macOS start a fresh ask with the needed context; on native Windows close and reopen to use native completion.";
 
-type Verdict = (Availability, &'static str, &'static str, &'static str);
+type Verdict = (Availability, Reason, &'static str, &'static str);
 
 // Known rejected records can explain a refusal. Valid historical readiness does not
 // establish live availability; delivery admission still reads its own records and gates.
@@ -225,62 +226,62 @@ fn verdict(mode: State, selected: Option<Mode>, readiness: State) -> Verdict {
     match (mode, selected, readiness) {
         (State::Unreadable, ..) => (
             Unknown,
-            "claude_completion_mode_unreadable",
+            Reason::CLAUDE_COMPLETION_MODE_UNREADABLE,
             "The completion-mode record could not be read within doctor's bounded reader, so the session's completion protocol is not known from this read.",
             KEEP_RECORDS,
         ),
         (State::Malformed, ..) => (
             Unavailable,
-            "claude_completion_mode_malformed",
+            Reason::CLAUDE_COMPLETION_MODE_MALFORMED,
             "The completion-mode record does not decode as its schema; this binary refuses new requests for the session while it stays so.",
             KEEP_RECORDS,
         ),
         (State::Unrecognized, ..) => (
             Unavailable,
-            "claude_completion_mode_unrecognized",
+            Reason::CLAUDE_COMPLETION_MODE_UNRECOGNIZED,
             "The completion-mode record names a schema or mode this binary does not know, for example one written by a newer binary; this binary refuses new requests for the session.",
             SAME_BINARY,
         ),
         (State::NotObserved, ..) => (
             Unavailable,
-            "claude_completion_mode_absent",
+            Reason::CLAUDE_COMPLETION_MODE_ABSENT,
             "No completion-mode record: Bridge applies legacy completion treatment while the record is absent and never upgrades from a version. This can be a pre-upgrade session or a launch that has not reached completion preparation. A pending Stop completion stays readable; new tells are refused.",
             "Inspect the launch state and terminal first: an in-progress launch may not have prepared completion, and a failed launch needs its cause diagnosed. For an unusable pre-upgrade session, inspect its result and close when appropriate; on macOS start a fresh ask with needed context, or on native Windows close and reopen.",
         ),
         (State::Observed, Some(Mode::LegacyStop), _) => (
             Unavailable,
-            "claude_completion_legacy_stop",
+            Reason::CLAUDE_COMPLETION_LEGACY_STOP,
             "The session records classic Stop completion. A pending Stop completion stays readable; new tells are refused.",
             LEGACY_RECOVERY,
         ),
         // Only native_v1 remains: an observed mode always carries its value.
         (_, _, State::Observed) => (
             Unknown,
-            "claude_completion_readiness_recorded",
+            Reason::CLAUDE_COMPLETION_READINESS_RECORDED,
             "The session records native_v1 completion and the module's session.start readiness, the records delivery admission reads. They do not prove that the module is still loaded, that messaging works or that a request will complete; admission reads them again under the current claim.",
             "No action from these records. Use inspect for a retained unmarked candidate and the managed surface for the live state; doctor sends nothing.",
         ),
         (_, _, State::NotObserved) => (
             Unknown,
-            "claude_completion_readiness_not_observed",
+            Reason::CLAUDE_COMPLETION_READINESS_NOT_OBSERVED,
             "native_v1 completion was selected at launch from the recorded Claude version, but no session.start readiness is recorded. The module may still be loading, or hooks, plugin trust or provider policy may have kept it from running; the version and settings do not prove it ran. Delivery waits for readiness and refuses without it, sending nothing.",
             "Inspect module load, plugin trust and provider policy, such as disableAllHooks, in the managed surface; doctor reads and changes none of them.",
         ),
         (_, _, State::Unrecognized) => (
             Unavailable,
-            "claude_completion_readiness_unrecognized",
+            Reason::CLAUDE_COMPLETION_READINESS_UNRECOGNIZED,
             "The readiness record has a schema or revision this binary does not accept; delivery refuses it and sends nothing.",
             SAME_BINARY,
         ),
         (_, _, State::Malformed) => (
             Unavailable,
-            "claude_completion_readiness_malformed",
+            Reason::CLAUDE_COMPLETION_READINESS_MALFORMED,
             "The readiness record does not decode as its schema or names an invalid conversation; delivery refuses it and sends nothing.",
             KEEP_RECORDS,
         ),
         (_, _, State::Unreadable) => (
             Unknown,
-            "claude_completion_readiness_unreadable",
+            Reason::CLAUDE_COMPLETION_READINESS_UNREADABLE,
             "The readiness record could not be read within doctor's bounded reader; readiness is not known from this read.",
             KEEP_RECORDS,
         ),
@@ -289,10 +290,9 @@ fn verdict(mode: State, selected: Option<Mode>, readiness: State) -> Verdict {
 
 fn completion(directory: Option<&Path>) -> Check {
     let Some(directory) = directory else {
-        return Check::new(
-            "claude_completion",
+        return Check::new(CheckId::CLAUDE_COMPLETION,
             Unknown,
-            "session_required",
+            Reason::SESSION_REQUIRED,
             "Completion mode and module readiness are records of one managed session; provider-only doctor reads none.",
             "Run doctor with a Claude session id to read its completion records.",
         )
@@ -305,7 +305,7 @@ fn completion(directory: Option<&Path>) -> Check {
     let (availability, reason, detail, next_action) =
         verdict(mode.state, selected, readiness.state);
     Check::new(
-        "claude_completion",
+        CheckId::CLAUDE_COMPLETION,
         availability,
         reason,
         detail,
@@ -318,10 +318,9 @@ fn completion(directory: Option<&Path>) -> Check {
 
 fn diagnostic(directory: Option<&Path>) -> Check {
     let Some(directory) = directory else {
-        return Check::new(
-            "claude_completion_diagnostic",
+        return Check::new(CheckId::CLAUDE_COMPLETION_DIAGNOSTIC,
             Unknown,
-            "session_required",
+            Reason::SESSION_REQUIRED,
             "The completion module's latest rejection is a record of one managed session; provider-only doctor reads none.",
             "Run doctor with a Claude session id to read its completion records.",
         )
@@ -330,34 +329,34 @@ fn diagnostic(directory: Option<&Path>) -> Check {
     let field = observe_diagnostic(&Reader::open_unchecked(directory));
     let (reason, detail, next_action) = match field.state {
         State::Observed => (
-            "claude_completion_diagnostic_recorded",
+            Reason::CLAUDE_COMPLETION_DIAGNOSTIC_RECORDED,
             "The latest signal the completion module rejected in this session, as sanitized and bounded untrusted text. The record carries no request id and no time: it cannot identify which request was rejected or show that the rejection is recent.",
             "Read it beside the managed surface and the exact request's result; never resend a request because of it.",
         ),
         State::NotObserved => (
-            "claude_completion_diagnostic_not_recorded",
+            Reason::CLAUDE_COMPLETION_DIAGNOSTIC_NOT_RECORDED,
             "No completion-module rejection is recorded. Absence does not show that no signal was rejected, that the module ran, or that a request will complete.",
             "Inspect the exact request's result and the managed surface; doctor sends nothing.",
         ),
         State::Unrecognized => (
-            "claude_completion_diagnostic_unrecognized",
+            Reason::CLAUDE_COMPLETION_DIAGNOSTIC_UNRECOGNIZED,
             "The latest diagnostic record has a schema this binary does not know; its text is not shown.",
             SAME_BINARY,
         ),
         State::Malformed => (
-            "claude_completion_diagnostic_malformed",
+            Reason::CLAUDE_COMPLETION_DIAGNOSTIC_MALFORMED,
             "The latest diagnostic record does not decode as its schema; its text is not shown.",
             KEEP_RECORDS,
         ),
         State::Unreadable => (
-            "claude_completion_diagnostic_unreadable",
+            Reason::CLAUDE_COMPLETION_DIAGNOSTIC_UNREADABLE,
             "The latest diagnostic record could not be read within doctor's bounded reader.",
             KEEP_RECORDS,
         ),
     };
     // A rejection is history without a request identity, so it never decides availability.
     Check::new(
-        "claude_completion_diagnostic",
+        CheckId::CLAUDE_COMPLETION_DIAGNOSTIC,
         Unknown,
         reason,
         detail,
