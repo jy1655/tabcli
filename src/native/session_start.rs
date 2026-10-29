@@ -61,7 +61,8 @@ impl Resolved {
         }
     }
 
-    #[cfg(test)]
+    // Only the Windows launch-recovery fixtures adjust a resolved spec.
+    #[cfg(all(test, windows))]
     pub(super) fn spec_mut(&mut self) -> &mut SessionSpec {
         &mut self.spec
     }
