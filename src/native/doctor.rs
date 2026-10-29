@@ -6,32 +6,24 @@ use super::query::observation::judgment::{
     Surface, SurfacePresence, SurfaceSource, Turn,
 };
 use super::query::observation::{Observation, PartialObservation, SessionEvidence};
-use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
+use super::{NativeCommand, consent, provider, query, reopen, terminal};
 use crate::native::clock::SystemClock;
-use crate::native::process_env;
+use crate::native::process_env::{PROBE_TIMEOUT, probe};
 use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
 use crate::native::session::launch::wrapper::{
     is_executable, provider_version_text, resolve_provider,
 };
 use crate::native::session::origin::{OriginEnvironment, OriginObservation, SourceKind};
-use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
+use crate::native::session::primitives::{require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
 use agent_bridge::PUBLIC_COMMAND;
 use agent_bridge::{FirstPartyCli, cli_version_is_supported, terminal_safe_text};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::ffi::OsString;
-use std::io::Read;
-use std::io::{Seek, SeekFrom};
-use std::path::Path;
-use std::process::{Output, Stdio};
+use std::fs;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
-use std::{fs, thread};
-
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
+use std::time::Instant;
 
 #[derive(Debug)]
 pub(crate) struct DoctorRequest {
@@ -890,161 +882,6 @@ fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
         ),
     };
     checks.push(check);
-}
-
-// Probe only explicitly requested local CLI information. Scratch files (including Windows
-// batch forwarders) live outside the session; contain descendants and cap time/output.
-fn probe_command(
-    executable: &Path,
-    arguments: &[&str],
-    workspace: Option<&Path>,
-    scratch: &Path,
-    environment_removals: &[&str],
-) -> Result<std::process::Command> {
-    let mut command = if arguments == ["--version"] {
-        let mut command = process_env::provider_version_command(executable, environment_removals)?;
-        command.arg("--version");
-        command
-    } else {
-        process_env::provider_command(
-            executable,
-            scratch,
-            arguments.iter().map(OsString::from).collect(),
-            environment_removals,
-        )?
-    };
-    command
-        .current_dir(workspace.unwrap_or(scratch))
-        .env_remove(SESSION_DIR_ENV);
-    provider_process::configure_process_tree(&mut command);
-    Ok(command)
-}
-
-pub(super) fn probe(
-    executable: &Path,
-    arguments: &[&str],
-    workspace: Option<&Path>,
-    environment_removals: &[&str],
-    deadline: Instant,
-) -> Result<Output> {
-    if Instant::now() >= deadline {
-        bail!("diagnostic probe deadline exhausted");
-    }
-    let scratch = tempfile::tempdir()?;
-    let mut command = probe_command(
-        executable,
-        arguments,
-        workspace,
-        scratch.path(),
-        environment_removals,
-    )?;
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
-    if Instant::now() >= deadline {
-        bail!("diagnostic probe deadline exhausted before launch");
-    }
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?)
-        .spawn()?;
-    let tree = match provider_process::ProviderProcessTree::attach(&child) {
-        Ok(tree) => tree,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    let outcome = (|| {
-        tree.resume(&child)?;
-        let status = loop {
-            if stdout
-                .metadata()?
-                .len()
-                .saturating_add(stderr.metadata()?.len())
-                > MAX_PROBE_OUTPUT
-            {
-                bail!("diagnostic probe output limit exceeded");
-            }
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                bail!("diagnostic probe timed out");
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        tree.terminate();
-        stdout.seek(SeekFrom::Start(0))?;
-        stderr.seek(SeekFrom::Start(0))?;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        stdout.take(MAX_PROBE_OUTPUT + 1).read_to_end(&mut out)?;
-        stderr.take(MAX_PROBE_OUTPUT + 1).read_to_end(&mut err)?;
-        if out.len().saturating_add(err.len()) as u64 > MAX_PROBE_OUTPUT {
-            bail!("diagnostic probe output limit exceeded");
-        }
-        Ok(Output {
-            status,
-            stdout: out,
-            stderr: err,
-        })
-    })();
-    tree.terminate();
-    let _ = child.kill();
-    let _ = child.wait();
-    outcome
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    #[test]
-    fn doctor_commands_keep_only_adapter_removals_and_the_session_directory_removal() {
-        for provider in agent_bridge::supported_clis() {
-            let removals = provider::probe_environment_removals(*provider);
-            for args in [vec!["--version"], vec!["diagnostic"]] {
-                let command =
-                    probe_command(Path::new("unused"), &args, None, Path::new("."), removals)
-                        .unwrap();
-                crate::native::process_env::tests::assert_provider_environment(
-                    &command,
-                    removals,
-                    &[(SESSION_DIR_ENV, None)],
-                );
-            }
-        }
-    }
-
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn local_probes_bound_output_and_stop_a_hung_cli() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("provider");
-        fs::write(&executable, "#!/bin/sh\nprintf '%066000d' 0\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let error = probe(
-            &executable,
-            &["--version"],
-            Some(directory.path()),
-            &[],
-            Instant::now() + Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("output limit"), "{error:#}");
-        fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        let error = probe(
-            &executable,
-            &["--version"],
-            Some(directory.path()),
-            &[],
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"), "{error:#}");
-    }
 }
 
 #[cfg(test)]

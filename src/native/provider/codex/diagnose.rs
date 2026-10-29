@@ -220,7 +220,7 @@ pub(super) fn diagnose_codex(
         Availability::{Available, Unavailable, Unknown},
         Check,
     };
-    use crate::native::doctor;
+    use crate::native::process_env;
     let mut checks = Vec::new();
     let version = context
         .manifest
@@ -284,7 +284,7 @@ pub(super) fn diagnose_codex(
             "Inspect the workspace check; doctor does not probe a daemon from a different workspace.",
         )
     } else if let Some(executable) = context.executable {
-        match doctor::probe(
+        match process_env::probe(
             executable,
             &["app-server", "daemon", "version"],
             Some(context.workspace),
