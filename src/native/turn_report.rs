@@ -5,21 +5,19 @@ use crate::native::session::Reader;
 use crate::native::{envelope, query};
 use agent_bridge::PUBLIC_COMMAND;
 use anyhow::{Context, Result};
-/// The command's known fields and the address acquired once its receipt exists.
+/// The command's own fields, present in every error rendering (`tell`: `session`; `reopen`:
+/// `source_session`), and the address acquired once its receipt exists.
 pub(super) struct TurnReport {
     json: bool,
-    before_address: serde_json::Map<String, serde_json::Value>,
+    fields: serde_json::Map<String, serde_json::Value>,
     address: Option<(String, String)>,
 }
 
 impl TurnReport {
-    pub(super) fn new(
-        json: bool,
-        before_address: serde_json::Map<String, serde_json::Value>,
-    ) -> Self {
+    pub(super) fn new(json: bool, fields: serde_json::Map<String, serde_json::Value>) -> Self {
         Self {
             json,
-            before_address,
+            fields,
             address: None,
         }
     }
@@ -34,19 +32,22 @@ impl TurnReport {
             .map(|(session, request)| (session.as_str(), request.as_str()))
     }
 
+    // The command's fields are merged with the caller's extra in both renderings. An
+    // addressed one lays them over the recorded request, which already carries `tell`'s
+    // `session` with the same value, so the rendering is unchanged.
     pub(super) fn finish(
         self,
         outcome: Result<()>,
         extra: serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
+        let mut fields = self.fields;
+        fields.extend(extra);
         if let Some((session, request_id)) = self.address {
-            return finish_request_with_extra(outcome, self.json, &session, &request_id, extra);
+            return finish_request_with_extra(outcome, self.json, &session, &request_id, fields);
         }
         if self.json
             && let Err(error) = &outcome
         {
-            let mut fields = self.before_address;
-            fields.extend(extra);
             envelope::print(&envelope::error(error, fields))?;
         }
         outcome

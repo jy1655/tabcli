@@ -1,8 +1,10 @@
 use super::*;
-use crate::native::args::{CommonStartOptions, parse_common_start_option};
+use crate::native::args::{
+    CommonStartOptions, OptionSet, parse_common_start_option, validate_start_options,
+};
 use crate::native::reopen::parse_reopen;
 use crate::native::session_start::parse_ask;
-use crate::native::{NativeCommand, terminal};
+use crate::native::{NativeCommand, tell, terminal};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -378,10 +380,162 @@ fn success_defaults_values_and_terminal_alias_matrix() {
     let options = vec!["--workspace".into()];
     let mut index = 0;
     assert!(
-        !parse_common_start_option(&options, &mut index, &mut CommonStartOptions::default())
-            .unwrap()
+        !parse_common_start_option(
+            &options,
+            &mut index,
+            &mut CommonStartOptions::default(),
+            OptionSet::Start
+        )
+        .unwrap()
     );
     assert_eq!(index, 0);
+}
+
+// tell parses through the common option helper, with the follow-up set: the options that
+// shape a session are not consumed and reach tell's own rejection, as before.
+#[test]
+fn tell_rejects_session_shaping_options_as_unknown() {
+    let tell_error = |options: &[&str]| {
+        let mut args = vec!["session-target".to_owned()];
+        args.extend(options.iter().map(|option| (*option).to_owned()));
+        tell::parse(&args).unwrap_err().to_string()
+    };
+    for (option, value) in [
+        ("--title", "x"),
+        ("--model", "x"),
+        ("--effort", "x"),
+        ("--terminal", "iterm2"),
+        ("--yolo", "x"),
+    ] {
+        assert_eq!(
+            tell_error(&["--prompt", "x", option, value]),
+            format!("unknown tell option: {option}")
+        );
+        assert_eq!(
+            tell_error(&[option, value, "--prompt", "x"]),
+            format!("unknown tell option: {option}")
+        );
+        // The follow-up set leaves the token where it stands, before any value is read.
+        let options = vec![option.to_owned()];
+        let mut index = 0;
+        assert!(
+            !parse_common_start_option(
+                &options,
+                &mut index,
+                &mut CommonStartOptions::default(),
+                OptionSet::FollowUp
+            )
+            .unwrap()
+        );
+        assert_eq!(index, 0);
+    }
+    // The options a follow-up does take keep their precedence and messages.
+    for (option, value) in [
+        ("--prompt", "x"),
+        ("--prompt-file", "x"),
+        ("--timeout-secs", "1"),
+    ] {
+        assert_eq!(tell_error(&[option]), format!("{option} requires a value"));
+        assert_eq!(
+            tell_error(&[option, value, option, value]),
+            format!("{option} may only be specified once")
+        );
+    }
+    for flag in ["--detach", "--json"] {
+        assert_eq!(
+            tell_error(&[flag, flag]),
+            format!("{flag} may only be specified once")
+        );
+    }
+    assert_eq!(
+        tell_error(&[]),
+        "tell requires --prompt <text> or --prompt-file <path>"
+    );
+    assert_eq!(tell_error(&["--prompt", " \n"]), "--prompt cannot be empty");
+    assert_eq!(
+        tell_error(&["--prompt", "x\x1b"]),
+        "--prompt contains terminal control U+001B; only newline and tab are allowed"
+    );
+    let NativeCommand::Tell(request) = tell::parse(&[
+        "session-target".into(),
+        "--prompt".into(),
+        "x".into(),
+        "--timeout-secs".into(),
+        "2".into(),
+        "--detach".into(),
+        "--json".into(),
+    ])
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(request.prompt, "x");
+    assert_eq!(request.timeout, Duration::from_secs(2));
+    assert!(request.json);
+}
+
+// The one validation every start command applies, in its order: the prompt is read, then
+// checked for emptiness and terminal control, then `--model` and `--effort` for blankness.
+#[test]
+fn shared_validation_produces_the_four_messages_in_order() {
+    let options =
+        |prompt: Option<&str>, model: Option<&str>, effort: Option<&str>| CommonStartOptions {
+            prompt: prompt.map(str::to_owned),
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+            ..CommonStartOptions::default()
+        };
+    let message = |parsed: CommonStartOptions| {
+        validate_start_options(parsed, "ask")
+            .err()
+            .map(|error| error.to_string())
+    };
+    assert_eq!(
+        message(options(None, Some(""), Some(""))),
+        Some("ask requires --prompt <text> or --prompt-file <path>".into())
+    );
+    assert_eq!(
+        message(options(Some(" \t\r\n"), Some(""), Some(""))),
+        Some("--prompt cannot be empty".into())
+    );
+    assert_eq!(
+        message(options(Some("x\0"), Some(""), Some(""))),
+        Some("--prompt contains terminal control U+0000; only newline and tab are allowed".into())
+    );
+    assert_eq!(
+        message(options(Some("x"), Some(" "), Some(""))),
+        Some("--model cannot be empty".into())
+    );
+    assert_eq!(
+        message(options(Some("x"), Some("m"), Some(" "))),
+        Some("--effort cannot be empty".into())
+    );
+    assert_eq!(
+        validate_start_options(options(None, None, None), "reopen")
+            .err()
+            .unwrap()
+            .to_string(),
+        "reopen requires --prompt <text> or --prompt-file <path>"
+    );
+    let validated = validate_start_options(
+        CommonStartOptions {
+            title: Some("t".into()),
+            terminal: Some(terminal::TerminalKind::Iterm2),
+            yolo: true,
+            timeout: Some(Duration::from_secs(3)),
+            detach: true,
+            json: true,
+            ..options(Some(" x "), Some("m"), Some("e"))
+        },
+        "ask",
+    )
+    .unwrap();
+    assert_eq!(validated.prompt, " x ");
+    assert_eq!(validated.title.as_deref(), Some("t"));
+    assert_eq!(validated.model.as_deref(), Some("m"));
+    assert_eq!(validated.effort.as_deref(), Some("e"));
+    assert_eq!(validated.terminal, Some(terminal::TerminalKind::Iterm2));
+    assert!(validated.yolo && validated.detach && validated.json);
+    assert_eq!(validated.timeout, Some(Duration::from_secs(3)));
 }
 
 #[test]
