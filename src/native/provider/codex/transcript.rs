@@ -1,6 +1,6 @@
 //! Append-only Codex rollout observation. Replace with an addressed, terminal first-party
 //! hook when Codex supplies one. Stop candidates never supply completion authority/text.
-use super::correlation::begins_with_bridge_prompt;
+use super::correlation::framed_for;
 use super::questions::Questions;
 use super::turn::{Binding, ObserverRecord, binding, pending, write_observer};
 use super::{PendingCodexTurn, correlated_response};
@@ -285,11 +285,8 @@ impl Cursor {
                     }
                     if item["type"].as_str().ok_or("invalid_schema")? == "input_text" {
                         let text = item["text"].as_str().ok_or("invalid_schema")?;
-                        self.accepted |= user_text
-                            && begins_with_bridge_prompt(text)
-                            && text
-                                .trim_end()
-                                .ends_with(&self.pending.as_ref().unwrap().marker);
+                        self.accepted |=
+                            user_text && framed_for(text, self.pending.as_ref().unwrap());
                     }
                 }
             }

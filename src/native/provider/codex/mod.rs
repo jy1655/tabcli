@@ -2,7 +2,6 @@ mod correlation;
 mod diagnose;
 mod hooks;
 mod launch;
-mod lifecycle;
 pub(super) mod questions;
 mod queue;
 mod runner;

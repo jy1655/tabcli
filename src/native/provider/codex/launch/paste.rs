@@ -1,5 +1,6 @@
 //! Bounded best-effort Windows console fallback, pinned to Codex 0.163.0.
 //! Counts are rendered cardinality, not content receipts. No concurrent input is assumed.
+use super::super::correlation::split_marker_line;
 use super::lexical::{
     REVIEW_HOOKS, TRUST_ALL_AND_CONTINUE, confirmation_hint, numbered_label, pinned_option,
 };
@@ -370,18 +371,10 @@ fn run(
     deadline: Instant,
     workspace: &Path,
 ) -> TerminalSendResult {
-    // Windows currently writes raw UTF-8 unchanged. Tolerate at most one
-    // terminal LF; never trim arbitrary prompt whitespace or multiple lines.
-    let prompt = prompt.strip_suffix('\n').unwrap_or(prompt);
-    let (body, tail) = prompt
-        .rsplit_once('\n')
-        .context("framed prompt has no marker line")
-        .map_err(Failure::not_sent)?;
-    if tail != format!("<!-- agent-bridge-codex-turn:{claim} -->") {
-        return Err(Failure::not_sent(anyhow::anyhow!(
-            "framed prompt marker does not match claim"
-        )));
-    }
+    // Windows currently writes raw UTF-8 unchanged. The grammar owner tolerates at most one
+    // terminal LF; the frame observed on screen is body, LF and marker line without it.
+    let (body, tail) = split_marker_line(prompt, claim).map_err(Failure::not_sent)?;
+    let prompt = &prompt[..body.len() + 1 + tail.len()];
     check(io, deadline).map_err(Failure::not_sent)?;
     if deadline.saturating_duration_since(io.now()) < POST_TEXT_RESERVE {
         return Err(Failure::not_sent(anyhow::anyhow!(
@@ -488,7 +481,7 @@ impl<H: console_control::HelperProcess> Input for Console<'_, H> {
         )
     }
     fn bound(&mut self) -> Result<bool> {
-        Ok(super::super::lifecycle::read_binding(self.directory, self.claim)?.is_some())
+        Ok(super::super::turn::read_binding(self.directory, self.claim)?.is_some())
     }
 }
 

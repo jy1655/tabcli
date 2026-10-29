@@ -199,6 +199,8 @@
   },
   "src/native/provider/codex/correlation.rs": {
     "[Agent Bridge Codex turn metadata; do not include this metadata in the response]": 1,
+    "format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\")": 1,
+    "agent-bridge-codex-turn": 1,
     "const IDE_CONTEXT_HEADING: &str = \"# Context from my IDE setup:\";": 1,
     "const IDE_REQUEST_HEADING: &str = \"## My request for Codex:\";": 1,
     "agent-turn-complete": 1,
@@ -507,8 +509,6 @@
   },
   "src/native/provider/codex/turn.rs": {
     "const PENDING_TURN_FILE: &str = \"codex-pending-turn.json\";": 1,
-    "format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\")": 1,
-    "agent-bridge-codex-turn": 1,
     "codex-pending-turn.json": 1,
     "struct PendingCodexTurn {\n    pub(super) schema: u32,\n    pub(super) claim_token: String,\n    pub(super) marker: String,\n    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's\n    // notify payload estimate (#127). The macOS launch argument and the queue message\n    // deliver that text; the Windows console paste can drop a non-BMP character (#147),\n    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14\n    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub(super) framed_prompt_chars: Option<u64>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub(super) framed_prompt_units: Option<u64>,\n}": 1,
     "impl PendingCodexTurn {\n    pub(super) fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: marker(claim_token),\n            framed_prompt_chars: None,\n            framed_prompt_units: None,\n        })\n    }\n": 1,

@@ -144,7 +144,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   reconstructing missing records or changing completion. The provider's turn-final event does
   not prove request finality or parentage; see the explicit marker fallback in [Providers](providers.md).
   Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
-  settlement remains in `codex/transcript.rs`.
+  settlement remains in `codex/transcript.rs`; the framed-prompt grammar (the frame, its
+  recognition and the marker line) lives in `codex/correlation.rs`.
   Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
   Its internal runtime supplies console dispatch, Record observations and the existing Clock;
   tests substitute that runtime while retaining the real Record readers and delivery settlement.
