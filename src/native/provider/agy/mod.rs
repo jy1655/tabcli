@@ -259,6 +259,20 @@ impl<R: Runtime> Transport for AgyPaste<R> {
 }
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn question_emissions(
+        &self,
+        _reader: &Reader,
+        _receipt: &crate::native::session::requests::Receipt,
+    ) -> Option<super::QuestionEmissions> {
+        // Agy has no question emission observation today.
+        None
+    }
+
+    fn completion_observation(&self, _reader: &Reader, _claim: &str) -> Option<serde_json::Value> {
+        // Agy has no completion observation today.
+        None
+    }
+
     fn result_timeout_diagnostic(
         &self,
     ) -> Option<super::super::diagnostics::ResultTimeoutDiagnostic> {
