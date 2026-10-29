@@ -223,45 +223,49 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
             && (directory || metadata.is_file())
             && owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }))
     };
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("invalid Ghostty launch directory")?;
-    crate::native::session::primitives::require_valid_session_id(id)?;
-    if !directory.is_absolute() || !private(directory, true)? {
-        bail!("Ghostty launch directory is not private to the current user");
-    }
-    let receipt = launch::read(&Reader::open_unchecked(directory))?
-        .context("missing Ghostty launch receipt")?;
-    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if receipt.phase != launch::Phase::Pending
-        || receipt.claim_token != token
-        || unix_ms() >= receipt.deadline_unix_ms
-        || status.state != SessionState::Launching
-        || crate::native::session::turn::current_claim_token(
-            &crate::native::session::Reader::open_unchecked(directory),
-        )?
-        .as_deref()
-            != Some(token)
-    {
-        bail!("Ghostty launch was cancelled, timed out or is not the one sent to this terminal");
-    }
-    let surface: TerminalSession = serde_json::from_str(
-        &Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .text()?
-            .context("Ghostty surface is not bound")?,
+    super::super::bound_host::run_bound_host(
+        directory,
+        &super::super::bound_host::BoundHostSpec {
+            name: "Ghostty",
+            metadata_context: None,
+            admission: super::super::bound_host::Admission::GhosttyFrame,
+        },
+        |id| {
+            let receipt = launch::read(&Reader::open_unchecked(directory))?
+                .context("missing Ghostty launch receipt")?;
+            let status: SessionStatus = Reader::open_unchecked(directory).status()?;
+            if receipt.phase != launch::Phase::Pending
+                || receipt.claim_token != token
+                || unix_ms() >= receipt.deadline_unix_ms
+                || status.state != SessionState::Launching
+                || crate::native::session::turn::current_claim_token(
+                    &crate::native::session::Reader::open_unchecked(directory),
+                )?
+                .as_deref()
+                    != Some(token)
+            {
+                bail!(
+                    "Ghostty launch was cancelled, timed out or is not the one sent to this terminal"
+                );
+            }
+            let surface: TerminalSession = serde_json::from_str(
+                &Reader::open_unchecked(directory)
+                    .record(CoreRecord::Terminal)
+                    .text()?
+                    .context("Ghostty surface is not bound")?,
+            )
+            .context("invalid Ghostty surface binding")?;
+            surface.verify_managed_session(id)?;
+            if surface.kind != TerminalKind::Ghostty {
+                bail!("the bound surface is not a Ghostty terminal");
+            }
+            let start = directory.join("ghostty-start.sh");
+            if !private(&start, false)? {
+                bail!("Ghostty start script is not private to the current user");
+            }
+            Ok(start)
+        },
     )
-    .context("invalid Ghostty surface binding")?;
-    surface.verify_managed_session(id)?;
-    if surface.kind != TerminalKind::Ghostty {
-        bail!("the bound surface is not a Ghostty terminal");
-    }
-    let start = directory.join("ghostty-start.sh");
-    if !private(&start, false)? {
-        bail!("Ghostty start script is not private to the current user");
-    }
-    Ok(start)
 }
 fn launch_command(
     directory: &Path,

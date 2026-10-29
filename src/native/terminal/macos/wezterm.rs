@@ -990,10 +990,11 @@ fn require_shared_pane(
 // Wait for the receipt/claim/status to bind the pane and socket supplied by the mux itself.
 // Failure or timeout never falls back to typed input; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    use super::bound_host::{BoundHostSpec, run_bound_host};
-    run_bound_host(
+    use super::bound_host::{BoundHostSpec, run_tty_bound_host};
+    run_tty_bound_host(
         directory,
         &BoundHostSpec {
+            admission: super::bound_host::Admission::MetadataFirst,
             name: BINDING.host,
             metadata_context: Some(|directory| {
                 format!("no WezTerm launch directory {}", directory.display())
@@ -1030,15 +1031,18 @@ fn wait_for_binding(
 ) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    if surface.kind != TerminalKind::WezTerm
-        || surface.id != pane
-        || surface
-            .wezterm_mux
-            .is_none_or(|mux| Path::new(&mux.socket) != socket)
-    {
-        bail!("WezTerm surface binding does not name the pane of this launch host");
-    }
-    Ok(())
+    super::bound_host::binding_names_host(
+        &surface,
+        TerminalKind::WezTerm,
+        |surface| {
+            surface.id == pane
+                && surface
+                    .wezterm_mux
+                    .as_ref()
+                    .is_some_and(|mux| Path::new(&mux.socket) == socket)
+        },
+        "WezTerm surface binding does not name the pane of this launch host",
+    )
 }
 
 // The prompt and its Enter are one write to the pty. Only a call that never started is
@@ -1136,83 +1140,100 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    crate::native::session::close::budget::close_remaining(deadline)?;
-    let (mux, pane) = target(session)?;
-    let mut outcome = CloseOutcome::Missing;
-    let mut kill: Option<Result<()>> = None;
-    let mut without_panes_since: Option<Instant> = None;
-    let mut asked_to_end = false;
-    loop {
-        crate::native::session::close::budget::close_remaining(deadline)?;
-        let waiting_for = match listed(host, mux, deadline) {
-            Ok(None) => {
-                forget_socket(host, mux);
-                return Ok(outcome);
-            }
-            Ok(Some(panes)) if panes.iter().any(|listed| listed.pane_id == pane) => {
-                let matching: Vec<_> = panes
-                    .iter()
-                    .filter(|listed| listed.pane_id == pane)
-                    .collect();
-                if !matches!(matching.as_slice(), [listed] if matches_handle(session, listed)) {
-                    bail!(
-                        "WezTerm close target does not match exactly its created pane/tab/window"
-                    );
-                }
-                match kill.take() {
-                    None => {
-                        crate::native::session::close::budget::close_remaining(deadline)?;
-                        outcome = CloseOutcome::Closed;
-                        kill = Some(
-                            call(
-                                host,
-                                mux,
-                                &["kill-pane", "--pane-id", &pane.to_string()],
-                                None,
-                                deadline,
-                            )
-                            .map(|_| ())
-                            .map_err(CommandOutputFailure::into_error),
-                        );
-                        // The next look waits one interval: a listing sent while the
-                        // process ends with its last pane fails and leaves a CLI log.
-                        anyhow!("WezTerm pane {pane} is being closed")
-                    }
-                    Some(Err(error)) => {
-                        return Err(error.context(format!("WezTerm pane {pane} was not closed")));
-                    }
-                    Some(Ok(())) => {
-                        kill = Some(Ok(()));
-                        anyhow!("WezTerm answered kill-pane, but pane {pane} is still listed")
-                    }
-                }
-            }
-            // Panes that the user opened in the process: it is theirs now and stays.
-            Ok(Some(panes)) if !panes.is_empty() => return Ok(outcome),
-            Ok(Some(_)) if !mux.owns_gui => return Ok(outcome),
-            Ok(Some(_)) => {
-                let since = *without_panes_since.get_or_insert_with(Instant::now);
-                if !asked_to_end && since.elapsed() >= EXIT_GRACE {
-                    asked_to_end = true;
-                    crate::native::session::close::budget::close_remaining(deadline)?;
-                    host.terminate(mux.pid)?;
-                }
-                anyhow!(
-                    "WezTerm process {} of this session is still running without a pane",
-                    mux.pid
-                )
-            }
+    use super::close_transaction::{self, InspectionError, Policy};
+    use std::ops::ControlFlow::{Break, Continue};
+    close_transaction::run(
+        &mut (),
+        Policy {
+            check: &|| close_remaining(deadline).map(|_| ()),
             // The process can be ending: its socket closes before it is gone.
-            Err(error) => error.into(),
-        };
-        if Instant::now() >= deadline {
-            return Err(waiting_for);
-        }
-        thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
-        if Instant::now() >= deadline {
-            return Err(waiting_for);
-        }
-    }
+            inspection_error: InspectionError::KeepWaiting,
+        },
+        |_, _| {
+            let (mux, pane) = target(session)?;
+            Ok(Continue((
+                mux,
+                pane,
+                CloseOutcome::Missing,
+                None::<Result<()>>,
+                None::<Instant>,
+                false,
+            )))
+        },
+        |_, (mux, _, _, _, _, _), _| listed(host, mux, deadline).map_err(Into::into),
+        |_, (mux, pane, outcome, kill, without_panes_since, asked_to_end), observation, check| {
+            let pane = *pane;
+            let waiting_for = match observation {
+                None => {
+                    forget_socket(host, mux);
+                    return Ok(Break(*outcome));
+                }
+                Some(panes) if panes.iter().any(|listed| listed.pane_id == pane) => {
+                    let matching: Vec<_> = panes
+                        .iter()
+                        .filter(|listed| listed.pane_id == pane)
+                        .collect();
+                    if !matches!(matching.as_slice(), [listed] if matches_handle(session, listed)) {
+                        bail!(
+                            "WezTerm close target does not match exactly its created pane/tab/window"
+                        );
+                    }
+                    match kill.take() {
+                        None => {
+                            check()?;
+                            *outcome = CloseOutcome::Closed;
+                            *kill = Some(
+                                call(
+                                    host,
+                                    mux,
+                                    &["kill-pane", "--pane-id", &pane.to_string()],
+                                    None,
+                                    deadline,
+                                )
+                                .map(|_| ())
+                                .map_err(CommandOutputFailure::into_error),
+                            );
+                            // The next look waits one interval: a listing sent while the
+                            // process ends with its last pane fails and leaves a CLI log.
+                            anyhow!("WezTerm pane {pane} is being closed")
+                        }
+                        Some(Err(error)) => {
+                            return Err(
+                                error.context(format!("WezTerm pane {pane} was not closed"))
+                            );
+                        }
+                        Some(Ok(())) => {
+                            *kill = Some(Ok(()));
+                            anyhow!("WezTerm answered kill-pane, but pane {pane} is still listed")
+                        }
+                    }
+                }
+                // Panes that the user opened in the process: it is theirs now and stays.
+                Some(panes) if !panes.is_empty() => return Ok(Break(*outcome)),
+                Some(_) if !mux.owns_gui => return Ok(Break(*outcome)),
+                Some(_) => {
+                    let since = *without_panes_since.get_or_insert_with(Instant::now);
+                    if !*asked_to_end && since.elapsed() >= EXIT_GRACE {
+                        *asked_to_end = true;
+                        check()?;
+                        host.terminate(mux.pid)?;
+                    }
+                    anyhow!(
+                        "WezTerm process {} of this session is still running without a pane",
+                        mux.pid
+                    )
+                }
+            };
+            Ok(Continue(waiting_for))
+        },
+        |_, _| {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+            Ok(Instant::now() < deadline)
+        },
+    )
 }
 
 pub(super) struct Adapter<H: Host> {

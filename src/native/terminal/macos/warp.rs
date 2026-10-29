@@ -971,54 +971,67 @@ fn close_exact<R: WarpRunner>(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    ensure_time(
-        deadline,
-        "Warp exact tab disappearance; tab remains present or absence is unverified",
-    )?;
-    require_exact_ids(session)?;
-    let was_present = tab_present_with(runner, client, session, deadline)?;
-    ensure_time(
-        deadline,
-        "Warp exact tab disappearance; tab remains present or absence is unverified",
-    )?;
-    if was_present {
-        match control_json::<OkResponse, _>(runner, client, &tab_args("close", session)?, deadline)
-        {
-            Ok(response) => {
-                if !response.ok
-                    || response.action != "tab.close"
-                    || response.instance_id != session.id
-                {
-                    bail!("Warp did not acknowledge the exact tab.close request");
+    use super::close_transaction::{self, InspectionError, Policy};
+    use std::ops::ControlFlow::{Break, Continue};
+    close_transaction::run(
+        runner,
+        Policy {
+            check: &|| {
+                ensure_time(
+                    deadline,
+                    "Warp exact tab disappearance; tab remains present or absence is unverified",
+                )
+            },
+            inspection_error: InspectionError::EnsureTimeThenPropagate,
+        },
+        |runner, check| {
+            require_exact_ids(session)?;
+            let was_present = tab_present_with(runner, client, session, deadline)?;
+            check()?;
+            if was_present {
+                match control_json::<OkResponse, _>(
+                    runner,
+                    client,
+                    &tab_args("close", session)?,
+                    deadline,
+                ) {
+                    Ok(response) => {
+                        if !response.ok
+                            || response.action != "tab.close"
+                            || response.instance_id != session.id
+                        {
+                            bail!("Warp did not acknowledge the exact tab.close request");
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_deref(),
+                            Some("stale_target" | "missing_target")
+                        ) => {}
+                    Err(error) => return Err(anyhow::Error::new(error)),
                 }
             }
-            Err(error)
-                if matches!(
-                    error.code.as_deref(),
-                    Some("stale_target" | "missing_target")
-                ) => {}
-            Err(error) => return Err(anyhow::Error::new(error)),
-        }
-    }
-    loop {
-        ensure_time(
-            deadline,
-            "Warp exact tab disappearance; tab remains present or absence is unverified",
-        )?;
-        let present = tab_present_with(runner, client, session, deadline)?;
-        ensure_time(
-            deadline,
-            "Warp exact tab disappearance; tab remains present or absence is unverified",
-        )?;
-        if !present {
-            return Ok(if was_present {
-                CloseOutcome::Closed
-            } else {
-                CloseOutcome::Missing
-            });
-        }
-        runner.pause(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
-    }
+            Ok(Continue(was_present))
+        },
+        |runner, _, _| tab_present_with(runner, client, session, deadline),
+        |_, was_present, present, check| {
+            check()?;
+            if !present {
+                return Ok(Break(if *was_present {
+                    CloseOutcome::Closed
+                } else {
+                    CloseOutcome::Missing
+                }));
+            }
+            Ok(Continue(anyhow!(
+                "Warp exact tab disappearance; tab remains present or absence is unverified deadline is exhausted"
+            )))
+        },
+        |runner, _| {
+            runner.pause(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+            Ok(true)
+        },
+    )
 }
 
 fn tab_present_with<R: WarpRunner>(
@@ -1802,71 +1815,69 @@ fn validate_attempt_token(value: &str) -> Result<()> {
 
 pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()> {
     validate_attempt_token(attempt)?;
-    if !directory.is_absolute() {
-        bail!("Warp host session directory must be absolute");
-    }
-    let session_id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Warp host session directory has no UTF-8 session id")?;
-    if !crate::native::session::primitives::valid_session_id(session_id) {
-        bail!("Warp host session directory has an invalid session id");
-    }
-    Reader::open_unchecked(directory)
-        .validate_private_session_directory(HOST_SESSION_DIRECTORY_LABEL)?;
-    let plan: HostPlan = RecordReader::at(
-        Reader::open_unchecked(directory)
-            .private(HOST_PLAN_FILE)
-            .path(),
-    )
-    .read_adapter_record("Warp host plan", MAX_CONTROL_OUTPUT as u64)?;
-    if plan.schema != RECORD_SCHEMA || plan.attempt != attempt {
-        bail!("Warp host plan does not match this launch attempt");
-    }
-    if plan.decision_timeout_ms == 0 {
-        bail!("Warp host plan has an invalid decision timeout");
-    }
-    let monotonic_deadline = Instant::now()
-        .checked_add(Duration::from_millis(plan.decision_timeout_ms))
-        .context("Warp host decision timeout is too large")?;
-    let tty = controlling_tty()?;
-    RecordStore::at(
-        Reader::open_unchecked(directory)
-            .private(HOST_OFFER_FILE)
-            .path(),
-    )
-    .write_new_json(
-        EXCLUSIVE_RECORD_LABEL,
-        EXCLUSIVE_TEMPORARY_PREFIX,
-        &HostOffer {
-            schema: RECORD_SCHEMA,
-            attempt: attempt.to_owned(),
-            directory: directory.to_owned(),
-            pid: std::process::id(),
-            tty,
+    super::bound_host::run_bound_host(
+        directory,
+        &super::bound_host::BoundHostSpec {
+            name: "Warp",
+            metadata_context: None,
+            admission: super::bound_host::Admission::WarpPlan,
         },
-    )?;
-    loop {
-        if Instant::now() >= monotonic_deadline || wall_ms()? >= plan.deadline_unix_ms {
-            bail!("Warp host decision timed out");
-        }
-        let decision_path = Reader::open_unchecked(directory)
-            .private(HOST_DECISION_FILE)
-            .path()
-            .to_owned();
-        if decision_path.exists() {
-            let decision: HostDecision = RecordReader::at(&decision_path)
-                .read_adapter_record("Warp host decision", MAX_CONTROL_OUTPUT as u64)?;
-            if decision.schema != RECORD_SCHEMA || decision.attempt != attempt {
-                bail!("Warp host decision does not match this launch attempt");
+        |_| {
+            let plan: HostPlan = RecordReader::at(
+                Reader::open_unchecked(directory)
+                    .private(HOST_PLAN_FILE)
+                    .path(),
+            )
+            .read_adapter_record("Warp host plan", MAX_CONTROL_OUTPUT as u64)?;
+            if plan.schema != RECORD_SCHEMA || plan.attempt != attempt {
+                bail!("Warp host plan does not match this launch attempt");
             }
-            return match decision.action {
-                HostAction::Abort => bail!("Warp host launch was aborted"),
-                HostAction::Start => Ok(()),
-            };
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
+            if plan.decision_timeout_ms == 0 {
+                bail!("Warp host plan has an invalid decision timeout");
+            }
+            let monotonic_deadline = Instant::now()
+                .checked_add(Duration::from_millis(plan.decision_timeout_ms))
+                .context("Warp host decision timeout is too large")?;
+            let tty = controlling_tty()?;
+            RecordStore::at(
+                Reader::open_unchecked(directory)
+                    .private(HOST_OFFER_FILE)
+                    .path(),
+            )
+            .write_new_json(
+                EXCLUSIVE_RECORD_LABEL,
+                EXCLUSIVE_TEMPORARY_PREFIX,
+                &HostOffer {
+                    schema: RECORD_SCHEMA,
+                    attempt: attempt.to_owned(),
+                    directory: directory.to_owned(),
+                    pid: std::process::id(),
+                    tty,
+                },
+            )?;
+            loop {
+                if Instant::now() >= monotonic_deadline || wall_ms()? >= plan.deadline_unix_ms {
+                    bail!("Warp host decision timed out");
+                }
+                let decision_path = Reader::open_unchecked(directory)
+                    .private(HOST_DECISION_FILE)
+                    .path()
+                    .to_owned();
+                if decision_path.exists() {
+                    let decision: HostDecision = RecordReader::at(&decision_path)
+                        .read_adapter_record("Warp host decision", MAX_CONTROL_OUTPUT as u64)?;
+                    if decision.schema != RECORD_SCHEMA || decision.attempt != attempt {
+                        bail!("Warp host decision does not match this launch attempt");
+                    }
+                    return match decision.action {
+                        HostAction::Abort => bail!("Warp host launch was aborted"),
+                        HostAction::Start => Ok(()),
+                    };
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+        },
+    )
 }
 
 fn controlling_tty() -> Result<String> {

@@ -4,17 +4,78 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 pub(in crate::native::terminal) struct BoundHostSpec {
+    pub(super) admission: Admission,
     pub(in crate::native::terminal) name: &'static str,
     pub(in crate::native::terminal) metadata_context: Option<fn(&Path) -> String>,
 }
 
-pub(in crate::native::terminal) fn run_bound_host<I>(
+pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     directory: &Path,
     spec: &BoundHostSpec,
     identity: impl FnOnce() -> Result<I>,
     bind: impl FnOnce(&Path, &str, &I) -> Result<()>,
     record_outcome: impl FnOnce(&Result<I>),
 ) -> Result<()> {
+    run_bound_host(directory, spec, |id| {
+        let outcome = (|| {
+            let identity = identity()?;
+            bind(directory, id, &identity)?;
+            // Discard only this host's input after its exact surface has been bound.
+            if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("cannot discard {} startup input", spec.name));
+            }
+            Ok(identity)
+        })();
+        record_outcome(&outcome);
+        outcome.map(|_| ())
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Admission {
+    MetadataFirst,
+    GhosttyFrame,
+    WarpPlan,
+}
+
+pub(super) fn run_bound_host<T>(
+    directory: &Path,
+    spec: &BoundHostSpec,
+    run: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
+    run(admit(directory, spec)?)
+}
+
+fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
+    if matches!(spec.admission, Admission::WarpPlan) {
+        if !directory.is_absolute() {
+            bail!("Warp host session directory must be absolute");
+        }
+        let id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Warp host session directory has no UTF-8 session id")?;
+        if !crate::native::session::primitives::valid_session_id(id) {
+            bail!("Warp host session directory has an invalid session id");
+        }
+        crate::native::session::Reader::open_unchecked(directory)
+            .validate_private_session_directory("Warp host session")?;
+        return Ok(id);
+    }
+    let early_id = if matches!(spec.admission, Admission::GhosttyFrame) {
+        let id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid Ghostty launch directory")?;
+        crate::native::session::primitives::require_valid_session_id(id)?;
+        if !directory.is_absolute() {
+            bail!("Ghostty launch directory is not private to the current user");
+        }
+        Some(id)
+    } else {
+        None
+    };
     let metadata = std::fs::symlink_metadata(directory);
     let metadata = match spec.metadata_context {
         Some(context) => metadata.with_context(|| context(directory))?,
@@ -29,23 +90,27 @@ pub(in crate::native::terminal) fn run_bound_host<I>(
             spec.name
         );
     }
+    if let Some(id) = early_id {
+        return Ok(id);
+    }
     let id = directory
         .file_name()
         .and_then(|name| name.to_str())
         .with_context(|| format!("invalid {} launch directory", spec.name))?;
     crate::native::session::primitives::require_valid_session_id(id)?;
-    let outcome = (|| {
-        let identity = identity()?;
-        bind(directory, id, &identity)?;
-        // Discard only this host's input after its exact surface has been bound.
-        if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("cannot discard {} startup input", spec.name));
-        }
-        Ok(identity)
-    })();
-    record_outcome(&outcome);
-    outcome.map(|_| ())
+    Ok(id)
+}
+
+pub(super) fn binding_names_host(
+    surface: &super::TerminalSession,
+    kind: super::TerminalKind,
+    names_host: impl FnOnce(&super::TerminalSession) -> bool,
+    refusal: &'static str,
+) -> Result<()> {
+    if surface.kind != kind || !names_host(surface) {
+        bail!("{refusal}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -129,6 +194,82 @@ mod tests {
                     fs::read(path.join(crate::native::session::launch::LOG)).unwrap(),
                     b"existing log\n"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn frame_and_plan_host_refusal_table_preserves_order_and_warp_privacy() {
+        use std::cell::Cell;
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("session-private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = root.path().join("session-shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o750)).unwrap();
+        let invalid = root.path().join("invalid-shared");
+        fs::create_dir(&invalid).unwrap();
+        fs::set_permissions(&invalid, fs::Permissions::from_mode(0o750)).unwrap();
+        let file = root.path().join("session-file");
+        fs::write(&file, "file").unwrap();
+        let link = root.path().join("session-link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        let missing = root.path().join("session-missing");
+        let relative = Path::new("session-relative");
+        for (name, admission) in [
+            ("Ghostty", Admission::GhosttyFrame),
+            ("Warp", Admission::WarpPlan),
+        ] {
+            let spec = BoundHostSpec {
+                name,
+                admission,
+                metadata_context: None,
+            };
+            for path in [
+                &private, &shared, &invalid, &file, &link, &missing, relative,
+            ] {
+                let called = Cell::new(false);
+                let result = run_bound_host(path, &spec, |_| {
+                    called.set(true);
+                    Ok(())
+                });
+                let expected = if path == relative {
+                    Some(
+                        if name == "Warp" {
+                            "Warp host session directory must be absolute"
+                        } else {
+                            "Ghostty launch directory is not private to the current user"
+                        }
+                        .to_string(),
+                    )
+                } else if path == invalid {
+                    Some(if name == "Warp" {
+                        "Warp host session directory has an invalid session id".to_string()
+                    } else {
+                        "invalid Agent Bridge session id: \"invalid-shared\"".to_string()
+                    })
+                } else if name == "Warp" {
+                    // The plan host must use the very same privacy reader, including
+                    // symlink, non-directory, ownership/mode and metadata diagnostics.
+                    crate::native::session::Reader::open_unchecked(path)
+                        .validate_private_session_directory("Warp host session")
+                        .err()
+                        .map(|error| format!("{error:#}"))
+                } else if path == missing {
+                    Some(fs::symlink_metadata(path).unwrap_err().to_string())
+                } else if path != private {
+                    Some("Ghostty launch directory is not private to the current user".to_string())
+                } else {
+                    None
+                };
+                assert_eq!(
+                    result.err().map(|error| format!("{error:#}")),
+                    expected,
+                    "{name} {}",
+                    path.display()
+                );
+                assert_eq!(called.get(), expected.is_none());
             }
         }
     }

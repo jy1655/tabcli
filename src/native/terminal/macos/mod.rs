@@ -1,4 +1,5 @@
 mod bound_host;
+mod close_transaction;
 pub(in crate::native) mod ownership;
 pub(in crate::native) mod process;
 
