@@ -70,6 +70,11 @@ _Avoid_: lock, lease, token (the token is the claim's identifier, not the claim)
 The caller-facing identity of one turn (`request-…`), fixed before delivery and never reused.
 _Avoid_: job, task, message id
 
+**Request outcome**:
+The caller-facing state of a Request, including whether it ends a wait, whether it succeeded,
+and the refusal text when no successful Result is available.
+_Avoid_: session state, delivery outcome, Result
+
 **Receipt**:
 The record that binds a request to its claim and, once published, to its result event.
 _Avoid_: mapping, index entry

@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.31](0.4.31.md) (2026-10-30): One reader for Pi's startup-readiness record, one owner for the Codex framed-prompt grammar, and one start-command shell shared by `ask`, `reopen` and `tell`; public output and records unchanged except two stricter Pi readiness checks (#318, #319, #320).
 - [0.4.30](0.4.30.md) (2026-10-29): Claude completion diagnostics, offline self-test comparison and diagnostic summaries, Claude inbound-interference regression coverage, and typed Status observations.
 - [0.4.29](0.4.29.md) (2026-10-27): Deterministic Request wait tests through the Clock seam and one shared iTerm2 session lookup traversal, preserving public behavior (#311, #312).
 - [0.4.28](0.4.28.md) (2026-10-27): Stable iTerm2 window lookup during window reordering, with human-origin macOS workspace-consent verification and documented wrapped-path limits (#28).

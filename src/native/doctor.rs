@@ -9,6 +9,7 @@ use super::query::observation::{Observation, PartialObservation, SessionEvidence
 use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
 use crate::native::clock::SystemClock;
 use crate::native::process_env;
+use crate::native::query::request::RequestState;
 use crate::native::session::launch::wrapper::{
     is_executable, provider_version_text, resolve_provider,
 };
@@ -644,8 +645,8 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
     let request_state = judgments.active_state.as_ref().map(|state| {
         state
             .as_ref()
-            .map(|state| state.as_str())
-            .unwrap_or("unknown")
+            .map(|state| state.name())
+            .unwrap_or(RequestState::Unknown.name())
     });
     *observations = json!({"stored_state": snapshot.status.state, "generation": snapshot.status.generation,
         "updated_unix_ms": snapshot.status.updated_unix_ms, "session_error": snapshot.status.error,

@@ -36,7 +36,7 @@ mod timeline;
 pub(super) mod wait;
 #[cfg(test)]
 pub(super) use inspect::inspect_value;
-use request::{RequestObservation, elapsed_text, usage_text};
+use request::{RequestObservation, RequestState, elapsed_text, usage_text};
 #[cfg(test)]
 pub(super) use timeline::timeline_value;
 
@@ -286,6 +286,7 @@ pub(super) use super::session::observe_owner;
 pub(in crate::native) use wait::one as wait_one;
 
 /// Ordinary `result --request`, with question fields, outside wait, failure envelopes and the doctor.
+#[cfg(test)]
 pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
     Ok(observe_snapshot(reader)?
         .observe_result(reader, &Selector::Request(request_id.to_owned()))?
@@ -332,7 +333,9 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
         }
         println!(
             "state: {}",
-            value["request_state"].as_str().unwrap_or("unknown")
+            value["request_state"]
+                .as_str()
+                .unwrap_or(RequestState::Unknown.name())
         );
         println!("{}", elapsed_text(value));
         if let Some(usage) = usage_text(value) {
@@ -393,30 +396,26 @@ pub(super) fn question_lines(value: &Value) -> Vec<String> {
     lines
 }
 
-fn correct_unsuccessful_result(value: &mut Value) {
+fn correct_unsuccessful_result(value: &mut Value, state: RequestState) {
     value["ok"] = json!(false);
     if value["error"].is_null() {
-        value["error"] = json!(match value["request_state"].as_str() {
-            Some("cancelled") => "request was cancelled without a successful result",
-            Some("unavailable") => "no published result is available for this selection",
-            Some("recovery_required") =>
-                "completion publication requires recovery; run sessions for this workspace, then query again",
-            _ =>
-                "request ended without a published successful result; inspect the session before sending another prompt",
-        });
+        value["error"] = json!(state.refusal_text());
     }
 }
 
 pub(super) fn run_result(request: ResultRequest) -> Result<()> {
     let outcome = result_value(&request);
     match outcome {
-        Ok(mut value) => {
+        Ok((mut value, state)) => {
             let empty_selection = matches!(request.selector, Selector::Latest | Selector::Event(_))
                 && value["result"].is_null();
-            let incomplete_wait = request.wait && value["request_state"] != "completed";
+            let incomplete_wait = request.wait && !state.is_some_and(RequestState::is_success);
             let unsuccessful = incomplete_wait || empty_selection;
             if unsuccessful {
-                correct_unsuccessful_result(&mut value);
+                correct_unsuccessful_result(
+                    &mut value,
+                    state.context("result selection has no Request state")?,
+                );
             }
             if matches!(request.selector, Selector::List) {
                 envelope::emit(request.json, &value, || {
@@ -454,26 +453,32 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
     }
 }
 
-fn result_value(request: &ResultRequest) -> Result<Value> {
-    result_value_in(&Reader::state_root()?, request)
+fn result_value(request: &ResultRequest) -> Result<(Value, Option<RequestState>)> {
+    result_value_with_state_in(&Reader::state_root()?, request)
 }
 
 /// The `result` command's value over one state root, including `--wait`.
+#[cfg(test)]
 pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Value> {
+    result_value_with_state_in(root, request).map(|(value, _)| value)
+}
+
+fn result_value_with_state_in(
+    root: &Path,
+    request: &ResultRequest,
+) -> Result<(Value, Option<RequestState>)> {
     if request.wait {
         let Selector::Request(id) = &request.selector else {
             bail!(
                 "--wait requires --request; waiting for the latest result could select another turn"
             )
         };
-        return wait::one(root, &request.id, id, request.timeout);
+        return wait::one_state(root, &request.id, id, request.timeout)
+            .map(|(value, state)| (value, Some(state)));
     }
     let directory = Reader::session_directory_in(root, &request.id)?;
     checked_deadline_from(Instant::now(), request.timeout)?;
     let reader = Reader::open_unchecked(&directory);
-    if let Selector::Request(id) = &request.selector {
-        return request_result(&reader, id);
-    }
     let snapshot = observe_snapshot(&reader)?;
     if matches!(request.selector, Selector::List) {
         let mut events = Vec::new();
@@ -498,14 +503,16 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
             value.as_object_mut().unwrap().remove("result");
             requests.push(value);
         }
-        return Ok(
+        return Ok((
             envelope::ok(json!({"session": request.id, "events": events, "requests": requests,
                         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}).as_object().unwrap().clone()),
-        );
+        None));
     }
-    Ok(snapshot
-        .observe_result(&reader, &request.selector)?
-        .value_with_questions(&reader))
+    let observation = snapshot.observe_result(&reader, &request.selector)?;
+    Ok((
+        observation.value_with_questions(&reader),
+        Some(observation.state()),
+    ))
 }
 
 pub(super) fn run_inspect(
