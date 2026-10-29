@@ -118,15 +118,15 @@ fn publish_binding(store: &Store, pending: &PendingCodexTurn, payload: &Value) -
 
 // Caller holds the lifecycle lock.
 pub(super) fn current_claim(reader: &Reader, token: &str) -> Result<bool> {
-    if turn::current_claim_token(reader)?.as_deref() != Some(token) {
-        return Ok(false);
-    }
-    if !matches!(
-        reader.status()?.state,
-        crate::native::session::SessionState::Running
-            | crate::native::session::SessionState::Working
-            | crate::native::session::SessionState::ResumePending
-    ) {
+    if (turn::ClaimCurrency {
+        expected: Some(token),
+        state: turn::ClaimState::Turn,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires: None,
+    })
+    .check(reader)?
+    .is_err()
+    {
         return Ok(false);
     }
     let Some(current_pending) = pending(reader)? else {
@@ -140,6 +140,17 @@ pub(super) fn stop(store: &Store, payload: &Value) -> Result<()> {
     let Some(token) = turn::current_claim_token(store)? else {
         return Ok(());
     };
+    if (turn::ClaimCurrency {
+        expected: Some(&token),
+        state: turn::ClaimState::Any,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires: None,
+    })
+    .check(store)?
+    .is_err()
+    {
+        return Ok(());
+    }
     let Some(binding) = binding(store, &token)? else {
         return Ok(());
     };
@@ -185,7 +196,15 @@ pub(super) fn notify(store: &Store, payload: &Value) -> Result<Route> {
 }
 fn record_notify(store: &Store, pending: PendingCodexTurn, payload: &Value) -> Result<Route> {
     let _lock = store.lock()?;
-    if turn::current_claim_token(store)?.as_deref() != Some(&pending.claim_token) {
+    if (turn::ClaimCurrency {
+        expected: Some(&pending.claim_token),
+        state: turn::ClaimState::Any,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires: None,
+    })
+    .check(store)?
+    .is_err()
+    {
         return Ok(Route::Stale);
     }
     let Some(binding) = binding(store, &pending.claim_token)? else {

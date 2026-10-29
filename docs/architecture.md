@@ -414,6 +414,7 @@ describes storage locations, permissions, and retention.
 
 A request is the caller-facing address of one turn. A claim is its exclusive delivery right;
 a receipt binds that request to the claim and the event address chosen before delivery.
+The session layer owns the Claim-currency guard; adapters supply their policy and map its outcome.
 Only one claim may exist at a time. Provider-owned correlation decides whether a completion
 belongs to it; shared request identity does not replace that correlation.
 

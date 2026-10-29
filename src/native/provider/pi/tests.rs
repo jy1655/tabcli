@@ -1099,3 +1099,49 @@ fn hook_payload_usage_is_validated_without_changing_the_outcome() {
         assert!(!dir.join(TURN_CLAIM_FILE).exists());
     }
 }
+
+#[test]
+fn pending_install_and_cancel_keep_token_only_currency() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let first = claim_pending_turn(directory.path());
+    let next = "999-999-999";
+    fs::write(
+        store
+            .record(crate::native::session::CoreRecord::TurnClaim)
+            .path(),
+        next.as_bytes(),
+    )
+    .unwrap();
+    let error = install_pending_turn(directory.path(), &first.claim_token).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Pi pending turn no longer holds the session claim"
+    );
+    cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
+    assert_eq!(
+        read_pending_turn(directory.path())
+            .unwrap()
+            .unwrap()
+            .claim_token,
+        first.claim_token
+    );
+    // Token-only policy must not inspect state or a tombstone.
+    fs::write(
+        store
+            .record(crate::native::session::CoreRecord::Status)
+            .path(),
+        b"unreadable",
+    )
+    .unwrap();
+    fs::write(
+        store
+            .record(crate::native::session::CoreRecord::Closed)
+            .path(),
+        b"unreadable",
+    )
+    .unwrap();
+    install_pending_turn(directory.path(), next).unwrap();
+    cancel_pending_turn(directory.path(), next).unwrap();
+    assert!(read_pending_turn(directory.path()).unwrap().is_none());
+}
