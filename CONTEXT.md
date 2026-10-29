@@ -36,7 +36,7 @@ _Avoid_: view, summary, status report, listing row, snapshot (an internal read, 
 
 **Judgment**:
 What an Observation concludes from its Records and, on request, from the owner and surface: owner
-binding and liveness, the turn, Claim without Receipt, recovery required, the request index, the
+binding, verification and liveness, the stored lifecycle verdict, the turn, Claim without Receipt, recovery required, the request index, the
 residual surface, Hold, Cancel, the surface record and its presence, the unreadable parts, Reopen
 marker eligibility, and the next `result` address. The Observation decides each once; every renderer
 (status, doctor, inspect, wait) maps a judgment to its own vocabulary and derives none of its own.

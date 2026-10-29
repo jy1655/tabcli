@@ -217,12 +217,36 @@ pub(in crate::native) struct AttachmentFailure {
     pub(in crate::native) detail: Option<String>,
 }
 
+/// The event read used to judge elapsed time; successful callers can pass their optional event.
+pub(in crate::native) enum ElapsedEvent<'a> {
+    Read(Option<&'a SessionEvent>),
+    Unreadable,
+}
+
+impl<'a> From<Option<&'a SessionEvent>> for ElapsedEvent<'a> {
+    fn from(event: Option<&'a SessionEvent>) -> Self {
+        Self::Read(event)
+    }
+}
+
+impl<'a> From<Result<Option<&'a SessionEvent>, &anyhow::Error>> for ElapsedEvent<'a> {
+    fn from(event: Result<Option<&'a SessionEvent>, &anyhow::Error>) -> Self {
+        match event {
+            Ok(event) => Self::Read(event),
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
 // Bridge wall-clock time from receipt creation to the published completion event's
 // timestamp, including dispatch and delivery waits; never model or billing time.
-pub(in crate::native) fn observed_elapsed(
+pub(in crate::native) fn observed_elapsed<'a>(
     receipt: Option<&requests::Receipt>,
-    event: Option<&SessionEvent>,
+    event: impl Into<ElapsedEvent<'a>>,
 ) -> (Option<u128>, Option<&'static str>) {
+    let ElapsedEvent::Read(event) = event.into() else {
+        return (None, Some("unreadable_result"));
+    };
     let Some(event) = event else {
         return (None, Some("no_published_result"));
     };
@@ -414,9 +438,26 @@ impl Snapshot {
 
 #[cfg(test)]
 mod elapsed_tests {
-    use super::{elapsed_text, reported_usage, usage_text};
+    use super::{elapsed_text, observed_elapsed, reported_usage, usage_text};
     use crate::native::session::schema::{SessionEvent, USAGE_OMITTED_SIZE};
     use serde_json::json;
+
+    #[test]
+    fn elapsed_read_failure_is_distinct_from_absence() {
+        let error = anyhow::anyhow!("invalid event");
+        assert_eq!(
+            observed_elapsed(None, Err(&error)),
+            (None, Some("unreadable_result"))
+        );
+        assert_eq!(
+            observed_elapsed(None, Ok(None)),
+            (None, Some("no_published_result"))
+        );
+        assert_eq!(
+            observed_elapsed(None, None),
+            observed_elapsed(None, Ok(None))
+        );
+    }
 
     #[test]
     fn human_usage_line_names_counts_runs_and_coverage() {

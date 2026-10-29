@@ -276,6 +276,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Cancel and Hold retain separate lock attempts and failure scopes, with the best-effort manifest
   read after both. Rendering partial evidence does not repair it or grant control authority.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules.
+  Stored lifecycle, owner verification, and elapsed-time reasons (including unreadable Results) are judged before rendering.
   Status carries owned active/latest summaries and the selected question focus to its renderer,
   without intermediate JSON or retained Result bodies. Missing and unreadable Results remain
   distinct observations, and the lifecycle lock is released before owner observation and rendering.
