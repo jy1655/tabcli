@@ -73,7 +73,30 @@ pub(super) fn claim_pending_turn(directory: &Path) -> PendingPiTurn {
     let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
     let token = claim.token().to_owned();
     claim.retain();
+    launching_status(directory);
     install_pending_turn(directory, &token).unwrap()
+}
+
+// Installation requires a stored lifecycle; a fixture without one is a launching session.
+// The record is written directly so that a later `update_status` transition from the
+// fixture's own choice of state stays valid.
+pub(super) fn launching_status(directory: &Path) {
+    if crate::native::session::Reader::open_unchecked(directory)
+        .status()
+        .is_err()
+    {
+        stored_state(directory, &crate::native::session::SessionState::Launching);
+    }
+}
+
+pub(super) fn stored_state(directory: &Path, state: &crate::native::session::SessionState) {
+    crate::native::session::primitives::write_json_atomic(
+        Store::open_unchecked(directory)
+            .record(crate::native::session::CoreRecord::Status)
+            .path(),
+        &serde_json::json!({"state": state.as_str(), "updated_unix_ms": 1}),
+    )
+    .unwrap();
 }
 
 pub(super) fn marked(message: &str, pending: &PendingPiTurn) -> String {
