@@ -244,8 +244,8 @@ fn verdict(mode: State, selected: Option<Mode>, readiness: State) -> Verdict {
         (State::NotObserved, ..) => (
             Unavailable,
             "claude_completion_mode_absent",
-            "No completion-mode record: Bridge treats the session as launched before native per-turn completion and never upgrades it from a version. A pending Stop completion stays readable; new tells are refused.",
-            LEGACY_RECOVERY,
+            "No completion-mode record: Bridge applies legacy completion treatment while the record is absent and never upgrades from a version. This can be a pre-upgrade session or a launch that has not reached completion preparation. A pending Stop completion stays readable; new tells are refused.",
+            "Inspect the launch state and terminal first: an in-progress launch may not have prepared completion, and a failed launch needs its cause diagnosed. For an unusable pre-upgrade session, inspect its result and close when appropriate; on macOS start a fresh ask with needed context, or on native Windows close and reopen.",
         ),
         (State::Observed, Some(Mode::LegacyStop), _) => (
             Unavailable,

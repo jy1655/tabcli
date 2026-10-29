@@ -14,7 +14,7 @@ import compare_self_test as comparison
 def report(index=0, result="passed", milliseconds=100):
     return {
         "schema_version": 1, "bridge_version": "0.4.29", "provider": "claude",
-        "provider_version": "2.1.309", "terminal": "iterm2", "isolated": True,
+        "provider_version": "2.1.309 (Claude Code)", "terminal": "iterm2", "isolated": True,
         "state_root": "/fixture/state", "marker": f"AB_fixture_{index}",
         "session": f"session-fixture-{index}", "session_state": "closed", "outcome": result,
         "elapsed_ms": milliseconds,
@@ -28,7 +28,7 @@ def report(index=0, result="passed", milliseconds=100):
 
 def experiment(count=1, arm="before"):
     conditions = {field: "fixture" for field in comparison.CONDITIONS}
-    conditions.update(provider="claude", provider_version="2.1.309", terminal="iterm2",
+    conditions.update(provider="claude", provider_version="2.1.309 (Claude Code)", terminal="iterm2",
                       isolated=True)
     return {"schema_version": 1, "conditions": conditions,
             "bridge": {"version": "0.4.29", "binary_sha256": "a" * 64,
@@ -69,6 +69,26 @@ class CompareSelfTestTests(unittest.TestCase):
         result = self.compare(before, after)
         self.assertEqual(result["status"], "compatible")
         self.assertEqual(set(result["bridge_changes"]), set(comparison.BRIDGE_FIELDS))
+
+    def test_raw_provider_versions_match_without_normalization(self):
+        for provider, raw, numeric in (("claude", "2.1.309 (Claude Code)", "2.1.309"),
+                                       ("codex", "codex-cli 0.165.0", "0.165.0")):
+            with self.subTest(provider=provider):
+                before, after = experiment(), experiment(arm="after")
+                for arm in (before, after):
+                    arm["conditions"].update(provider=provider, provider_version=raw)
+                    arm["runs"][0]["report"].update(provider=provider, provider_version=raw)
+                self.assertEqual(self.compare(before, after)["status"], "compatible")
+
+                for arm in (before, after):
+                    arm["conditions"]["provider_version"] = numeric
+                result = self.compare(before, after)
+                self.assertEqual(result["status"], "incompatible")
+                self.assertEqual(result["differences"], {})
+                self.assertEqual(result["incompatible"], [
+                    "before/runs/0: report disagrees with condition provider_version",
+                    "after/runs/0: report disagrees with condition provider_version",
+                ])
 
     def test_every_required_condition_and_identity_is_needed(self):
         for group, fields in (("conditions", (*comparison.CONDITIONS, "isolated")),

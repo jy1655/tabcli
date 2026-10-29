@@ -47,14 +47,17 @@ Use the same declared trial plan and include every attempt; do not stop only aft
 Collect distinct runs for each baseline, including an A/A control experiment. Copying
 the same run into both baselines does not supply independent observations.
 
-Create one wrapper per baseline, replacing every example value with the observed value:
+Create one wrapper per baseline, replacing every example value with the observed value.
+Copy `provider_version` exactly from the self-test report, including CLI labels such as
+`2.1.309 (Claude Code)` or `codex-cli 0.165.0`. The comparator checks the raw string;
+reducing it to the numeric version makes the wrapper disagree with the unchanged report.
 
 ```json
 {
   "schema_version": 1,
   "conditions": {
     "provider": "claude",
-    "provider_version": "2.1.309",
+    "provider_version": "2.1.309 (Claude Code)",
     "provider_backend": "record-the-configured-backend",
     "terminal": "iterm2",
     "terminal_version": "record-the-installed-version",

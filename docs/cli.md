@@ -960,7 +960,10 @@ record. Known rejected records explain a refusal, while valid historical readine
   will complete.
 - `unknown` / `claude_completion_readiness_not_observed`: native_v1 mode without a readiness
   record. The recorded version and settings do not prove that the module ran.
-- `unavailable` / `claude_completion_mode_absent`: no mode record, the pre-upgrade legacy state.
+- `unavailable` / `claude_completion_mode_absent`: no mode record. Bridge applies legacy
+  completion treatment while it is absent, but this does not establish the session's age:
+  a launch still preparing or one that failed before completion preparation can also lack
+  the record. Inspect the launch state and terminal before choosing recovery.
   `unavailable` / `claude_completion_legacy_stop`: an explicit `legacy_stop` mode. New tells are
   refused in both.
 - `unavailable` / `claude_completion_mode_unrecognized`, `claude_completion_mode_malformed`,
@@ -971,6 +974,10 @@ record. Known rejected records explain a refusal, while valid historical readine
 
 `claude_completion_diagnostic` is always `unknown`: the latest rejection never decides
 availability. `claude_completion_diagnostic_recorded` shows its `event`, `reason` and `truncated`.
+`truncated` describes only doctor's display excerpt of the stored text. The writer already
+limits each event and reason to 1,024 characters without recording whether it cut the original;
+`truncated: false` therefore does not establish that the original rejection text was preserved
+in full. Display sanitization can also expand stored text before doctor applies its own limit.
 The record has no request id and no time, so it cannot identify which request was rejected
 or show that the rejection is recent. `claude_completion_diagnostic_not_recorded`
 does not show that nothing was rejected. The other reasons are
