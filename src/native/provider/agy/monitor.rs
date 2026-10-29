@@ -1,4 +1,4 @@
-use super::diagnostics::{only_user_input_carries, parse_tool_confirmation};
+use super::evidence::{only_user_input_carries, parse_tool_confirmation, transcript_logs};
 use super::log::complete_log_lines;
 use super::receipt::{parse_input_receipt, receipt_matches};
 use super::{
@@ -364,11 +364,7 @@ impl MonitorState {
             && let Some(newest_id) = parse_conversation_id(log)
             && self.conversation_id.as_deref() != Some(newest_id.as_str())
         {
-            let path = brain_root
-                .join(&newest_id)
-                .join(".system_generated")
-                .join("logs")
-                .join(TRANSCRIPT_FILE);
+            let path = transcript_logs(brain_root, &newest_id).join(TRANSCRIPT_FILE);
             self.conversation_id = Some(newest_id);
             self.transcript = Some(TranscriptCursor::new(path));
         }

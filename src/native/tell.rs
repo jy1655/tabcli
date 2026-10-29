@@ -1,5 +1,8 @@
 //! Follow-up input to a managed session.
-use super::args::{option_value, parse_timeout, read_prompt_option, set_flag_once, set_once};
+use super::args::{
+    CommonStartOptions, OptionSet, ValidatedStartOptions, option_value, parse_common_start_option,
+    set_once, validate_start_options,
+};
 use crate::native::reopen::{
     read_resumed_from, refuse_follow_up_to_shared_conversation, reopen_refusal_gate,
 };
@@ -10,9 +13,8 @@ use crate::native::{
     DEFAULT_TIMEOUT_SECS, NativeCommand, context, delivery, native_delegation_prompt, session,
     terminal, turn_run,
 };
-use agent_bridge::{FirstPartyCli, checked_deadline_from, validate_terminal_input};
+use agent_bridge::{FirstPartyCli, checked_deadline_from};
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -29,32 +31,17 @@ pub(crate) struct TellRequest {
 pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
     let (id, options) = args.split_first().context("tell requires one session id")?;
     require_valid_session_id(id)?;
-    let mut prompt = None;
-    let mut prompt_file = None;
-    let mut timeout = None;
-    let mut detach = false;
-    let mut json = false;
+    let mut parsed = CommonStartOptions::default();
     let mut context_results = Vec::new();
     let mut context_mode = None;
     let mut index = 0;
     while index < options.len() {
+        // A follow-up shapes no session: the session-shaping options are not consumed here
+        // and are rejected below as unknown.
+        if parse_common_start_option(options, &mut index, &mut parsed, OptionSet::FollowUp)? {
+            continue;
+        }
         match options[index].as_str() {
-            "--prompt" => set_once(
-                &mut prompt,
-                option_value(options, &mut index, "--prompt")?.to_owned(),
-                "--prompt",
-            )?,
-            "--prompt-file" => set_once(
-                &mut prompt_file,
-                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
-                "--prompt-file",
-            )?,
-            "--timeout-secs" => {
-                let value = option_value(options, &mut index, "--timeout-secs")?;
-                set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
-            }
-            "--detach" => set_flag_once(&mut detach, "--detach")?,
-            "--json" => set_flag_once(&mut json, "--json")?,
             "--context-mode" => set_once(
                 &mut context_mode,
                 context::parse_mode(option_value(options, &mut index, "--context-mode")?)?,
@@ -69,11 +56,13 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
         index += 1;
     }
     context::apply_mode(&mut context_results, context_mode)?;
-    let prompt = read_prompt_option(prompt, prompt_file, "tell")?;
-    if prompt.trim().is_empty() {
-        bail!("--prompt cannot be empty");
-    }
-    validate_terminal_input(&prompt, "--prompt")?;
+    let ValidatedStartOptions {
+        prompt,
+        timeout,
+        detach,
+        json,
+        ..
+    } = validate_start_options(parsed, "tell")?;
     Ok(NativeCommand::Tell(TellRequest {
         id: id.to_owned(),
         prompt,

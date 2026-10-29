@@ -75,6 +75,11 @@ _Avoid_: liveness, validity, ownership
 The caller-facing identity of one turn (`request-…`), fixed before delivery and never reused.
 _Avoid_: job, task, message id
 
+**Request outcome**:
+The caller-facing state of a Request, including whether it ends a wait, whether it succeeded,
+and the refusal text when no successful Result is available.
+_Avoid_: session state, delivery outcome, Result
+
 **Receipt**:
 The record that binds a request to its claim and, once published, to its result event.
 _Avoid_: mapping, index entry
@@ -92,6 +97,13 @@ _Avoid_: output, response, answer
 The act of putting a prompt in front of the provider. Its outcome is sent, not sent, or
 uncertain; an uncertain delivery is never retried blindly.
 _Avoid_: send, submit, paste (these name transports, not the act)
+
+**Input evidence** (Agy):
+What Agy's own log and transcript prove about Bridge's input: the readiness gate before a
+paste, its `HandleUserInput` receipt, and the marker in exactly one `USER_INPUT` step for
+an argument-delivered initial turn. A tool confirmation is an observation correlated to
+that input, not proof of approval or a dialog that remains open.
+_Avoid_: acceptance signal, approval, delivery guarantee
 
 **Question emission**:
 Request-scoped evidence that a provider emitted a structured question, retained independently

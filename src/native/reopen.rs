@@ -1,8 +1,10 @@
 //! Reopen of a closed Session: source reservation, launch refusal, and cleanup settlement.
 //! Provider adapters retain conversation-holder evidence; terminal ownership retains Close authority.
-use super::args::{CommonStartOptions, parse_common_start_option, read_prompt_option};
+use super::args::{
+    CommonStartOptions, OptionSet, ValidatedStartOptions, parse_common_start_option,
+    validate_start_options,
+};
 use super::close::close_session_surface;
-use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::schema::{SessionEvent, SessionManifest};
 use crate::native::session::{
@@ -11,9 +13,9 @@ use crate::native::session::{
 use crate::native::turn_report::TurnReport;
 use crate::native::{
     CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, delivery, provider,
-    sanitize_title, session, session_start, terminal,
+    session, session_start, terminal,
 };
-use agent_bridge::{FirstPartyCli, validate_terminal_input};
+use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -191,17 +193,14 @@ struct ReopenSource {
 }
 
 pub(super) fn run_reopen(request: ReopenRequest) -> Result<()> {
-    let source = request.id.clone();
     let mut report = TurnReport::new(
         request.json,
-        serde_json::Map::from_iter([("source_session".into(), serde_json::json!(source))]),
+        serde_json::Map::from_iter([("source_session".into(), serde_json::json!(request.id))]),
     );
     let (outcome, gate) = run_reopen_inner(request, &mut report);
-    let mut extra = serde_json::Map::from_iter([
-        ("source_session".into(), serde_json::json!(source)),
-        ("gate".into(), serde_json::json!(gate)),
-    ]);
+    let mut extra = serde_json::Map::from_iter([("gate".into(), serde_json::json!(gate))]);
     if report.address().is_none() {
+        // A failure before any Request address still shows where the address would be.
         extra.insert("session".into(), serde_json::Value::Null);
         extra.insert("request_id".into(), serde_json::Value::Null);
     }
@@ -262,23 +261,40 @@ impl ReopenAttempt {
     }
 }
 
-// A reopened session assesses workspace consent for itself, from the current stores and
-// exactly as a fresh `ask` does, so that it can take the same guarded trust-dialog answer. The
-// source's assessment is diagnostic history of another session, never consent for this one
-// (#202). The workspace is the source's recorded, canonical path: reopen takes no path alias.
-// The assessment is part of the resolution, before create claims the source marker, so a
-// failed assessment leaves the source reopenable.
-fn resolved(
-    root: &Path,
-    spec: SessionSpec,
+// What reopen resolves differently from a fresh start. The provider and the workspace are
+// the source's: its recorded, canonical path, so the shared resolution assesses consent for
+// the canonical path (reopen takes no path alias). That assessment is the new session's own,
+// from the current stores and exactly as a fresh `ask` makes it, so that it can take the same
+// guarded trust-dialog answer; the source's assessment is diagnostic history of another
+// session, never consent for this one (#202). The default title names the source, the two
+// workspace errors say "source workspace", and an admission refusal is typed as the
+// workspace-refused gate: a pre-create gate, as the source marker is claimed only by create
+// and no refusal record is written. Model, effort and yolo come from the request alone.
+pub(super) fn resolution<'a>(
+    request: &'a ReopenRequest,
+    provider: FirstPartyCli,
+    workspace: &'a Path,
     terminal_kind: terminal::TerminalKind,
-) -> Result<session_start::Resolved> {
-    Ok(session_start::Resolved {
-        consent: Some(consent::assess(root, &spec.workspace)?),
-        spec,
+) -> session_start::Resolution<'a> {
+    session_start::Resolution {
+        provider,
+        workspace,
+        consent_path: session_start::ConsentPath::Canonical,
+        title: request.title.clone(),
+        default_title: session_start::DefaultTitle::Reopened {
+            source: &request.id,
+        },
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        yolo: request.yolo,
+        prompt: request.prompt.clone(),
         terminal_kind,
         context_sources: Vec::new(),
-    })
+        workspace_noun: "source workspace",
+        admission_refusal: |error| {
+            reopen_refusal(ReopenGate::WorkspaceRefused, format!("{error:#}"))
+        },
+    }
 }
 
 impl ResolvedReopen {
@@ -295,50 +311,17 @@ impl ResolvedReopen {
             .map_err(|error| {
                 reopen_refusal(ReopenGate::ProviderUnsupported, format!("{error:#}"))
             })?;
-        let workspace = source.manifest.workspace.canonicalize().with_context(|| {
-            format!(
-                "source workspace does not exist or cannot be resolved: {}",
-                source.manifest.workspace.display()
-            )
-        })?;
-        if !workspace.is_dir() {
-            bail!(
-                "source workspace is not a directory: {}",
-                workspace.display()
-            );
-        }
-        // A pre-create gate: the source marker is claimed only by create, and no refusal
-        // record is written.
-        let root = Reader::state_root()
-            .and_then(|root| session_start::admission::check(&root, &workspace).map(|()| root))
-            .map_err(|error| reopen_refusal(ReopenGate::WorkspaceRefused, format!("{error:#}")))?;
-        let provider_path = resolve_provider(source.provider)?;
-        let provider_version =
-            check_provider_version_until(source.provider, &provider_path, Some(deadline))?;
-        let requested_title = request.title.clone().unwrap_or_else(|| {
-            let workspace_name = workspace
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("workspace");
-            format!(
-                "{} · {workspace_name} (reopened {})",
-                source.provider.as_str(),
-                request.id
-            )
-        });
-        let title = sanitize_title(&requested_title)?;
-        let spec = SessionSpec {
-            provider: source.provider,
-            provider_path,
-            provider_version,
-            workspace,
-            title,
-            model: request.model.clone(),
-            effort: request.effort.clone(),
-            yolo: request.yolo,
-            prompt: request.prompt.clone(),
-        };
-        let start = resolved(&root, spec, terminal_kind)?;
+        // The shared resolution fails before anything is created, so a failed consent
+        // assessment leaves the source reopenable.
+        let start = session_start::resolve(
+            resolution(
+                &request,
+                source.provider,
+                &source.manifest.workspace,
+                terminal_kind,
+            ),
+            deadline,
+        )?;
         Ok(Self {
             source_id: request.id,
             source_directory,
@@ -715,14 +698,13 @@ pub(super) fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
     let mut parsed = CommonStartOptions::default();
     let mut index = 0;
     while index < options.len() {
-        if parse_common_start_option(options, &mut index, &mut parsed)? {
+        if parse_common_start_option(options, &mut index, &mut parsed, OptionSet::Start)? {
             continue;
         }
         bail!("unknown reopen option: {}", options[index]);
     }
-    let CommonStartOptions {
+    let ValidatedStartOptions {
         prompt,
-        prompt_file,
         title,
         model,
         effort,
@@ -731,18 +713,7 @@ pub(super) fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
         timeout,
         detach,
         json,
-    } = parsed;
-    let prompt = read_prompt_option(prompt, prompt_file, "reopen")?;
-    if prompt.trim().is_empty() {
-        bail!("--prompt cannot be empty");
-    }
-    validate_terminal_input(&prompt, "--prompt")?;
-    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
-        bail!("--model cannot be empty");
-    }
-    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
-        bail!("--effort cannot be empty");
-    }
+    } = validate_start_options(parsed, "reopen")?;
     Ok(NativeCommand::Reopen(ReopenRequest {
         id: id.to_owned(),
         prompt,
