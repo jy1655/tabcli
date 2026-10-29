@@ -595,14 +595,14 @@ fn cleanup_after_an_early_target_completion_leaves_the_next_request_intact() {
 }
 
 #[test]
-fn native_messenger_pending_matches_the_guard_executed_input() {
+fn native_messenger_success_without_target_turn_keeps_the_claim() {
     use crate::native::session::{SessionState, Store, turn};
 
     let root = tempfile::tempdir().unwrap();
     let directory = managed_session_directory(root.path());
     crate::native::session::update_status(&directory, SessionState::Working, None, None).unwrap();
     let store = Store::open_unchecked(&directory);
-    let claim = turn::claim(&store, &[]).unwrap();
+    let mut claim = turn::claim(&store, &[]).unwrap();
     let token = claim.token().to_owned();
     store
         .private("claude-completion-mode.json")
@@ -732,6 +732,7 @@ const timer = setInterval(() => {
         ),
     };
     sent.unwrap();
+    claim.settle_delivery(turn::Delivery::Sent).unwrap();
     assert_eq!(pending["schema"], 2);
     assert_eq!(pending["claim_token"].as_str(), Some(token.as_str()));
     assert_eq!(
@@ -749,6 +750,50 @@ const timer = setInterval(() => {
         Some(token.as_str())
     );
     assert!(store.events().unwrap().is_empty());
+    // The controlled sender succeeded, but emitted no target turn. Consumed input is
+    // one hypothesis for this state, not a live-reproduced Claude receive-hook outcome.
+    fn snapshot(directory: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut records = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                records.extend(snapshot(&path));
+            } else {
+                records.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+        records
+    }
+    let before = snapshot(&directory);
+    let waited = turn::wait(
+        &store,
+        0,
+        Some(TEST_REQUEST),
+        Some(&token),
+        Instant::now(),
+        Duration::ZERO,
+    )
+    .expect_err("the pending request must time out without a target turn");
+    assert!(format!("{waited:#}").contains("timed out"), "{waited:#}");
+    assert_eq!(snapshot(&directory), before);
+    let Err(refused) = turn::claim(&store, &[]) else {
+        panic!("a second claim started while the delivered request was pending");
+    };
+    assert!(
+        format!("{refused:#}").contains("already owns this session turn"),
+        "{refused:#}"
+    );
+    assert_eq!(snapshot(&directory), before);
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    assert!(store.events().unwrap().is_empty());
+    assert!(
+        !directory
+            .join(format!("claude-mod-bound-{token}.json"))
+            .exists()
+    );
 }
 
 #[cfg(unix)]

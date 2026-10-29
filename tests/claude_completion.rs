@@ -43,6 +43,7 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         "questions",
         "questions_oversize",
         "questions_retry",
+        "coexistence",
     ]
     .iter()
     .enumerate()
