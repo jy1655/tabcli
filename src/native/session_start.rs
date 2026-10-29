@@ -1,6 +1,7 @@
 //! One start operation; each source owns resolution, creation and provider-specific gates.
 use super::args::{
-    CommonStartOptions, option_value, parse_common_start_option, read_prompt_option, set_once,
+    CommonStartOptions, OptionSet, ValidatedStartOptions, option_value, parse_common_start_option,
+    set_once, validate_start_options,
 };
 use crate::native::failure_kind::DeliveryUncertain;
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
@@ -12,7 +13,7 @@ use crate::native::{
     create_session, delivery, native_delegation_prompt, sanitize_title, session_start, terminal,
     turn_run,
 };
-use agent_bridge::{FirstPartyCli, checked_deadline_from, validate_terminal_input};
+use agent_bridge::{FirstPartyCli, checked_deadline_from};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -28,19 +29,43 @@ pub(super) struct StartOptions {
     pub(super) json: bool,
 }
 
+// Only `resolve` constructs one: a Resolved is the outcome of the seven operations below,
+// never of a caller's own assembly.
 pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
-    pub(super) spec: SessionSpec,
-    pub(super) terminal_kind: terminal::TerminalKind,
-    pub(super) context_sources: Vec<requests::ContextSource>,
-    // Assessed by resolve, from the original requested path including aliases, before anything
-    // is created; recorded with the session once it exists. None records nothing.
-    pub(super) consent: Option<consent::Assessment>,
+    spec: SessionSpec,
+    terminal_kind: terminal::TerminalKind,
+    context_sources: Vec<requests::ContextSource>,
+    // Assessed by resolve, from the path its Resolution names (ask: the requested path,
+    // aliases included; reopen: the canonical one), before anything is created; recorded
+    // with the session once it exists. None records nothing.
+    consent: Option<consent::Assessment>,
 }
 
 // Resolution and creation are completed before the shared Initial prompt operation.
 // The source-specific value returned by create cannot exist without its Session.
 impl Resolved {
+    // A fixture that skips the resolution; tests reach the later phases through it.
+    #[cfg(test)]
+    pub(super) fn from_parts(
+        spec: SessionSpec,
+        terminal_kind: terminal::TerminalKind,
+        context_sources: Vec<requests::ContextSource>,
+        consent: Option<consent::Assessment>,
+    ) -> Self {
+        Self {
+            spec,
+            terminal_kind,
+            context_sources,
+            consent,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn spec_mut(&mut self) -> &mut SessionSpec {
+        &mut self.spec
+    }
+
     pub(super) fn create_with<T>(
         self,
         create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<(CreatedSession, T)>,
@@ -108,50 +133,171 @@ impl InitialSource for FreshSource {
     }
 }
 
-fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
-    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
-    // or delivery exists, so a failed resolution changes nothing.
-    let attached = context::resolve(&request.context_results)?;
-    let terminal_kind = terminal::select(request.terminal)?;
-    let workspace = request.workspace.canonicalize().with_context(|| {
+// Which path the consent assessment sees. `ask` passes the workspace as requested, aliases
+// included, so an alias is recorded as one; `reopen` passes the canonical path, as it takes
+// no path alias.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConsentPath {
+    Requested,
+    Canonical,
+}
+
+// How a start without `--title` names its session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DefaultTitle<'a> {
+    // `{provider} · {workspace name}`
+    Fresh,
+    // `{provider} · {workspace name} (reopened {source})`
+    Reopened { source: &'a str },
+}
+
+impl DefaultTitle<'_> {
+    fn render(self, provider: FirstPartyCli, workspace_name: &str) -> String {
+        match self {
+            Self::Fresh => format!("{} · {workspace_name}", provider.as_str()),
+            Self::Reopened { source } => format!(
+                "{} · {workspace_name} (reopened {source})",
+                provider.as_str()
+            ),
+        }
+    }
+}
+
+// What a fresh start and a reopen resolve differently; the resolution itself is the same
+// seven operations (`resolve`). `ask` fills it from its request, `reopen` from its request
+// and the closed source.
+pub(super) struct Resolution<'a> {
+    pub(super) provider: FirstPartyCli,
+    // The workspace as requested; the resolution canonicalizes it.
+    pub(super) workspace: &'a Path,
+    pub(super) consent_path: ConsentPath,
+    pub(super) title: Option<String>,
+    pub(super) default_title: DefaultTitle<'a>,
+    pub(super) model: Option<String>,
+    pub(super) effort: Option<String>,
+    pub(super) yolo: bool,
+    pub(super) prompt: String,
+    pub(super) terminal: Option<terminal::TerminalKind>,
+    pub(super) context_sources: Vec<requests::ContextSource>,
+    // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
+    pub(super) workspace_noun: &'static str,
+    // How an admission refusal is reported: unchanged for `ask`, typed as reopen's
+    // workspace-refused gate for a reopen.
+    pub(super) admission_refusal: fn(anyhow::Error) -> anyhow::Error,
+}
+
+// The launchable spec of a start, in this order: terminal selection, the canonical
+// workspace directory, state root and launch admission, provider executable and version,
+// title, and workspace consent. Nothing is created, so a failure changes nothing.
+pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
+    resolve_with(resolution, |provider| {
+        let provider_path = resolve_provider(provider)?;
+        let provider_version =
+            check_provider_version_until(provider, &provider_path, Some(deadline))?;
+        Ok((provider_path, provider_version))
+    })
+}
+
+// `probe` is the resolution's one look at the installed CLI: its executable path and its
+// supported version. Tests resolve without an installed provider through it.
+pub(super) fn resolve_with(
+    resolution: Resolution<'_>,
+    probe: impl FnOnce(FirstPartyCli) -> Result<(PathBuf, String)>,
+) -> Result<Resolved> {
+    let Resolution {
+        provider,
+        workspace: requested,
+        consent_path,
+        title,
+        default_title,
+        model,
+        effort,
+        yolo,
+        prompt,
+        terminal,
+        context_sources,
+        workspace_noun,
+        admission_refusal,
+    } = resolution;
+    let terminal_kind = terminal::select(terminal)?;
+    let workspace = requested.canonicalize().with_context(|| {
         format!(
-            "workspace does not exist or cannot be resolved: {}",
-            request.workspace.display()
+            "{workspace_noun} does not exist or cannot be resolved: {}",
+            requested.display()
         )
     })?;
     if !workspace.is_dir() {
-        bail!("workspace is not a directory: {}", workspace.display());
+        bail!(
+            "{workspace_noun} is not a directory: {}",
+            workspace.display()
+        );
     }
-    let root = Reader::state_root()?;
-    admission::check(&root, &workspace)?;
-    let provider_path = resolve_provider(request.provider)?;
-    let provider_version =
-        check_provider_version_until(request.provider, &provider_path, Some(deadline))?;
-    let requested_title = request.title.clone().unwrap_or_else(|| {
+    let root = Reader::state_root()
+        .and_then(|root| admission::check(&root, &workspace).map(|()| root))
+        .map_err(admission_refusal)?;
+    let (provider_path, provider_version) = probe(provider)?;
+    let requested_title = title.unwrap_or_else(|| {
         let workspace_name = workspace
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("workspace");
-        format!("{} · {workspace_name}", request.provider.as_str())
+        default_title.render(provider, workspace_name)
     });
     let title = sanitize_title(&requested_title)?;
-    let consent = consent::assess(&root, &request.workspace)?;
+    let consent = consent::assess(
+        &root,
+        match consent_path {
+            ConsentPath::Requested => requested,
+            ConsentPath::Canonical => &workspace,
+        },
+    )?;
     Ok(Resolved {
         spec: SessionSpec {
-            provider: request.provider,
+            provider,
             provider_path,
             provider_version,
             workspace,
             title,
-            model: request.model.clone(),
-            effort: request.effort.clone(),
-            yolo: request.yolo,
-            prompt: attached.prompt_with_attachments(&request.prompt),
+            model,
+            effort,
+            yolo,
+            prompt,
         },
         terminal_kind,
-        context_sources: attached.sources,
+        context_sources,
         consent: Some(consent),
     })
+}
+
+fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
+    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
+    // or delivery exists, so a failed resolution changes nothing.
+    let attached = context::resolve(&request.context_results)?;
+    resolve(fresh_resolution(request, attached), deadline)
+}
+
+// A fresh start's resolution: consent sees the workspace as requested, the default title
+// names provider and workspace, and the workspace errors and the admission refusal keep
+// their own words.
+pub(super) fn fresh_resolution(
+    request: &AskRequest,
+    attached: context::ResolvedContext,
+) -> Resolution<'_> {
+    Resolution {
+        provider: request.provider,
+        workspace: &request.workspace,
+        consent_path: ConsentPath::Requested,
+        title: request.title.clone(),
+        default_title: DefaultTitle::Fresh,
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        yolo: request.yolo,
+        prompt: attached.prompt_with_attachments(&request.prompt),
+        terminal: request.terminal,
+        context_sources: attached.sources,
+        workspace_noun: "workspace",
+        admission_refusal: std::convert::identity,
+    }
 }
 
 // Delegation framing and consent recording precede any source provenance binding.
@@ -350,7 +496,7 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut context_mode = None;
     let mut index = 0;
     while index < options.len() {
-        if parse_common_start_option(options, &mut index, &mut parsed)? {
+        if parse_common_start_option(options, &mut index, &mut parsed, OptionSet::Start)? {
             continue;
         }
         match options[index].as_str() {
@@ -373,9 +519,9 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         index += 1;
     }
     context::apply_mode(&mut context_results, context_mode)?;
-    let CommonStartOptions {
+    let workspace = workspace.unwrap_or(std::env::current_dir()?);
+    let ValidatedStartOptions {
         prompt,
-        prompt_file,
         title,
         model,
         effort,
@@ -384,19 +530,7 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         timeout,
         detach,
         json,
-    } = parsed;
-    let workspace = workspace.unwrap_or(std::env::current_dir()?);
-    let prompt = read_prompt_option(prompt, prompt_file, "ask")?;
-    if prompt.trim().is_empty() {
-        bail!("--prompt cannot be empty");
-    }
-    validate_terminal_input(&prompt, "--prompt")?;
-    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
-        bail!("--model cannot be empty");
-    }
-    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
-        bail!("--effort cannot be empty");
-    }
+    } = validate_start_options(parsed, "ask")?;
     Ok(NativeCommand::Ask(AskRequest {
         provider,
         workspace,
