@@ -1,4 +1,5 @@
 //! Diagnostic vocabulary shared by observations and provider adapters.
+pub(super) mod vocabulary;
 use super::{consent, provider};
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::schema::SessionManifest;
@@ -7,6 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
+use vocabulary::{CheckId, Reason};
 
 // A provider owns which observation can explain a timed-out result and whether it
 // needs an explicit probe. The caller owns the bound on executing the command.
@@ -80,16 +82,18 @@ pub(super) struct Check {
 
 impl Check {
     pub(super) fn new(
-        id: &'static str,
+        id: CheckId,
         availability: Availability,
-        reason_code: &'static str,
+        reason_code: Reason,
         detail: impl Into<String>,
         next_action: impl Into<String>,
     ) -> Self {
+        debug_assert!(CheckId::ALL.contains(&id));
+        debug_assert!(Reason::ALL.contains(&reason_code));
         Self {
-            id,
+            id: id.name(),
             availability,
-            reason_code,
+            reason_code: reason_code.name(),
             observed_unix_ms: unix_ms(),
             detail: detail.into(),
             next_action: next_action.into(),
@@ -235,5 +239,29 @@ mod timeout_tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::vocabulary::{CheckId, Reason};
+    use crate::native::{query::status::AttentionFlag, self_test};
+
+    #[test]
+    fn public_vocabulary_matches_committed_fixture() {
+        let vocabulary = serde_json::json!({
+            "attention_flags": AttentionFlag::ALL.iter().map(|flag| flag.name()).collect::<Vec<_>>(),
+            "check_ids": CheckId::ALL.iter().map(|id| id.name()).collect::<Vec<_>>(),
+            "reasons": Reason::ALL.iter().map(|reason| reason.name()).collect::<Vec<_>>(),
+            "self_test_outcomes": self_test::OUTCOMES,
+            "self_test_steps": self_test::STEPS,
+            "self_test_skip_reason": self_test::SKIP_REASON,
+        });
+        let expected = format!("{}\n", serde_json::to_string_pretty(&vocabulary).unwrap());
+        assert_eq!(
+            include_str!("../../tests/fixtures/public_vocabulary.json"),
+            expected,
+            "Update tests/fixtures/public_vocabulary.json deliberately to:\n{expected}"
+        );
     }
 }

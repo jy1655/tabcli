@@ -5,6 +5,7 @@ use crate::native::delivery as native_delivery;
 use crate::native::delivery::{
     Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::provider::{
     ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
     NativeProviderAdapter, ReopenSupport,
@@ -53,8 +54,6 @@ impl Home {
 }
 
 pub(super) struct AgyAdapter;
-
-const AGY_TOOL_CONFIRMATION_OBSERVED: &str = "agy_tool_confirmation_observed";
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 const TRANSCRIPT_FILE: &str = "transcript.jsonl";
@@ -265,7 +264,8 @@ impl NativeProviderAdapter for AgyAdapter {
         Some(super::super::diagnostics::ResultTimeoutDiagnostic {
             probe: false,
             detail: |check, request_id| {
-                (check.reason_code.as_deref() == Some(AGY_TOOL_CONFIRMATION_OBSERVED)
+                (check.reason_code.as_deref()
+                    == Some(Reason::AGY_TOOL_CONFIRMATION_OBSERVED.name())
                     && check.request_id.as_deref() == Some(request_id))
                 .then_some(check.detail.as_deref())
                 .flatten()
@@ -350,9 +350,9 @@ impl NativeProviderAdapter for AgyAdapter {
         use super::super::diagnostics::{Availability::Unknown, Check};
         let mut checks = vec![
             Check::new(
-                "agy_follow_up",
+                CheckId::AGY_FOLLOW_UP,
                 Unknown,
-                "agy_terminal_fallback",
+                Reason::AGY_TERMINAL_FALLBACK,
                 "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; the Windows initial prompt and every macOS follow-up also wait until Agy's own trust store lists the exact workspace and the session's own log shows that it loaded the workspace customizations. The macOS initial prompt is a launch argument and never waits.",
                 "Inspect the managed owner and terminal; retain this fallback until Agy offers a verified native path.",
             ),

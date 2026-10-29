@@ -1,6 +1,7 @@
 # Architecture
 
 Follow an `ask` from launch preparation to a retained result to find the module you need to change.
+Public vocabulary is owned by the status renderer, `diagnostics::vocabulary`, and `self_test`, with `tests/fixtures/public_vocabulary.json` checking their agreement with Python consumers and the attention catalog.
 The Rust CLI manages one provider conversation per session in a visible surface. A request crosses
 these boundaries:
 

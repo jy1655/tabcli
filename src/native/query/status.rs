@@ -14,6 +14,83 @@ use observation::judgment::{
 };
 use observation::{Observation, QuestionFocus, StatusObservation};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::native) enum AttentionFlag {
+    CancelRequested,
+    ClaimWithoutReceipt,
+    DeliveryUnconfirmed,
+    Held,
+    LaunchFailed,
+    LaunchTimeout,
+    LaunchUncertain,
+    OriginEnded,
+    OwnerExited,
+    OwnerIdentityMismatch,
+    OwnerUnverified,
+    QuestionEmitted,
+    RecordsPartiallyUnreadable,
+    RecoveryRequired,
+    RequestIndexIncomplete,
+    ResidualSurfaceUnverified,
+    SessionExited,
+    SessionFailed,
+}
+
+impl AttentionFlag {
+    pub(in crate::native) const ALL: &[Self] = &[
+        Self::CancelRequested,
+        Self::ClaimWithoutReceipt,
+        Self::DeliveryUnconfirmed,
+        Self::Held,
+        Self::LaunchFailed,
+        Self::LaunchTimeout,
+        Self::LaunchUncertain,
+        Self::OriginEnded,
+        Self::OwnerExited,
+        Self::OwnerIdentityMismatch,
+        Self::OwnerUnverified,
+        Self::QuestionEmitted,
+        Self::RecordsPartiallyUnreadable,
+        Self::RecoveryRequired,
+        Self::RequestIndexIncomplete,
+        Self::ResidualSurfaceUnverified,
+        Self::SessionExited,
+        Self::SessionFailed,
+    ];
+
+    pub(in crate::native) const fn name(self) -> &'static str {
+        match self {
+            Self::CancelRequested => "cancel_requested",
+            Self::ClaimWithoutReceipt => "claim_without_receipt",
+            Self::DeliveryUnconfirmed => "delivery_unconfirmed",
+            Self::Held => "held",
+            Self::LaunchFailed => "launch_failed",
+            Self::LaunchTimeout => "launch_timeout",
+            Self::LaunchUncertain => "launch_uncertain",
+            Self::OriginEnded => "origin_ended",
+            Self::OwnerExited => "owner_exited",
+            Self::OwnerIdentityMismatch => "owner_identity_mismatch",
+            Self::OwnerUnverified => "owner_unverified",
+            Self::QuestionEmitted => "question_emitted",
+            Self::RecordsPartiallyUnreadable => "records_partially_unreadable",
+            Self::RecoveryRequired => "recovery_required",
+            Self::RequestIndexIncomplete => "request_index_incomplete",
+            Self::ResidualSurfaceUnverified => "residual_surface_unverified",
+            Self::SessionExited => "session_exited",
+            Self::SessionFailed => "session_failed",
+        }
+    }
+}
+
+impl serde::Serialize for AttentionFlag {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StatusRequest {
     scope: SearchScope,
@@ -78,12 +155,14 @@ fn parse_options(args: &[String]) -> Result<StatusRequest> {
 
 /// Status's owner attention: a live owner whose identity was not compared is not flagged,
 /// and an Unknown attestation is unverified, never exited (B3).
-fn owner_flag(owner: &OwnerJudgment) -> Option<&'static str> {
+fn owner_flag(owner: &OwnerJudgment) -> Option<AttentionFlag> {
     match owner.bound() {
-        Some(BoundOwner::Exited) => Some("owner_exited"),
-        Some(BoundOwner::Reused | BoundOwner::ControlChanged) => Some("owner_identity_mismatch"),
+        Some(BoundOwner::Exited) => Some(AttentionFlag::OwnerExited),
+        Some(BoundOwner::Reused | BoundOwner::ControlChanged) => {
+            Some(AttentionFlag::OwnerIdentityMismatch)
+        }
         Some(BoundOwner::Verified | BoundOwner::Uncompared) => None,
-        Some(BoundOwner::Unknown) | None => Some("owner_unverified"),
+        Some(BoundOwner::Unknown) | None => Some(AttentionFlag::OwnerUnverified),
     }
 }
 
@@ -107,27 +186,32 @@ fn attention(
     observed: &StatusObservation,
     owner: &OwnerJudgment,
     origin: &OriginObservation,
-) -> Vec<&'static str> {
+) -> Vec<AttentionFlag> {
     let observation = &observed.observation;
     let judgments = &observation.judgments;
     let closed = judgments.lifecycle == Lifecycle::Closed;
     let mut flags = Vec::new();
     if judgments.cancel == Cancel::Recorded(Some(CancelState::RequestedActive)) {
-        flags.push("cancel_requested");
+        flags.push(AttentionFlag::CancelRequested);
     }
     if matches!(judgments.hold, Hold::Held { .. }) {
-        flags.push("held");
+        flags.push(AttentionFlag::Held);
     }
     match &judgments.turn {
-        Turn::DeliveryUnconfirmed => flags.push("delivery_unconfirmed"),
-        Turn::LaunchFailed { reason, .. } => flags.push(reason),
+        Turn::DeliveryUnconfirmed => flags.push(AttentionFlag::DeliveryUnconfirmed),
+        Turn::LaunchFailed { reason, .. } => flags.push(
+            *AttentionFlag::ALL
+                .iter()
+                .find(|flag| flag.name() == *reason)
+                .expect("known launch attention"),
+        ),
         Turn::TurnInProgress | Turn::NoActiveTurn => (),
     }
     if judgments.claim_without_receipt {
-        flags.push("claim_without_receipt");
+        flags.push(AttentionFlag::ClaimWithoutReceipt);
     }
     if judgments.recovery_required {
-        flags.push("recovery_required");
+        flags.push(AttentionFlag::RecoveryRequired);
     }
     if !closed {
         flags.extend(owner_flag(owner));
@@ -136,7 +220,7 @@ fn attention(
             .as_ref()
             .is_some_and(|q| !q.emissions.items.is_empty())
         {
-            flags.push("question_emitted");
+            flags.push(AttentionFlag::QuestionEmitted);
         }
     }
     // Status unions its own two reads with the Observation's unreadable parts (D12).
@@ -148,22 +232,22 @@ fn attention(
             .as_ref()
             .is_some_and(|q| q.emissions.observation == QuestionObservation::Unreadable)
     {
-        flags.push("records_partially_unreadable");
+        flags.push(AttentionFlag::RecordsPartiallyUnreadable);
     }
     if judgments.request_index.is_some() {
-        flags.push("request_index_incomplete");
+        flags.push(AttentionFlag::RequestIndexIncomplete);
     }
     if judgments.residual_surface.is_some() {
-        flags.push("residual_surface_unverified");
+        flags.push(AttentionFlag::ResidualSurfaceUnverified);
     }
     match judgments.lifecycle {
-        Lifecycle::Failed => flags.push("session_failed"),
-        Lifecycle::Exited => flags.push("session_exited"),
+        Lifecycle::Failed => flags.push(AttentionFlag::SessionFailed),
+        Lifecycle::Exited => flags.push(AttentionFlag::SessionExited),
         Lifecycle::Ready | Lifecycle::Closed | Lifecycle::Other => (),
     }
     // Derived from the Origin's records; neither an open surface nor a close authority.
     if !closed && origin.ended == Some(true) {
-        flags.push("origin_ended");
+        flags.push(AttentionFlag::OriginEnded);
     }
     flags
 }

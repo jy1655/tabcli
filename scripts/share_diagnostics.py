@@ -49,12 +49,12 @@ CHECK_IDS = enum("""
     agy_tool_confirmation pi_follow_up pi_provider_credentials
 """)
 REASONS = enum("""
-    platform_supported platform_unsupported session_unavailable session_busy records_read records_busy
+    platform_supported platform_unsupported session_unavailable records_read records_busy
     records_unreadable stored_state active_request_unknown delivery_unconfirmed turn_in_progress
     no_active_turn recovery_required no_pending_completion request_index_incomplete
     launch_timeout launch_failed launch_uncertain terminal_selected terminal_unsupported
     terminal_selection_failed terminal_surface_present terminal_surface_missing
-    terminal_surface_unverified terminal_consumed terminal_closed terminal_close_in_progress
+    terminal_surface_unverified terminal_consumed terminal_close_in_progress
     terminal_binding_unverified terminal_record_found terminal_record_missing
     terminal_record_unreadable terminal_tombstone_unreadable powershell_found
     powershell_unavailable provider_unrecognized executable_found executable_path_unverified

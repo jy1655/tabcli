@@ -5,6 +5,7 @@ use super::{
 #[cfg(test)]
 use crate::native::delivery::Readiness;
 use crate::native::delivery::Transport;
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 #[cfg(test)]
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, record};
@@ -138,10 +139,10 @@ impl NativeProviderAdapter for ClaudeAdapter {
         });
         let (availability, reason, detail) = match setting {
             Some(Ok(Some(value))) if value.get("crossSessionInbound").and_then(serde_json::Value::as_str) == Some("accept") =>
-                (Available, "claude_inbound_configured", "The session settings record crossSessionInbound=accept. This does not prove the running CLI loaded it.".to_owned()),
-            Some(Ok(Some(_))) => (Unknown, "claude_inbound_unverified", "The session file does not establish inbound acceptance; effective provider policy is unknown.".to_owned()),
-            Some(Err(error)) => (Unknown, "claude_settings_unreadable", format!("{error:#}")),
-            _ => (Unknown, "claude_settings_unavailable", "No managed session settings were observed.".to_owned()),
+                (Available, Reason::CLAUDE_INBOUND_CONFIGURED, "The session settings record crossSessionInbound=accept. This does not prove the running CLI loaded it.".to_owned()),
+            Some(Ok(Some(_))) => (Unknown, Reason::CLAUDE_INBOUND_UNVERIFIED, "The session file does not establish inbound acceptance; effective provider policy is unknown.".to_owned()),
+            Some(Err(error)) => (Unknown, Reason::CLAUDE_SETTINGS_UNREADABLE, format!("{error:#}")),
+            _ => (Unknown, Reason::CLAUDE_SETTINGS_UNAVAILABLE, "No managed session settings were observed.".to_owned()),
         };
         let inherited_markers = CLAUDE_CODE_SESSION_MARKERS
             .iter()
@@ -152,13 +153,13 @@ impl NativeProviderAdapter for ClaudeAdapter {
         {
             (
                 Available,
-                "claude_caller_markers_absent",
+                Reason::CLAUDE_CALLER_MARKERS_ABSENT,
                 "The doctor process inherited no Claude Code session markers.".to_owned(),
             )
         } else {
             (
                 Available,
-                "claude_caller_markers_removed_at_launch",
+                Reason::CLAUDE_CALLER_MARKERS_REMOVED_AT_LAUNCH,
                 format!(
                     "The caller is running inside a Claude Code session ({}). Managed launches and messengers drop these markers so the managed session registers as an independent top-level session; an unmanaged nested claude inherits them and stays undiscoverable.",
                     inherited_markers.join(", ")
@@ -166,25 +167,22 @@ impl NativeProviderAdapter for ClaudeAdapter {
             )
         };
         let mut checks = vec![
-            Check::new(
-                "claude_inbound_setting",
+            Check::new(CheckId::CLAUDE_INBOUND_SETTING,
                 availability,
                 reason,
                 detail,
                 "Inspect the session settings and provider policy; doctor does not change either.",
             ),
-            Check::new(
-                "claude_caller_markers",
+            Check::new(CheckId::CLAUDE_CALLER_MARKERS,
                 markers_availability,
                 markers_reason,
                 markers_detail,
                 "No action; this observes the doctor's own environment, not the running managed session.",
             )
             .evidence(serde_json::json!({ "inherited": inherited_markers })),
-            Check::new(
-                "claude_messaging",
+            Check::new(CheckId::CLAUDE_MESSAGING,
                 Unknown,
-                "claude_runtime_gates_unverified",
+                Reason::CLAUDE_RUNTIME_GATES_UNVERIFIED,
                 "Follow-up uses official ListAgents/SendMessage. Backend, feature flags, policy, and live discovery have not been verified; --probe only reads the CLI version.",
                 "Use the official provider's availability diagnostics. Doctor never calls a messenger/model or substitutes terminal injection.",
             ),
@@ -409,20 +407,18 @@ fn resumed_conversation_holders_check(
         });
     let next_action = "Detection is best-effort and taken only at launch, before each delivery, and now; a foreign claude --resume can still interleave between checks. Close the other holder before the next tell, or accept the shared transcript.";
     Some(match scan {
-        Ok(others) if others.is_empty() => Check::new(
-            "claude_resumed_conversation_holders",
+        Ok(others) if others.is_empty() => Check::new(CheckId::CLAUDE_RESUMED_CONVERSATION_HOLDERS,
             Available,
-            "claude_resumed_conversation_exclusive_now",
+            Reason::CLAUDE_RESUMED_CONVERSATION_EXCLUSIVE_NOW,
             format!(
                 "No other live Claude Code process is registered for resumed conversation {provider_session_id} at this moment."
             ),
             next_action,
         )
         .evidence(serde_json::json!({ "provider_session_id": provider_session_id, "other_holders": [] })),
-        Ok(others) => Check::new(
-            "claude_resumed_conversation_holders",
+        Ok(others) => Check::new(CheckId::CLAUDE_RESUMED_CONVERSATION_HOLDERS,
             Unavailable,
-            "claude_resumed_conversation_shared",
+            Reason::CLAUDE_RESUMED_CONVERSATION_SHARED,
             format!(
                 "Resumed conversation {provider_session_id} is also held by live Claude Code process(es) {}; the next tell to this session will be refused with gate reopen-conflict while they stay registered.",
                 others
@@ -434,10 +430,9 @@ fn resumed_conversation_holders_check(
             next_action,
         )
         .evidence(serde_json::json!({ "provider_session_id": provider_session_id, "other_holders": others })),
-        Err(error) => Check::new(
-            "claude_resumed_conversation_holders",
+        Err(error) => Check::new(CheckId::CLAUDE_RESUMED_CONVERSATION_HOLDERS,
             Unknown,
-            "claude_resumed_conversation_unverified",
+            Reason::CLAUDE_RESUMED_CONVERSATION_UNVERIFIED,
             format!(
                 "The registry scan for resumed conversation {provider_session_id} failed: {error:#}; the next tell to this session will be refused with gate reopen-verification-failed until it succeeds."
             ),

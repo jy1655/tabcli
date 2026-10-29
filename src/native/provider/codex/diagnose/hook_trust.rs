@@ -1,5 +1,6 @@
 //! Current-installation probe, never evidence that a managed session ran a hook.
 use super::super::{ADAPTER, hooks};
+use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::diagnostics::{Availability, Check, Context};
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::{process_env, provider_process};
@@ -21,15 +22,15 @@ pub(super) fn check(context: &Context<'_>) -> Check {
             let trusted = evidence["hooks"].as_array().unwrap().iter().all(|h| {
                 h["trustStatus"] == "trusted" && h["hash_matches"] == true
             });
-            Check::new("codex_hook_trust",
+            Check::new(CheckId::CODEX_HOOK_TRUST,
                 if trusted { Availability::Available } else { Availability::Unavailable },
-                if trusted { "codex_hook_trust_observed" } else { "codex_hook_trust_attention" },
+                if trusted { Reason::CODEX_HOOK_TRUST_OBSERVED } else { Reason::CODEX_HOOK_TRUST_ATTENTION },
                 "Current installed Codex hooks/list probe with this Bridge executable's proposed override; not an observation of hook execution or this session's effective configuration.",
                 "Inspect trustStatus and hash_matches; normalization drift means currentHash differs. Bridge never answers the hook-review picker.")
                 .evidence(evidence)
         }
-        Err(error) => Check::new("codex_hook_trust", Availability::Unavailable,
-            "codex_hook_trust_unavailable", format!("Current hook-trust probe unavailable: {error:#}"),
+        Err(error) => Check::new(CheckId::CODEX_HOOK_TRUST, Availability::Unavailable,
+            Reason::CODEX_HOOK_TRUST_UNAVAILABLE, format!("Current hook-trust probe unavailable: {error:#}"),
             "Inspect the installed Codex and workspace; this probe grants no session readiness or completion authority.")
             .evidence(json!({"source":"current_probe","error":format!("{error:#}")})),
     }

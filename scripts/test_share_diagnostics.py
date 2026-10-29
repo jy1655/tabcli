@@ -12,6 +12,28 @@ from unittest import mock
 import share_diagnostics as share
 
 
+class PublicVocabularyTests(unittest.TestCase):
+    def test_allowlists_match_public_vocabulary(self):
+        fixture = json.loads((Path(__file__).resolve().parents[1]
+                              / "tests/fixtures/public_vocabulary.json").read_text(encoding="utf-8"))
+        for actual, key in ((share.ATTENTION, "attention_flags"),
+                            (share.CHECK_IDS, "check_ids"), (share.REASONS, "reasons")):
+            with self.subTest(key=key):
+                self.assertEqual(actual, set(fixture[key]))
+                self.assertEqual(len(fixture[key]), len(set(fixture[key])))
+
+    def test_attention_catalog_matches_public_vocabulary(self):
+        import re
+        root = Path(__file__).resolve().parents[1]
+        fixture = json.loads((root / "tests/fixtures/public_vocabulary.json").read_text(encoding="utf-8"))
+        catalog = (root / "docs/cli.md").read_text(encoding="utf-8")
+        sentences = re.findall(r"Attention flags are ([^.]+)\.", catalog)
+        self.assertEqual(len(sentences), 1)
+        flags = re.findall(r"`([^`]+)`", sentences[0])
+        self.assertEqual(set(flags), set(fixture["attention_flags"]))
+        self.assertEqual(len(flags), len(set(flags)))
+
+
 CANARY = "PRIVATE_CANARY_9f731a"
 HOSTILE = CANARY + "\x1b[2J\r\n```\n[link](https://private.invalid)\u202e\u2066"
 

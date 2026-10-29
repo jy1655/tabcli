@@ -453,7 +453,7 @@ fn notify_payload_budget_counts_json_escaped_utf16_units() {
 fn notify_payload_budget_classifies_by_host_and_remaining_budget() {
     use super::{
         NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS, NOTIFY_COMMAND_LINE_LIMIT_UNITS,
-        classify_notify_payload_budget, notify_payload_budget,
+        notify_payload_budget,
     };
     use crate::native::diagnostics::Availability::{Available, Unavailable};
     assert_eq!(NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS, 4_096);
@@ -626,4 +626,12 @@ fn notify_payload_check_reads_the_pending_initial_prompt_and_reports_unknown_oth
     );
     assert!(evidence["prompt_chars"].as_u64().unwrap() > 10_000);
     assert!(evidence["answer_budget_units"].as_u64().unwrap() < 32_767 - 10_000);
+}
+
+fn classify_notify_payload_budget(
+    budget: &super::NotifyPayloadBudget,
+    windows: bool,
+) -> (crate::native::diagnostics::Availability, &'static str) {
+    let (availability, reason) = super::classify_notify_payload_budget(budget, windows);
+    (availability, reason.name())
 }

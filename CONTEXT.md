@@ -42,6 +42,11 @@ marker eligibility, and the next `result` address. The Observation decides each 
 (status, doctor, inspect, wait) maps a judgment to its own vocabulary and derives none of its own.
 _Avoid_: flag, check, attention, reason (renderer vocabularies)
 
+**Public vocabulary**:
+The fixed names through which public queries and self-test reports express observations and
+outcomes; a name conveys evidence, never permission to act.
+_Avoid_: schema, judgment, protocol
+
 **Store**:
 The read-write view of a session's records, held by a command that changes a session (ask,
 tell, hook, close, repair). A Store converges unfinished work before it is used.

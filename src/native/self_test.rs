@@ -60,14 +60,46 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
     Ok(NativeCommand::SelfTest(Request { ask, isolated }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Outcome {
     Passed,
     Failed,
     TimedOut,
     Unsupported,
     NotVerified,
+}
+
+pub(super) const OUTCOMES: &[&str] = &[
+    "passed",
+    "failed",
+    "timed_out",
+    "unsupported",
+    "not_verified",
+];
+pub(super) const STEPS: &[&str] = &[
+    "admission",
+    "ask",
+    "initial_result",
+    "tell",
+    "follow_up_result",
+    "cleanup",
+];
+pub(super) const SKIP_REASON: &str = "not run because a preceding step was not verified";
+
+impl Serialize for Outcome {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let index = match self {
+            Self::Passed => 0,
+            Self::Failed => 1,
+            Self::TimedOut => 2,
+            Self::Unsupported => 3,
+            Self::NotVerified => 4,
+        };
+        serializer.serialize_str(OUTCOMES[index])
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -432,7 +464,7 @@ fn orchestrate(
     }
     let start = Instant::now();
     let initial = operations.call(&args, ask.timeout.saturating_add(COMMAND_MARGIN));
-    let mut initial_step = step("ask", start, &initial);
+    let mut initial_step = step(STEPS[1], start, &initial);
     report.session = initial.value["session"].as_str().map(str::to_owned);
     let ownership = match report.session.as_deref() {
         Some(id) => require_valid_session_id(id).map(|()| Some(id.to_owned())),
@@ -472,7 +504,7 @@ fn orchestrate(
     report.steps.push(initial_step);
     let mut first_event = None;
     let mut current_request = initial.value["request_id"].as_str().map(str::to_owned);
-    for name in ["initial_result", "tell", "follow_up_result"] {
+    for &name in &STEPS[2..5] {
         if report.steps.last().unwrap().outcome != Outcome::Passed {
             report.steps.push(Step {
                 name,
@@ -480,13 +512,13 @@ fn orchestrate(
                 elapsed_ms: 0,
                 request_address: None,
                 event_address: None,
-                reason: Some("not run because a preceding step was not verified".to_owned()),
+                reason: Some(SKIP_REASON.to_owned()),
             });
             continue;
         }
         let session = report.session.as_deref().unwrap();
         let request_id = current_request.as_deref().unwrap();
-        let args = if name == "tell" {
+        let args = if name == STEPS[3] {
             arguments(&[
                 "tell",
                 session,
@@ -512,7 +544,7 @@ fn orchestrate(
         let start = Instant::now();
         let reply = operations.call(&args, ask.timeout.saturating_add(COMMAND_MARGIN));
         let mut current = step(name, start, &reply);
-        if name == "tell" {
+        if name == STEPS[3] {
             if current.outcome == Outcome::Passed
                 && (reply.value["session"] != session
                     || reply.value["request_id"].as_str().is_none()
@@ -546,7 +578,7 @@ fn orchestrate(
                     current.reason.as_deref().unwrap_or("waiting timed out")
                 ));
             }
-            if name == "initial_result" {
+            if name == STEPS[2] {
                 first_event = reply.value["event_id"].as_str().map(str::to_owned);
             }
         }
@@ -554,7 +586,7 @@ fn orchestrate(
     }
     let start = Instant::now();
     let mut cleanup = Step {
-        name: "cleanup",
+        name: STEPS[5],
         outcome: Outcome::Passed,
         elapsed_ms: 0,
         request_address: None,
@@ -595,7 +627,7 @@ fn orchestrate(
             ]),
             CLEANUP_BUDGET + COMMAND_MARGIN,
         );
-        let mut closed = step("cleanup", close_start, &reply);
+        let mut closed = step(STEPS[5], close_start, &reply);
         let observed =
             operations.call(&arguments(&["inspect", &session, "--json"]), CLEANUP_BUDGET);
         let state = observed.value["stored_state"].as_str().map(str::to_owned);
@@ -707,7 +739,7 @@ fn refused(
         outcome: Outcome::Failed,
         elapsed_ms,
         steps: vec![Step {
-            name: "admission",
+            name: STEPS[0],
             outcome: Outcome::Failed,
             elapsed_ms,
             request_address: None,
