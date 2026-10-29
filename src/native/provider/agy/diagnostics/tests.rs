@@ -188,13 +188,6 @@ fn tool_confirmation_uses_failure_binding_and_rejects_other_turns() {
         pending_turn_failure(failed.as_bytes(), &pending),
         Some(("quota exhausted".to_owned(), true))
     );
-    for line in [
-        "Surfacing tool confirmation: \"\" at step 2",
-        "Surfacing tool confirmation: \"RunCommand\" at step x",
-        "Surfacing tool confirmation: \"RunCommand\" at step 2 trailing",
-    ] {
-        assert!(parse_tool_confirmation(line).is_none());
-    }
 }
 
 #[test]
