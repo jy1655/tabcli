@@ -4,9 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 pub(in crate::native::terminal) struct BoundHostSpec {
-    pub(super) admission: Admission,
     pub(in crate::native::terminal) name: &'static str,
-    pub(in crate::native::terminal) metadata_context: Option<fn(&Path) -> String>,
 }
 
 pub(in crate::native::terminal) fn run_tty_bound_host<I>(
@@ -32,15 +30,6 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     })
 }
 
-/// Preserve the three host policies' check orders on purpose: changing their order
-/// would change which refusal is reported when multiple admission checks fail.
-#[derive(Clone, Copy)]
-pub(super) enum Admission {
-    MetadataFirst,
-    GhosttyFrame,
-    WarpPlan,
-}
-
 pub(super) fn run_bound_host<T>(
     directory: &Path,
     spec: &BoundHostSpec,
@@ -49,57 +38,31 @@ pub(super) fn run_bound_host<T>(
     run(admit(directory, spec)?)
 }
 
+/// One admission for every macOS host, in one order: an absolute path, a session-id file
+/// name, an existing path, a real directory (never a symlink), private to the current user.
+/// Decided 2026-10-30: the per-host orders and refusal texts this replaces changed which
+/// refusal a defective directory reported; the refusal vocabulary is now one template.
 fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
-    if matches!(spec.admission, Admission::WarpPlan) {
-        if !directory.is_absolute() {
-            bail!("Warp host session directory must be absolute");
-        }
-        let id = directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("Warp host session directory has no UTF-8 session id")?;
-        if !crate::native::session::primitives::valid_session_id(id) {
-            bail!("Warp host session directory has an invalid session id");
-        }
-        crate::native::session::Reader::open_unchecked(directory)
-            .validate_private_session_directory("Warp host session")?;
-        return Ok(id);
-    }
-    let early_id = if matches!(spec.admission, Admission::GhosttyFrame) {
-        let id = directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("invalid Ghostty launch directory")?;
-        crate::native::session::primitives::require_valid_session_id(id)?;
-        if !directory.is_absolute() {
-            bail!("Ghostty launch directory is not private to the current user");
-        }
-        Some(id)
-    } else {
-        None
-    };
-    let metadata = std::fs::symlink_metadata(directory);
-    let metadata = match spec.metadata_context {
-        Some(context) => metadata.with_context(|| context(directory))?,
-        None => metadata?,
-    };
-    if !directory.is_absolute()
-        || !metadata.is_dir()
-        || !owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() })
-    {
-        bail!(
-            "{} launch directory is not private to the current user",
-            spec.name
-        );
-    }
-    if let Some(id) = early_id {
-        return Ok(id);
+    let name = spec.name;
+    if !directory.is_absolute() {
+        bail!("{name} launch directory must be absolute");
     }
     let id = directory
         .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("invalid {} launch directory", spec.name))?;
+        .and_then(|file_name| file_name.to_str())
+        .with_context(|| format!("invalid {name} launch directory"))?;
     crate::native::session::primitives::require_valid_session_id(id)?;
+    let metadata = std::fs::symlink_metadata(directory)
+        .with_context(|| format!("no such {name} launch directory: {}", directory.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing non-directory {name} launch path: {}",
+            directory.display()
+        );
+    }
+    if !owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }) {
+        bail!("{name} launch directory is not private to the current user");
+    }
     Ok(id)
 }
 
@@ -166,27 +129,37 @@ mod tests {
             .unwrap();
         }
         for (name, run) in hosts() {
-            for missing in [
-                root.path().join("invalid-missing"),
-                relative_path.join("missing"),
-            ] {
-                let cause = fs::symlink_metadata(&missing).unwrap_err().to_string();
-                let expected = match name {
-                    "Terminal.app" => format!("failed to inspect {}: {cause}", missing.display()),
-                    "WezTerm" => {
-                        format!("no WezTerm launch directory {}: {cause}", missing.display())
-                    }
-                    _ => cause,
-                };
-                assert_eq!(format!("{:#}", run(&missing).unwrap_err()), expected);
-                assert!(!missing.exists());
-            }
-            for path in [relative_path.as_path(), &file, &link, &shared] {
+            let missing = root.path().join("session-missing");
+            let cause = fs::symlink_metadata(&missing).unwrap_err().to_string();
+            assert_eq!(
+                format!("{:#}", run(&missing).unwrap_err()),
+                format!(
+                    "no such {name} launch directory: {}: {cause}",
+                    missing.display()
+                )
+            );
+            assert!(!missing.exists());
+            for path in [relative_path.as_path(), &relative_path.join("missing")] {
                 assert_eq!(
                     format!("{:#}", run(path).unwrap_err()),
-                    format!("{name} launch directory is not private to the current user")
+                    format!("{name} launch directory must be absolute")
                 );
             }
+            for path in [&file, &link] {
+                assert_eq!(
+                    format!("{:#}", run(path).unwrap_err()),
+                    format!(
+                        "refusing non-directory {name} launch path: {}",
+                        path.display()
+                    )
+                );
+            }
+            // The session-id check precedes the privacy check: a shared directory with an
+            // invalid name is refused for its name.
+            assert_eq!(
+                format!("{:#}", run(&shared).unwrap_err()),
+                "invalid Agent Bridge session id: \"invalid-shared\""
+            );
             assert_eq!(
                 format!("{:#}", run(&invalid).unwrap_err()),
                 "invalid Agent Bridge session id: \"invalid-private\""
@@ -201,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_and_plan_host_refusal_table_preserves_order_and_warp_privacy() {
+    fn every_host_admits_in_one_order_with_one_refusal_vocabulary() {
         use std::cell::Cell;
         let root = tempfile::tempdir().unwrap();
         let private = root.path().join("session-private");
@@ -219,49 +192,36 @@ mod tests {
         std::os::unix::fs::symlink(&private, &link).unwrap();
         let missing = root.path().join("session-missing");
         let relative = Path::new("session-relative");
-        for (name, admission) in [
-            ("Ghostty", Admission::GhosttyFrame),
-            ("Warp", Admission::WarpPlan),
-        ] {
-            let spec = BoundHostSpec {
-                name,
-                admission,
-                metadata_context: None,
-            };
+        for name in ["Terminal.app", "iTerm2", "WezTerm", "Ghostty", "Warp"] {
+            let spec = BoundHostSpec { name };
             for path in [
                 &private, &shared, &invalid, &file, &link, &missing, relative,
             ] {
                 let called = Cell::new(false);
-                let result = run_bound_host(path, &spec, |_| {
+                let result = run_bound_host(path, &spec, |id| {
                     called.set(true);
+                    assert_eq!(id, "session-private");
                     Ok(())
                 });
                 let expected = if path == relative {
-                    Some(
-                        if name == "Warp" {
-                            "Warp host session directory must be absolute"
-                        } else {
-                            "Ghostty launch directory is not private to the current user"
-                        }
-                        .to_string(),
-                    )
+                    Some(format!("{name} launch directory must be absolute"))
                 } else if path == invalid {
-                    Some(if name == "Warp" {
-                        "Warp host session directory has an invalid session id".to_string()
-                    } else {
-                        "invalid Agent Bridge session id: \"invalid-shared\"".to_string()
-                    })
-                } else if name == "Warp" {
-                    // The plan host must use the very same privacy reader, including
-                    // symlink, non-directory, ownership/mode and metadata diagnostics.
-                    crate::native::session::Reader::open_unchecked(path)
-                        .validate_private_session_directory("Warp host session")
-                        .err()
-                        .map(|error| format!("{error:#}"))
+                    Some("invalid Agent Bridge session id: \"invalid-shared\"".to_string())
                 } else if path == missing {
-                    Some(fs::symlink_metadata(path).unwrap_err().to_string())
-                } else if path != private {
-                    Some("Ghostty launch directory is not private to the current user".to_string())
+                    Some(format!(
+                        "no such {name} launch directory: {}: {}",
+                        path.display(),
+                        fs::symlink_metadata(path).unwrap_err()
+                    ))
+                } else if path == file || path == link {
+                    Some(format!(
+                        "refusing non-directory {name} launch path: {}",
+                        path.display()
+                    ))
+                } else if path == shared {
+                    Some(format!(
+                        "{name} launch directory is not private to the current user"
+                    ))
                 } else {
                     None
                 };

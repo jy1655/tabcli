@@ -1818,11 +1818,7 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
     validate_attempt_token(attempt)?;
     super::bound_host::run_bound_host(
         directory,
-        &super::bound_host::BoundHostSpec {
-            name: "Warp",
-            metadata_context: None,
-            admission: super::bound_host::Admission::WarpPlan,
-        },
+        &super::bound_host::BoundHostSpec { name: "Warp" },
         |_| {
             let plan: HostPlan = RecordReader::at(
                 Reader::open_unchecked(directory)

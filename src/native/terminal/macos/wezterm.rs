@@ -993,13 +993,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_tty_bound_host};
     run_tty_bound_host(
         directory,
-        &BoundHostSpec {
-            admission: super::bound_host::Admission::MetadataFirst,
-            name: BINDING.host,
-            metadata_context: Some(|directory| {
-                format!("no WezTerm launch directory {}", directory.display())
-            }),
-        },
+        &BoundHostSpec { name: BINDING.host },
         || {
             let pane =
                 env::var("WEZTERM_PANE").context("WezTerm did not name the pane of this host")?;
