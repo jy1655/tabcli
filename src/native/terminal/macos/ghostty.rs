@@ -708,28 +708,48 @@ fn close_with_runner(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    crate::native::session::close::budget::close_remaining(deadline)?;
-    let (tab, window) = ownership_proof(session)?;
-    let before = snapshot(runner, deadline)?;
-    crate::native::session::close::budget::close_remaining(deadline)?;
-    if !present(&before, session)? {
-        return Ok(CloseOutcome::Missing);
-    }
-    // Exactly one native close. A failed reply can still have closed the terminal.
-    crate::native::session::close::budget::close_remaining(deadline)?;
-    let answer = runner.run(CLOSE_TAB_SCRIPT, &[&session.id, tab, window], deadline);
-    for attempt in 0..DISCOVERY_ATTEMPTS {
-        crate::native::session::close::budget::close_remaining(deadline)?;
-        let after = snapshot(runner, deadline)?;
-        crate::native::session::close::budget::close_remaining(deadline)?;
-        if !present(&after, session)? {
-            return Ok(CloseOutcome::Closed);
-        }
-        if attempt + 1 < DISCOVERY_ATTEMPTS {
+    use super::close_transaction::{self, InspectionError, Policy};
+    use std::ops::ControlFlow::{Break, Continue};
+    close_transaction::run(
+        runner,
+        Policy {
+            check: &|| close_remaining(deadline).map(|_| ()),
+            inspection_error: InspectionError::Fatal,
+        },
+        |runner, check| {
+            let (tab, window) = ownership_proof(session)?;
+            let before = snapshot(runner, deadline)?;
+            check()?;
+            if !present(&before, session)? {
+                return Ok(Break(CloseOutcome::Missing));
+            }
+            // Exactly one native close. A failed reply can still have closed the terminal.
+            check()?;
+            let answer = runner.run(CLOSE_TAB_SCRIPT, &[&session.id, tab, window], deadline);
+            Ok(Continue((answer, 0)))
+        },
+        |runner, _, check| {
+            let after = snapshot(runner, deadline)?;
+            check()?;
+            present(&after, session)
+        },
+        |_, (answer, _), present, _| {
+            if !present {
+                return Ok(Break(CloseOutcome::Closed));
+            }
+            Ok(Continue(anyhow!(
+                "Ghostty owned surface remains; handle retained; close response={answer:?}"
+            )))
+        },
+        |runner, (_, attempts)| {
+            *attempts += 1;
+            if *attempts >= DISCOVERY_ATTEMPTS {
+                return Ok(false);
+            }
             runner.pause(deadline)?;
-        }
-    }
-    bail!("Ghostty owned surface remains; handle retained; close response={answer:?}")
+            Ok(true)
+        },
+    )
 }
 
 // The runner uses `&mut self` and the adapter `&self`. The lock is taken for one

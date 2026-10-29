@@ -291,10 +291,11 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
 // The typed start precedes tty discovery; wait for restored focus and the exact tty binding.
 // A failed, closed or timed-out launch must start nothing.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    use super::bound_host::{BoundHostSpec, run_bound_host};
-    run_bound_host(
+    use super::bound_host::{BoundHostSpec, run_tty_bound_host};
+    run_tty_bound_host(
         directory,
         &BoundHostSpec {
+            admission: super::bound_host::Admission::MetadataFirst,
             name: BINDING.host,
             metadata_context: Some(|directory| {
                 format!("failed to inspect {}", directory.display())
@@ -324,13 +325,18 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 fn wait_for_binding(directory: &Path, id: &str, tty: &str, clock: &mut dyn Clock) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    if surface.kind != TerminalKind::AppleTerminal
-        || surface.id != tty
-        || surface.window_id.as_deref().is_none_or(str::is_empty)
-    {
-        bail!("Terminal.app surface binding does not name the tty of this launch host");
-    }
-    Ok(())
+    super::bound_host::binding_names_host(
+        &surface,
+        TerminalKind::AppleTerminal,
+        |surface| {
+            surface.id == tty
+                && surface
+                    .window_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+        },
+        "Terminal.app surface binding does not name the tty of this launch host",
+    )
 }
 
 fn send_file(

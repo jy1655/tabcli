@@ -370,10 +370,11 @@ fn iterm_argument(value: &str) -> String {
 // Wait for restored selection and the exact returned UUID in the receipt and surface binding.
 // Failure or timeout never falls back to typed shell input.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    use super::bound_host::{BoundHostSpec, run_bound_host};
-    run_bound_host(
+    use super::bound_host::{BoundHostSpec, run_tty_bound_host};
+    run_tty_bound_host(
         directory,
         &BoundHostSpec {
+            admission: super::bound_host::Admission::MetadataFirst,
             name: BINDING.host,
             metadata_context: None,
         },
@@ -400,10 +401,12 @@ fn wait_for_binding(
 ) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
-        bail!("iTerm2 surface binding does not match this launch host");
-    }
-    Ok(())
+    super::bound_host::binding_names_host(
+        &surface,
+        TerminalKind::Iterm2,
+        |surface| surface.id == iterm_id,
+        "iTerm2 surface binding does not match this launch host",
+    )
 }
 
 fn send_file(
