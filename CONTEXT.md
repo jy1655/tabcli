@@ -115,6 +115,12 @@ The provider-chosen way to deliver an initial prompt or follow-up, including the
 needed before input and whether a failed attempt is known not sent or uncertain.
 _Avoid_: delivery (the act), channel, shared fallback
 
+**Startup readiness**:
+A provider adapter's record that its session-local extension reached its startup hook for a
+Claim, and which turn capabilities that extension offers (cancel, input acknowledgement).
+It is evidence for one session, carried to later Claims, and never inferred from a version.
+_Avoid_: capability flag, handshake, version check
+
 **Initial prompt**:
 The first turn's prompt, delivered as part of launching the session.
 

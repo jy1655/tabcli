@@ -555,7 +555,9 @@ acceptance.
 `cancel` supports sessions whose installed extension has reported schema 2 in
 `pi-startup-ready.json`. Bridge carries that capability evidence to each new Claim when
 installing its pending turn; the receipt must identify the current Claim. Schema 1,
-missing, or unreadable readiness is unsupported: start a new session.
+missing, or unreadable readiness is unsupported: start a new session. The readiness
+record is read within a 4 KiB bound and must carry a valid Pi session id; a record that
+fails either is unreadable, which refuses Windows input and leaves `cancel` unsupported.
 
 The extension uses Pi's official `ctx.abort()` API through an adapter-local fallback:
 every 200 ms during a run it reads Bridge's `cancel.json`, checks the active Claim and

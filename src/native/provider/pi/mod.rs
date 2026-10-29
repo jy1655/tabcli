@@ -3,6 +3,7 @@ mod hook;
 mod input;
 mod monitor;
 mod startup;
+mod startup_ready;
 #[cfg(test)]
 mod test_support;
 mod usage;
@@ -25,6 +26,7 @@ use hook::{pi_owned_string, pi_string, record_correlated_failure};
 use monitor::PiFailureMonitor;
 use serde::{Deserialize, Serialize};
 use startup::send_initial_prompt;
+use startup_ready::StartupReadiness;
 use std::{cell::RefCell, ffi::OsString, path::Path, time::Duration};
 use usage::reported_usage;
 
@@ -37,17 +39,6 @@ const PI_PROVIDER_CREDENTIALS: &str = "pi_provider_credentials";
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
 
 const CANCEL_ACCEPTED_FILE: &str = "pi-cancel-accepted.json";
-
-const STARTUP_READY_FILE: &str = "pi-startup-ready.json";
-
-#[derive(Deserialize, Serialize)]
-struct StartupReady {
-    schema: u32,
-    claim_token: String,
-    session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    input_ack_schema: Option<u32>,
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingPiTurn {
@@ -249,13 +240,11 @@ impl NativeProviderAdapter for PiAdapter {
 
     fn cancel_support(&self, directory: &Path) -> Result<super::CancelSupport> {
         let reader = Reader::open_unchecked(directory);
-        let ready = reader
-            .private(STARTUP_READY_FILE)
-            .optional_json::<StartupReady>();
-        if let Ok(Some(ready)) = ready
-            && ready.schema == 2
-            && !ready.session_id.trim().is_empty()
-            && turn::current_claim_token(&reader)?.as_deref() == Some(&ready.claim_token)
+        // A legacy record is unsupported before the Claim is read, as before this module.
+        if let StartupReadiness::Present(ready) = startup_ready::read(&reader)
+            && ready.offers_cancel()
+            && turn::current_claim_token(&reader)?
+                .is_some_and(|claim| ready.supports_cancel_for(&claim))
         {
             return Ok(super::CancelSupport::Supported);
         }
@@ -522,22 +511,7 @@ fn install_pending_turn_bound(
     // Startup proves the installed extension's capability for the whole session.
     // Carry that evidence to a follow-up claim before delivery, including after a
     // rolled-back delivery; never upgrade a legacy extension's schema.
-    let ready = store
-        .private(STARTUP_READY_FILE)
-        .timeline(4096)
-        .and_then(|bytes| {
-            bytes
-                .map(|bytes| serde_json::from_slice::<StartupReady>(&bytes).map_err(Into::into))
-                .transpose()
-        });
-    if let Ok(Some(mut ready)) = ready
-        && ready.schema == 2
-        && validate_claim_token(&ready.claim_token).is_ok()
-        && !ready.session_id.trim().is_empty()
-    {
-        ready.claim_token = claim_token.to_owned();
-        store.private(STARTUP_READY_FILE).write_json(&ready)?;
-    }
+    startup_ready::carry_forward(&store, claim_token)?;
     store.private(PENDING_TURN_FILE).write_json(&pending)?;
     Ok(pending)
 }
