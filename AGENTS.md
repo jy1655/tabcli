@@ -267,6 +267,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   strip the startup input capability. Replace this fallback when Pi exposes addressed
   interactive input with per-turn acceptance identity.
 
+- A Pi pending turn is installed (the launch plan while the session is Launching, and a
+  follow-up before delivery) only for the current Claim of a session that has no close
+  tombstone and whose stored state is not ended; the rollback cancel removes the exact
+  Claim's pending record in any state. Decided 2026-10-30 after the Claim-currency guard
+  (#324) made the token-only installation visible.
 - Pi v1.0.4 exposes `ctx.abort()` to an interactive extension, but no verified official
   endpoint addresses that running interactive session from outside. Cancel therefore
   reaches the official API through a Pi-owned record and polling fallback. Replace the

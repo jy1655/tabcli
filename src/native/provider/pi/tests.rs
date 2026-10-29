@@ -656,6 +656,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         turn::claim(&Store::open_unchecked(&directory), &[])
                             .unwrap()
                             .retain();
+                        super::test_support::launching_status(&directory);
                         // The authorized rows use the adapter's gate seam with a
                         // positive answer and the real applied record; the absent rows
                         // use the production gate, which has no consent record to read.
@@ -770,6 +771,7 @@ fn launch_plan_watcher_starts_the_hook_failure_monitor_only_when_started() {
     turn::claim(&Store::open_unchecked(&directory), &[])
         .unwrap()
         .retain();
+    super::test_support::launching_status(&directory);
     let signal = directory.join(HOOK_FAILURE_FILE);
     fs::write(
         &signal,
@@ -1101,23 +1103,77 @@ fn hook_payload_usage_is_validated_without_changing_the_outcome() {
 }
 
 #[test]
-fn pending_install_and_cancel_keep_token_only_currency() {
+fn pending_install_requires_a_live_session_and_cancel_is_unconditional() {
+    use crate::native::session::CoreRecord;
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());
     let first = claim_pending_turn(directory.path());
-    let next = "999-999-999";
-    fs::write(
-        store
-            .record(crate::native::session::CoreRecord::TurnClaim)
-            .path(),
-        next.as_bytes(),
-    )
-    .unwrap();
-    let error = install_pending_turn(directory.path(), &first.claim_token).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Pi pending turn no longer holds the session claim"
-    );
+    let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
+    let closed_path = store.record(CoreRecord::Closed).path().to_owned();
+    // Both installation paths: the launch plan (plain) and the delivery (bound).
+    type Install = fn(&Path, &str) -> Result<PendingPiTurn>;
+    let installs: [(&str, Install); 2] = [
+        ("launch plan", |directory, token| {
+            install_pending_turn(directory, token)
+        }),
+        ("delivery", |directory, token| {
+            install_pending_turn_bound(directory, token, None)
+        }),
+    ];
+    for (label, install) in installs {
+        for state in [
+            SessionState::Launching,
+            SessionState::Running,
+            SessionState::AwaitingInitialInput,
+            SessionState::Ready,
+            SessionState::Claimed,
+            SessionState::Working,
+            SessionState::ResumePending,
+        ] {
+            super::test_support::stored_state(directory.path(), &state);
+            install(directory.path(), &first.claim_token)
+                .unwrap_or_else(|error| panic!("{label} {state:?}: {error:#}"));
+        }
+        for state in [
+            SessionState::Exited,
+            SessionState::Failed,
+            SessionState::Closed,
+        ] {
+            super::test_support::stored_state(directory.path(), &state);
+            assert_eq!(
+                install(directory.path(), &first.claim_token)
+                    .unwrap_err()
+                    .to_string(),
+                "Pi session ended; no pending turn installed",
+                "{label} {state:?}"
+            );
+        }
+        super::test_support::stored_state(directory.path(), &SessionState::Working);
+        fs::write(
+            &closed_path,
+            b"{\"state\":\"closed\",\"updated_unix_ms\":1}",
+        )
+        .unwrap();
+        assert_eq!(
+            install(directory.path(), &first.claim_token)
+                .unwrap_err()
+                .to_string(),
+            "Pi session ended; no pending turn installed",
+            "{label} tombstone"
+        );
+        fs::remove_file(&closed_path).unwrap();
+        fs::write(&claim_path, b"999-999-999").unwrap();
+        assert_eq!(
+            install(directory.path(), &first.claim_token)
+                .unwrap_err()
+                .to_string(),
+            "Pi pending turn no longer holds the session claim",
+            "{label} replaced claim"
+        );
+        fs::write(&claim_path, first.claim_token.as_bytes()).unwrap();
+    }
+    // A replaced claim leaves the previous owner's pending record alone.
+    fs::write(&claim_path, b"999-999-999").unwrap();
     cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
     assert_eq!(
         read_pending_turn(directory.path())
@@ -1126,22 +1182,10 @@ fn pending_install_and_cancel_keep_token_only_currency() {
             .claim_token,
         first.claim_token
     );
-    // Token-only policy must not inspect state or a tombstone.
-    fs::write(
-        store
-            .record(crate::native::session::CoreRecord::Status)
-            .path(),
-        b"unreadable",
-    )
-    .unwrap();
-    fs::write(
-        store
-            .record(crate::native::session::CoreRecord::Closed)
-            .path(),
-        b"unreadable",
-    )
-    .unwrap();
-    install_pending_turn(directory.path(), next).unwrap();
-    cancel_pending_turn(directory.path(), next).unwrap();
+    // Cancel is cleanup: it checks the token only and tolerates unreadable state records.
+    fs::write(&claim_path, first.claim_token.as_bytes()).unwrap();
+    fs::write(store.record(CoreRecord::Status).path(), b"unreadable").unwrap();
+    fs::write(&closed_path, b"unreadable").unwrap();
+    cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
     assert!(read_pending_turn(directory.path()).unwrap().is_none());
 }

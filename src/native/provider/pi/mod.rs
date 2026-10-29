@@ -516,10 +516,14 @@ fn install_pending_turn_bound(
     let mut pending = PendingPiTurn::new(claim_token)?;
     pending.windows_input = windows_input;
     let store = Store::open_unchecked(directory);
+    // Both installations (the launch plan while the session is Launching, and a
+    // follow-up before delivery) require the current Claim of a session that has no
+    // close tombstone and whose stored state is not ended; the rollback cancel below
+    // checks the token only, because cleanup must run in any state.
     let result = (turn::ClaimCurrency {
         expected: Some(claim_token),
-        state: turn::ClaimState::Any,
-        tombstone: turn::ClaimTombstone::Ignored,
+        state: turn::ClaimState::NotEnded,
+        tombstone: turn::ClaimTombstone::Refused,
         expires: None,
     })
     .run(&store, || {
@@ -533,7 +537,10 @@ fn install_pending_turn_bound(
     })?;
     match result {
         Ok(pending) => Ok(pending),
-        Err(_) => bail!("Pi pending turn no longer holds the session claim"),
+        Err(turn::StaleClaim::Changed) => {
+            bail!("Pi pending turn no longer holds the session claim")
+        }
+        Err(_) => bail!("Pi session ended; no pending turn installed"),
     }
 }
 
