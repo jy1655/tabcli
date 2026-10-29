@@ -693,4 +693,5 @@ fn peer_quoting_preserves_the_whole_body_and_existing_literal_backslashes() {
 #[path = "continuation_tests.rs"]
 mod continuation_tests;
 
+mod doctor_tests;
 mod question_tests;

@@ -319,6 +319,9 @@ waits for that module to report readiness before sending the initial prompt. Dis
 (`disableAllHooks: true`, observed on Windows and macOS), unresolved plugin trust or provider policy can withhold
 readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
 The version floor establishes launch eligibility, not proof that the module ran.
+`tabcli doctor <session>` reports the recorded completion mode and readiness as
+`claude_completion` and the module's latest rejection as `claude_completion_diagnostic`;
+see [doctor](cli.md#doctor). Those rows read the session's records and nothing else.
 
 On both platforms, Bridge delivers the initial prompt after launch through Claude's official
 cross-session messaging. The prompt is absent from argv. Every follow-up uses that messaging path too:
@@ -401,7 +404,8 @@ repair records or publish results. Inspect the terminal before closing or diagno
 An official interrupted, API-error, refused or empty final outcome fails the bound request.
 Failure does not prove that no work or tools ran. Malformed or unmatched signals retain the
 claim and write the latest rejection reason to `claude-mod-diagnostic.json` in the session
-directory. A message delivered into an unrelated running turn without its own exact start
+directory. That record keeps only an event name and a reason, so it does not identify the request
+it rejected or when; `doctor` shows it as untrusted text and never attributes it to a request. A message delivered into an unrelated running turn without its own exact start
 cannot be correlated. Combined queued input that differs from the exact addressed frame also
 stays unbound. A retained claim prevents another tell; inspect the result and terminal, then
 close it if you abandon it. On macOS, start a fresh `ask` with the needed context; native Windows

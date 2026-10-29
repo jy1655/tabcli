@@ -936,6 +936,47 @@ installed before this version has lost its initial prompt record. If the request
 while the session is working after a long turn, read the answer from Codex's rollout record and
 close the session; never resend. Otherwise keep prompts and requested answers short on Windows.
 
+For Claude, `checks` includes `claude_completion` and `claude_completion_diagnostic` after
+`claude_messaging`. They read only this session's completion records, each with its own bounded
+read (16 KiB) and without the session lock, so they are not one snapshot. They repair nothing,
+start no helper, read no provider policy or settings, and send nothing. `evidence.source` is
+`session_records`; with `doctor --provider claude` it is `no_session_scope`, every field is
+`observation: not_read`, and both rows are `unknown` / `session_required`. Each field reports
+its `file` and an `observation`: `observed`, `not_observed`, `unrecognized` (a schema, revision or
+mode that this binary does not know; the known numbers and `expected_schema` or
+`expected_revision` are shown), `malformed` (with `fault`: `invalid_json`, `truncated_json`,
+`schema_mismatch` or `invalid_conversation`), or `unreadable` (oversized, not a regular file,
+changing or invalid UTF-8, with `reason` and `limit_bytes`). Record text is sanitized and cut
+to 1,024 characters (64 for an unknown mode name).
+
+`claude_completion` carries `mode` and `readiness`. An observed mode has `mode`, `reason` and
+`claude_version_at_launch`; observed readiness has `revision` and `session_start_conversation`,
+the conversation of the latest recorded `session.start`, which `/clear` can change without a new
+record. Known rejected records explain a refusal, while valid historical readiness remains
+`unknown`. Delivery admission reads its own records and gates for every delivery:
+
+- `unknown` / `claude_completion_readiness_recorded`: native_v1 mode and valid readiness.
+  This does not prove that the module is still loaded, that messaging works, or that a request
+  will complete.
+- `unknown` / `claude_completion_readiness_not_observed`: native_v1 mode without a readiness
+  record. The recorded version and settings do not prove that the module ran.
+- `unavailable` / `claude_completion_mode_absent`: no mode record, the pre-upgrade legacy state.
+  `unavailable` / `claude_completion_legacy_stop`: an explicit `legacy_stop` mode. New tells are
+  refused in both.
+- `unavailable` / `claude_completion_mode_unrecognized`, `claude_completion_mode_malformed`,
+  `claude_completion_readiness_unrecognized` or `claude_completion_readiness_malformed`: a record
+  that this binary refuses.
+- `unknown` / `claude_completion_mode_unreadable` or `claude_completion_readiness_unreadable`:
+  doctor's bound refused the read, so the state is not known from it.
+
+`claude_completion_diagnostic` is always `unknown`: the latest rejection never decides
+availability. `claude_completion_diagnostic_recorded` shows its `event`, `reason` and `truncated`.
+The record has no request id and no time, so it cannot identify which request was rejected
+or show that the rejection is recent. `claude_completion_diagnostic_not_recorded`
+does not show that nothing was rejected. The other reasons are
+`claude_completion_diagnostic_unrecognized`, `_malformed` and `_unreadable`, whose text is not
+shown. Neither row shows a retained unmarked candidate; use [inspect](#inspect) for it.
+
 For Pi, `checks` includes `pi_provider_credentials`. With a session's explicit
 `provider/model` and `--probe`, Pi's local, non-refreshing auth check reports
 `evidence.status` as `ready`, `not_ready`, or `unknown`, alongside `provider`, `authType`,
@@ -1727,6 +1768,10 @@ No command stdout, stderr, or arbitrary error text is copied into that evidence.
 
 The session `cancel` check has reason `cancel_absent`, `cancel_recorded`, or
 `cancel_unreadable`; recorded intent does not confirm interruption.
+
+The Claude `claude_completion` and `claude_completion_diagnostic` checks carry
+`evidence.source` and, respectively, `mode` and `readiness` or `latest_diagnostic`; each field has
+`observation` and, when a session was read, `file`. See [doctor](#doctor) for their reasons.
 
 The session `origin` check has reason `origin_external`, `origin_live`, `origin_ended`,
 `origin_ended_session_closed`, or `origin_unverified`. Its `evidence` holds `origin` and
