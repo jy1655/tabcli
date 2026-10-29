@@ -160,19 +160,6 @@ fn parse_options(args: &[String]) -> Result<WaitRequest> {
     })
 }
 
-impl RequestState {
-    fn ends_wait(self) -> bool {
-        matches!(
-            self,
-            Self::Completed
-                | Self::Cancelled
-                | Self::Failed
-                | Self::Unresolved
-                | Self::RecoveryRequired
-        )
-    }
-}
-
 /// Completed observations precede owner checks and therefore have no owner fields.
 fn observe(
     snapshot: &Snapshot,
@@ -181,8 +168,8 @@ fn observe(
     session: &str,
     questions: bool,
     after: Option<&str>,
-) -> Result<(Value, Option<WakeReason>)> {
-    observe_with_owner(
+) -> Result<(Value, RequestState, Option<WakeReason>)> {
+    observe_with_owner_state(
         snapshot,
         reader,
         selector,
@@ -195,7 +182,7 @@ fn observe(
 
 /// Each poll judges the Owner record afresh. Only a verified-gone owner ends the wait:
 /// a changed control identity, an Unknown attestation and a foreign record keep it (B2).
-fn observe_with_owner(
+fn observe_with_owner_state(
     snapshot: &Snapshot,
     reader: &Reader,
     selector: &Selector,
@@ -203,7 +190,7 @@ fn observe_with_owner(
     observers: &judgment::Observers<'_>,
     questions: bool,
     after: Option<&str>,
-) -> Result<(Value, Option<WakeReason>)> {
+) -> Result<(Value, RequestState, Option<WakeReason>)> {
     let mut observation = snapshot.observe_result(reader, selector)?;
     let mut owner = None;
     if !observation.state().ends_wait() {
@@ -253,12 +240,12 @@ fn observe_with_owner(
             }
         }
     }
-    Ok((value, reason))
+    Ok((value, observation.state(), reason))
 }
 
 struct Outcome {
     selected: Option<(usize, WakeReason)>,
-    last: Vec<Value>,
+    last: Vec<(Value, RequestState)>,
 }
 
 struct SessionGroup {
@@ -298,12 +285,12 @@ fn poll(
         .collect();
     let mut outcome = Outcome {
         selected: None,
-        last: addresses.iter().map(|address| envelope::ok(json!({
+        last: addresses.iter().map(|address| (envelope::ok(json!({
             "session": address.session,
-            "request_id": address.request, "request_state": "busy", "result": null,
+            "request_id": address.request, "request_state": RequestState::Busy, "result": null,
             "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result",
             "usage": null, "usage_reason": "no_published_result", "usage_error": null
-        }).as_object().unwrap().clone())).collect(),
+        }).as_object().unwrap().clone()), RequestState::Busy)).collect(),
     };
     loop {
         for group in &groups {
@@ -318,7 +305,7 @@ fn poll(
                     .iter()
                     .find(|cursor| cursor.address == addresses[index])
                     .map(|cursor| cursor.id.as_str());
-                let (value, reason) = observe(
+                let (value, state, reason) = observe(
                     &snapshot,
                     &reader,
                     &selectors[index],
@@ -326,7 +313,7 @@ fn poll(
                     questions,
                     after,
                 )?;
-                outcome.last[index] = value;
+                outcome.last[index] = (value, state);
                 if let Some(reason) = reason
                     && outcome
                         .selected
@@ -350,22 +337,22 @@ fn poll(
 }
 
 /// The legacy result caller retains its timeout envelope and last good observation.
-pub(in crate::native) fn one(
+pub(super) fn one_state(
     root: &Path,
     session: &str,
     request: &str,
     timeout: Duration,
-) -> Result<Value> {
-    one_with(root, session, request, timeout, &mut SystemClock)
+) -> Result<(Value, RequestState)> {
+    one_with_state(root, session, request, timeout, &mut SystemClock)
 }
 
-fn one_with(
+fn one_with_state(
     root: &Path,
     session: &str,
     request: &str,
     timeout: Duration,
     clock: &mut impl Clock,
-) -> Result<Value> {
+) -> Result<(Value, RequestState)> {
     let outcome = poll(
         root,
         &[Address {
@@ -377,7 +364,7 @@ fn one_with(
         &[],
         clock,
     )?;
-    let mut last = outcome.last.into_iter().next().unwrap();
+    let (mut last, state) = outcome.last.into_iter().next().unwrap();
     if outcome.selected.is_none() {
         last["ok"] = json!(false);
         last["timed_out"] = json!(true);
@@ -385,10 +372,14 @@ fn one_with(
         // This wait observed its own deadline; the request and its records are unchanged.
         last["failure_kind"] = json!(FailureKind::TimedOut.as_str());
     }
-    Ok(last)
+    Ok((last, state))
 }
 
-fn value_in(root: &Path, request: &WaitRequest, clock: &mut impl Clock) -> Result<Value> {
+fn value_with_state_in(
+    root: &Path,
+    request: &WaitRequest,
+    clock: &mut impl Clock,
+) -> Result<(Value, Option<(RequestState, WakeReason)>)> {
     let outcome = poll(
         root,
         &request.addresses,
@@ -405,38 +396,89 @@ fn value_in(root: &Path, request: &WaitRequest, clock: &mut impl Clock) -> Resul
         .map(|(_, address)| address.text())
         .collect();
     let Some((index, reason)) = outcome.selected else {
-        return Ok(envelope::error(
-            &anyhow::anyhow!("waiting timed out; no request was cancelled or resent"),
-            json!({"ended": null,
-            "remaining": remaining, "timed_out": true,
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
+        return Ok((
+            envelope::error(
+                &anyhow::anyhow!("waiting timed out; no request was cancelled or resent"),
+                json!({"ended": null,
+                "remaining": remaining, "timed_out": true,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            None,
         ));
     };
-    let mut ended = outcome.last.into_iter().nth(index).unwrap();
+    let (mut ended, state) = outcome.last.into_iter().nth(index).unwrap();
     ended["address"] = json!(request.addresses[index].text());
     if reason == WakeReason::QuestionEmitted {
-        return Ok(envelope::ok(
-            json!({
-                "ended": null, "question": ended, "remaining": remaining, "timed_out": false,
-            })
+        return Ok((
+            envelope::ok(
+                json!({
+                    "ended": null, "question": ended, "remaining": remaining, "timed_out": false,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            Some((state, reason)),
+        ));
+    }
+    if !state.is_success() {
+        correct_unsuccessful_result(&mut ended, state);
+    }
+    Ok((
+        envelope::ok(
+            json!({"ok": ended["ok"], "ended": ended,
+        "remaining": remaining, "timed_out": false})
             .as_object()
             .unwrap()
             .clone(),
-        ));
-    }
-    if ended["request_state"] != "completed" {
-        correct_unsuccessful_result(&mut ended);
-    }
-    Ok(envelope::ok(
-        json!({"ok": ended["ok"], "ended": ended,
-        "remaining": remaining, "timed_out": false})
-        .as_object()
-        .unwrap()
-        .clone(),
+        ),
+        Some((state, reason)),
     ))
+}
+
+#[cfg(test)]
+fn observe_with_owner(
+    snapshot: &Snapshot,
+    reader: &Reader,
+    selector: &Selector,
+    session: &str,
+    observers: &judgment::Observers<'_>,
+    questions: bool,
+    after: Option<&str>,
+) -> Result<(Value, Option<WakeReason>)> {
+    observe_with_owner_state(
+        snapshot, reader, selector, session, observers, questions, after,
+    )
+    .map(|(value, _, reason)| (value, reason))
+}
+
+#[cfg(test)]
+pub(in crate::native) fn one(
+    root: &Path,
+    session: &str,
+    request: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    one_state(root, session, request, timeout).map(|(value, _)| value)
+}
+
+#[cfg(test)]
+fn one_with(
+    root: &Path,
+    session: &str,
+    request: &str,
+    timeout: Duration,
+    clock: &mut impl Clock,
+) -> Result<Value> {
+    one_with_state(root, session, request, timeout, clock).map(|(value, _)| value)
+}
+
+#[cfg(test)]
+fn value_in(root: &Path, request: &WaitRequest, clock: &mut impl Clock) -> Result<Value> {
+    value_with_state_in(root, request, clock).map(|(value, _)| value)
 }
 
 #[cfg(test)]
@@ -451,16 +493,17 @@ pub(in crate::native) fn test_value_in(
 }
 
 pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
-    let value =
-        match Reader::state_root().and_then(|root| value_in(&root, &request, &mut SystemClock)) {
-            Ok(value) => value,
-            Err(error) => {
-                if request.json {
-                    envelope::print(&error_value(&error))?;
-                }
-                return Err(error);
+    let (value, state) = match Reader::state_root()
+        .and_then(|root| value_with_state_in(&root, &request, &mut SystemClock))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            if request.json {
+                envelope::print(&error_value(&error))?;
             }
-        };
+            return Err(error);
+        }
+    };
     envelope::emit(request.json, &value, || {
         if !value["ended"].is_null() {
             print_result(&value["ended"], false)?;
@@ -487,7 +530,8 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
         );
         Ok(())
     })?;
-    if value["ok"] != true {
+    if state.is_none_or(|(state, reason)| reason == WakeReason::RequestEnded && !state.is_success())
+    {
         bail!(
             "{}",
             value["error"]
@@ -726,21 +770,6 @@ mod tests {
         assert_eq!(ended, Some(WakeReason::RequestEnded));
         assert_eq!(value["request_state"], "completed");
         assert!(value.get("owner").is_none());
-    }
-
-    #[test]
-    fn only_recorded_wait_end_states_end_a_wait() {
-        for state in [
-            RequestState::Completed,
-            RequestState::Failed,
-            RequestState::Unresolved,
-            RequestState::RecoveryRequired,
-        ] {
-            assert!(state.ends_wait());
-        }
-        for state in [RequestState::Pending, RequestState::Unavailable] {
-            assert!(!state.ends_wait());
-        }
     }
 
     #[test]

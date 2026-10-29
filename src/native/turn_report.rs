@@ -1,6 +1,7 @@
 //! Lifecycle output for ask, tell and reopen: accepted, completed and failed,
 //! with or without a request address.
 
+use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
 use crate::native::{envelope, query};
 use agent_bridge::PUBLIC_COMMAND;
@@ -71,7 +72,7 @@ pub(super) fn finish_request_with_extra(
                 .unwrap_or_else(|_| {
                     serde_json::json!({
                         "session": session, "request_id": request_id,
-                        "request_state": "unknown", "result": null
+                        "request_state": RequestState::Unknown, "result": null
                     })
                 });
             let fields = value.as_object_mut().unwrap();
