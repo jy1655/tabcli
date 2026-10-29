@@ -146,14 +146,14 @@ impl ClaudeTurn {
 
 pub(super) fn require_current(reader: &Reader, token: &str) -> Result<()> {
     if !session_turn::valid_turn_claim_token(token)
-        || session_turn::current_claim_token(reader)?.as_deref() != Some(token)
-        || reader.closed_if_present()?.is_some()
-        || !matches!(
-            reader.status()?.state,
-            crate::native::session::SessionState::Working
-                | crate::native::session::SessionState::Running
-                | crate::native::session::SessionState::ResumePending
-        )
+        || (session_turn::ClaimCurrency {
+            expected: Some(token),
+            state: session_turn::ClaimState::Turn,
+            tombstone: session_turn::ClaimTombstone::Refused,
+            expires: None,
+        })
+        .check(reader)?
+        .is_err()
     {
         bail!("Claude completion delivery refused: this claim or session is no longer current");
     }

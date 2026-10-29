@@ -444,11 +444,17 @@ impl<H: console_control::HelperProcess> Input for Console<'_, H> {
     }
     fn current(&mut self) -> Result<()> {
         let reader = Reader::open_unchecked(self.directory);
-        if turn::current_claim_token(&reader)?.as_deref() != Some(self.claim) {
-            bail!("Codex claim changed");
-        }
-        if reader.status()?.state.ended() {
-            bail!("Codex session ended");
+        match (turn::ClaimCurrency {
+            expected: Some(self.claim),
+            state: turn::ClaimState::NotEnded,
+            tombstone: turn::ClaimTombstone::Ignored,
+            expires: None,
+        })
+        .check(&reader)?
+        {
+            Ok(()) => {}
+            Err(turn::StaleClaim::Changed) => bail!("Codex claim changed"),
+            Err(_) => bail!("Codex session ended"),
         }
         Ok(())
     }

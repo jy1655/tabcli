@@ -49,8 +49,14 @@ fn send_initial_prompt_after_startup(
                     "Pi startup has not confirmed that project trust was resolved; no initial console input was sent. Resolve the prompt in the managed terminal, then close and start a new Bridge session if this request timed out"
                 );
             }
-            if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
-                != Some(pending.claim_token.as_str())
+            if (turn::ClaimCurrency {
+                expected: Some(&pending.claim_token),
+                state: turn::ClaimState::Any,
+                tombstone: turn::ClaimTombstone::Ignored,
+                expires: None,
+            })
+            .check(&Reader::open_unchecked(directory))?
+            .is_err()
             {
                 bail!("Pi initial turn is no longer claimed; no initial console input was sent");
             }

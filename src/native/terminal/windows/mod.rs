@@ -3,7 +3,7 @@ pub(in crate::native) mod ownership;
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::console_control::{self, ResolvedAction, WindowLookup};
 use crate::native::failure_kind::Unsupported;
-use crate::native::session::{Reader, Store};
+use crate::native::session::Store;
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
@@ -895,15 +895,15 @@ fn dispatch_with_claim<T>(
         return write().map(Some);
     };
     let store = Store::open_unchecked(directory);
-    let _lock = store.lock()?;
-    let reader = Reader::open_unchecked(directory);
-    if crate::native::session::turn::current_claim_token(&reader)?.as_deref() != Some(expected)
-        || reader.status()?.state.ended()
-        || expires.is_some_and(|expiry| crate::native::session::primitives::unix_ms() >= expiry)
-    {
-        return Ok(None);
-    }
-    write().map(Some)
+    use crate::native::session::turn;
+    Ok((turn::ClaimCurrency {
+        expected: Some(expected),
+        state: turn::ClaimState::NotEnded,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires,
+    })
+    .run(&store, write)?
+    .ok())
 }
 
 fn guarded_text_write_with(

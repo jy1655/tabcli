@@ -333,7 +333,7 @@ impl NativeProviderAdapter for PiAdapter {
                 "Inspect the managed owner and terminal. Live input was not tested; replace this fallback when Pi provides the required native path.",
             ),
             credential_diagnosis(context, |path, args, workspace, deadline| {
-                super::super::doctor::probe(path, args, Some(workspace), &[], deadline)
+                super::super::process_env::probe(path, args, Some(workspace), &[], deadline)
             }),
         ]
     }
@@ -517,17 +517,25 @@ fn install_pending_turn_bound(
     let mut pending = PendingPiTurn::new(claim_token)?;
     pending.windows_input = windows_input;
     let store = Store::open_unchecked(directory);
-    let _lock = store.lock()?;
-    if turn::current_claim_token(&store)?.as_deref() != Some(claim_token) {
-        bail!("Pi pending turn no longer holds the session claim");
+    let result = (turn::ClaimCurrency {
+        expected: Some(claim_token),
+        state: turn::ClaimState::Any,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires: None,
+    })
+    .run(&store, || {
+        store.private(CANCEL_ACCEPTED_FILE).remove()?;
+        // Startup proves the installed extension's capability for the whole session.
+        // Carry that evidence to a follow-up claim before delivery, including after a
+        // rolled-back delivery; never upgrade a legacy extension's schema.
+        startup_ready::carry_forward(&store, claim_token)?;
+        store.private(PENDING_TURN_FILE).write_json(&pending)?;
+        Ok(pending)
+    })?;
+    match result {
+        Ok(pending) => Ok(pending),
+        Err(_) => bail!("Pi pending turn no longer holds the session claim"),
     }
-    store.private(CANCEL_ACCEPTED_FILE).remove()?;
-    // Startup proves the installed extension's capability for the whole session.
-    // Carry that evidence to a follow-up claim before delivery, including after a
-    // rolled-back delivery; never upgrade a legacy extension's schema.
-    startup_ready::carry_forward(&store, claim_token)?;
-    store.private(PENDING_TURN_FILE).write_json(&pending)?;
-    Ok(pending)
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn>> {
@@ -552,7 +560,15 @@ fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn>> {
 fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     let store = Store::open_unchecked(directory);
     let _lock = store.lock()?;
-    if turn::current_claim_token(&store)?.as_deref() != Some(claim_token) {
+    if (turn::ClaimCurrency {
+        expected: Some(claim_token),
+        state: turn::ClaimState::Any,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires: None,
+    })
+    .check(&store)?
+    .is_err()
+    {
         return Ok(());
     }
     let Some(pending) = read_pending_turn(directory)? else {

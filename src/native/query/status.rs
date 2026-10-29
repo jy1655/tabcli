@@ -9,7 +9,7 @@ use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::origin::{ObservationCache, OriginEnvironment, OriginObservation};
 use agent_bridge::PUBLIC_COMMAND;
 use observation::judgment::{
-    self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
+    self, BoundOwner, Cancel, CancelState, FOREIGN_OWNER, Hold, Lifecycle, OwnerJudgment,
     ResultCandidate, Turn,
 };
 use observation::{Observation, QuestionFocus, StatusObservation};
@@ -110,7 +110,7 @@ fn attention(
 ) -> Vec<&'static str> {
     let observation = &observed.observation;
     let judgments = &observation.judgments;
-    let closed = observation.records.status.state == SessionState::Closed;
+    let closed = judgments.lifecycle == Lifecycle::Closed;
     let mut flags = Vec::new();
     if judgments.cancel == Cancel::Recorded(Some(CancelState::RequestedActive)) {
         flags.push("cancel_requested");
@@ -156,10 +156,10 @@ fn attention(
     if judgments.residual_surface.is_some() {
         flags.push("residual_surface_unverified");
     }
-    match judgments.ended {
-        Ended::Failed => flags.push("session_failed"),
-        Ended::Exited => flags.push("session_exited"),
-        Ended::Neither => (),
+    match judgments.lifecycle {
+        Lifecycle::Failed => flags.push("session_failed"),
+        Lifecycle::Exited => flags.push("session_exited"),
+        Lifecycle::Ready | Lifecycle::Closed | Lifecycle::Other => (),
     }
     // Derived from the Origin's records; neither an open surface nor a close authority.
     if !closed && origin.ended == Some(true) {
@@ -202,7 +202,8 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
             "request_state": active.map(|active| active.state),
             "bridge_observed_elapsed_ms": active.and_then(|active| active.elapsed_ms),
             "bridge_observed_elapsed_reason": active.map(|active| active.elapsed_reason)
-                .unwrap_or(Some("unreadable_result"))})
+                .unwrap_or_else(|| super::request::observed_elapsed(
+                    Some(receipt), super::request::ElapsedEvent::Unreadable).1)})
     });
     let latest = latest.map(|latest| {
         json!({"event_id": latest.event_id, "request_id": latest.request_id,

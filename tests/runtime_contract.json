@@ -103,7 +103,9 @@
     "const TURN_PROTOCOL_HEADER: &str = \"[Agent Bridge Agy turn protocol]\";": 1
   },
   "src/native/provider/agy/diagnostics.rs": {
-    "agy.log": 10,
+    "agy.log": 10
+  },
+  "src/native/provider/agy/evidence.rs": {
     "\"type\"": 1,
     "\"USER_INPUT\"": 1,
     "\"content\"": 1

@@ -3471,7 +3471,7 @@ fn close_fixtures_keep_independent_publication_expectations() {
                         .judgments
                         .active_state
                         .as_ref()
-                        .map(|s| s.as_ref().unwrap().as_str())
+                        .map(|s| s.as_ref().unwrap().name())
                 )
             );
             assert_eq!(

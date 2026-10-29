@@ -26,6 +26,104 @@ use std::{
 
 pub(in crate::native) static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// State policy for Claim currency; Turn names the provider turn-state set once.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::native) enum ClaimState {
+    Any,
+    #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
+    NotEnded,
+    Turn,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::native) enum ClaimTombstone {
+    Ignored,
+    Refused,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::native) enum StaleClaim {
+    Changed,
+    Tombstone,
+    State(SessionState),
+    Expired,
+    #[cfg(any(target_os = "macos", test))]
+    Busy,
+}
+
+/// Core-only currency observation. None preserves callers with no token requirement.
+/// This never recovers completion or reads adapter-private records.
+pub(in crate::native) struct ClaimCurrency<'a> {
+    pub(in crate::native) expected: Option<&'a str>,
+    pub(in crate::native) state: ClaimState,
+    pub(in crate::native) tombstone: ClaimTombstone,
+    pub(in crate::native) expires: Option<u128>,
+}
+
+impl ClaimCurrency<'_> {
+    /// Caller holds the lifecycle lock, or explicitly accepts an advisory observation.
+    pub(in crate::native) fn check(
+        &self,
+        reader: &Reader,
+    ) -> Result<std::result::Result<(), StaleClaim>> {
+        if let Some(expected) = self.expected
+            && current_claim_token(reader)?.as_deref() != Some(expected)
+        {
+            return Ok(Err(StaleClaim::Changed));
+        }
+        if matches!(self.tombstone, ClaimTombstone::Refused)
+            && reader.closed_if_present()?.is_some()
+        {
+            return Ok(Err(StaleClaim::Tombstone));
+        }
+        if !matches!(self.state, ClaimState::Any) {
+            let state = reader.status()?.state;
+            let accepted = match self.state {
+                ClaimState::Any => unreachable!(),
+                ClaimState::NotEnded => !state.ended(),
+                ClaimState::Turn => matches!(
+                    state,
+                    SessionState::Running | SessionState::Working | SessionState::ResumePending
+                ),
+            };
+            if !accepted {
+                return Ok(Err(StaleClaim::State(state)));
+            }
+        }
+        if self.expires.is_some_and(|expiry| unix_ms() >= expiry) {
+            return Ok(Err(StaleClaim::Expired));
+        }
+        Ok(Ok(()))
+    }
+
+    pub(in crate::native) fn run<T>(
+        &self,
+        store: &Store,
+        write: impl FnOnce() -> Result<T>,
+    ) -> Result<std::result::Result<T, StaleClaim>> {
+        let _lock = store.lock()?;
+        match self.check(store)? {
+            Ok(()) => write().map(Ok),
+            Err(stale) => Ok(Err(stale)),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(in crate::native) fn try_run<T>(
+        &self,
+        store: &Store,
+        write: impl FnOnce() -> Result<T>,
+    ) -> Result<std::result::Result<T, StaleClaim>> {
+        let Some(_lock) = store.try_lock()? else {
+            return Ok(Err(StaleClaim::Busy));
+        };
+        match self.check(store)? {
+            Ok(()) => write().map(Ok),
+            Err(stale) => Ok(Err(stale)),
+        }
+    }
+}
+
 /// Provenance of a Bridge-owned failure event that records a delivery refusal: nothing was
 /// sent to the provider, and the event's error is the refusal text.
 pub(in crate::native) const DELIVERY_NOT_SENT_PROVENANCE: &str = "delivery_not_sent";

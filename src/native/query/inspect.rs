@@ -4,6 +4,7 @@ use super::*;
 use crate::native::clock::SystemClock;
 use crate::native::session;
 use crate::native::session::origin::OriginEnvironment;
+use observation::judgment::{BoundOwner, OwnerJudgment};
 use observation::{Observation, ResultReference};
 
 pub(super) fn inspect_inner(id: &str, json: bool) -> Result<()> {
@@ -65,7 +66,9 @@ pub(super) fn value(
     environment: &mut OriginEnvironment<'_>,
 ) -> Result<Value> {
     let origin = observation.observe_origin(reader, None, environment);
-    let owner = observation.evidence.judge_owner(id).observation();
+    let owner_judgment = observation.evidence.judge_owner(id);
+    let owner = owner_judgment.observation();
+    let owner_verified = owner_identity_verified(owner_judgment);
     let judgments = &observation.judgments;
     let snapshot = &observation.records;
     let resumed_from = observation.resumed_from?;
@@ -74,10 +77,9 @@ pub(super) fn value(
         .receipts
         .iter()
         .map(|receipt| {
-            let (elapsed, elapsed_reason) = match snapshot.event(reader, &receipt.event_file) {
-                Ok(event) => observed_elapsed(Some(receipt), event.as_ref()),
-                Err(_) => (None, Some("unreadable_result")),
-            };
+            let event = snapshot.event(reader, &receipt.event_file);
+            let (elapsed, elapsed_reason) = observed_elapsed(
+                Some(receipt), event.as_ref().map(Option::as_ref));
             let mut value = json!({
                 "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
                 "event_id": receipt.event_file, "context_sources": receipt.context_sources,
@@ -102,7 +104,7 @@ pub(super) fn value(
         "resumed_from": resumed_from,
         "workspace_consent": observation.workspace_consent.into_value(),
         "cancel": observation.cancel,
-        "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
+        "owner_process_alive": owner.process_alive, "owner_identity_verified": owner_verified, "owner": owner,
         "recovery_required": judgments.recovery_required, "turn_claimed": snapshot.claim.is_some(),
         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
         "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
@@ -123,6 +125,10 @@ pub(super) fn value(
     Ok(value)
 }
 
+fn owner_identity_verified(owner: &OwnerJudgment) -> bool {
+    owner.bound() == Some(BoundOwner::Verified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +139,70 @@ mod tests {
     use crate::native::session::owner::ControlAttestation::{NotRecorded, Verified};
     use crate::native::session::owner::OwnerAttestation;
     use crate::native::tests::seed_close_fixture;
+
+    #[test]
+    fn owner_verification_matches_identity_projection_for_every_verdict() {
+        use crate::native::session::owner::ControlAttestation::{Changed, Unknown};
+        use crate::native::session::owner::tests::reused_attestation;
+        let live = |control| {
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Live(Attested::Incarnation),
+                control,
+                Some(true),
+            ))
+        };
+        let rows = [
+            (live(Verified), Some(BoundOwner::Verified)),
+            (
+                live(Changed("changed".into())),
+                Some(BoundOwner::ControlChanged),
+            ),
+            (live(NotRecorded), Some(BoundOwner::Uncompared)),
+            (live(Unknown("unknown".into())), Some(BoundOwner::Unknown)),
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    NotRecorded,
+                    Some(false),
+                )),
+                Some(BoundOwner::Exited),
+            ),
+            (
+                OwnerJudgment::Bound(reused_attestation()),
+                Some(BoundOwner::Reused),
+            ),
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Live(Attested::PidOnly),
+                    NotRecorded,
+                    Some(true),
+                )),
+                Some(BoundOwner::Uncompared),
+            ),
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Unknown("denied".into()),
+                    NotRecorded,
+                    Some(false),
+                )),
+                Some(BoundOwner::Unknown),
+            ),
+            (OwnerJudgment::UnboundLegacy { alive: Some(true) }, None),
+            (OwnerJudgment::UnboundLegacy { alive: Some(false) }, None),
+            (OwnerJudgment::UnboundLegacy { alive: None }, None),
+            (OwnerJudgment::Foreign, None),
+            (OwnerJudgment::Absent, None),
+            (OwnerJudgment::Unreadable("invalid".into()), None),
+        ];
+        for (owner, verdict) in rows {
+            assert_eq!(owner.bound(), verdict);
+            assert_eq!(
+                owner_identity_verified(&owner),
+                owner.observation().identity_matches == Some(true),
+                "{owner:?}"
+            );
+        }
+    }
 
     #[test]
     fn inspect_maps_its_judgments_and_the_owner() {
