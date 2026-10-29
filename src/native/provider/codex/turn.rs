@@ -1,5 +1,5 @@
 //! Claim-addressed lifecycle evidence. Bound claims settle through the transcript observer.
-use super::correlation::{begins_with_bridge_prompt, valid_codex_thread_id};
+use super::correlation::{framed_for, marker, valid_codex_thread_id};
 use super::{codex_input_correlates, codex_string, diagnose, established_codex_thread};
 use crate::native::provider::QuestionEmission;
 use crate::native::session::primitives::unix_ms;
@@ -76,8 +76,7 @@ fn publish_binding(store: &Store, pending: &PendingCodexTurn, payload: &Value) -
     ) else {
         return Ok(());
     };
-    if !begins_with_bridge_prompt(prompt)
-        || !prompt.trim_end().ends_with(&pending.marker)
+    if !framed_for(prompt, pending)
         || !valid_codex_thread_id(thread_id)
         || turn_id.is_empty()
         || established_codex_thread(directory)?
@@ -299,9 +298,6 @@ pub(super) fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result
         .remove()
 }
 
-pub(super) fn marker(claim_token: &str) -> String {
-    format!("<!-- agent-bridge-codex-turn:{claim_token} -->")
-}
 const QUESTION_RECORD_BYTES: u64 = 64 * 1024;
 
 #[derive(Deserialize, Serialize)]

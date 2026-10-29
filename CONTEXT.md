@@ -128,6 +128,12 @@ The first turn's prompt, delivered as part of launching the session.
 Any later turn's prompt, delivered with `tell` into the running session.
 _Avoid_: continuation, reply
 
+**Framed prompt**:
+The text a provider adapter delivers for a Turn: the delegation header, the caller's prompt and
+the adapter's correlation marker. The frame lets the adapter's correlation recognise Bridge's
+turn; it is never turn identity by itself.
+_Avoid_: wrapped prompt, payload, marker (the marker is one part of the frame)
+
 **Request source**:
 The id of the managed session that Bridge recorded as having issued one request, or the
 external mark when the request came from outside Bridge. Without that record, or when it

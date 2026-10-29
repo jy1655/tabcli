@@ -306,7 +306,7 @@ impl Input for Fake {
                     "turn_id":"bound", "transcript_path":"rollout.jsonl", "bound_unix_ms":1
                 }))?;
         }
-        Ok(super::super::super::lifecycle::read_binding(self.root.path(), &self.token)?.is_some())
+        Ok(super::super::super::turn::read_binding(self.root.path(), &self.token)?.is_some())
     }
 }
 fn settle(mut claim: turn::Claim, result: TerminalSendResult) {
@@ -388,7 +388,7 @@ fn protocol_failures_are_sticky_and_never_replay() {
             "schema":1, "claim_token":io.token, "thread_id":"01234567-89ab-cdef-0123-456789abcdef", "turn_id":"late", "transcript_path":"rollout.jsonl", "bound_unix_ms":1
         })).unwrap();
         assert!(
-            super::super::super::lifecycle::read_binding(io.root.path(), &io.token)
+            super::super::super::turn::read_binding(io.root.path(), &io.token)
                 .unwrap()
                 .is_some()
         );

@@ -15,6 +15,11 @@ pub(super) fn valid_codex_thread_id(value: &str) -> bool {
         })
 }
 
+// The correlation marker: the last line of every framed prompt, derived from the claim alone.
+pub(super) fn marker(claim_token: &str) -> String {
+    format!("<!-- agent-bridge-codex-turn:{claim_token} -->")
+}
+
 pub(super) fn correlated_prompt(prompt: &str, pending: &PendingCodexTurn) -> String {
     format!(
         "{prompt}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{}",
@@ -67,6 +72,27 @@ pub(super) fn begins_with_bridge_prompt(message: &str) -> bool {
 
 // Require header and trailing marker: Codex's title turn can quote the marker on another thread.
 // Framing is not turn identity; see docs/verification/2026-10-02-windows.md.
+pub(super) fn framed_for(message: &str, pending: &PendingCodexTurn) -> bool {
+    begins_with_bridge_prompt(message) && message.trim_end().ends_with(&pending.marker)
+}
+
+// The Windows console paste writes the body and the marker line separately (#124). Tolerate
+// at most one terminal LF; never trim arbitrary prompt whitespace or multiple lines.
+#[cfg(any(windows, test))]
+pub(super) fn split_marker_line<'a>(
+    prompt: &'a str,
+    claim_token: &str,
+) -> Result<(&'a str, &'a str)> {
+    let prompt = prompt.strip_suffix('\n').unwrap_or(prompt);
+    let (body, tail) = prompt
+        .rsplit_once('\n')
+        .context("framed prompt has no marker line")?;
+    if tail != marker(claim_token) {
+        bail!("framed prompt marker does not match claim");
+    }
+    Ok((body, tail))
+}
+
 // Any element may be the prompt: a message typed into the TUI during the turn is steered into
 // that turn and follows the prompt as a later element (codex-cli 0.163.0, 2026-10-17, #65).
 pub(super) fn codex_input_correlates(
@@ -83,10 +109,7 @@ pub(super) fn codex_input_correlates(
             messages
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .any(|message| {
-                    begins_with_bridge_prompt(message)
-                        && message.trim_end().ends_with(&pending.marker)
-                })
+                .any(|message| framed_for(message, pending))
         })
 }
 
