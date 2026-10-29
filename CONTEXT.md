@@ -66,6 +66,11 @@ The exclusive right to deliver the next turn of a session. One claim exists at a
 released when the turn completes, fails, or is rolled back.
 _Avoid_: lock, lease, token (the token is the claim's identifier, not the claim)
 
+**Claim currency**:
+Whether a claim still identifies the current delivery right under the caller's session-state,
+close-tombstone, and expiry policies. An advisory observation does not reserve that right.
+_Avoid_: liveness, validity, ownership
+
 **Request**:
 The caller-facing identity of one turn (`request-…`), fixed before delivery and never reused.
 _Avoid_: job, task, message id

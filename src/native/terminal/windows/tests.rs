@@ -1264,3 +1264,51 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
     assert_eq!(format!("{refused:#}"), "iTerm2 is not available on Windows");
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
 }
+
+#[test]
+fn claim_dispatch_refuses_replaced_claim_and_keeps_not_ended_policy() {
+    use crate::native::session::{CoreRecord, SessionState, Store, update_status};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    store
+        .record(CoreRecord::TurnClaim)
+        .write_private(b"successor")
+        .unwrap();
+    assert_eq!(
+        super::dispatch_with_claim(directory.path(), Some("expected"), None, || panic!(
+            "replaced claim wrote"
+        ))
+        .unwrap(),
+        None::<()>
+    );
+    update_status(directory.path(), SessionState::Launching, None, None).unwrap();
+    // Launching is allowed, and an ignored tombstone must not be decoded.
+    store
+        .record(CoreRecord::Closed)
+        .write_private(b"unreadable")
+        .unwrap();
+    assert_eq!(
+        super::dispatch_with_claim(directory.path(), Some("successor"), None, || {
+            assert!(store.try_lock()?.is_none());
+            Ok(7)
+        })
+        .unwrap(),
+        Some(7)
+    );
+    assert_eq!(
+        super::dispatch_with_claim(directory.path(), Some("successor"), Some(0), || panic!(
+            "expired claim wrote"
+        ))
+        .unwrap(),
+        None::<()>
+    );
+    store.record(CoreRecord::Closed).remove().unwrap();
+    update_status(directory.path(), SessionState::Failed, None, None).unwrap();
+    assert_eq!(
+        super::dispatch_with_claim(directory.path(), Some("successor"), None, || panic!(
+            "ended session wrote"
+        ))
+        .unwrap(),
+        None::<()>
+    );
+}

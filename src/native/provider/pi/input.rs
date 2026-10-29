@@ -114,11 +114,17 @@ pub(super) fn read_accepted(
 #[cfg(windows)]
 pub(super) fn current(turn: &TurnContext<'_>) -> Result<()> {
     let reader = Reader::open_unchecked(turn.directory);
-    if turn::current_claim_token(&reader)?.as_deref() != Some(turn.claim_token) {
-        bail!("Pi turn claim retired or changed");
-    }
-    if reader.closed_if_present()?.is_some() || reader.status()?.state.ended() {
-        bail!("Pi session ended");
+    match (turn::ClaimCurrency {
+        expected: Some(turn.claim_token),
+        state: turn::ClaimState::NotEnded,
+        tombstone: turn::ClaimTombstone::Refused,
+        expires: None,
+    })
+    .check(&reader)?
+    {
+        Ok(()) => {}
+        Err(turn::StaleClaim::Changed) => bail!("Pi turn claim retired or changed"),
+        Err(_) => bail!("Pi session ended"),
     }
     Ok(())
 }
