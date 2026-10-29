@@ -380,22 +380,19 @@ impl Observation {
         }
         let latest_event_id = records.latest_event_id();
         let latest = records.observe_result(reader, &Selector::Latest);
-        let active_value = |observed: &RequestObservation<'_>| {
+        let active_summary = |observed: &RequestObservation<'_>| {
             let (elapsed, reason) = observed_elapsed(observed.receipt, observed.event.as_ref());
-            (
-                observed.state,
-                json!({
-                    "request_state": observed.state,
-                    "bridge_observed_elapsed_ms": elapsed,
-                    "bridge_observed_elapsed_reason": reason,
-                }),
-            )
+            ActiveRequestStatus {
+                state: observed.state,
+                elapsed_ms: elapsed,
+                elapsed_reason: reason,
+            }
         };
         let active = records.active_receipt().map(|receipt| {
             if latest_event_id == Some(receipt.event_file.as_str()) {
                 latest
                     .as_ref()
-                    .map(active_value)
+                    .map(active_summary)
                     .map_err(|error| anyhow::anyhow!("{error:#}"))
             } else {
                 if clock.now() >= deadline {
@@ -403,35 +400,41 @@ impl Observation {
                 }
                 records
                     .observe_result(reader, &Selector::Request(receipt.request_id.clone()))
-                    .map(|observed| active_value(&observed))
+                    .map(|observed| active_summary(&observed))
             }
         });
         let focus = if records.claim.is_some() {
-            records.active_receipt()
+            records
+                .active_receipt()
+                .map(|receipt| (QuestionFocus::ActiveRequest, receipt))
         } else {
-            latest.as_ref().ok().and_then(|observed| observed.receipt)
+            latest
+                .as_ref()
+                .ok()
+                .and_then(|observed| observed.receipt)
+                .map(|receipt| (QuestionFocus::LatestResult, receipt))
         };
         if clock.now() >= deadline {
             bail!("status time budget exhausted");
         }
-        let questions = focus.and_then(|receipt| question_emissions(reader, &records, receipt));
+        let questions = focus.and_then(|(focus, receipt)| {
+            question_emissions(reader, &records, receipt)
+                .map(|emissions| FocusedQuestions { focus, emissions })
+        });
         let latest = latest.map(|observed| {
-            observed.event.as_ref().map_or(Value::Null, |event| {
-                json!({
-                    "event_id": observed.event_id,
-                    "request_id": observed.receipt.map(|receipt| &receipt.request_id),
-                    "request_state": observed.state,
-                    "created_unix_ms": event.created_unix_ms,
-                })
+            observed.event.as_ref().map(|event| LatestResultStatus {
+                event_id: observed.event_id.map(str::to_owned),
+                request_id: observed.receipt.map(|receipt| receipt.request_id.clone()),
+                state: observed.state,
+                created_unix_ms: event.created_unix_ms,
             })
         });
         let active_state = active.as_ref().map(|result| {
             result
                 .as_ref()
-                .map(|(state, _)| *state)
+                .map(|active| active.state)
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
         });
-        let active = active.map(|result| result.map(|(_, value)| value));
         let mut observation = Self::from_records(reader, records, active_state);
         observation.records._lock.take();
         Ok(Some(StatusObservation {
@@ -475,9 +478,35 @@ pub(in crate::native) fn state_root_of(reader: &Reader) -> PathBuf {
 
 pub(super) struct StatusObservation {
     pub(super) observation: Observation,
-    pub(super) active: Option<Result<Value>>,
-    pub(super) latest: Result<Value>,
-    pub(super) questions: Option<QuestionEmissions>,
+    pub(super) active: Option<Result<ActiveRequestStatus>>,
+    pub(super) latest: Result<Option<LatestResultStatus>>,
+    pub(super) questions: Option<FocusedQuestions>,
+}
+
+/// Status retains only the observed facts it renders, never a Result's body or a
+/// borrow that extends the lifecycle lock into owner observation or rendering.
+pub(super) struct ActiveRequestStatus {
+    pub(super) state: RequestState,
+    pub(super) elapsed_ms: Option<u128>,
+    pub(super) elapsed_reason: Option<&'static str>,
+}
+
+pub(super) struct LatestResultStatus {
+    pub(super) event_id: Option<String>,
+    pub(super) request_id: Option<String>,
+    pub(super) state: RequestState,
+    pub(super) created_unix_ms: Option<u128>,
+}
+
+pub(super) enum QuestionFocus {
+    ActiveRequest,
+    LatestResult,
+}
+
+/// The target selected under the Snapshot's lock travels with its question evidence.
+pub(super) struct FocusedQuestions {
+    pub(super) focus: QuestionFocus,
+    pub(super) emissions: QuestionEmissions,
 }
 
 #[cfg(test)]

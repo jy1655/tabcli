@@ -8,6 +8,8 @@ use crate::native::session::primitives::{write_json_atomic, write_private};
 use crate::native::{session, tests::seed_close_fixture};
 use observation::judgment::tests::{CLAIM, SESSION, attestation, evidence, receipt, snapshot};
 use observation::judgment::{IndexIncomplete, Judgments, Surface, SurfaceSource, UnreadablePart};
+use observation::{ActiveRequestStatus, LatestResultStatus};
+use request::RequestState;
 
 fn read(reader: &Reader) -> StatusObservation {
     Observation::read_for_status(
@@ -57,7 +59,7 @@ fn in_memory(records: Snapshot) -> StatusObservation {
             judgments,
         },
         active: None,
-        latest: Ok(Value::Null),
+        latest: Ok(None),
         questions: None,
     }
 }
@@ -177,10 +179,14 @@ fn status_maps_each_judgment_to_its_documented_output() {
     // Status's own two reads join the unreadable parts (D12).
     observed.latest = Err(anyhow::anyhow!("latest"));
     assert_eq!(flags(&observed, None), ["records_partially_unreadable"]);
-    observed.latest = Ok(Value::Null);
+    observed.latest = Ok(None);
     observed.active = Some(Err(anyhow::anyhow!("active")));
     assert_eq!(flags(&observed, None), ["records_partially_unreadable"]);
-    observed.active = Some(Ok(json!({"request_state": "pending"})));
+    observed.active = Some(Ok(ActiveRequestStatus {
+        state: RequestState::Pending,
+        elapsed_ms: None,
+        elapsed_reason: Some("no_published_result"),
+    }));
     assert!(flags(&observed, None).is_empty());
     observed.active = None;
     assert_eq!(flags(&observed, Some(true)), ["origin_ended"]);
@@ -347,7 +353,12 @@ fn status_maps_each_judgment_to_its_documented_output() {
         source: SurfaceSource::ActiveHandle,
         reason: "x".into(),
     };
-    observed.latest = Ok(json!({"event_id": "event-9.json"}));
+    observed.latest = Ok(Some(LatestResultStatus {
+        event_id: Some("event-9.json".into()),
+        request_id: None,
+        state: RequestState::Completed,
+        created_unix_ms: None,
+    }));
     let value = entry(observed, SESSION, origin(None));
     assert_eq!(value["recovery_required"], true);
     assert_eq!(value["residual_surface"], "unverified");
@@ -358,7 +369,12 @@ fn status_maps_each_judgment_to_its_documented_output() {
     );
     assert_eq!(value["derived_from"], "observation");
     let mut observed = in_memory(snapshot(SessionState::Ready));
-    observed.latest = Ok(json!({"event_id": "event-9.json"}));
+    observed.latest = Ok(Some(LatestResultStatus {
+        event_id: Some("event-9.json".into()),
+        request_id: None,
+        state: RequestState::Completed,
+        created_unix_ms: None,
+    }));
     let value = entry(observed, SESSION, origin(None));
     assert_eq!(value["recovery_required"], false);
     assert!(value.get("residual_surface").is_none());
@@ -376,18 +392,9 @@ fn status_decodes_only_latest_and_reuses_it_for_active_elapsed() {
     let (observed, reads) = with_event_read_count(|| read(&reader));
     assert_eq!(reads, 1);
     assert!(!flag(&observed, "records_partially_unreadable"));
-    assert!(
-        observed
-            .active
-            .as_ref()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .get("result")
-            .is_none()
-    );
-    assert!(observed.latest.as_ref().unwrap().get("result").is_none());
     let value = entry(observed, "session-fault", origin(None));
+    assert!(value["active_request"].get("result").is_none());
+    assert!(value["latest_result"].get("result").is_none());
     assert_eq!(value["active_request"]["request_state"], "completed");
     assert_eq!(value["latest_result"]["request_state"], "completed");
     assert_eq!(
@@ -409,6 +416,35 @@ fn status_decodes_only_latest_and_reuses_it_for_active_elapsed() {
     assert_eq!(
         value["active_request"]["bridge_observed_elapsed_reason"],
         "no_published_result"
+    );
+}
+
+#[test]
+fn an_unreadable_active_result_keeps_its_request_and_null_fields() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let (observed, reads) = with_event_read_count(|| {
+        with_event_read_hook(|path| fs::write(path, b"{").unwrap(), || read(&reader))
+    });
+    assert_eq!(reads, 1);
+    assert!(flag(&observed, "records_partially_unreadable"));
+    let request_id = observed
+        .observation
+        .active_request()
+        .unwrap()
+        .request_id
+        .clone();
+    let value = entry(observed, "session-fault", origin(None));
+    assert_eq!(
+        value["active_request"],
+        json!({"request_id": request_id,
+            "request_state": null, "bridge_observed_elapsed_ms": null,
+            "bridge_observed_elapsed_reason": "unreadable_result"})
+    );
+    assert!(value["latest_result"].is_null());
+    assert_eq!(
+        value["result_command"],
+        format!("{PUBLIC_COMMAND} result session-fault --request {request_id} --json")
     );
 }
 

@@ -267,8 +267,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `query::observation::PartialObservation` owns doctor's fallback when no Snapshot can be read:
   Cancel and Hold retain separate lock attempts and failure scopes, with the best-effort manifest
   read after both. Rendering partial evidence does not repair it or grant control authority.
-  Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
-  owner process observations and surface probes are added on request, while `sessions` keeps
+  Inspect, doctor, and `status` render one Observation per session from these readers and publication rules.
+  Status carries owned active/latest summaries and the selected question focus to its renderer,
+  without intermediate JSON or retained Result bodies. Missing and unreadable Results remain
+  distinct observations, and the lifecycle lock is released before owner observation and rendering.
+  Owner process observations and surface probes are added on request, while `sessions` keeps
   its own lock-free listing after its optional repair. The Observation's judgments live in
   `query/observation/judgment.rs` as pure functions over the Records, with the owner attestation
   and the surface probe made on request and memoized per Observation; `wait` makes a fresh owner

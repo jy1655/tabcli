@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.30](0.4.30.md) (2026-10-29): Claude completion diagnostics, offline self-test comparison and diagnostic summaries, Claude inbound-interference regression coverage, and typed Status observations.
 - [0.4.29](0.4.29.md) (2026-10-27): Deterministic Request wait tests through the Clock seam and one shared iTerm2 session lookup traversal, preserving public behavior (#311, #312).
 - [0.4.28](0.4.28.md) (2026-10-27): Stable iTerm2 window lookup during window reordering, with human-origin macOS workspace-consent verification and documented wrapped-path limits (#28).
 - [0.4.27](0.4.27.md) (2026-10-26): Producer-owned self-test failure hints that preserve delivery uncertainty, plus Windows SID lookup regression checks and retained CI/Release test timings (#204, #308).
