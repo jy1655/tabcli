@@ -5,6 +5,7 @@ use crate::native::session::primitives::{SESSION_DIR_ENV, STATE_DIR_ENV};
 use std::{
     ffi::OsStr,
     ffi::OsString,
+    fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
     process::{Command, Output, Stdio},
@@ -151,7 +152,18 @@ pub(in crate::native) fn command_output_with_stdin_until_classified(
     deadline: Instant,
     label: &str,
 ) -> std::result::Result<Output, CommandOutputFailure> {
-    bounded_output(command, stdin, deadline, ExecutionOptions::command(label))
+    if Instant::now() >= deadline {
+        return Err(not_started_at_deadline(label));
+    }
+    let execution = Execution::Command { label };
+    let storage = OutputStorage::new(&execution).map_err(CommandOutputFailure::not_started)?;
+    let child_streams = storage
+        .child_streams(&execution)
+        .map_err(CommandOutputFailure::not_started)?;
+    if Instant::now() >= deadline {
+        return Err(not_started_at_deadline(label));
+    }
+    bounded_output(command, stdin, deadline, execution, storage, child_streams)
 }
 
 pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,53 +205,76 @@ pub(super) fn probe(
     }
     let scratch = tempfile::tempdir()?;
     let mut command = probe_command(executable, arguments, scratch.path(), environment_removals)?;
+    command.current_dir(workspace.unwrap_or(scratch.path()));
+    provider_process::configure_process_tree(&mut command);
+    let execution = Execution::Probe;
+    let storage = OutputStorage::new(&execution)?;
+    if Instant::now() >= deadline {
+        anyhow::bail!("diagnostic probe deadline exhausted before launch");
+    }
+    let child_streams = storage.child_streams(&execution)?;
     bounded_output(
         &mut command,
         Stdio::null(),
         deadline,
-        ExecutionOptions {
-            label: None,
-            output_limit: Some(MAX_PROBE_OUTPUT),
-            contain_tree: true,
-            working_directory: Some(workspace.unwrap_or(scratch.path())),
-        },
+        execution,
+        storage,
+        child_streams,
     )
     .map_err(CommandOutputFailure::into_error)
 }
 
-// A label selects the existing classified command diagnostics. Probes retain raw
-// I/O errors, their launch-check ordering and their fixed polling interval.
-struct ExecutionOptions<'a> {
-    label: Option<&'a str>,
-    output_limit: Option<u64>,
-    contain_tree: bool,
-    working_directory: Option<&'a Path>,
+// Entry points own preparation and launch-check ordering. The shared core uses
+// this policy for diagnostics, polling, output limits and process containment.
+enum Execution<'a> {
+    Command { label: &'a str },
+    Probe,
 }
 
-impl<'a> ExecutionOptions<'a> {
-    fn command(label: &'a str) -> Self {
-        Self {
-            label: Some(label),
-            output_limit: None,
-            contain_tree: false,
-            working_directory: None,
-        }
-    }
-
+impl Execution<'_> {
     fn io<T>(&self, result: std::io::Result<T>, context: &str) -> Result<T> {
-        match self.label {
-            Some(label) => result.with_context(|| format!("{context} {label}")),
-            None => Ok(result?),
+        match self {
+            Self::Command { label } => result.with_context(|| format!("{context} {label}")),
+            Self::Probe => Ok(result?),
         }
     }
 
-    fn before_launch(&self) -> CommandOutputFailure {
-        match self.label {
-            Some(label) => not_started_at_deadline(label),
-            None => CommandOutputFailure::not_started(anyhow::anyhow!(
-                "diagnostic probe deadline exhausted before launch"
-            )),
+    fn output_limit(&self) -> Option<u64> {
+        match self {
+            Self::Command { .. } => None,
+            Self::Probe => Some(MAX_PROBE_OUTPUT),
         }
+    }
+}
+
+struct OutputStorage {
+    stdout: File,
+    stderr: File,
+}
+
+impl OutputStorage {
+    fn new(execution: &Execution<'_>) -> Result<Self> {
+        let stdout = execution.io(
+            tempfile::tempfile(),
+            "failed to create bounded stdout storage for",
+        )?;
+        let stderr = execution.io(
+            tempfile::tempfile(),
+            "failed to create bounded stderr storage for",
+        )?;
+        Ok(Self { stdout, stderr })
+    }
+
+    fn child_streams(&self, execution: &Execution<'_>) -> Result<(File, File)> {
+        let stdout = execution.io(
+            self.stdout.try_clone(),
+            "failed to clone bounded stdout storage for",
+        )?;
+        let stderr = execution.io(
+            self.stderr.try_clone(),
+            "failed to clone bounded stderr storage for",
+        )?;
+        Ok((stdout, stderr))
     }
 }
 
@@ -247,49 +282,15 @@ fn bounded_output(
     command: &mut Command,
     stdin: Stdio,
     deadline: Instant,
-    options: ExecutionOptions<'_>,
+    execution: Execution<'_>,
+    storage: OutputStorage,
+    (child_stdout, child_stderr): (File, File),
 ) -> std::result::Result<Output, CommandOutputFailure> {
-    if options.label.is_some() && Instant::now() >= deadline {
-        return Err(options.before_launch());
-    }
-    if let Some(directory) = options.working_directory {
-        command.current_dir(directory);
-    }
-    if options.contain_tree {
-        provider_process::configure_process_tree(command);
-    }
-    let mut stdout = options
-        .io(
-            tempfile::tempfile(),
-            "failed to create bounded stdout storage for",
-        )
-        .map_err(CommandOutputFailure::not_started)?;
-    let mut stderr = options
-        .io(
-            tempfile::tempfile(),
-            "failed to create bounded stderr storage for",
-        )
-        .map_err(CommandOutputFailure::not_started)?;
-    // The probe checks before cloning; classified commands check after cloning.
-    if options.label.is_none() && Instant::now() >= deadline {
-        return Err(options.before_launch());
-    }
-    let child_stdout = options
-        .io(
-            stdout.try_clone(),
-            "failed to clone bounded stdout storage for",
-        )
-        .map_err(CommandOutputFailure::not_started)?;
-    let child_stderr = options
-        .io(
-            stderr.try_clone(),
-            "failed to clone bounded stderr storage for",
-        )
-        .map_err(CommandOutputFailure::not_started)?;
-    if options.label.is_some() && Instant::now() >= deadline {
-        return Err(options.before_launch());
-    }
-    let mut child = options
+    let OutputStorage {
+        mut stdout,
+        mut stderr,
+    } = storage;
+    let mut child = execution
         .io(
             command
                 .stdin(stdin)
@@ -299,7 +300,7 @@ fn bounded_output(
             "failed to start",
         )
         .map_err(CommandOutputFailure::not_started)?;
-    let tree = if options.contain_tree {
+    let tree = if matches!(execution, Execution::Probe) {
         match provider_process::ProviderProcessTree::attach(&child) {
             Ok(tree) => Some(tree),
             Err(error) => {
@@ -311,12 +312,13 @@ fn bounded_output(
     } else {
         None
     };
+    let mut reaped = false;
     let outcome = (|| {
         if let Some(tree) = &tree {
             tree.resume(&child).map_err(CommandOutputFailure::started)?;
         }
         let status = loop {
-            if let Some(limit) = options.output_limit {
+            if let Some(limit) = execution.output_limit() {
                 let size = (|| -> Result<u64> {
                     Ok(stdout
                         .metadata()?
@@ -330,42 +332,42 @@ fn bounded_output(
                     )));
                 }
             }
-            if let Some(status) = options
+            if let Some(status) = execution
                 .io(child.try_wait(), "failed to wait for")
                 .map_err(CommandOutputFailure::started)?
             {
+                reaped = true;
                 break status;
             }
             if Instant::now() >= deadline {
-                return Err(match options.label {
-                    Some(label) => CommandOutputFailure::started(anyhow::Error::new(
-                        TimedOut::new(format!("{label} timed out")),
-                    ))
+                return Err(match execution {
+                    Execution::Command { label } => CommandOutputFailure::started(
+                        anyhow::Error::new(TimedOut::new(format!("{label} timed out"))),
+                    )
                     .ended_at_deadline(),
-                    None => {
+                    Execution::Probe => {
                         CommandOutputFailure::started(anyhow::anyhow!("diagnostic probe timed out"))
                     }
                 });
             }
             let interval = Duration::from_millis(20);
-            thread::sleep(if options.label.is_some() {
-                deadline
+            thread::sleep(match execution {
+                Execution::Command { .. } => deadline
                     .saturating_duration_since(Instant::now())
-                    .min(interval)
-            } else {
-                interval
+                    .min(interval),
+                Execution::Probe => interval,
             });
         };
         if let Some(tree) = &tree {
             tree.terminate();
         }
-        options
+        execution
             .io(
                 stdout.seek(SeekFrom::Start(0)),
                 "failed to rewind bounded stdout storage for",
             )
             .map_err(CommandOutputFailure::started)?;
-        options
+        execution
             .io(
                 stderr.seek(SeekFrom::Start(0)),
                 "failed to rewind bounded stderr storage for",
@@ -373,20 +375,20 @@ fn bounded_output(
             .map_err(CommandOutputFailure::started)?;
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
-        let read_limit = options.output_limit.map_or(u64::MAX, |limit| limit + 1);
-        options
+        let read_limit = execution.output_limit().map_or(u64::MAX, |limit| limit + 1);
+        execution
             .io(
                 stdout.take(read_limit).read_to_end(&mut stdout_bytes),
                 "failed to read bounded stdout storage for",
             )
             .map_err(CommandOutputFailure::started)?;
-        options
+        execution
             .io(
                 stderr.take(read_limit).read_to_end(&mut stderr_bytes),
                 "failed to read bounded stderr storage for",
             )
             .map_err(CommandOutputFailure::started)?;
-        if options.output_limit.is_some_and(|limit| {
+        if execution.output_limit().is_some_and(|limit| {
             stdout_bytes.len().saturating_add(stderr_bytes.len()) as u64 > limit
         }) {
             return Err(CommandOutputFailure::started(anyhow::anyhow!(
@@ -402,9 +404,9 @@ fn bounded_output(
     if let Some(tree) = &tree {
         tree.terminate();
     }
-    // Probes always clean up. Ordinary commands only need this on failure;
-    // successful commands have already been reaped by try_wait.
-    if options.contain_tree || outcome.is_err() {
+    // Probes always clean up. Once try_wait reaps an ordinary command, even
+    // a later rewind/read failure must not kill or wait for it again.
+    if matches!(execution, Execution::Probe) || !reaped {
         let _ = child.kill();
         let _ = child.wait();
     }
