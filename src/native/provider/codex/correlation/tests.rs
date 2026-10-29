@@ -436,3 +436,62 @@ fn codex_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
     assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
     assert!(directory.path().join(TURN_CLAIM_FILE).exists());
 }
+
+// The grammar rows: direct header, the IDE wrapper, and the marker's position.
+#[test]
+fn framed_for_requires_the_header_and_the_trailing_marker() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let pending = claim_pending_turn(directory.path());
+    let header = native_delegation_prompt("external", "Reply READY.");
+    let prompt = correlated_prompt(&header, &pending);
+    let with_context = format!(
+        "# Context from my IDE setup:\n\n## Active file: src/prompt.rs\n\n## My request for Codex:\n{prompt}"
+    );
+    for (message, framed) in [
+        (prompt.clone(), true),
+        (with_context, true),
+        (header, false),
+        (format!("steered\n{}", pending.marker), false),
+        (format!("{prompt}\nmore text"), false),
+        (format!("{prompt} \n\n"), true),
+    ] {
+        assert_eq!(framed_for(&message, &pending), framed, "{message:?}");
+    }
+}
+
+#[test]
+fn split_marker_line_tolerates_one_trailing_lf_and_verifies_the_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let pending = claim_pending_turn(directory.path());
+    let token = pending.claim_token.as_str();
+    let expected = marker(token);
+    assert_eq!(
+        split_marker_line(&format!("body\n{expected}"), token).unwrap(),
+        ("body", expected.as_str())
+    );
+    assert_eq!(
+        split_marker_line(&format!("line one\nline two\n{expected}\n"), token).unwrap(),
+        ("line one\nline two", expected.as_str())
+    );
+    for (prompt, error) in [
+        (
+            format!("body\n{expected}\n\n"),
+            "framed prompt marker does not match claim",
+        ),
+        (expected.clone(), "framed prompt has no marker line"),
+        (
+            format!("body\n{}", marker(&format!("{token}-0"))),
+            "framed prompt marker does not match claim",
+        ),
+    ] {
+        assert_eq!(
+            split_marker_line(&prompt, token).unwrap_err().to_string(),
+            error,
+            "{prompt:?}"
+        );
+    }
+}
