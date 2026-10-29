@@ -2,7 +2,7 @@
 use super::search::{IncompleteReason, SEARCH_TIME_BUDGET, SearchScope};
 use super::*;
 use crate::native::args::{option_value, set_flag_once, set_once, workspace_scope};
-use crate::native::clock::SystemClock;
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
@@ -236,7 +236,16 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
 }
 
 fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Value> {
-    let deadline = Instant::now() + budget;
+    value_in_with_clock(root, request, budget, &mut SystemClock)
+}
+
+fn value_in_with_clock(
+    root: &Path,
+    request: &StatusRequest,
+    budget: Duration,
+    clock: &mut dyn Clock,
+) -> Result<Value> {
+    let deadline = clock.now() + budget;
     let mut ids = Vec::new();
     let mut reasons = Vec::new();
     match enumerate(root, CheckOrder::IdFirst) {
@@ -266,11 +275,9 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
     let mut sessions = Vec::new();
     let mut scanned = 0;
     let mut origins = ObservationCache::default();
-    let mut clock = SystemClock;
-    let mut origin_environment = OriginEnvironment::production(&mut clock);
     for id in ids {
         let read = (|| -> Result<Option<Value>> {
-            if Instant::now() >= deadline {
+            if clock.now() >= deadline {
                 bail!("status time budget exhausted");
             }
             let reader = Reader::open_unchecked(root.join(&id));
@@ -286,23 +293,23 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
             {
                 return Ok(None);
             }
-            if Instant::now() >= deadline {
+            if clock.now() >= deadline {
                 bail!("status time budget exhausted");
             }
             scanned += 1;
             let Some(observed) =
-                Observation::read_for_status(&reader, deadline, request.include_closed)?
+                Observation::read_for_status(&reader, deadline, request.include_closed, clock)?
             else {
                 return Ok(None);
             };
-            if Instant::now() >= deadline {
+            if clock.now() >= deadline {
                 bail!("status time budget exhausted");
             }
             let origin = origins.observe(
                 root,
                 observed.observation.origin.clone(),
                 Some(deadline),
-                &mut origin_environment,
+                &mut OriginEnvironment::production(clock),
             );
             Ok(Some(entry(observed, &id, origin)))
         })();

@@ -13,7 +13,7 @@ use super::requests::{self, Receipt};
 use super::snapshot::Snapshot;
 use super::turn::valid_turn_claim_token;
 use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy};
-use crate::native::clock::{Clock, SystemClock};
+use crate::native::clock::Clock;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::terminal::ownership::NativeSessionOwner;
 use serde::Serialize;
@@ -86,7 +86,7 @@ pub(in crate::native) struct OriginEnvironment<'a> {
 }
 
 impl<'a> OriginEnvironment<'a> {
-    pub(in crate::native) fn production(clock: &'a mut SystemClock) -> Self {
+    pub(in crate::native) fn production(clock: &'a mut dyn Clock) -> Self {
         Self {
             attest: &attest_through_platform_observer,
             clock,

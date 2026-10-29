@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::clock::FakeClock;
+use crate::native::clock::{FakeClock, SystemClock};
 use crate::native::session::Store;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 use std::cell::{Cell, RefCell};

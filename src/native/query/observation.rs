@@ -364,13 +364,18 @@ impl Observation {
         reader: &Reader,
         deadline: Instant,
         include_closed: bool,
+        clock: &mut dyn Clock,
     ) -> Result<Option<StatusObservation>> {
-        let records =
-            observe_snapshot_until(reader, PublicationRead::Within(EVENT_READ_LIMIT), deadline)?;
+        let records = observe_snapshot_until(
+            reader,
+            PublicationRead::Within(EVENT_READ_LIMIT),
+            deadline,
+            clock,
+        )?;
         if !include_closed && records.status.state == SessionState::Closed {
             return Ok(None);
         }
-        if Instant::now() >= deadline {
+        if clock.now() >= deadline {
             bail!("status time budget exhausted");
         }
         let latest_event_id = records.latest_event_id();
@@ -393,7 +398,7 @@ impl Observation {
                     .map(active_value)
                     .map_err(|error| anyhow::anyhow!("{error:#}"))
             } else {
-                if Instant::now() >= deadline {
+                if clock.now() >= deadline {
                     bail!("status time budget exhausted");
                 }
                 records
@@ -406,7 +411,7 @@ impl Observation {
         } else {
             latest.as_ref().ok().and_then(|observed| observed.receipt)
         };
-        if Instant::now() >= deadline {
+        if clock.now() >= deadline {
             bail!("status time budget exhausted");
         }
         let questions = focus.and_then(|receipt| question_emissions(reader, &records, receipt));
