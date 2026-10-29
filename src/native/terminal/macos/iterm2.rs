@@ -373,11 +373,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_tty_bound_host};
     run_tty_bound_host(
         directory,
-        &BoundHostSpec {
-            admission: super::bound_host::Admission::MetadataFirst,
-            name: BINDING.host,
-            metadata_context: None,
-        },
+        &BoundHostSpec { name: BINDING.host },
         || {
             let iterm_id = std::env::var("ITERM_SESSION_ID")
                 .context("iTerm2 did not supply its session identity")?;

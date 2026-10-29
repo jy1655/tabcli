@@ -294,13 +294,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_tty_bound_host};
     run_tty_bound_host(
         directory,
-        &BoundHostSpec {
-            admission: super::bound_host::Admission::MetadataFirst,
-            name: BINDING.host,
-            metadata_context: Some(|directory| {
-                format!("failed to inspect {}", directory.display())
-            }),
-        },
+        &BoundHostSpec { name: BINDING.host },
         || {
             let tty = process::current_terminal_tty()?;
             let live = process::live_native_process_identity(std::process::id())?;
@@ -2536,14 +2530,17 @@ end run
         let private = launch_fixture();
         let link = root.path().join("session-link");
         std::os::unix::fs::symlink(private.path(), &link).unwrap();
-        refused(&link, "not private");
+        refused(&link, "refusing non-directory Terminal.app launch path");
 
         let unnamed = root.path().join("not-a-session");
         std::fs::create_dir(&unnamed).unwrap();
         crate::native::session::primitives::set_private_directory_permissions(&unnamed).unwrap();
         refused(&unnamed, "invalid Agent Bridge session id");
 
-        refused(&root.path().join("session-missing"), "failed to inspect");
+        refused(
+            &root.path().join("session-missing"),
+            "no such Terminal.app launch directory",
+        );
         assert_eq!(
             std::fs::read(shared.path().join(crate::native::session::launch::LOG)).unwrap(),
             log

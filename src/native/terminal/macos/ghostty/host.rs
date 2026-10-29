@@ -225,11 +225,7 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
     };
     super::super::bound_host::run_bound_host(
         directory,
-        &super::super::bound_host::BoundHostSpec {
-            name: "Ghostty",
-            metadata_context: None,
-            admission: super::super::bound_host::Admission::GhosttyFrame,
-        },
+        &super::super::bound_host::BoundHostSpec { name: "Ghostty" },
         |id| {
             let receipt = launch::read(&Reader::open_unchecked(directory))?
                 .context("missing Ghostty launch receipt")?;
