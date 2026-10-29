@@ -225,9 +225,10 @@ fn unwritable_consent_record_fails_create_and_marks_the_session_failed() {
     );
 }
 
-// Both starts resolve through one step; a row is what each command supplies to it. Linux
-// selects no terminal, which is the step's first operation, so the table runs where a
-// surface can be selected.
+// Both starts resolve through one step; a row is what each command supplies to it, the
+// terminal kind it selected included. The rows are platform-neutral; the table is kept to
+// the platforms where the whole start path, terminal selection included, runs, and it has
+// not run on Linux.
 #[cfg(any(target_os = "macos", windows))]
 mod resolution {
     use super::*;
@@ -238,6 +239,8 @@ mod resolution {
 
     const CHILD: &str = "TABCLI_START_RESOLUTION_CHILD";
     const SOURCE: &str = "session-source";
+    // The kind the command selected before the step; the step only carries it.
+    const SELECTED: terminal::TerminalKind = terminal::TerminalKind::WindowsConsole;
 
     #[derive(Clone, Copy, Debug)]
     enum Row {
@@ -279,7 +282,7 @@ mod resolution {
                         context_results: Vec::new(),
                     };
                     resolve_with(
-                        fresh_resolution(&request, context::resolve(&[]).unwrap()),
+                        fresh_resolution(&request, context::resolve(&[]).unwrap(), SELECTED),
                         probe,
                     )
                 }
@@ -297,7 +300,7 @@ mod resolution {
                         json: false,
                     };
                     resolve_with(
-                        reopen::resolution(&request, FirstPartyCli::Codex, workspace),
+                        reopen::resolution(&request, FirstPartyCli::Codex, workspace, SELECTED),
                         probe,
                     )
                 }
@@ -364,7 +367,6 @@ mod resolution {
                     .starts_with("session-")
             }));
         };
-        let expected_terminal = terminal::select(None).unwrap();
         let refused = |outcome: Result<Resolved>| outcome.err().expect("the row must refuse");
         for row in [Row::Fresh, Row::Reopen] {
             let noun = row.noun();
@@ -435,7 +437,7 @@ mod resolution {
             assert_eq!(resolved.spec.effort.as_deref(), Some("effort"));
             assert!(resolved.spec.yolo);
             assert_eq!(resolved.spec.prompt, "fixture prompt");
-            assert_eq!(resolved.terminal_kind, expected_terminal);
+            assert_eq!(resolved.terminal_kind, SELECTED);
             assert!(resolved.context_sources.is_empty());
             assert_ne!(resolved.consent.as_ref().unwrap().state, "alias");
             let resolved = row

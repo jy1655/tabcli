@@ -29,8 +29,8 @@ pub(super) struct StartOptions {
     pub(super) json: bool,
 }
 
-// Only `resolve` constructs one: a Resolved is the outcome of the seven operations below,
-// never of a caller's own assembly.
+// Only `resolve` constructs one: a Resolved is the outcome of the operations below, never of
+// a caller's own assembly.
 pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
     spec: SessionSpec,
@@ -164,8 +164,8 @@ impl DefaultTitle<'_> {
 }
 
 // What a fresh start and a reopen resolve differently; the resolution itself is the same
-// seven operations (`resolve`). `ask` fills it from its request, `reopen` from its request
-// and the closed source.
+// operations (`resolve`). `ask` fills it from its request, `reopen` from its request and the
+// closed source.
 pub(super) struct Resolution<'a> {
     pub(super) provider: FirstPartyCli,
     // The workspace as requested; the resolution canonicalizes it.
@@ -177,7 +177,9 @@ pub(super) struct Resolution<'a> {
     pub(super) effort: Option<String>,
     pub(super) yolo: bool,
     pub(super) prompt: String,
-    pub(super) terminal: Option<terminal::TerminalKind>,
+    // Selected by the command itself, at its own place in the command's order: `ask` after
+    // its context resolution, `reopen` before it inspects the source.
+    pub(super) terminal_kind: terminal::TerminalKind,
     pub(super) context_sources: Vec<requests::ContextSource>,
     // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
     pub(super) workspace_noun: &'static str,
@@ -186,9 +188,10 @@ pub(super) struct Resolution<'a> {
     pub(super) admission_refusal: fn(anyhow::Error) -> anyhow::Error,
 }
 
-// The launchable spec of a start, in this order: terminal selection, the canonical
-// workspace directory, state root and launch admission, provider executable and version,
-// title, and workspace consent. Nothing is created, so a failure changes nothing.
+// The launchable spec of a start, after the command selected its terminal, in this order:
+// the canonical workspace directory, state root and launch admission, provider executable
+// and version, title, and workspace consent. Nothing is created, so a failure changes
+// nothing.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
     resolve_with(resolution, |provider| {
         let provider_path = resolve_provider(provider)?;
@@ -214,12 +217,11 @@ pub(super) fn resolve_with(
         effort,
         yolo,
         prompt,
-        terminal,
+        terminal_kind,
         context_sources,
         workspace_noun,
         admission_refusal,
     } = resolution;
-    let terminal_kind = terminal::select(terminal)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -273,7 +275,8 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
-    resolve(fresh_resolution(request, attached), deadline)
+    let terminal_kind = terminal::select(request.terminal)?;
+    resolve(fresh_resolution(request, attached, terminal_kind), deadline)
 }
 
 // A fresh start's resolution: consent sees the workspace as requested, the default title
@@ -282,6 +285,7 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
 pub(super) fn fresh_resolution(
     request: &AskRequest,
     attached: context::ResolvedContext,
+    terminal_kind: terminal::TerminalKind,
 ) -> Resolution<'_> {
     Resolution {
         provider: request.provider,
@@ -293,7 +297,7 @@ pub(super) fn fresh_resolution(
         effort: request.effort.clone(),
         yolo: request.yolo,
         prompt: attached.prompt_with_attachments(&request.prompt),
-        terminal: request.terminal,
+        terminal_kind,
         context_sources: attached.sources,
         workspace_noun: "workspace",
         admission_refusal: std::convert::identity,

@@ -274,6 +274,7 @@ pub(super) fn resolution<'a>(
     request: &'a ReopenRequest,
     provider: FirstPartyCli,
     workspace: &'a Path,
+    terminal_kind: terminal::TerminalKind,
 ) -> session_start::Resolution<'a> {
     session_start::Resolution {
         provider,
@@ -287,7 +288,7 @@ pub(super) fn resolution<'a>(
         effort: request.effort.clone(),
         yolo: request.yolo,
         prompt: request.prompt.clone(),
-        terminal: request.terminal,
+        terminal_kind,
         context_sources: Vec::new(),
         workspace_noun: "source workspace",
         admission_refusal: |error| {
@@ -298,6 +299,7 @@ pub(super) fn resolution<'a>(
 
 impl ResolvedReopen {
     fn resolve(request: ReopenRequest, deadline: Instant) -> Result<Self> {
+        let terminal_kind = terminal::select(request.terminal)?;
         let source_directory = Reader::session_directory(&request.id)?;
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
@@ -312,7 +314,12 @@ impl ResolvedReopen {
         // The shared resolution fails before anything is created, so a failed consent
         // assessment leaves the source reopenable.
         let start = session_start::resolve(
-            resolution(&request, source.provider, &source.manifest.workspace),
+            resolution(
+                &request,
+                source.provider,
+                &source.manifest.workspace,
+                terminal_kind,
+            ),
             deadline,
         )?;
         Ok(Self {

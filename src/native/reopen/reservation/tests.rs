@@ -3906,9 +3906,9 @@ fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
 // Launch admission (#216) refuses a source whose workspace is the Codex memory workspace
 // before the new session exists: no marker, no refusal record, no new session, and the
 // source's bytes unchanged. Where Claude reopen is unsupported, that earlier gate still
-// refuses first; it is not evidence that admission passed. Linux selects no terminal, which
-// the shared resolution does before admission, with an error that names no gate, so the
-// test runs where a surface can be selected.
+// refuses first; it is not evidence that admission passed. Linux fails terminal selection
+// before either gate, with an error that names no gate, so the test runs where a surface
+// can be selected.
 #[cfg(any(target_os = "macos", windows))]
 #[test]
 fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_source() {
