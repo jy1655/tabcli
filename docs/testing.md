@@ -71,12 +71,20 @@ the production `SystemClock`, and the test-only `FakeClock`, whose `sleep` advan
 simulated instant and whose shared handle lets a hook or a log reader move it from outside.
 Tests inject it into the workspace trust wait, Agy's readiness gate and receipt wait, the Claude
 messenger, the Codex queue's bounded send, legacy Codex submission polling, Windows console
-input drain, read-only Request polling in `wait` and `result --wait`, the Origin observation
-environment (which also carries the process attester), the macOS launch binding wait, and the
+input drain, read-only Request polling in `wait` and `result --wait`, the Status scan and its
+Session observation and snapshot retries, the Origin observation environment (which also carries
+the process attester), the macOS launch binding wait, and the
 close scope. The close deadline stays an ambient scope by design, because record primitives and
 the AppleScript diagnostics read it without a parameter; the scope's clock is a field of that
 scope, set only by tests, and `close_now` reads it or the system clock. No production path
 branches on `cfg(test)` for time.
+
+Status shares one clock with its snapshot retries and Origin observations. Its budget tests
+keep real Readers and locks, advance the fake clock through the existing observation hooks,
+and check which sessions remain listed or receive a busy or budget-exhausted reason. They
+preserve the first snapshot attempt even after its deadline, and retain an already-read
+session when its Origin observation consumes the remaining scan budget. Ordinary queries
+keep their system clock, publication policy and 250 ms snapshot retry window.
 
 The deterministic race hooks are the declared test adapter at the record seam that the
 reproduction rule above needs: the fault budget, the sync log and sync failures, the publication

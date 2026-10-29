@@ -1,5 +1,6 @@
 //! Read-only views of durable session records. Never recover, send, or close here.
 use super::args::{option_value, parse_timeout, set_flag_once, set_once};
+use super::clock::{Clock, SystemClock};
 use super::envelope;
 use super::provider::{self, QuestionEmissions, QuestionObservation};
 use super::{DEFAULT_TIMEOUT_SECS, NativeCommand, consent, terminal};
@@ -15,12 +16,12 @@ use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, checked_deadline_from, termina
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
+use std::fs;
 #[cfg(test)]
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 mod inspect;
 pub(super) mod observation;
@@ -253,26 +254,23 @@ fn snapshot_retry_window() -> Duration {
 /// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]; every attempt decides a journaled
 /// event's publication as `publication` says.
 fn observe_snapshot_with(reader: &Reader, publication: PublicationRead) -> Result<Snapshot> {
-    observe_snapshot_until(
-        reader,
-        publication,
-        Instant::now() + snapshot_retry_window(),
-    )
+    let mut clock = SystemClock;
+    let deadline = clock.now() + snapshot_retry_window();
+    observe_snapshot_until(reader, publication, deadline, &mut clock)
 }
 
 fn observe_snapshot_until(
     reader: &Reader,
     publication: PublicationRead,
     deadline: Instant,
+    clock: &mut dyn Clock,
 ) -> Result<Snapshot> {
-    let deadline = deadline.min(Instant::now() + snapshot_retry_window());
+    let deadline = deadline.min(clock.now() + snapshot_retry_window());
     loop {
         match reader.snapshot_with(publication) {
-            Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
-                thread::sleep(
-                    Duration::from_millis(25)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
+            Err(error) if error.is::<SnapshotBusy>() && clock.now() < deadline => {
+                let remaining = deadline.saturating_duration_since(clock.now());
+                clock.sleep(Duration::from_millis(25).min(remaining));
             }
             outcome => return outcome,
         }

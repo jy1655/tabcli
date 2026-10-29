@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::clock::FakeClock;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::session::ResidualSurface;
 use crate::native::session::owner::ControlAttestation::{self, *};
@@ -9,9 +10,14 @@ use observation::judgment::tests::{CLAIM, SESSION, attestation, evidence, receip
 use observation::judgment::{IndexIncomplete, Judgments, Surface, SurfaceSource, UnreadablePart};
 
 fn read(reader: &Reader) -> StatusObservation {
-    Observation::read_for_status(reader, Instant::now() + SEARCH_TIME_BUDGET, true)
-        .unwrap()
-        .unwrap()
+    Observation::read_for_status(
+        reader,
+        Instant::now() + SEARCH_TIME_BUDGET,
+        true,
+        &mut SystemClock,
+    )
+    .unwrap()
+    .unwrap()
 }
 
 fn origin(ended: Option<bool>) -> OriginObservation {
@@ -451,27 +457,184 @@ fn many_busy_sessions_share_remaining_budget_and_each_gets_a_reason() {
         lock.lock().unwrap();
         locks.push(lock);
     }
-    // Allow enumeration and the first manifest read to reach the busy lock even
-    // on a slow host. That lock deliberately consumes the two-second budget.
-    let started = Instant::now();
-    let value = with_snapshot_retry_window(Duration::from_secs(5), || {
-        value_in(root.path(), &all(), Duration::from_secs(2))
-    })
-    .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert_eq!(value["scanned"], json!({"sessions":1,"listed":0}));
-    let reasons = value["incomplete_reasons"].as_array().unwrap();
-    assert_eq!(reasons.len(), 8);
-    assert!(reasons[0]["reason"].as_str().unwrap().contains("busy"));
-    for (index, reason) in reasons.iter().enumerate().skip(1) {
-        assert_eq!(reason["session"], format!("session-busy{index}"));
-        assert!(
-            reason["reason"]
-                .as_str()
-                .unwrap()
-                .contains("budget exhausted")
-        );
+    for (retry_window, budget, scanned) in [
+        (Duration::from_secs(5), Duration::from_secs(2), 1),
+        (SNAPSHOT_RETRY_WINDOW, Duration::from_millis(400), 2),
+    ] {
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let value = with_snapshot_retry_window(retry_window, || {
+            value_in_with_clock(root.path(), &all(), budget, &mut clock)
+        })
+        .unwrap();
+        assert_eq!(clock.slept, budget);
+        assert_eq!(clock.now(), start + budget);
+        assert_eq!(value["scanned"], json!({"sessions":scanned,"listed":0}));
+        let reasons = value["incomplete_reasons"].as_array().unwrap();
+        assert_eq!(reasons.len(), 8);
+        for (index, reason) in reasons.iter().enumerate() {
+            assert_eq!(reason["session"], format!("session-busy{index}"));
+            let expected = if index < scanned {
+                "busy"
+            } else {
+                "budget exhausted"
+            };
+            assert!(reason["reason"].as_str().unwrap().contains(expected));
+        }
     }
+}
+
+#[test]
+fn snapshot_retry_keeps_its_first_read_after_the_deadline() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    for busy in [false, true] {
+        let fixture = seed_close_fixture(JournaledEventState::Committed);
+        let reader = Reader::open_unchecked(&fixture.directory);
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let attempts = Rc::new(Cell::new(0));
+        let observed_attempts = Rc::clone(&attempts);
+        let result = with_snapshot_hook(
+            move |directory| {
+                observed_attempts.set(observed_attempts.get() + 1);
+                if busy {
+                    let path = directory.join("status.json");
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes.push(b' ');
+                    fs::write(path, bytes).unwrap();
+                }
+            },
+            || {
+                observe_snapshot_until(
+                    &reader,
+                    PublicationRead::Within(EVENT_READ_LIMIT),
+                    start - Duration::from_millis(1),
+                    &mut clock,
+                )
+            },
+        );
+        if busy {
+            assert!(result.err().unwrap().is::<SnapshotBusy>());
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
+}
+
+#[test]
+fn status_observation_checks_deadline_before_and_after_event_decode() {
+    for expire_at_snapshot in [true, false] {
+        let fixture = seed_close_fixture(JournaledEventState::Committed);
+        // The active Request needs a second decode if the latest Result leaves time.
+        write_json_atomic(
+            &fixture.directory.join("events/event-zz.json"),
+            &json!({"provider":"codex","message":"later legacy result","error":null,
+                "provider_session_id":null,"turn_id":null,"created_unix_ms":2}),
+        )
+        .unwrap();
+        let mut clock = FakeClock::new(Instant::now());
+        let budget = Duration::from_millis(50);
+        let deadline = clock.now() + budget;
+        let snapshot_time = clock.shared();
+        let event_time = clock.shared();
+        let (value, reads) = with_event_read_count(|| {
+            with_snapshot_hook(
+                move |_| {
+                    if expire_at_snapshot {
+                        snapshot_time.set(deadline);
+                    }
+                },
+                || {
+                    with_event_read_hook(
+                        move |_| {
+                            if !expire_at_snapshot {
+                                event_time.set(deadline);
+                            }
+                        },
+                        || {
+                            value_in_with_clock(
+                                fixture.directory.parent().unwrap(),
+                                &all(),
+                                budget,
+                                &mut clock,
+                            )
+                            .unwrap()
+                        },
+                    )
+                },
+            )
+        });
+        assert_eq!(reads, usize::from(!expire_at_snapshot));
+        assert_eq!(value["scanned"], json!({"sessions":1,"listed":0}));
+        assert_eq!(
+            value["incomplete_reasons"],
+            json!([{"session":"session-fault","reason":"status time budget exhausted"}])
+        );
+        assert_eq!(clock.now(), deadline);
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
+}
+
+#[test]
+fn origin_consumes_the_remaining_scan_budget_without_discarding_the_session() {
+    use session::origin::tests::{Checkpoint, Hooks, Session};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    let root = tempfile::tempdir().unwrap();
+    Session::started_from(root.path(), "session-a", "ready", "session-z");
+    Session::new(root.path(), "session-b", "ready");
+    Session::new(root.path(), "session-z", "ready");
+    let start = Instant::now();
+    let mut clock = FakeClock::new(start);
+    let snapshot_time = clock.shared();
+    let origin_time = clock.shared();
+    let reads = Rc::new(RefCell::new(Vec::new()));
+    let observed_reads = Rc::clone(&reads);
+    let origin_reads = Rc::new(Cell::new(0));
+    let observed_origin_reads = Rc::clone(&origin_reads);
+    let hooks = Hooks::new();
+    hooks.checkpoint(move |point, directory| {
+        assert_eq!(point, Checkpoint::OriginRead);
+        assert_eq!(directory.file_name().unwrap(), "session-z");
+        observed_origin_reads.set(observed_origin_reads.get() + 1);
+        assert_eq!(origin_time.get(), start + Duration::from_millis(10));
+        // The Origin's own 100 ms allowance is longer than the 40 ms left in the scan.
+        origin_time.set(origin_time.get() + Duration::from_millis(40));
+    });
+    let value = with_snapshot_hook(
+        move |directory| {
+            observed_reads
+                .borrow_mut()
+                .push(directory.file_name().unwrap().to_str().unwrap().to_owned());
+            snapshot_time.set(snapshot_time.get() + Duration::from_millis(10));
+        },
+        || value_in_with_clock(root.path(), &all(), Duration::from_millis(50), &mut clock),
+    )
+    .unwrap();
+    assert_eq!(*reads.borrow(), ["session-a"]);
+    assert_eq!(origin_reads.get(), 1);
+    assert_eq!(value["scanned"], json!({"sessions":1,"listed":1}));
+    assert_eq!(value["sessions"][0]["id"], "session-a");
+    assert_eq!(value["sessions"][0]["origin"], "session-z");
+    assert_eq!(
+        value["sessions"][0]["origin_observation"]["reason"],
+        "origin_budget_exhausted"
+    );
+    assert!(value["sessions"][0]["origin_observation"]["ended"].is_null());
+    assert_eq!(
+        value["incomplete_reasons"],
+        json!([
+            {"session":"session-b","reason":"status time budget exhausted"},
+            {"session":"session-z","reason":"status time budget exhausted"}
+        ])
+    );
+    assert_eq!(clock.now(), start + Duration::from_millis(50));
+    assert_eq!(clock.slept, Duration::ZERO);
 }
 
 #[test]
@@ -504,7 +667,13 @@ fn closed_filter_precedes_event_decode_and_tombstone_shape_stays_distinct() {
     status["state"] = json!("closed");
     write_json_atomic(&fixture.directory.join("status.json"), &status).unwrap();
     let (observed, reads) = with_event_read_count(|| {
-        Observation::read_for_status(&reader, Instant::now() + SEARCH_TIME_BUDGET, false).unwrap()
+        Observation::read_for_status(
+            &reader,
+            Instant::now() + SEARCH_TIME_BUDGET,
+            false,
+            &mut SystemClock,
+        )
+        .unwrap()
     });
     assert!(observed.is_none());
     assert_eq!(reads, 0);
