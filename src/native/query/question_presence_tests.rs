@@ -190,3 +190,30 @@ fn status_counts_the_focus_request_and_closed_sessions_keep_no_attention() {
     assert_eq!(closed["latest_result"]["question_emission_count"], 2);
     assert!(!has_attention(&closed));
 }
+
+#[test]
+fn status_keeps_question_evidence_when_the_latest_event_disappears_before_decode() {
+    let root = tempfile::tempdir().unwrap();
+    let (directory, claim) = session(root.path());
+    let receipt = claim.receipt().clone();
+    let token = claim.token().to_owned();
+    claim.retain();
+    record(&directory, &receipt, true);
+    complete(&directory, &token);
+    let (value, reads) = with_event_read_count(|| {
+        with_event_read_hook(
+            |path| fs::remove_file(path).unwrap(),
+            || status::test_value_in(root.path())["sessions"][0].clone(),
+        )
+    });
+    assert_eq!(reads, 1);
+    assert!(value["active_request"].is_null());
+    assert!(value["latest_result"].is_null());
+    assert!(value["result_command"].is_null());
+    assert_eq!(value["question_observation"], "incomplete");
+    let attention = value["attention"].as_array().unwrap();
+    assert!(attention.contains(&json!("question_emitted")));
+    assert!(!attention.contains(&json!("records_partially_unreadable")));
+    assert!(value.get("question_emission_count").is_none());
+    assert!(value.get("question_emissions").is_none());
+}

@@ -12,7 +12,7 @@ use observation::judgment::{
     self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
     ResultCandidate, Turn,
 };
-use observation::{Observation, StatusObservation};
+use observation::{Observation, QuestionFocus, StatusObservation};
 
 #[derive(Debug)]
 pub(crate) struct StatusRequest {
@@ -134,7 +134,7 @@ fn attention(
         if observed
             .questions
             .as_ref()
-            .is_some_and(|q| !q.items.is_empty())
+            .is_some_and(|q| !q.emissions.items.is_empty())
         {
             flags.push("question_emitted");
         }
@@ -146,7 +146,7 @@ fn attention(
         || observed
             .questions
             .as_ref()
-            .is_some_and(|q| q.observation == QuestionObservation::Unreadable)
+            .is_some_and(|q| q.emissions.observation == QuestionObservation::Unreadable)
     {
         flags.push("records_partially_unreadable");
     }
@@ -189,20 +189,24 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
     let records = &observation.records;
     let judgments = &observation.judgments;
     // The latest Result status has already decoded; nothing more is decoded (D16).
-    let latest_event = observed
-        .latest
-        .as_ref()
-        .ok()
-        .and_then(|latest| latest["event_id"].as_str());
+    let latest = observed.latest.as_ref().ok().and_then(Option::as_ref);
+    let latest_event = latest.and_then(|latest| latest.event_id.as_deref());
     let command = result_command(judgment::result_candidate(records, latest_event), id);
     let manifest = &records.manifest;
     let active = observation.active_request().map(|receipt| {
-        let value = observed.active.as_ref().and_then(|active| active.as_ref().ok());
+        let active = observed
+            .active
+            .as_ref()
+            .and_then(|active| active.as_ref().ok());
         json!({"request_id": receipt.request_id,
-            "request_state": value.map(|v| &v["request_state"]),
-            "bridge_observed_elapsed_ms": value.map(|v| &v["bridge_observed_elapsed_ms"]),
-            "bridge_observed_elapsed_reason": value.map(|v| v["bridge_observed_elapsed_reason"].clone())
-                .unwrap_or_else(|| json!("unreadable_result"))})
+            "request_state": active.map(|active| active.state),
+            "bridge_observed_elapsed_ms": active.and_then(|active| active.elapsed_ms),
+            "bridge_observed_elapsed_reason": active.map(|active| active.elapsed_reason)
+                .unwrap_or(Some("unreadable_result"))})
+    });
+    let latest = latest.map(|latest| {
+        json!({"event_id": latest.event_id, "request_id": latest.request_id,
+            "request_state": latest.state, "created_unix_ms": latest.created_unix_ms})
     });
     let mut value = json!({
         "id": id, "provider": manifest.provider, "workspace": manifest.workspace,
@@ -212,20 +216,19 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
         "error": records.status.error, "turn_claimed": records.claim.is_some(),
         "recovery_required": judgments.recovery_required, "unreadable_requests": records.unreadable_requests,
         "request_index_error": records.request_index_error,
-        "active_request": active, "latest_result": observed.latest.as_ref().ok(),
+        "active_request": active, "latest_result": latest,
         "owner": owner, "attention": flags, "derived_from": "observation", "result_command": command,
     });
     session::hold::add_fields(&mut value, &observation.evidence.held);
     if let Some(questions) = &observed.questions {
-        question_observation(&mut value, questions);
+        question_observation(&mut value, &questions.emissions);
         // The count describes the focus Request, closed sessions included; attention does not.
-        let focus = if records.claim.is_some() {
-            "active_request"
-        } else {
-            "latest_result"
+        let focus = match questions.focus {
+            QuestionFocus::ActiveRequest => "active_request",
+            QuestionFocus::LatestResult => "latest_result",
         };
         if value[focus].is_object() {
-            question_count(&mut value[focus], questions);
+            question_count(&mut value[focus], &questions.emissions);
         }
     }
     if let Some(residual) = judgments.residual_surface {
