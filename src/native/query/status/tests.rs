@@ -168,13 +168,13 @@ fn status_maps_each_judgment_to_its_documented_output() {
     observed.observation.judgments.residual_surface = Some(ResidualSurface::Unverified);
     assert_eq!(flags(&observed, None), ["residual_surface_unverified"]);
     observed.observation.judgments.residual_surface = None;
-    for (ended, expected) in [
-        (Ended::Failed, vec!["session_failed"]),
-        (Ended::Exited, vec!["session_exited"]),
-        (Ended::Neither, vec![]),
+    for (lifecycle, expected) in [
+        (Lifecycle::Failed, vec!["session_failed"]),
+        (Lifecycle::Exited, vec!["session_exited"]),
+        (Lifecycle::Other, vec![]),
     ] {
-        observed.observation.judgments.ended = ended;
-        assert_eq!(flags(&observed, None), expected, "{ended:?}");
+        observed.observation.judgments.lifecycle = lifecycle;
+        assert_eq!(flags(&observed, None), expected, "{lifecycle:?}");
     }
     // Status's own two reads join the unreadable parts (D12).
     observed.latest = Err(anyhow::anyhow!("latest"));
@@ -274,14 +274,14 @@ fn status_maps_each_judgment_to_its_documented_output() {
         );
     }
     // A closed session has neither owner nor origin attention.
-    observed.observation.records.status.state = SessionState::Closed;
+    observed.observation.judgments.lifecycle = Lifecycle::Closed;
     for (owner, _, _) in &owner_rows {
         assert!(
             attention(&observed, owner, &origin(Some(true))).is_empty(),
             "{owner:?}"
         );
     }
-    observed.observation.records.status.state = SessionState::Working;
+    observed.observation.judgments.lifecycle = Lifecycle::Other;
 
     // Every flag at once, in the documented order.
     let judgments = &mut observed.observation.judgments;
@@ -298,7 +298,7 @@ fn status_maps_each_judgment_to_its_documented_output() {
         error: None,
     });
     judgments.residual_surface = Some(ResidualSurface::Unverified);
-    judgments.ended = Ended::Failed;
+    judgments.lifecycle = Lifecycle::Failed;
     assert_eq!(
         attention(&observed, &owner_rows[0].0, &origin(Some(true))),
         [

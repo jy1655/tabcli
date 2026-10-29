@@ -221,19 +221,23 @@ pub(in crate::native) fn residual_surface(records: &Snapshot) -> Option<Residual
     records.status.residual_surface()
 }
 
-/// How the stored state says the session ended, when it did.
+/// The stored lifecycle verdict, independent of owner and surface observations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::native) enum Ended {
+pub(in crate::native) enum Lifecycle {
+    Ready,
+    Closed,
     Failed,
     Exited,
-    Neither,
+    Other,
 }
 
-pub(in crate::native) fn ended(records: &Snapshot) -> Ended {
+pub(in crate::native) fn lifecycle(records: &Snapshot) -> Lifecycle {
     match records.status.state {
-        SessionState::Failed => Ended::Failed,
-        SessionState::Exited => Ended::Exited,
-        _ => Ended::Neither,
+        SessionState::Ready => Lifecycle::Ready,
+        SessionState::Closed => Lifecycle::Closed,
+        SessionState::Failed => Lifecycle::Failed,
+        SessionState::Exited => Lifecycle::Exited,
+        _ => Lifecycle::Other,
     }
 }
 
@@ -476,7 +480,7 @@ pub(in crate::native) struct Judgments {
     pub(in crate::native) recovery_required: bool,
     pub(in crate::native) request_index: Option<IndexIncomplete>,
     pub(in crate::native) residual_surface: Option<ResidualSurface>,
-    pub(in crate::native) ended: Ended,
+    pub(in crate::native) lifecycle: Lifecycle,
     pub(in crate::native) hold: Hold,
     pub(in crate::native) cancel: Cancel,
     pub(in crate::native) surface: Surface,
@@ -509,7 +513,7 @@ impl Judgments {
             recovery_required: recovery_required(records),
             request_index,
             residual_surface: residual_surface(records),
-            ended: ended(records),
+            lifecycle: lifecycle(records),
             hold: hold(
                 &evidence.held,
                 evidence.close_tombstone.as_ref(),
@@ -923,7 +927,7 @@ pub(in crate::native) mod tests {
     }
 
     #[test]
-    fn claim_receipt_journal_index_residual_and_ended_rows() {
+    fn claim_receipt_journal_index_residual_and_lifecycle_rows() {
         let mut records = snapshot(SessionState::Working);
         assert!(!claim_without_receipt(&records));
         records.claim = Some(CLAIM.to_owned());
@@ -987,14 +991,20 @@ pub(in crate::native) mod tests {
         }
 
         for (state, expected) in [
-            (SessionState::Failed, Ended::Failed),
-            (SessionState::Exited, Ended::Exited),
-            (SessionState::Working, Ended::Neither),
-            (SessionState::Closed, Ended::Neither),
-            (SessionState::Unknown("odd".into()), Ended::Neither),
+            (SessionState::Ready, Lifecycle::Ready),
+            (SessionState::Failed, Lifecycle::Failed),
+            (SessionState::Exited, Lifecycle::Exited),
+            (SessionState::Launching, Lifecycle::Other),
+            (SessionState::Running, Lifecycle::Other),
+            (SessionState::AwaitingInitialInput, Lifecycle::Other),
+            (SessionState::Claimed, Lifecycle::Other),
+            (SessionState::Working, Lifecycle::Other),
+            (SessionState::ResumePending, Lifecycle::Other),
+            (SessionState::Closed, Lifecycle::Closed),
+            (SessionState::Unknown("odd".into()), Lifecycle::Other),
         ] {
             records.status.state = state.clone();
-            assert_eq!(ended(&records), expected, "{state:?}");
+            assert_eq!(lifecycle(&records), expected, "{state:?}");
         }
     }
 
@@ -1484,7 +1494,7 @@ pub(in crate::native) mod tests {
             })
         );
         assert_eq!(judgments.residual_surface, None);
-        assert_eq!(judgments.ended, Ended::Neither);
+        assert_eq!(judgments.lifecycle, Lifecycle::Other);
         assert_eq!(
             judgments.hold,
             Hold::Held {

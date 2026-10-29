@@ -2269,3 +2269,108 @@ fn stale_and_duplicate_reports_never_rewrite_winning_provenance_in_either_order(
         }
     }
 }
+
+#[test]
+fn claim_currency_policy_table_and_locked_execution() {
+    use ClaimState::{Any, NotEnded, Turn};
+    use ClaimTombstone::{Ignored, Refused};
+    let states = [
+        (SessionState::Launching, true, false),
+        (SessionState::Running, true, true),
+        (SessionState::AwaitingInitialInput, true, false),
+        (SessionState::Ready, true, false),
+        (SessionState::Claimed, true, false),
+        (SessionState::Working, true, true),
+        (SessionState::ResumePending, true, true),
+        (SessionState::Exited, false, false),
+        (SessionState::Failed, false, false),
+        (SessionState::Closed, false, false),
+        (SessionState::Unknown("future-state".into()), true, false),
+    ];
+    for (state, not_ended, turn) in states {
+        let (_directory, store) = fixture(state.clone());
+        fs::write(store.record(CoreRecord::TurnClaim).path(), b"expected\n").unwrap();
+        for (policy, accepted) in [(Any, true), (NotEnded, not_ended), (Turn, turn)] {
+            let guard = ClaimCurrency {
+                expected: Some("expected"),
+                state: policy,
+                tombstone: Ignored,
+                expires: None,
+            };
+            assert_eq!(
+                guard.check(&store).unwrap(),
+                if accepted {
+                    Ok(())
+                } else {
+                    Err(StaleClaim::State(state.clone()))
+                }
+            );
+        }
+    }
+    let (_directory, store) = fixture(SessionState::Working);
+    let mut guard = ClaimCurrency {
+        expected: Some("expected"),
+        state: Any,
+        tombstone: Ignored,
+        expires: None,
+    };
+    for token in [None, Some("successor")] {
+        if let Some(token) = token {
+            fs::write(store.record(CoreRecord::TurnClaim).path(), token.as_bytes()).unwrap();
+        }
+        assert_eq!(guard.check(&store).unwrap(), Err(StaleClaim::Changed));
+        assert_eq!(
+            guard.run(&store, || panic!("stale claim wrote")).unwrap(),
+            Err::<(), _>(StaleClaim::Changed)
+        );
+    }
+    fs::write(store.record(CoreRecord::TurnClaim).path(), b"expected").unwrap();
+    for expiry in [None, Some(u128::MAX), Some(0)] {
+        guard.expires = expiry;
+        assert_eq!(
+            guard.check(&store).unwrap(),
+            if expiry == Some(0) {
+                Err(StaleClaim::Expired)
+            } else {
+                Ok(())
+            }
+        );
+    }
+    guard.expires = None;
+    store
+        .record(CoreRecord::Closed)
+        .write_json(&store.status().unwrap())
+        .unwrap();
+    for (policy, verdict) in [(Ignored, Ok(())), (Refused, Err(StaleClaim::Tombstone))] {
+        guard.tombstone = policy;
+        assert_eq!(guard.check(&store).unwrap(), verdict);
+    }
+    guard.tombstone = Ignored;
+    let lock = store.lock().unwrap();
+    assert_eq!(
+        guard
+            .try_run(&store, || panic!("busy claim wrote"))
+            .unwrap(),
+        Err::<(), _>(StaleClaim::Busy)
+    );
+    drop(lock);
+    assert_eq!(
+        guard
+            .run(&store, || {
+                assert!(store.try_lock()?.is_none());
+                Ok(42)
+            })
+            .unwrap(),
+        Ok(42)
+    );
+    assert_eq!(
+        guard
+            .try_run(&store, || {
+                assert!(store.try_lock()?.is_none());
+                Ok(43)
+            })
+            .unwrap(),
+        Ok(43)
+    );
+    assert!(store.try_lock().unwrap().is_some());
+}

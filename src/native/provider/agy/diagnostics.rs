@@ -1,7 +1,6 @@
 use super::delivery::read_log_bytes;
-use super::monitor::{
-    ResultReader, brain_root, parse_conversation_id, pending_turn_log, validated_file_metadata,
-};
+use super::evidence::{only_user_input_carries, transcript_logs};
+use super::monitor::{ResultReader, brain_root, parse_conversation_id, pending_turn_log};
 use super::readiness::observe_startup;
 use super::receipt::{input_receipts, receipt_matches};
 use super::trust::workspace_trust_missing;
@@ -10,9 +9,7 @@ use super::{
     read_pending_turn,
 };
 use crate::native::session::{Reader, SessionState};
-use anyhow::{Context, Result};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader};
+use anyhow::Result;
 use std::path::Path;
 
 pub(super) fn workspace_trust_check(
@@ -192,19 +189,6 @@ fn input_receipt_check_for_platform(
     }))
 }
 
-// Observed once: Agy 1.3.0, 2026-10-07, issue #82. The line identifies a tool,
-// not its command or a documented approval lifecycle. Do not infer approval from
-// unrelated later log activity; this is a log observation, not a failure signal.
-pub(super) fn parse_tool_confirmation(line: &str) -> Option<&str> {
-    let (_, tail) = line.split_once("Surfacing tool confirmation: \"")?;
-    let (tool, step) = tail.split_once("\" at step ")?;
-    (!tool.is_empty()
-        && tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !step.is_empty()
-        && step.bytes().all(|c| c.is_ascii_digit()))
-    .then_some(tool)
-}
-
 pub(super) fn tool_confirmation_check(
     directory: &Path,
     env: &super::super::super::consent::Environment,
@@ -268,7 +252,7 @@ fn pending_tool_confirmation(directory: &Path, brain: &Path) -> Result<Option<(S
     let Some(id) = parse_conversation_id(&log) else {
         return Ok(None);
     };
-    let logs = brain.join(id).join(".system_generated").join("logs");
+    let logs = transcript_logs(brain, &id);
     let full = logs.join(FULL_TRANSCRIPT_FILE);
     if !observed.pasted && !only_user_input_carries(&full, brain, &pending.marker)? {
         return Ok(None);
@@ -284,34 +268,6 @@ fn pending_tool_confirmation(directory: &Path, brain: &Path) -> Result<Option<(S
         return Ok(None);
     }
     Ok(Some((tool, receipt.request_id.clone())))
-}
-
-pub(super) fn only_user_input_carries(
-    path: &Path,
-    brain_root: &Path,
-    marker: &str,
-) -> Result<bool> {
-    if validated_file_metadata(path, brain_root)?.is_none() {
-        return Ok(false);
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .with_context(|| format!("failed to read full Agy transcript: {}", path.display()))?;
-    let (mut inputs, mut carries) = (0_usize, false);
-    for line in BufReader::new(file).lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line?) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("USER_INPUT") {
-            inputs += 1;
-            carries = value
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|content| content.contains(marker));
-        }
-    }
-    Ok(inputs == 1 && carries)
 }
 
 #[cfg(test)]

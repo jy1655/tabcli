@@ -1,5 +1,6 @@
 //! A read-only projection of retained evidence, not a history of inferred transitions.
 use super::*;
+use crate::native::query::request::RequestState;
 use crate::native::session::EventsDirectory;
 use crate::native::session::record::{self, Cached, CachedRecords as Records};
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
@@ -366,7 +367,7 @@ fn request_summaries(
             Err(error) => {
                 *incomplete = true;
                 json!({"request_id": receipt.request_id, "event_id": receipt.event_file,
-                    "request_state": "unknown", "delivery": "unknown", "error": format!("{error:#}"),
+                    "request_state": RequestState::Unknown, "delivery": "unknown", "error": format!("{error:#}"),
                     "result_command": format!("{PUBLIC_COMMAND} result {id} --request {} --json", receipt.request_id)})
             }
         };

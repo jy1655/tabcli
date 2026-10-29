@@ -9,8 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum RequestState {
     Completed,
     Failed,
@@ -19,10 +18,13 @@ pub(in crate::native) enum RequestState {
     Pending,
     Unresolved,
     Unavailable,
+    Accepted,
+    Unknown,
+    Busy,
 }
 
 impl RequestState {
-    pub(in crate::native) fn as_str(self) -> &'static str {
+    pub(in crate::native) fn name(self) -> &'static str {
         match self {
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -31,7 +33,63 @@ impl RequestState {
             Self::Pending => "pending",
             Self::Unresolved => "unresolved",
             Self::Unavailable => "unavailable",
+            Self::Accepted => "accepted",
+            Self::Unknown => "unknown",
+            Self::Busy => "busy",
         }
+    }
+
+    pub(in crate::native) fn ends_wait(self) -> bool {
+        match self {
+            Self::Completed
+            | Self::Cancelled
+            | Self::Failed
+            | Self::Unresolved
+            | Self::RecoveryRequired => true,
+            Self::Pending | Self::Unavailable | Self::Accepted | Self::Unknown | Self::Busy => {
+                false
+            }
+        }
+    }
+
+    pub(in crate::native) fn is_success(self) -> bool {
+        match self {
+            Self::Completed => true,
+            Self::Failed
+            | Self::Cancelled
+            | Self::RecoveryRequired
+            | Self::Pending
+            | Self::Unresolved
+            | Self::Unavailable
+            | Self::Accepted
+            | Self::Unknown
+            | Self::Busy => false,
+        }
+    }
+
+    pub(in crate::native) fn refusal_text(self) -> &'static str {
+        match self {
+            Self::Cancelled => "request was cancelled without a successful result",
+            Self::Unavailable => "no published result is available for this selection",
+            Self::RecoveryRequired => {
+                "completion publication requires recovery; run sessions for this workspace, then query again"
+            }
+            Self::Completed
+            | Self::Failed
+            | Self::Pending
+            | Self::Unresolved
+            | Self::Accepted
+            | Self::Unknown
+            | Self::Busy => {
+                "request ended without a published successful result; inspect the session before sending another prompt"
+            }
+        }
+    }
+}
+
+impl Serialize for RequestState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
     }
 }
 
@@ -99,7 +157,7 @@ impl RequestObservation<'_> {
         let refuse = |state, detail| AttachmentFailure { state, detail };
         let unreadable = |detail| refuse("unreadable", Some(detail));
         if self.state != RequestState::Completed || self.event.is_none() || self.error.is_some() {
-            return Err(refuse(self.state.as_str(), None));
+            return Err(refuse(self.state.name(), None));
         }
         let event_id = self
             .event_id
@@ -134,7 +192,7 @@ impl RequestObservation<'_> {
         // retain their distinct readers. Do not substitute the lossy event above.
         let event = reader.event_strict(event_id).map_err(unreadable)?;
         if event.cancelled || event.error.is_some() {
-            return Err(refuse("failed", None));
+            return Err(refuse(RequestState::Failed.name(), None));
         }
         let source = requests::ContextSource {
             mode: None,
@@ -159,12 +217,36 @@ pub(in crate::native) struct AttachmentFailure {
     pub(in crate::native) detail: Option<String>,
 }
 
+/// The event read used to judge elapsed time; successful callers can pass their optional event.
+pub(in crate::native) enum ElapsedEvent<'a> {
+    Read(Option<&'a SessionEvent>),
+    Unreadable,
+}
+
+impl<'a> From<Option<&'a SessionEvent>> for ElapsedEvent<'a> {
+    fn from(event: Option<&'a SessionEvent>) -> Self {
+        Self::Read(event)
+    }
+}
+
+impl<'a> From<Result<Option<&'a SessionEvent>, &anyhow::Error>> for ElapsedEvent<'a> {
+    fn from(event: Result<Option<&'a SessionEvent>, &anyhow::Error>) -> Self {
+        match event {
+            Ok(event) => Self::Read(event),
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
 // Bridge wall-clock time from receipt creation to the published completion event's
 // timestamp, including dispatch and delivery waits; never model or billing time.
-pub(in crate::native) fn observed_elapsed(
+pub(in crate::native) fn observed_elapsed<'a>(
     receipt: Option<&requests::Receipt>,
-    event: Option<&SessionEvent>,
+    event: impl Into<ElapsedEvent<'a>>,
 ) -> (Option<u128>, Option<&'static str>) {
+    let ElapsedEvent::Read(event) = event.into() else {
+        return (None, Some("unreadable_result"));
+    };
     let Some(event) = event else {
         return (None, Some("no_published_result"));
     };
@@ -356,9 +438,26 @@ impl Snapshot {
 
 #[cfg(test)]
 mod elapsed_tests {
-    use super::{elapsed_text, reported_usage, usage_text};
+    use super::{elapsed_text, observed_elapsed, reported_usage, usage_text};
     use crate::native::session::schema::{SessionEvent, USAGE_OMITTED_SIZE};
     use serde_json::json;
+
+    #[test]
+    fn elapsed_read_failure_is_distinct_from_absence() {
+        let error = anyhow::anyhow!("invalid event");
+        assert_eq!(
+            observed_elapsed(None, Err(&error)),
+            (None, Some("unreadable_result"))
+        );
+        assert_eq!(
+            observed_elapsed(None, Ok(None)),
+            (None, Some("no_published_result"))
+        );
+        assert_eq!(
+            observed_elapsed(None, None),
+            observed_elapsed(None, Ok(None))
+        );
+    }
 
     #[test]
     fn human_usage_line_names_counts_runs_and_coverage() {
@@ -488,6 +587,69 @@ mod owner_tests {
             let adjusted = observation.with_owner(owner, ended);
             assert_eq!(adjusted.state(), state);
             assert_eq!(adjusted.error.as_deref(), Some(error));
+        }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::RequestState;
+
+    #[test]
+    fn only_recorded_wait_end_states_end_a_wait() {
+        for state in [
+            RequestState::Completed,
+            RequestState::Failed,
+            RequestState::Cancelled,
+            RequestState::Unresolved,
+            RequestState::RecoveryRequired,
+        ] {
+            assert!(state.ends_wait());
+        }
+        for state in [
+            RequestState::Pending,
+            RequestState::Unavailable,
+            RequestState::Accepted,
+            RequestState::Unknown,
+            RequestState::Busy,
+        ] {
+            assert!(!state.ends_wait());
+        }
+    }
+
+    #[test]
+    fn public_request_state_names_are_stable() {
+        use RequestState::*;
+        let states = [
+            Completed,
+            Failed,
+            Cancelled,
+            RecoveryRequired,
+            Pending,
+            Unresolved,
+            Unavailable,
+            Accepted,
+            Unknown,
+            Busy,
+        ];
+        for state in states {
+            let expected = match state {
+                Completed => "completed",
+                Failed => "failed",
+                Cancelled => "cancelled",
+                RecoveryRequired => "recovery_required",
+                Pending => "pending",
+                Unresolved => "unresolved",
+                Unavailable => "unavailable",
+                Accepted => "accepted",
+                Unknown => "unknown",
+                Busy => "busy",
+            };
+            assert_eq!(state.name(), expected);
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(expected)
+            );
         }
     }
 }

@@ -263,6 +263,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
   `query/request.rs` owns the Request observation, which precedes JSON rendering.
+  It owns the Request outcome vocabulary: terminality, success, refusal text, and public
+  `request_state` names.
   `with_owner` is the only adjustment of that observation, and only `wait` applies it.
   `query/search.rs` owns search with its budgets.
   Context attachment resolution uses the same
@@ -277,6 +279,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Cancel and Hold retain separate lock attempts and failure scopes, with the best-effort manifest
   read after both. Rendering partial evidence does not repair it or grant control authority.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules.
+  Stored lifecycle, owner verification, and elapsed-time reasons (including unreadable Results) are judged before rendering.
   Status carries owned active/latest summaries and the selected question focus to its renderer,
   without intermediate JSON or retained Result bodies. Missing and unreadable Results remain
   distinct observations, and the lifecycle lock is released before owner observation and rendering.
@@ -301,8 +304,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
   optional bounded probes. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
   `ResultTimeoutDiagnostic`) lives in `src/native/diagnostics.rs`; provider adapters and the
-  Reopen marker observation depend on it rather than on the command. `probe` stays in
-  `doctor` for now. Providers choose which observation can explain a result timeout;
+  Reopen marker observation depend on it rather than on the command. `process_env` owns `probe`
+  and the shared bounded executor, including optional output limits, process-tree containment,
+  and probe scratch working directories. Providers choose which observation can explain a result
+  timeout;
   `diagnostics` assembles that read and `self_test` bounds its execution. A diagnostic report is not
   proof of successful delivery. The report states its scope using the check inputs and existing
   observations.
@@ -420,6 +425,7 @@ describes storage locations, permissions, and retention.
 
 A request is the caller-facing address of one turn. A claim is its exclusive delivery right;
 a receipt binds that request to the claim and the event address chosen before delivery.
+The session layer owns the Claim-currency guard; adapters supply their policy and map its outcome.
 Only one claim may exist at a time. Provider-owned correlation decides whether a completion
 belongs to it; shared request identity does not replace that correlation.
 
@@ -444,6 +450,7 @@ Commands hold a Claim for Delivery and settlement; provider adapters report comp
 late delivery outcomes. Agy keeps its Result evidence reader inside its adapter: both the monitor
 and diagnostics resolve truncated transcript rows and correlate the complete body there, while
 only the monitor publishes the Result or records a subsequent failure.
+`agy/evidence.rs` owns the input-evidence rules read by both the monitor and doctor checks.
 
 ## Record and adapter seams
 
@@ -477,6 +484,7 @@ The native provider contract requires explicit launch configuration, initial del
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every
 provider. There is no default adapter that silently gives all CLIs the same transport. Launch
 plans also state which caller environment markers must be removed.
+Read-only question emissions and completion observations dispatch through the adapter like every other provider operation.
 
 The terminal seam binds a concrete surface to a session and reports whether delivery was known
 not to start or may have occurred. `terminal::ownership` checks the recorded owner against the

@@ -1,6 +1,6 @@
 use super::{GuardedDialogInput, StaleDialogClaim};
-use crate::native::session::{Store, primitives::unix_ms, turn};
-use anyhow::{Context, Result, bail};
+use crate::native::session::{Store, turn};
+use anyhow::{Result, bail};
 use std::{path::Path, time::Instant};
 
 pub(super) fn dispatch(
@@ -18,23 +18,26 @@ pub(super) fn dispatch(
 fn precheck(directory: &Path, input: &GuardedDialogInput, deadline: Instant) -> Result<()> {
     let store = Store::open_unchecked(directory);
     // A busy lifecycle must not extend the response deadline. No input has been sent.
-    let _lock = store.try_lock()?.context("session lifecycle is busy")?;
-    if let Some(expected) = &input.expected_claim
-        && turn::current_claim_token(&store)?.as_ref() != Some(expected)
-    {
-        bail!("workspace trust response claim changed or retired");
+    let verdict = (turn::ClaimCurrency {
+        expected: input.expected_claim.as_deref(),
+        state: turn::ClaimState::NotEnded,
+        tombstone: turn::ClaimTombstone::Ignored,
+        expires: input.expires_unix_ms,
+    })
+    .try_run(&store, || Ok(Instant::now() < deadline))?;
+    match verdict {
+        Ok(true) => Ok(()),
+        Err(turn::StaleClaim::Changed) => {
+            bail!("workspace trust response claim changed or retired")
+        }
+        Err(turn::StaleClaim::State(_) | turn::StaleClaim::Tombstone) => {
+            bail!("session ended before workspace trust response")
+        }
+        Ok(false) | Err(turn::StaleClaim::Expired) => {
+            bail!("workspace trust response deadline expired")
+        }
+        Err(turn::StaleClaim::Busy) => bail!("session lifecycle is busy"),
     }
-    if store.status()?.state.ended() {
-        bail!("session ended before workspace trust response");
-    }
-    if Instant::now() >= deadline
-        || input
-            .expires_unix_ms
-            .is_some_and(|expiry| unix_ms() >= expiry)
-    {
-        bail!("workspace trust response deadline expired");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
