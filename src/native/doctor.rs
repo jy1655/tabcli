@@ -2,21 +2,21 @@
 use super::args::{option_value, set_flag_once, set_once};
 use super::diagnostics::{Availability, Check, Context};
 use super::query::observation::judgment::{
-    self, ActiveHandle, BoundOwner, Cancel, Hold, OwnerJudgment, ResultCandidate, Surface,
-    SurfacePresence, SurfaceSource, Turn,
+    self, ActiveHandle, BoundOwner, Cancel, Hold, Lifecycle, OwnerJudgment, ResultCandidate,
+    Surface, SurfacePresence, SurfaceSource, Turn,
 };
 use super::query::observation::{Observation, PartialObservation, SessionEvidence};
 use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
 use crate::native::clock::SystemClock;
 use crate::native::process_env;
 use crate::native::query::request::RequestState;
+use crate::native::session::Reader;
 use crate::native::session::launch::wrapper::{
     is_executable, provider_version_text, resolve_provider,
 };
 use crate::native::session::origin::{OriginEnvironment, OriginObservation, SourceKind};
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
-use crate::native::session::{Reader, SessionState};
 use agent_bridge::PUBLIC_COMMAND;
 use agent_bridge::{FirstPartyCli, cli_version_is_supported, terminal_safe_text};
 use anyhow::{Result, bail};
@@ -444,7 +444,7 @@ pub(super) fn record_checks(
             origin.add_fields(observations);
             origin_check(
                 &origin,
-                observation.records.status.state == SessionState::Closed,
+                observation.judgments.lifecycle == Lifecycle::Closed,
                 id,
                 checks,
             );
@@ -664,7 +664,7 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
     ));
     checks.push(Check::new(
         "session_state",
-        if snapshot.status.state == SessionState::Ready {
+        if judgments.lifecycle == Lifecycle::Ready {
             Available
         } else {
             Unavailable
@@ -1122,14 +1122,14 @@ mod attestation_tests {
             CLAIM, SESSION, receipt, snapshot,
         };
         use crate::native::query::observation::judgment::{
-            CancelState, Ended, IndexIncomplete, SurfacePresence,
+            CancelState, IndexIncomplete, SurfacePresence,
         };
         use crate::native::query::request::RequestState;
         use crate::native::terminal::TerminalKind;
         use ControlAttestation::*;
 
         // session_checks: the turn, the completion, the index, the claim and the actions.
-        let mut records = snapshot(SessionState::Working);
+        let mut records = snapshot(crate::native::session::SessionState::Working);
         records.claim = Some(CLAIM.to_owned());
         records.receipts.push(receipt(CLAIM));
         let mut observation = observation(records);
@@ -1228,11 +1228,19 @@ mod attestation_tests {
             row(find(&checks, "session_state").unwrap()),
             json!(["unavailable", "stored_state"])
         );
-        observation.records.status.state = SessionState::Ready;
-        assert_eq!(
-            row(find(&session(&observation).0, "session_state").unwrap()),
-            json!(["available", "stored_state"])
-        );
+        for (lifecycle, availability) in [
+            (Lifecycle::Closed, "unavailable"),
+            (Lifecycle::Failed, "unavailable"),
+            (Lifecycle::Exited, "unavailable"),
+            (Lifecycle::Other, "unavailable"),
+            (Lifecycle::Ready, "available"),
+        ] {
+            observation.judgments.lifecycle = lifecycle;
+            let (checks, _) = session(&observation);
+            let check = find(&checks, "session_state").unwrap();
+            assert_eq!(row(check), json!([availability, "stored_state"]));
+            assert_eq!(check.detail, "Stored state: working");
+        }
 
         // cancel_check
         for (cancel, expected) in [
@@ -1487,7 +1495,7 @@ mod attestation_tests {
         for (owner, expected) in rows {
             assert_eq!(owner_row(&owner), expected, "{owner:?}");
         }
-        assert_eq!(observation.judgments.ended, Ended::Neither);
+        assert_eq!(observation.judgments.lifecycle, Lifecycle::Ready);
     }
 
     #[cfg(target_os = "macos")]
