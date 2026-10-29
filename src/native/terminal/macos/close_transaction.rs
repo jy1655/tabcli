@@ -9,7 +9,6 @@ type Check<'a> = &'a dyn Fn() -> Result<()>;
 pub(super) enum InspectionError {
     Fatal,
     KeepWaiting,
-    EnsureTimeThenPropagate,
 }
 
 pub(super) struct Policy<'a> {
@@ -48,11 +47,6 @@ pub(super) fn run<C: ?Sized, S, P>(
             Err(error) => match policy.inspection_error {
                 InspectionError::Fatal => return Err(error),
                 InspectionError::KeepWaiting => error,
-                InspectionError::EnsureTimeThenPropagate => {
-                    // Time was checked immediately before the probe. Preserve its
-                    // error even if the probe itself exhausted that budget.
-                    return Err(error);
-                }
             },
         };
         if !pause(context, &mut state)? {
@@ -77,6 +71,7 @@ mod tests {
             policy: InspectionError,
             absent_at: usize,
             error_at: Option<usize>,
+            exhaust_budget_in_probe: bool,
             budget: usize,
             expected: &'static str,
             probes: usize,
@@ -88,6 +83,7 @@ mod tests {
                 policy: InspectionError::Fatal,
                 absent_at: 1,
                 error_at: None,
+                exhaust_budget_in_probe: false,
                 budget: 5,
                 expected: "closed",
                 probes: 1,
@@ -98,6 +94,7 @@ mod tests {
                 policy: InspectionError::Fatal,
                 absent_at: 3,
                 error_at: None,
+                exhaust_budget_in_probe: false,
                 budget: 5,
                 expected: "closed",
                 probes: 3,
@@ -108,6 +105,7 @@ mod tests {
                 policy: InspectionError::Fatal,
                 absent_at: 9,
                 error_at: None,
+                exhaust_budget_in_probe: false,
                 budget: 3,
                 expected: "present",
                 probes: 3,
@@ -118,6 +116,7 @@ mod tests {
                 policy: InspectionError::Fatal,
                 absent_at: 3,
                 error_at: Some(1),
+                exhaust_budget_in_probe: false,
                 budget: 5,
                 expected: "inspection",
                 probes: 1,
@@ -128,6 +127,7 @@ mod tests {
                 policy: InspectionError::KeepWaiting,
                 absent_at: 2,
                 error_at: Some(1),
+                exhaust_budget_in_probe: false,
                 budget: 5,
                 expected: "closed",
                 probes: 2,
@@ -138,6 +138,7 @@ mod tests {
                 policy: InspectionError::KeepWaiting,
                 absent_at: 9,
                 error_at: Some(1),
+                exhaust_budget_in_probe: false,
                 budget: 1,
                 expected: "inspection",
                 probes: 1,
@@ -145,9 +146,21 @@ mod tests {
             },
             Row {
                 name: "Warp checks time before propagating inspection",
-                policy: InspectionError::EnsureTimeThenPropagate,
+                policy: InspectionError::Fatal,
                 absent_at: 3,
                 error_at: Some(1),
+                exhaust_budget_in_probe: false,
+                budget: 5,
+                expected: "inspection",
+                probes: 1,
+                pauses: 0,
+            },
+            Row {
+                name: "probe exhausts budget then reports inspection error",
+                policy: InspectionError::Fatal,
+                absent_at: 3,
+                error_at: Some(1),
+                exhaust_budget_in_probe: true,
                 budget: 5,
                 expected: "inspection",
                 probes: 1,
@@ -158,6 +171,7 @@ mod tests {
                 policy: InspectionError::Fatal,
                 absent_at: 1,
                 error_at: None,
+                exhaust_budget_in_probe: false,
                 budget: 0,
                 expected: "budget",
                 probes: 0,
@@ -188,6 +202,9 @@ mod tests {
                 },
                 |_, _, _| {
                     probes.set(probes.get() + 1);
+                    if row.exhaust_budget_in_probe {
+                        elapsed.set(row.budget);
+                    }
                     if row.error_at == Some(probes.get()) {
                         bail!("inspection");
                     }
@@ -212,6 +229,9 @@ mod tests {
                 Err(error) => error.to_string(),
             };
             assert_eq!(actual, row.expected, "{}", row.name);
+            if row.exhaust_budget_in_probe {
+                assert_eq!(elapsed.get(), row.budget, "{}", row.name);
+            }
             assert_eq!(probes.get(), row.probes, "{}", row.name);
             assert_eq!(pauses.get(), row.pauses, "{}", row.name);
             assert_eq!(checks.get(), 1 + row.probes, "{}", row.name);

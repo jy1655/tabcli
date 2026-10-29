@@ -982,7 +982,8 @@ fn close_exact<R: WarpRunner>(
                     "Warp exact tab disappearance; tab remains present or absence is unverified",
                 )
             },
-            inspection_error: InspectionError::EnsureTimeThenPropagate,
+            // The time check precedes the probe; an inspection error stays unchanged.
+            inspection_error: InspectionError::Fatal,
         },
         |runner, check| {
             require_exact_ids(session)?;

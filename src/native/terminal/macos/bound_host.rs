@@ -32,6 +32,8 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     })
 }
 
+/// Preserve the three host policies' check orders on purpose: changing their order
+/// would change which refusal is reported when multiple admission checks fail.
 #[derive(Clone, Copy)]
 pub(super) enum Admission {
     MetadataFirst,
