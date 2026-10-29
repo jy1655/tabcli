@@ -438,6 +438,7 @@ Commands hold a Claim for Delivery and settlement; provider adapters report comp
 late delivery outcomes. Agy keeps its Result evidence reader inside its adapter: both the monitor
 and diagnostics resolve truncated transcript rows and correlate the complete body there, while
 only the monitor publishes the Result or records a subsequent failure.
+`agy/evidence.rs` owns the input-evidence rules read by both the monitor and doctor checks.
 
 ## Record and adapter seams
 

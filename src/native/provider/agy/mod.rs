@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 mod delivery;
 mod diagnostics;
+mod evidence;
 mod log;
 mod monitor;
 mod readiness;
