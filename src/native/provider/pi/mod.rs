@@ -240,7 +240,9 @@ impl NativeProviderAdapter for PiAdapter {
 
     fn cancel_support(&self, directory: &Path) -> Result<super::CancelSupport> {
         let reader = Reader::open_unchecked(directory);
+        // A legacy record is unsupported before the Claim is read, as before this module.
         if let StartupReadiness::Present(ready) = startup_ready::read(&reader)
+            && ready.offers_cancel()
             && turn::current_claim_token(&reader)?
                 .is_some_and(|claim| ready.supports_cancel_for(&claim))
         {

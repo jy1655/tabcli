@@ -405,6 +405,33 @@ fn cancel_support_requires_schema_two_and_current_claim() {
 }
 
 #[test]
+fn cancel_support_refuses_a_legacy_record_before_reading_the_claim() {
+    // A schema 1 record never offers cancel, so an unreadable Claim is not consulted:
+    // the answer stays Unsupported, as it was before the shared reader. A schema 2 record
+    // does consult the Claim, and its read failure surfaces as before.
+    let directory = tempfile::tempdir().unwrap();
+    let pending = claim_pending_turn(directory.path());
+    let claim = directory.path().join("turn.claim");
+    fs::remove_file(&claim).unwrap();
+    fs::create_dir(&claim).unwrap();
+    for (schema, unsupported) in [(1, true), (2, false)] {
+        write_json_atomic(
+            &directory.path().join(STARTUP_READY_FILE),
+            &StartupReady {
+                input_ack_schema: None,
+                schema,
+                claim_token: pending.claim_token.clone(),
+                session_id: "native".into(),
+            },
+        )
+        .unwrap();
+        let support = ADAPTER.cancel_support(directory.path());
+        let unsupported_now = matches!(support, Ok(super::super::CancelSupport::Unsupported(_)));
+        assert_eq!(unsupported_now, unsupported, "schema {schema}");
+    }
+}
+
+#[test]
 fn cancel_accepted_cleanup_is_owned_by_pending_turn_lifecycle() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());

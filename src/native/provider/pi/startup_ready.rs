@@ -36,7 +36,10 @@ pub(super) enum StartupReadiness {
     Absent,
     /// A record Bridge cannot use: unreadable, over the bound, malformed JSON, or one that
     /// fails the validity floor (schema outside 1..=2, an invalid claim token, an invalid
-    /// session id). Callers choose whether that is a refusal or merely "unsupported".
+    /// session id). Callers choose whether that is a refusal or merely "unsupported"; the
+    /// reason is reported by the Windows input gates, while `cancel` support and the
+    /// carry-forward only observe that the record is unusable.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     Unreadable(anyhow::Error),
     /// A record that passed the floor. Ask it the questions below against the expected Claim.
     Present(StartupReady),
@@ -84,9 +87,15 @@ impl StartupReady {
         matches!(self.schema, 1 | 2) && self.claim_token == claim_token
     }
 
+    /// The installed extension offers `cancel` at all: schema 2. A legacy record never does,
+    /// whatever Claim it names, so callers can refuse it before reading the Claim.
+    pub(super) fn offers_cancel(&self) -> bool {
+        self.schema == 2
+    }
+
     /// The installed extension offers `cancel` for `claim_token`.
     pub(super) fn supports_cancel_for(&self, claim_token: &str) -> bool {
-        self.schema == 2 && self.claim_token == claim_token
+        self.offers_cancel() && self.claim_token == claim_token
     }
 
     /// The installed extension acknowledges Windows input for `claim_token`.
