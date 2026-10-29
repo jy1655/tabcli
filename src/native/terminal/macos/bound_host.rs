@@ -145,6 +145,8 @@ mod tests {
                     format!("{name} launch directory must be absolute")
                 );
             }
+            // A refused relative path is never created on the way out.
+            assert!(!relative_path.join("missing").exists());
             for path in [&file, &link] {
                 assert_eq!(
                     format!("{:#}", run(path).unwrap_err()),
