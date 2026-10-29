@@ -36,8 +36,12 @@ impl Fingerprint {
 #[cfg(any(windows, test))]
 use super::PendingPiTurn;
 use super::TurnContext;
+#[cfg(any(windows, test))]
+use super::startup_ready::valid_session_id;
 #[cfg(windows)]
-use super::{Prepared, STARTUP_READY_FILE, StartupReady, turn};
+use super::startup_ready::{self, StartupReadiness};
+#[cfg(windows)]
+use super::{Prepared, turn};
 #[cfg(windows)]
 use crate::native::clock::{Clock, SystemClock};
 #[cfg(any(windows, test))]
@@ -78,11 +82,6 @@ struct Accepted {
     prompt_sha256: String,
     prompt_utf8_bytes: u64,
     session_id: String,
-}
-
-#[cfg(any(windows, test))]
-fn valid_session_id(id: &str) -> bool {
-    !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
 }
 
 #[cfg(any(windows, test))]
@@ -190,16 +189,12 @@ pub(super) fn send_windows(
         super::validate_claim_token(turn.claim_token)?;
         let reader = Reader::open_unchecked(turn.directory);
         let capability = (|| -> Result<()> {
-            let bytes = reader
-                .private(STARTUP_READY_FILE)
-                .timeline(4096)?
-                .context("Pi startup receipt is missing")?;
-            let ready: StartupReady = serde_json::from_slice(&bytes)?;
-            if ready.schema != 2
-                || ready.input_ack_schema != Some(1)
-                || ready.claim_token != turn.claim_token
-                || !valid_session_id(&ready.session_id)
-            {
+            let ready = match startup_ready::read(&reader) {
+                StartupReadiness::Absent => bail!("Pi startup receipt is missing"),
+                StartupReadiness::Unreadable(error) => return Err(error),
+                StartupReadiness::Present(ready) => ready,
+            };
+            if !ready.acknowledges_windows_input_for(turn.claim_token) {
                 bail!("Pi input acknowledgement capability is absent or unsupported");
             }
             Ok(())
