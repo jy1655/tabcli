@@ -577,6 +577,36 @@ pub(super) mod tests {
         "CODEX_DAEMON_SHUTDOWN_FILE",
         "CODEX_DAEMON_SHUTDOWN_SOCKET",
     ];
+    // Fixed spellings of both providers' caller identities. Non-Claude commands keep
+    // Claude's execution configuration, but must not inherit its session or inbox.
+    pub(crate) const NON_CLAUDE_CALLER_MARKERS: [&str; 15] = [
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_TOOL_CALL_ID",
+        "CODEX_DAEMON_SHUTDOWN_FILE",
+        "CODEX_DAEMON_SHUTDOWN_SOCKET",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CODEX_COMPANION_SESSION_ID",
+        "CODEX_COMPANION_TRANSCRIPT_PATH",
+    ];
+    pub(crate) const NON_CLAUDE_CONTEXT_KEPT: [&str; 9] = [
+        "AI_AGENT",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_EFFORT",
+        "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_USER_CUSTOM_SETTING",
+    ];
     // Codex configuration, credentials, install hints, informational and sandbox or proxy
     // context, and an unknown name: none is a caller marker, so every launch inherits them.
     pub(crate) const CODEX_CONTEXT_KEPT: [&str; 14] = [

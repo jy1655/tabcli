@@ -632,15 +632,20 @@ fn pi_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsStr
     expected
 }
 
-// Pi selects the Codex caller markers for its probes and launches, and nothing else.
+// Pi selects both providers' caller identities without removing their configuration.
 #[test]
-fn probes_drop_exactly_the_codex_caller_markers() {
-    use crate::native::process_env::tests::{CODEX_CALLER_MARKERS, CODEX_CONTEXT_KEPT};
+fn probes_drop_caller_identities_and_keep_configuration() {
+    use crate::native::process_env::tests::{
+        CODEX_CONTEXT_KEPT, NON_CLAUDE_CALLER_MARKERS, NON_CLAUDE_CONTEXT_KEPT,
+    };
     assert_eq!(
         ADAPTER.probe_environment_removals(),
-        &CODEX_CALLER_MARKERS[..]
+        &NON_CLAUDE_CALLER_MARKERS[..]
     );
-    for kept in CODEX_CONTEXT_KEPT {
+    for kept in CODEX_CONTEXT_KEPT
+        .into_iter()
+        .chain(NON_CLAUDE_CONTEXT_KEPT)
+    {
         assert!(
             !ADAPTER.probe_environment_removals().contains(&kept),
             "{kept}"
@@ -761,7 +766,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         );
                         assert_eq!(
                             plan.environment_removals,
-                            &crate::native::process_env::tests::CODEX_CALLER_MARKERS[..],
+                            &crate::native::process_env::tests::NON_CLAUDE_CALLER_MARKERS[..],
                             "{label}"
                         );
                         let extension = fs::read_to_string(&extension_path).unwrap();

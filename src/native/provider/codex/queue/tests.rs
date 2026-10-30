@@ -33,7 +33,7 @@ fn outcome_error(outcome: &Outcome) -> &anyhow::Error {
 }
 
 #[test]
-fn queue_drops_the_codex_caller_markers_and_keeps_its_explicit_session_directory() {
+fn queue_drops_caller_identities_and_keeps_its_explicit_session_directory() {
     let directory = std::path::Path::new("session-directory");
     let workspace = std::path::Path::new("workspace");
     let arguments: Vec<OsString> = ["queue", "--thread", "thread-id", "--message", "framed"]
@@ -48,7 +48,7 @@ fn queue_drops_the_codex_caller_markers_and_keeps_its_explicit_session_directory
     .unwrap();
     crate::native::process_env::tests::assert_provider_environment(
         &command,
-        &crate::native::process_env::tests::CODEX_CALLER_MARKERS,
+        &crate::native::process_env::tests::NON_CLAUDE_CALLER_MARKERS,
         &[(
             crate::native::session::primitives::SESSION_DIR_ENV,
             Some(directory.as_os_str()),

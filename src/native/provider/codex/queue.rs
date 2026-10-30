@@ -30,7 +30,7 @@ fn queue_command(
         executable,
         directory,
         arguments,
-        super::CODEX_CALLER_SESSION_MARKERS,
+        super::launch_environment_removals(),
     )?;
     command.current_dir(workspace).env(
         crate::native::session::primitives::SESSION_DIR_ENV,

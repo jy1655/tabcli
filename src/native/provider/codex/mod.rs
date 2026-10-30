@@ -31,7 +31,7 @@ use agent_bridge::{
 };
 use anyhow::{Context, Result, bail};
 use semver::Version;
-use std::{ffi::OsString, path::Path, time::Duration};
+use std::{ffi::OsString, path::Path, sync::LazyLock, time::Duration};
 
 pub(super) static ADAPTER: CodexAdapter = CodexAdapter;
 
@@ -53,6 +53,17 @@ pub(super) const CODEX_CALLER_SESSION_MARKERS: &[&str] = &[
     "CODEX_DAEMON_SHUTDOWN_FILE",
     "CODEX_DAEMON_SHUTDOWN_SOCKET",
 ];
+
+fn launch_environment_removals() -> &'static [&'static str] {
+    static REMOVALS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        [
+            CODEX_CALLER_SESSION_MARKERS,
+            super::claude::caller_identity_markers(),
+        ]
+        .concat()
+    });
+    &REMOVALS
+}
 
 #[cfg(test)]
 use self::turn::PENDING_TURN_FILE;
@@ -269,7 +280,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
-        CODEX_CALLER_SESSION_MARKERS
+        launch_environment_removals()
     }
 
     fn diagnose(
@@ -447,7 +458,7 @@ fn prepare_launch_for_platform(
             initial_transport_for_platform(windows).as_ref(),
         ),
         watcher: Box::new(transcript::Watcher),
-        environment_removals: CODEX_CALLER_SESSION_MARKERS,
+        environment_removals: launch_environment_removals(),
     })
 }
 
