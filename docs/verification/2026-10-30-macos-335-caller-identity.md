@@ -2,8 +2,8 @@
 
 Verified on 2026-10-30 on macOS 26.5.2 (25F84), Apple silicon, iTerm2 3.7.6.
 The owner selected the narrower caller-identity subset: keep execution settings in direct
-non-Claude provider commands. No user settings, trust stores or installed binaries were
-changed. All five sessions created by these checks were closed.
+non-Claude provider commands. No user settings or trust stores were edited, and the installed
+`tabcli` binary was not replaced. All five sessions created by these checks were closed.
 
 ## Change and identities
 
