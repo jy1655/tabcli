@@ -193,6 +193,9 @@ fn a_record_that_stays_open_fails_the_replacement_after_a_bounded_wait() {
 }
 
 // Each stage runs in a test child: never mutate the test runner's environment.
+// The Codex caller markers are fixed mixed-case spellings, not read from the adapters. A
+// second chain starts the wrapper stage contaminated with them, so the provider builder
+// itself must remove them rather than an earlier helper.
 #[cfg(windows)]
 #[test]
 fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_hook() {
@@ -201,6 +204,14 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
     const STAGE: &str = "ISSUE111_TEST_STAGE";
     const ROOT: &str = "ISSUE111_TEST_ROOT";
     const ID: &str = "session-environment";
+    const CODEX_CALLER: [&str; 5] = [
+        "Codex_Session_Id",
+        "codex_thread_id",
+        "CODEX_TOOL_CALL_ID",
+        "Codex_Daemon_Shutdown_File",
+        "codex_daemon_shutdown_SOCKET",
+    ];
+    const CODEX_HOME: &str = "C:\\codex-home-sentinel";
     let test = "native::tests::windows::windows_environment_boundary_replaces_caller_context_through_bootstrap_and_hook";
     let executable = std::env::current_exe().unwrap();
     let run = |command: &mut Command| {
@@ -226,20 +237,39 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
             .args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(STAGE, "launcher")
             .env(ROOT, root.path());
-        for name in process_env::non_provider_removals() {
+        for name in process_env::non_provider_removals().chain(CODEX_CALLER) {
+            child.env(name, "caller-sentinel");
+        }
+        child.env("CODEX_HOME", CODEX_HOME);
+        run(&mut child);
+        assert_eq!(
+            fs::read(root.path().join("hook-verified")).unwrap(),
+            b"verified"
+        );
+        let direct = tempfile::tempdir().unwrap();
+        fs::create_dir(direct.path().join(ID)).unwrap();
+        let mut child = process_env::helper_command(&executable);
+        child
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(STAGE, "contaminated-wrapper")
+            .env(ROOT, direct.path())
+            .env(STATE_DIR_ENV, direct.path())
+            .env("CODEX_HOME", CODEX_HOME);
+        for name in CODEX_CALLER {
             child.env(name, "caller-sentinel");
         }
         run(&mut child);
         assert_eq!(
-            fs::read(root.path().join("hook-verified")).unwrap(),
+            fs::read(direct.path().join("hook-verified")).unwrap(),
             b"verified"
         );
         return;
     }
     let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
     let directory = root.join(ID);
+    assert_eq!(std::env::var("CODEX_HOME").unwrap(), CODEX_HOME, "{stage}");
     if stage == "launcher" {
-        for name in process_env::non_provider_removals() {
+        for name in process_env::non_provider_removals().chain(CODEX_CALLER) {
             assert_eq!(std::env::var(name).unwrap(), "caller-sentinel");
         }
         let stub = root.join("bridge owner's stub.cmd");
@@ -260,9 +290,15 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
         return;
     }
     assert_eq!(state_root().unwrap(), root);
+    let contaminated = stage == "contaminated-wrapper";
+    let wrapper = stage == "wrapper" || contaminated;
     for name in process_env::non_provider_removals() {
         if name != STATE_DIR_ENV
-            && (stage == "wrapper"
+            && !(contaminated
+                && CODEX_CALLER
+                    .iter()
+                    .any(|caller| caller.eq_ignore_ascii_case(name)))
+            && (wrapper
                 || ![
                     SESSION_DIR_ENV,
                     "AGENT_BRIDGE_NATIVE_SESSION_ID",
@@ -270,10 +306,18 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
                 ]
                 .contains(&name))
         {
-            assert!(std::env::var_os(name).is_none(), "{name}");
+            assert!(std::env::var_os(name).is_none(), "{stage}: {name}");
         }
     }
-    if stage == "wrapper" {
+    // Windows looks names up without regard to case.
+    for name in CODEX_CALLER {
+        assert_eq!(
+            std::env::var_os(name).is_some(),
+            contaminated,
+            "{stage}: {name}"
+        );
+    }
+    if wrapper {
         let mut command = process_env::provider_command(
             &executable,
             &directory,

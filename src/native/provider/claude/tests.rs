@@ -1,4 +1,5 @@
 use super::turn::ClaudeTurn;
+use crate::native::process_env::tests::{CODEX_CALLER_MARKERS, CODEX_CONTEXT_KEPT};
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 use crate::native::session::{Store, turn};
 use std::{path::PathBuf, time::Duration};
@@ -898,24 +899,64 @@ fn managed_launch_name_is_the_known_unique_session_id() {
     );
 }
 
+// Claude's own markers followed by the Codex caller markers, fixed rather than read from the
+// Codex adapter.
+fn claude_launch_removals() -> Vec<&'static str> {
+    [CLAUDE_CODE_SESSION_MARKERS, &CODEX_CALLER_MARKERS[..]].concat()
+}
+
 #[test]
 fn probe_and_version_queries_drop_the_same_markers_as_managed_launches() {
     use super::super::{FirstPartyCli, probe_environment_removals};
     assert_eq!(
         probe_environment_removals(FirstPartyCli::Claude),
-        CLAUDE_CODE_SESSION_MARKERS
+        claude_launch_removals()
     );
     for marker in [
         "AI_AGENT",
         "CLAUDE_CODE_BRIDGE_SESSION_ID",
         "CODEX_COMPANION_SESSION_ID",
         "CODEX_COMPANION_TRANSCRIPT_PATH",
-    ] {
+    ]
+    .into_iter()
+    .chain(CODEX_CALLER_MARKERS)
+    {
         assert!(probe_environment_removals(FirstPartyCli::Claude).contains(&marker));
     }
-    for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
-        assert!(probe_environment_removals(other).is_empty(), "{other:?}");
+    for kept in CODEX_CONTEXT_KEPT {
+        assert!(
+            !probe_environment_removals(FirstPartyCli::Claude).contains(&kept),
+            "{kept}"
+        );
     }
+    // The other adapters select only the Codex caller markers.
+    for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        assert_eq!(
+            probe_environment_removals(other),
+            &CODEX_CALLER_MARKERS[..],
+            "{other:?}"
+        );
+    }
+}
+
+// Only Claude's own markers say the caller runs inside Claude Code: a caller that carries
+// only Codex names, configuration included, is not reported as one.
+#[test]
+fn own_origin_diagnostic_ignores_codex_only_names() {
+    let codex_only: Vec<&str> = CODEX_CALLER_MARKERS
+        .into_iter()
+        .chain(CODEX_CONTEXT_KEPT)
+        .collect();
+    assert!(inherited_claude_markers(|name| codex_only.contains(&name)).is_empty());
+    let mixed: Vec<&str> = codex_only
+        .iter()
+        .copied()
+        .chain(["CLAUDECODE", "CODEX_COMPANION_SESSION_ID"])
+        .collect();
+    assert_eq!(
+        inherited_claude_markers(|name| mixed.contains(&name)),
+        ["CLAUDECODE", "CODEX_COMPANION_SESSION_ID"]
+    );
 }
 
 #[test]
@@ -966,6 +1007,10 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
         ] {
             assert!(plan.environment_removals.contains(&marker), "{marker}");
         }
+        // A caller inside a Codex tool shell carries Codex's caller identity (#111).
+        for marker in CODEX_CALLER_MARKERS {
+            assert!(plan.environment_removals.contains(&marker), "{marker}");
+        }
         // User configuration is not the adapter's to strip.
         for kept in [
             "ANTHROPIC_API_KEY",
@@ -974,7 +1019,10 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
             "CLAUDE_CONFIG_DIR",
             "PATH",
             "HOME",
-        ] {
+        ]
+        .into_iter()
+        .chain(CODEX_CONTEXT_KEPT)
+        {
             assert!(!plan.environment_removals.contains(&kept), "{kept}");
         }
     }
@@ -1383,7 +1431,7 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
         ]
     );
     assert_no_op_watcher(plan.watcher);
-    assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
+    assert_eq!(plan.environment_removals, claude_launch_removals());
     for forbidden in [
         "--dangerously-skip-permissions",
         "--model",
@@ -1583,7 +1631,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         "{label}"
                     );
                     assert_no_op_watcher(plan.watcher);
-                    assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
+                    assert_eq!(plan.environment_removals, claude_launch_removals());
                     let settings: serde_json::Value =
                         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())
                             .unwrap();
@@ -1639,7 +1687,7 @@ fn resume_plan_is_the_complete_command_for_every_policy() {
                     InitialPromptDisposition::AwaitingDelivery,
                     "{label}"
                 );
-                assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
+                assert_eq!(plan.environment_removals, claude_launch_removals());
             }
         }
     }

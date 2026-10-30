@@ -189,13 +189,17 @@ additional TUI input have separate verification limits (#57, #65). Consult
 
 Windows launches remove adapter-owned caller-session markers and Bridge's inherited state
 root, session directory, session id and executable from `wt.exe`, its tab host, both
-PowerShell roots and helpers. The tab host receives only the new attempt marker from this
-context. The bootstrap sets the selected state root for the wrapper; the wrapper supplies
-its new session directory, id and executable to the provider and its hooks. Console control
-helpers explicitly receive the selected state root. These Bridge variables in a managed
-provider are expected; their values must describe the new session. This does not remove
-all Claude configuration or plugin context, or retroactively clean an existing terminal
-application's environment. Restart an already contaminated terminal application.
+PowerShell roots and helpers. The markers include the five that a Codex tool shell carries:
+`CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_DAEMON_SHUTDOWN_FILE` and
+`CODEX_DAEMON_SHUTDOWN_SOCKET`, compared without regard to case. Codex configuration, install
+hints and sandbox context, such as `CODEX_HOME`, stay. The tab host receives only the new
+attempt marker from this context. The bootstrap sets the selected state root for the wrapper;
+the wrapper supplies its new session directory, id and executable to the provider and its
+hooks. Console control helpers explicitly receive the selected state root. These Bridge
+variables in a managed provider are expected; their values must describe the new session.
+This does not remove all Claude or Codex configuration or plugin context, or retroactively
+clean an existing terminal application's environment. Restart an already contaminated
+terminal application.
 
 ## Ownership and close
 

@@ -166,7 +166,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   fails (issue #42, observed 2026-09-24 with Claude Code 2.1.281). The removal list is
   adapter-owned launch configuration; the shared module only applies it. Provider
   commands (managed launches, version and doctor probes, messengers and the Codex queue)
-  keep their own adapter's removal list. Non-provider commands on macOS and native Windows,
+  keep their own adapter's removal list. An adapter may select another adapter's owned
+  list by reference, never by copy: Claude, Agy and Pi select the Codex caller markers
+  (see Current Codex Boundary), and Claude's own-origin diagnostic still reads only the
+  Claude markers. Non-provider commands on macOS and native Windows,
   including terminal automation that can start an application and helpers, drop the union
   of the adapters' caller-session markers and Bridge's state directory, session directory,
   session id and executable variables. A child that needs one receives it explicitly. On
@@ -498,6 +501,23 @@ launch, observe, continue, and close without replacing the capabilities those CL
   observed path, not a fallback for a Codex transport; the Codex adapter only declares the
   location. Re-examine the default when Codex's behavior is verified to stop through an
   official control or an upstream fix; do not disable it from a version check alone.
+- A `tabcli` started from a Codex tool shell inherits Codex's caller context. On native
+  Windows, 2026-10-29 (#111, names only), the Terminal, tab host, PowerShell root and managed
+  Claude all carried `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`,
+  `CODEX_DAEMON_SHUTDOWN_FILE` and `CODEX_DAEMON_SHUTDOWN_SOCKET`. In Codex 0.166.0 the first
+  three name the caller's session, thread and tool call; a managed Codex rewrites them for its
+  own tool shells, but its command hooks and legacy notify replay the inherited process
+  environment. On Windows the presence of the socket marker lets a control-socket app-server
+  accept the PID-checked shutdown route, and the file marker is one updater's shutdown
+  request path. The Codex adapter owns exactly these five names as caller markers and every
+  adapter selects them for its probes, launches, messenger and the Codex queue; non-provider
+  helpers drop them through the union. Never strip by `CODEX_*` prefix: `CODEX_HOME`, CA,
+  authentication, install hints, `CODEX_CI`, `CODEX_VERSION`, the permission profile, patch
+  compatibility and sandbox or proxy context stay. A hook that relied on an outer Codex id no
+  longer receives it. Source evidence and the unverified runtime matrix are in
+  `docs/verification/2026-10-30-codex-caller-environment-source-notes.md`. Revisit an entry
+  when Codex stops exporting it or isolates it across every child path, hooks, notify and
+  nested launches included; rewriting tool-shell ids alone is not that condition.
 
 ## Current Windows Surface Boundary
 

@@ -15,6 +15,7 @@ use agent_bridge::{
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use std::process::Command;
+use std::sync::LazyLock;
 use std::time::Instant;
 use std::{ffi::OsString, path::Path};
 
@@ -62,6 +63,28 @@ const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
     "CODEX_COMPANION_SESSION_ID",
     "CODEX_COMPANION_TRANSCRIPT_PATH",
 ];
+
+// Launches, probes and messengers also drop the Codex caller markers that the Codex adapter
+// owns. Only the Claude markers above are evidence that the caller runs inside Claude Code.
+static LAUNCH_ENVIRONMENT_REMOVALS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    [
+        CLAUDE_CODE_SESSION_MARKERS,
+        super::codex::CODEX_CALLER_SESSION_MARKERS,
+    ]
+    .concat()
+});
+
+fn launch_environment_removals() -> &'static [&'static str] {
+    &LAUNCH_ENVIRONMENT_REMOVALS
+}
+
+fn inherited_claude_markers(present: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    CLAUDE_CODE_SESSION_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| present(marker))
+        .collect()
+}
 
 impl NativeProviderAdapter for ClaudeAdapter {
     fn question_emissions(
@@ -128,7 +151,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         // A `claude --version` or doctor probe is not an interactive session, but it is
         // still a `claude` started by the bridge: it drops the same markers so that no
         // bridge-run Claude process is classified by an inherited session identity.
-        CLAUDE_CODE_SESSION_MARKERS
+        launch_environment_removals()
     }
 
     fn diagnose(
@@ -150,11 +173,8 @@ impl NativeProviderAdapter for ClaudeAdapter {
             Some(Err(error)) => (Unknown, Reason::CLAUDE_SETTINGS_UNREADABLE, format!("{error:#}")),
             _ => (Unknown, Reason::CLAUDE_SETTINGS_UNAVAILABLE, "No managed session settings were observed.".to_owned()),
         };
-        let inherited_markers = CLAUDE_CODE_SESSION_MARKERS
-            .iter()
-            .copied()
-            .filter(|marker| std::env::var_os(marker).is_some())
-            .collect::<Vec<_>>();
+        let inherited_markers =
+            inherited_claude_markers(|marker| std::env::var_os(marker).is_some());
         let (markers_availability, markers_reason, markers_detail) = if inherited_markers.is_empty()
         {
             (
@@ -324,7 +344,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         arguments,
         initial_prompt: InitialPromptDisposition::of(&ClaudeMessage),
         watcher: Box::new(NoWatcher),
-        environment_removals: CLAUDE_CODE_SESSION_MARKERS,
+        environment_removals: launch_environment_removals(),
     })
 }
 
@@ -351,7 +371,7 @@ fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Res
         arguments,
         initial_prompt: InitialPromptDisposition::of(&ClaudeMessage),
         watcher: Box::new(NoWatcher),
-        environment_removals: CLAUDE_CODE_SESSION_MARKERS,
+        environment_removals: launch_environment_removals(),
     })
 }
 

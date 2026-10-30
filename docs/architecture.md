@@ -70,8 +70,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `process_identity::classify` for incarnation comparison; messages and authority remain
   adapter-owned.
 - `src/native/process_env.rs` owns child environment policy and deadline-bounded command execution;
-  provider-specific execution remains in its adapter. Non-provider children on macOS and
-  Windows remove the union of adapter caller-session markers and Bridge's four session
+  provider-specific execution remains in its adapter. Provider commands (launches, version and
+  doctor probes, messengers and the Codex queue) apply only their adapter's removal list. An
+  adapter may select another adapter's owned list by reference, never by copy: Claude, Agy and
+  Pi select the Codex caller markers, and Claude adds them to its own. Non-provider children on
+  macOS and Windows remove the union of adapter caller-session markers and Bridge's four session
   variables; helpers and the bootstrap explicitly supply the context each child needs.
   Windows Terminal and both console roots use the same filtered environment block.
 - `src/native/delivery.rs` consumes one Claim and owns readiness, injected reopen gates,
@@ -485,7 +488,10 @@ Record, and every reader of a core Record calls it.
 The native provider contract requires explicit launch configuration, initial delivery,
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every
 provider. There is no default adapter that silently gives all CLIs the same transport. Launch
-plans also state which caller environment markers must be removed.
+plans also state which caller environment markers must be removed. Each list has one owning
+adapter, which keeps its spelling and evidence, whatever a name's prefix: the Codex adapter owns
+the five Codex caller markers, and the Claude adapter owns the companion names that the Claude
+Code Codex plugin sets. Another adapter removes an owned list by referencing it, never by copy.
 Read-only question emissions and completion observations dispatch through the adapter like every other provider operation.
 
 The terminal seam binds a concrete surface to a session and reports whether delivery was known

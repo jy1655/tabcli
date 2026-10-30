@@ -568,6 +568,34 @@ pub(super) mod tests {
         );
     }
 
+    // The Codex caller markers as Codex 0.166.0 spells them. Fixed here, not read from the
+    // adapter, so that a dropped entry fails every test that uses them.
+    pub(crate) const CODEX_CALLER_MARKERS: [&str; 5] = [
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_TOOL_CALL_ID",
+        "CODEX_DAEMON_SHUTDOWN_FILE",
+        "CODEX_DAEMON_SHUTDOWN_SOCKET",
+    ];
+    // Codex configuration, credentials, install hints, informational and sandbox or proxy
+    // context, and an unknown name: none is a caller marker, so every launch inherits them.
+    pub(crate) const CODEX_CONTEXT_KEPT: [&str; 14] = [
+        "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
+        "CODEX_CA_CERTIFICATE",
+        "CODEX_API_KEY",
+        "CODEX_MANAGED_BY_NPM",
+        "CODEX_MANAGED_PACKAGE_ROOT",
+        "CODEX_CI",
+        "CODEX_VERSION",
+        "CODEX_PERMISSION_PROFILE",
+        "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "CODEX_NETWORK_PROXY_ACTIVE",
+        "CODEX_USER_CUSTOM_SETTING",
+    ];
+
     pub(crate) fn assert_provider_environment(
         command: &Command,
         removals: &[&str],
@@ -596,7 +624,10 @@ pub(super) mod tests {
             expected.insert(OsStr::new(name), *value);
         }
         assert_eq!(command.get_envs().collect::<BTreeMap<_, _>>(), expected);
-        for name in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"] {
+        for name in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"]
+            .into_iter()
+            .chain(CODEX_CALLER_MARKERS)
+        {
             assert_eq!(expected.get(OsStr::new(name)), Some(&None), "{name}");
         }
         // No override/removal of user configuration: it remains inherited.
@@ -606,7 +637,10 @@ pub(super) mod tests {
             "CLAUDE_CONFIG_DIR",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL",
-        ] {
+        ]
+        .into_iter()
+        .chain(CODEX_CONTEXT_KEPT)
+        {
             assert!(!expected.contains_key(OsStr::new(name)), "{name}");
         }
     }
@@ -663,6 +697,23 @@ pub(super) mod tests {
     #[test]
     fn helpers_remove_only_adapter_markers_and_bridge_session_variables() {
         assert_helper_environment(&helper_command("unused"), &[]);
+    }
+
+    #[test]
+    fn non_provider_removals_drop_the_codex_caller_markers_and_keep_codex_configuration() {
+        let removals: std::collections::BTreeSet<_> = non_provider_removals().collect();
+        for name in CODEX_CALLER_MARKERS {
+            assert!(removals.contains(name), "{name}");
+        }
+        for name in CODEX_CONTEXT_KEPT {
+            assert!(!removals.contains(name), "{name}");
+        }
+        let command = helper_command("unused");
+        let environment: BTreeMap<_, _> = command.get_envs().collect();
+        for name in CODEX_CALLER_MARKERS {
+            assert_eq!(environment.get(OsStr::new(name)), Some(&None), "{name}");
+        }
+        assert!(!environment.contains_key(OsStr::new("CODEX_HOME")));
     }
 
     #[test]

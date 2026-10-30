@@ -353,8 +353,9 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
-        // Agy derives no session identity from the caller's environment.
-        &[]
+        // Agy is not known to read these names; it drops the Codex caller's identity and
+        // shutdown context so that an independent launch and its descendants never carry it.
+        super::codex::CODEX_CALLER_SESSION_MARKERS
     }
 
     fn diagnose(
@@ -462,7 +463,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
             initial_transport_for_platform(windows).as_ref(),
         ),
         watcher: Box::new(AgyTranscriptWatcher { log_path }),
-        environment_removals: &[],
+        environment_removals: super::codex::CODEX_CALLER_SESSION_MARKERS,
     })
 }
 

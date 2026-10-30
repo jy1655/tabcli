@@ -39,9 +39,15 @@ fn declared_message_prepares_only_identity_and_leaves_pending_ownership_in_send(
 fn messenger_keeps_only_claude_removals_and_its_explicit_session_directory() {
     let directory = std::path::Path::new(".");
     let command = messenger_command(std::path::Path::new("unused"), directory, vec![]).unwrap();
+    // Claude's own markers and the Codex caller markers, the latter fixed here.
+    let removals = [
+        super::super::CLAUDE_CODE_SESSION_MARKERS,
+        &crate::native::process_env::tests::CODEX_CALLER_MARKERS[..],
+    ]
+    .concat();
     crate::native::process_env::tests::assert_provider_environment(
         &command,
-        CLAUDE_CODE_SESSION_MARKERS,
+        &removals,
         &[(
             crate::native::session::primitives::SESSION_DIR_ENV,
             Some(directory.as_os_str()),

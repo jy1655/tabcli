@@ -632,6 +632,22 @@ fn pi_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsStr
     expected
 }
 
+// Pi selects the Codex caller markers for its probes and launches, and nothing else.
+#[test]
+fn probes_drop_exactly_the_codex_caller_markers() {
+    use crate::native::process_env::tests::{CODEX_CALLER_MARKERS, CODEX_CONTEXT_KEPT};
+    assert_eq!(
+        ADAPTER.probe_environment_removals(),
+        &CODEX_CALLER_MARKERS[..]
+    );
+    for kept in CODEX_CONTEXT_KEPT {
+        assert!(
+            !ADAPTER.probe_environment_removals().contains(&kept),
+            "{kept}"
+        );
+    }
+}
+
 // The complete launch command for every policy combination, both platform branches and
 // both consent answers: policy first, the result extension, the managed name, a second
 // `--approve` when consent authorizes the workspace (both stay when both apply), and off
@@ -743,7 +759,11 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             format!("{:?}", PiHookFailureWatcher),
                             "{label}"
                         );
-                        assert!(plan.environment_removals.is_empty(), "{label}");
+                        assert_eq!(
+                            plan.environment_removals,
+                            &crate::native::process_env::tests::CODEX_CALLER_MARKERS[..],
+                            "{label}"
+                        );
                         let extension = fs::read_to_string(&extension_path).unwrap();
                         assert!(extension.contains("agent_settled"), "{label}");
                         let observed = crate::native::consent::observe(&directory);
