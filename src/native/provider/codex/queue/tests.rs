@@ -33,18 +33,29 @@ fn outcome_error(outcome: &Outcome) -> &anyhow::Error {
 }
 
 #[test]
-fn queue_keeps_the_inherited_environment_and_its_explicit_session_directory() {
-    let directory = std::path::Path::new(".");
-    let command =
-        super::queue_command(std::path::Path::new("unused"), directory, directory, vec![]).unwrap();
+fn queue_drops_the_codex_caller_markers_and_keeps_its_explicit_session_directory() {
+    let directory = std::path::Path::new("session-directory");
+    let workspace = std::path::Path::new("workspace");
+    let arguments: Vec<OsString> = ["queue", "--thread", "thread-id", "--message", "framed"]
+        .map(OsString::from)
+        .to_vec();
+    let command = super::queue_command(
+        std::path::Path::new("unused"),
+        directory,
+        workspace,
+        arguments.clone(),
+    )
+    .unwrap();
     crate::native::process_env::tests::assert_provider_environment(
         &command,
-        &[],
+        &crate::native::process_env::tests::CODEX_CALLER_MARKERS,
         &[(
             crate::native::session::primitives::SESSION_DIR_ENV,
             Some(directory.as_os_str()),
         )],
     );
+    assert_eq!(command.get_current_dir(), Some(workspace));
+    assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
 }
 
 #[test]

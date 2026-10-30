@@ -973,8 +973,9 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
 
 // A probe is a bridge-run provider process like any other: the adapter's removal list is
 // applied to it, so a `claude --version` started from inside Claude Code does not carry
-// the caller's session markers, while a Codex probe (empty list) inherits its caller's
-// environment unchanged (Codex review of PR #44).
+// the caller's session markers, while a Codex probe, whose list holds only the Codex caller
+// markers, inherits the Claude marker unchanged (Codex review of PR #44). Both drop the
+// Codex caller's thread id.
 #[cfg(unix)]
 #[test]
 fn version_probes_drop_the_adapters_environment_removals() {
@@ -991,13 +992,16 @@ fn version_probes_drop_the_adapters_environment_removals() {
         let executable = fixture.root.path().join("provider");
         fs::write(
             &executable,
-            "#!/bin/sh\nif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.302 (Claude Code)'; fi\n",
+            "#!/bin/sh\nif [ -n \"$CODEX_THREAD_ID\" ]; then echo 'inherited CODEX_THREAD_ID'; elif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.302 (Claude Code)'; fi\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let report = report(fixture.run_with_env(
             &["doctor", "session-doctor", "--probe", "--json"],
-            &[("CLAUDE_CODE_CHILD_SESSION", Some("1"))],
+            &[
+                ("CLAUDE_CODE_CHILD_SESSION", Some("1")),
+                ("CODEX_THREAD_ID", Some("caller-thread")),
+            ],
         ));
         let version = check(&report, "provider_version");
         assert_eq!(

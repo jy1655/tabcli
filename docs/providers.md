@@ -298,6 +298,18 @@ Shorten the follow-up and pass long material by path in the workspace. Codex's i
 route does not change this send-side limit; the console-pasted initial prompt has no such limit
 beyond the paste defects of #124.
 
+Codex exports the caller's session, thread and tool-call ids (`CODEX_SESSION_ID`,
+`CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`) to its tool shells, and on native Windows its daemon
+backend gives its own children shutdown markers (`CODEX_DAEMON_SHUTDOWN_FILE`,
+`CODEX_DAEMON_SHUTDOWN_SOCKET`). Codex hooks and the legacy `notify` replay the inherited
+environment without replacing these names. A Bridge session is independent of the shell that
+started it, so every Bridge launch, probe, messenger and Codex queue command, for all four
+providers, removes these five names, and so do the terminal and helper processes Bridge starts.
+Codex configuration, credentials, install hints and sandbox or proxy context, such as
+`CODEX_HOME`, `CODEX_CA_CERTIFICATE` and `CODEX_SANDBOX`, stay. A hook or script inside a managed
+session no longer sees the outer Codex ids; pass any parent correlation explicitly. Evidence and
+open checks are in the [source notes](verification/2026-10-30-codex-caller-environment-source-notes.md).
+
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.
 
@@ -329,7 +341,9 @@ a separate, nonpersistent Claude messenger model turn calls `ListAgents` to find
 and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session markers so a
 launch from inside Claude does not create a nested session with an undiscoverable inbox; the list
 includes the caller's session id and transcript path that the Claude Code Codex plugin sets
-(`CODEX_COMPANION_SESSION_ID`, `CODEX_COMPANION_TRANSCRIPT_PATH`, #149).
+(`CODEX_COMPANION_SESSION_ID`, `CODEX_COMPANION_TRANSCRIPT_PATH`, #149). Claude launches,
+probes and messengers also drop the five [Codex caller markers](#codex); doctor's
+`claude_caller_markers` row reports only Claude's own markers.
 On macOS, Bridge also keeps those markers and its own per-session variables out of every
 other process it starts, including a terminal application it starts. An application already
 started by an earlier version keeps them until it is restarted. The [2026-10-12 Windows check][win48]

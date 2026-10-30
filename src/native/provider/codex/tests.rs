@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::process_env::tests::{CODEX_CALLER_MARKERS, CODEX_CONTEXT_KEPT};
 use crate::native::session::turn;
 
 // The session watcher waits without a Claim or binding. Starting and stopping on an
@@ -447,7 +448,11 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             "{label}"
                         );
                         assert_idle_watcher(plan.watcher);
-                        assert!(plan.environment_removals.is_empty(), "{label}");
+                        assert_eq!(
+                            plan.environment_removals,
+                            &CODEX_CALLER_MARKERS[..],
+                            "{label}"
+                        );
                         let observed = crate::native::consent::observe(&directory);
                         if consent {
                             assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
@@ -458,6 +463,22 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                 }
             }
         }
+    }
+}
+
+// Launches and probes drop exactly the five caller markers and leave every other Codex name,
+// configuration and sandbox context included, to the inherited environment.
+#[test]
+fn launch_and_probe_drop_exactly_the_codex_caller_markers() {
+    assert_eq!(
+        ADAPTER.probe_environment_removals(),
+        &CODEX_CALLER_MARKERS[..]
+    );
+    for kept in CODEX_CONTEXT_KEPT {
+        assert!(
+            !ADAPTER.probe_environment_removals().contains(&kept),
+            "{kept}"
+        );
     }
 }
 

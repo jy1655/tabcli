@@ -314,8 +314,10 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
-        // Pi derives no session identity from the caller's environment.
-        &[]
+        // Pi is not known to take session identity from these names, but its descendants and
+        // a bundled agent-detection dependency can read them: an independent launch drops the
+        // Codex caller's identity and shutdown context.
+        super::codex::CODEX_CALLER_SESSION_MARKERS
     }
 
     fn diagnose(
@@ -332,7 +334,13 @@ impl NativeProviderAdapter for PiAdapter {
                 "Inspect the managed owner and terminal. Live input was not tested; replace this fallback when Pi provides the required native path.",
             ),
             credential_diagnosis(context, |path, args, workspace, deadline| {
-                super::super::process_env::probe(path, args, Some(workspace), &[], deadline)
+                super::super::process_env::probe(
+                    path,
+                    args,
+                    Some(workspace),
+                    self.probe_environment_removals(),
+                    deadline,
+                )
             }),
         ]
     }
@@ -482,7 +490,7 @@ fn prepare_launch_for_platform(
             initial_transport_for_platform(windows).as_ref(),
         ),
         watcher: Box::new(PiHookFailureWatcher),
-        environment_removals: &[],
+        environment_removals: super::codex::CODEX_CALLER_SESSION_MARKERS,
     })
 }
 

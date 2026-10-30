@@ -141,22 +141,40 @@ fn session_metadata_titles_drop_control_characters_and_are_bounded() {
 // workspace, with the adapter's environment removals applied and Bridge's session
 // variables set. Claude's removal list is non-empty, so a dropped list is observable; an
 // inherited CLAUDE_CODE_CHILD_SESSION is the marker that would stop the managed session
-// from registering its inbox (issue #42).
+// from registering its inbox (issue #42), and the Codex caller markers of a Codex tool
+// shell must not reach it either (#111). The fake provider records only the selected
+// names, never the host's whole environment.
 #[cfg(unix)]
 #[test]
 fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
     use std::os::unix::fs::PermissionsExt;
 
+    const CODEX_HOME_SENTINEL: &str = "/codex-home-sentinel";
+    let codex_markers = process_env::tests::CODEX_CALLER_MARKERS;
+    let recorded = ["CLAUDE_CODE_CHILD_SESSION", "CODEX_HOME"]
+        .into_iter()
+        .chain(codex_markers)
+        .chain([
+            SESSION_DIR_ENV,
+            "AGENT_BRIDGE_NATIVE_SESSION_ID",
+            "AGENT_BRIDGE_EXECUTABLE",
+            STDERR_ENV,
+            STDOUT_ENV,
+        ])
+        .collect::<Vec<_>>()
+        .join("|");
     let root = tempfile::tempdir().unwrap();
     let provider = root.path().join("fake-claude");
     fs::write(
         &provider,
-        concat!(
+        [
             "#!/bin/sh\n",
             "if [ \"$1\" = \"--version\" ]; then printf '2.1.302 (Claude Code)\\n'; exit 0; fi\n",
             "printf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
             "pwd > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/cwd.txt\"\n",
-            "env > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/env.txt\"\n",
+            &format!(
+                "env | grep -E '^({recorded})=' > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/env.txt\"\n"
+            ),
             "i=0\n",
             "until grep -q '\"awaiting-initial-input\"' \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status.json\" 2>/dev/null; do\n",
             "  i=$((i + 1)); [ \"$i\" -gt 500 ] && exit 3; sleep 0.01\n",
@@ -164,7 +182,8 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
             "cp \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status.json\" \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/status-at-run.json\"\n",
             "[ -e \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/initial-prompt.txt\" ] || exit 4\n",
             "exit 0\n",
-        ),
+        ]
+        .concat(),
     )
     .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -196,11 +215,27 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
     update_status(&directory, SessionState::Launching, None, None).unwrap();
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
-    // SAFETY: the test harness runs serially (`--test-threads=1`); the marker is set for
-    // this spawn only and removed before the test ends.
-    unsafe { std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "inherited-from-parent") };
+    // Synthetic caller values; the previous values are restored after this spawn.
+    let caller = [
+        ("CLAUDE_CODE_CHILD_SESSION", "inherited-from-parent"),
+        ("CODEX_HOME", CODEX_HOME_SENTINEL),
+    ]
+    .into_iter()
+    .chain(codex_markers.map(|name| (name, "codex-caller-sentinel")))
+    .map(|(name, value)| (name, value, std::env::var_os(name)))
+    .collect::<Vec<_>>();
+    // SAFETY: the test harness runs serially (`--test-threads=1`); the values are set for
+    // this spawn only and restored before the test ends.
+    for (name, value, _) in &caller {
+        unsafe { std::env::set_var(name, value) };
+    }
     let result = provision(&directory);
-    unsafe { std::env::remove_var("CLAUDE_CODE_CHILD_SESSION") };
+    for (name, _, previous) in &caller {
+        match previous {
+            Some(previous) => unsafe { std::env::set_var(name, previous) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
@@ -240,6 +275,15 @@ fn native_session_runs_the_adapters_complete_plan_with_its_environment() {
             .map(str::to_owned)
     };
     assert_eq!(variable("CLAUDE_CODE_CHILD_SESSION"), None, "{environment}");
+    for name in codex_markers {
+        assert_eq!(variable(name), None, "{name}: {environment}");
+    }
+    // Codex configuration is the user's, not a caller marker.
+    assert_eq!(
+        variable("CODEX_HOME").as_deref(),
+        Some(CODEX_HOME_SENTINEL),
+        "{environment}"
+    );
     assert_eq!(
         variable(SESSION_DIR_ENV).as_deref(),
         Some(directory.to_str().unwrap())

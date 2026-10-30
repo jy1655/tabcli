@@ -1622,10 +1622,35 @@ mod tests {
             .flat_map(|name| [name.to_owned(), name.to_ascii_lowercase()])
             .map(|name| (OsString::from(name), OsString::from("caller-sentinel")))
             .collect();
+        // The Codex caller markers in fixed spellings of every case, not read from the
+        // adapters: a Codex tool shell's identity and shutdown context (#111).
+        for name in [
+            "CODEX_SESSION_ID",
+            "codex_session_id",
+            "Codex_Session_Id",
+            "CODEX_THREAD_ID",
+            "codex_thread_id",
+            "Codex_Thread_Id",
+            "CODEX_TOOL_CALL_ID",
+            "codex_tool_call_id",
+            "Codex_Tool_Call_Id",
+            "CODEX_DAEMON_SHUTDOWN_FILE",
+            "codex_daemon_shutdown_file",
+            "Codex_Daemon_Shutdown_File",
+            "CODEX_DAEMON_SHUTDOWN_SOCKET",
+            "codex_daemon_shutdown_socket",
+            "Codex_Daemon_Shutdown_Socket",
+        ] {
+            variables.push((name.into(), "codex-caller-sentinel".into()));
+        }
         for (name, value) in [
             ("Agent_Bridge_Console_Host_Attempt", "old-attempt"),
             ("PATH", "C:\\tools"),
             ("CODEX_HOME", "C:\\codex"),
+            ("CODEX_SQLITE_HOME", "C:\\codex-sqlite"),
+            ("CODEX_CA_CERTIFICATE", "C:\\ca.pem"),
+            ("CODEX_CI", "1"),
+            ("CODEX_VERSION", "0.166.0"),
             ("CLAUDE_CODE_EFFORT_LEVEL", "high"),
             ("CLAUDE_PLUGIN_DATA", "plugin-data"),
             ("AGENT_BRIDGE_BATCH_ARG_0", "argument"),
@@ -1636,7 +1661,11 @@ mod tests {
             "AGENT_BRIDGE_BATCH_ARG_0=argument",
             "CLAUDE_CODE_EFFORT_LEVEL=high",
             "CLAUDE_PLUGIN_DATA=plugin-data",
+            "CODEX_CA_CERTIFICATE=C:\\ca.pem",
+            "CODEX_CI=1",
             "CODEX_HOME=C:\\codex",
+            "CODEX_SQLITE_HOME=C:\\codex-sqlite",
+            "CODEX_VERSION=0.166.0",
             "PATH=C:\\tools",
         ];
         assert_eq!(

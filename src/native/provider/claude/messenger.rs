@@ -21,7 +21,7 @@
 // messenger protocol, executed-input proof, retry evidence and clock injection.
 
 use super::{
-    CLAUDE_CODE_SESSION_MARKERS, claude_owned_string, claude_string, completion,
+    claude_owned_string, claude_string, completion, launch_environment_removals,
     managed_session_name, turn,
 };
 use crate::native::clock::{Clock, SystemClock};
@@ -720,7 +720,7 @@ fn messenger_command(
         executable,
         directory,
         arguments,
-        CLAUDE_CODE_SESSION_MARKERS,
+        launch_environment_removals(),
     )?;
     configure_process_tree(&mut command);
     command.current_dir(directory).env(

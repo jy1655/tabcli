@@ -26,8 +26,12 @@ fn queue_command(
     workspace: &Path,
     arguments: Vec<OsString>,
 ) -> Result<std::process::Command> {
-    let mut command =
-        crate::native::process_env::provider_command(executable, directory, arguments, &[])?;
+    let mut command = crate::native::process_env::provider_command(
+        executable,
+        directory,
+        arguments,
+        super::CODEX_CALLER_SESSION_MARKERS,
+    )?;
     command.current_dir(workspace).env(
         crate::native::session::primitives::SESSION_DIR_ENV,
         directory,

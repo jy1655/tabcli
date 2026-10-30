@@ -231,6 +231,22 @@ fn agy_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsSt
     expected
 }
 
+// Agy selects the Codex caller markers for its probes and launches, and nothing else.
+#[test]
+fn probes_drop_exactly_the_codex_caller_markers() {
+    use crate::native::process_env::tests::{CODEX_CALLER_MARKERS, CODEX_CONTEXT_KEPT};
+    assert_eq!(
+        ADAPTER.probe_environment_removals(),
+        &CODEX_CALLER_MARKERS[..]
+    );
+    for kept in CODEX_CONTEXT_KEPT {
+        assert!(
+            !ADAPTER.probe_environment_removals().contains(&kept),
+            "{kept}"
+        );
+    }
+}
+
 // The complete launch command for every policy combination and both platform branches:
 // policy, the private log file, and off Windows the correlated interactive prompt.
 #[test]
@@ -300,7 +316,11 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         format!("{:?}", AgyTranscriptWatcher { log_path }),
                         "{label}"
                     );
-                    assert!(plan.environment_removals.is_empty(), "{label}");
+                    assert_eq!(
+                        plan.environment_removals,
+                        &crate::native::process_env::tests::CODEX_CALLER_MARKERS[..],
+                        "{label}"
+                    );
                 }
             }
         }

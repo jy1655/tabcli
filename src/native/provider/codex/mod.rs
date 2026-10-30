@@ -37,6 +37,23 @@ pub(super) static ADAPTER: CodexAdapter = CodexAdapter;
 
 pub(super) struct CodexAdapter;
 
+// Codex 0.166.0 exports the caller's session, thread and tool-call identities to tool
+// children; its hooks and legacy notify replay the inherited process environment without
+// replacing them. On Windows the socket marker's presence enables a local control-socket
+// app-server's PID-checked shutdown route, and the file marker belongs to one updater.
+// A Bridge launch is an independent session, so these five caller-owned names stay out of
+// it. Configuration, install hints and sandbox or proxy context stay: never strip a
+// `CODEX_` prefix. The other adapters select this list by reference. Revisit an entry when
+// Codex stops exporting it or isolates it across every child path, including hooks, notify
+// and nested launches. See docs/verification/2026-10-30-codex-caller-environment-source-notes.md.
+pub(super) const CODEX_CALLER_SESSION_MARKERS: &[&str] = &[
+    "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_TOOL_CALL_ID",
+    "CODEX_DAEMON_SHUTDOWN_FILE",
+    "CODEX_DAEMON_SHUTDOWN_SOCKET",
+];
+
 #[cfg(test)]
 use self::turn::PENDING_TURN_FILE;
 use self::turn::{PendingCodexTurn, cancel_pending_turn, read_pending_turn, write_pending_turn};
@@ -252,8 +269,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
-        // Codex derives no session identity from the caller's environment.
-        &[]
+        CODEX_CALLER_SESSION_MARKERS
     }
 
     fn diagnose(
@@ -431,7 +447,7 @@ fn prepare_launch_for_platform(
             initial_transport_for_platform(windows).as_ref(),
         ),
         watcher: Box::new(transcript::Watcher),
-        environment_removals: &[],
+        environment_removals: CODEX_CALLER_SESSION_MARKERS,
     })
 }
 
