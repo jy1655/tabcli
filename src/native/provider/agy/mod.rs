@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 mod delivery;
@@ -54,6 +55,17 @@ impl Home {
 }
 
 pub(super) struct AgyAdapter;
+
+fn launch_environment_removals() -> &'static [&'static str] {
+    static REMOVALS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        [
+            super::codex::CODEX_CALLER_SESSION_MARKERS,
+            super::claude::caller_identity_markers(),
+        ]
+        .concat()
+    });
+    &REMOVALS
+}
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 const TRANSCRIPT_FILE: &str = "transcript.jsonl";
@@ -353,9 +365,9 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
-        // Agy is not known to read these names; it drops the Codex caller's identity and
-        // shutdown context so that an independent launch and its descendants never carry it.
-        super::codex::CODEX_CALLER_SESSION_MARKERS
+        // An independent Agy launch and its descendants must not carry the caller's
+        // Codex identity/shutdown context or Claude identity/inbox.
+        launch_environment_removals()
     }
 
     fn diagnose(
@@ -463,7 +475,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
             initial_transport_for_platform(windows).as_ref(),
         ),
         watcher: Box::new(AgyTranscriptWatcher { log_path }),
-        environment_removals: super::codex::CODEX_CALLER_SESSION_MARKERS,
+        environment_removals: launch_environment_removals(),
     })
 }
 

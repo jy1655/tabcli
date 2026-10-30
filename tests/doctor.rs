@@ -971,28 +971,31 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
     observe("reopen_marker_unreadable", "unknown");
 }
 
-// A probe is a bridge-run provider process like any other: the adapter's removal list is
-// applied to it, so a `claude --version` started from inside Claude Code does not carry
-// the caller's session markers, while a Codex probe, whose list holds only the Codex caller
-// markers, inherits the Claude marker unchanged (Codex review of PR #44). Both drop the
-// Codex caller's thread id.
+// Every provider's version probe removes both callers' identities. Non-Claude probes
+// retain Claude execution hints; Claude's existing full removal list still removes them.
 #[cfg(unix)]
 #[test]
 fn version_probes_drop_the_adapters_environment_removals() {
     use std::os::unix::fs::PermissionsExt;
-    for (provider, expected_version, expected_reason) in [
-        ("claude", "2.1.302 (Claude Code)", "version_supported"),
-        (
-            "codex",
-            "nested CLAUDE_CODE_CHILD_SESSION=1",
-            "version_unrecognized",
-        ),
-    ] {
+    for provider in ["claude", "codex", "agy", "pi"] {
         let fixture = Fixture::new(provider);
         let executable = fixture.root.path().join("provider");
         fs::write(
             &executable,
-            "#!/bin/sh\nif [ -n \"$CODEX_THREAD_ID\" ]; then echo 'inherited CODEX_THREAD_ID'; elif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.302 (Claude Code)'; fi\n",
+            r#"#!/bin/sh
+if [ -n "${CODEX_THREAD_ID}${CLAUDE_CODE_CHILD_SESSION}${CODEX_COMPANION_SESSION_ID}${CLAUDE_CODE_MESSAGING_TOKEN}" ]; then
+  echo 'inherited caller identity'; exit 0
+fi
+if [ "$AB_EXPECT_CLAUDE_HINTS" = yes ]; then
+  if [ "$AI_AGENT" != 'fixture-ai' ] || [ "$CLAUDE_EFFORT" != 'fixture-effort' ] ||
+     [ "$CLAUDE_CODE_ENTRYPOINT" != 'fixture-entrypoint' ] || [ "$CLAUDE_CODE_EXECPATH" != 'fixture-execpath' ]; then
+    echo 'lost execution hint'; exit 0
+  fi
+elif [ -n "${AI_AGENT}${CLAUDE_EFFORT}${CLAUDE_CODE_ENTRYPOINT}${CLAUDE_CODE_EXECPATH}" ]; then
+  echo 'changed Claude full removal list'; exit 0
+fi
+echo '2.1.302 (Claude Code)'
+"#,
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1001,15 +1004,25 @@ fn version_probes_drop_the_adapters_environment_removals() {
             &[
                 ("CLAUDE_CODE_CHILD_SESSION", Some("1")),
                 ("CODEX_THREAD_ID", Some("caller-thread")),
+                ("CODEX_COMPANION_SESSION_ID", Some("caller-companion")),
+                ("CLAUDE_CODE_MESSAGING_TOKEN", Some("synthetic-inbox-token")),
+                ("AI_AGENT", Some("fixture-ai")),
+                ("CLAUDE_EFFORT", Some("fixture-effort")),
+                ("CLAUDE_CODE_ENTRYPOINT", Some("fixture-entrypoint")),
+                ("CLAUDE_CODE_EXECPATH", Some("fixture-execpath")),
+                (
+                    "AB_EXPECT_CLAUDE_HINTS",
+                    Some(if provider == "claude" { "no" } else { "yes" }),
+                ),
             ],
         ));
         let version = check(&report, "provider_version");
         assert_eq!(
-            version["evidence"]["current_version"], expected_version,
+            version["evidence"]["current_version"], "2.1.302 (Claude Code)",
             "{provider}: {version}"
         );
         assert_eq!(
-            version["reason_code"], expected_reason,
+            version["reason_code"], "version_supported",
             "{provider}: {version}"
         );
     }

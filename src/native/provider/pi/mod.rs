@@ -28,12 +28,23 @@ use monitor::PiFailureMonitor;
 use serde::{Deserialize, Serialize};
 use startup::send_initial_prompt;
 use startup_ready::StartupReadiness;
-use std::{cell::RefCell, ffi::OsString, path::Path, time::Duration};
+use std::{cell::RefCell, ffi::OsString, path::Path, sync::LazyLock, time::Duration};
 use usage::reported_usage;
 
 pub(super) static ADAPTER: PiAdapter = PiAdapter;
 
 pub(super) struct PiAdapter;
+
+fn launch_environment_removals() -> &'static [&'static str] {
+    static REMOVALS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        [
+            super::codex::CODEX_CALLER_SESSION_MARKERS,
+            super::claude::caller_identity_markers(),
+        ]
+        .concat()
+    });
+    &REMOVALS
+}
 
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
 
@@ -314,10 +325,9 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
-        // Pi is not known to take session identity from these names, but its descendants and
-        // a bundled agent-detection dependency can read them: an independent launch drops the
-        // Codex caller's identity and shutdown context.
-        super::codex::CODEX_CALLER_SESSION_MARKERS
+        // Pi's descendants and a bundled agent-detection dependency can read caller context:
+        // an independent launch drops Codex identity/shutdown context and Claude identity/inbox.
+        launch_environment_removals()
     }
 
     fn diagnose(
@@ -490,7 +500,7 @@ fn prepare_launch_for_platform(
             initial_transport_for_platform(windows).as_ref(),
         ),
         watcher: Box::new(PiHookFailureWatcher),
-        environment_removals: super::codex::CODEX_CALLER_SESSION_MARKERS,
+        environment_removals: launch_environment_removals(),
     })
 }
 

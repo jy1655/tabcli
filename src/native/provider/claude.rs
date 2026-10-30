@@ -64,6 +64,29 @@ const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
     "CODEX_COMPANION_TRANSCRIPT_PATH",
 ];
 
+// Other providers need the caller's identity and inbox removed (#335), not Claude's
+// execution hints. Keep ownership here and preserve Claude's full launch/diagnostic list.
+// SESSION_ATTENDED describes the caller's session, so it stays in the identity subset.
+// Revisit this subset when Claude isolates caller identity across directly spawned children.
+pub(super) fn caller_identity_markers() -> &'static [&'static str] {
+    static MARKERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        CLAUDE_CODE_SESSION_MARKERS
+            .iter()
+            .copied()
+            .filter(|marker| {
+                !matches!(
+                    *marker,
+                    "AI_AGENT"
+                        | "CLAUDE_CODE_ENTRYPOINT"
+                        | "CLAUDE_CODE_EXECPATH"
+                        | "CLAUDE_EFFORT"
+                )
+            })
+            .collect()
+    });
+    &MARKERS
+}
+
 // Launches, probes and messengers also drop the Codex caller markers that the Codex adapter
 // owns. Only the Claude markers above are evidence that the caller runs inside Claude Code.
 static LAUNCH_ENVIRONMENT_REMOVALS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {

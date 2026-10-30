@@ -929,11 +929,11 @@ fn probe_and_version_queries_drop_the_same_markers_as_managed_launches() {
             "{kept}"
         );
     }
-    // The other adapters select only the Codex caller markers.
+    // The other adapters select Claude caller identities, without Claude execution settings.
     for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
         assert_eq!(
             probe_environment_removals(other),
-            &CODEX_CALLER_MARKERS[..],
+            &crate::native::process_env::tests::NON_CLAUDE_CALLER_MARKERS[..],
             "{other:?}"
         );
     }

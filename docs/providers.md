@@ -344,8 +344,16 @@ includes the caller's session id and transcript path that the Claude Code Codex 
 (`CODEX_COMPANION_SESSION_ID`, `CODEX_COMPANION_TRANSCRIPT_PATH`, #149). Claude launches,
 probes and messengers also drop the five [Codex caller markers](#codex); doctor's
 `claude_caller_markers` row reports only Claude's own markers.
-On macOS, Bridge also keeps those markers and its own per-session variables out of every
-other process it starts, including a terminal application it starts. An application already
+Codex, Agy and Pi launches and probes, including the Codex queue and Pi credential probe,
+also remove a Claude-owned caller-identity subset: `CLAUDE_CODE_BRIDGE_SESSION_ID`,
+`CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`,
+`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_SESSION_ATTENDED`
+and both `CODEX_COMPANION_*` names (#335). Direct non-Claude provider commands keep
+`AI_AGENT`, `CLAUDE_EFFORT`, `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EXECPATH`, as well as
+credentials and user configuration. Claude's own full removal list and the helper union
+are unchanged; this does not restore a variable a terminal or helper already removed.
+On macOS, non-provider helpers keep Claude's full list and Bridge's per-session variables out
+of the processes they start, including a terminal application. An application already
 started by an earlier version keeps them until it is restarted. The [2026-10-12 Windows check][win48]
 verified scrubbing in the managed Codex process on both a Windows Terminal tab and a separate
 console window. Only the Windows Terminal cold-start observation followed by a user-opened tab

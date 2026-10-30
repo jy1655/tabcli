@@ -168,8 +168,13 @@ launch, observe, continue, and close without replacing the capabilities those CL
   commands (managed launches, version and doctor probes, messengers and the Codex queue)
   keep their own adapter's removal list. An adapter may select another adapter's owned
   list by reference, never by copy: Claude, Agy and Pi select the Codex caller markers
-  (see Current Codex Boundary), and Claude's own-origin diagnostic still reads only the
-  Claude markers. Non-provider commands on macOS and native Windows,
+  (see Current Codex Boundary). Codex, Agy and Pi also select the Claude-owned caller
+  identity subset for probes and launches, and Codex uses it for its queue (#335).
+  That subset includes session ids, the child-session marker, pid, inbox credentials,
+  attended-session state and the companion ids; it excludes `AI_AGENT`, `CLAUDE_EFFORT`,
+  `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EXECPATH`. These execution hints stay inherited
+  in directly spawned non-Claude provider commands. Claude's full removal list and
+  own-origin diagnostic remain unchanged. Non-provider commands on macOS and native Windows,
   including terminal automation that can start an application and helpers, drop the union
   of the adapters' caller-session markers and Bridge's state directory, session directory,
   session id and executable variables. A child that needs one receives it explicitly. On
