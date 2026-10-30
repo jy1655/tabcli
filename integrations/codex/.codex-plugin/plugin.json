@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.4.31",
+  "version": "0.4.32",
   "description": "Delegate work to coding agents, read results, send follow-ups, and close task sessions.",
   "author": {
     "name": "jy1655"
