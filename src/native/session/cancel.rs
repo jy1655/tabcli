@@ -52,11 +52,58 @@ pub(in crate::native) fn observe(reader: &Reader, locked: bool) -> Result<Option
     Ok(cancel)
 }
 
+/// Why the cancel admission refused. Observers report `code`; the action renders the
+/// message, which keeps the wording the command has always printed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum RefusalReason {
+    StateNotRunning,
+    NoActiveClaim,
+    NoActiveReceipt,
+    ResultAlreadyPublished,
+    CancelAlreadyRecorded,
+    ProviderUnsupported,
+}
+
+impl RefusalReason {
+    pub(in crate::native) fn code(self) -> &'static str {
+        match self {
+            Self::StateNotRunning => "state_not_running",
+            Self::NoActiveClaim => "no_active_claim",
+            Self::NoActiveReceipt => "no_active_receipt",
+            Self::ResultAlreadyPublished => "result_already_published",
+            Self::CancelAlreadyRecorded => "cancel_already_recorded",
+            Self::ProviderUnsupported => "provider_unsupported",
+        }
+    }
+}
+
 #[derive(Debug)]
-pub(in crate::native) struct Refusal(String);
+pub(in crate::native) struct Refusal {
+    reason: RefusalReason,
+    message: String,
+    /// The refused request, when the admission had read its receipt.
+    request_id: Option<String>,
+}
+
+impl Refusal {
+    fn new(reason: RefusalReason, message: String, request_id: Option<&str>) -> Self {
+        Self {
+            reason,
+            message,
+            request_id: request_id.map(str::to_owned),
+        }
+    }
+    pub(in crate::native) fn reason(&self) -> RefusalReason {
+        self.reason
+    }
+    pub(in crate::native) fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for Refusal {}
@@ -71,26 +118,49 @@ pub(in crate::native) fn request(store: &Store, id: &str) -> Result<Cancel> {
     })
 }
 
-fn request_with_support(
-    store: &Store,
+/// The request a cancel would be recorded for. The claim token never leaves this module;
+/// observers report only the request id.
+pub(in crate::native) struct Admitted {
+    pub(in crate::native) request_id: String,
+    claim_token: String,
+}
+
+/// The cancel admission without its write: every read and gate `cancel` makes before it
+/// records the request, in the same order. The caller holds the lifecycle lock (exclusive
+/// for the action, the query's retained shared lock for an observer); this function takes
+/// no lock and writes nothing. A gate refusal is a [`Refusal`]; any other error is
+/// evidence that could not be read.
+pub(in crate::native) fn admission(
+    reader: &Reader,
     id: &str,
     support: impl FnOnce() -> Result<provider::CancelSupport>,
-) -> Result<Cancel> {
-    let _lock = store.lock()?;
-    let state = store
+) -> Result<Admitted> {
+    let state = reader
         .closed_if_present()?
-        .map_or_else(|| store.status().map(|s| s.state), |s| Ok(s.state))?;
+        .map_or_else(|| reader.status().map(|s| s.state), |s| Ok(s.state))?;
     if !matches!(state, SessionState::Running | SessionState::Working) {
-        return Err(Refusal(format!(
-            "session {id} is {state}; cancel requires the running or working state"
-        ))
+        return Err(Refusal::new(
+            RefusalReason::StateNotRunning,
+            format!("session {id} is {state}; cancel requires the running or working state"),
+            None,
+        )
         .into());
     }
-    let token = turn::current_claim_token(store)?
-        .ok_or_else(|| Refusal(format!("session {id} has no active claim to cancel")))?;
-    let receipt = requests::for_claim(store, &token)?
-        .ok_or_else(|| Refusal(format!("session {id} has no receipt for its active claim")))?;
-    let pending = store
+    let token = turn::current_claim_token(reader)?.ok_or_else(|| {
+        Refusal::new(
+            RefusalReason::NoActiveClaim,
+            format!("session {id} has no active claim to cancel"),
+            None,
+        )
+    })?;
+    let receipt = requests::for_claim(reader, &token)?.ok_or_else(|| {
+        Refusal::new(
+            RefusalReason::NoActiveReceipt,
+            format!("session {id} has no receipt for its active claim"),
+            None,
+        )
+    })?;
+    let pending = reader
         .record(CoreRecord::Completion)
         .optional_json::<turn::PendingTurnCompletion>()?;
     if let Some(pending) = &pending {
@@ -101,30 +171,59 @@ fn request_with_support(
         .filter(|p| p.event_file == receipt.event_file);
     let published = journaled
         .map(|p| {
-            store.journaled_event_state_within(p, crate::native::session::schema::EVENT_READ_LIMIT)
+            reader.journaled_event_state_within(p, crate::native::session::schema::EVENT_READ_LIMIT)
         })
         .transpose()?;
     if turn::event_published(journaled.is_some(), published.as_ref(), true) {
-        return Err(Refusal(format!(
-            "request {} already has a published result",
-            receipt.request_id
-        ))
+        return Err(Refusal::new(
+            RefusalReason::ResultAlreadyPublished,
+            format!(
+                "request {} already has a published result",
+                receipt.request_id
+            ),
+            Some(&receipt.request_id),
+        )
         .into());
     }
-    if read(store)?.is_some_and(|r| r.claim_token == token) {
-        return Err(Refusal(format!(
-            "a cancel for request {} is already recorded",
-            receipt.request_id
-        ))
+    if read(reader)?.is_some_and(|r| r.claim_token == token) {
+        return Err(Refusal::new(
+            RefusalReason::CancelAlreadyRecorded,
+            format!(
+                "a cancel for request {} is already recorded",
+                receipt.request_id
+            ),
+            Some(&receipt.request_id),
+        )
         .into());
     }
     if let provider::CancelSupport::Unsupported(reason) = support()? {
-        return Err(Refusal(reason).into());
+        return Err(Refusal::new(
+            RefusalReason::ProviderUnsupported,
+            reason,
+            Some(&receipt.request_id),
+        )
+        .into());
     }
-    let record = Cancel {
-        schema: 1,
+    Ok(Admitted {
         request_id: receipt.request_id,
         claim_token: token,
+    })
+}
+
+fn request_with_support(
+    store: &Store,
+    id: &str,
+    support: impl FnOnce() -> Result<provider::CancelSupport>,
+) -> Result<Cancel> {
+    let _lock = store.lock()?;
+    let Admitted {
+        request_id,
+        claim_token,
+    } = admission(store, id, support)?;
+    let record = Cancel {
+        schema: 1,
+        request_id,
+        claim_token,
         created_unix_ms: unix_ms(),
     };
     store

@@ -605,6 +605,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         "the host entries end the registry"
     );
     let cases: Vec<(Vec<&str>, String)> = vec![
+        (vec!["describe", "wait", "--json"], "Describe(Request { command: Some(\"wait\"), json: true })".into()),
         (vec!["ask", "codex", "--prompt", "hello"], format!("Ask({ask})")),
         (vec!["self-test", "pi", "--isolated", "--json"], format!("SelfTest(Request {{ ask: {self_test_ask}, isolated: true }})")),
         (vec!["tell", "session-route", "--prompt", "hello"], "Tell(TellRequest { id: \"session-route\", prompt: \"hello\", timeout: 900s, detach: false, json: false, context_results: [] })".into()),

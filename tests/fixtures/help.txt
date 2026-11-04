@@ -1,6 +1,7 @@
 tabcli <version>: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
 
 Usage:
+  tabcli describe [COMMAND] [--json]
   tabcli ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
@@ -30,6 +31,7 @@ Usage:
   tabcli settings [windows-tab-window <dedicated|current>] [--json]
   tabcli settings macos-open-mode <tab-first|new-window> [--json]
   tabcli settings codex-memory-workspace <refuse|allow> [--json]
+  tabcli settings codex-lifecycle-hooks <on|off> [--json]
   tabcli prune-sessions --closed-before-days N --explicit [--json]
   tabcli close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
   tabcli --help | --version

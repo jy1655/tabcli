@@ -12,9 +12,10 @@ The **target provider** is the CLI selected in `ask`. Install and sign in to jus
 For the current engine's minimum versions and transport capabilities, consult
 [providers](https://github.com/jy1655/tabcli/blob/main/docs/providers.md), and inspect the
 installed engine with `tabcli doctor --provider PROVIDER --probe --json`.
-Linked repository guides describe the current source. Prefer the installed `tabcli --help`
-for its command contract; select the documentation's `v<installed-version>` Git tag when
-checking a release-specific capability.
+Linked repository guides describe the current source. Prefer the installed engine's own
+`tabcli describe --json` build contract, adopted as the skill describes; engines that lack
+it, or return a contract the skill does not recognize, fall back to `tabcli --help`. Select
+the documentation's `v<installed-version>` Git tag when checking a release-specific capability.
 The probe checks local capabilities; success does not establish authentication, trust,
 successful delivery, or completed work.
 
@@ -97,7 +98,8 @@ can be addressed after its cause is fixed, but an uncertain delivery must never 
 automatically. Report the provider's actual error rather than inferring success from an
 empty output, process exit, or terminal text.
 
-Cancellation and reopening are not uniform capabilities. Check the installed `tabcli --help`,
+Cancellation and reopening are not uniform capabilities. Check the installed command contract
+(or `tabcli --help` on older engines),
 the session's doctor findings, and the matching release's provider documentation before using
 either, and only do so for the user's intended operation. Acceptance of cancellation is not
 completion; reopening has provider-specific ownership and receipt gates. `tell` continues an open ready

@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+mod capabilities;
+#[cfg(test)]
+mod capabilities_tests;
 mod inspect;
 pub(super) mod observation;
 #[cfg(test)]

@@ -73,6 +73,12 @@ pub(super) fn value(
     let snapshot = &observation.records;
     let resumed_from = observation.resumed_from?;
     let latest = ResultReference::latest(snapshot, reader)?.value();
+    let capabilities = super::capabilities::value(
+        reader,
+        snapshot,
+        id,
+        crate::native::session::primitives::unix_ms(),
+    );
     let request_refs = snapshot
         .receipts
         .iter()
@@ -108,6 +114,7 @@ pub(super) fn value(
         "recovery_required": judgments.recovery_required, "turn_claimed": snapshot.claim.is_some(),
         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
         "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
+        "capabilities": capabilities,
     }).as_object().unwrap().clone());
     session::hold::add_fields(&mut value, &observation.evidence.held);
     if let Some(completion) = provider::completion_observation(
