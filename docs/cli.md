@@ -22,14 +22,15 @@ errors too. Unknown commands and hidden helpers produce the same public-command 
 `tabcli <COMMAND> --help` (or `-h`) prints one public command's entry as a plain-text page: the
 summary and synopsis block that `tabcli describe <COMMAND>` prints, then its notes, its argv
 examples as `tabcli ...` lines, its features and its possible effects. An example argument that
-contains a space is shown in double quotes; pass it as one argument. The page reads no provider,
-setting, state root or session and exits with status 0. `--help` must be the only argument after
-the command name: `tabcli ask --help extra` fails with `--help does not accept arguments`, and a
-hidden helper or unknown name fails with the same public-command error as `describe`. The commands
-of the removed embedded TUI (`open`, `prompt`, `read`, `list`, `close` and `hook`) keep their
-migration message with or without `--help`. A `--help`
-later in the arguments is still parsed by the command itself. `tabcli --help` prints the main help,
-which keeps the runtime, session-policy and platform details that the command pages leave out.
+is empty, contains a space or another shell-sensitive character, or starts with `@` or `=` is
+shown in double quotes; pass it as one argument. The page reads no provider, setting, state root
+or session and exits with status 0. `--help` must be the only argument after the command name:
+`tabcli ask --help extra` fails with `--help does not accept arguments`, and a hidden helper or
+unknown name fails with the same public-command error as `describe`. The commands of the removed
+embedded TUI (`open`, `prompt`, `read`, `list`, `close` and `hook`) keep their migration message
+with or without `--help`. A `--help` later in the arguments is still parsed by the command itself.
+`tabcli --help` prints the main help, which keeps the runtime, session-policy and platform details
+that the command pages leave out.
 
 `describe` does not inspect providers, settings or sessions, create a state root, repair records,
 or run a probe. Its build contract is not runtime capability or authorization. `possible_effects`

@@ -97,6 +97,7 @@ pub(super) const SELF_TEST: Contract = Contract {
     notes: &[
         "Can repair a dead owner's records and close its remaining Windows console; recovery may also finish an interrupted close.",
         "Makes real model calls. Default timeout is 120 seconds per command; retained records and isolated directories are not deleted.",
+        "Opens a real terminal. Without --isolated it runs in the ordinary state root with its settings and consent records; it closes only the session it creates.",
     ],
 };
 pub(super) const TELL: Contract = Contract {
@@ -390,10 +391,12 @@ fn summary_text(command: &Value) -> String {
     text
 }
 
-/// Quotes an example argument for display. Registry examples avoid characters that would need
-/// escaping inside double quotes in POSIX shells, PowerShell or cmd.exe.
+/// Quotes an example argument for display when it is empty, has a character outside a
+/// conservative plain set, or starts with `@` (a PowerShell splat) or `=` (zsh's equals
+/// expansion). Registry examples contain no character that would need escaping inside the quotes.
 fn display_argument(argument: &str) -> String {
     let plain = !argument.is_empty()
+        && !argument.starts_with(['@', '='])
         && argument
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_./:=,@+".contains(c));
@@ -633,6 +636,12 @@ mod tests {
         );
         assert_eq!(display_argument("entry point"), "\"entry point\"");
         assert_eq!(display_argument(""), "\"\"");
+        // A leading @ splats in PowerShell and a leading = expands in zsh; inside a word both stay.
+        assert_eq!(display_argument("@file"), "\"@file\"");
+        assert_eq!(display_argument("@"), "\"@\"");
+        assert_eq!(display_argument("=value"), "\"=value\"");
+        assert_eq!(display_argument("--key=@value"), "--key=@value");
+        assert_eq!(display_argument("user@host"), "user@host");
         for entry in COMMANDS {
             for example in entry.contract.into_iter().flat_map(|c| c.examples) {
                 for argument in *example {
