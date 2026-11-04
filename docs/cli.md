@@ -19,6 +19,19 @@ to execute automatically. Synopsis strings are usage notation, not an input JSON
 Without `--json`, describe prints a concise human-readable summary. Pass `--json` for structured
 errors too. Unknown commands and hidden helpers produce the same public-command error.
 
+`tabcli <COMMAND> --help` (or `-h`) prints one public command's entry as a plain-text page: the
+summary and synopsis block that `tabcli describe <COMMAND>` prints, then its notes, its argv
+examples as `tabcli ...` lines, its features and its possible effects. An example argument that
+is empty, contains a space or another shell-sensitive character, or starts with `@` or `=` is
+shown in double quotes; pass it as one argument. The page reads no provider, setting, state root
+or session and exits with status 0. `--help` must be the only argument after the command name:
+`tabcli ask --help extra` fails with `--help does not accept arguments`, and a hidden helper or
+unknown name fails with the same public-command error as `describe`. The commands of the removed
+embedded TUI (`open`, `prompt`, `read`, `list`, `close` and `hook`) keep their migration message
+with or without `--help`. A `--help` later in the arguments is still parsed by the command itself.
+`tabcli --help` prints the main help, which keeps the runtime, session-policy and platform details
+that the command pages leave out.
+
 `describe` does not inspect providers, settings or sessions, create a state root, repair records,
 or run a probe. Its build contract is not runtime capability or authorization. `possible_effects`
 lists effects across all forms of a command; consult `notes` for conditional effects. For example,
@@ -36,8 +49,8 @@ every command's result fields. A command may override the defaults; legacy `cons
 `settings` omit this envelope and report errors only on stderr. Neither an exit code nor
 `failure_kind` grants retry authority; in particular, a wait timeout does not cancel the request.
 This entry point is additive: callers supporting older binaries must handle an unavailable
-`describe` before relying on this contract. Existing `--help` behavior is unchanged apart from
-listing the new entry point and the already-supported `settings codex-lifecycle-hooks` form.
+`describe` before relying on this contract. Binaries without command pages print the main help
+for `tabcli <COMMAND> --help`.
 
 ## Start and continue a session
 
@@ -110,8 +123,9 @@ Bridge ids, not the provider's conversation or turn ids. See [providers](provide
 installation requirements and [terminals](terminals.md) for terminal selection.
 
 Run `tabcli --help` (or `-h`) for the main help and `tabcli --version` (or `-V`) for the
-installed version; these flags take no further arguments. A public command followed immediately by
-`--help` also shows the main help.
+installed version; these flags take no further arguments. A public command followed only by
+`--help` (or `-h`) prints that command's page; see
+[Discover the command contract](#discover-the-command-contract).
 
 ## ask
 

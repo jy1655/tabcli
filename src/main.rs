@@ -11,9 +11,13 @@ fn legacy_removal_message() -> String {
     )
 }
 
+/// Commands of the removed embedded TUI; they always answer with the migration message.
+const LEGACY_COMMANDS: [&str; 6] = ["open", "prompt", "read", "list", "close", "hook"];
+
 #[derive(Debug)]
 enum Launch {
     Help,
+    CommandHelp(String),
     Version,
     Native(native::NativeCommand),
 }
@@ -253,26 +257,33 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
     }
 
     let command = first.to_string_lossy().into_owned();
-    if native::is_command(&command) {
-        let rest = args[1..]
-            .iter()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        if rest
+    let rest = args[1..]
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if !command.starts_with('-')
+        && !LEGACY_COMMANDS.contains(&command.as_str())
+        && rest
             .first()
             .is_some_and(|value| value == "--help" || value == "-h")
-        {
-            return Ok(Launch::Help);
+    {
+        // Hidden helpers and other unknown names fail exactly as `describe <name>` does;
+        // removed TUI commands keep their migration message below.
+        let page = native::command_help(&command)?;
+        if rest.len() != 1 {
+            bail!("--help does not accept arguments");
         }
+        return Ok(Launch::CommandHelp(page));
+    }
+    if native::is_command(&command) {
         return Ok(Launch::Native(native::parse_args(
             std::iter::once(command).chain(rest),
         )?));
     }
 
-    if matches!(
-        command.as_str(),
-        "open" | "prompt" | "read" | "list" | "close" | "hook" | "--restore" | "--yolo" | "-yolo"
-    ) || !command.starts_with('-')
+    if LEGACY_COMMANDS.contains(&command.as_str())
+        || matches!(command.as_str(), "--restore" | "--yolo" | "-yolo")
+        || !command.starts_with('-')
     {
         bail!(legacy_removal_message());
     }
@@ -284,6 +295,10 @@ fn main() -> Result<()> {
     match parse_args_from(std::env::args_os().skip(1))? {
         Launch::Help => {
             println!("{}", help_text());
+            Ok(())
+        }
+        Launch::CommandHelp(page) => {
+            print!("{page}");
             Ok(())
         }
         Launch::Version => {
@@ -337,7 +352,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_args_from([OsString::from("ask"), OsString::from("--help")]).unwrap(),
-            Launch::Help
+            Launch::CommandHelp(page) if page.starts_with("ask: ")
         ));
         assert!(parse_args_from([OsString::from("--unknown")]).is_err());
     }
@@ -465,12 +480,68 @@ mod tests {
             );
             for entry in native::COMMANDS {
                 assert!(native::is_command(entry.name));
-                assert!(
-                    matches!(parse(&[entry.name, flag, "extra"]).unwrap(), Launch::Help),
-                    "{}",
-                    entry.name
+                let describe_refusal = native::parse_args(["describe", entry.name])
+                    .map(|_| ())
+                    .err();
+                match parse(&[entry.name, flag]) {
+                    Ok(Launch::CommandHelp(page)) => {
+                        assert!(!entry.hidden, "{}", entry.name);
+                        assert_eq!(page, native::command_help(entry.name).unwrap());
+                    }
+                    Err(error) => {
+                        assert!(entry.hidden, "{}", entry.name);
+                        assert_eq!(
+                            error.to_string(),
+                            describe_refusal.unwrap().to_string(),
+                            "{}",
+                            entry.name
+                        );
+                    }
+                    Ok(other) => panic!("{}: {other:?}", entry.name),
+                }
+                let extra = parse(&[entry.name, flag, "extra"]).unwrap_err();
+                let expected = if entry.hidden {
+                    "unknown public command"
+                } else {
+                    "--help does not accept arguments"
+                };
+                assert_eq!(extra.to_string(), expected, "{}", entry.name);
+            }
+            for name in ["does-not-exist", ""] {
+                assert_eq!(
+                    parse(&[name, flag]).unwrap_err().to_string(),
+                    native::parse_args(["describe", name])
+                        .map(|_| ())
+                        .unwrap_err()
+                        .to_string(),
+                    "{name:?}"
+                );
+                assert_eq!(
+                    parse(&[name, flag]).unwrap_err().to_string(),
+                    "unknown public command"
                 );
             }
+            for name in LEGACY_COMMANDS {
+                for args in [vec![name, flag], vec![name, flag, "extra"]] {
+                    assert_eq!(
+                        parse(&args).unwrap_err().to_string(),
+                        legacy_removal_message(),
+                        "{args:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                parse(&["--unknown", flag]).unwrap_err().to_string(),
+                "unknown command or option: --unknown"
+            );
+            assert_eq!(
+                parse(&["--yolo", flag]).unwrap_err().to_string(),
+                legacy_removal_message()
+            );
+            assert_eq!(
+                parse(&["ask", flag, "--json"]).unwrap_err().to_string(),
+                "--help does not accept arguments"
+            );
             assert_eq!(
                 parse(&["tell", "session-route", flag])
                     .unwrap_err()
