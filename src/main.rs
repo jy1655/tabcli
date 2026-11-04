@@ -11,6 +11,9 @@ fn legacy_removal_message() -> String {
     )
 }
 
+/// Commands of the removed embedded TUI; they always answer with the migration message.
+const LEGACY_COMMANDS: [&str; 6] = ["open", "prompt", "read", "list", "close", "hook"];
+
 #[derive(Debug)]
 enum Launch {
     Help,
@@ -259,11 +262,13 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
         .map(|value| value.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     if !command.starts_with('-')
+        && !LEGACY_COMMANDS.contains(&command.as_str())
         && rest
             .first()
             .is_some_and(|value| value == "--help" || value == "-h")
     {
-        // Hidden helpers and unknown names fail exactly as `describe <name>` does.
+        // Hidden helpers and other unknown names fail exactly as `describe <name>` does;
+        // removed TUI commands keep their migration message below.
         let page = native::command_help(&command)?;
         if rest.len() != 1 {
             bail!("--help does not accept arguments");
@@ -276,10 +281,9 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
         )?));
     }
 
-    if matches!(
-        command.as_str(),
-        "open" | "prompt" | "read" | "list" | "close" | "hook" | "--restore" | "--yolo" | "-yolo"
-    ) || !command.starts_with('-')
+    if LEGACY_COMMANDS.contains(&command.as_str())
+        || matches!(command.as_str(), "--restore" | "--yolo" | "-yolo")
+        || !command.starts_with('-')
     {
         bail!(legacy_removal_message());
     }
@@ -503,7 +507,7 @@ mod tests {
                 };
                 assert_eq!(extra.to_string(), expected, "{}", entry.name);
             }
-            for name in ["does-not-exist", "", "open", "hook"] {
+            for name in ["does-not-exist", ""] {
                 assert_eq!(
                     parse(&[name, flag]).unwrap_err().to_string(),
                     native::parse_args(["describe", name])
@@ -512,6 +516,19 @@ mod tests {
                         .to_string(),
                     "{name:?}"
                 );
+                assert_eq!(
+                    parse(&[name, flag]).unwrap_err().to_string(),
+                    "unknown public command"
+                );
+            }
+            for name in LEGACY_COMMANDS {
+                for args in [vec![name, flag], vec![name, flag, "extra"]] {
+                    assert_eq!(
+                        parse(&args).unwrap_err().to_string(),
+                        legacy_removal_message(),
+                        "{args:?}"
+                    );
+                }
             }
             assert_eq!(
                 parse(&["--unknown", flag]).unwrap_err().to_string(),
