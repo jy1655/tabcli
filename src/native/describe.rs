@@ -3,6 +3,7 @@ use super::{COMMANDS, NativeCommand, args, envelope, failure_kind::FailureKind};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
 #[derive(Debug)]
 pub(crate) struct Request {
@@ -330,10 +331,12 @@ pub(super) const CLOSE: Contract = Contract {
     ],
 };
 
-fn public_command(name: &str) -> Option<&'static super::CommandSpec> {
+/// The one refusal for hidden helpers and unregistered names, shared by describe and command help.
+fn public_command(name: &str) -> Result<&'static super::CommandSpec> {
     COMMANDS
         .iter()
         .find(|entry| entry.name == name && !entry.hidden)
+        .ok_or_else(|| anyhow::anyhow!("unknown public command"))
 }
 
 pub(super) fn parse(arguments: &[String]) -> Result<NativeCommand> {
@@ -344,9 +347,7 @@ pub(super) fn parse(arguments: &[String]) -> Result<NativeCommand> {
             match argument.as_str() {
                 "--json" => args::set_flag_once(&mut json, "--json")?,
                 name if !name.starts_with('-') => {
-                    if public_command(name).is_none() {
-                        bail!("unknown public command");
-                    }
+                    public_command(name)?;
                     args::set_once(&mut command, name.to_owned(), "command")?;
                 }
                 _ => bail!("describe accepts one public command and --json"),
@@ -360,6 +361,102 @@ pub(super) fn parse(arguments: &[String]) -> Result<NativeCommand> {
     parsed
 }
 
+/// One public registry entry as describe publishes it; text output and command help read this.
+fn command_value(entry: &super::CommandSpec) -> Value {
+    let mut contract =
+        serde_json::to_value(entry.contract.expect("public command contract")).unwrap();
+    contract["name"] = json!(entry.name);
+    contract
+}
+
+fn strings(array: &Value) -> impl Iterator<Item = &str> {
+    array
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap())
+}
+
+/// The name, summary and synopsis block that describe's text mode prints for each command.
+fn summary_text(command: &Value) -> String {
+    let mut text = format!(
+        "{}: {}\n",
+        command["name"].as_str().unwrap(),
+        command["summary"].as_str().unwrap()
+    );
+    for synopsis in strings(&command["synopsis"]) {
+        writeln!(text, "  {} {synopsis}", agent_bridge::PUBLIC_COMMAND).unwrap();
+    }
+    text
+}
+
+/// Quotes an example argument for display. Registry examples avoid characters that would need
+/// escaping inside double quotes in POSIX shells, PowerShell or cmd.exe.
+fn display_argument(argument: &str) -> String {
+    let plain = !argument.is_empty()
+        && argument
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=,@+".contains(c));
+    if plain {
+        argument.to_owned()
+    } else {
+        format!("\"{argument}\"")
+    }
+}
+
+/// `tabcli <COMMAND> --help`: the describe summary block followed by the rest of the same
+/// registry entry. It reads no provider, setting, state root or session.
+pub(crate) fn command_help(name: &str) -> Result<String> {
+    let command = command_value(public_command(name)?);
+    let executable = agent_bridge::PUBLIC_COMMAND;
+    let examples = command["examples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|example| {
+            strings(example).fold(executable.to_owned(), |line, argument| {
+                format!("{line} {}", display_argument(argument))
+            })
+        });
+    let sections: [(&str, Vec<String>); 4] = [
+        (
+            "Notes",
+            strings(&command["notes"])
+                .map(|note| format!("- {note}"))
+                .collect(),
+        ),
+        ("Examples", examples.collect()),
+        (
+            "Features",
+            strings(&command["features"]).map(str::to_owned).collect(),
+        ),
+        (
+            "Possible effects",
+            strings(&command["possible_effects"])
+                .map(str::to_owned)
+                .collect(),
+        ),
+    ];
+    let mut page = summary_text(&command);
+    for (heading, items) in sections {
+        writeln!(page, "\n{heading}:").unwrap();
+        if items.is_empty() {
+            page.push_str("  none\n");
+        }
+        for item in items {
+            writeln!(page, "  {item}").unwrap();
+        }
+    }
+    writeln!(
+        page,
+        "\nThis is the build contract. Possible effects cover every form of the command and are not\n\
+         authorization; runtime availability still requires session and provider checks.\n\
+         Structured form: {executable} describe {name} --json. Full help: {executable} --help."
+    )
+    .unwrap();
+    Ok(page)
+}
+
 fn value(request: &Request) -> Value {
     let commands: Vec<_> = COMMANDS
         .iter()
@@ -370,12 +467,7 @@ fn value(request: &Request) -> Value {
                 .as_deref()
                 .is_none_or(|name| name == entry.name)
         })
-        .map(|entry| {
-            let mut contract =
-                serde_json::to_value(entry.contract.expect("public command contract")).unwrap();
-            contract["name"] = json!(entry.name);
-            contract
-        })
+        .map(command_value)
         .collect();
     envelope::ok(serde_json::Map::from_iter([
         ("contract_version".into(), json!(1)),
@@ -417,18 +509,7 @@ pub(super) fn run(request: Request) -> Result<()> {
         );
         println!("Use --json for metadata; runtime availability requires session/provider checks.");
         for command in value["commands"].as_array().unwrap() {
-            println!(
-                "\n{}: {}",
-                command["name"].as_str().unwrap(),
-                command["summary"].as_str().unwrap()
-            );
-            for synopsis in command["synopsis"].as_array().unwrap() {
-                println!(
-                    "  {} {}",
-                    agent_bridge::PUBLIC_COMMAND,
-                    synopsis.as_str().unwrap()
-                );
-            }
+            print!("\n{}", summary_text(command));
         }
         Ok(())
     })
@@ -456,6 +537,109 @@ mod tests {
                     assert_eq!(example[0], entry.name);
                     super::super::parse_args(example.iter())
                         .unwrap_or_else(|error| panic!("{example:?}: {error:#}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_help_renders_every_public_entry_and_refuses_hidden_ones_like_describe() {
+        let refusal = |name: &str| parse(&[name.to_owned()]).unwrap_err().to_string();
+        for entry in COMMANDS {
+            let Some(contract) = entry.contract else {
+                assert_eq!(
+                    command_help(entry.name).unwrap_err().to_string(),
+                    refusal(entry.name),
+                    "{}",
+                    entry.name
+                );
+                continue;
+            };
+            let page = command_help(entry.name).unwrap();
+            // describe's text block for this entry opens the page unchanged.
+            assert!(page.starts_with(&summary_text(&command_value(entry))));
+            assert!(page.starts_with(&format!("{}: {}\n", entry.name, contract.summary)));
+            for synopsis in contract.synopsis {
+                assert!(
+                    page.contains(&format!(
+                        "\n  {} {synopsis}\n",
+                        agent_bridge::PUBLIC_COMMAND
+                    )),
+                    "missing synopsis for {}",
+                    entry.name
+                );
+            }
+            for note in contract.notes {
+                assert!(page.contains(&format!("\n  - {note}\n")), "{}", entry.name);
+            }
+            for feature in contract.features {
+                assert!(page.contains(&format!("\n  {feature}\n")), "{}", entry.name);
+            }
+            for effect in contract.possible_effects {
+                let effect = serde_json::to_value(effect).unwrap();
+                let effect = effect.as_str().unwrap();
+                assert!(page.contains(&format!("\n  {effect}\n")), "{}", entry.name);
+            }
+            let examples = page
+                .split_once("\nExamples:\n")
+                .unwrap()
+                .1
+                .split_once("\n\n")
+                .unwrap()
+                .0;
+            assert_eq!(examples.lines().count(), contract.examples.len());
+            for line in examples.lines() {
+                let prefix = format!("  {} {} ", agent_bridge::PUBLIC_COMMAND, entry.name);
+                assert!(line.starts_with(&prefix), "{line}");
+            }
+            assert!(!page.contains('\x1b'), "help is plain text");
+        }
+        for name in ["does-not-exist", "", "--json"] {
+            assert_eq!(
+                command_help(name).unwrap_err().to_string(),
+                "unknown public command"
+            );
+        }
+        assert_eq!(refusal("does-not-exist"), "unknown public command");
+    }
+
+    #[test]
+    fn ask_help_starts_with_the_command_and_shows_a_quoted_example() {
+        let page = command_help("ask").unwrap();
+        assert!(page.starts_with("ask: Start a new visible provider session"));
+        assert!(page.contains(&format!(
+            "\nExamples:\n  {} ask codex --prompt \"Explain the project entry point.\" --detach --json\n",
+            agent_bridge::PUBLIC_COMMAND
+        )));
+        assert!(page.contains("\nFeatures:\n  context_result\n  context_mode\n"));
+        assert!(page.ends_with(&format!(
+            "Structured form: {0} describe ask --json. Full help: {0} --help.\n",
+            agent_bridge::PUBLIC_COMMAND
+        )));
+        let describe = command_help("describe").unwrap();
+        assert!(describe.contains("\nPossible effects:\n  none\n"));
+        assert!(
+            command_help("hold")
+                .unwrap()
+                .contains("\nFeatures:\n  none\n")
+        );
+    }
+
+    #[test]
+    fn example_arguments_render_without_shell_escapes() {
+        assert_eq!(
+            display_argument("session-example/request-1"),
+            "session-example/request-1"
+        );
+        assert_eq!(display_argument("entry point"), "\"entry point\"");
+        assert_eq!(display_argument(""), "\"\"");
+        for entry in COMMANDS {
+            for example in entry.contract.into_iter().flat_map(|c| c.examples) {
+                for argument in *example {
+                    assert!(
+                        !argument.contains(['"', '\\', '$', '`', '%', '!']),
+                        "{argument:?} needs escaping inside double quotes"
+                    );
                 }
             }
         }

@@ -91,3 +91,48 @@ fn hidden_unknown_and_invalid_requests_fail_without_mutation_then_valid_call_suc
     );
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn command_help_shares_describe_text_and_refuses_like_describe_without_state() {
+    let root = tempfile::tempdir().unwrap();
+    for flag in ["--help", "-h"] {
+        let help = invoke(root.path(), &["ask", flag]);
+        assert!(help.status.success(), "{help:?}");
+        assert!(help.stderr.is_empty());
+        let page = String::from_utf8(help.stdout).unwrap();
+        assert!(page.starts_with("ask: "));
+        assert!(page.contains("\nExamples:\n  tabcli ask codex --prompt "));
+        // describe's text block for ask is the page's first block, byte for byte.
+        let describe = invoke(root.path(), &["describe", "ask"]);
+        assert!(describe.status.success());
+        let describe = String::from_utf8(describe.stdout).unwrap();
+        let block = page.split_once("\n\n").unwrap().0;
+        assert_eq!(describe.split_once("\n\n").unwrap().1, format!("{block}\n"));
+    }
+    for (args, expected) in [
+        (
+            vec!["ask", "--help", "extra"],
+            "--help does not accept arguments",
+        ),
+        (
+            vec!["ask", "-h", "--json"],
+            "--help does not accept arguments",
+        ),
+        (vec!["native-hook", "--help"], "unknown public command"),
+        (vec!["does-not-exist", "--help"], "unknown public command"),
+    ] {
+        let result = invoke(root.path(), &args);
+        assert!(!result.status.success(), "{args:?}");
+        assert!(result.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+    }
+    let global = invoke(root.path(), &["--help"]);
+    assert!(global.status.success());
+    assert!(
+        String::from_utf8(global.stdout)
+            .unwrap()
+            .starts_with("tabcli ")
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}

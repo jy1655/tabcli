@@ -17,6 +17,7 @@ mod console_control;
 mod context;
 mod delivery;
 mod describe;
+pub(crate) use describe::command_help;
 mod diagnostics;
 mod doctor;
 mod envelope;

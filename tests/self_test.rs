@@ -4,8 +4,23 @@ use std::process::Command;
 
 #[test]
 fn self_test_help_explicitly_describes_real_calls_and_terminals() {
+    // The command page carries the contract and points at the full help, which explains the run.
     let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["self-test", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let page = String::from_utf8(output.stdout).unwrap();
+    assert!(page.starts_with("self-test: "));
+    assert!(page.contains("tabcli self-test <codex|claude|agy|pi>"));
+    assert!(page.contains("[--isolated]"));
+    assert!(page.contains("Makes real model calls."));
+    for effect in ["launches_provider", "closes_surface", "model_calls"] {
+        assert!(page.contains(&format!("\n  {effect}\n")), "{effect}");
+    }
+    assert!(page.contains("Full help: tabcli --help."));
+    let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
+        .arg("--help")
         .output()
         .unwrap();
     assert!(output.status.success());
