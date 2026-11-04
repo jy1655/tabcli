@@ -321,6 +321,20 @@ impl NativeProviderAdapter for AgyAdapter {
         ))
     }
 
+    fn follow_up_static(&self, _reader: &Reader) -> super::FollowUpStatic {
+        // No record gate: workspace trust and log readiness are waited for at delivery.
+        super::FollowUpStatic::Ok {
+            unevaluated: &["agy_trust_store", "agy_log_readiness"],
+        }
+    }
+
+    fn question_capability(&self, _reader: &Reader) -> super::QuestionCapability {
+        super::QuestionCapability {
+            emission: super::EmissionObservation::Unsupported("no_question_plugin"),
+            response: super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
+        }
+    }
+
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
         agy_trust_prompt_key(screen, workspace)
     }

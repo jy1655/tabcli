@@ -507,15 +507,33 @@ fn initial_transport_rechecks_startup_before_input_receipt_delivery() {
 #[cfg(windows)]
 fn input_ack_legacy_or_unknown_capability_refuses_both_transports_before_input() {
     for initial in [true, false] {
-        for (schema, capability) in [(1, None), (2, None), (2, Some(2))] {
+        // An absent record holds the initial paste at its startup gate instead.
+        let records: &[Option<(u32, Option<u32>)>] = if initial {
+            &[Some((1, None)), Some((2, None)), Some((2, Some(2)))]
+        } else {
+            &[Some((1, None)), Some((2, None)), Some((2, Some(2))), None]
+        };
+        for record in records {
             let fixture = delivery::test_support::Fixture::new();
             let claim = fixture.claim(initial);
             let token = claim.token().to_owned();
             install_pending_turn(fixture.store.directory(), &token).unwrap();
-            write_ready(&fixture.store, &token, schema, capability);
+            if let Some((schema, capability)) = record {
+                write_ready(&fixture.store, &token, *schema, *capability);
+            }
+            // inspect's follow-up observation refuses from the same record, with the
+            // preflight's own text as the innermost cause of the delivery error.
+            let observed = super::windows_follow_up_static(&fixture.store);
             let mut scenario = InputScenario::new(|_| Ok(()));
             let error = deliver_pi(&fixture, claim, initial, &mut scenario).unwrap_err();
             assert!(format!("{error:#}").contains("start a new Bridge session"));
+            match observed {
+                crate::native::provider::FollowUpStatic::Refused { reason, detail } => {
+                    assert_eq!(reason, "pi_input_ack_unsupported");
+                    assert!(format!("{error:#}").ends_with(&detail), "{error:#}");
+                }
+                other => panic!("{record:?} was observed as {other:?}"),
+            }
             assert_eq!(scenario.sends, 0);
             assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
         }

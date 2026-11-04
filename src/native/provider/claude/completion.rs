@@ -15,6 +15,10 @@ use std::{
 const MODE_FILE: &str = "claude-completion-mode.json";
 const READY_FILE: &str = "claude-mod-ready.json";
 const DIAGNOSTIC_FILE: &str = "claude-mod-diagnostic.json";
+/// The question plugin's manifest that `prepare` writes for a native-mode launch.
+const QUESTION_PLUGIN_MANIFEST: &str = "claude-question-mod/.claude-plugin/plugin.json";
+/// The plugin name that manifest carries.
+const QUESTION_PLUGIN_NAME: &str = "agent-bridge-questions";
 const REVISION: u32 = 1;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FROM_BYTES: usize = 1024;
@@ -163,8 +167,8 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     let questions = directory.join("claude-question-mod");
     std::fs::create_dir_all(questions.join(".claude-plugin"))?;
     std::fs::create_dir_all(questions.join("hooks"))?;
-    store.private("claude-question-mod/.claude-plugin/plugin.json").write_json(&json!({
-        "name":"agent-bridge-questions", "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
+    store.private(QUESTION_PLUGIN_MANIFEST).write_json(&json!({
+        "name":QUESTION_PLUGIN_NAME, "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
     }))?;
     store
         .private("claude-question-mod/hooks/hooks.json")
@@ -187,6 +191,74 @@ pub(super) fn settings(_executable: &Path) -> Value {
     json!({"crossSessionInbound":"accept"})
 }
 
+/// The completion-mode gate a request passes before the readiness wait: None for native
+/// completion, the refusal text for a session launched before it. `admit` and the inspect
+/// observation (`follow_up_static`) both decide from this one function; an unreadable or
+/// unsupported mode record is an error for both.
+fn legacy_refusal(directory: &Path, windows: bool) -> Result<Option<&'static str>> {
+    if native_mode(directory)? {
+        return Ok(None);
+    }
+    Ok(Some(if windows {
+        "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
+    } else {
+        "Claude session was launched before native per-turn completion; inspect its result and terminal, close it when appropriate, then start a fresh ask with the needed context; no message was sent"
+    }))
+}
+
+/// The follow-up gate decided from the completion-mode record alone. Readiness is the
+/// later wait in `admit`, which this observation names instead of evaluating.
+pub(super) fn follow_up_static(
+    directory: &Path,
+    windows: bool,
+) -> crate::native::provider::FollowUpStatic {
+    use crate::native::provider::FollowUpStatic;
+    match legacy_refusal(directory, windows) {
+        Ok(None) => FollowUpStatic::Ok {
+            unevaluated: &["claude_native_readiness"],
+        },
+        Ok(Some(refusal)) => FollowUpStatic::Refused {
+            reason: "claude_legacy_completion",
+            detail: refusal.to_owned(),
+        },
+        Err(error) => FollowUpStatic::Unknown(format!("{error:#}")),
+    }
+}
+
+/// Question emissions are observed by the separate plugin that a native-mode launch
+/// prepares. Native mode alone does not prove it: v0.4.25 recorded native mode before the
+/// question plugin existed (v0.4.26). The prepared manifest is read, never written; its
+/// presence does not prove that Claude loaded the plugin.
+pub(super) fn emission_observation(
+    directory: &Path,
+) -> crate::native::provider::EmissionObservation {
+    use crate::native::provider::EmissionObservation;
+    let observe = || -> Result<EmissionObservation> {
+        if !native_mode(directory)? {
+            return Ok(EmissionObservation::Unavailable("legacy_completion_mode"));
+        }
+        let Some(bytes) = Reader::open_unchecked(directory)
+            .private(QUESTION_PLUGIN_MANIFEST)
+            .bytes()?
+        else {
+            return Ok(EmissionObservation::Unavailable(
+                "question_plugin_not_prepared",
+            ));
+        };
+        // Only the manifest `prepare` writes identifies the prepared observer; an empty,
+        // truncated or foreign file is evidence that cannot be read as it.
+        let manifest: Value = serde_json::from_slice(&bytes)
+            .context("Claude question plugin manifest is not valid JSON")?;
+        if manifest.get("name").and_then(Value::as_str) != Some(QUESTION_PLUGIN_NAME) {
+            bail!("Claude question plugin manifest does not name {QUESTION_PLUGIN_NAME}");
+        }
+        Ok(EmissionObservation::Configured(
+            "plugin_configured_unverified",
+        ))
+    };
+    observe().unwrap_or_else(|error| EmissionObservation::Unknown(format!("{error:#}")))
+}
+
 pub(super) fn admit(
     directory: &Path,
     token: &str,
@@ -194,15 +266,8 @@ pub(super) fn admit(
     windows: bool,
     clock: &mut impl Clock,
 ) -> Result<()> {
-    if !native_mode(directory)? {
-        if windows {
-            bail!(
-                "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
-            );
-        }
-        bail!(
-            "Claude session was launched before native per-turn completion; inspect its result and terminal, close it when appropriate, then start a fresh ask with the needed context; no message was sent"
-        );
+    if let Some(refusal) = legacy_refusal(directory, windows)? {
+        return Err(anyhow::Error::msg(refusal));
     }
     loop {
         claude_turn::require_current(&Reader::open_unchecked(directory), token)?;

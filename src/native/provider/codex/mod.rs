@@ -223,6 +223,31 @@ impl NativeProviderAdapter for CodexAdapter {
         ))
     }
 
+    fn follow_up_static(&self, _reader: &Reader) -> super::FollowUpStatic {
+        // Not evaluated here (the design defers them): at delivery the queue transport
+        // decides the native queue's version floor from the recorded launch version and
+        // the established thread from recorded events, before it starts any process.
+        super::FollowUpStatic::Ok {
+            unevaluated: &["codex_native_queue_version", "codex_thread"],
+        }
+    }
+
+    fn question_capability(&self, reader: &Reader) -> super::QuestionCapability {
+        // Emissions are observed only for turns bound through the injected lifecycle hooks;
+        // the launch record says what was configured, not that Codex trusted or ran them.
+        let emission = match hooks::read_launch_mode(reader.directory()) {
+            Ok(Some(mode)) if mode.lifecycle_hooks == hooks::LifecycleHooks::Injected => {
+                super::EmissionObservation::Configured("hooks_injected_unverified")
+            }
+            Ok(_) => super::EmissionObservation::Unavailable("hooks_not_injected"),
+            Err(error) => super::EmissionObservation::Unknown(format!("{error:#}")),
+        };
+        super::QuestionCapability {
+            emission,
+            response: super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
+        }
+    }
+
     fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
         None
     }

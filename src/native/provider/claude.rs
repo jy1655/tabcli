@@ -158,6 +158,18 @@ impl NativeProviderAdapter for ClaudeAdapter {
         ))
     }
 
+    fn follow_up_static(&self, reader: &Reader) -> super::FollowUpStatic {
+        completion::follow_up_static(reader.directory(), cfg!(windows))
+    }
+
+    fn question_capability(&self, reader: &Reader) -> super::QuestionCapability {
+        super::QuestionCapability {
+            emission: completion::emission_observation(reader.directory()),
+            // Claude Code 2.1.318 has no official addressed answer for an open TUI dialog.
+            response: super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
+        }
+    }
+
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
         trust::dialog_key(screen, workspace)
     }

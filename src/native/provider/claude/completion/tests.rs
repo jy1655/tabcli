@@ -461,15 +461,114 @@ fn legacy_sessions_refuse_new_input_with_platform_specific_recovery() {
                     "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
                 );
             } else {
-                assert!(error.contains("inspect its result and terminal"));
-                assert!(error.contains("close it when appropriate"));
-                assert!(error.contains("fresh ask with the needed context"));
-                assert!(!error.contains("reopen"));
+                assert_eq!(
+                    error,
+                    "Claude session was launched before native per-turn completion; inspect its result and terminal, close it when appropriate, then start a fresh ask with the needed context; no message was sent"
+                );
             }
             assert_eq!(clock.now(), now);
             f.retained();
+            // The inspect observation decides from the same function and reports this text.
+            assert_eq!(
+                follow_up_static(f.root.path(), windows),
+                crate::native::provider::FollowUpStatic::Refused {
+                    reason: "claude_legacy_completion",
+                    detail: error,
+                }
+            );
+            assert_eq!(
+                emission_observation(f.root.path()),
+                crate::native::provider::EmissionObservation::Unavailable("legacy_completion_mode")
+            );
         }
     }
+}
+
+#[test]
+fn the_follow_up_observation_shares_admits_mode_gate_and_reads_only() {
+    use crate::native::provider::{EmissionObservation, FollowUpStatic};
+    let f = Fixture::new();
+    let before = std::fs::read(f.root.path().join(MODE_FILE)).unwrap();
+    for windows in [false, true] {
+        assert_eq!(
+            follow_up_static(f.root.path(), windows),
+            FollowUpStatic::Ok {
+                unevaluated: &["claude_native_readiness"],
+            }
+        );
+    }
+    // Native mode without the prepared question plugin is a v0.4.25 launch: no observer.
+    assert_eq!(
+        emission_observation(f.root.path()),
+        EmissionObservation::Unavailable("question_plugin_not_prepared")
+    );
+    std::fs::create_dir_all(f.root.path().join("claude-question-mod/.claude-plugin")).unwrap();
+    f.store()
+        .private(QUESTION_PLUGIN_MANIFEST)
+        .write_json(&json!({"name": "agent-bridge-questions"}))
+        .unwrap();
+    assert_eq!(
+        emission_observation(f.root.path()),
+        EmissionObservation::Configured("plugin_configured_unverified")
+    );
+    // Only the manifest prepare writes counts: an empty, truncated or foreign one is
+    // unreadable evidence, with the reason as its detail, never a configuration.
+    for (bytes, reason) in [
+        (&b""[..], "not valid JSON"),
+        (&b"{\"name\":\"agent-bridge-que"[..], "not valid JSON"),
+        (
+            &br#"{"name":"another-plugin"}"#[..],
+            "does not name agent-bridge-questions",
+        ),
+    ] {
+        std::fs::write(f.root.path().join(QUESTION_PLUGIN_MANIFEST), bytes).unwrap();
+        match emission_observation(f.root.path()) {
+            EmissionObservation::Unknown(detail) => {
+                assert!(detail.contains(reason), "{detail}");
+            }
+            other => panic!("{bytes:?} was observed as {other:?}"),
+        }
+    }
+    // A manifest path that is not a regular file is unreadable evidence, not a plugin.
+    std::fs::remove_file(f.root.path().join(QUESTION_PLUGIN_MANIFEST)).unwrap();
+    std::fs::create_dir(f.root.path().join(QUESTION_PLUGIN_MANIFEST)).unwrap();
+    assert!(matches!(
+        emission_observation(f.root.path()),
+        EmissionObservation::Unknown(_)
+    ));
+    // Readiness is admit's later wait: the observation neither waits for nor writes it.
+    assert!(!f.root.path().join(READY_FILE).exists());
+    assert_eq!(
+        std::fs::read(f.root.path().join(MODE_FILE)).unwrap(),
+        before
+    );
+    // An unreadable or unsupported mode record is an error for admit and unknown here,
+    // never a refusal.
+    let unsupported = br#"{"schema":2,"mode":"native_v1","reason":"x","claude_version":null}"#;
+    for record in [&b"{"[..], &unsupported[..]] {
+        f.store().private(MODE_FILE).remove().unwrap();
+        f.store().private(MODE_FILE).write_private(record).unwrap();
+        for windows in [false, true] {
+            let now = Instant::now();
+            let error = admit(
+                f.root.path(),
+                &f.token,
+                now + Duration::from_secs(1),
+                windows,
+                &mut FakeClock::new(now),
+            )
+            .unwrap_err();
+            assert_eq!(
+                follow_up_static(f.root.path(), windows),
+                FollowUpStatic::Unknown(format!("{error:#}"))
+            );
+        }
+        assert!(matches!(
+            emission_observation(f.root.path()),
+            EmissionObservation::Unknown(_)
+        ));
+    }
+    f.retained();
 }
 
 #[test]

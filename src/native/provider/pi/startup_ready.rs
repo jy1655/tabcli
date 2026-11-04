@@ -98,12 +98,50 @@ impl StartupReady {
         self.offers_cancel() && self.claim_token == claim_token
     }
 
+    /// The installed extension acknowledges Windows input at all: schema 2 with
+    /// `input_ack_schema` 1, whatever Claim it names.
+    pub(super) fn offers_windows_input_ack(&self) -> bool {
+        self.schema == 2 && self.input_ack_schema == Some(1)
+    }
+
     /// The installed extension acknowledges Windows input for `claim_token`.
     #[cfg(any(windows, test))]
     pub(super) fn acknowledges_windows_input_for(&self, claim_token: &str) -> bool {
-        self.schema == 2 && self.input_ack_schema == Some(1) && self.claim_token == claim_token
+        self.offers_windows_input_ack() && self.claim_token == claim_token
     }
 }
+
+/// The Claim-independent part of the Windows input gate, from one read of the record.
+/// The Windows input preflight decides from it before matching the Claim; inspect's
+/// follow-up observation decides from it alone, because the follow-up's carry-forward
+/// rewrites a schema 2 record's Claim before the preflight reads it.
+#[derive(Debug)]
+pub(super) enum WindowsInput {
+    /// The record offers acknowledgement; whether it names the Claim is still to be checked.
+    /// Only the native Windows preflight reads the record to check it.
+    Offered(#[cfg_attr(not(windows), allow(dead_code))] StartupReady),
+    /// No record, or one without the capability: the preflight refuses whatever the Claim.
+    Refused(&'static str),
+    Unreadable(anyhow::Error),
+}
+
+pub(super) fn windows_input(reader: &Reader) -> WindowsInput {
+    match read(reader) {
+        StartupReadiness::Absent => WindowsInput::Refused("Pi startup receipt is missing"),
+        StartupReadiness::Unreadable(error) => WindowsInput::Unreadable(error),
+        StartupReadiness::Present(ready) if ready.offers_windows_input_ack() => {
+            WindowsInput::Offered(ready)
+        }
+        StartupReadiness::Present(_) => WindowsInput::Refused(WINDOWS_INPUT_ACK_ABSENT),
+    }
+}
+
+/// The preflight's reason when the record does not acknowledge Windows input for the Claim.
+pub(super) const WINDOWS_INPUT_ACK_ABSENT: &str =
+    "Pi input acknowledgement capability is absent or unsupported";
+
+/// The context every Windows input capability refusal carries.
+pub(super) const WINDOWS_INPUT_REFUSAL: &str = "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent";
 
 /// Carries the extension's startup evidence to `claim_token`, the Claim the caller holds
 /// under the lifecycle lock. Schema 2 is rewritten with the new token and nothing else

@@ -2415,3 +2415,111 @@ fn completion_provenance_is_readable_by_result_inspect_and_timeline_without_writ
     success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
     assert_eq!(support::entries(fixture.root.path()), before);
 }
+
+fn tell_json(fixture: &Fixture) -> Value {
+    let output = fixture.run(&[
+        "tell",
+        "session-observe",
+        "--prompt",
+        "continue",
+        "--timeout-secs",
+        "5",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+// capabilities.tell for the gates tell decides before any surface probe or provider: the
+// observation reports the refusal the real command then prints, and neither changes a record.
+#[test]
+fn inspect_reports_the_tell_refusals_the_command_then_prints_unchanged() {
+    for (hold, reason, error) in [
+        (
+            r#"{"held":true,"created_unix_ms":1}"#,
+            "session_held",
+            "session session-observe is held; release the hold before sending a follow-up",
+        ),
+        (
+            "malformed",
+            "hold_unreadable",
+            "session session-observe has an unreadable hold record; inspect it before sending a follow-up",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.directory.join("turn.claim.lock"), b"").unwrap();
+        fs::write(fixture.directory.join("hold.json"), hold).unwrap();
+        let before = support::entries(fixture.root.path());
+        let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
+        assert_eq!(
+            inspected["capabilities"]["tell"],
+            json!({"state": "refused", "reason": reason, "detail": error})
+        );
+        // The pre-claim Hold refusal envelope: no request address and no failure_kind.
+        assert_eq!(
+            tell_json(&fixture),
+            json!({"schema_version": 1, "ok": false, "error": error, "session": "session-observe"})
+        );
+        assert_eq!(support::entries(fixture.root.path()), before);
+    }
+
+    // Past the Hold and a live bound owner, tell reads the terminal handle before its probe.
+    // The probe would verify this PID-only owner's identity (on macOS it would not match),
+    // but the missing handle refuses first, on every platform, in inspect as in tell.
+    let fixture = Fixture::new();
+    fs::write(fixture.directory.join("turn.claim.lock"), b"").unwrap();
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": std::process::id(), "managed_session_id": "session-observe"}),
+    );
+    let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
+    assert_eq!(
+        inspected["capabilities"]["tell"],
+        json!({"state": "refused", "reason": "surface_missing",
+            "detail": "no active terminal handle is recorded"})
+    );
+    let refused = tell_json(&fixture);
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["session"], "session-observe");
+    assert!(refused.get("request_id").is_none(), "{refused}");
+    assert!(refused.get("failure_kind").is_none(), "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("terminal.json"),
+        "{refused}"
+    );
+    assert!(!fixture.directory.join("turn.claim").exists());
+    let status: Value =
+        serde_json::from_slice(&fs::read(fixture.directory.join("status.json")).unwrap()).unwrap();
+    assert_eq!(status["state"], "ready");
+}
+
+// Capabilities are JSON-only: the human rendering and the timeline carry no new lines.
+#[test]
+fn capabilities_add_nothing_to_human_inspect_or_the_timeline() {
+    let fixture = Fixture::new();
+    fs::write(fixture.directory.join("turn.claim.lock"), b"").unwrap();
+    let output = fixture.run(&["inspect", "session-observe"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let labels: Vec<&str> = text
+        .lines()
+        .map(|line| line.split_once(": ").map_or(line, |(label, _)| label))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "session",
+            "provider",
+            "state (stored)",
+            "workspace",
+            "updated",
+            "owner process alive",
+            "recovery required",
+            "held",
+        ],
+        "{text}"
+    );
+    let timeline = timeline(&fixture, None);
+    assert!(timeline.get("capabilities").is_none());
+    assert!(!timeline.to_string().contains("record_gates_passed"));
+}

@@ -39,7 +39,7 @@ use super::TurnContext;
 #[cfg(any(windows, test))]
 use super::startup_ready::valid_session_id;
 #[cfg(windows)]
-use super::startup_ready::{self, StartupReadiness};
+use super::startup_ready::{self, WindowsInput};
 #[cfg(windows)]
 use super::{Prepared, turn};
 #[cfg(windows)]
@@ -195,17 +195,17 @@ pub(super) fn send_windows(
         super::validate_claim_token(turn.claim_token)?;
         let reader = Reader::open_unchecked(turn.directory);
         let capability = (|| -> Result<()> {
-            let ready = match startup_ready::read(&reader) {
-                StartupReadiness::Absent => bail!("Pi startup receipt is missing"),
-                StartupReadiness::Unreadable(error) => return Err(error),
-                StartupReadiness::Present(ready) => ready,
+            let ready = match startup_ready::windows_input(&reader) {
+                WindowsInput::Refused(reason) => return Err(anyhow::Error::msg(reason)),
+                WindowsInput::Unreadable(error) => return Err(error),
+                WindowsInput::Offered(ready) => ready,
             };
             if !ready.acknowledges_windows_input_for(turn.claim_token) {
-                bail!("Pi input acknowledgement capability is absent or unsupported");
+                return Err(anyhow::Error::msg(startup_ready::WINDOWS_INPUT_ACK_ABSENT));
             }
             Ok(())
         })();
-        capability.context("this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent")?;
+        capability.context(startup_ready::WINDOWS_INPUT_REFUSAL)?;
         runtime.current(turn)?;
         if runtime.clock().now() >= turn.deadline {
             bail!("Pi input deadline expired before console input; nothing was sent");

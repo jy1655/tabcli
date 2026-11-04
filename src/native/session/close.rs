@@ -38,6 +38,23 @@ pub(in crate::native) fn repair_owner_is_live(a: &OwnerAttestation) -> Result<bo
     }
 }
 
+/// The stored states in which dead-owner repair examines the owner record; in any other
+/// state it leaves the session untouched.
+pub(in crate::native) fn repair_examines_owner(state: &SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Launching
+            | SessionState::AwaitingInitialInput
+            | SessionState::Running
+            | SessionState::Ready
+            | SessionState::Claimed
+            | SessionState::ResumePending
+            | SessionState::Working
+            | SessionState::Exited
+            | SessionState::Failed
+    )
+}
+
 // The close is synchronous. Scope its record I/O and diagnostics as well as its
 // terminal calls; ordinary callers of these shared primitives remain unchanged.
 // This is thread-local, never inherited by another command/thread, and restored on
@@ -868,18 +885,7 @@ where
         return untouched(recovery_damage);
     }
     let status: SessionStatus = store.status()?;
-    if !matches!(
-        status.state,
-        SessionState::Launching
-            | SessionState::AwaitingInitialInput
-            | SessionState::Running
-            | SessionState::Ready
-            | SessionState::Claimed
-            | SessionState::ResumePending
-            | SessionState::Working
-            | SessionState::Exited
-            | SessionState::Failed
-    ) {
+    if !repair_examines_owner(&status.state) {
         return untouched(recovery_damage);
     }
     let owner_path = store.record(CoreRecord::Owner).path().to_owned();

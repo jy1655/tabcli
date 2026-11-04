@@ -590,7 +590,13 @@ For Codex and Claude, ordinary JSON inspection adds `question_emitted: true` and
 with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
 
 Ordinary JSON inspection adds `capabilities` with `schema_version: 1`, `observed_unix_ms` (the time
-of this observation, not of any record) and `cancel`. `capabilities.cancel` reports what `cancel`'s
+of this observation, not of any record), `cancel`, `tell` and `questions`. All three are evaluated
+under the shared lifecycle lock inspect already retains for the snapshot; none takes another lock,
+writes, waits, probes a surface or starts a provider process. A legacy session without a lifecycle
+lock reports every capability, including both `questions` entries, as `unknown` with
+`lifecycle_lock_absent`.
+
+`capabilities.cancel` reports what `cancel`'s
 own admission would decide at the snapshot inspect read. Inspect evaluates it under the shared
 lifecycle lock it already retains for that snapshot, without the write; the `cancel` action itself
 repeats the admission under its exclusive lock. `state` is `admissible`, `refused`, `unsupported`,
@@ -615,6 +621,87 @@ carries the refusal or read error text. This is an observation, not a reservatio
 change the session right after inspect releases its lock, and `cancel` rechecks every gate. An
 admissible cancel records intent only; it does not prove interruption or completion. Human and
 timeline output do not include capabilities.
+
+`capabilities.tell` evaluates only the gates `tell` decides from Bridge records, in the command's
+order, and stops at the first gate that does not pass: the hold; what interrupted-update recovery
+and dead-owner repair would find about the owner's liveness, without performing either; the
+recorded terminal handle; the owner record's side of the surface ownership check, which `tell`'s
+probe verifies after it reads that handle; the stored state; an installed claim; and the provider
+adapter's own record gate. `state` is
+`admissible`, `refused` or `unknown`, never `available`, with a stable `reason` and an optional
+`detail`:
+
+| state | reason |
+|---|---|
+| `admissible` | `record_gates_passed` |
+| `refused` | `session_held`, `hold_unreadable`, `owner_ended`, `surface_missing`, `surface_closed`, `surface_unsupported`, `surface_unbound`, `state_not_ready`, `turn_claimed`, `claude_legacy_completion`, `pi_input_ack_unsupported` |
+| `unknown` | `lifecycle_lock_absent`, `recovery_required`, `owner_unverified`, `owner_control_unverified`, `owner_unattested`, `evidence_unreadable` |
+
+For `session_held`, `hold_unreadable` and `state_not_ready`, `detail` is the exact error text
+`tell` prints for the same records; `state_not_ready` names the stored state. `hold_unreadable` is
+the hold gate's own refusal: the hold gate refuses an unreadable hold record, before any other gate.
+Unreadable adapter records are reported as `unknown` (`evidence_unreadable`) by the rule for
+unreadable evidence, even though `tell` refuses on them too, after claiming a request.
+`turn_claimed` carries the text the command's claim step prints before its file-system cause. For
+`claude_legacy_completion` and `pi_input_ack_unsupported`, `detail` is the adapter's refusal text.
+`tell` reaches these gates only after it has claimed a request, so it records that request as
+failed and reports the same text in its delivery error: as the innermost cause for
+`claude_legacy_completion`, and at the end of the error, refusal context followed by its reason,
+for `pi_input_ack_unsupported`.
+`pi_input_ack_unsupported` applies to native Windows only: Pi's startup record is absent, or does
+not offer Windows input acknowledgement (schema 2 with `input_ack_schema: 1`), as with an older
+extension.
+
+`owner_ended` means the recorded owner is verified gone, and `tell` refuses. Its dead-owner repair
+usually closes such a session, but may leave it open for an explicit `close-session`. On macOS this
+happens when a close is already pending, or when the terminal can outlive its owner (Terminal.app,
+Ghostty, Warp, WezTerm). On any platform it happens for a launch that was never confirmed, which
+launch repair settles instead. `recovery_required` means a completion journal is pending, and
+recovery can change every later gate. `owner_unverified` means the bound owner's process could not
+be inspected, which dead-owner repair also cannot judge, or, past the terminal handle, that its
+control identity could not be read. The other two owner reasons are judged only past the
+terminal handle, as part of the surface ownership check: a missing or unusable handle refuses
+first. `owner_control_unverified` means the owner is live, but the identity `tell`'s surface probe
+requires is missing or changed: on macOS its recorded birth, TTY or process groups, and on native
+Windows its recorded process identity, without which the Windows probe refuses the owner record.
+`owner_unattested` means the owner record is absent, belongs to another session, or is a
+legacy record without a binding whose process is not observed gone; the probe requires an owner
+bound to the session. `evidence_unreadable` covers an unreadable owner record, terminal handle,
+adapter record or provider name, with the read error in `detail`.
+
+An admissible `tell` adds `unevaluated`, the gates this observation does not evaluate, in the
+command's order: `terminal_surface_probe`; `reopened_conversation_exclusivity` for a reopened
+session; `provider_delivery_readiness`; and the adapter gates left to delivery. For Codex,
+`tell` decides `codex_native_queue_version` (the recorded launch version against the native queue's
+floor) and `codex_thread` (the Codex thread established in recorded events) from records, before
+it starts a process; inspect does not evaluate them yet. The others are waits:
+`claude_native_readiness` for Claude, `agy_trust_store` and `agy_log_readiness` for Agy, and, on
+native Windows, `pi_windows_input_receipt` for the per-turn input receipt Pi publishes after the
+paste. `admissible` is an observation, not a reservation or a delivery forecast: `tell` rechecks
+every gate under its own locks, and any unevaluated gate can still refuse the follow-up or leave
+its delivery uncertain.
+
+`capabilities.questions` has `emission_observation` and `response`, each with `state` and
+`reason`. `emission_observation` reports what the session's own launch records say was configured
+for observing question emissions:
+
+| provider | state | reason |
+|---|---|---|
+| Codex | `configured` | `hooks_injected_unverified` (lifecycle hooks were injected at launch) |
+| Codex | `unavailable` | `hooks_not_injected` (launch record absent or hooks not injected) |
+| Claude | `configured` | `plugin_configured_unverified` (native completion mode with the prepared question plugin) |
+| Claude | `unavailable` | `legacy_completion_mode`, or `question_plugin_not_prepared` (native completion mode without the question plugin, as a session launched by 0.4.25 has) |
+| Agy, Pi | `unsupported` | `no_question_plugin` |
+
+`configured` does not prove that the provider loaded or trusted the observer, or that any question
+will be observed. A Codex session launched by 0.4.17 to 0.4.19 records the hook injection, but its
+transcript watcher records no question emissions. A malformed or unsupported launch record is
+`unknown` with `evidence_unreadable` and `detail`, never `unavailable`, as is a Claude question
+plugin manifest that is empty, is not valid JSON or does not name the plugin Bridge prepares. `response` is `unsupported`
+with `no_addressed_answer_path` for every provider: Bridge has no addressed way to answer an open
+question dialog, and none of these fields grants one. Each provider's adapter states this, so
+when the manifest's provider name is not recognized, both `emission_observation` and `response`
+are `unknown` with `evidence_unreadable`.
 
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.
@@ -1762,8 +1849,9 @@ Fields: `schema_version`, `ok`, `session`, `provider`, `workspace`, `title`, `st
 `generation`, `created_unix_ms`, `updated_unix_ms`, `error`, `exit_code`, `configured`,
 `resumed_from`, `workspace_consent`, `owner_process_alive`, `owner_identity_verified`, `owner`,
 `recovery_required`, `turn_claimed`, `unreadable_requests`, `request_index_error`,
-`recorded_events`, `latest_result`, `requests`, `origin`, and `origin_observation`. `configured` contains `model`, `effort`, `yolo`,
-and `provider_version_at_launch`. Request references include `request_id`, `created_unix_ms`,
+`recorded_events`, `latest_result`, `requests`, `capabilities`, `origin`, and `origin_observation`. `configured` contains `model`, `effort`, `yolo`,
+and `provider_version_at_launch`. `capabilities` contains `schema_version`, `observed_unix_ms`,
+`cancel`, `tell` and `questions`, as described under [inspect](#inspect). Request references include `request_id`, `created_unix_ms`,
 `source`, `event_id`, `context_sources`, `active`, and the two elapsed-time fields described under
 `result`.
 

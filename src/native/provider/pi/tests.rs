@@ -362,6 +362,66 @@ fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
 }
 
 #[test]
+fn the_windows_follow_up_gate_reads_only_the_claim_independent_capability() {
+    use super::super::FollowUpStatic;
+    let directory = tempfile::tempdir().unwrap();
+    let reader = Reader::open_unchecked(directory.path());
+    let refused = |reason: &str| FollowUpStatic::Refused {
+        reason: "pi_input_ack_unsupported",
+        detail: format!(
+            "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent: {reason}"
+        ),
+    };
+    assert_eq!(
+        windows_follow_up_static(&reader),
+        refused("Pi startup receipt is missing")
+    );
+    // The follow-up rewrites a schema 2 record's Claim before the preflight, so another
+    // Claim is no refusal; a legacy or capability-less record refuses whatever its Claim.
+    for (schema, capability, token, offered) in [
+        (1, None, "1-2-3", false),
+        (2, None, "1-2-3", false),
+        (2, Some(2), "1-2-3", false),
+        (2, Some(1), "1-2-3", true),
+        (2, Some(1), "4-5-6", true),
+    ] {
+        write_json_atomic(
+            &directory.path().join(STARTUP_READY_FILE),
+            &StartupReady {
+                input_ack_schema: capability,
+                schema,
+                claim_token: token.into(),
+                session_id: "native".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            windows_follow_up_static(&reader),
+            if offered {
+                FollowUpStatic::Ok {
+                    unevaluated: &["pi_windows_input_receipt"],
+                }
+            } else {
+                refused("Pi input acknowledgement capability is absent or unsupported")
+            },
+            "{schema} {capability:?} {token}"
+        );
+    }
+    fs::write(directory.path().join(STARTUP_READY_FILE), "not-json").unwrap();
+    assert!(matches!(
+        windows_follow_up_static(&reader),
+        FollowUpStatic::Unknown(detail) if !detail.is_empty()
+    ));
+    // Only native Windows follow-ups have this gate; elsewhere the paste has none.
+    let expected = if cfg!(windows) {
+        windows_follow_up_static(&reader)
+    } else {
+        FollowUpStatic::Ok { unevaluated: &[] }
+    };
+    assert_eq!(ADAPTER.follow_up_static(&reader), expected);
+}
+
+#[test]
 fn cancel_support_requires_schema_two_and_current_claim() {
     let directory = tempfile::tempdir().unwrap();
     let pending = claim_pending_turn(directory.path());
