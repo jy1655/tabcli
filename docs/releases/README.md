@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.35](0.4.35.md) (2026-11-05): Per-command `--help` pages from the describe contract (#338), and read-only `capabilities.tell` and `capabilities.questions` in JSON inspection (#339).
 - [0.4.34](0.4.34.md) (2026-11-04): Static command contract discovery, integration skill adoption with older-binary fallback, and read-only cancel admission observation in JSON inspection.
 - [0.4.33](0.4.33.md) (2026-10-30): Isolates a Claude caller's session identity in Codex, Agy and Pi commands, including the Codex queue (#335).
 - [0.4.32](0.4.32.md) (2026-10-30): Drops a Codex caller's session, thread, tool-call and daemon-shutdown variables from every Bridge launch, probe, messenger, queue and helper (#332, #111 follow-up); installs a Pi pending turn only for a live session (#331); unifies the five macOS hosts' session-directory admission order and refusal vocabulary (#330); one public diagnostics vocabulary checked by Rust and the scripts (#329); internal ownership moves with no output change (#322 to #328).
