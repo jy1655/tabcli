@@ -1,10 +1,26 @@
 //! What a session's own action admissions would decide at this Snapshot. An observation is
 //! not a reservation: the action rechecks every gate under its own lock, and an admissible
-//! cancel records intent only, never interruption or completion.
+//! cancel records intent only, never interruption or completion. `tell` is observed through
+//! its Bridge record gates only; the gates no record decides are named, never inferred.
 use super::*;
 use crate::native::session::cancel::{self, Refusal, RefusalReason};
+use crate::native::session::{self, close, hold};
+use observation::judgment::{ActiveHandle, OwnerJudgment, Surface};
 
 pub(super) const SCHEMA_VERSION: u32 = 1;
+
+/// A legacy session without a lifecycle lock has no Snapshot that excludes writers.
+const LOCK_ABSENT: &str = "lifecycle_lock_absent";
+
+/// The Observation's own evidence and judgments the follow-up gates map: read under the
+/// Snapshot's lock and judged once for the whole inspection.
+pub(super) struct FollowUpEvidence<'a> {
+    pub(super) held: &'a Result<bool>,
+    pub(super) recovery_required: bool,
+    pub(super) owner: &'a OwnerJudgment,
+    pub(super) surface: &'a Surface,
+    pub(super) reopened: bool,
+}
 
 /// Called only while the caller retains the Snapshot's lifecycle lock; it takes no lock,
 /// writes nothing and starts no provider process. `observed_unix_ms` is the time of this
@@ -14,18 +30,20 @@ pub(super) fn value(
     records: &Snapshot,
     id: &str,
     observed_unix_ms: u128,
+    follow_up: &FollowUpEvidence<'_>,
 ) -> Value {
     json!({
         "schema_version": SCHEMA_VERSION,
         "observed_unix_ms": observed_unix_ms,
         "cancel": cancel_value(reader, records, id),
+        "tell": tell_value(reader, records, id, follow_up),
+        "questions": questions_value(reader, records),
     })
 }
 
 fn cancel_value(reader: &Reader, records: &Snapshot, id: &str) -> Value {
-    // A legacy session without a lifecycle lock has no Snapshot that excludes writers.
     if records._lock.is_none() {
-        return json!({"state": "unknown", "reason": "lifecycle_lock_absent"});
+        return json!({"state": "unknown", "reason": LOCK_ABSENT});
     }
     let support = || {
         provider::cancel_support(
@@ -60,4 +78,215 @@ fn cancel_value(reader: &Reader, records: &Snapshot, id: &str) -> Value {
             }),
         },
     }
+}
+
+/// The first follow-up gate that did not pass.
+enum Stop {
+    Refused {
+        reason: &'static str,
+        detail: String,
+    },
+    Unknown {
+        reason: &'static str,
+        detail: Option<String>,
+    },
+}
+
+impl Stop {
+    fn refused(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self::Refused {
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    fn unknown(reason: &'static str, detail: Option<String>) -> Self {
+        Self::Unknown { reason, detail }
+    }
+
+    fn unreadable(detail: String) -> Self {
+        Self::unknown("evidence_unreadable", Some(detail))
+    }
+
+    fn value(self) -> Value {
+        match self {
+            Self::Refused { reason, detail } => {
+                json!({"state": "refused", "reason": reason, "detail": detail})
+            }
+            Self::Unknown { reason, detail } => {
+                let mut value = json!({"state": "unknown", "reason": reason});
+                if let Some(detail) = detail {
+                    value["detail"] = json!(detail);
+                }
+                value
+            }
+        }
+    }
+}
+
+/// The action's own refusal: the same code path decides it and renders its text.
+impl From<hold::FollowUpRefusal> for Stop {
+    fn from(refusal: hold::FollowUpRefusal) -> Self {
+        Self::refused(refusal.code(), refusal.to_string())
+    }
+}
+
+fn tell_value(
+    reader: &Reader,
+    records: &Snapshot,
+    id: &str,
+    evidence: &FollowUpEvidence<'_>,
+) -> Value {
+    if records._lock.is_none() {
+        return json!({"state": "unknown", "reason": LOCK_ABSENT});
+    }
+    match tell_gates(reader, records, id, evidence) {
+        Ok(unevaluated) => json!({
+            "state": "admissible", "reason": "record_gates_passed",
+            "unevaluated": unevaluated,
+        }),
+        Err(stop) => stop.value(),
+    }
+}
+
+/// `tell`'s Bridge record gates in the action's order, stopping at the first that does not
+/// pass. On success, returns the later gates no record decides, in the action's order: the
+/// terminal surface probe, reopened-conversation exclusivity, and the provider's delivery
+/// readiness with the adapter's own waits and probes.
+fn tell_gates(
+    reader: &Reader,
+    records: &Snapshot,
+    id: &str,
+    evidence: &FollowUpEvidence<'_>,
+) -> std::result::Result<Vec<&'static str>, Stop> {
+    // `tell` checks the Hold before it changes any record.
+    hold::hold_gate(evidence.held, id)?;
+    // What convergence would find, without performing its recovery or repair. Recovery can
+    // publish the pending turn and change every later gate.
+    if evidence.recovery_required {
+        return Err(Stop::unknown("recovery_required", None));
+    }
+    if close::repair_examines_owner(&records.status.state) {
+        owner_gate(evidence.owner)?;
+    }
+    let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
+    surface_gate(evidence.surface)?;
+    hold::ready_gate(&records.status.state, id)?;
+    if records.claim.is_some() {
+        return Err(Stop::refused("turn_claimed", session::TURN_ALREADY_CLAIMED));
+    }
+    let adapter = match provider::follow_up_static(cli, reader) {
+        provider::FollowUpStatic::Ok { unevaluated } => unevaluated,
+        provider::FollowUpStatic::Refused { reason, detail } => {
+            return Err(Stop::refused(reason, detail));
+        }
+        provider::FollowUpStatic::Unknown(detail) => return Err(Stop::unreadable(detail)),
+    };
+    let mut unevaluated = vec!["terminal_surface_probe"];
+    if evidence.reopened {
+        unevaluated.push("reopened_conversation_exclusivity");
+    }
+    unevaluated.push("provider_delivery_readiness");
+    unevaluated.extend_from_slice(adapter);
+    Ok(unevaluated)
+}
+
+/// The owner verdict dead-owner repair would act on. A bound record is judged by repair's
+/// own liveness rule; an unbound record observed gone is the same death the repair finds.
+/// Every other record is left to the action, which this observation does not emulate.
+fn owner_gate(owner: &OwnerJudgment) -> std::result::Result<(), Stop> {
+    match owner {
+        OwnerJudgment::Bound(attestation) => match close::repair_owner_is_live(attestation) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(owner_ended()),
+            Err(error) => Err(Stop::unknown(
+                "owner_unverified",
+                Some(format!("{error:#}")),
+            )),
+        },
+        owner if owner.gone() => Err(owner_ended()),
+        OwnerJudgment::Unreadable(reason) => Err(Stop::unreadable(reason.clone())),
+        OwnerJudgment::UnboundLegacy { .. } | OwnerJudgment::Foreign | OwnerJudgment::Absent => {
+            Err(Stop::unknown("owner_unattested", None))
+        }
+    }
+}
+
+fn owner_ended() -> Stop {
+    Stop::refused(
+        "owner_ended",
+        "the recorded session owner is no longer running",
+    )
+}
+
+/// The recorded surface as the action reads it before its probe, judged once by the
+/// Observation (`judgment::surface`).
+fn surface_gate(surface: &Surface) -> std::result::Result<(), Stop> {
+    match surface {
+        Surface::Missing => Err(Stop::refused(
+            "surface_missing",
+            "no active terminal handle is recorded",
+        )),
+        Surface::Closed { .. } | Surface::Closing { .. } => Err(Stop::refused(
+            "surface_closed",
+            "the terminal surface is closed or being closed",
+        )),
+        Surface::Active {
+            supported,
+            bound,
+            empty_id,
+            ..
+        } => match ActiveHandle::of(*supported, *bound, *empty_id) {
+            ActiveHandle::Bound => Ok(()),
+            ActiveHandle::Unsupported => Err(Stop::refused(
+                "surface_unsupported",
+                "the recorded terminal is not supported on this platform",
+            )),
+            ActiveHandle::BindingUnverified => Err(Stop::refused(
+                "surface_unbound",
+                "the terminal handle is not bound to this session",
+            )),
+        },
+        Surface::Unreadable { reason, .. } => Err(Stop::unreadable(reason.clone())),
+    }
+}
+
+/// Whether this session was configured to observe question emissions, and whether Bridge
+/// can answer one; each adapter states both.
+fn questions_value(reader: &Reader, records: &Snapshot) -> Value {
+    let unknown = |reason: &str, detail: Option<&str>| {
+        let mut value = json!({"state": "unknown", "reason": reason});
+        if let Some(detail) = detail {
+            value["detail"] = json!(detail);
+        }
+        json!({"emission_observation": value, "response": value})
+    };
+    if records._lock.is_none() {
+        return unknown(LOCK_ABSENT, None);
+    }
+    let cli = match FirstPartyCli::from_str(&records.manifest.provider) {
+        Ok(cli) => cli,
+        Err(error) => return unknown("evidence_unreadable", Some(error.as_str())),
+    };
+    let capability = provider::question_capability(cli, reader);
+    let emission = match capability.emission {
+        provider::EmissionObservation::Configured(reason) => {
+            json!({"state": "configured", "reason": reason})
+        }
+        provider::EmissionObservation::Unavailable(reason) => {
+            json!({"state": "unavailable", "reason": reason})
+        }
+        provider::EmissionObservation::Unsupported(reason) => {
+            json!({"state": "unsupported", "reason": reason})
+        }
+        provider::EmissionObservation::Unknown(detail) => {
+            json!({"state": "unknown", "reason": "evidence_unreadable", "detail": detail})
+        }
+    };
+    let response = match capability.response {
+        provider::QuestionResponse::Unsupported(reason) => {
+            json!({"state": "unsupported", "reason": reason})
+        }
+    };
+    json!({"emission_observation": emission, "response": response})
 }

@@ -78,6 +78,13 @@ pub(super) fn value(
         snapshot,
         id,
         crate::native::session::primitives::unix_ms(),
+        &super::capabilities::FollowUpEvidence {
+            held: &observation.evidence.held,
+            recovery_required: judgments.recovery_required,
+            owner: owner_judgment,
+            surface: &judgments.surface,
+            reopened: resumed_from.is_some(),
+        },
     );
     let request_refs = snapshot
         .receipts
@@ -256,6 +263,7 @@ mod tests {
             ),
         ];
         for (recovery, residual, attested, expected_alive, verified) in rows {
+            let before = crate::native::reopen::tests::snapshot_directory(&fixture.directory);
             let mut observation = Observation::read_locked(&reader).unwrap();
             observation.judgments.recovery_required = recovery;
             observation.judgments.residual_surface = residual;
@@ -285,6 +293,35 @@ mod tests {
             assert_eq!(value["owner"]["process_alive"], expected_alive);
             assert_eq!(value["held"], false);
             assert_eq!(value["requests"].as_array().unwrap().len(), 1);
+            // The capabilities map the same judgments: a required recovery leaves tell
+            // unknown before the owner; past a live owner, the handle bound to another
+            // session (on a platform that supports it) refuses.
+            let tell = &value["capabilities"]["tell"];
+            if recovery {
+                assert_eq!(
+                    tell,
+                    &json!({"state": "unknown", "reason": "recovery_required"})
+                );
+            } else {
+                assert_eq!(tell["state"], "refused");
+                assert_eq!(
+                    tell["reason"],
+                    if cfg!(any(windows, target_os = "macos")) {
+                        "surface_unbound"
+                    } else {
+                        "surface_unsupported"
+                    }
+                );
+            }
+            assert_eq!(
+                value["capabilities"]["questions"]["emission_observation"],
+                json!({"state": "unavailable", "reason": "hooks_not_injected"})
+            );
+            assert_eq!(
+                crate::native::reopen::tests::snapshot_directory(&fixture.directory),
+                before,
+                "inspect changed a record"
+            );
         }
     }
 }

@@ -278,6 +278,21 @@ impl NativeProviderAdapter for PiAdapter {
         ))
     }
 
+    fn follow_up_static(&self, _reader: &Reader) -> super::FollowUpStatic {
+        // No record gate: startup readiness, and on native Windows the input capability, are
+        // checked by the paste transport at delivery.
+        super::FollowUpStatic::Ok {
+            unevaluated: &["pi_startup_readiness"],
+        }
+    }
+
+    fn question_capability(&self, _reader: &Reader) -> super::QuestionCapability {
+        super::QuestionCapability {
+            emission: super::EmissionObservation::Unsupported("no_question_plugin"),
+            response: super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
+        }
+    }
+
     fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
         None
     }

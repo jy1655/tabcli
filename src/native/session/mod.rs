@@ -305,6 +305,11 @@ impl Reader {
     }
 }
 
+/// Why a new claim cannot be created while one is installed; observers report it as the
+/// detail of the same gate.
+pub(in crate::native) const TURN_ALREADY_CLAIMED: &str =
+    "another tell request already owns this session turn";
+
 impl Store {
     pub(in crate::native) fn create_claim_file(&self) -> Result<File> {
         let path = self.directory.join(TURN_CLAIM_FILE);
@@ -313,7 +318,7 @@ impl Store {
             .write(true)
             .create_new(true)
             .open(&path)
-            .with_context(|| "another tell request already owns this session turn")?;
+            .with_context(|| TURN_ALREADY_CLAIMED)?;
         set_private_file_permissions(&file)?;
         Ok(file)
     }

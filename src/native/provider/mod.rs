@@ -191,6 +191,66 @@ pub(super) fn cancel_support(provider: FirstPartyCli, directory: &Path) -> Resul
     adapter(provider).cancel_support(directory)
 }
 
+/// What a follow-up's adapter-owned gate decides from this session's own records alone,
+/// before any wait, probe or provider process. The delivery path keeps its own checks.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FollowUpStatic {
+    /// The record gate passes; `unevaluated` names the adapter's later waits and probes.
+    Ok {
+        unevaluated: &'static [&'static str],
+    },
+    /// The action refuses on these records; `detail` is the text it reports.
+    Refused {
+        reason: &'static str,
+        detail: String,
+    },
+    /// A record the gate needs could not be read.
+    Unknown(String),
+}
+
+/// Whether this session was configured to observe question emissions. Configuration is not
+/// evidence that the observer loaded or ran.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EmissionObservation {
+    Configured(&'static str),
+    Unavailable(&'static str),
+    Unsupported(&'static str),
+    /// A launch record the adapter decides from could not be read.
+    Unknown(String),
+}
+
+/// Whether Bridge can answer an emitted question for the provider.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum QuestionResponse {
+    Unsupported(&'static str),
+}
+
+/// No supported provider offers an addressed answer for an open question dialog; the
+/// Claude Code 2.1.318 documentation was checked on 2026-11-05.
+pub(super) const NO_ADDRESSED_ANSWER_PATH: &str = "no_addressed_answer_path";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct QuestionCapability {
+    pub(super) emission: EmissionObservation,
+    pub(super) response: QuestionResponse,
+}
+
+/// Read-only and lock-free; inspect calls it only under its retained Snapshot lock.
+pub(super) fn follow_up_static(
+    provider: FirstPartyCli,
+    reader: &super::session::Reader,
+) -> FollowUpStatic {
+    adapter(provider).follow_up_static(reader)
+}
+
+/// Read-only and lock-free; inspect calls it only under its retained Snapshot lock.
+pub(super) fn question_capability(
+    provider: FirstPartyCli,
+    reader: &super::session::Reader,
+) -> QuestionCapability {
+    adapter(provider).question_capability(reader)
+}
+
 pub(super) trait ReopenSupport: Sync {
     fn verify_available(&self, provider_session_id: &str) -> Result<()>;
     fn prepare(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
@@ -219,6 +279,12 @@ trait NativeProviderAdapter: Sync {
     fn initial_transport(&self) -> Box<dyn Transport>;
     fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
+    // The follow-up gate this adapter decides from its own records, before its delivery
+    // waits and probes, which it names instead of evaluating. Reads only; no lock.
+    fn follow_up_static(&self, reader: &super::session::Reader) -> FollowUpStatic;
+    // Whether question emission observation was configured for this session, and the
+    // answer path. Reads only; no lock.
+    fn question_capability(&self, reader: &super::session::Reader) -> QuestionCapability;
     fn launch_trust(&self) -> super::consent::LaunchTrust;
     // Exact-workspace trust from the provider's own store. The adapter resolves the store
     // from its home in `env`; `store` is consent's recorded source store, which the recheck
@@ -405,6 +471,131 @@ mod tests {
                 assert!(completion_observation(&reader, provider, locked, None).is_none());
             }
         }
+        // The follow-up gate and the question capability dispatch to each adapter: a
+        // malformed record an adapter reads is unknown, never refused or unavailable.
+        store
+            .private("codex-launch-mode.json")
+            .write_private(b"{")
+            .unwrap();
+        let answer = QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH);
+        for (provider, follow_up, emission) in [
+            (
+                FirstPartyCli::Codex,
+                FollowUpStatic::Ok {
+                    unevaluated: &["codex_native_queue_version", "codex_thread"],
+                },
+                false,
+            ),
+            (
+                FirstPartyCli::Claude,
+                FollowUpStatic::Unknown(String::new()),
+                false,
+            ),
+            (
+                FirstPartyCli::Agy,
+                FollowUpStatic::Ok {
+                    unevaluated: &["agy_trust_store", "agy_log_readiness"],
+                },
+                true,
+            ),
+            (
+                FirstPartyCli::Pi,
+                FollowUpStatic::Ok {
+                    unevaluated: &["pi_startup_readiness"],
+                },
+                true,
+            ),
+        ] {
+            match (follow_up_static(provider, &reader), follow_up) {
+                (FollowUpStatic::Unknown(detail), FollowUpStatic::Unknown(_)) => {
+                    assert!(!detail.is_empty(), "{provider:?}");
+                }
+                (observed, expected) => assert_eq!(observed, expected, "{provider:?}"),
+            }
+            let observed = question_capability(provider, &reader);
+            assert_eq!(observed.response, answer, "{provider:?}");
+            if emission {
+                assert_eq!(
+                    observed.emission,
+                    EmissionObservation::Unsupported("no_question_plugin"),
+                    "{provider:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&observed.emission, EmissionObservation::Unknown(detail) if !detail.is_empty()),
+                    "{provider:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn launch_records_decide_the_follow_up_gate_and_question_configuration() {
+        use crate::native::session::{Reader, Store};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_unchecked(directory.path());
+        let reader = Reader::open_unchecked(directory.path());
+        let emission = |provider| question_capability(provider, &reader).emission;
+        // No launch record: a pre-hook Codex launch and a legacy Claude completion session.
+        assert_eq!(
+            emission(FirstPartyCli::Codex),
+            EmissionObservation::Unavailable("hooks_not_injected")
+        );
+        assert_eq!(
+            emission(FirstPartyCli::Claude),
+            EmissionObservation::Unavailable("legacy_completion_mode")
+        );
+        assert!(matches!(
+            follow_up_static(FirstPartyCli::Claude, &reader),
+            FollowUpStatic::Refused {
+                reason: "claude_legacy_completion",
+                ..
+            }
+        ));
+        for (record, expected) in [
+            (
+                r#"{"schema":1,"lifecycle_hooks":"injected","reason":null,"codex_version":"codex-cli 0.163.0","vector_codex_version":"0.163.0"}"#,
+                EmissionObservation::Configured("hooks_injected_unverified"),
+            ),
+            (
+                r#"{"schema":1,"lifecycle_hooks":"not_injected","reason":"settings_off","codex_version":"codex-cli 0.163.0","vector_codex_version":"0.163.0"}"#,
+                EmissionObservation::Unavailable("hooks_not_injected"),
+            ),
+        ] {
+            store.private("codex-launch-mode.json").remove().unwrap();
+            store
+                .private("codex-launch-mode.json")
+                .write_private(record.as_bytes())
+                .unwrap();
+            assert_eq!(emission(FirstPartyCli::Codex), expected);
+        }
+        // A record Codex's own reader rejects is unknown, not a configuration.
+        store.private("codex-launch-mode.json").remove().unwrap();
+        store
+            .private("codex-launch-mode.json")
+            .write_private(br#"{"schema":1,"lifecycle_hooks":"injected","reason":"settings_off","codex_version":null,"vector_codex_version":"0.163.0"}"#)
+            .unwrap();
+        assert!(matches!(
+            emission(FirstPartyCli::Codex),
+            EmissionObservation::Unknown(_)
+        ));
+        store
+            .private("claude-completion-mode.json")
+            .write_private(
+                br#"{"schema":1,"mode":"native_v1","reason":"windows_stable_2_1_302_or_newer","claude_version":"2.1.302"}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            emission(FirstPartyCli::Claude),
+            EmissionObservation::Configured("plugin_configured_unverified")
+        );
+        assert_eq!(
+            follow_up_static(FirstPartyCli::Claude, &reader),
+            FollowUpStatic::Ok {
+                unevaluated: &["claude_native_readiness"],
+            }
+        );
     }
 
     #[test]

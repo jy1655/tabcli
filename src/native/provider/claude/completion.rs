@@ -187,6 +187,53 @@ pub(super) fn settings(_executable: &Path) -> Value {
     json!({"crossSessionInbound":"accept"})
 }
 
+/// The completion-mode gate a request passes before the readiness wait: None for native
+/// completion, the refusal text for a session launched before it. `admit` and the inspect
+/// observation (`follow_up_static`) both decide from this one function; an unreadable or
+/// unsupported mode record is an error for both.
+fn legacy_refusal(directory: &Path, windows: bool) -> Result<Option<&'static str>> {
+    if native_mode(directory)? {
+        return Ok(None);
+    }
+    Ok(Some(if windows {
+        "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
+    } else {
+        "Claude session was launched before native per-turn completion; inspect its result and terminal, close it when appropriate, then start a fresh ask with the needed context; no message was sent"
+    }))
+}
+
+/// The follow-up gate decided from the completion-mode record alone. Readiness is the
+/// later wait in `admit`, which this observation names instead of evaluating.
+pub(super) fn follow_up_static(
+    directory: &Path,
+    windows: bool,
+) -> crate::native::provider::FollowUpStatic {
+    use crate::native::provider::FollowUpStatic;
+    match legacy_refusal(directory, windows) {
+        Ok(None) => FollowUpStatic::Ok {
+            unevaluated: &["claude_native_readiness"],
+        },
+        Ok(Some(refusal)) => FollowUpStatic::Refused {
+            reason: "claude_legacy_completion",
+            detail: refusal.to_owned(),
+        },
+        Err(error) => FollowUpStatic::Unknown(format!("{error:#}")),
+    }
+}
+
+/// Question emissions are observed by the separate plugin that a native-mode launch
+/// prepares; its loading is not proven by the record.
+pub(super) fn emission_observation(
+    directory: &Path,
+) -> crate::native::provider::EmissionObservation {
+    use crate::native::provider::EmissionObservation;
+    match native_mode(directory) {
+        Ok(true) => EmissionObservation::Configured("plugin_configured_unverified"),
+        Ok(false) => EmissionObservation::Unavailable("legacy_completion_mode"),
+        Err(error) => EmissionObservation::Unknown(format!("{error:#}")),
+    }
+}
+
 pub(super) fn admit(
     directory: &Path,
     token: &str,
@@ -194,15 +241,8 @@ pub(super) fn admit(
     windows: bool,
     clock: &mut impl Clock,
 ) -> Result<()> {
-    if !native_mode(directory)? {
-        if windows {
-            bail!(
-                "Claude session was launched before native per-turn completion; close and reopen it before sending a new request"
-            );
-        }
-        bail!(
-            "Claude session was launched before native per-turn completion; inspect its result and terminal, close it when appropriate, then start a fresh ask with the needed context; no message was sent"
-        );
+    if let Some(refusal) = legacy_refusal(directory, windows)? {
+        return Err(anyhow::Error::msg(refusal));
     }
     loop {
         claude_turn::require_current(&Reader::open_unchecked(directory), token)?;

@@ -42,30 +42,89 @@ pub(in crate::native) fn observe(reader: &Reader, locked: bool) -> Result<bool> 
     Ok(held)
 }
 
-/// A pre-claim Hold refusal has a JSON envelope without changing other tell errors.
-#[derive(Debug)]
-pub(in crate::native) struct Refusal(String);
+/// Why a follow-up admission refused before a claim. A pre-claim Hold refusal has a JSON
+/// envelope without changing other tell errors. `Display` is the text `tell` has always
+/// printed; observers report `code` and render the same text as their detail.
+pub(in crate::native) enum FollowUpRefusal {
+    Held(String),
+    HoldUnreadable(String),
+    NotReady {
+        session: String,
+        state: super::SessionState,
+    },
+}
 
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+impl FollowUpRefusal {
+    pub(in crate::native) fn code(&self) -> &'static str {
+        match self {
+            Self::Held(_) => "session_held",
+            Self::HoldUnreadable(_) => "hold_unreadable",
+            Self::NotReady { .. } => "state_not_ready",
+        }
     }
 }
-impl std::error::Error for Refusal {}
+
+impl std::fmt::Display for FollowUpRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held(id) => write!(
+                f,
+                "session {id} is held; release the hold before sending a follow-up"
+            ),
+            Self::HoldUnreadable(id) => write!(
+                f,
+                "session {id} has an unreadable hold record; inspect it before sending a follow-up"
+            ),
+            Self::NotReady { session, state } => write!(
+                f,
+                "session {session} is {state}; tell requires the ready state"
+            ),
+        }
+    }
+}
+
+// Every error rendering stays what it was before the refusals were typed: the Hold refusals
+// were a `Refusal(String)` and the state refusal an anyhow message leaf.
+impl std::fmt::Debug for FollowUpRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = self.to_string();
+        match self {
+            Self::Held(_) | Self::HoldUnreadable(_) => {
+                f.debug_tuple("Refusal").field(&message).finish()
+            }
+            Self::NotReady { .. } => std::fmt::Debug::fmt(&message, f),
+        }
+    }
+}
+impl std::error::Error for FollowUpRefusal {}
+
+/// The Hold gate judged from one read of the record. Reads nothing and takes no lock.
+pub(in crate::native) fn hold_gate(held: &Result<bool>, id: &str) -> Result<(), FollowUpRefusal> {
+    match held {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(FollowUpRefusal::Held(id.to_owned())),
+        Err(_) => Err(FollowUpRefusal::HoldUnreadable(id.to_owned())),
+    }
+}
+
+/// The lifecycle gate of a follow-up: only a ready session accepts one.
+pub(in crate::native) fn ready_gate(
+    state: &super::SessionState,
+    id: &str,
+) -> Result<(), FollowUpRefusal> {
+    if state.accepts_prompt() {
+        return Ok(());
+    }
+    Err(FollowUpRefusal::NotReady {
+        session: id.to_owned(),
+        state: state.clone(),
+    })
+}
 
 /// No lock acquisition: admission callers own their lifecycle ordering.
 pub(in crate::native) fn permit(reader: &Reader, id: &str) -> Result<()> {
-    match read(reader) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(Refusal(format!(
-            "session {id} is held; release the hold before sending a follow-up"
-        ))
-        .into()),
-        Err(_) => Err(Refusal(format!(
-            "session {id} has an unreadable hold record; inspect it before sending a follow-up"
-        ))
-        .into()),
-    }
+    hold_gate(&read(reader), id)?;
+    Ok(())
 }
 
 pub(in crate::native) fn follow_up_admission(
@@ -73,9 +132,7 @@ pub(in crate::native) fn follow_up_admission(
     id: &str,
 ) -> Result<super::SessionState> {
     let state = reader.status()?.state;
-    if !state.accepts_prompt() {
-        bail!("session {id} is {state}; tell requires the ready state");
-    }
+    ready_gate(&state, id)?;
     permit(reader, id)?;
     Ok(state)
 }

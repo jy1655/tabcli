@@ -209,10 +209,16 @@ pub(super) const INSPECT: Contract = Contract {
     synopsis: &["inspect <session> [--timeline [--request REQUEST]] [--json]"],
     possible_effects: &[ReadsRecords],
     examples: &[&["inspect", "session-example", "--json"]],
-    features: &["timeline", "cancel_admission_observation"],
+    features: &[
+        "timeline",
+        "cancel_admission_observation",
+        "tell_admission_observation",
+        "question_capability_observation",
+    ],
     notes: &[
         "Observes records without repair or publication. --request filters a timeline and requires --timeline.",
         "JSON capabilities.cancel reports what cancel's admission would decide at this snapshot; cancel rechecks it, and an admissible cancel records intent, not interruption or completion.",
+        "JSON capabilities.tell evaluates only tell's record gates and lists the probes and waits it did not evaluate; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and no answer path.",
     ],
 };
 pub(super) const RESULT: Contract = Contract {
