@@ -663,8 +663,8 @@ fn an_owner_whose_process_cannot_be_inspected_is_unverified_not_ended() {
     );
 }
 
-/// A live bound owner passes only where tell's probe could verify it. Both platform
-/// mappings are covered on every host by `capabilities::tests`; these rows go through
+/// A live bound owner passes only where tell's probe could verify it. Every platform
+/// mapping is covered on every host by `capabilities::tests`; these rows go through
 /// inspect on this host.
 #[test]
 fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
@@ -677,14 +677,16 @@ fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
         "codex_native_queue_version",
         "codex_thread",
     ]);
-    let on_macos = |verdict: Value| {
-        if cfg!(target_os = "macos") {
-            verdict
+    let control = json!({"state": "unknown", "reason": "owner_control_unverified"});
+    let when = |unverifiable: bool| {
+        if unverifiable {
+            control.clone()
         } else {
             past_owner.clone()
         }
     };
-    let control = json!({"state": "unknown", "reason": "owner_control_unverified"});
+    let macos = cfg!(target_os = "macos");
+    let probing = cfg!(any(target_os = "macos", windows));
     let rows = [
         (
             ProcessObservation::Live(Attested::Incarnation),
@@ -694,12 +696,12 @@ fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
         (
             ProcessObservation::Live(Attested::Incarnation),
             ControlAttestation::Changed("process group changed".into()),
-            on_macos(control.clone()),
+            when(macos),
         ),
         (
             ProcessObservation::Live(Attested::PidOnly),
             ControlAttestation::NotRecorded,
-            on_macos(control.clone()),
+            when(probing),
         ),
         (
             ProcessObservation::Live(Attested::Incarnation),
@@ -714,6 +716,25 @@ fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
             attested_owner(observed, process, control_attestation);
         });
         assert_eq!(observed["tell"], expected, "{label}");
+    }
+
+    // The production observers on a bound live owner recorded without any identity (on
+    // Windows, without its process identity, which tell's Windows probe refuses).
+    Store::open_unchecked(&fixture.directory)
+        .write_owner(&NativeSessionOwner {
+            pid: std::process::id(),
+            managed_session_id: Some(SESSION.to_owned()),
+            ..NativeSessionOwner::default()
+        })
+        .unwrap();
+    assert_eq!(
+        observe_past_surface(&fixture.directory)["tell"],
+        when(probing)
+    );
+    // With its process identity recorded, the same owner passes on Windows.
+    if cfg!(windows) {
+        write_owner(&fixture.directory, std::process::id(), Some(SESSION));
+        assert_eq!(observe_past_surface(&fixture.directory)["tell"], past_owner);
     }
 }
 

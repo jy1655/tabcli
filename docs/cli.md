@@ -624,11 +624,11 @@ adapter's own record gate. `state` is
 | `unknown` | `lifecycle_lock_absent`, `recovery_required`, `owner_unverified`, `owner_control_unverified`, `owner_unattested`, `evidence_unreadable` |
 
 For `session_held`, `hold_unreadable` and `state_not_ready`, `detail` is the exact error text
-`tell` prints for the same records; `state_not_ready` names the stored state. `tell` itself refuses
-on an unreadable hold record, so the observation reports `hold_unreadable` as that refusal rather
-than `unknown`, unlike unreadable provider records whose gates the command evaluates later.
-`turn_claimed`
-carries the text the command's claim step prints before its file-system cause. For
+`tell` prints for the same records; `state_not_ready` names the stored state. `hold_unreadable` is
+the hold gate's own refusal: the hold gate refuses an unreadable hold record, before any other gate.
+Unreadable adapter records are reported as `unknown` (`evidence_unreadable`) by the rule for
+unreadable evidence, even though `tell` refuses on them too, after claiming a request.
+`turn_claimed` carries the text the command's claim step prints before its file-system cause. For
 `claude_legacy_completion` and `pi_input_ack_unsupported`, `detail` is the adapter's refusal text.
 `tell` reaches these gates only after it has claimed a request, so it records that request as
 failed and reports the same text in its delivery error: as the innermost cause for
@@ -647,9 +647,10 @@ recovery can change every later gate. `owner_unverified` means the bound owner's
 be inspected, which dead-owner repair also cannot judge, or, past the terminal handle, that its
 control identity could not be read. The other two owner reasons are judged only past the
 terminal handle, as part of the surface ownership check: a missing or unusable handle refuses
-first. `owner_control_unverified` applies to macOS only: the owner is live, but its recorded birth,
-TTY or process groups are missing or changed, and `tell`'s macOS surface probe requires them to
-match. `owner_unattested` means the owner record is absent, belongs to another session, or is a
+first. `owner_control_unverified` means the owner is live, but the identity `tell`'s surface probe
+requires is missing or changed: on macOS its recorded birth, TTY or process groups, and on native
+Windows its recorded process identity, without which the Windows probe refuses the owner record.
+`owner_unattested` means the owner record is absent, belongs to another session, or is a
 legacy record without a binding whose process is not observed gone; the probe requires an owner
 bound to the session. `evidence_unreadable` covers an unreadable owner record, terminal handle,
 adapter record or provider name, with the read error in `detail`.
