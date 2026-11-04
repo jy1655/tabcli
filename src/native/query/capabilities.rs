@@ -203,7 +203,11 @@ fn owner_gate(owner: &OwnerJudgment, macos: bool) -> std::result::Result<(), Sto
     match owner {
         OwnerJudgment::Bound(attestation) => match close::repair_owner_is_live(attestation) {
             Ok(true) => match BoundOwner::of(attestation) {
-                BoundOwner::Unknown => Err(Stop::unknown("owner_unverified", None)),
+                // The control identity could not be read; its projection carries why.
+                BoundOwner::Unknown => Err(Stop::unknown(
+                    "owner_unverified",
+                    session::OwnerObservation::from(attestation).error,
+                )),
                 BoundOwner::ControlChanged | BoundOwner::Uncompared if macos => {
                     Err(Stop::unknown("owner_control_unverified", None))
                 }
@@ -321,7 +325,8 @@ mod tests {
     // probe can verify there, and the other platforms keep repair's liveness rule.
     #[test]
     fn a_live_bound_owner_passes_only_where_the_probe_could_verify_it() {
-        let unverified = json!({"state": "unknown", "reason": "owner_unverified"});
+        let unverified =
+            json!({"state": "unknown", "reason": "owner_unverified", "detail": "tty unreadable"});
         let control = json!({"state": "unknown", "reason": "owner_control_unverified"});
         let ended = json!({"state": "refused", "reason": "owner_ended",
             "detail": "the recorded session owner is no longer running"});

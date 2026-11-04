@@ -655,7 +655,7 @@ fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
         (
             ProcessObservation::Live(Attested::Incarnation),
             ControlAttestation::Unknown("tty unreadable".into()),
-            json!({"state": "unknown", "reason": "owner_unverified"}),
+            json!({"state": "unknown", "reason": "owner_unverified", "detail": "tty unreadable"}),
         ),
         (
             ProcessObservation::Live(Attested::Incarnation),

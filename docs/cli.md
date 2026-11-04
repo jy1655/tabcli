@@ -626,7 +626,9 @@ For `session_held`, `hold_unreadable` and `state_not_ready`, `detail` is the exa
 carries the text the command's claim step prints before its file-system cause. For
 `claude_legacy_completion` and `pi_input_ack_unsupported`, `detail` is the adapter's refusal text.
 `tell` reaches these gates only after it has claimed a request, so it records that request as
-failed and reports the same text as the innermost cause of its delivery error.
+failed and reports the same text in its delivery error: as the innermost cause for
+`claude_legacy_completion`, and at the end of the error, refusal context followed by its reason,
+for `pi_input_ack_unsupported`.
 `pi_input_ack_unsupported` applies to native Windows only: Pi's startup record is absent, or does
 not offer Windows input acknowledgement (schema 2 with `input_ack_schema: 1`), as with an older
 extension.
