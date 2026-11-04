@@ -2,6 +2,45 @@
 
 Terminal Agent Bridge (TAB) is installed as `tabcli`.
 
+## Discover the command contract
+
+An agent can discover the binary's public commands without reading a skill or project instructions:
+
+```sh
+tabcli describe --json
+tabcli describe wait --json
+```
+
+The versioned JSON envelope contains `contract_version: 1`, `binary_version`, `scope: "build"`,
+and `commands`. Each command has a `name`, `summary`, `synopsis` array, `possible_effects`,
+argv `examples`, `features`, and `notes`. Examples omit the executable; pass their elements as
+separate argv arguments to `tabcli`, with your own ids and values. They are examples, not commands
+to execute automatically. Synopsis strings are usage notation, not an input JSON schema.
+Without `--json`, describe prints a concise human-readable summary. Pass `--json` for structured
+errors too. Unknown commands and hidden helpers produce the same public-command error.
+
+`describe` does not inspect providers, settings or sessions, create a state root, repair records,
+or run a probe. Its build contract is not runtime capability or authorization. `possible_effects`
+lists effects across all forms of a command; consult `notes` for conditional effects. For example,
+`sessions` can repair records while `status` only observes them. Runtime evidence comes from
+`status`, `inspect` and `doctor`; every action still checks its own current gates.
+
+Feature keys are scoped to their command. `result.features` containing `question_emissions`
+and `wait.features` containing `questions` and `after_question` advertise the existing question
+observation interface. They do not prove that a particular provider/session can observe a question,
+that a dialog is pending, or that Bridge can answer it. A question return from `wait` with
+`ended: null` is not completion. Keep the request address and use the returned cursor on the next wait.
+
+The `output` section describes common JSON envelope defaults and optional failure hints, not
+every command's result fields. A command may override the defaults; legacy `consent` and
+`settings` omit this envelope and report errors only on stderr. Neither an exit code nor
+`failure_kind` grants retry authority; in particular, a wait timeout does not cancel the request.
+This entry point is additive: callers supporting older binaries must handle an unavailable
+`describe` before relying on this contract. Existing `--help` behavior is unchanged apart from
+listing the new entry point and the already-supported `settings codex-lifecycle-hooks` form.
+
+## Start and continue a session
+
 Use `ask` to start a provider session, `result` to read its result, `tell` to continue it, and
 `close-session` to close it when you are done. These commands leave the provider visible in a
 terminal surface: the tab, window, pane, or console that Bridge creates for the session.
@@ -535,6 +574,33 @@ For Codex and Claude, ordinary JSON inspection adds `question_emitted: true` and
 `question_observation` only as `incomplete` or
 `unreadable`. This reads at most one optional 64 KiB record per request. Retrieve content
 with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
+
+Ordinary JSON inspection adds `capabilities` with `schema_version: 1`, `observed_unix_ms` (the time
+of this observation, not of any record) and `cancel`. `capabilities.cancel` reports what `cancel`'s
+own admission would decide at the snapshot inspect read. Inspect evaluates it under the shared
+lifecycle lock it already retains for that snapshot, without the write; the `cancel` action itself
+repeats the admission under its exclusive lock. `state` is `admissible`, `refused`, `unsupported`,
+or `unknown`, with a stable `reason`:
+
+| state | reason |
+|---|---|
+| `admissible` | `admission_passed` |
+| `refused` | `state_not_running`, `no_active_claim`, `no_active_receipt`, `result_already_published`, `cancel_already_recorded` |
+| `unsupported` | `provider_unsupported` |
+| `unknown` | `lifecycle_lock_absent`, `evidence_unreadable` |
+
+`provider_unsupported` means the existing provider adapter refused cancel support for this
+admission. For Pi this includes startup readiness that is missing, unusable, or not current for the
+active claim; it does not prove that the provider lacks the feature. `unknown` means the shared
+admission returned an evidence error (`evidence_unreadable`) or the query read a legacy session
+without a lifecycle lock (`lifecycle_lock_absent`); it is not a classification of every unreadable
+provider record, since an adapter can report such a record as unsupported.
+
+`request_id` appears only when the admission read the active request's receipt, and `detail`
+carries the refusal or read error text. This is an observation, not a reservation: a writer can
+change the session right after inspect releases its lock, and `cancel` rechecks every gate. An
+admissible cancel records intent only; it does not prove interruption or completion. Human and
+timeline output do not include capabilities.
 
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.

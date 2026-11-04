@@ -23,6 +23,7 @@ fn help_text() -> String {
         "{PUBLIC_COMMAND} {}: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
 
 Usage:
+  {PUBLIC_COMMAND} describe [COMMAND] [--json]
   {PUBLIC_COMMAND} ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
@@ -52,6 +53,7 @@ Usage:
   {PUBLIC_COMMAND} settings [windows-tab-window <dedicated|current>] [--json]
   {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
   {PUBLIC_COMMAND} settings codex-memory-workspace <refuse|allow> [--json]
+  {PUBLIC_COMMAND} settings codex-lifecycle-hooks <on|off> [--json]
   {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
   {PUBLIC_COMMAND} close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} --help | --version
@@ -408,7 +410,7 @@ mod tests {
             native::COMMANDS.len(),
             "duplicate registry name"
         );
-        assert_eq!(registered.len(), 17);
+        assert_eq!(registered.len(), 18);
         assert_eq!(
             native::COMMANDS.iter().filter(|entry| entry.hidden).count(),
             10

@@ -1123,7 +1123,17 @@ fn unselected_signals_leave_exact_no_question_outputs_unchanged() {
     observer.poll(&directory, false);
     let before_result = result(&directory, &pending);
     let before_status = status(root.path());
-    let before_inspect = inspect(&directory);
+    // Each inspect stamps its own capability observation time; every other byte must match.
+    let untimed_inspect = |directory: &Path| {
+        let mut value = inspect(directory);
+        value["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_unix_ms")
+            .unwrap();
+        value
+    };
+    let before_inspect = untimed_inspect(&directory);
     let before_list = cli_result(root.path(), &[SESSION, "--list"]);
     let reader = Reader::open_unchecked(&directory);
     let before_timeline = read_only(root.path(), || {
@@ -1171,7 +1181,7 @@ fn unselected_signals_leave_exact_no_question_outputs_unchanged() {
         serde_json::to_vec(&before_status).unwrap()
     );
     assert_eq!(
-        serde_json::to_vec(&inspect(&directory)).unwrap(),
+        serde_json::to_vec(&untimed_inspect(&directory)).unwrap(),
         serde_json::to_vec(&before_inspect).unwrap()
     );
     assert_eq!(cli_result(root.path(), &[SESSION, "--list"]), before_list);

@@ -16,6 +16,7 @@ mod consent;
 mod console_control;
 mod context;
 mod delivery;
+mod describe;
 mod diagnostics;
 mod doctor;
 mod envelope;
@@ -49,6 +50,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
+    Describe(describe::Request),
     Consent(Vec<String>),
     Settings(Vec<String>),
     Ask(AskRequest),
@@ -110,146 +112,179 @@ struct SessionSpec {
 pub(crate) struct CommandSpec {
     pub(crate) name: &'static str,
     parse: fn(&str, &[String]) -> Result<NativeCommand>,
-    // Usage remains handwritten; this flag is checked by its consistency test.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Usage remains handwritten; contract coverage and synopsis are checked together.
     pub(crate) hidden: bool,
+    contract: Option<&'static describe::Contract>,
 }
 
 pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        name: "describe",
+        parse: |_, args| describe::parse(args),
+        hidden: false,
+        contract: Some(&describe::DESCRIBE),
+    },
+    CommandSpec {
         name: "ask",
         parse: |_, args| session_start::parse_ask(args),
         hidden: false,
+        contract: Some(&describe::ASK),
     },
     CommandSpec {
         name: "self-test",
         parse: |_, args| self_test::parse(args),
         hidden: false,
+        contract: Some(&describe::SELF_TEST),
     },
     CommandSpec {
         name: "tell",
         parse: |_, args| tell::parse(args),
         hidden: false,
+        contract: Some(&describe::TELL),
     },
     CommandSpec {
         name: "hold",
         parse: |_, args| hold::parse(args),
         hidden: false,
+        contract: Some(&describe::HOLD),
     },
     CommandSpec {
         name: "cancel",
         parse: |_, args| cancel::parse(args),
         hidden: false,
+        contract: Some(&describe::CANCEL),
     },
     CommandSpec {
         name: "consent",
         parse: |_, args| parse_consent(args),
         hidden: false,
+        contract: Some(&describe::CONSENT),
     },
     CommandSpec {
         name: "settings",
         parse: |_, args| parse_settings(args),
         hidden: false,
+        contract: Some(&describe::SETTINGS),
     },
     CommandSpec {
         name: "reopen",
         parse: |_, args| reopen::parse_reopen(args),
         hidden: false,
+        contract: Some(&describe::REOPEN),
     },
     CommandSpec {
         name: "inspect",
         parse: |_, args| query::parse_inspect(args),
         hidden: false,
+        contract: Some(&describe::INSPECT),
     },
     CommandSpec {
         name: "result",
         parse: |_, args| query::parse_result(args),
         hidden: false,
+        contract: Some(&describe::RESULT),
     },
     CommandSpec {
         name: "wait",
         parse: |_, args| query::wait::parse(args),
         hidden: false,
+        contract: Some(&describe::WAIT),
     },
     CommandSpec {
         name: "search",
         parse: |_, args| query::search::parse_search(args),
         hidden: false,
+        contract: Some(&describe::SEARCH),
     },
     CommandSpec {
         name: "doctor",
         parse: |_, args| doctor::parse_args(args),
         hidden: false,
+        contract: Some(&describe::DOCTOR),
     },
     CommandSpec {
         name: "sessions",
         parse: |_, args| sessions::parse(args),
         hidden: false,
+        contract: Some(&describe::SESSIONS),
     },
     CommandSpec {
         name: "status",
         parse: |_, args| query::status::parse(args),
         hidden: false,
+        contract: Some(&describe::STATUS),
     },
     CommandSpec {
         name: "prune-sessions",
         parse: |_, args| prune::parse(args),
         hidden: false,
+        contract: Some(&describe::PRUNE),
     },
     CommandSpec {
         name: "close-session",
         parse: |_, args| close::parse(args),
         hidden: false,
+        contract: Some(&describe::CLOSE),
     },
     CommandSpec {
         name: "native-session",
         parse: |_, args| parse_session(args),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: "native-hook",
         parse: |_, args| hook::parse(args),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: "native-provider-control",
         parse: |_, args| parse_provider_control(args),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: "native-console-control",
         parse: |_, args| console_control::parse(args),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: terminal::host::CONSOLE_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: terminal::host::ITERM2_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: terminal::host::APPLE_TERMINAL_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: terminal::host::WEZTERM_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: terminal::host::GHOSTTY_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
+        contract: None,
     },
     CommandSpec {
         name: terminal::host::WARP_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
+        contract: None,
     },
 ];
 
@@ -301,6 +336,7 @@ fn parse_provider_control(rest: &[String]) -> Result<NativeCommand> {
 
 pub(crate) fn run(command: NativeCommand) -> Result<()> {
     match command {
+        NativeCommand::Describe(request) => describe::run(request),
         NativeCommand::Consent(args) => consent::run(&args),
         NativeCommand::Settings(args) => settings::run(&args),
         NativeCommand::Ask(request) => session_start::run_ask(request),

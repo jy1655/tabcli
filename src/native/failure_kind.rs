@@ -17,6 +17,9 @@ pub(in crate::native) enum FailureKind {
 }
 
 impl FailureKind {
+    pub(in crate::native) const ALL: [Self; 3] =
+        [Self::DeliveryUncertain, Self::TimedOut, Self::Unsupported];
+
     pub(in crate::native) fn as_str(self) -> &'static str {
         match self {
             Self::DeliveryUncertain => "delivery_uncertain",
@@ -27,7 +30,7 @@ impl FailureKind {
 
     /// Only the exact public values are recognized; anything else is unknown.
     pub(in crate::native) fn from_hint(value: &serde_json::Value) -> Option<Self> {
-        [Self::DeliveryUncertain, Self::TimedOut, Self::Unsupported]
+        Self::ALL
             .into_iter()
             .find(|kind| value.as_str() == Some(kind.as_str()))
     }

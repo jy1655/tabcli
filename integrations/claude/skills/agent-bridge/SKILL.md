@@ -14,8 +14,16 @@ If this is itself a delegated task, do not delegate it again unless the task ask
 
 - Resolve `tabcli` with the host shell (`Get-Command tabcli` in PowerShell;
   `command -v tabcli` in POSIX shells) and run `tabcli --version`. This workflow requires
-  tabcli **0.4.22 or newer** and the commands shown below in `tabcli --help`.
-  Read [setup and recovery](references/setup.md) if the executable, version, platform,
+  tabcli **0.4.22 or newer** and the commands shown below.
+- Discover the command contract once per resolved executable and task with
+  `tabcli describe --json`. Adopt it only when the command succeeds with JSON `ok: true`,
+  `contract_version: 1`, `scope: "build"`, and public `commands` entries named `ask`, `tell`,
+  `result`, `wait`, `inspect`, `doctor`, and `close-session`. Read a feature only from its
+  own command entry, such as `features` of `result` or `wait`. If describe fails or returns
+  anything else, do not guess: fall back to `tabcli --help` for this executable and
+  report that the contract was unavailable or unrecognized. The contract states build
+  support only, never runtime readiness, provider availability, or authorization.
+- Read [setup and recovery](references/setup.md) if the executable, version, platform,
   provider, shell permission, or workspace trust prevents progress.
 - Select the actual project directory explicitly with `--workspace`. Use the user's
   requested worktree when supplied. A child shares that directory: agree on file ownership
@@ -80,8 +88,9 @@ Absent question fields do not prove that no question was asked.
 - A result with `question_emission_count` retained emissions: read them with
   `tabcli result SESSION --request REQUEST --json` (`question_emissions`) before accepting the
   answer as final. The child may have continued on an assumption.
-- If `tabcli --help` lists `wait ... --questions`, add `--questions` to a bounded `wait` to
-  return on an emission while the request is pending. `ended: null` with a `question` object
+- If the adopted contract's `wait` features include `questions` and `after_question` (with the
+  help fallback: only if `tabcli --help` lists `wait ... --questions`), add `--questions` to a
+  bounded `wait` to return on an emission while the request is pending. `ended: null` with a `question` object
   is not completion; pass its `after_question` as `--after-question` on the next wait.
 - Supply a missing fact only with an ordinary `tell` once the request has ended and the
   session is `ready`. It is a new request and does not resolve the earlier emission. Never
