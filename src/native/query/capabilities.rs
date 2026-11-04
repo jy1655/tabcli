@@ -167,10 +167,11 @@ fn tell_gates(
         return Err(Stop::unknown("recovery_required", None));
     }
     if close::repair_examines_owner(&records.status.state) {
-        owner_gate(evidence.owner, cfg!(target_os = "macos"))?;
+        owner_gate(evidence.owner)?;
     }
     let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
     surface_gate(evidence.surface)?;
+    owner_control_gate(evidence.owner, cfg!(target_os = "macos"))?;
     hold::ready_gate(&records.status.state, id)?;
     if records.claim.is_some() {
         return Err(Stop::refused("turn_claimed", session::TURN_ALREADY_CLAIMED));
@@ -191,28 +192,14 @@ fn tell_gates(
     Ok(unevaluated)
 }
 
-/// The owner verdict dead-owner repair would act on. A bound record is judged by repair's
-/// own liveness rule; an unbound record observed gone is the same death the repair finds.
-/// Every other record is left to the action, which this observation does not emulate.
-///
-/// A live bound owner is not yet a pass. An attestation that could not inspect its control
-/// identity is unverified everywhere. On macOS, `tell`'s surface probe also requires the
-/// recorded birth, TTY and process groups to match the live owner, so a changed or
-/// uncompared control identity is unknown there; it is not a death, so it is never refused.
-fn owner_gate(owner: &OwnerJudgment, macos: bool) -> std::result::Result<(), Stop> {
+/// The liveness verdict dead-owner repair would act on, judged where convergence runs. A
+/// bound record is judged by repair's own liveness rule; an unbound record observed gone is
+/// the same death the repair finds. Repair reads an unreadable record and fails there. Any
+/// other record lets convergence continue, and is judged with the surface ownership below.
+fn owner_gate(owner: &OwnerJudgment) -> std::result::Result<(), Stop> {
     match owner {
         OwnerJudgment::Bound(attestation) => match close::repair_owner_is_live(attestation) {
-            Ok(true) => match BoundOwner::of(attestation) {
-                // The control identity could not be read; its projection carries why.
-                BoundOwner::Unknown => Err(Stop::unknown(
-                    "owner_unverified",
-                    session::OwnerObservation::from(attestation).error,
-                )),
-                BoundOwner::ControlChanged | BoundOwner::Uncompared if macos => {
-                    Err(Stop::unknown("owner_control_unverified", None))
-                }
-                _ => Ok(()),
-            },
+            Ok(true) => Ok(()),
             Ok(false) => Err(owner_ended()),
             Err(error) => Err(Stop::unknown(
                 "owner_unverified",
@@ -221,6 +208,34 @@ fn owner_gate(owner: &OwnerJudgment, macos: bool) -> std::result::Result<(), Sto
         },
         owner if owner.gone() => Err(owner_ended()),
         OwnerJudgment::Unreadable(reason) => Err(Stop::unreadable(reason.clone())),
+        OwnerJudgment::UnboundLegacy { .. } | OwnerJudgment::Foreign | OwnerJudgment::Absent => {
+            Ok(())
+        }
+    }
+}
+
+/// The owner side of `tell`'s surface ownership check, judged after the recorded handle as
+/// the probe that verifies it runs after `tell` reads that handle. The probe requires an
+/// owner bound to this session, so any other record is unattested. An attestation that
+/// could not inspect its control identity is unverified everywhere. On macOS the probe
+/// also requires the recorded birth, TTY and process groups to match the live owner, so a
+/// changed or uncompared control identity is unknown there. None of these is a death, so
+/// none is refused; a death and an unreadable record are the liveness gate's verdicts.
+fn owner_control_gate(owner: &OwnerJudgment, macos: bool) -> std::result::Result<(), Stop> {
+    match owner {
+        OwnerJudgment::Bound(attestation) => match BoundOwner::of(attestation) {
+            // The identity could not be read; its projection carries why.
+            BoundOwner::Unknown => Err(Stop::unknown(
+                "owner_unverified",
+                session::OwnerObservation::from(attestation).error,
+            )),
+            BoundOwner::ControlChanged | BoundOwner::Uncompared if macos => {
+                Err(Stop::unknown("owner_control_unverified", None))
+            }
+            _ => Ok(()),
+        },
+        owner if owner.gone() => Ok(()),
+        OwnerJudgment::Unreadable(_) => Ok(()),
         OwnerJudgment::UnboundLegacy { .. } | OwnerJudgment::Foreign | OwnerJudgment::Absent => {
             Err(Stop::unknown("owner_unattested", None))
         }
@@ -313,11 +328,48 @@ mod tests {
     use crate::native::query::observation::judgment::tests::attestation;
     use crate::native::session::owner::ControlAttestation;
 
+    /// The liveness gate, then (past the recorded handle) the ownership gate, as tell_gates
+    /// orders them.
     fn gate(process: ProcessObservation, control: ControlAttestation, macos: bool) -> Value {
         let owner = OwnerJudgment::Bound(attestation(process, control, Some(true)));
-        match owner_gate(&owner, macos) {
+        match owner_gate(&owner).and_then(|()| owner_control_gate(&owner, macos)) {
             Ok(()) => json!("pass"),
             Err(stop) => stop.value(),
+        }
+    }
+
+    // A record that lets convergence continue passes the liveness gate and is judged by
+    // the ownership gate; a death or an unreadable record is the liveness gate's verdict.
+    #[test]
+    fn the_liveness_gate_stops_only_where_repair_would() {
+        for owner in [
+            OwnerJudgment::UnboundLegacy { alive: Some(true) },
+            OwnerJudgment::UnboundLegacy { alive: None },
+            OwnerJudgment::Foreign,
+            OwnerJudgment::Absent,
+        ] {
+            assert!(owner_gate(&owner).is_ok(), "{owner:?}");
+            for macos in [false, true] {
+                assert_eq!(
+                    owner_control_gate(&owner, macos).unwrap_err().value(),
+                    json!({"state": "unknown", "reason": "owner_unattested"}),
+                    "{owner:?}"
+                );
+            }
+        }
+        let gone = OwnerJudgment::UnboundLegacy { alive: Some(false) };
+        assert_eq!(
+            owner_gate(&gone).unwrap_err().value()["reason"],
+            "owner_ended"
+        );
+        let unreadable = OwnerJudgment::Unreadable("invalid JSON".into());
+        assert_eq!(
+            owner_gate(&unreadable).unwrap_err().value(),
+            json!({"state": "unknown", "reason": "evidence_unreadable", "detail": "invalid JSON"})
+        );
+        for macos in [false, true] {
+            assert!(owner_control_gate(&gone, macos).is_ok());
+            assert!(owner_control_gate(&unreadable, macos).is_ok());
         }
     }
 

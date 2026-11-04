@@ -2464,8 +2464,8 @@ fn inspect_reports_the_tell_refusals_the_command_then_prints_unchanged() {
     }
 
     // Past the Hold and a live bound owner, tell reads the terminal handle before its probe.
-    // On macOS that probe also needs the owner's birth, TTY and process groups, which this
-    // PID-only record lacks, so the owner gate is unknown there first.
+    // The probe would verify this PID-only owner's identity (on macOS it would not match),
+    // but the missing handle refuses first, on every platform, in inspect as in tell.
     let fixture = Fixture::new();
     fs::write(fixture.directory.join("turn.claim.lock"), b"").unwrap();
     write(
@@ -2475,12 +2475,8 @@ fn inspect_reports_the_tell_refusals_the_command_then_prints_unchanged() {
     let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
     assert_eq!(
         inspected["capabilities"]["tell"],
-        if cfg!(target_os = "macos") {
-            json!({"state": "unknown", "reason": "owner_control_unverified"})
-        } else {
-            json!({"state": "refused", "reason": "surface_missing",
-                "detail": "no active terminal handle is recorded"})
-        }
+        json!({"state": "refused", "reason": "surface_missing",
+            "detail": "no active terminal handle is recorded"})
     );
     let refused = tell_json(&fixture);
     assert_eq!(refused["ok"], false);

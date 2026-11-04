@@ -611,6 +611,40 @@ fn the_owner_gate_is_what_dead_owner_repair_finds_without_repairing() {
     );
 }
 
+/// tell's convergence judges only the owner's liveness; it reads the terminal handle next
+/// and verifies the owner's binding and control identity in the probe after that. A
+/// missing handle therefore refuses before any ownership verdict, on every platform.
+#[test]
+fn a_missing_terminal_handle_refuses_before_the_owners_identity_is_judged() {
+    use crate::native::process_identity::{Attested, ProcessObservation};
+    use crate::native::session::owner::ControlAttestation;
+    let fixture = ready("codex");
+    let directory = &fixture.directory;
+    fs::remove_file(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+    let missing = refused("surface_missing", "no active terminal handle is recorded");
+    // The fixture's live PID-only owner, judged by the production observers: on macOS its
+    // control identity is uncompared, which the probe would refuse only after the read.
+    assert_eq!(observe_all(directory)["tell"], missing);
+    // A live owner whose control identity could not be read, on every platform.
+    let observed = render(directory, |observed| {
+        attested_owner(
+            observed,
+            ProcessObservation::Live(Attested::Incarnation),
+            ControlAttestation::Unknown("tty unreadable".into()),
+        );
+    });
+    assert_eq!(observed["tell"], missing);
+    // Records repair leaves to the probe: absent, foreign and unbound live owners.
+    fs::remove_file(directory.join(SESSION_OWNER_FILE)).unwrap();
+    assert_eq!(observe_all(directory)["tell"], missing);
+    for session in [Some("session-other"), None] {
+        write_owner(directory, std::process::id(), session);
+        assert_eq!(observe_all(directory)["tell"], missing, "{session:?}");
+    }
+    // tell itself reads that handle before its probe and fails without it.
+    assert!(Reader::open_unchecked(directory).terminal().is_err());
+}
+
 #[test]
 fn an_owner_whose_process_cannot_be_inspected_is_unverified_not_ended() {
     use crate::native::process_identity::ProcessObservation;

@@ -511,6 +511,24 @@ fn the_follow_up_observation_shares_admits_mode_gate_and_reads_only() {
         emission_observation(f.root.path()),
         EmissionObservation::Configured("plugin_configured_unverified")
     );
+    // Only the manifest prepare writes counts: an empty, truncated or foreign one is
+    // unreadable evidence, with the reason as its detail, never a configuration.
+    for (bytes, reason) in [
+        (&b""[..], "not valid JSON"),
+        (&b"{\"name\":\"agent-bridge-que"[..], "not valid JSON"),
+        (
+            &br#"{"name":"another-plugin"}"#[..],
+            "does not name agent-bridge-questions",
+        ),
+    ] {
+        std::fs::write(f.root.path().join(QUESTION_PLUGIN_MANIFEST), bytes).unwrap();
+        match emission_observation(f.root.path()) {
+            EmissionObservation::Unknown(detail) => {
+                assert!(detail.contains(reason), "{detail}");
+            }
+            other => panic!("{bytes:?} was observed as {other:?}"),
+        }
+    }
     // A manifest path that is not a regular file is unreadable evidence, not a plugin.
     std::fs::remove_file(f.root.path().join(QUESTION_PLUGIN_MANIFEST)).unwrap();
     std::fs::create_dir(f.root.path().join(QUESTION_PLUGIN_MANIFEST)).unwrap();

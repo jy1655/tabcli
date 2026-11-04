@@ -17,6 +17,8 @@ const READY_FILE: &str = "claude-mod-ready.json";
 const DIAGNOSTIC_FILE: &str = "claude-mod-diagnostic.json";
 /// The question plugin's manifest that `prepare` writes for a native-mode launch.
 const QUESTION_PLUGIN_MANIFEST: &str = "claude-question-mod/.claude-plugin/plugin.json";
+/// The plugin name that manifest carries.
+const QUESTION_PLUGIN_NAME: &str = "agent-bridge-questions";
 const REVISION: u32 = 1;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FROM_BYTES: usize = 1024;
@@ -166,7 +168,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     std::fs::create_dir_all(questions.join(".claude-plugin"))?;
     std::fs::create_dir_all(questions.join("hooks"))?;
     store.private(QUESTION_PLUGIN_MANIFEST).write_json(&json!({
-        "name":"agent-bridge-questions", "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
+        "name":QUESTION_PLUGIN_NAME, "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
     }))?;
     store
         .private("claude-question-mod/hooks/hooks.json")
@@ -235,15 +237,24 @@ pub(super) fn emission_observation(
         if !native_mode(directory)? {
             return Ok(EmissionObservation::Unavailable("legacy_completion_mode"));
         }
-        let prepared = Reader::open_unchecked(directory)
+        let Some(bytes) = Reader::open_unchecked(directory)
             .private(QUESTION_PLUGIN_MANIFEST)
             .bytes()?
-            .is_some();
-        Ok(if prepared {
-            EmissionObservation::Configured("plugin_configured_unverified")
-        } else {
-            EmissionObservation::Unavailable("question_plugin_not_prepared")
-        })
+        else {
+            return Ok(EmissionObservation::Unavailable(
+                "question_plugin_not_prepared",
+            ));
+        };
+        // Only the manifest `prepare` writes identifies the prepared observer; an empty,
+        // truncated or foreign file is evidence that cannot be read as it.
+        let manifest: Value = serde_json::from_slice(&bytes)
+            .context("Claude question plugin manifest is not valid JSON")?;
+        if manifest.get("name").and_then(Value::as_str) != Some(QUESTION_PLUGIN_NAME) {
+            bail!("Claude question plugin manifest does not name {QUESTION_PLUGIN_NAME}");
+        }
+        Ok(EmissionObservation::Configured(
+            "plugin_configured_unverified",
+        ))
     };
     observe().unwrap_or_else(|error| EmissionObservation::Unknown(format!("{error:#}")))
 }
