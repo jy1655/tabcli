@@ -15,6 +15,8 @@ use std::{
 const MODE_FILE: &str = "claude-completion-mode.json";
 const READY_FILE: &str = "claude-mod-ready.json";
 const DIAGNOSTIC_FILE: &str = "claude-mod-diagnostic.json";
+/// The question plugin's manifest that `prepare` writes for a native-mode launch.
+const QUESTION_PLUGIN_MANIFEST: &str = "claude-question-mod/.claude-plugin/plugin.json";
 const REVISION: u32 = 1;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FROM_BYTES: usize = 1024;
@@ -163,7 +165,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     let questions = directory.join("claude-question-mod");
     std::fs::create_dir_all(questions.join(".claude-plugin"))?;
     std::fs::create_dir_all(questions.join("hooks"))?;
-    store.private("claude-question-mod/.claude-plugin/plugin.json").write_json(&json!({
+    store.private(QUESTION_PLUGIN_MANIFEST).write_json(&json!({
         "name":"agent-bridge-questions", "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
     }))?;
     store
@@ -222,16 +224,28 @@ pub(super) fn follow_up_static(
 }
 
 /// Question emissions are observed by the separate plugin that a native-mode launch
-/// prepares; its loading is not proven by the record.
+/// prepares. Native mode alone does not prove it: v0.4.25 recorded native mode before the
+/// question plugin existed (v0.4.26). The prepared manifest is read, never written; its
+/// presence does not prove that Claude loaded the plugin.
 pub(super) fn emission_observation(
     directory: &Path,
 ) -> crate::native::provider::EmissionObservation {
     use crate::native::provider::EmissionObservation;
-    match native_mode(directory) {
-        Ok(true) => EmissionObservation::Configured("plugin_configured_unverified"),
-        Ok(false) => EmissionObservation::Unavailable("legacy_completion_mode"),
-        Err(error) => EmissionObservation::Unknown(format!("{error:#}")),
-    }
+    let observe = || -> Result<EmissionObservation> {
+        if !native_mode(directory)? {
+            return Ok(EmissionObservation::Unavailable("legacy_completion_mode"));
+        }
+        let prepared = Reader::open_unchecked(directory)
+            .private(QUESTION_PLUGIN_MANIFEST)
+            .bytes()?
+            .is_some();
+        Ok(if prepared {
+            EmissionObservation::Configured("plugin_configured_unverified")
+        } else {
+            EmissionObservation::Unavailable("question_plugin_not_prepared")
+        })
+    };
+    observe().unwrap_or_else(|error| EmissionObservation::Unknown(format!("{error:#}")))
 }
 
 pub(super) fn admit(

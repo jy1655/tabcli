@@ -224,8 +224,9 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn follow_up_static(&self, _reader: &Reader) -> super::FollowUpStatic {
-        // No record gate: the native queue's version floor and the established thread are
-        // checked by the queue transport at delivery.
+        // Not evaluated here (the design defers them): at delivery the queue transport
+        // decides the native queue's version floor from the recorded launch version and
+        // the established thread from recorded events, before it starts any process.
         super::FollowUpStatic::Ok {
             unevaluated: &["codex_native_queue_version", "codex_thread"],
         }

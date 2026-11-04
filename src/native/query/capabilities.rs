@@ -1,11 +1,11 @@
 //! What a session's own action admissions would decide at this Snapshot. An observation is
 //! not a reservation: the action rechecks every gate under its own lock, and an admissible
 //! cancel records intent only, never interruption or completion. `tell` is observed through
-//! its Bridge record gates only; the gates no record decides are named, never inferred.
+//! its Bridge record gates only; the gates it does not evaluate are named, never inferred.
 use super::*;
 use crate::native::session::cancel::{self, Refusal, RefusalReason};
 use crate::native::session::{self, close, hold};
-use observation::judgment::{ActiveHandle, OwnerJudgment, Surface};
+use observation::judgment::{ActiveHandle, BoundOwner, OwnerJudgment, Surface};
 
 pub(super) const SCHEMA_VERSION: u32 = 1;
 
@@ -150,9 +150,9 @@ fn tell_value(
 }
 
 /// `tell`'s Bridge record gates in the action's order, stopping at the first that does not
-/// pass. On success, returns the later gates no record decides, in the action's order: the
-/// terminal surface probe, reopened-conversation exclusivity, and the provider's delivery
-/// readiness with the adapter's own waits and probes.
+/// pass. On success, returns the gates this observation does not evaluate, in the action's
+/// order: the terminal surface probe, reopened-conversation exclusivity, and the provider's
+/// delivery readiness with the adapter gates it leaves to delivery.
 fn tell_gates(
     reader: &Reader,
     records: &Snapshot,
@@ -167,7 +167,7 @@ fn tell_gates(
         return Err(Stop::unknown("recovery_required", None));
     }
     if close::repair_examines_owner(&records.status.state) {
-        owner_gate(evidence.owner)?;
+        owner_gate(evidence.owner, cfg!(target_os = "macos"))?;
     }
     let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
     surface_gate(evidence.surface)?;
@@ -194,10 +194,21 @@ fn tell_gates(
 /// The owner verdict dead-owner repair would act on. A bound record is judged by repair's
 /// own liveness rule; an unbound record observed gone is the same death the repair finds.
 /// Every other record is left to the action, which this observation does not emulate.
-fn owner_gate(owner: &OwnerJudgment) -> std::result::Result<(), Stop> {
+///
+/// A live bound owner is not yet a pass. An attestation that could not inspect its control
+/// identity is unverified everywhere. On macOS, `tell`'s surface probe also requires the
+/// recorded birth, TTY and process groups to match the live owner, so a changed or
+/// uncompared control identity is unknown there; it is not a death, so it is never refused.
+fn owner_gate(owner: &OwnerJudgment, macos: bool) -> std::result::Result<(), Stop> {
     match owner {
         OwnerJudgment::Bound(attestation) => match close::repair_owner_is_live(attestation) {
-            Ok(true) => Ok(()),
+            Ok(true) => match BoundOwner::of(attestation) {
+                BoundOwner::Unknown => Err(Stop::unknown("owner_unverified", None)),
+                BoundOwner::ControlChanged | BoundOwner::Uncompared if macos => {
+                    Err(Stop::unknown("owner_control_unverified", None))
+                }
+                _ => Ok(()),
+            },
             Ok(false) => Err(owner_ended()),
             Err(error) => Err(Stop::unknown(
                 "owner_unverified",
@@ -289,4 +300,83 @@ fn questions_value(reader: &Reader, records: &Snapshot) -> Value {
         }
     };
     json!({"emission_observation": emission, "response": response})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+    use crate::native::query::observation::judgment::tests::attestation;
+    use crate::native::session::owner::ControlAttestation;
+
+    fn gate(process: ProcessObservation, control: ControlAttestation, macos: bool) -> Value {
+        let owner = OwnerJudgment::Bound(attestation(process, control, Some(true)));
+        match owner_gate(&owner, macos) {
+            Ok(()) => json!("pass"),
+            Err(stop) => stop.value(),
+        }
+    }
+
+    // Both platform mappings, on every host: the macOS rows are what tell's own surface
+    // probe can verify there, and the other platforms keep repair's liveness rule.
+    #[test]
+    fn a_live_bound_owner_passes_only_where_the_probe_could_verify_it() {
+        let unverified = json!({"state": "unknown", "reason": "owner_unverified"});
+        let control = json!({"state": "unknown", "reason": "owner_control_unverified"});
+        let ended = json!({"state": "refused", "reason": "owner_ended",
+            "detail": "the recorded session owner is no longer running"});
+        for macos in [false, true] {
+            let on_macos = |verdict: &Value| {
+                if macos {
+                    verdict.clone()
+                } else {
+                    json!("pass")
+                }
+            };
+            let live = || ProcessObservation::Live(Attested::Incarnation);
+            let rows = [
+                (live(), ControlAttestation::Verified, json!("pass")),
+                (
+                    live(),
+                    ControlAttestation::Unknown("tty unreadable".into()),
+                    unverified.clone(),
+                ),
+                (
+                    live(),
+                    ControlAttestation::Changed("process group changed".into()),
+                    on_macos(&control),
+                ),
+                (live(), ControlAttestation::NotRecorded, on_macos(&control)),
+                (
+                    ProcessObservation::Live(Attested::PidOnly),
+                    ControlAttestation::NotRecorded,
+                    on_macos(&control),
+                ),
+                (
+                    ProcessObservation::Gone(Gone::Exited),
+                    ControlAttestation::NotRecorded,
+                    ended.clone(),
+                ),
+                (
+                    ProcessObservation::Gone(Gone::Reused("another birth".into())),
+                    ControlAttestation::NotRecorded,
+                    ended.clone(),
+                ),
+                (
+                    ProcessObservation::Unknown("access denied".into()),
+                    ControlAttestation::NotRecorded,
+                    json!({"state": "unknown", "reason": "owner_unverified",
+                        "detail": "access denied"}),
+                ),
+            ];
+            for (process, control_attestation, expected) in rows {
+                let label = format!("{macos} {process:?} {control_attestation:?}");
+                assert_eq!(
+                    gate(process, control_attestation, macos),
+                    expected,
+                    "{label}"
+                );
+            }
+        }
+    }
 }

@@ -345,13 +345,61 @@ fn render(directory: &Path, adjust: impl FnOnce(&mut observation::Observation)) 
 /// inspect's own tests replace judgments; every other gate, the owner included, is judged
 /// from the records by the production observers.
 fn observe_past_surface(directory: &Path) -> Value {
+    render(directory, bound_surface)
+}
+
+fn bound_surface(observed: &mut observation::Observation) {
+    observed.judgments.surface = observation::judgment::Surface::Active {
+        kind: supported_kind(),
+        supported: true,
+        bound: true,
+        empty_id: false,
+    };
+}
+
+/// Judges the fixture's bound owner record with the given attestation.
+fn attested_owner(
+    observed: &observation::Observation,
+    process: crate::native::process_identity::ProcessObservation,
+    control: crate::native::session::owner::ControlAttestation,
+) {
+    let attested = std::cell::RefCell::new(Some(observation::judgment::tests::attestation(
+        process,
+        control,
+        Some(true),
+    )));
+    observed.evidence.judge_owner_with(
+        SESSION,
+        &observation::judgment::Observers {
+            attest: &|_| attested.borrow_mut().take().expect("one attestation"),
+            pid_alive: &|_| panic!("a bound record is attested"),
+        },
+    );
+}
+
+/// The fixture's owner record is PID-only, which macOS's probe cannot verify, so rows past
+/// the owner gate judge it as a live owner whose control identity was verified, as
+/// inspect's own tests replace the owner observers.
+fn verified_owner(observed: &mut observation::Observation) {
+    attested_owner(
+        observed,
+        crate::native::process_identity::ProcessObservation::Live(
+            crate::native::process_identity::Attested::Incarnation,
+        ),
+        crate::native::session::owner::ControlAttestation::Verified,
+    );
+}
+
+/// For rows past the owner gate whose surface is judged from the records.
+fn observe_past_owner(directory: &Path) -> Value {
+    render(directory, verified_owner)
+}
+
+/// For rows past the owner and the surface gates.
+fn observe_past_owner_and_surface(directory: &Path) -> Value {
     render(directory, |observed| {
-        observed.judgments.surface = observation::judgment::Surface::Active {
-            kind: supported_kind(),
-            supported: true,
-            bound: true,
-            empty_id: false,
-        };
+        bound_surface(observed);
+        verified_owner(observed);
     })
 }
 
@@ -370,7 +418,7 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
     let store = Store::open_unchecked(directory);
     let reader = Reader::open_unchecked(directory);
     assert_eq!(
-        observe_past_surface(directory)["tell"],
+        observe_past_owner_and_surface(directory)["tell"],
         admissible(&[
             "terminal_surface_probe",
             "provider_delivery_readiness",
@@ -384,7 +432,7 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
     let mut status = store.status().unwrap();
     status.state = SessionState::Working;
     store.write_status(&status).unwrap();
-    let observed = observe_past_surface(directory)["tell"].clone();
+    let observed = observe_past_owner_and_surface(directory)["tell"].clone();
     assert_eq!(
         observed,
         refused(
@@ -401,7 +449,7 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
         .record(CoreRecord::Hold)
         .write_private(b"malformed")
         .unwrap();
-    let observed = observe_past_surface(directory)["tell"].clone();
+    let observed = observe_past_owner_and_surface(directory)["tell"].clone();
     assert_eq!(
         observed,
         refused(
@@ -418,7 +466,7 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
 
     // Without a Hold, the stored state is decided as follow_up_admission decides it.
     hold::change(&store, true).unwrap();
-    let observed = observe_past_surface(directory)["tell"].clone();
+    let observed = observe_past_owner_and_surface(directory)["tell"].clone();
     assert_eq!(
         observed,
         refused(
@@ -436,7 +484,7 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
     status.state = SessionState::Ready;
     store.write_status(&status).unwrap();
     turn::claim(&store, &[]).unwrap().retain();
-    let observed = observe_past_surface(directory)["tell"].clone();
+    let observed = observe_past_owner_and_surface(directory)["tell"].clone();
     assert_eq!(observed, refused("turn_claimed", TURN_ALREADY_CLAIMED));
     let action = turn::claim_ready(&store, SESSION, &[]).err().unwrap();
     assert!(
@@ -466,13 +514,13 @@ fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated(
         (supported_kind(), None, unbound),
     ] {
         write_handle(directory, kind, session);
-        let observed = observe_all(directory)["tell"].clone();
+        let observed = observe_past_owner(directory)["tell"].clone();
         assert_eq!(observed["state"], "refused", "{kind:?} {session:?}");
         assert_eq!(observed["reason"], reason, "{kind:?} {session:?}");
     }
     fs::remove_file(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
     assert_eq!(
-        observe_all(directory)["tell"],
+        observe_past_owner(directory)["tell"],
         refused("surface_missing", "no active terminal handle is recorded")
     );
     // tell reads the same handle before its probe and fails without it.
@@ -483,7 +531,7 @@ fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated(
     )
     .unwrap();
     assert_eq!(
-        observe_all(directory)["tell"],
+        observe_past_owner(directory)["tell"],
         refused(
             "surface_closed",
             "the terminal surface is closed or being closed"
@@ -491,7 +539,7 @@ fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated(
     );
     fs::remove_file(directory.join(TERMINAL_TOMBSTONE_FILE)).unwrap();
     fs::write(directory.join(TERMINAL_HANDLE_FILE), "{").unwrap();
-    let observed = observe_all(directory)["tell"].clone();
+    let observed = observe_past_owner(directory)["tell"].clone();
     assert_eq!(observed["state"], "unknown");
     assert_eq!(observed["reason"], "evidence_unreadable");
     assert!(observed["detail"].as_str().is_some());
@@ -501,14 +549,20 @@ fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated(
 #[test]
 fn a_ready_session_passes_every_record_gate_through_the_production_judgments() {
     let fixture = ready("agy");
+    // macOS's probe needs the recorded birth, TTY and process groups that the fixture's
+    // PID-only owner record lacks, so the owner gate is unknown there.
     assert_eq!(
         observe_all(&fixture.directory)["tell"],
-        admissible(&[
-            "terminal_surface_probe",
-            "provider_delivery_readiness",
-            "agy_trust_store",
-            "agy_log_readiness",
-        ])
+        if cfg!(target_os = "macos") {
+            json!({"state": "unknown", "reason": "owner_control_unverified"})
+        } else {
+            admissible(&[
+                "terminal_surface_probe",
+                "provider_delivery_readiness",
+                "agy_trust_store",
+                "agy_log_readiness",
+            ])
+        }
     );
 }
 
@@ -563,18 +617,10 @@ fn an_owner_whose_process_cannot_be_inspected_is_unverified_not_ended() {
     use crate::native::session::owner::ControlAttestation::NotRecorded;
     let fixture = ready("codex");
     let observed = render(&fixture.directory, |observed| {
-        observed.evidence.judge_owner_with(
-            SESSION,
-            &observation::judgment::Observers {
-                attest: &|_| {
-                    observation::judgment::tests::attestation(
-                        ProcessObservation::Unknown("access denied".into()),
-                        NotRecorded,
-                        Some(true),
-                    )
-                },
-                pid_alive: &|_| panic!("a bound record is attested"),
-            },
+        attested_owner(
+            observed,
+            ProcessObservation::Unknown("access denied".into()),
+            NotRecorded,
         );
     });
     assert_eq!(
@@ -583,29 +629,125 @@ fn an_owner_whose_process_cannot_be_inspected_is_unverified_not_ended() {
     );
 }
 
+/// A live bound owner passes only where tell's probe could verify it. Both platform
+/// mappings are covered on every host by `capabilities::tests`; these rows go through
+/// inspect on this host.
+#[test]
+fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
+    use crate::native::process_identity::{Attested, ProcessObservation};
+    use crate::native::session::owner::ControlAttestation;
+    let fixture = ready("codex");
+    let past_owner = admissible(&[
+        "terminal_surface_probe",
+        "provider_delivery_readiness",
+        "codex_native_queue_version",
+        "codex_thread",
+    ]);
+    let on_macos = |verdict: Value| {
+        if cfg!(target_os = "macos") {
+            verdict
+        } else {
+            past_owner.clone()
+        }
+    };
+    let control = json!({"state": "unknown", "reason": "owner_control_unverified"});
+    let rows = [
+        (
+            ProcessObservation::Live(Attested::Incarnation),
+            ControlAttestation::Unknown("tty unreadable".into()),
+            json!({"state": "unknown", "reason": "owner_unverified"}),
+        ),
+        (
+            ProcessObservation::Live(Attested::Incarnation),
+            ControlAttestation::Changed("process group changed".into()),
+            on_macos(control.clone()),
+        ),
+        (
+            ProcessObservation::Live(Attested::PidOnly),
+            ControlAttestation::NotRecorded,
+            on_macos(control.clone()),
+        ),
+        (
+            ProcessObservation::Live(Attested::Incarnation),
+            ControlAttestation::Verified,
+            past_owner.clone(),
+        ),
+    ];
+    for (process, control_attestation, expected) in rows {
+        let label = format!("{process:?} {control_attestation:?}");
+        let observed = render(&fixture.directory, |observed| {
+            bound_surface(observed);
+            attested_owner(observed, process, control_attestation);
+        });
+        assert_eq!(observed["tell"], expected, "{label}");
+    }
+}
+
 #[test]
 fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
     for (provider, adapter) in [
         ("codex", &["codex_native_queue_version", "codex_thread"][..]),
         ("agy", &["agy_trust_store", "agy_log_readiness"][..]),
-        ("pi", &["pi_startup_readiness"][..]),
     ] {
         let fixture = ready(provider);
         let mut expected = vec!["terminal_surface_probe", "provider_delivery_readiness"];
         expected.extend_from_slice(adapter);
         assert_eq!(
-            observe_past_surface(&fixture.directory)["tell"],
+            observe_past_owner_and_surface(&fixture.directory)["tell"],
             admissible(&expected),
             "{provider}"
         );
     }
+
+    // Pi: native Windows follow-ups decide the startup record's input acknowledgement,
+    // whatever Claim it names; elsewhere the paste has no record gate.
+    let fixture = ready("pi");
+    let windows = cfg!(windows);
+    if windows {
+        assert_eq!(
+            observe_past_owner_and_surface(&fixture.directory)["tell"],
+            refused(
+                "pi_input_ack_unsupported",
+                "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent: Pi startup receipt is missing",
+            )
+        );
+    }
+    let ready_record = |schema: u32, ack: Option<u32>| {
+        Store::open_unchecked(&fixture.directory)
+            .private("pi-startup-ready.json")
+            .write_json(&json!({"schema": schema, "claim_token": "1-2-3",
+                "session_id": "native", "input_ack_schema": ack}))
+            .unwrap();
+    };
+    ready_record(1, None);
+    let observed = observe_past_owner_and_surface(&fixture.directory)["tell"].clone();
+    if windows {
+        assert_eq!(observed["reason"], "pi_input_ack_unsupported");
+    } else {
+        assert_eq!(observed["state"], "admissible");
+    }
+    ready_record(2, Some(1));
+    let mut expected = vec!["terminal_surface_probe", "provider_delivery_readiness"];
+    if windows {
+        expected.push("pi_windows_input_receipt");
+    }
+    assert_eq!(
+        observe_past_owner_and_surface(&fixture.directory)["tell"],
+        admissible(&expected)
+    );
+    fs::write(fixture.directory.join("pi-startup-ready.json"), "{").unwrap();
+    let observed = observe_past_owner_and_surface(&fixture.directory)["tell"].clone();
+    assert_eq!(
+        observed["state"],
+        if windows { "unknown" } else { "admissible" }
+    );
 
     // Claude decides from the completion-mode record, with admit's own text.
     let fixture = ready("claude");
     let directory = &fixture.directory;
     let store = Store::open_unchecked(directory);
     assert_eq!(
-        observe_past_surface(directory)["tell"],
+        observe_past_owner_and_surface(directory)["tell"],
         refused(
             "claude_legacy_completion",
             if cfg!(windows) {
@@ -622,7 +764,7 @@ fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
         .write_json(&native)
         .unwrap();
     assert_eq!(
-        observe_past_surface(directory)["tell"],
+        observe_past_owner_and_surface(directory)["tell"],
         admissible(&[
             "terminal_surface_probe",
             "provider_delivery_readiness",
@@ -637,7 +779,7 @@ fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
         .private("claude-completion-mode.json")
         .write_private(b"{")
         .unwrap();
-    let observed = observe_past_surface(directory)["tell"].clone();
+    let observed = observe_past_owner_and_surface(directory)["tell"].clone();
     assert_eq!(observed["state"], "unknown");
     assert_eq!(observed["reason"], "evidence_unreadable");
     assert!(observed["detail"].as_str().is_some());
@@ -655,7 +797,7 @@ fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
         .write_json(&manifest)
         .unwrap();
     assert_eq!(
-        observe_past_surface(directory)["tell"],
+        observe_past_owner_and_surface(directory)["tell"],
         admissible(&[
             "terminal_surface_probe",
             "reopened_conversation_exclusivity",

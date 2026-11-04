@@ -91,8 +91,10 @@ fn tell_repairs_a_dead_owner_before_refusing_the_turn() {
     fixture.assert_repaired();
 }
 
-// The inference capabilities.tell relies on: an owner inspect judges gone is one that tell's
-// own repair closes, so the session never reaches the ready state the follow-up needs.
+// capabilities.tell refuses a session whose owner inspect judges gone, and tell refuses it
+// too. Here tell's dead-owner repair closes it; repair can instead leave such a session open
+// for an explicit close (a pending macOS close, a terminal that outlives its owner, an
+// unconfirmed launch), which this fixture has none of.
 #[test]
 fn inspect_observes_the_dead_owner_refusal_that_tell_repairs_into_a_closed_session() {
     let fixture = Fixture::dead_owner();

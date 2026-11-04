@@ -193,6 +193,25 @@ impl<R: input::Runtime> Transport for PiPaste<R> {
     }
 }
 
+/// The native Windows follow-up gate decided from the startup record alone: the Windows
+/// input preflight's Claim-independent part (`startup_ready::windows_input`). The
+/// follow-up carries a schema 2 record to its new Claim before that preflight, so the
+/// Claim match is left to delivery with the per-turn input receipt it then awaits.
+fn windows_follow_up_static(reader: &Reader) -> super::FollowUpStatic {
+    match startup_ready::windows_input(reader) {
+        startup_ready::WindowsInput::Offered(_) => super::FollowUpStatic::Ok {
+            unevaluated: &["pi_windows_input_receipt"],
+        },
+        startup_ready::WindowsInput::Refused(reason) => super::FollowUpStatic::Refused {
+            reason: "pi_input_ack_unsupported",
+            detail: format!("{}: {reason}", startup_ready::WINDOWS_INPUT_REFUSAL),
+        },
+        startup_ready::WindowsInput::Unreadable(error) => {
+            super::FollowUpStatic::Unknown(format!("{error:#}"))
+        }
+    }
+}
+
 const APPLIED_MARKER: &str = "pi-approve-once";
 
 // Pi's home: `trust.json` under `PI_CODING_AGENT_DIR`, or under `.pi/agent` in the user
@@ -278,11 +297,12 @@ impl NativeProviderAdapter for PiAdapter {
         ))
     }
 
-    fn follow_up_static(&self, _reader: &Reader) -> super::FollowUpStatic {
-        // No record gate: startup readiness, and on native Windows the input capability, are
-        // checked by the paste transport at delivery.
-        super::FollowUpStatic::Ok {
-            unevaluated: &["pi_startup_readiness"],
+    fn follow_up_static(&self, reader: &Reader) -> super::FollowUpStatic {
+        // Only native Windows follow-ups have a record gate; elsewhere the paste has none.
+        if cfg!(windows) {
+            windows_follow_up_static(reader)
+        } else {
+            super::FollowUpStatic::Ok { unevaluated: &[] }
         }
     }
 

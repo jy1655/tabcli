@@ -195,7 +195,8 @@ pub(super) fn cancel_support(provider: FirstPartyCli, directory: &Path) -> Resul
 /// before any wait, probe or provider process. The delivery path keeps its own checks.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FollowUpStatic {
-    /// The record gate passes; `unevaluated` names the adapter's later waits and probes.
+    /// The evaluated gate passes; `unevaluated` names the adapter gates inspect does not
+    /// evaluate: waits, probes, and record gates left to delivery.
     Ok {
         unevaluated: &'static [&'static str],
     },
@@ -279,8 +280,9 @@ trait NativeProviderAdapter: Sync {
     fn initial_transport(&self) -> Box<dyn Transport>;
     fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
-    // The follow-up gate this adapter decides from its own records, before its delivery
-    // waits and probes, which it names instead of evaluating. Reads only; no lock.
+    // The follow-up gate this adapter evaluates for inspect from its own records, before any
+    // wait, probe or provider process. It names every adapter gate it does not evaluate,
+    // including any that delivery decides from records. Reads only; no lock.
     fn follow_up_static(&self, reader: &super::session::Reader) -> FollowUpStatic;
     // Whether question emission observation was configured for this session, and the
     // answer path. Reads only; no lock.
@@ -498,10 +500,16 @@ mod tests {
                 },
                 true,
             ),
+            // No startup record: native Windows follow-ups refuse; elsewhere Pi has no gate.
             (
                 FirstPartyCli::Pi,
-                FollowUpStatic::Ok {
-                    unevaluated: &["pi_startup_readiness"],
+                if cfg!(windows) {
+                    FollowUpStatic::Refused {
+                        reason: "pi_input_ack_unsupported",
+                        detail: "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent: Pi startup receipt is missing".into(),
+                    }
+                } else {
+                    FollowUpStatic::Ok { unevaluated: &[] }
                 },
                 true,
             ),
@@ -585,6 +593,18 @@ mod tests {
             .write_private(
                 br#"{"schema":1,"mode":"native_v1","reason":"windows_stable_2_1_302_or_newer","claude_version":"2.1.302"}"#,
             )
+            .unwrap();
+        // Native mode records the plugin prepared at launch only with its manifest; a
+        // v0.4.25 native launch has none.
+        assert_eq!(
+            emission(FirstPartyCli::Claude),
+            EmissionObservation::Unavailable("question_plugin_not_prepared")
+        );
+        std::fs::create_dir_all(directory.path().join("claude-question-mod/.claude-plugin"))
+            .unwrap();
+        store
+            .private("claude-question-mod/.claude-plugin/plugin.json")
+            .write_private(br#"{"name":"agent-bridge-questions"}"#)
             .unwrap();
         assert_eq!(
             emission(FirstPartyCli::Claude),

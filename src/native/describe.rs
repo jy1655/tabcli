@@ -218,7 +218,7 @@ pub(super) const INSPECT: Contract = Contract {
     notes: &[
         "Observes records without repair or publication. --request filters a timeline and requires --timeline.",
         "JSON capabilities.cancel reports what cancel's admission would decide at this snapshot; cancel rechecks it, and an admissible cancel records intent, not interruption or completion.",
-        "JSON capabilities.tell evaluates only tell's record gates and lists the probes and waits it did not evaluate; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and no answer path.",
+        "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and no answer path.",
     ],
 };
 pub(super) const RESULT: Contract = Contract {

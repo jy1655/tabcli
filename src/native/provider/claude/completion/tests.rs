@@ -497,10 +497,27 @@ fn the_follow_up_observation_shares_admits_mode_gate_and_reads_only() {
             }
         );
     }
+    // Native mode without the prepared question plugin is a v0.4.25 launch: no observer.
+    assert_eq!(
+        emission_observation(f.root.path()),
+        EmissionObservation::Unavailable("question_plugin_not_prepared")
+    );
+    std::fs::create_dir_all(f.root.path().join("claude-question-mod/.claude-plugin")).unwrap();
+    f.store()
+        .private(QUESTION_PLUGIN_MANIFEST)
+        .write_json(&json!({"name": "agent-bridge-questions"}))
+        .unwrap();
     assert_eq!(
         emission_observation(f.root.path()),
         EmissionObservation::Configured("plugin_configured_unverified")
     );
+    // A manifest path that is not a regular file is unreadable evidence, not a plugin.
+    std::fs::remove_file(f.root.path().join(QUESTION_PLUGIN_MANIFEST)).unwrap();
+    std::fs::create_dir(f.root.path().join(QUESTION_PLUGIN_MANIFEST)).unwrap();
+    assert!(matches!(
+        emission_observation(f.root.path()),
+        EmissionObservation::Unknown(_)
+    ));
     // Readiness is admit's later wait: the observation neither waits for nor writes it.
     assert!(!f.root.path().join(READY_FILE).exists());
     assert_eq!(
