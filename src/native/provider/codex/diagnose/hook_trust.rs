@@ -42,13 +42,12 @@ fn probe(context: &Context<'_>) -> Result<Value> {
         bail!("workspace unavailable");
     }
     let bridge = std::env::current_exe()?;
-    let notice = proposes_notice_hook(context.current_version, || {
-        let root = crate::native::session::Reader::state_root()?;
-        Ok((
-            crate::native::settings::codex_lifecycle_hooks(&root)?,
-            crate::native::settings::codex_question_notice(&root)?,
-        ))
-    });
+    let settings = crate::native::session::Reader::state_root().and_then(|root| settings(&root));
+    let notice = proposes_notice(
+        context.current_version,
+        settings,
+        hooks::hook_command(&bridge).is_some(),
+    );
     let override_value =
         hooks::hooks_override(&bridge, notice).context("hook launcher unavailable")?;
     // This command constructor handles PowerShell shims without creating a forwarder.
@@ -99,23 +98,29 @@ fn probe(context: &Context<'_>) -> Result<Value> {
     summarize(&result?, &bridge, notice)
 }
 
-// Whether a new launch would inject the notice hook: Codex 0.166.0 or newer (not a prerelease),
-// lifecycle hooks on (the notice rides in their value) and the notice setting on. Unreadable
-// settings propose the notice's default, off. The two lifecycle hooks are proposed whatever
-// their setting says.
-fn proposes_notice_hook(
-    version: Option<&str>,
-    settings: impl FnOnce() -> Result<(
-        crate::native::settings::CodexLifecycleHooks,
-        crate::native::settings::CodexQuestionNotice,
-    )>,
-) -> bool {
-    use crate::native::settings::{CodexLifecycleHooks, CodexQuestionNotice};
-    version
-        .and_then(|version| super::super::codex_version(version).ok())
-        .is_some_and(|version| version >= semver::Version::new(0, 166, 0) && version.pre.is_empty())
-        && settings()
-            .is_ok_and(|settings| settings == (CodexLifecycleHooks::On, CodexQuestionNotice::On))
+type Settings = (
+    crate::native::settings::CodexLifecycleHooks,
+    crate::native::settings::CodexQuestionNotice,
+);
+
+// The two settings a new launch reads from this state root.
+fn settings(root: &Path) -> Result<Settings> {
+    Ok((
+        crate::native::settings::codex_lifecycle_hooks(root)?,
+        crate::native::settings::codex_question_notice(root)?,
+    ))
+}
+
+// The probe proposes the notice hook exactly when the launch rule would inject it for the
+// installed Codex, these settings and this executable. Settings it cannot read enter as their own
+// defaults: a launch fails on them instead, and the probe still reports the hooks a launch with
+// the defaults would carry. The two lifecycle hooks are proposed whatever the rule says of them.
+fn proposes_notice(version: Option<&str>, settings: Result<Settings>, launcher: bool) -> bool {
+    let (lifecycle, notice) = settings.unwrap_or_default();
+    matches!(
+        hooks::Eligibility::new(version, lifecycle, launcher).notice(|| Ok(notice)),
+        Ok(None)
+    )
 }
 
 // Own both streams so even a blocked write/read cannot hold the caller past its
@@ -174,17 +179,8 @@ fn summarize(result: &Value, bridge: &Path, notice: bool) -> Result<Value> {
         .as_array()
         .context("hooks/list data missing")?;
     let mut rows = Vec::new();
-    let labels: &[(&str, Option<&str>)] = if notice {
-        &[
-            ("user_prompt_submit", None),
-            ("stop", None),
-            ("pre_tool_use", Some(hooks::QUESTION_TOOL)),
-        ]
-    } else {
-        &[("user_prompt_submit", None), ("stop", None)]
-    };
-    for &(label, matcher) in labels {
-        let key = hooks::session_flags_state_key(label);
+    for injected in hooks::Hook::injected(notice) {
+        let key = injected.state_key();
         let mut matches = Vec::new();
         for entry in data {
             for hook in entry["hooks"]
@@ -206,7 +202,7 @@ fn summarize(result: &Value, bridge: &Path, notice: bool) -> Result<Value> {
         let status = hook["trustStatus"]
             .as_str()
             .context("trustStatus missing")?;
-        let expected = hooks::matched_trust_hash(label, matcher, &command);
+        let expected = injected.trust_hash(&command);
         rows.push(json!({"key":key,"trustStatus":status,"currentHash":hash,
             "expected_hash":expected,"hash_matches":hash == expected,
             "diagnostic":if hash == expected { None } else { Some("normalization drift") }}));

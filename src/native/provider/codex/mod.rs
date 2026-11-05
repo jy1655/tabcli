@@ -330,22 +330,25 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
-        match codex_string(payload, "hook_event_name") {
-            Some("UserPromptSubmit") => {
-                return turn::bind(&Store::open_unchecked(directory), payload);
-            }
-            Some("Stop") => return turn::stop(&Store::open_unchecked(directory), payload),
-            Some("PreToolUse") => {
-                if let Some(output) = question_notice::pre_tool_use(directory, payload)? {
-                    use std::io::Write;
-                    let mut stdout = std::io::stdout().lock();
-                    writeln!(stdout, "{output}")?;
-                    stdout.flush()?;
+        // A hook payload names its event; a legacy notify payload names none. An event outside
+        // Bridge's injected set is ignored.
+        if let Some(event) = codex_string(payload, "hook_event_name") {
+            return match hooks::Hook::from_event(event) {
+                Some(hooks::Hook::UserPromptSubmit) => {
+                    turn::bind(&Store::open_unchecked(directory), payload)
                 }
-                return Ok(());
-            }
-            Some(_) => return Ok(()),
-            None => {}
+                Some(hooks::Hook::Stop) => turn::stop(&Store::open_unchecked(directory), payload),
+                Some(hooks::Hook::QuestionNotice) => {
+                    if let Some(output) = question_notice::pre_tool_use(directory, payload)? {
+                        use std::io::Write;
+                        let mut stdout = std::io::stdout().lock();
+                        writeln!(stdout, "{output}")?;
+                        stdout.flush()?;
+                    }
+                    Ok(())
+                }
+                None => Ok(()),
+            };
         }
         let pending = match turn::notify(&Store::open_unchecked(directory), payload)? {
             turn::Route::Bound | turn::Route::Stale => return Ok(()),
