@@ -905,3 +905,272 @@ fn windows_lifecycle_hook_binary_never_blocks_or_writes_stdout() {
             .is_empty()
     );
 }
+
+// The notice record is the second of the two launch records `prepare` writes. Each atomic
+// record write passes four fault boundaries (temporary file, content, rename, sync after the
+// rename), so a budget of `NOTICE_WRITE_START + 2` fails the notice record before its rename and
+// `NOTICE_WRITE_START + 3` after it.
+const NOTICE_WRITE_START: usize = 4;
+// The pending-turn record precedes both launch records in the adapter's launch plan.
+const PLAN_NOTICE_WRITE_START: usize = 4 + NOTICE_WRITE_START;
+
+fn notice_payload() -> serde_json::Value {
+    serde_json::json!({"session_id":"01234567-89ab-cdef-0123-456789abcdef","turn_id":"turn-1",
+        "transcript_path":"rollout.jsonl","cwd":"workspace","hook_event_name":"PreToolUse",
+        "model":"model","permission_mode":"bypassPermissions",
+        "tool_name":"request_user_input_async",
+        "tool_input":{"questions":[{"title":"Which codename?","options":["ALPHA","BRAVO"]}]},
+        "tool_use_id":"call_partial"})
+}
+
+fn session_files(directory: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            entries.extend(session_files(&path));
+        } else {
+            entries.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+fn launch_executable() -> &'static Path {
+    Path::new(if cfg!(windows) {
+        WINDOWS_EXE
+    } else {
+        "/opt/tabcli"
+    })
+}
+
+// What each read-only path says about a session whose preparation failed while it wrote the
+// notice record, and that none of them writes: the record alone decides, as for any launch.
+fn assert_partial_notice_state(directory: &Path, present: bool, case: &str) {
+    use crate::native::provider::NativeProviderAdapter;
+    use crate::native::provider::codex::{ADAPTER, question_notice};
+    // The lifecycle record was published before the notice record was attempted.
+    assert_eq!(
+        read_launch_mode(directory)
+            .unwrap()
+            .unwrap()
+            .lifecycle_hooks,
+        LifecycleHooks::Injected,
+        "{case}"
+    );
+    assert_eq!(directory.join(NOTICE_FILE).exists(), present, "{case}");
+    let before = session_files(directory);
+    let mode = read_notice_mode(directory).unwrap();
+    assert_eq!(
+        mode.map(|mode| (mode.notice_hook, mode.reason)),
+        present.then_some((NoticeHook::Injected, None)),
+        "{case}"
+    );
+    assert_eq!(notice_hook_injected(directory).unwrap(), present, "{case}");
+    let reader = Reader::open_unchecked(directory);
+    assert_eq!(
+        ADAPTER.question_capability(&reader).response,
+        if present {
+            crate::native::provider::QuestionResponse::AnswerAfterTurn("hook_configured_unverified")
+        } else {
+            crate::native::provider::QuestionResponse::Unsupported(
+                crate::native::provider::NO_ADDRESSED_ANSWER_PATH,
+            )
+        },
+        "{case}"
+    );
+    let inspected = crate::native::query::inspect_value(&reader, "session-hooks").unwrap();
+    assert_eq!(
+        inspected["capabilities"]["questions"]["response"]["state"],
+        if present {
+            "answer_after_turn"
+        } else {
+            "unsupported"
+        },
+        "{case}"
+    );
+    let output = question_notice::pre_tool_use(directory, &notice_payload()).unwrap();
+    assert_eq!(output.is_some(), present, "{case}");
+    if let Some(output) = output {
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            value["hookSpecificOutput"]["additionalContext"],
+            question_notice::NOTICE
+        );
+    }
+    if !present {
+        // The dispatch prints nothing here; with the record it prints the line checked above,
+        // straight to the process's stdout.
+        ADAPTER.handle_hook(directory, &notice_payload()).unwrap();
+    }
+    assert_eq!(
+        session_files(directory),
+        before,
+        "{case}: a read-only path wrote"
+    );
+}
+
+#[test]
+fn a_notice_record_that_fails_before_or_after_its_rename_fails_preparation_without_a_value() {
+    use crate::native::session::primitives::{injected_fault, with_fault_budget};
+    for (passed, present, boundary) in [
+        (2, false, "renaming a temporary record over its final path"),
+        (3, true, "syncing a renamed record"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
+        crate::native::session::update_status(
+            &directory,
+            crate::native::session::SessionState::Launching,
+            None,
+            None,
+        )
+        .unwrap();
+        let error = with_fault_budget(NOTICE_WRITE_START + passed, || {
+            prepare(&directory, launch_executable())
+        })
+        .expect_err("a failed notice record must fail preparation and return no hooks value");
+        assert!(injected_fault(&error), "{error:#}");
+        assert!(format!("{error:#}").contains(boundary), "{error:#}");
+        // A fault after the temporary file exists leaves it beside the records; no reader
+        // takes it for a record.
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".agent-bridge-")
+            }),
+            !present,
+            "{boundary}"
+        );
+        assert_partial_notice_state(&directory, present, boundary);
+    }
+}
+
+#[test]
+fn the_launch_plan_propagates_a_failed_notice_record_instead_of_returning_arguments() {
+    use crate::native::session::primitives::{injected_fault, with_fault_budget};
+    for (passed, present) in [(2, false), (3, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
+        crate::native::session::update_status(
+            &directory,
+            crate::native::session::SessionState::Launching,
+            None,
+            None,
+        )
+        .unwrap();
+        let prompt = "[Agent Bridge native delegation]\nSource: test\n\nhello";
+        // The dispatch the launch wrapper calls; a plan is the only way to the provider command.
+        let result = with_fault_budget(PLAN_NOTICE_WRITE_START + passed, || {
+            crate::native::provider::prepare_launch(
+                agent_bridge::FirstPartyCli::Codex,
+                LaunchContext {
+                    bridge_executable: launch_executable(),
+                    directory: &directory,
+                    workspace: root.path(),
+                    title: "test",
+                    prompt,
+                    yolo: false,
+                    model: None,
+                    effort: None,
+                },
+            )
+        });
+        let Err(error) = result else {
+            panic!("a failed notice record returned a launch plan ({present})");
+        };
+        assert!(injected_fault(&error), "{error:#}");
+        // The pending turn was installed before the launch records, as on every launch.
+        assert!(codex::read_pending_turn(&directory).unwrap().is_some());
+        assert_partial_notice_state(&directory, present, &format!("plan {present}"));
+    }
+}
+
+// The launch wrapper itself: a preparation that fails on the notice record returns before the
+// provider process exists. The fault budget fails every later write as well, so the wrapper would
+// stop before its spawn even if the notice write were ignored; a directory at the record's path
+// fails that one rename and lets every other write succeed. The fake Codex answers its version
+// probe and otherwise records that it was started.
+#[cfg(unix)]
+#[test]
+fn a_failed_notice_record_stops_the_launch_before_the_provider_is_spawned() {
+    use crate::native::provider::NativeProviderAdapter;
+    use crate::native::provider::codex::{ADAPTER, question_notice};
+    use crate::native::session::launch::wrapper::provision;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let provider = root.path().join("fake-codex");
+    let started = root.path().join("provider-started");
+    std::fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'codex-cli 0.166.0\\n'; exit 0; fi\n: > '{}'\nexit 0\n",
+            started.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
+    Store::open_unchecked(&directory)
+        .private("manifest.json")
+        .write_json(&serde_json::json!({
+            "schema": 1, "id": "session-hooks", "provider": "codex",
+            "provider_path": provider, "provider_version": "codex-cli 0.166.0",
+            "workspace": root.path(), "title": "hooks fixture", "yolo": false,
+            "created_unix_ms": 1
+        }))
+        .unwrap();
+    crate::native::session::primitives::write_private(
+        &directory.join("initial-prompt.txt"),
+        b"hello",
+    )
+    .unwrap();
+    crate::native::session::update_status(
+        &directory,
+        crate::native::session::SessionState::Launching,
+        None,
+        None,
+    )
+    .unwrap();
+    std::fs::create_dir(directory.join(NOTICE_FILE)).unwrap();
+    let error = provision(&directory).expect_err("a failed notice record must fail the launch");
+    assert!(
+        format!("{error:#}").contains("codex-question-notice.json"),
+        "{error:#}"
+    );
+    assert!(
+        !started.exists(),
+        "the provider was spawned after a failed preparation"
+    );
+    assert!(!directory.join("provider-process.json").exists());
+    assert_eq!(
+        read_launch_mode(&directory)
+            .unwrap()
+            .unwrap()
+            .lifecycle_hooks,
+        LifecycleHooks::Injected
+    );
+    // No reader takes the obstruction for a decision: the record is unreadable, the capability
+    // is unknown, and the hook fails (exit 1, never 2), so Codex would run the tool without the
+    // notice. None of them writes.
+    let before = session_files(&directory);
+    assert!(read_notice_mode(&directory).is_err());
+    assert!(notice_hook_injected(&directory).is_err());
+    let reader = Reader::open_unchecked(&directory);
+    assert!(matches!(
+        ADAPTER.question_capability(&reader).response,
+        crate::native::provider::QuestionResponse::Unknown(_)
+    ));
+    let inspected = crate::native::query::inspect_value(&reader, "session-hooks").unwrap();
+    assert_eq!(
+        inspected["capabilities"]["questions"]["response"]["state"],
+        "unknown"
+    );
+    assert!(question_notice::pre_tool_use(&directory, &notice_payload()).is_err());
+    assert!(ADAPTER.handle_hook(&directory, &notice_payload()).is_err());
+    assert_eq!(session_files(&directory), before, "a read-only path wrote");
+}
