@@ -825,9 +825,12 @@ mod tests {
         let fixture = seed_close_fixture(JournaledEventState::Absent);
         let reader = Reader::open_unchecked(&fixture.directory);
         let id = reader.snapshot().unwrap().receipts[0].request_id.clone();
+        // Read and write access: Windows refuses to lock a handle opened for append only.
         let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
             .create(true)
-            .append(true)
+            .truncate(false)
             .open(fixture.directory.join("turn.claim.lock"))
             .unwrap();
         lock.lock().unwrap();
