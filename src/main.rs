@@ -27,43 +27,7 @@ fn help_text() -> String {
         "{PUBLIC_COMMAND} {}: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
 
 Usage:
-  {PUBLIC_COMMAND} describe [COMMAND] [--json]
-  {PUBLIC_COMMAND} ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>]
-      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
-  {PUBLIC_COMMAND} self-test <codex|claude|agy|pi> [--workspace PATH]
-      [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]
-      [--yolo] [--timeout-secs N] [--isolated] [--json]
-  {PUBLIC_COMMAND} tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
-      [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
-  {PUBLIC_COMMAND} hold <session> [--release] [--json]
-  {PUBLIC_COMMAND} cancel <session> [--json]
-  {PUBLIC_COMMAND} reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]
-      [--detach] [--json]
-  {PUBLIC_COMMAND} sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
-      [--sort <id|updated>] [--json]
-  {PUBLIC_COMMAND} status [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>] [--all] [--json]
-  {PUBLIC_COMMAND} inspect <session> [--timeline [--request REQUEST]] [--json]
-  {PUBLIC_COMMAND} screen <session> [--timeout-secs N] [--json]
-  {PUBLIC_COMMAND} result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
-  {PUBLIC_COMMAND} result <session> --request REQUEST --wait [--timeout-secs N] [--json]
-  {PUBLIC_COMMAND} wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
-      [--questions [--after-question SESSION/REQUEST/EMISSION_ID]...]
-  {PUBLIC_COMMAND} search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
-      [--limit N] [--json]
-  {PUBLIC_COMMAND} doctor <session> [--probe] [--json]
-  {PUBLIC_COMMAND} doctor --provider <codex|claude|agy|pi> [--probe] [--json]
-  {PUBLIC_COMMAND} consent <inspect|revoke|reset> PATH [--json]
-  {PUBLIC_COMMAND} settings [windows-tab-window <dedicated|current>] [--json]
-  {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
-  {PUBLIC_COMMAND} settings codex-memory-workspace <refuse|allow> [--json]
-  {PUBLIC_COMMAND} settings codex-lifecycle-hooks <on|off> [--json]
-  {PUBLIC_COMMAND} settings claude-question-deflection <on|off> [--json]
-  {PUBLIC_COMMAND} settings codex-question-notice <on|off> [--json]
-  {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
-  {PUBLIC_COMMAND} close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
-  {PUBLIC_COMMAND} --help | --version
+{usage}  {PUBLIC_COMMAND} --help | --version
 
 Runtime:
   macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm from the invoking environment
@@ -258,7 +222,8 @@ Session policy:
 Migration:
   The embedded multi-PTY TUI was removed in 0.0.1. Existing legacy files under
   ~/.agent-bridge are not read or deleted automatically.",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        usage = native::usage_lines()
     )
 }
 
@@ -421,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_and_registry_agree_without_hiding_unregistered_commands() {
+    fn registry_names_are_unique_and_usage_advertises_no_hidden_helper() {
         use std::collections::BTreeSet;
         let help = help_text();
         let usage = help
@@ -435,28 +400,20 @@ mod tests {
         let advertised: BTreeSet<_> = usage
             .lines()
             .filter_map(|line| line.strip_prefix(&prefix))
-            .filter(|line| *line != "--help | --version")
             .map(|line| line.split_whitespace().next().unwrap())
             .collect();
-        let registered: BTreeSet<_> = native::COMMANDS
-            .iter()
-            .filter(|entry| !entry.hidden)
-            .map(|entry| entry.name)
-            .collect();
-        assert_eq!(advertised, registered);
         let names: BTreeSet<_> = native::COMMANDS.iter().map(|entry| entry.name).collect();
         assert_eq!(
             names.len(),
             native::COMMANDS.len(),
             "duplicate registry name"
         );
-        assert_eq!(registered.len(), 19);
-        assert_eq!(
-            native::COMMANDS.iter().filter(|entry| entry.hidden).count(),
-            10
-        );
-        for entry in native::COMMANDS.iter().filter(|entry| entry.hidden) {
-            assert!(!advertised.contains(entry.name));
+        let (public, hidden): (Vec<_>, Vec<_>) =
+            native::COMMANDS.iter().partition(|entry| entry.is_public());
+        assert_eq!(public.len(), 19);
+        assert_eq!(hidden.len(), 10);
+        for entry in hidden {
+            assert!(!advertised.contains(entry.name), "{}", entry.name);
         }
     }
 
@@ -510,11 +467,11 @@ mod tests {
                     .err();
                 match parse(&[entry.name, flag]) {
                     Ok(Launch::CommandHelp(page)) => {
-                        assert!(!entry.hidden, "{}", entry.name);
+                        assert!(entry.is_public(), "{}", entry.name);
                         assert_eq!(page, native::command_help(entry.name).unwrap());
                     }
                     Err(error) => {
-                        assert!(entry.hidden, "{}", entry.name);
+                        assert!(!entry.is_public(), "{}", entry.name);
                         assert_eq!(
                             error.to_string(),
                             describe_refusal.unwrap().to_string(),
@@ -525,10 +482,10 @@ mod tests {
                     Ok(other) => panic!("{}: {other:?}", entry.name),
                 }
                 let extra = parse(&[entry.name, flag, "extra"]).unwrap_err();
-                let expected = if entry.hidden {
-                    "unknown public command"
-                } else {
+                let expected = if entry.is_public() {
                     "--help does not accept arguments"
+                } else {
+                    "unknown public command"
                 };
                 assert_eq!(extra.to_string(), expected, "{}", entry.name);
             }
