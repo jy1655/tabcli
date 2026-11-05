@@ -169,7 +169,8 @@ pub(super) fn read_native(reader: &Reader, token: &str) -> Result<ClaudeTurn> {
         || pending.marker != expected.marker
         || pending.claim_token.as_deref() != Some(token)
         || !pending.expected_message.as_deref().is_some_and(|text| {
-            text.starts_with("[Agent Bridge native delegation]\nSource: ")
+            text.strip_prefix(crate::native::NATIVE_DELEGATION_HEADER)
+                .is_some_and(|rest| rest.starts_with("\nSource: "))
                 && text.ends_with(&pending.marker)
         })
     {

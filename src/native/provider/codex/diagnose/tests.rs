@@ -626,6 +626,24 @@ fn notify_payload_check_reads_the_pending_initial_prompt_and_reports_unknown_oth
     );
     assert!(evidence["prompt_chars"].as_u64().unwrap() > 10_000);
     assert!(evidence["answer_budget_units"].as_u64().unwrap() < 32_767 - 10_000);
+
+    // The request id comes through the receipt decoder that `result` and `inspect` use: a
+    // valid receipt names the request, and a receipt that decoder refuses names none.
+    use crate::native::session::requests;
+    let store = Store::open_unchecked(&directory);
+    let receipt = requests::create(&store, "1700000000000-3", &[]).unwrap();
+    let (_, _, row) = check(Some(&directory));
+    assert_eq!(row["evidence"]["pending_request"], receipt.request_id);
+    let mut other_claim = serde_json::to_value(&receipt).unwrap();
+    other_claim["claim_token"] = "1700000000000-9".into();
+    store
+        .record(CoreRecord::Requests)
+        .child("1700000000000-3.json")
+        .write_json(&other_claim)
+        .unwrap();
+    assert!(requests::for_claim(&store, "1700000000000-3").is_err());
+    let (_, _, row) = check(Some(&directory));
+    assert!(row["evidence"]["pending_request"].is_null());
 }
 
 fn classify_notify_payload_budget(
