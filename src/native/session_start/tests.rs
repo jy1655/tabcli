@@ -587,48 +587,83 @@ mod consent_failure {
         assert_eq!(result["request_state"], "pending");
     }
 
+    // Every fault point of the settlement, up to the budget at which it completes. Each
+    // interruption leaves a prefix of the settlement order on disk (journal, event, status,
+    // claim release, journal removal); the error claims nothing about which, and recovery
+    // converges every prefix that has a journal to the same failed event.
     #[test]
-    fn an_interrupted_refusal_journal_never_releases_the_claim() {
-        let mut saw_retained_without_journal = false;
-        let mut saw_recoverable_journal = false;
-        for budget in 0..=12 {
+    fn an_interrupted_refusal_claims_nothing_the_records_contradict() {
+        const PHASES: [&str; 6] = [
+            "nothing recorded",
+            "journal",
+            "event",
+            "status",
+            "claim released",
+            "journal removed",
+        ];
+        let mut phases = Vec::new();
+        let mut budget = 0;
+        loop {
+            assert!(budget < 64, "the settlement never completed");
             let (_directory, store, mut claim) = launched(SessionState::AwaitingInitialInput);
             let token = claim.token().to_owned();
             let request = claim.receipt().request_id.clone();
             let error = with_fault_budget(budget, || settle(&store, &mut claim));
             drop(claim);
             let text = format!("{error:#}");
-            if injected_fault(&error) {
-                assert!(
-                    text.starts_with(
-                        "the refusal was not recorded and the request stays claimed: "
-                    ) && text.ends_with(&format!(": {CONSENT_FAILURE}")),
-                    "budget {budget}: {text}"
-                );
-                assert_eq!(
-                    turn::current_claim_token(&store).unwrap().as_deref(),
-                    Some(token.as_str()),
-                    "budget {budget}"
-                );
-                if !store.record(CoreRecord::Completion).path().exists() {
-                    saw_retained_without_journal = true;
-                    assert!(store.events().unwrap().is_empty(), "budget {budget}");
-                    assert_eq!(
-                        store.status().unwrap().state,
-                        SessionState::AwaitingInitialInput
-                    );
-                    continue;
-                }
-                saw_recoverable_journal = true;
-            } else {
+            if !injected_fault(&error) {
                 assert_eq!(text, CONSENT_FAILURE, "budget {budget}");
+                assert_not_sent(&store, &token, &request);
+                break;
             }
-            store.converge().unwrap();
-            assert!(!store.record(CoreRecord::Completion).path().exists());
-            assert_not_sent(&store, &token, &request);
+            let claimed = turn::current_claim_token(&store).unwrap().is_some();
+            let journal = store.record(CoreRecord::Completion).path().exists();
+            let event = !store.events().unwrap().is_empty();
+            let failed = store.status().unwrap().state == SessionState::Failed;
+            let phase = match (claimed, journal, event, failed) {
+                (true, false, false, false) => 0,
+                (true, true, false, false) => 1,
+                (true, true, true, false) => 2,
+                (true, true, true, true) => 3,
+                (false, true, true, true) => 4,
+                (false, false, true, true) => 5,
+                other => panic!("budget {budget}: records outside the settlement order: {other:?}"),
+            };
+            // The text asserts nothing the records contradict.
+            if text.contains("stays claimed") {
+                assert!(claimed, "budget {budget} ({}): {text}", PHASES[phase]);
+            }
+            if text.contains("not recorded") {
+                assert!(
+                    !journal && !event,
+                    "budget {budget} ({}): {text}",
+                    PHASES[phase]
+                );
+            }
+            assert!(
+                text.starts_with(
+                    "the not-sent settlement did not complete and may or may not have recorded the refusal; read this request's recorded outcome with `tabcli result` or `tabcli inspect`: "
+                ) && text.ends_with(&format!(": {CONSENT_FAILURE}")),
+                "budget {budget}: {text}"
+            );
+            phases.push(phase);
+            if phase == 0 {
+                assert_eq!(turn::current_claim_token(&store).unwrap(), Some(token));
+                let result = query::request_result(&store, &request).unwrap();
+                assert_eq!(result["request_state"], "pending", "budget {budget}");
+            } else {
+                store.converge().unwrap();
+                assert!(!store.record(CoreRecord::Completion).path().exists());
+                assert_not_sent(&store, &token, &request);
+            }
+            budget += 1;
         }
-        assert!(saw_retained_without_journal);
-        assert!(saw_recoverable_journal);
+        assert!(
+            phases.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{phases:?}"
+        );
+        phases.dedup();
+        assert_eq!(phases, [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
