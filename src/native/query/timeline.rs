@@ -211,12 +211,23 @@ fn sort(entries: &mut [Value]) {
     });
 }
 
+/// One entry for each retained receipt read fault or receipt bytes that the receipt index
+/// refuses: the retained fault, the timeline parser's reason for malformed bytes, or the
+/// index's own decoder on the same bytes under the file name's token, which the listing
+/// validated.
 fn unreadable_receipts(before: &Records, id: &str, session_entries: &mut Vec<Value>) {
-    for source in before
-        .keys()
-        .filter(|s| s.starts_with("requests/") && s.ends_with(".json"))
-    {
-        if let Err(error) = parsed::<requests::Receipt>(before, source) {
+    for (source, read) in before {
+        let Some(token) = source
+            .strip_prefix("requests/")
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let refused = parsed::<requests::Receipt>(before, source).and_then(|_| match read {
+            Ok(Some(bytes)) => record::receipt(bytes, token).map(drop).map_err(Into::into),
+            _ => Ok(()),
+        });
+        if let Err(error) = refused {
             session_entries.push(unreadable_entry(
                 id,
                 "request_receipt",
