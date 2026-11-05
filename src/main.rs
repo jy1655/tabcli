@@ -58,6 +58,7 @@ Usage:
   {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
   {PUBLIC_COMMAND} settings codex-memory-workspace <refuse|allow> [--json]
   {PUBLIC_COMMAND} settings codex-lifecycle-hooks <on|off> [--json]
+  {PUBLIC_COMMAND} settings claude-question-deflection <on|off> [--json]
   {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
   {PUBLIC_COMMAND} close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} --help | --version
@@ -95,6 +96,11 @@ Runtime:
   there that nobody closed. The refusal applies to every provider and also to a
   launch you start there yourself; settings codex-memory-workspace allow permits
   it, and refuse restores the default.
+  A Claude session is launched with question deflection unless settings
+  claude-question-deflection off was chosen before the launch: its question plugin
+  refuses the model's own AskUserQuestion call before any dialog and tells the
+  child to end its turn with the question, which the caller answers with tell.
+  Each session keeps the decision recorded at its launch.
 
 Self-test:
   self-test makes real model calls and opens a real terminal. It runs in the

@@ -43,6 +43,10 @@ and `wait.features` containing `questions` and `after_question` advertise the ex
 observation interface. They do not prove that a particular provider/session can observe a question,
 that a dialog is pending, or that Bridge can answer it. A question return from `wait` with
 `ended: null` is not completion. Keep the request address and use the returned cursor on the next wait.
+`question_deflection` in the features of `ask`, `tell`, `reopen`, `result`, `wait`, `status` and
+`inspect` advertises the [question deflection](#question-deflection) fields in that command's JSON,
+and in `settings.features` `claude_question_deflection` advertises the setting. Neither proves that a
+session was launched with deflection or that any call was refused.
 
 The `output` section describes common JSON envelope defaults and optional failure hints, not
 every command's result fields. A command may override the defaults; legacy `consent` and
@@ -509,7 +513,9 @@ under its existing budget. Attention `question_emitted` means that record has em
 the active request, or for the request behind the latest published result when no claim exists.
 A claim without a readable receipt has no question focus. The focus object, `active_request`
 under a claim and otherwise `latest_result`, carries `question_emitted: true` and
-`question_emission_count`, including for a closed session listed with `--all`. Closed sessions
+`question_emission_count`, including for a closed session listed with `--all`. When the record
+holds a deflected call, the focus object also carries `question_deflected: true` and
+`question_deflection_count` ([question deflection](#question-deflection)). Closed sessions
 have no `question_emitted` attention. Changing focus does not resolve an older emission.
 `question_observation` is present only as `incomplete` or `unreadable`; unreadable evidence
 also adds `records_partially_unreadable`. Question content is in `result --request`.
@@ -584,7 +590,8 @@ Timeline does not include hold history. The default inspection adds `origin` and
 `origin_observation` as in `status`; the timeline has no origin entry.
 
 For Codex and Claude, ordinary JSON inspection adds `question_emitted: true` and
-`question_emission_count` to a request reference when retained emissions exist. It adds
+`question_emission_count` to a request reference when retained emissions exist, and
+`question_deflected: true` with `question_deflection_count` when one of them was deflected. It adds
 `question_observation` only as `incomplete` or
 `unreadable`. This reads at most one optional 64 KiB record per request. Retrieve content
 with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
@@ -697,9 +704,20 @@ for observing question emissions:
 will be observed. A Codex session launched by 0.4.17 to 0.4.19 records the hook injection, but its
 transcript watcher records no question emissions. A malformed or unsupported launch record is
 `unknown` with `evidence_unreadable` and `detail`, never `unavailable`, as is a Claude question
-plugin manifest that is empty, is not valid JSON or does not name the plugin Bridge prepares. `response` is `unsupported`
-with `no_addressed_answer_path` for every provider: Bridge has no addressed way to answer an open
-question dialog, and none of these fields grants one. Each provider's adapter states this, so
+plugin manifest that is empty, is not valid JSON or does not name the plugin Bridge prepares.
+
+Bridge has no addressed way to answer an open question dialog, and none of these fields grants
+one. `response` reports the answer path the session's own launch records configured:
+
+| provider | state | reason |
+|---|---|---|
+| Claude | `deflected_to_result` | `plugin_configured_unverified`, with `answer_by: "tell"` (native completion mode, launched with [question deflection](#question-deflection) on) |
+| Claude | `unsupported` | `no_addressed_answer_path` (deflection off, legacy completion mode, or a session launched before the deflection record existed) |
+| Codex, Agy, Pi | `unsupported` | `no_addressed_answer_path` |
+
+`deflected_to_result` is configuration, not evidence: it does not prove that Claude loaded the
+plugin or that any call was refused. A Claude deflection record that cannot be read is `unknown`
+with `evidence_unreadable` and `detail`. Each provider's adapter states its answer path, so
 when the manifest's provider name is not recognized, both `emission_observation` and `response`
 are `unknown` with `evidence_unreadable`.
 
@@ -781,6 +799,35 @@ record could not be validated.
 Absence of these fields is unknown; it does not prove that no question existed.
 After the session becomes `ready`, `tell` can carry a known fact as another request. It
 does not resolve the earlier emission.
+
+### Question deflection
+
+A Bridge-managed Claude session has nobody at its `AskUserQuestion` dialog. A Claude session
+launched with `settings claude-question-deflection on` (the default) has its question plugin
+refuse a model's own main-loop `AskUserQuestion` call before any dialog, with a fixed reason that
+tells the child to end its turn with the question (`QUESTION FOR CALLER: <question> Options:
+<option labels>`) while keeping the request's turn protocol. That turn completes as an ordinary
+Result, the emission record still holds the structured question, and the caller answers with an
+ordinary `tell`. Bridge waits for nothing, injects no answer and adds no transport.
+
+When the retained record holds a deflected call, the outputs that report question presence
+(waited `ask`, `tell` and `reopen`, `result`, `wait`, the `status` focus object and `inspect`
+request references) add `question_deflected: true` and `question_deflection_count`, and each
+deflected item in `question_emissions` carries `deflected: true`. Otherwise these fields are
+absent and the output is unchanged. Human output adds
+`question calls deflected (refused before their dialog; read the result): N`.
+
+The evidence is that the plugin refused a call, not that the Result is a question or what the
+child wrote after the refusal: read the Result and `question_emissions` before treating the
+request as finished. Bridge neither strips nor parses the `QUESTION FOR CALLER:` prefix. A call
+is refused only when the plugin passed its streamed tool chunk in the observed main-loop step;
+subagent questions, a plugin's own questions and unobserved calls reach the dialog as before,
+and so does every call when the plugin's hook fails or overruns its budget. The flag is set only
+on an item whose step evidence holds the same question text and option labels at the refused
+call's position; a refusal that cannot be attributed marks `question_observation: "incomplete"`
+instead. `wait --questions` can return an emission before its `deflected` flag is recorded, and
+its cursor does not return that emission again; read `result --request` for the current flags.
+Codex, Agy and Pi sessions never report deflection.
 
 Successful waited `ask`, `tell` and `reopen` read the record once and add only
 `question_emitted`, `question_emission_count`, and any `question_observation` diagnostic,
@@ -902,6 +949,9 @@ All retained emissions after it are returned together; the new cursor names the 
 Omitting the cursor returns the retained prefix again. For several addresses, repeat
 `--after-question` at most once per selected address and carry forward the cursors already
 observed for other addresses. The command stores no acknowledgement or cursor of its own.
+
+A [deflected](#question-deflection) item can be returned before its `deflected` flag is recorded;
+the cursor does not return it again, so read `result --request` for the current flags.
 
 An absent or unreadable question record does not wake the caller. A retained incomplete
 prefix can wake it and carries `question_observation: "incomplete"`. A supplied cursor that
@@ -1305,6 +1355,7 @@ tabcli settings windows-tab-window dedicated|current [--json]
 tabcli settings macos-open-mode tab-first|new-window [--json]
 tabcli settings codex-memory-workspace refuse|allow [--json]
 tabcli settings codex-lifecycle-hooks on|off [--json] # default: on
+tabcli settings claude-question-deflection on|off [--json] # default: on
 ```
 
 `codex-lifecycle-hooks` controls hook injection for new Codex launches only. It writes Bridge's
@@ -1312,6 +1363,13 @@ setting, never Codex configuration. Existing sessions retain their recorded laun
 Windows composer gate. Injection requires stable Codex 0.163.0+ and a supported executable
 path; it is not proof of hook execution. See [Codex](providers.md#codex) for trust hashes,
 picker recovery, transcript completion and the unbound notify fallback.
+
+`claude-question-deflection` decides, for new Claude launches only, whether the question plugin
+refuses a model's `AskUserQuestion` call and returns the question in the Result
+([question deflection](#question-deflection)). Choose `off` for sessions a person watches and
+answers in the terminal. Each session keeps the decision recorded at its launch
+(`claude-question-mode.json`); a settings record that cannot be read at launch keeps the default
+and is noted in the session's launch log. The setting is not evidence that a call was refused.
 
 ```sh
 tabcli settings
@@ -1725,8 +1783,8 @@ refused an isolated test before its private directory existed; that report has o
 ### settings
 
 Fields: `settings_file`, `windows_tab_window` (`dedicated` or `current`), `macos_open_mode`
-(`tab-first` or `new-window`), and `codex_memory_workspace` (`refuse` or `allow`). There is no
-`schema_version`.
+(`tab-first` or `new-window`), `codex_memory_workspace` (`refuse` or `allow`), and
+`claude_question_deflection` (`on` or `off`). There is no `schema_version`.
 
 ### sessions
 

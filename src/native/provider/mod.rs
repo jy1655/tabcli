@@ -22,6 +22,14 @@ pub(super) struct EmittedQuestion {
 pub(super) struct QuestionEmission {
     pub(super) id: String,
     pub(super) questions: Vec<EmittedQuestion>,
+    /// Set only by the Claude adapter: its question plugin refused this call before any dialog.
+    /// Omitted when false, so other records and outputs keep their bytes; old records read.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) deflected: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -224,6 +232,11 @@ pub(super) enum EmissionObservation {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum QuestionResponse {
     Unsupported(&'static str),
+    /// The launch configured a refusal that returns the question in the Result, answered
+    /// by an ordinary `tell`. Configuration is not evidence that any call was refused.
+    DeflectedToResult(&'static str),
+    /// A launch record the adapter decides from could not be read.
+    Unknown(String),
 }
 
 /// No supported provider offers an addressed answer for an open question dialog; the
@@ -521,7 +534,15 @@ mod tests {
                 (observed, expected) => assert_eq!(observed, expected, "{provider:?}"),
             }
             let observed = question_capability(provider, &reader);
-            assert_eq!(observed.response, answer, "{provider:?}");
+            if provider == FirstPartyCli::Claude {
+                // Claude's answer path is decided from the same malformed completion-mode record.
+                assert!(
+                    matches!(&observed.response, QuestionResponse::Unknown(detail) if !detail.is_empty()),
+                    "{provider:?}"
+                );
+            } else {
+                assert_eq!(observed.response, answer, "{provider:?}");
+            }
             if emission {
                 assert_eq!(
                     observed.emission,

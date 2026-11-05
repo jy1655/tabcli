@@ -34,6 +34,10 @@ claim replacement, timeout retention and interruption between identity selection
 `tests/claude_completion.rs` executes the real JS module through native-hook, including helper
 retry, an oversized unbound completion and read-only candidate inspection. These fixtures do
 not prove provider parentage; authenticated background ask/tell evidence is recorded separately.
+Its `questions_deflection` scenario raises synthetic `tool.call` events while a step still
+streams and after it, with deflection on and off, and checks which calls are refused and what
+the record retains; it does not establish Claude's own dispatch order or that Claude loads the
+module.
 
 ### Claude inbound module coexistence
 

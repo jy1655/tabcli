@@ -14,6 +14,7 @@ const logs = [];
 let completeAttempts = 0;
 let continuationAttempts = 0;
 let questionAttempts = 0;
+let failDeflected = false;
 const $ = {
   env: { get: async name => name === "AGENT_BRIDGE_EXECUTABLE" ? executable : undefined },
   session: { id: async () => conversation },
@@ -21,8 +22,9 @@ const $ = {
   process: { run: async (argv, init) => {
     assert.deepEqual(argv, [executable, "native-hook", "claude"]);
     const wire = JSON.parse(init.stdin);
-    assert.equal(init.timeoutMs, wire.event === "question.emissions" ? 5000 : 30000);
+    assert.equal(init.timeoutMs, wire.event.startsWith("question.") ? 5000 : 30000);
     calls.push({ event: wire.event, bytes: Buffer.byteLength(init.stdin), stdin: init.stdin });
+    if (failDeflected && wire.event === "question.deflected") return { exitCode: 1 };
     if (wire.event === "turn.complete") {
       completeAttempts++;
       if (scenario === "helper_failure") return { exitCode: 1 };
@@ -116,18 +118,27 @@ await fire("turn.start", start);
 if (scenario.startsWith("questions")) {
   const questionHandlers = new Map();
   const { register: registerQuestions } = await import(new URL("./questions.mjs", pathToFileURL(modulePath)).href);
-  registerQuestions((name, fn) => questionHandlers.set(name, fn));
-  assert.deepEqual([...questionHandlers.keys()], ["turn.complete", "turn.step"]);
+  const registration = handlers => (name, ...rest) => {
+    // Only AskUserQuestion calls reach the tool.call hook.
+    if (name === "tool.call") assert.deepEqual(rest[0], { tool: "AskUserQuestion" });
+    else assert.equal(rest.length, 1);
+    handlers.set(name, rest.at(-1));
+  };
+  registerQuestions(registration(questionHandlers));
+  assert.deepEqual([...questionHandlers.keys()], ["turn.complete", "turn.step", "tool.call"]);
   const question = { question: "Which baseline? 한😀", header: "Baseline", multiSelect: true,
     options: [{ label: "Current", description: "Current baseline" }, { label: "Previous", description: "Previous baseline" }] };
   async function step({ index = 0, agentId, origin = { plugin: "engine", tier: "core" },
       broken = false, mismatch = false, cancel = false, clear = false, large = false,
-      empty = false, noTrace = false, rewritten = false, stopReason = "tool_use", sessionFailure = false } = {}) {
+      empty = false, noTrace = false, rewritten = false, stopReason = "tool_use", sessionFailure = false,
+      handlers = questionHandlers, during } = {}) {
     const e = { turnId, index, model: "fixture", messageCount: 1 };
     if (agentId !== undefined) e.agentId = agentId;
     const chunks = [{ kind: "text", index: 0, text: "Question follows", ref: 1 },
-      { kind: "tool", index: 1, id: "toolu-question", name: "AskUserQuestion", ref: 2 },
-      { kind: "engine", ref: 3 }, { kind: "input", index: 1, json: "{}", ref: 4 }];
+      { kind: "tool", index: 1, id: `toolu-read-${index}`, name: "Read", ref: 2 },
+      { kind: "input", index: 1, json: "{}", ref: 3 }, { kind: "engine", ref: 4 },
+      { kind: "tool", index: 2, id: `toolu-question-${index}`, name: "AskUserQuestion", ref: 5 },
+      { kind: "input", index: 2, json: "{}", ref: 6 }, { kind: "engine", ref: 7 }];
     const core = { turnId: mismatch ? "foreign" : turnId, index, answer: "Question follows", stopReason,
       toolUses: [{ name: "Read", input: {} }, { name: "AskUserQuestion", input: { questions: [
         large ? { ...question, question: "x".repeat(max + 1) } : question,
@@ -145,17 +156,31 @@ if (scenario.startsWith("questions")) {
     };
     next.origin = origin;
     if (sessionFailure) $.session.id = async () => { throw new Error("unavailable"); };
-    const stream = questionHandlers.get("turn.step")($, e, next);
-    assert.equal((await stream.next()).value, chunks[0]);
-    if (cancel) { await stream.return(); return; }
-    assert.equal((await stream.next()).value, chunks[1]);
-    assert.equal((await stream.next()).value, chunks[2]);
-    assert.equal((await stream.next()).value, chunks[3]);
+    const stream = handlers.get("turn.step")($, e, next);
+    for (const [position, chunk] of chunks.entries()) {
+      assert.equal((await stream.next()).value, chunk);
+      if (cancel) { await stream.return(); return; }
+      // Claude starts a tool when its block ends, while the response still streams.
+      if (position === chunks.length - 1 && during) await during();
+    }
     if (broken) { await assert.rejects(stream.next(), actual => actual === error); return; }
     const final = await stream.next();
     assert.equal(final.done, true);
     assert.equal(final.value, response);
     $.session.id = async () => conversation;
+  }
+  // A tool.call as the engine raises it: `next(e)` is the dialog beneath the hook.
+  async function toolCall({ id, agentId, origin = { plugin: "engine", tier: "core" },
+      questions = [question], handlers = questionHandlers } = {}) {
+    const e = { tool: "AskUserQuestion", tool_use_id: id, questions };
+    if (agentId !== undefined) e.agentId = agentId;
+    const answered = { result: "dialog answered" };
+    let called = 0;
+    const next = async received => { assert.equal(received, e); called++; return answered; };
+    next.origin = origin;
+    const result = await handlers.get("tool.call")($, e, next);
+    assert.equal(called, result === answered ? 1 : 0);
+    return result === answered ? "dialog" : result;
   }
   const before = calls.length;
   for (const agentId of ["child", "", null]) await step({ agentId });
@@ -225,6 +250,84 @@ if (scenario.startsWith("questions")) {
     assert.equal(after.items.length, 2);
     assert.equal(after.items[1].id, "step:4/tool:1");
     assert.equal(after.items.some(item => /step:[23]\//.test(item.id)), false);
+  }
+  if (scenario === "questions_deflection") {
+    const wires = from => calls.slice(from).map(call => JSON.parse(call.stdin));
+    function refused(result) {
+      assert.deepEqual(Object.keys(result), ["deny"]);
+      assert.match(result.deny, /^Agent Bridge managed session: no person is at this question dialog/);
+      assert.match(result.deny, /Do not call AskUserQuestion again in this turn\./);
+      assert.match(result.deny, /QUESTION FOR CALLER: <question> Options: <option labels>\./);
+      assert.match(result.deny, /follow-up message/);
+      assert.match(result.deny, /\[Agent Bridge Claude turn protocol\] in the request still applies/);
+      assert.match(result.deny, /exact marker on its own final line\.$/);
+    }
+    // Deflection off: the same observed call reaches the dialog; observation is unchanged.
+    const offHandlers = new Map();
+    const { register: registerOff } = await import(new URL("./off/questions.mjs", pathToFileURL(modulePath)).href);
+    registerOff(registration(offHandlers));
+    let from = calls.length;
+    let outcome;
+    await step({ index: 4, handlers: offHandlers,
+      during: async () => { outcome = await toolCall({ id: "toolu-question-4", handlers: offHandlers }); } });
+    assert.equal(outcome, "dialog");
+    assert.deepEqual(wires(from).map(wire => wire.event), ["question.emissions"]);
+    // Refused while its step streams: nothing is reported until the step's evidence exists.
+    from = calls.length;
+    await step({ index: 5, during: async () => {
+      for (const unrefused of [{ id: "toolu-question-5", agentId: "child" },
+          { id: "toolu-question-5", origin: { plugin: "another-plugin", tier: "user" } },
+          { id: "toolu-unknown" }, { id: "toolu-read-5" }, {}]) {
+        assert.equal(await toolCall(unrefused), "dialog", JSON.stringify(unrefused));
+      }
+      refused(await toolCall({ id: "toolu-question-5" }));
+      assert.equal(calls.length, from);
+      assert.equal(await toolCall({ id: "toolu-question-5" }), "dialog", "a call is refused once");
+    } });
+    assert.deepEqual(wires(from).map(wire => [wire.event, wire.data, wire.conversation]), [
+      ["question.emissions", { turnId, step: 5, items: [{ index: 1, questions: [question] }], incomplete: false }, conversation],
+      ["question.deflected", { turnId, step: 5, index: 1 }, conversation],
+    ]);
+    // Refused after its step was evaluated: reported at once.
+    await step({ index: 6 });
+    from = calls.length;
+    refused(await toolCall({ id: "toolu-question-6" }));
+    assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]),
+      [["question.deflected", { turnId, step: 6, index: 1 }]]);
+    // The same question in a later step is refused again.
+    from = calls.length;
+    await step({ index: 7, during: async () => refused(await toolCall({ id: "toolu-question-7" })) });
+    assert.deepEqual(wires(from).at(-1).data, { turnId, step: 7, index: 1 });
+    // A call whose questions differ from the step's evidence at its position names no item.
+    from = calls.length;
+    await step({ index: 8, during: async () => refused(await toolCall({ id: "toolu-question-8",
+      questions: [{ ...question, question: "Another question?" }] })) });
+    assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]), [
+      ["question.emissions", { turnId, step: 8, items: [{ index: 1, questions: [question] }], incomplete: false }],
+      ["question.emissions", { turnId, step: 8, items: [], incomplete: true }],
+    ]);
+    // A deflection that cannot be recorded still refuses the call.
+    await step({ index: 9 });
+    from = calls.length;
+    const logged = logs.length;
+    failDeflected = true;
+    refused(await toolCall({ id: "toolu-question-9" }));
+    failDeflected = false;
+    assert.deepEqual(wires(from).map(wire => wire.event), ["question.deflected", "question.deflected"]);
+    assert.deepEqual(logs.slice(logged),
+      ["Agent Bridge could not record this question deflection; the question call was still refused."]);
+    const session = directory.split(/[\\/]/).at(-1);
+    const query = spawnSync(executable, ["result", session, "--request", receipt.request_id, "--json"],
+      { encoding: "utf8", env: process.env });
+    assert.equal(query.status, 0, query.stderr);
+    const result = JSON.parse(query.stdout);
+    assert.equal(result.request_state, "pending");
+    assert.equal(result.question_emission_count, 7);
+    assert.equal(result.question_deflected, true);
+    assert.equal(result.question_deflection_count, 3);
+    assert.deepEqual(result.question_emissions.filter(item => item.deflected === true).map(item => item.id),
+      ["step:5/tool:1", "step:6/tool:1", "step:7/tool:1"]);
+    assert(result.question_emissions.every(item => item.deflected === true || !("deflected" in item)));
   }
 }
 let answer = "한😀\n".repeat(15000);
