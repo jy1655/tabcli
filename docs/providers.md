@@ -251,6 +251,10 @@ Replace this transcript fallback when the same managed TUI exposes a verified of
 addressed question event or lifecycle. `wait --questions` can return retained emissions to a
 waiting caller before completion, with a caller-held cursor for resuming observation.
 Answer handling and unsolicited notification of a caller remain deferred.
+On codex-cli 0.166.0 the question tool returns at once and leaves the turn running. A message
+queued during that turn waited for it to end and started the next turn, and a child with
+nothing else to do kept its turn open waiting for the answer
+([measurement](verification/2026-11-05-macos-342-codex-question-answer.md)).
 Component verification is recorded in
 [the focused verification note](verification/2026-10-19-codex-question-emissions.md).
 
