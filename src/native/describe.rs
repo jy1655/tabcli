@@ -309,6 +309,7 @@ pub(super) const DOCTOR: Contract = Contract {
     features: &["probe"],
     notes: &[
         "Without --probe, reads existing evidence. --probe runs provider processes; neither form repairs sessions or sends a task.",
+        "JSON output is doctor's own report with schema_version and ok: true whenever a report is produced, even when checks are unavailable. Errors are reported on stderr without a JSON error object.",
     ],
 };
 pub(super) const SESSIONS: Contract = Contract {
@@ -322,6 +323,7 @@ pub(super) const SESSIONS: Contract = Contract {
     notes: &[
         "Can repair a dead owner's records and close its remaining Windows console; recovery may also finish an interrupted close.",
         "Can write recovery records. Use status for read-only observation.",
+        "JSON output is an array of session rows, without schema_version or ok. Errors are reported on stderr without a JSON error object.",
     ],
 };
 pub(super) const STATUS: Contract = Contract {
@@ -348,7 +350,10 @@ pub(super) const PRUNE: Contract = Contract {
         "--json",
     ]],
     features: &[],
-    notes: &["Destructive: requires --explicit and a positive age. Does not close live sessions."],
+    notes: &[
+        "Destructive: requires --explicit and a positive age. Does not close live sessions.",
+        "JSON output is one object with ok, closed_before_days and pruned, without schema_version. Errors are reported on stderr without a JSON error object.",
+    ],
 };
 pub(super) const CLOSE: Contract = Contract {
     summary: "Close a managed session's recorded terminal surface.",
@@ -360,6 +365,7 @@ pub(super) const CLOSE: Contract = Contract {
     features: &["with_started_from"],
     notes: &[
         "Requires explicit authority over the target. --with-started-from includes one level of recorded children within the same deadline. Records are retained.",
+        "JSON output is one object with ok, session, closed and started_from, without schema_version, printed only after the session closed; ok is false when a --with-started-from target failed. Errors are reported on stderr without a JSON error object.",
     ],
 };
 
@@ -535,7 +541,7 @@ fn value(request: &Request) -> Value {
                 "success_defaults": envelope::ok(serde_json::Map::new()),
                 "error_example": envelope::error(&anyhow::anyhow!("example error"), serde_json::Map::new()),
                 "failure_kinds": FailureKind::ALL.map(FailureKind::as_str),
-            "notes": ["Common defaults are not universal: consent and settings use legacy JSON without this envelope, and report errors only on stderr. Other command fields may override defaults. Consult result fields; exit status alone does not identify request completion.", "failure_kind is optional, diagnostic only, and never authorizes retry. Absence is unknown, not proof of non-delivery."]
+            "notes": ["Common defaults are not universal: consent, settings, sessions, prune-sessions and close-session print JSON without schema_version, and self-test's report has outcome instead of ok; consent, settings, sessions, prune-sessions, close-session, doctor and self-test report errors on stderr without a JSON error object. With --json, an argument-parsing failure prints a JSON error object only for describe, hold, cancel, screen, wait, status and search; other commands report it on stderr only. Other command fields may override defaults. Consult result fields; exit status alone does not identify request completion.", "failure_kind is optional, diagnostic only, and never authorizes retry. Absence is unknown, not proof of non-delivery."]
             }),
         ),
         (
@@ -689,6 +695,60 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn output_notes_name_every_command_outside_the_common_envelope() {
+        // Command names as whole words: "sessions" must not match inside "prune-sessions".
+        let names = |text: &str| -> std::collections::BTreeSet<String> {
+            text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .map(str::to_owned)
+                .collect()
+        };
+        let described = value(&Request {
+            command: None,
+            json: true,
+        });
+        let common = described["output"]["notes"][0].as_str().unwrap();
+        let sentences: Vec<_> = common.split(". ").map(names).collect();
+        // Their JSON lacks part of the envelope or they never print a JSON error object.
+        let own_shapes = [
+            "consent",
+            "settings",
+            "sessions",
+            "prune-sessions",
+            "close-session",
+            "doctor",
+            "self-test",
+        ];
+        // With --json, a parse failure prints a JSON error object only for these.
+        let parse_json = [
+            "describe", "hold", "cancel", "screen", "wait", "status", "search",
+        ];
+        for group in [&own_shapes, &parse_json] {
+            assert!(
+                sentences
+                    .iter()
+                    .any(|sentence| group.iter().all(|name| sentence.contains(*name))),
+                "no sentence of the common output note names all of {group:?}: {common}"
+            );
+        }
+        for (name, contract) in [
+            ("consent", &CONSENT),
+            ("settings", &SETTINGS),
+            ("sessions", &SESSIONS),
+            ("prune-sessions", &PRUNE),
+            ("close-session", &CLOSE),
+            ("doctor", &DOCTOR),
+        ] {
+            assert!(
+                contract
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("stderr") && note.contains("JSON error object")),
+                "{name} states neither its own JSON shape nor its stderr-only errors"
+            );
         }
     }
 

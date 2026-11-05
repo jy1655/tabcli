@@ -54,8 +54,12 @@ session was launched with deflection or that any call was refused. `question_not
 setting; neither proves that a session was launched with the notice or that a child followed it.
 
 The `output` section describes common JSON envelope defaults and optional failure hints, not
-every command's result fields. A command may override the defaults; legacy `consent` and
-`settings` omit this envelope and report errors only on stderr. Neither an exit code nor
+every command's result fields. A command may override the defaults, and the section's first note
+names the commands outside them: `consent`, `settings`, `sessions`, `prune-sessions` and
+`close-session` print JSON without `schema_version`; `self-test` reports `outcome` instead of `ok`;
+those commands and `doctor` report errors only on stderr; and with `--json` only `describe`, `hold`,
+`cancel`, `screen`, `wait`, `status` and `search` print a JSON error object for an argument-parsing
+failure. Neither an exit code nor
 `failure_kind` grants retry authority; in particular, a wait timeout does not cancel the request.
 This entry point is additive: callers supporting older binaries must handle an unavailable
 `describe` before relying on this contract. Binaries without command pages print the main help
