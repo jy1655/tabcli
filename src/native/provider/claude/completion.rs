@@ -2,6 +2,7 @@ use super::turn::{self as claude_turn, ClaudeTurn, Installed};
 use super::valid_claude_conversation_id;
 use crate::native::clock::Clock;
 use crate::native::session::{Reader, Store, primitives::unix_ms, turn};
+use crate::native::settings::{self, ClaudeQuestionDeflection};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ const DIAGNOSTIC_FILE: &str = "claude-mod-diagnostic.json";
 const QUESTION_PLUGIN_MANIFEST: &str = "claude-question-mod/.claude-plugin/plugin.json";
 /// The plugin name that manifest carries.
 const QUESTION_PLUGIN_NAME: &str = "agent-bridge-questions";
+/// The question deflection decided at launch; later reads use it, never the current setting.
+const QUESTION_MODE_FILE: &str = "claude-question-mode.json";
 const REVISION: u32 = 1;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FROM_BYTES: usize = 1024;
@@ -45,6 +48,21 @@ struct LaunchMode {
     mode: Mode,
     reason: String,
     claude_version: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Deflection {
+    On,
+    Off,
+}
+
+/// Whether the question plugin of this launch refuses a model's main-loop `AskUserQuestion`
+/// call and returns the question in the Result. It records configuration, not execution.
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+struct QuestionMode {
+    schema: u32,
+    deflection: Deflection,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -179,6 +197,35 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     store
         .private("claude-question-mod/hooks/report.js")
         .write_private(include_bytes!("report.js"))?;
+    // Decided once per launch from the user's setting. An unreadable settings record keeps
+    // the default: no person is at a managed session's dialog by construction.
+    let setting = directory
+        .parent()
+        .context("Claude session has no state root")
+        .and_then(settings::claude_question_deflection);
+    let deflection = match setting {
+        Ok(ClaudeQuestionDeflection::On) => Deflection::On,
+        Ok(ClaudeQuestionDeflection::Off) => Deflection::Off,
+        Err(error) => {
+            crate::native::session::launch::log(
+                &store,
+                &format!("settings could not be read, using question deflection on: {error:#}"),
+            );
+            Deflection::On
+        }
+    };
+    store
+        .private("claude-question-mod/hooks/config.js")
+        .write_private(
+            format!("export const deflect = {};\n", deflection == Deflection::On).as_bytes(),
+        )?;
+    // Written after the module switch, so the record never names a switch that was not written.
+    store
+        .private(QUESTION_MODE_FILE)
+        .write_json(&QuestionMode {
+            schema: 1,
+            deflection,
+        })?;
     Ok(vec![
         "--plugin-dir".into(),
         plugin.into_os_string(),
@@ -257,6 +304,32 @@ pub(super) fn emission_observation(
         ))
     };
     observe().unwrap_or_else(|error| EmissionObservation::Unknown(format!("{error:#}")))
+}
+
+/// The answer path this launch recorded. Deflection returns a refused question in the Result,
+/// answered by an ordinary `tell`; the record proves neither that Claude loaded the plugin nor
+/// that any call was refused. A session launched before the record existed, with deflection
+/// off, or in legacy completion mode has no answer path.
+pub(super) fn question_response(directory: &Path) -> crate::native::provider::QuestionResponse {
+    use crate::native::provider::{NO_ADDRESSED_ANSWER_PATH, QuestionResponse};
+    let observe = || -> Result<QuestionResponse> {
+        if native_mode(directory)?
+            && let Some(mode) = Reader::open_unchecked(directory)
+                .private(QUESTION_MODE_FILE)
+                .optional_json::<QuestionMode>()?
+        {
+            if mode.schema != 1 {
+                bail!("unsupported Claude question mode schema");
+            }
+            if mode.deflection == Deflection::On {
+                return Ok(QuestionResponse::DeflectedToResult(
+                    "plugin_configured_unverified",
+                ));
+            }
+        }
+        Ok(QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH))
+    };
+    observe().unwrap_or_else(|error| QuestionResponse::Unknown(format!("{error:#}")))
 }
 
 pub(super) fn admit(
@@ -628,7 +701,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
     let Some(binding) = binding.filter(|binding| {
         binding_matches_request(binding, &pending, &token) && binding.conversation == conversation
     }) else {
-        if event == "question.emissions" {
+        if event == "question.emissions" || event == "question.deflected" {
             return Ok(());
         }
         return diagnostic(
@@ -638,11 +711,13 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
         );
     };
     let bound = binding == proposed;
-    if event == "question.emissions" {
-        return if bound {
+    if event == "question.emissions" || event == "question.deflected" {
+        return if !bound {
+            Ok(())
+        } else if event == "question.emissions" {
             questions::publish(&store, &binding, data)
         } else {
-            Ok(())
+            questions::deflect(&store, &binding, data)
         };
     }
     if !bound && event != "turn.complete" {

@@ -23,6 +23,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features -- --test-threads=1
+        # A hang fails here instead of at the 6-hour job limit; this step normally takes under 3 minutes.
+        timeout-minutes: 20
 
   rust:
     env:
@@ -55,9 +57,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Run serial tests
         if: runner.os != 'Windows'
+        # A hang fails here instead of at the 6-hour job limit; macOS normally takes 3-7 minutes.
+        timeout-minutes: 30
         run: cargo test --all-targets --all-features -- --test-threads=1
       - name: Run Windows serial tests with timing
         if: runner.os == 'Windows'
+        # Normally 7-13 minutes, at most 19 so far, and up to 22 before the in-process SID lookup.
+        timeout-minutes: 60
         env:
           TEST_TIMING_DIR: ${{ runner.temp }}/ci-test-timing
         run: python -I scripts/ci_test_timing.py run --output-dir "$env:TEST_TIMING_DIR"

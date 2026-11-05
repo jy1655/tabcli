@@ -924,6 +924,74 @@ fn questions_report_each_adapters_configuration_and_no_answer_path() {
 }
 
 #[test]
+fn claude_question_response_reports_the_deflection_recorded_at_launch() {
+    let unsupported = json!({"state": "unsupported", "reason": "no_addressed_answer_path"});
+    let deflected = json!({"state": "deflected_to_result",
+        "reason": "plugin_configured_unverified", "answer_by": "tell"});
+    let fixture = working("claude");
+    let store = Store::open_unchecked(&fixture.directory);
+    let mode = "claude-question-mode.json";
+    // Legacy completion mode has no deflecting plugin, whatever a record says.
+    store
+        .private(mode)
+        .write_json(&json!({"schema": 1, "deflection": "on"}))
+        .unwrap();
+    assert_eq!(
+        observe_all(&fixture.directory)["questions"]["response"],
+        unsupported
+    );
+    store
+        .private("claude-completion-mode.json")
+        .write_json(&json!({"schema": 1, "mode": "native_v1",
+            "reason": "macos_stable_2_1_302_or_newer", "claude_version": "2.1.318"}))
+        .unwrap();
+    assert_eq!(
+        observe_all(&fixture.directory)["questions"]["response"],
+        deflected
+    );
+    store.private(mode).remove().unwrap();
+    store
+        .private(mode)
+        .write_json(&json!({"schema": 1, "deflection": "off"}))
+        .unwrap();
+    assert_eq!(
+        observe_all(&fixture.directory)["questions"]["response"],
+        unsupported
+    );
+    // A session launched before the record existed keeps the earlier answer.
+    store.private(mode).remove().unwrap();
+    assert_eq!(
+        observe_all(&fixture.directory)["questions"]["response"],
+        unsupported
+    );
+    for record in [
+        &b"{"[..],
+        br#"{"schema":2,"deflection":"on"}"#,
+        br#"{"schema":1,"deflection":"maybe"}"#,
+    ] {
+        store.private(mode).write_private(record).unwrap();
+        let response = observe_all(&fixture.directory)["questions"]["response"].clone();
+        assert_eq!(response["state"], "unknown", "{response}");
+        assert_eq!(response["reason"], "evidence_unreadable");
+        assert!(response["detail"].as_str().is_some());
+        store.private(mode).remove().unwrap();
+    }
+    // Other providers never read the Claude record.
+    for provider in ["codex", "agy", "pi"] {
+        let fixture = working(provider);
+        Store::open_unchecked(&fixture.directory)
+            .private(mode)
+            .write_json(&json!({"schema": 1, "deflection": "on"}))
+            .unwrap();
+        assert_eq!(
+            observe_all(&fixture.directory)["questions"]["response"],
+            unsupported,
+            "{provider}"
+        );
+    }
+}
+
+#[test]
 fn a_snapshot_without_the_lifecycle_lock_leaves_every_capability_unknown() {
     let fixture = ready("claude");
     Store::open_unchecked(&fixture.directory)

@@ -154,16 +154,16 @@ fn emission(step: u64, item: &Value) -> Option<QuestionEmission> {
     Some(QuestionEmission {
         id: format!("step:{step}/tool:{index}"),
         questions: emitted,
+        deflected: false,
     })
 }
 
-// Completion validates the immutable original turn binding and live Claim under this
-// same lock. An unbound continuation supplies no question attribution authority.
-pub(super) fn publish(store: &Store, binding: &Binding, data: &Value) -> Result<()> {
+// The saved record of the Claim's Receipt, or an empty one, with its encoding before any change.
+fn saved(store: &Store, binding: &Binding) -> Result<Option<(Record, Vec<u8>)>> {
     let Some(receipt) = requests::for_claim(store, &binding.claim)? else {
-        return Ok(());
+        return Ok(None);
     };
-    let mut saved = record(store, &receipt)?.unwrap_or_else(|| Record {
+    let saved = record(store, &receipt)?.unwrap_or_else(|| Record {
         schema: 1,
         request_id: receipt.request_id,
         binding: binding.clone(),
@@ -175,6 +175,15 @@ pub(super) fn publish(store: &Store, binding: &Binding, data: &Value) -> Result<
         bail!("Claude question binding cannot be replaced");
     }
     let before = serde_json::to_vec(&saved)?;
+    Ok(Some((saved, before)))
+}
+
+// Completion validates the immutable original turn binding and live Claim under this
+// same lock. An unbound continuation supplies no question attribution authority.
+pub(super) fn publish(store: &Store, binding: &Binding, data: &Value) -> Result<()> {
+    let Some((mut saved, before)) = self::saved(store, binding)? else {
+        return Ok(());
+    };
     let items = data.get("items").and_then(Value::as_array);
     let step = data
         .get("step")
@@ -189,7 +198,8 @@ pub(super) fn publish(store: &Store, binding: &Binding, data: &Value) -> Result<
                 continue;
             };
             if let Some(previous) = saved.items.iter().find(|previous| previous.id == item.id) {
-                saved.incomplete |= previous != &item;
+                // A replay compares content only: a recorded deflection is not a conflict.
+                saved.incomplete |= previous.questions != item.questions;
                 continue;
             }
             if saved.full {
@@ -215,6 +225,55 @@ pub(super) fn publish(store: &Store, binding: &Binding, data: &Value) -> Result<
     }
     // Empty healthy observations add no evidence. Retries never rewrite a saved prefix.
     if (!saved.items.is_empty() || saved.incomplete) && serde_json::to_vec(&saved)? != before {
+        store.private(&name(&binding.claim)).write_json(&saved)?;
+    }
+    Ok(())
+}
+
+// The question plugin refused the call at `step`/`index` before any dialog. Under the same
+// lock and binding rules as `publish`, this sets the deflected flag of the retained item at
+// that position: the one change a saved item may receive, still within the record limit. The
+// position alone does not name the call: a repeated step keeps the first question retained
+// there, so the flag is set only when the refused questions project to the retained item's
+// text and option labels. An item the record lacks (its emission report was lost, or the
+// record is full), a different question at the position and malformed data are never turned
+// into a flag: the observation becomes incomplete. Repeats are idempotent.
+pub(super) fn deflect(store: &Store, binding: &Binding, data: &Value) -> Result<()> {
+    let Some((mut saved, before)) = self::saved(store, binding)? else {
+        return Ok(());
+    };
+    let number = |key| {
+        data.get(key)
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= MAX_INDEX)
+    };
+    let refused = number("step")
+        .zip(number("index"))
+        .and_then(|(step, index)| {
+            let questions = data.get("questions")?;
+            emission(
+                step,
+                &serde_json::json!({"index": index, "questions": questions}),
+            )
+        });
+    match refused.and_then(|refused| {
+        saved
+            .items
+            .iter()
+            .position(|item| item.id == refused.id && item.questions == refused.questions)
+    }) {
+        Some(found) if !saved.items[found].deflected => {
+            saved.items[found].deflected = true;
+            if !fits(&saved) {
+                saved.items[found].deflected = false;
+                saved.incomplete = true;
+                saved.full = true;
+            }
+        }
+        Some(_) => {}
+        None => saved.incomplete = true,
+    }
+    if serde_json::to_vec(&saved)? != before {
         store.private(&name(&binding.claim)).write_json(&saved)?;
     }
     Ok(())
