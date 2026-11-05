@@ -4064,3 +4064,50 @@ fn a_refused_follow_up_is_a_recorded_failure_that_reopen_accepts() {
     assert_eq!(source.event_id, completed_event);
     assert_ne!(source.event_id, refused_event);
 }
+
+// A consent failure after a reopened launch ends the child's initial Request as not sent,
+// but it is no launch refusal: the source marker stays with the child, whose provider can
+// still hold the resumed conversation.
+#[test]
+fn consent_failure_after_a_reopened_launch_keeps_the_source_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-consent-source";
+    let child_id = "session-consent-child";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let child = write_reopen_launch_session(root.path(), child_id, Path::new("claude"));
+    Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION)
+        .unwrap()
+        .finalize(child_id)
+        .unwrap();
+    let marker = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
+    let store = Store::open_unchecked(&child);
+    let mut claim = turn::claim(&store, &[]).unwrap();
+    claim.fence_launch();
+    update_status(&child, SessionState::AwaitingInitialInput, None, None).unwrap();
+    let request = claim.receipt().request_id.clone();
+    let consent = "workspace consent changed before trust dialog response; no response sent";
+    let error = crate::native::session_start::settle_consent_failure(
+        &child,
+        &mut claim,
+        anyhow::anyhow!(consent),
+    );
+    drop(claim);
+    let result = query::request_result(&store, &request).unwrap();
+    assert_eq!(result["request_state"], "failed");
+    assert_eq!(result["error"], consent);
+    let (outcome, gate) = settle_reopen_outcome(&source, &child, Err(error));
+    assert_eq!(gate, None);
+    assert_eq!(format!("{:#}", outcome.unwrap_err()), consent);
+    assert_eq!(fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(), marker);
+    assert!(!child.join(REOPEN_REFUSAL_FILE).exists());
+    assert!(
+        Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).is_err(),
+        "a second reopen was admitted"
+    );
+}

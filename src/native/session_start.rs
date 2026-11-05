@@ -406,14 +406,21 @@ impl Start {
                 ));
             }
         };
-        // Consent failure is neither a launcher failure nor a Delivery failure.
-        consent::complete_launch(
+        // Consent failure is neither a launcher failure nor a Delivery failure, and its
+        // Request still ends: see `settle_consent_failure`.
+        if let Err(error) = consent::complete_launch(
             &created.directory,
             provider,
             &terminal_session,
             &expected_claim_token,
             deadline,
-        )?;
+        ) {
+            return Err(settle_consent_failure(
+                &created.directory,
+                &mut initial_claim,
+                error,
+            ));
+        }
         initial_claim.startup_confirmed();
         let mut gate = |gate| source.gate(&created.directory, gate, deadline);
         turn_run::run(
@@ -449,6 +456,32 @@ impl Start {
                 )
             },
         )
+    }
+}
+
+// A consent failure after a confirmed launch sends no prompt. While the session is still
+// `awaiting-initial-input`, the wrapper recorded that this provider's initial prompt is
+// delivered after launch, and only this start's delivery could have sent it: the Request
+// ends as a delivery refusal (`delivery_not_sent`) with the consent text, which says
+// whether a dialog key may have been sent. Any other state keeps the fenced Claim: an
+// argument-delivered prompt is already with the provider, and an ended session's Claim
+// belongs to its wrapper or close. A refusal that cannot be recorded keeps the Claim.
+pub(super) fn settle_consent_failure(
+    directory: &Path,
+    claim: &mut turn::Claim,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let undelivered = Reader::open_unchecked(directory)
+        .status()
+        .is_ok_and(|status| status.state == SessionState::AwaitingInitialInput);
+    if !undelivered {
+        return error;
+    }
+    match claim.settle_delivery(turn::Delivery::NotSent(&error)) {
+        Ok(()) => error,
+        Err(refusal) => error.context(format!(
+            "the refusal was not recorded and the request stays claimed: {refusal:#}"
+        )),
     }
 }
 

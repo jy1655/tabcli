@@ -480,3 +480,179 @@ fn consent_receives_original_alias_not_canonical_spec_workspace() {
     .unwrap();
     assert_eq!(value["state"], "alias");
 }
+
+// A consent failure after a confirmed launch, as `Start::run` meets it: the launcher has
+// fenced the initial Claim and the wrapper has recorded the state the adapter's launch plan
+// selected. Nothing here sends a prompt, so only that recorded state decides the Request.
+mod consent_failure {
+    use super::*;
+    use crate::native::query;
+    use crate::native::session::test_support::{
+        injected_fault, with_fault_budget, write_test_manifest,
+    };
+    use crate::native::session::{close, launch};
+
+    // The text keeps the dialog evidence: a key may have reached the dialog.
+    const CONSENT_FAILURE: &str = "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal; possible response; trust unconfirmed; no input was retried";
+
+    // `awaiting-initial-input` keeps the preserved prompt for delivery after launch;
+    // `running` is an argument-delivered prompt the wrapper already removed.
+    fn launched(state: SessionState) -> (tempfile::TempDir, Store, turn::Claim) {
+        let directory = tempfile::Builder::new()
+            .prefix("session-")
+            .tempdir()
+            .unwrap();
+        let store = Store::open_unchecked(directory.path());
+        fs::create_dir(store.record(CoreRecord::Events).path()).unwrap();
+        write_test_manifest(directory.path(), "claude");
+        update_status(store.directory(), SessionState::Launching, None, None).unwrap();
+        let mut claim = turn::claim(&store, &[]).unwrap();
+        claim.fence_launch();
+        if state == SessionState::AwaitingInitialInput {
+            store
+                .record(CoreRecord::InitialPrompt)
+                .write_private(b"prompt")
+                .unwrap();
+        }
+        update_status(store.directory(), state, None, None).unwrap();
+        (directory, store, claim)
+    }
+
+    fn settle(store: &Store, claim: &mut turn::Claim) -> anyhow::Error {
+        settle_consent_failure(store.directory(), claim, anyhow::anyhow!(CONSENT_FAILURE))
+    }
+
+    fn assert_not_sent(store: &Store, token: &str, request: &str) {
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        assert_eq!(status.error.as_deref(), Some(CONSENT_FAILURE));
+        assert!(turn::current_claim_token(store).unwrap().is_none());
+        assert_eq!(store.events().unwrap().len(), 1);
+        let receipt = requests::for_claim(store, token).unwrap().unwrap();
+        let event = store.event_strict(&receipt.event_file).unwrap();
+        assert_eq!(
+            event.provenance.as_deref(),
+            Some(turn::DELIVERY_NOT_SENT_PROVENANCE)
+        );
+        assert_eq!(event.error.as_deref(), Some(CONSENT_FAILURE));
+        let result = query::request_result(store, request).unwrap();
+        assert_eq!(result["request_state"], "failed");
+        assert_eq!(result["error"], CONSENT_FAILURE);
+    }
+
+    #[test]
+    fn an_undelivered_initial_prompt_ends_as_not_sent() {
+        let (_directory, store, mut claim) = launched(SessionState::AwaitingInitialInput);
+        let token = claim.token().to_owned();
+        let request = claim.receipt().request_id.clone();
+        let error = settle(&store, &mut claim);
+        drop(claim);
+        assert_eq!(format!("{error:#}"), CONSENT_FAILURE);
+        assert_not_sent(&store, &token, &request);
+        assert_eq!(
+            store.record(CoreRecord::InitialPrompt).bytes().unwrap(),
+            Some(b"prompt".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_argument_delivered_claim_is_kept() {
+        let (_directory, store, mut claim) = launched(SessionState::Running);
+        let token = claim.token().to_owned();
+        let request = claim.receipt().request_id.clone();
+        let records = || {
+            [
+                store.record(CoreRecord::Status).bytes().unwrap(),
+                store.record(CoreRecord::TurnClaim).bytes().unwrap(),
+                fs::read(
+                    store
+                        .record(CoreRecord::Requests)
+                        .path()
+                        .join(format!("{token}.json")),
+                )
+                .ok(),
+            ]
+        };
+        let before = records();
+        let error = settle(&store, &mut claim);
+        drop(claim);
+        assert_eq!(format!("{error:#}"), CONSENT_FAILURE);
+        assert_eq!(records(), before);
+        assert!(store.events().unwrap().is_empty());
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+        let result = query::request_result(&store, &request).unwrap();
+        assert_eq!(result["request_state"], "pending");
+    }
+
+    #[test]
+    fn an_interrupted_refusal_journal_never_releases_the_claim() {
+        let mut saw_retained_without_journal = false;
+        let mut saw_recoverable_journal = false;
+        for budget in 0..=12 {
+            let (_directory, store, mut claim) = launched(SessionState::AwaitingInitialInput);
+            let token = claim.token().to_owned();
+            let request = claim.receipt().request_id.clone();
+            let error = with_fault_budget(budget, || settle(&store, &mut claim));
+            drop(claim);
+            let text = format!("{error:#}");
+            if injected_fault(&error) {
+                assert!(
+                    text.starts_with(
+                        "the refusal was not recorded and the request stays claimed: "
+                    ) && text.ends_with(&format!(": {CONSENT_FAILURE}")),
+                    "budget {budget}: {text}"
+                );
+                assert_eq!(
+                    turn::current_claim_token(&store).unwrap().as_deref(),
+                    Some(token.as_str()),
+                    "budget {budget}"
+                );
+                if !store.record(CoreRecord::Completion).path().exists() {
+                    saw_retained_without_journal = true;
+                    assert!(store.events().unwrap().is_empty(), "budget {budget}");
+                    assert_eq!(
+                        store.status().unwrap().state,
+                        SessionState::AwaitingInitialInput
+                    );
+                    continue;
+                }
+                saw_recoverable_journal = true;
+            } else {
+                assert_eq!(text, CONSENT_FAILURE, "budget {budget}");
+            }
+            store.converge().unwrap();
+            assert!(!store.record(CoreRecord::Completion).path().exists());
+            assert_not_sent(&store, &token, &request);
+        }
+        assert!(saw_retained_without_journal);
+        assert!(saw_recoverable_journal);
+    }
+
+    #[test]
+    fn a_provider_exit_or_close_before_the_settlement_records_nothing() {
+        for closed in [false, true] {
+            let (_directory, store, mut claim) = launched(SessionState::AwaitingInitialInput);
+            let request = claim.receipt().request_id.clone();
+            if closed {
+                close::close(&store, None, close::budget::close_deadline(), |_| {
+                    panic!("no terminal handle")
+                })
+                .unwrap();
+            } else {
+                launch::finalize(&store, &Ok(())).unwrap();
+            }
+            let status = store.record(CoreRecord::Status).bytes().unwrap();
+            let error = settle(&store, &mut claim);
+            drop(claim);
+            assert_eq!(format!("{error:#}"), CONSENT_FAILURE);
+            assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), status);
+            assert!(store.events().unwrap().is_empty(), "closed: {closed}");
+            assert!(turn::current_claim_token(&store).unwrap().is_none());
+            let result = query::request_result(&store, &request).unwrap();
+            assert_eq!(result["request_state"], "unresolved", "closed: {closed}");
+        }
+    }
+}
