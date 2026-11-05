@@ -247,9 +247,15 @@ impl Operations for Installed {
         let manifest = Reader::open_unchecked(&directory).manifest()?;
         let terminal = Reader::open_unchecked(&directory)
             .terminal()
-            .or_else(|_| Reader::open_unchecked(&directory).terminal_closed())
+            .map(|terminal| Some(terminal.kind))
+            .or_else(|_| {
+                Reader::open_unchecked(&directory)
+                    .terminal_closed()
+                    .map(|tombstone| tombstone.terminal)
+            })
             .ok()
-            .map(|terminal| terminal.kind.as_str().to_owned());
+            .flatten()
+            .map(|kind| kind.as_str().to_owned());
         Ok((manifest.provider_version, terminal))
     }
 }
