@@ -60,6 +60,7 @@ Usage:
   {PUBLIC_COMMAND} settings codex-memory-workspace <refuse|allow> [--json]
   {PUBLIC_COMMAND} settings codex-lifecycle-hooks <on|off> [--json]
   {PUBLIC_COMMAND} settings claude-question-deflection <on|off> [--json]
+  {PUBLIC_COMMAND} settings codex-question-notice <on|off> [--json]
   {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
   {PUBLIC_COMMAND} close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} --help | --version
@@ -102,6 +103,11 @@ Runtime:
   refuses the model's own AskUserQuestion call before any dialog and tells the
   child to end its turn with the question, which the caller answers with tell.
   Each session keeps the decision recorded at its launch.
+  A Codex session of 0.166.0 or newer with lifecycle hooks is launched with a
+  question notice unless settings codex-question-notice off was chosen before the
+  launch: its question tool still runs, and a hook tells the child that no reply
+  can arrive during the turn, so it finishes its other work and ends the turn with
+  the question. Answer with tell once the request has ended.
 
 Self-test:
   self-test makes real model calls and opens a real terminal. It runs in the

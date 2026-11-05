@@ -236,6 +236,10 @@ pub(super) enum QuestionResponse {
     /// The launch configured a refusal that returns the question in the Result, answered
     /// by an ordinary `tell`. Configuration is not evidence that any call was refused.
     DeflectedToResult(&'static str),
+    /// The launch configured a notice that lets the question through and tells the child that no
+    /// reply can arrive during the turn; the caller answers with an ordinary `tell` after the
+    /// Request has ended. Configuration is not evidence that the child read or followed it.
+    AnswerAfterTurn(&'static str),
     /// A launch record the adapter decides from could not be read.
     Unknown(String),
 }

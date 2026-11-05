@@ -992,6 +992,84 @@ fn claude_question_response_reports_the_deflection_recorded_at_launch() {
 }
 
 #[test]
+fn codex_question_response_reports_the_notice_recorded_at_launch() {
+    let unsupported = json!({"state": "unsupported", "reason": "no_addressed_answer_path"});
+    let after_turn = json!({"state": "answer_after_turn",
+        "reason": "hook_configured_unverified", "answer_by": "tell"});
+    let fixture = working("codex");
+    let store = Store::open_unchecked(&fixture.directory);
+    let mode = "codex-question-notice.json";
+    // A session launched before the record existed has no notice hook.
+    assert_eq!(
+        observe_all(&fixture.directory)["questions"]["response"],
+        unsupported
+    );
+    store
+        .private(mode)
+        .write_json(
+            &json!({"schema": 1, "notice_hook": "injected", "reason": null,
+            "vector_codex_version": "0.166.0"}),
+        )
+        .unwrap();
+    let questions = observe_all(&fixture.directory)["questions"].clone();
+    assert_eq!(questions["response"], after_turn);
+    // Emission observation still follows the lifecycle record alone.
+    assert_eq!(
+        questions["emission_observation"],
+        json!({"state": "unavailable", "reason": "hooks_not_injected"})
+    );
+    for reason in [
+        "settings_off",
+        "lifecycle_hooks_not_injected",
+        "version_below_0_166",
+        "launcher_unavailable",
+    ] {
+        store
+            .private(mode)
+            .write_json(
+                &json!({"schema": 1, "notice_hook": "not_injected", "reason": reason,
+                "vector_codex_version": "0.166.0"}),
+            )
+            .unwrap();
+        assert_eq!(
+            observe_all(&fixture.directory)["questions"]["response"],
+            unsupported,
+            "{reason}"
+        );
+    }
+    store.private(mode).remove().unwrap();
+    for record in [
+        &b"{"[..],
+        br#"{"schema":2,"notice_hook":"injected","reason":null,"vector_codex_version":"0.166.0"}"#,
+        br#"{"schema":1,"notice_hook":"maybe","reason":null,"vector_codex_version":"0.166.0"}"#,
+        br#"{"schema":1,"notice_hook":"injected","reason":null,"vector_codex_version":"0.163.0"}"#,
+    ] {
+        store.private(mode).write_private(record).unwrap();
+        let response = observe_all(&fixture.directory)["questions"]["response"].clone();
+        assert_eq!(response["state"], "unknown", "{response}");
+        assert_eq!(response["reason"], "evidence_unreadable");
+        assert!(response["detail"].as_str().is_some());
+        store.private(mode).remove().unwrap();
+    }
+    // Other providers never read the Codex record.
+    for provider in ["claude", "agy", "pi"] {
+        let fixture = working(provider);
+        Store::open_unchecked(&fixture.directory)
+            .private(mode)
+            .write_json(
+                &json!({"schema": 1, "notice_hook": "injected", "reason": null,
+                "vector_codex_version": "0.166.0"}),
+            )
+            .unwrap();
+        assert_eq!(
+            observe_all(&fixture.directory)["questions"]["response"],
+            unsupported,
+            "{provider}"
+        );
+    }
+}
+
+#[test]
 fn a_snapshot_without_the_lifecycle_lock_leaves_every_capability_unknown() {
     let fixture = ready("claude");
     Store::open_unchecked(&fixture.directory)

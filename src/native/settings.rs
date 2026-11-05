@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 const FILE: &str = "settings.json";
-const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow>, codex-lifecycle-hooks <on|off> or claude-question-deflection <on|off> to change one; --json is accepted";
+const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow>, codex-lifecycle-hooks <on|off>, claude-question-deflection <on|off> or codex-question-notice <on|off> to change one; --json is accepted";
 
 /// A creation preference, never cleanup authority. Each terminal handle records
 /// the surface that was actually created, even if this setting changes later.
@@ -169,6 +169,38 @@ impl FromStr for ClaudeQuestionDeflection {
     }
 }
 
+/// Whether new Codex launches inject the `PreToolUse` hook that lets the model's
+/// `request_user_input_async` call run and adds a notice: no reply can arrive during the turn, so
+/// finish what does not depend on the answer and end the turn with the question. Each session
+/// records its own launch decision; the setting is not evidence that a child read the notice.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum CodexQuestionNotice {
+    #[default]
+    On,
+    Off,
+}
+
+impl CodexQuestionNotice {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl FromStr for CodexQuestionNotice {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            _ => bail!("codex-question-notice is on or off, not {value:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Record {
     schema: u32,
@@ -182,6 +214,8 @@ struct Record {
     codex_lifecycle_hooks: Option<CodexLifecycleHooks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_question_deflection: Option<ClaudeQuestionDeflection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_question_notice: Option<CodexQuestionNotice>,
 }
 
 fn read(root: &Path) -> Result<Record> {
@@ -194,6 +228,7 @@ fn read(root: &Path) -> Result<Record> {
             codex_memory_workspace: None,
             codex_lifecycle_hooks: None,
             claude_question_deflection: None,
+            codex_question_notice: None,
         });
     };
     let record: Record = serde_json::from_str(&text)
@@ -226,6 +261,10 @@ pub(super) fn codex_lifecycle_hooks(root: &Path) -> Result<CodexLifecycleHooks> 
 
 pub(super) fn claude_question_deflection(root: &Path) -> Result<ClaudeQuestionDeflection> {
     Ok(read(root)?.claude_question_deflection.unwrap_or_default())
+}
+
+pub(super) fn codex_question_notice(root: &Path) -> Result<CodexQuestionNotice> {
+    Ok(read(root)?.codex_question_notice.unwrap_or_default())
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
@@ -286,6 +325,14 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
+        ["codex-question-notice", value] => {
+            let value = value.parse::<CodexQuestionNotice>()?;
+            Store::create_state_root(root, &Reader::home_directories())?;
+            let mut record = read(root)?;
+            record.codex_question_notice = Some(value);
+            RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
+                .write_json(&record)?;
+        }
         _ => bail!(USAGE),
     }
     Ok(serde_json::json!({
@@ -295,6 +342,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         "codex_memory_workspace": codex_memory_workspace(root)?.as_str(),
         "codex_lifecycle_hooks": codex_lifecycle_hooks(root)?.as_str(),
         "claude_question_deflection": claude_question_deflection(root)?.as_str(),
+        "codex_question_notice": codex_question_notice(root)?.as_str(),
     }))
 }
 
@@ -412,6 +460,75 @@ mod tests {
         )
         .unwrap();
         assert!(claude_question_deflection(&root).is_err());
+    }
+
+    #[test]
+    fn codex_question_notice_defaults_on_and_updates_preserve_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        assert_eq!(
+            codex_question_notice(&root).unwrap(),
+            CodexQuestionNotice::On
+        );
+        assert_eq!(apply(&root, &[]).unwrap()["codex_question_notice"], "on");
+        for invalid in [
+            vec!["codex-question-notice"],
+            vec!["codex-question-notice", "ON"],
+            vec!["codex-question-notice", "yes"],
+            vec!["codex-question-notice", "off", "extra"],
+        ] {
+            assert!(apply(&root, &arguments(&invalid)).is_err(), "{invalid:?}");
+        }
+        assert!(!root.exists(), "an invalid value must not create the root");
+        assert_eq!(
+            apply(&root, &arguments(&["codex-question-notice", "maybe"]))
+                .unwrap_err()
+                .to_string(),
+            "codex-question-notice is on or off, not \"maybe\""
+        );
+        apply(&root, &arguments(&["claude-question-deflection", "off"])).unwrap();
+        for value in ["off", "on", "off"] {
+            assert_eq!(
+                apply(
+                    &root,
+                    &arguments(&["codex-question-notice", value, "--json"])
+                )
+                .unwrap()["codex_question_notice"],
+                value
+            );
+            assert_eq!(
+                claude_question_deflection(&root).unwrap(),
+                ClaudeQuestionDeflection::Off
+            );
+        }
+        assert_eq!(
+            read_json::<serde_json::Value>(&root.join(FILE)).unwrap(),
+            serde_json::json!({
+                "schema": 1,
+                "claude_question_deflection": "off",
+                "codex_question_notice": "off",
+            })
+        );
+        // The two providers' settings are independent keys of one record.
+        assert_eq!(
+            codex_lifecycle_hooks(&root).unwrap(),
+            CodexLifecycleHooks::On
+        );
+        fs::write(
+            root.join(FILE),
+            r#"{"schema":1,"claude_question_deflection":"off"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_question_notice(&root).unwrap(),
+            CodexQuestionNotice::On
+        );
+        fs::write(
+            root.join(FILE),
+            r#"{"schema":1,"codex_question_notice":"sometimes"}"#,
+        )
+        .unwrap();
+        assert!(codex_question_notice(&root).is_err());
     }
 
     #[test]
@@ -537,6 +654,7 @@ mod tests {
                 "codex_memory_workspace": "refuse",
                 "codex_lifecycle_hooks": "on",
                 "claude_question_deflection": "on",
+                "codex_question_notice": "on",
             })
         );
         assert!(!root.exists(), "reading defaults must not write settings");
