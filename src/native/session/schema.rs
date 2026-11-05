@@ -114,6 +114,16 @@ pub(in crate::native) struct RecordedReopenRefusal {
     pub(in crate::native) cleanup_detail: Option<String>,
 }
 
+/// The tombstone a close leaves once it has consumed the terminal handle. `terminal` is the
+/// consumed handle's kind, null when the close found no handle; only macOS records `reason`.
+#[derive(Debug, Deserialize, PartialEq)]
+pub(in crate::native) struct TerminalTombstone {
+    pub(in crate::native) consumed: bool,
+    pub(in crate::native) terminal: Option<terminal::TerminalKind>,
+    #[serde(default)]
+    pub(in crate::native) reason: Option<String>,
+}
+
 // The record a winning reopen leaves in its closed source. `reopened_by` is filled once the
 // new session exists; until then the marker still excludes every other reopen attempt.
 #[derive(Clone, Debug, Deserialize, Serialize)]

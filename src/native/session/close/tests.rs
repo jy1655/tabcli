@@ -6,7 +6,7 @@ use crate::native::session::names::*;
 use crate::native::session::primitives::event_paths;
 use crate::native::session::primitives::{SyncRecord, read_json, write_json_atomic};
 use crate::native::session::schema::EVENT_READ_LIMIT;
-use crate::native::session::schema::SessionEvent;
+use crate::native::session::schema::{SessionEvent, TerminalTombstone};
 use crate::native::session::test_support::lifecycle::{
     assert_journal_settled, cli_result, cli_search, cli_sessions, close_test_terminal,
     link_directory, oversized_sample_event, reaped_child_pid, request_state, sample_completion,
@@ -327,6 +327,75 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "closed");
+}
+
+#[test]
+fn consumed_handle_tombstone_reads_back_through_its_reader() {
+    // A close that consumes a handle records its kind, and on macOS the adapter's reason.
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join("terminal.json"),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "missing-iterm-session".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let outcome = close(
+        &store,
+        None,
+        crate::native::session::close::budget::close_deadline(),
+        |_| {
+            Ok(terminal::CloseResult {
+                outcome: terminal::CloseOutcome::Missing,
+                reason: Some("the tab was already gone".to_owned()),
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome, terminal::CloseOutcome::Missing);
+    assert!(!directory.path().join("terminal.json").exists());
+    assert_eq!(
+        Reader::open_unchecked(directory.path())
+            .terminal_closed()
+            .unwrap(),
+        TerminalTombstone {
+            consumed: true,
+            terminal: Some(terminal::TerminalKind::Iterm2),
+            reason: cfg!(target_os = "macos").then(|| "the tab was already gone".to_owned()),
+        }
+    );
+
+    // A close that finds no handle records no kind.
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Closed, None, None).unwrap();
+    let store = Store::open_unchecked(directory.path());
+    close(
+        &store,
+        None,
+        crate::native::session::close::budget::close_deadline(),
+        |_| unreachable!("no handle to close"),
+    )
+    .unwrap();
+    assert_eq!(
+        Reader::open_unchecked(directory.path())
+            .terminal_closed()
+            .unwrap(),
+        TerminalTombstone {
+            consumed: true,
+            terminal: None,
+            reason: None,
+        }
+    );
 }
 
 #[test]
