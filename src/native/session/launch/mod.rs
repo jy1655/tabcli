@@ -755,12 +755,24 @@ fn uncertain(reader: &Reader) -> bool {
         .is_some_and(|record| record.phase == Phase::Spawning)
 }
 
+/// What [`diagnostic`] concludes about a launch that has not recorded its spawn. A closed
+/// set: each renderer maps it to its own public vocabulary exhaustively.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum Verdict {
+    /// The session failed while the record shows a spawn in progress: a provider may exist.
+    Uncertain,
+    /// The session failed while the launch was pending: no provider process was started.
+    Failed,
+    /// The current claim's launch deadline expired while the session was still launching.
+    Timeout,
+}
+
 /// Called with the read-only snapshot's lifecycle lock held.
 pub(in crate::native) fn diagnostic(
     record: Option<&Record>,
     status: &SessionStatus,
     claim: Option<&str>,
-) -> Option<(&'static str, String)> {
+) -> Option<(Verdict, String)> {
     let record = record?;
     if record.phase == Phase::Spawned {
         return None;
@@ -768,9 +780,9 @@ pub(in crate::native) fn diagnostic(
     if status.state == SessionState::Failed {
         return Some((
             if record.phase == Phase::Spawning {
-                "launch_uncertain"
+                Verdict::Uncertain
             } else {
-                "launch_failed"
+                Verdict::Failed
             },
             status
                 .error
@@ -782,7 +794,7 @@ pub(in crate::native) fn diagnostic(
         && claim == Some(&record.claim_token)
         && unix_ms() >= record.deadline_unix_ms
     {
-        return Some(("launch_timeout", "provider launch deadline expired; run sessions for this workspace to settle startup, then inspect the same request; do not resend".to_owned()));
+        return Some((Verdict::Timeout, "provider launch deadline expired; run sessions for this workspace to settle startup, then inspect the same request; do not resend".to_owned()));
     }
     None
 }
@@ -1326,6 +1338,57 @@ mod tests {
                 assert!(!store.record(CoreRecord::Terminal).path().exists());
             }
         }
+    }
+
+    #[test]
+    fn diagnostic_yields_each_verdict_only_for_an_unspawned_launch() {
+        let status = |state, error: Option<&str>| SessionStatus {
+            state,
+            generation: 1,
+            updated_unix_ms: 1,
+            exit_code: None,
+            error: error.map(str::to_owned),
+            residual_surface: None,
+        };
+        let record = |phase, deadline_unix_ms| Record {
+            schema: 1,
+            claim_token: "claim".to_owned(),
+            deadline_unix_ms,
+            phase,
+        };
+        let failed = status(SessionState::Failed, Some("spawn broke"));
+        assert_eq!(
+            diagnostic(Some(&record(Phase::Spawning, u128::MAX)), &failed, None),
+            Some((Verdict::Uncertain, "spawn broke".to_owned()))
+        );
+        assert_eq!(
+            diagnostic(
+                Some(&record(Phase::Pending, u128::MAX)),
+                &status(SessionState::Failed, None),
+                None
+            ),
+            Some((Verdict::Failed, "provider launch failed".to_owned()))
+        );
+        let launching = status(SessionState::Launching, None);
+        let expired = record(Phase::Pending, 1);
+        let (verdict, detail) = diagnostic(Some(&expired), &launching, Some("claim")).unwrap();
+        assert_eq!(verdict, Verdict::Timeout);
+        assert!(detail.starts_with("provider launch deadline expired;"));
+        // Another claim, a live deadline, a recorded spawn or no record yields none.
+        assert_eq!(diagnostic(Some(&expired), &launching, Some("other")), None);
+        assert_eq!(
+            diagnostic(
+                Some(&record(Phase::Spawning, u128::MAX)),
+                &launching,
+                Some("claim")
+            ),
+            None
+        );
+        assert_eq!(
+            diagnostic(Some(&record(Phase::Spawned, 1)), &failed, Some("claim")),
+            None
+        );
+        assert_eq!(diagnostic(None, &failed, None), None);
     }
 
     #[test]

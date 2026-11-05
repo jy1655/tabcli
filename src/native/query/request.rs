@@ -212,6 +212,24 @@ impl RequestObservation<'_> {
     }
 }
 
+/// The Request object for an address that no pass could observe because its session was
+/// busy: no Result was read, so elapsed time and usage have none either.
+pub(super) fn busy_request_value(session: &str, request_id: &str) -> Value {
+    let (elapsed, elapsed_reason) = observed_elapsed(None, None::<&SessionEvent>);
+    let (usage, usage_reason, usage_error) = reported_usage(None);
+    envelope::ok(
+        json!({
+            "session": session,
+            "request_id": request_id, "request_state": RequestState::Busy, "result": null,
+            "bridge_observed_elapsed_ms": elapsed, "bridge_observed_elapsed_reason": elapsed_reason,
+            "usage": usage, "usage_reason": usage_reason, "usage_error": usage_error,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+}
+
 pub(in crate::native) struct AttachmentFailure {
     pub(in crate::native) state: &'static str,
     pub(in crate::native) detail: Option<String>,
