@@ -45,6 +45,7 @@ Usage:
       [--sort <id|updated>] [--json]
   {PUBLIC_COMMAND} status [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>] [--all] [--json]
   {PUBLIC_COMMAND} inspect <session> [--timeline [--request REQUEST]] [--json]
+  {PUBLIC_COMMAND} screen <session> [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
   {PUBLIC_COMMAND} result <session> --request REQUEST --wait [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
@@ -233,6 +234,17 @@ Session policy:
   inspect --timeline reads preserved request, launch, completion and close evidence.
   --request filters request entries; session diagnostics remain separate. Unknown
   times are not inferred. This query never repairs, resends or closes a session.
+  screen reads once the visible text of the terminal surface that a session's
+  records bind, between two ownership checks like tell's, and withholds it unless
+  the same binding and owner hold after the read. It sends no input or key and
+  writes no record; the text stays out of logs and diagnostics. It addresses no
+  terminal application that is not running when it checks; one that quits before
+  the read can be started again by the scripting call. On native Windows a caller
+  without a console can get a console window from the helper (unverified).
+  --timeout-secs (default 10) is the deadline of these calls; on macOS a call that
+  times out adds a screen-lock probe of up to 0.5 s. The text is what the terminal
+  showed, not a request state, and can contain secrets the provider printed.
+  Closed sessions, Ghostty and Warp are refused.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.
 
@@ -431,7 +443,7 @@ mod tests {
             native::COMMANDS.len(),
             "duplicate registry name"
         );
-        assert_eq!(registered.len(), 18);
+        assert_eq!(registered.len(), 19);
         assert_eq!(
             native::COMMANDS.iter().filter(|entry| entry.hidden).count(),
             10
@@ -583,6 +595,38 @@ mod tests {
                 "wait requires at least one SESSION/REQUEST address",
             ),
             (vec!["wait", "--bad"], "unknown wait option: --bad"),
+            (vec!["screen"], "screen requires one session id"),
+            (
+                vec!["screen", "--json"],
+                "invalid Agent Bridge session id: \"--json\"",
+            ),
+            (
+                vec!["screen", "session-route", "--bad"],
+                "unknown screen option: --bad",
+            ),
+            (
+                vec!["screen", "session-route", "--json", "--json"],
+                "--json may only be specified once",
+            ),
+            (
+                vec!["screen", "session-route", "--timeout-secs", "0"],
+                "timeout must be greater than zero",
+            ),
+            (
+                vec!["screen", "session-route", "--timeout-secs"],
+                "--timeout-secs requires a value",
+            ),
+            (
+                vec![
+                    "screen",
+                    "session-route",
+                    "--timeout-secs",
+                    "5",
+                    "--timeout-secs",
+                    "5",
+                ],
+                "--timeout-secs may only be specified once",
+            ),
             (
                 vec!["wait", "broken"],
                 "invalid wait address \"broken\"; expected SESSION/REQUEST with a Bridge request id",
@@ -619,6 +663,11 @@ mod tests {
             "sessions [--workspace PATH]",
             "status [--workspace PATH | --all-workspaces]",
             "inspect <session> [--timeline [--request REQUEST]] [--json]",
+            "screen <session> [--timeout-secs N] [--json]",
+            "withholds it unless",
+            "terminal application that is not running when it checks",
+            "times out adds a screen-lock probe of up to 0.5 s",
+            "without a console can get a console window from the helper (unverified)",
             "result <session>",
             "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",

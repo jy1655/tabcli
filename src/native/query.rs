@@ -31,6 +31,7 @@ pub(super) mod observation;
 #[cfg(test)]
 mod question_presence_tests;
 pub(super) mod request;
+pub(super) mod screen;
 pub(super) mod search;
 pub(super) mod status;
 #[cfg(test)]

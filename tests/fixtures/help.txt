@@ -19,6 +19,7 @@ Usage:
       [--sort <id|updated>] [--json]
   tabcli status [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>] [--all] [--json]
   tabcli inspect <session> [--timeline [--request REQUEST]] [--json]
+  tabcli screen <session> [--timeout-secs N] [--json]
   tabcli result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
   tabcli result <session> --request REQUEST --wait [--timeout-secs N] [--json]
   tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
@@ -207,6 +208,17 @@ Session policy:
   inspect --timeline reads preserved request, launch, completion and close evidence.
   --request filters request entries; session diagnostics remain separate. Unknown
   times are not inferred. This query never repairs, resends or closes a session.
+  screen reads once the visible text of the terminal surface that a session's
+  records bind, between two ownership checks like tell's, and withholds it unless
+  the same binding and owner hold after the read. It sends no input or key and
+  writes no record; the text stays out of logs and diagnostics. It addresses no
+  terminal application that is not running when it checks; one that quits before
+  the read can be started again by the scripting call. On native Windows a caller
+  without a console can get a console window from the helper (unverified).
+  --timeout-secs (default 10) is the deadline of these calls; on macOS a call that
+  times out adds a screen-lock probe of up to 0.5 s. The text is what the terminal
+  showed, not a request state, and can contain secrets the provider printed.
+  Closed sessions, Ghostty and Warp are refused.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.
 

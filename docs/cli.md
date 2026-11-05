@@ -35,7 +35,9 @@ that the command pages leave out.
 `describe` does not inspect providers, settings or sessions, create a state root, repair records,
 or run a probe. Its build contract is not runtime capability or authorization. `possible_effects`
 lists effects across all forms of a command; consult `notes` for conditional effects. For example,
-`sessions` can repair records while `status` only observes them. Runtime evidence comes from
+`sessions` can repair records while `status` only observes them. `reads_surface` means that the
+command reads the visible text of a managed terminal surface: `screen` returns it, and `ask`,
+`reopen` and `self-test` read it for their launch dialog and composer gates. Runtime evidence comes from
 `status`, `inspect` and `doctor`; every action still checks its own current gates.
 
 Feature keys are scoped to their command. `result.features` containing `question_emissions`
@@ -731,6 +733,111 @@ a missing session, check the id and state-root override. If records changed duri
 the query; it sends nothing. For unreadable records, use `doctor SESSION` and keep the records for
 diagnosis. An `incomplete` timeline reports the evidence it could read; it does not fill the gaps
 with inferred events.
+
+## screen
+
+Use `screen` when a request stays pending and you need to see what the child's terminal shows,
+such as a dialog, an error, an update screen or a quota message, without touching it.
+
+```text
+tabcli screen SESSION [--timeout-secs N] [--json]
+```
+
+```sh
+tabcli screen session-K7m2Qx --json
+```
+
+```json
+{
+  "ok": true,
+  "session": "session-K7m2Qx",
+  "terminal": "iterm2",
+  "observed_unix_ms": 1791285120000,
+  "screen": "Do you trust the files in this folder?\n> 1. Yes, proceed\n  2. No, exit\n"
+}
+```
+
+`screen` reads once the visible text of the terminal surface that the session's own records bind.
+It reads the session status and surface records under the shared lifecycle lock that the other
+queries use and releases the lock before it addresses the terminal, so a slow terminal holds up no
+hook or `tell`. It then makes the surface ownership check that `tell` and the launch's dialog
+check make before they address a surface, and reads the screen only if the check passes. After
+the read it reads the binding again under a fresh lock and repeats the ownership check, and it
+returns the text only if the binding is the same handle and the second check verified the same
+owner record as the first. It sends no
+input, key, selection or activation request, starts no provider, and repairs, recovers, writes or
+closes nothing.
+
+The ownership check requires a handle bound to this session and a live recorded owner attached to
+the surface. On macOS the terminal adapter must find exactly the recorded surface (an iTerm2 session
+by its unique id, a Terminal.app tab by its window id and TTY, a WezTerm pane of the recorded GUI
+process) and report its TTY, and the recorded owner must be alive with its recorded birth, TTY and
+process groups on that TTY. On native Windows the recorded owner's process identity must match, and
+the console helper verifies the owner and the console root's identity again before it attaches to
+read the visible window of the console.
+
+The checks and the read are separate calls: the read addresses the recorded surface again without
+the owner. After the read the binding must be the same handle, and the owner record that the
+second check verifies must be identical to the one the first check verified. That record names
+the owner process and its birth (on macOS its start time, TTY and process groups; on native
+Windows its creation time and executable path), and each check found that process alive with
+that identity, on macOS also on the surface's TTY; on native Windows the console helper checks
+the console root at the read. A record replaced by one for another process of the session, or for
+the same pid with another birth, is refused even when that owner passes the check. This shows
+that one owner incarnation held the surface at both checks. It does not show that the owner held
+it throughout the read, which is atomic with neither check, and a close that starts after the
+second check is not seen. When the second check fails or verifies another owner, the session is
+closed or being closed, or its handle record changed or is gone, the command fails with `the
+terminal surface could not be confirmed as this session's after the read; the text is withheld`
+and its cause, and returns no text.
+
+`screen` addresses no terminal application that is not running when it checks. The iTerm2 and
+Terminal.app scripts ask whether the application is running before they address it and report a
+missing surface otherwise; an application that quits between that question and the next scripting
+call can be started again by that call, the same race that the presence and close scripts have.
+WezTerm is addressed only through the recorded GUI process's own socket with `--no-auto-start`.
+Like every scripted read, the first read from an application that has no macOS Automation consent
+for the terminal can show the system's consent prompt; see [macOS permissions](macos-permissions.md).
+
+On native Windows the read runs Bridge's console helper, which attaches to the session's console.
+The helper is started with the default creation flags, so a caller without a console of its own
+can get a console window from it, which can take the foreground. This is not verified; starting
+the screen helper detached is a follow-up.
+
+`--timeout-secs` (default 10 seconds) is the deadline of both ownership checks and the read, and
+nothing is retried. A read that ends close to the deadline can leave the second check no time,
+and its text is then withheld. On macOS a terminal call that times out is followed by a
+screen-lock probe of up to 0.5 seconds that explains the timeout, so the command can return up to
+that much after the deadline.
+
+Human output is the text alone, so it can be piped; control characters other than line feed and
+tab are escaped as in other human output. JSON `screen` is the text exactly as the adapter reported
+it, `terminal` is the recorded terminal kind, and `observed_unix_ms` is when Bridge received the
+text, not when the terminal drew it. At most 512 KiB of UTF-8 is returned: the limit is checked
+after the capture, so it bounds what is returned, not what the read holds in memory, and a larger
+screen fails instead of being cut.
+
+The text is what the terminal showed at one moment. Bridge does not interpret it, and it is not
+evidence of a request's state: read the request with `result`, `wait` or `inspect`. Do not type
+into the managed terminal to change what it shows. The text can contain secrets that the provider
+printed. Bridge does not write it to session records, logs or diagnostics. While a terminal call
+runs, its output is staged in a temporary file in the system temporary directory, which is unlinked
+as soon as it is created on macOS and, on Windows, held without sharing and deleted when it is
+closed; it is gone when the call ends. Anything that keeps the command's output keeps the text.
+
+| Recorded session | `screen` |
+|---|---|
+| `closed`, or a close tombstone | Refused from the records, before any terminal call |
+| Surface closed or being closed | Refused from the records, before any terminal call |
+| No active terminal handle, as during `launching` before the surface is bound | Refused from the records |
+| Handle bound to another session, or a terminal of another platform | Refused from the records |
+| Ghostty or Warp | Refused before any adapter: their scripting exposes no screen text |
+| Any other state, including `exited`, `failed` and an unrecognized state | Read when the ownership check passes, returned when the second check passes, refused or withheld otherwise |
+
+A stored `exited` or `failed` state does not prove that the surface or its owner has ended; a
+launch that missed its deadline, for example, can leave a provider dialog on a live surface. Once
+the recorded owner has ended, or before a launching session's owner has recorded itself, the
+ownership check refuses the read.
 
 ## result
 
@@ -1694,8 +1801,8 @@ refusal from `status.error` and never repairs such receipts.
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
 
-`status`, `inspect`, timeline, `result`, `wait`, `search`, and `doctor` only observe. They never repair, recover,
-resend, close, or write records. The public `sessions` command performs repair as documented above;
+`status`, `inspect`, timeline, `result`, `wait`, `search`, `doctor`, and `screen` only observe. They never repair,
+recover, resend, close, or write records; `screen` also reads a terminal surface. The public `sessions` command performs repair as documented above;
 its origin fields and the started-from report of `close-session` only observe.
 No query treats a missing result as an instruction to deliver the prompt again.
 
@@ -1958,6 +2065,13 @@ has not been confirmed. It persists independently of `error`, including after a 
 close. Only the terminal adapter's confirmed close or absence clears it. Older records with
 the residual-surface warning are recognized without being rewritten. Ordinary inspections omit
 this field; it grants no additional close authority.
+
+### screen
+
+Fields: `schema_version`, `ok`, `session`, `terminal`, `observed_unix_ms`, and `screen` (see
+[screen](#screen)). An error has `schema_version`, `ok: false`, `session` and `error`, and can
+carry the optional `failure_kind`: `unsupported` for Ghostty, Warp or a terminal of another
+platform, `timed_out` for a deadline that Bridge observed expire. No error carries screen text.
 
 ### result
 

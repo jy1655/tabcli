@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub(in crate::native) fn verified_windows_native_owner(
     directory: &Path,
     expected_session_id: &str,
-) -> Result<()> {
+) -> Result<NativeSessionOwner> {
     let owner_path = Reader::open_unchecked(directory)
         .record(CoreRecord::Owner)
         .path()
@@ -25,7 +25,8 @@ pub(in crate::native) fn verified_windows_native_owner(
         .as_ref()
         .context("Windows native-session owner is missing its process identity")?;
     super::verify_process_identity(owner.pid, identity.creation_time, &identity.executable_path)
-        .context("Windows native-session owner identity changed")
+        .context("Windows native-session owner identity changed")?;
+    Ok(owner)
 }
 
 // The console root runs the wrapper, and the wrapper records itself as the owner before
