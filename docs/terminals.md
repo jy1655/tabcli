@@ -137,7 +137,10 @@ Claude and Agy workspace-trust recognition requires the complete exact path on o
 line. A long path wrapped across rows is not an exact match. Use a wider terminal or the
 provider's own trust prompt; Bridge does not guess the wrapped path or approve a different
 dialog. If the launch has already failed, inspect and close that session before starting a
-new one. See the [macOS consent verification](verification/2026-10-27-macos-28-consent.md)
+new one. A prompt that Bridge delivers after launch was not sent; while the session is still
+`awaiting-initial-input`, its request is recorded as `failed`, and [ask](cli.md#ask) describes
+the other outcomes.
+See the [macOS consent verification](verification/2026-10-27-macos-28-consent.md)
 for the measured layouts and their limits.
 
 Bridge expects Ghostty at `/Applications/Ghostty.app` with the required native scripting commands.

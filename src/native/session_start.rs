@@ -13,7 +13,7 @@ use crate::native::{
     create_session, delivery, native_delegation_prompt, sanitize_title, session_start, terminal,
     turn_run,
 };
-use agent_bridge::{FirstPartyCli, checked_deadline_from};
+use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, checked_deadline_from};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -406,14 +406,21 @@ impl Start {
                 ));
             }
         };
-        // Consent failure is neither a launcher failure nor a Delivery failure.
-        consent::complete_launch(
+        // Consent failure is neither a launcher failure nor a Delivery failure; whether it
+        // settles the Request is `settle_consent_failure`'s decision.
+        if let Err(error) = consent::complete_launch(
             &created.directory,
             provider,
             &terminal_session,
             &expected_claim_token,
             deadline,
-        )?;
+        ) {
+            return Err(settle_consent_failure(
+                &created.directory,
+                &mut initial_claim,
+                error,
+            ));
+        }
         initial_claim.startup_confirmed();
         let mut gate = |gate| source.gate(&created.directory, gate, deadline);
         turn_run::run(
@@ -449,6 +456,37 @@ impl Start {
                 )
             },
         )
+    }
+}
+
+// A consent failure after a confirmed launch sends no prompt. The Request is settled as a
+// delivery refusal (`delivery_not_sent`, with the consent text and its note on whether a
+// dialog key may have been sent) only when the session is still `awaiting-initial-input`
+// (the wrapper recorded that this provider's prompt is delivered after launch, and only
+// this start's delivery could have sent it), the Claim is still current in an unclosed
+// session, and the publication succeeds. Every other outcome is left as recorded for
+// inspection: an argument-delivered prompt (`running`) keeps its fenced Claim because the
+// provider has it; an ended or closed session, an unreadable status or a Claim that is no
+// longer current records nothing; an interrupted publication leaves the steps it reached,
+// and a journal it left is completed by the next lifecycle recovery.
+pub(super) fn settle_consent_failure(
+    directory: &Path,
+    claim: &mut turn::Claim,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let undelivered = Reader::open_unchecked(directory)
+        .status()
+        .is_ok_and(|status| status.state == SessionState::AwaitingInitialInput);
+    if !undelivered {
+        return error;
+    }
+    match claim.settle_delivery(turn::Delivery::NotSent(&error)) {
+        Ok(()) => error,
+        // An interrupted settlement can stop at any of its steps, before or after the
+        // event, the status or the Claim release: the records, not this error, say which.
+        Err(refusal) => error.context(format!(
+            "the not-sent settlement did not complete and may or may not have recorded the refusal; read this request's recorded outcome with `{PUBLIC_COMMAND} result` or `{PUBLIC_COMMAND} inspect`: {refusal:#}"
+        )),
     }
 }
 

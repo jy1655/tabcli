@@ -222,6 +222,15 @@ the surface shows the composer instead of a trust dialog, or input remains withh
 close the session and start a new one. Do not resend after uncertain delivery. For other providers,
 inspect the session if no dialog is present.
 
+If answering the trust dialog with verified consent fails, the error keeps any note that a key may
+have reached the dialog. A prompt that Bridge delivers after launch (Claude, and Agy on native
+Windows) was not sent. While the session is still `awaiting-initial-input` and the request still
+holds its claim, Bridge records the request as `failed` with `provenance: "delivery_not_sent"` and
+the session as `failed`; close it and start a new one. Other outcomes are left as recorded for
+inspection: an argument-delivered prompt (Agy on macOS) keeps its claim because Agy already has
+it; a provider that exited first, or a close, leaves the request `unresolved`; if recording the
+refusal is interrupted, the error says so, and `result` reports what was recorded.
+
 For timeout or delivery errors, follow the
 [shared recovery instructions](#shared-prompt-and-output-options).
 
@@ -1793,7 +1802,8 @@ Request states reported by `result` are `completed`, `failed`, `cancelled`, `pen
 consistent observation. `cancelled` occurs only for a correlated provider interruption (see
 [cancel](#cancel)). `accepted` is the detached command acknowledgement, not a published result.
 A follow-up or initial prompt that Bridge refused before anything was sent (a preparation, budget,
-hold or transport refusal) is `failed`: Bridge records a failure event for the receipt whose
+hold or transport refusal, or a trust-dialog failure while the session still awaits a prompt
+delivered after launch) is `failed`: Bridge records a failure event for the receipt whose
 `error` is the refusal text and whose `provenance` is `delivery_not_sent`, with no provider
 session or turn id. `unresolved` is a receipt without any event: a refusal recorded by an earlier
 Bridge release, a reopened-conversation refusal, or a claim-stage race. Bridge never infers a
