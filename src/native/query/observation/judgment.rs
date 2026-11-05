@@ -7,7 +7,7 @@ use crate::native::reopen::ResumedFrom;
 use crate::native::session::ResidualSurface;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation, attest_owner};
 use crate::native::session::snapshot::Snapshot;
-use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus};
+use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalKind;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use agent_bridge::process_is_alive;
@@ -161,7 +161,7 @@ impl OwnerJudgment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::native) enum Turn {
     LaunchFailed {
-        reason: &'static str,
+        verdict: launch::Verdict,
         detail: String,
     },
     /// A turn is claimed with a recorded error while the session works and no completion
@@ -173,10 +173,10 @@ pub(in crate::native) enum Turn {
 
 pub(in crate::native) fn turn(
     records: &Snapshot,
-    launch_failure: Option<(&'static str, String)>,
+    launch_failure: Option<(launch::Verdict, String)>,
 ) -> Turn {
-    if let Some((reason, detail)) = launch_failure {
-        return Turn::LaunchFailed { reason, detail };
+    if let Some((verdict, detail)) = launch_failure {
+        return Turn::LaunchFailed { verdict, detail };
     }
     match (&records.claim, &records.status.error) {
         (Some(_), Some(_))
@@ -493,7 +493,7 @@ impl Judgments {
         evidence: &SessionEvidence,
         cancel: Option<&CancelObservation>,
         resumed_from: &Result<Option<ResumedFrom>>,
-        launch_failure: Option<(&'static str, String)>,
+        launch_failure: Option<(launch::Verdict, String)>,
         active_state: Option<Result<RequestState>>,
         session: &str,
     ) -> Self {
@@ -529,7 +529,7 @@ impl Judgments {
 #[cfg(test)]
 pub(in crate::native) mod tests {
     use super::*;
-    use crate::native::session::launch::{self, Phase};
+    use crate::native::session::launch::Phase;
     use crate::native::session::requests::Receipt;
     use crate::native::session::schema::{SessionEvent, SessionManifest};
     use crate::native::session::turn::PendingTurnCompletion;
@@ -901,10 +901,10 @@ pub(in crate::native) mod tests {
             assert_eq!(
                 turn(
                     &records,
-                    Some(("launch_failed", "provider launch failed".into()))
+                    Some((launch::Verdict::Failed, "provider launch failed".into()))
                 ),
                 Turn::LaunchFailed {
-                    reason: "launch_failed",
+                    verdict: launch::Verdict::Failed,
                     detail: "provider launch failed".into()
                 },
                 "{name}: the launch diagnostic overrides"
@@ -1518,14 +1518,14 @@ pub(in crate::native) mod tests {
             &evidence,
             None,
             &Ok(None),
-            Some(("launch_failed", "provider launch failed".into())),
+            Some((launch::Verdict::Failed, "provider launch failed".into())),
             None,
             SESSION,
         );
         assert!(matches!(
             judgments.turn,
             Turn::LaunchFailed {
-                reason: "launch_failed",
+                verdict: launch::Verdict::Failed,
                 ..
             }
         ));
