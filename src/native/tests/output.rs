@@ -237,3 +237,113 @@ fn envelope_command_output_order() {
         before
     );
 }
+
+#[test]
+fn a_parse_failure_prints_json_only_for_the_commands_describe_names() {
+    const CHILD: &str = "AGENT_BRIDGE_PARSE_FAILURE_OUTPUT_TEST";
+    // One argument list per public command that fails before the command does any work.
+    const CASES: &[(&str, &[&str])] = &[
+        ("describe", &["--bogus", "--json"]),
+        ("ask", &["codex", "--bogus", "--json"]),
+        ("self-test", &["codex", "--bogus", "--json"]),
+        ("tell", &["session-example", "--bogus", "--json"]),
+        ("hold", &["session-example", "--bogus", "--json"]),
+        ("cancel", &["session-example", "--bogus", "--json"]),
+        ("reopen", &["session-example", "--bogus", "--json"]),
+        ("sessions", &["--bogus", "--json"]),
+        ("status", &["--bogus", "--json"]),
+        ("inspect", &["session-example", "--bogus", "--json"]),
+        ("screen", &["session-example", "--bogus", "--json"]),
+        ("result", &["session-example", "--bogus", "--json"]),
+        ("wait", &["session-example/request-1", "--bogus", "--json"]),
+        ("search", &["needle", "--bogus", "--json"]),
+        ("doctor", &["--bogus", "--json"]),
+        ("consent", &["--bogus", "--json"]),
+        ("settings", &["--bogus", "--json"]),
+        ("prune-sessions", &["--bogus", "--json"]),
+        ("close-session", &["session-example", "--bogus", "--json"]),
+    ];
+    // The list in describe's common output note.
+    const JSON_ON_PARSE_FAILURE: [&str; 7] = [
+        "describe", "hold", "cancel", "screen", "wait", "status", "search",
+    ];
+    if std::env::var_os(CHILD).is_some() {
+        for (name, rest) in CASES {
+            println!("{name}_BEGIN");
+            let outcome = match parse_args(std::iter::once(*name).chain(rest.iter().copied())) {
+                // consent and settings check their arguments when they run, before any write.
+                Ok(command @ (NativeCommand::Consent(_) | NativeCommand::Settings(_))) => {
+                    run(command)
+                }
+                Ok(command) => panic!("{name} parsed: {command:?}"),
+                Err(error) => Err(error),
+            };
+            assert!(outcome.is_err(), "{name}");
+            println!("{name}_END");
+        }
+        // prune-sessions over a missing state root has nothing to remove.
+        println!("PRUNE_BEGIN");
+        run(parse_args([
+            "prune-sessions",
+            "--closed-before-days",
+            "1",
+            "--explicit",
+            "--json",
+        ])
+        .unwrap())
+        .unwrap();
+        println!("PRUNE_END");
+        return;
+    }
+    let mut public: Vec<_> = crate::native::COMMANDS
+        .iter()
+        .filter(|entry| entry.is_public())
+        .map(|entry| entry.name)
+        .collect();
+    let mut covered: Vec<_> = CASES.iter().map(|(name, _)| *name).collect();
+    public.sort_unstable();
+    covered.sort_unstable();
+    assert_eq!(covered, public, "every public command needs a case");
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("missing-state");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "native::tests::output::a_parse_failure_prints_json_only_for_the_commands_describe_names",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env(STATE_DIR_ENV, &state)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty(), "{:?}", output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let section = |name: &str| {
+        text.split(&format!("{name}_BEGIN\n"))
+            .nth(1)
+            .unwrap()
+            .split(&format!("{name}_END\n"))
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    for (name, _) in CASES {
+        let printed = section(name);
+        if JSON_ON_PARSE_FAILURE.contains(name) {
+            let value: serde_json::Value = serde_json::from_str(&printed)
+                .unwrap_or_else(|error| panic!("{name}: {error}: {printed:?}"));
+            assert_eq!(value["schema_version"], 1, "{name}");
+            assert_eq!(value["ok"], false, "{name}");
+            assert!(value["error"].is_string(), "{name}");
+        } else {
+            assert_eq!(printed, "", "{name} printed stdout on a parse failure");
+        }
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&section("PRUNE")).unwrap(),
+        serde_json::json!({"ok": true, "closed_before_days": 1, "pruned": []})
+    );
+    assert!(!state.exists(), "no case may create the state root");
+}
