@@ -95,6 +95,12 @@ Absent question fields do not prove that no question was asked.
 - Supply a missing fact only with an ordinary `tell` once the request has ended and the
   session is `ready`. It is a new request and does not resolve the earlier emission. Never
   send it while the request is pending or type into the managed terminal.
+- If the adopted contract's `result` features include `question_deflection`, a result with
+  `question_deflected: true` means Bridge refused a Claude child's question dialog and told the
+  child to end its turn with the question instead of finishing. Read the result and its
+  `question_emissions` (`tabcli result SESSION --request REQUEST --json`); relay the question to
+  the user with your own question tool, or answer it from your own context, then continue the
+  same session with `tell`. Never treat that result as a finished answer without reading it.
 - A Claude request still pending after an emission may be held by its question dialog. Check
   the actual terminal surface, or ask the user to: if the dialog is shown, report the request
   address and ask the user to answer it there; otherwise keep waiting or inspect the request.

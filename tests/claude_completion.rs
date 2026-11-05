@@ -81,9 +81,27 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         include_str!("../src/native/provider/claude/report.js"),
     )
     .unwrap();
+    // The question module imports the launch switch that prepare writes; a second copy
+    // runs with deflection off.
+    for (directory, deflect) in [
+        (root.path().to_owned(), true),
+        (root.path().join("off"), false),
+    ] {
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("questions.mjs"),
+            include_str!("../src/native/provider/claude/questions.js"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("config.js"),
+            format!("export const deflect = {deflect};\n"),
+        )
+        .unwrap();
+    }
     fs::write(
-        root.path().join("questions.mjs"),
-        include_str!("../src/native/provider/claude/questions.js"),
+        root.path().join("off").join("report.js"),
+        include_str!("../src/native/provider/claude/report.js"),
     )
     .unwrap();
     let harness = root.path().join("test.mjs");
@@ -107,6 +125,7 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         "questions",
         "questions_oversize",
         "questions_retry",
+        "questions_deflection",
         "coexistence",
     ]
     .iter()
@@ -211,9 +230,30 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
             .unwrap();
             assert_eq!(
                 record["items"].as_array().unwrap().len(),
-                if *scenario == "questions" { 2 } else { 1 }
+                match *scenario {
+                    "questions" => 2,
+                    "questions_deflection" => 8,
+                    _ => 1,
+                }
             );
             assert_eq!(record["incomplete"], *scenario != "questions_retry");
+            // Only the deflection scenario's refused and attributed calls carry the flag.
+            let deflected: Vec<_> = record["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item.get("deflected").is_some())
+                .map(|item| (item["id"].as_str().unwrap(), item["deflected"].clone()))
+                .collect();
+            if *scenario == "questions_deflection" {
+                assert_eq!(
+                    deflected,
+                    ["step:5/tool:1", "step:6/tool:1", "step:7/tool:1"]
+                        .map(|id| (id, Value::Bool(true)))
+                );
+            } else {
+                assert!(deflected.is_empty(), "{scenario}");
+            }
         }
         if *scenario == "oversize" {
             assert!(event["error"].as_str().unwrap().contains("not truncated"));

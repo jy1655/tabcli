@@ -55,7 +55,7 @@ fn contract_is_repeatable_without_providers_or_state_and_lists_public_commands()
     );
     assert_eq!(
         one["commands"][0]["features"],
-        serde_json::json!(["questions", "after_question"])
+        serde_json::json!(["questions", "after_question", "question_deflection"])
     );
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }

@@ -70,7 +70,7 @@ pub(super) const ASK: Contract = Contract {
         "--detach",
         "--json",
     ]],
-    features: &["context_result", "context_mode"],
+    features: &["context_result", "context_mode", "question_deflection"],
     notes: &[
         "Can repair a dead owner's records and close its remaining Windows console; recovery may also finish an interrupted close.",
         "Requires an installed, authenticated provider and supported terminal. Retain session and request_id even on errors.",
@@ -123,7 +123,7 @@ pub(super) const TELL: Contract = Contract {
         "--detach",
         "--json",
     ]],
-    features: &["context_result", "context_mode"],
+    features: &["context_result", "context_mode", "question_deflection"],
     notes: &[
         "Can repair a dead owner's records and close its remaining Windows console; recovery may also finish an interrupted close.",
         "Requires ready, unheld state and the provider's delivery gates. A pending request cannot receive tell.",
@@ -169,10 +169,11 @@ pub(super) const SETTINGS: Contract = Contract {
         "settings macos-open-mode <tab-first|new-window> [--json]",
         "settings codex-memory-workspace <refuse|allow> [--json]",
         "settings codex-lifecycle-hooks <on|off> [--json]",
+        "settings claude-question-deflection <on|off> [--json]",
     ],
     possible_effects: &[ReadsRecords, WritesRecords],
     examples: &[&["settings", "--json"]],
-    features: &["codex_lifecycle_hooks"],
+    features: &["codex_lifecycle_hooks", "claude_question_deflection"],
     notes: &[
         "No setting arguments reads current settings; a name and value changes them. Success output is JSON without the common schema_version/ok envelope; errors are reported on stderr without a JSON error object.",
     ],
@@ -200,7 +201,7 @@ pub(super) const REOPEN: Contract = Contract {
         "--detach",
         "--json",
     ]],
-    features: &[],
+    features: &["question_deflection"],
     notes: &[
         "Can repair a dead owner's records and close its remaining Windows console; recovery may also finish an interrupted close.",
         "Only Claude on native Windows is supported. Closed source, readable completed history and provider ownership checks are required; no exclusive provider hold is promised.",
@@ -216,11 +217,12 @@ pub(super) const INSPECT: Contract = Contract {
         "cancel_admission_observation",
         "tell_admission_observation",
         "question_capability_observation",
+        "question_deflection",
     ],
     notes: &[
         "Observes records without repair or publication. --request filters a timeline and requires --timeline.",
         "JSON capabilities.cancel reports what cancel's admission would decide at this snapshot; cancel rechecks it, and an admissible cancel records intent, not interruption or completion.",
-        "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and no answer path.",
+        "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and the configured answer path: deflected_to_result (answer with tell) or unsupported.",
     ],
 };
 pub(super) const RESULT: Contract = Contract {
@@ -237,7 +239,7 @@ pub(super) const RESULT: Contract = Contract {
         "request-1",
         "--json",
     ]],
-    features: &["question_emissions", "request_wait"],
+    features: &["question_emissions", "request_wait", "question_deflection"],
     notes: &[
         "Use the exact request_id, not --latest, when correlating a delegated task. --timeout-secs requires --wait and --wait requires --request.",
         "Question emissions do not prove shown, pending, executed or answered. Absent fields mean unknown observation, not no questions.",
@@ -257,7 +259,7 @@ pub(super) const WAIT: Contract = Contract {
         "60",
         "--json",
     ]],
-    features: &["questions", "after_question"],
+    features: &["questions", "after_question", "question_deflection"],
     notes: &[
         "ADDRESS is SESSION/REQUEST. --after-question requires --questions and a cursor belonging to one of the waited addresses.",
         "ended:null with question is not completion: retain remaining and use the returned after_question cursor. timed_out:true never cancels or retires a request.",
@@ -306,7 +308,7 @@ pub(super) const STATUS: Contract = Contract {
     ],
     possible_effects: &[ReadsRecords],
     examples: &[&["status", "--json"]],
-    features: &[],
+    features: &["question_deflection"],
     notes: &[
         "Observation is not a promise that a subsequent operation will pass its runtime gates.",
     ],

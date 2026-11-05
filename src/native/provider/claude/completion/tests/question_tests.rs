@@ -299,6 +299,166 @@ fn claude_questions_limit_includes_the_entire_pretty_encoded_record() {
     }
 }
 
+// The refused call's own questions, in the shape the emission of `questions(step, label)` has.
+fn deflected(step: u64, index: u64, label: &str) -> Value {
+    json!({"turnId":TURN,"step":step,"index":index,
+        "questions":questions(step, label)["items"][0]["questions"]})
+}
+
+fn deflected_ids(f: &Fixture) -> Vec<String> {
+    observe(f)
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|item| item.deflected)
+        .map(|item| item.id)
+        .collect()
+}
+
+#[test]
+fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
+    let f = Fixture::new();
+    f.start();
+    f.send("question.emissions", questions(0, "first"));
+    let path = format!("claude-questions-{}.json", f.token);
+    // A record without the flag (any record written before deflection existed) reads as not
+    // deflected, and an item that is not deflected is written without the field.
+    assert!(
+        !f.store()
+            .private(&path)
+            .text()
+            .unwrap()
+            .unwrap()
+            .contains("deflected")
+    );
+    assert!(deflected_ids(&f).is_empty());
+    f.send("question.deflected", deflected(0, 0, "first"));
+    assert_eq!(deflected_ids(&f), ["step:0/tool:0"]);
+    assert!(matches!(
+        observe(&f).unwrap().observation,
+        provider::QuestionObservation::Complete
+    ));
+    let saved: Value = f.store().private(&path).json().unwrap();
+    assert_eq!(saved["items"][0]["deflected"], true);
+    // Repeats and a replay of the same emission change nothing; the flag is not a conflict.
+    let before = snapshot(f.root.path());
+    f.send("question.deflected", deflected(0, 0, "first"));
+    f.send("question.emissions", questions(0, "first"));
+    assert_eq!(snapshot(f.root.path()), before);
+    // A later emission is retained unflagged; the earlier flag stays.
+    f.send("question.emissions", questions(1, "second"));
+    assert_eq!(deflected_ids(&f), ["step:0/tool:0"]);
+    assert_eq!(observe(&f).unwrap().items.len(), 2);
+    // An item the record lacks is never invented: the observation becomes incomplete.
+    f.send("question.deflected", deflected(2, 0, "first"));
+    let observation = observe(&f).unwrap();
+    assert_eq!(observation.items.len(), 2);
+    assert!(matches!(
+        observation.observation,
+        provider::QuestionObservation::Incomplete
+    ));
+    assert_eq!(deflected_ids(&f), ["step:0/tool:0"]);
+    f.retained();
+    f.complete_marked("QUESTION FOR CALLER: Which baseline? Options: Current, Previous");
+    assert_eq!(
+        f.events()[0].message,
+        "QUESTION FOR CALLER: Which baseline? Options: Current, Previous"
+    );
+    assert_eq!(deflected_ids(&f), ["step:0/tool:0"]);
+}
+
+#[test]
+fn claude_deflection_without_a_record_or_with_malformed_data_marks_only_incomplete() {
+    for data in [
+        deflected(0, 0, "first"),
+        // A repeated step can retain another question at the refused call's position.
+        deflected(0, 0, "another"),
+        json!({"turnId":TURN,"step":0,"index":0}),
+        json!({"turnId":TURN,"step":0,"index":0,"questions":[]}),
+        json!({"turnId":TURN,"step":0}),
+        json!({"turnId":TURN,"step":Value::Null,"index":0}),
+        json!({"turnId":TURN,"step":-1,"index":0}),
+        json!({"turnId":TURN,"step":0,"index":0.5}),
+        json!({"turnId":TURN,"step":0,"index":"0"}),
+    ] {
+        let f = Fixture::new();
+        f.start();
+        // The first case has no record at all; every other case has the item "first" retained.
+        let first = data == deflected(0, 0, "first");
+        if !first {
+            f.send("question.emissions", questions(0, "first"));
+        }
+        f.send("question.deflected", data.clone());
+        let observation = observe(&f).unwrap();
+        assert_eq!(observation.items.len(), usize::from(!first), "{data}");
+        assert!(
+            observation.items.iter().all(|item| !item.deflected),
+            "{data}"
+        );
+        assert!(
+            matches!(
+                observation.observation,
+                provider::QuestionObservation::Incomplete
+            ),
+            "{data}"
+        );
+        f.retained();
+    }
+}
+
+#[test]
+fn claude_deflection_requires_the_original_turn_and_a_live_session() {
+    let f = Fixture::new();
+    f.send("question.deflected", deflected(0, 0, "original"));
+    assert!(observe(&f).is_none(), "before the binding");
+    f.start();
+    f.send("question.emissions", questions(0, "original"));
+    let before = snapshot(f.root.path());
+    let mut other_turn = deflected(0, 0, "original");
+    other_turn["turnId"] = json!("next-turn");
+    f.send("question.deflected", other_turn);
+    let mut subagent = deflected(0, 0, "original");
+    subagent["agentId"] = json!("child");
+    f.send("question.deflected", subagent);
+    let mut wire = f.wire("question.deflected", deflected(0, 0, "original"));
+    wire["conversation"] = json!("00000000-0000-4000-8000-000000000999");
+    receive(f.root.path(), &wire).unwrap();
+    assert_eq!(snapshot(f.root.path()), before);
+    crate::native::session::update_status(f.root.path(), SessionState::Closed, None, None).unwrap();
+    let before = snapshot(f.root.path());
+    f.send("question.deflected", deflected(0, 0, "original"));
+    assert_eq!(snapshot(f.root.path()), before);
+    assert!(deflected_ids(&f).is_empty());
+}
+
+#[test]
+fn claude_deflection_that_would_exceed_the_record_limit_marks_the_record_full() {
+    let f = Fixture::new();
+    f.start();
+    f.send("question.emissions", questions(0, "x"));
+    let path = format!("claude-questions-{}.json", f.token);
+    let baseline = f.store().private(&path).text().unwrap().unwrap().len();
+    f.store().private(&path).remove().unwrap();
+    // The largest record that fits: the flag no longer does.
+    let label = "x".repeat(65536 - baseline + 1);
+    f.send("question.emissions", questions(0, &label));
+    assert_eq!(
+        f.store().private(&path).text().unwrap().unwrap().len(),
+        65536
+    );
+    f.send("question.deflected", deflected(0, 0, &label));
+    let saved: Value = f.store().private(&path).json().unwrap();
+    assert_eq!(saved["incomplete"], true);
+    assert_eq!(saved["full"], true);
+    assert!(saved["items"][0].get("deflected").is_none());
+    assert!(f.store().private(&path).text().unwrap().unwrap().len() <= 65536);
+    assert!(matches!(
+        observe(&f).unwrap().observation,
+        provider::QuestionObservation::Incomplete
+    ));
+    f.retained();
+}
+
 #[test]
 fn claude_questions_reject_mismatched_historical_identity_and_invalid_prefix() {
     let f = Fixture::new();

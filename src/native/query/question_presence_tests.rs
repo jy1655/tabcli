@@ -217,3 +217,135 @@ fn status_keeps_question_evidence_when_the_latest_event_disappears_before_decode
     assert!(value.get("question_emission_count").is_none());
     assert!(value.get("question_emissions").is_none());
 }
+
+/// A Claude record whose items at steps 0.. carry `deflected` as given.
+fn claude_record(directory: &Path, receipt: &requests::Receipt, deflected: &[bool]) {
+    let items: Vec<Value> = deflected
+        .iter()
+        .enumerate()
+        .map(|(step, deflected)| {
+            let mut item = json!({"id": format!("step:{step}/tool:0"), "questions": [
+                {"title": "Which baseline?", "options": ["Current", "Previous"]}]});
+            if *deflected {
+                item["deflected"] = json!(true);
+            }
+            item
+        })
+        .collect();
+    fs::write(
+        directory.join(format!("claude-questions-{}.json", receipt.claim_token)),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1, "request_id": receipt.request_id,
+            "binding": {"schema": 1, "claim": receipt.claim_token,
+                "correlation_id": "claude-turn-presence",
+                "conversation": "00000000-0000-4000-8000-000000000249", "turn_id": "turn-1"},
+            "items": items, "incomplete": false, "full": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn deflection_fields_appear_only_for_a_refused_call_and_count_its_items() {
+    let lines_without_deflection = |value: &Value| {
+        !question_lines(value)
+            .iter()
+            .any(|line| line.contains("deflected"))
+    };
+    for flags in [[true, false], [false, false]] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(SESSION);
+        fs::create_dir_all(directory.join("events")).unwrap();
+        write_test_manifest(&directory, "claude");
+        update_status(&directory, SessionState::Working, None, None).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
+        let receipt = claim.receipt().clone();
+        let token = claim.token().to_owned();
+        claim.retain();
+        claude_record(&directory, &receipt, &flags);
+        let pending = status::test_value_in(root.path())["sessions"][0]["active_request"].clone();
+        turn::Report::for_claim(
+            &Store::open_unchecked(&directory),
+            FirstPartyCli::Claude,
+            Some(&token),
+        )
+        .complete(
+            "QUESTION FOR CALLER: Which baseline? Options: Current, Previous",
+            None,
+            None,
+        )
+        .unwrap();
+        let before = tree(root.path());
+        let waited = wait::one(
+            root.path(),
+            SESSION,
+            &receipt.request_id,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let finished = Value::Object(finished_question_presence(&directory, &receipt.request_id));
+        let result =
+            request_result(&Reader::open_unchecked(&directory), &receipt.request_id).unwrap();
+        let reference =
+            inspect_value(&Reader::open_unchecked(&directory), SESSION).unwrap()["requests"][0]
+                .clone();
+        let latest = status::test_value_in(root.path())["sessions"][0]["latest_result"].clone();
+        assert_eq!(tree(root.path()), before, "queries must not write");
+        let items = result["question_emissions"].as_array().unwrap();
+        assert!(items[1].get("deflected").is_none());
+        if flags[0] {
+            assert_eq!(
+                finished,
+                json!({"question_emitted": true, "question_emission_count": 2,
+                    "question_deflected": true, "question_deflection_count": 1})
+            );
+            for value in [&waited, &result, &reference, &latest, &pending] {
+                assert_eq!(value["question_deflected"], true, "{value}");
+                assert_eq!(value["question_deflection_count"], 1, "{value}");
+            }
+            assert_eq!(items[0]["deflected"], true);
+            assert!(
+                question_lines(&waited).contains(
+                    &"question calls deflected (refused before their dialog; read the result): 1"
+                        .to_owned()
+                )
+            );
+            // The Result is reported as it was published: the flag does not change it.
+            assert_eq!(waited["request_state"], "completed");
+            assert_eq!(
+                waited["result"],
+                "QUESTION FOR CALLER: Which baseline? Options: Current, Previous"
+            );
+        } else {
+            assert_eq!(
+                finished,
+                json!({"question_emitted": true, "question_emission_count": 2})
+            );
+            for value in [&waited, &result, &reference, &latest, &pending] {
+                assert!(value.get("question_deflected").is_none(), "{value}");
+                assert!(value.get("question_deflection_count").is_none(), "{value}");
+            }
+            assert!(items[0].get("deflected").is_none());
+            assert!(lines_without_deflection(&waited));
+            assert!(lines_without_deflection(&result));
+        }
+    }
+}
+
+#[test]
+fn codex_outputs_carry_no_deflection_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let (directory, claim) = session(root.path());
+    let receipt = claim.receipt().clone();
+    let token = claim.token().to_owned();
+    claim.retain();
+    record(&directory, &receipt, false);
+    complete(&directory, &token);
+    let result = request_result(&Reader::open_unchecked(&directory), &receipt.request_id).unwrap();
+    let reference = inspect_value(&Reader::open_unchecked(&directory), SESSION).unwrap();
+    for value in [&result, &reference] {
+        assert!(!value.to_string().contains("deflect"), "{value}");
+    }
+    assert_eq!(result["question_emission_count"], 2);
+}

@@ -141,6 +141,7 @@ impl Questions {
                     }),
                 })
                 .collect(),
+            deflected: false,
         };
         if let Some(first) = self.items.iter().find(|first| first.id == id) {
             self.incomplete |= first != &candidate;

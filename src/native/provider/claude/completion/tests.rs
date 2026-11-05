@@ -807,6 +807,115 @@ fn both_platforms_select_native_mode_from_the_recorded_stable_version_only() {
 }
 
 #[test]
+fn prepare_records_question_deflection_from_the_setting_at_launch() {
+    use crate::native::provider::{NO_ADDRESSED_ANSWER_PATH, QuestionResponse};
+    let root = tempfile::tempdir().unwrap();
+    let launch = |id: &str| {
+        let directory = root.path().join(id);
+        std::fs::create_dir(&directory).unwrap();
+        Store::open_unchecked(&directory)
+            .write_manifest(&crate::native::session::schema::SessionManifest {
+                schema: 1,
+                id: id.into(),
+                provider: "claude".into(),
+                provider_path: "unused".into(),
+                provider_version: "2.1.318".into(),
+                workspace: root.path().into(),
+                title: "deflection fixture".into(),
+                model: None,
+                effort: None,
+                yolo: true,
+                created_unix_ms: 1,
+            })
+            .unwrap();
+        prepare(&directory, false).unwrap();
+        directory
+    };
+    let switch = |directory: &Path| {
+        std::fs::read_to_string(directory.join("claude-question-mod/hooks/config.js")).unwrap()
+    };
+    let record = |directory: &Path| {
+        Store::open_unchecked(directory)
+            .private(QUESTION_MODE_FILE)
+            .json::<Value>()
+            .unwrap()
+    };
+    let settings = root.path().join("settings.json");
+    // Without a settings record the default is on.
+    let on = launch("session-on");
+    assert_eq!(switch(&on), "export const deflect = true;\n");
+    assert_eq!(record(&on), json!({"schema": 1, "deflection": "on"}));
+    assert_eq!(
+        question_response(&on),
+        QuestionResponse::DeflectedToResult("plugin_configured_unverified")
+    );
+    std::fs::write(
+        &settings,
+        r#"{"schema":1,"claude_question_deflection":"off"}"#,
+    )
+    .unwrap();
+    let off = launch("session-off");
+    assert_eq!(switch(&off), "export const deflect = false;\n");
+    assert_eq!(record(&off), json!({"schema": 1, "deflection": "off"}));
+    assert_eq!(
+        question_response(&off),
+        QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH)
+    );
+    // Each session keeps its own launch decision; a later setting changes neither.
+    assert_eq!(
+        question_response(&on),
+        QuestionResponse::DeflectedToResult("plugin_configured_unverified")
+    );
+    // An unreadable settings record keeps the default and says so in the launch log.
+    std::fs::write(&settings, "{").unwrap();
+    let unreadable = launch("session-unreadable");
+    assert_eq!(switch(&unreadable), "export const deflect = true;\n");
+    assert_eq!(
+        record(&unreadable),
+        json!({"schema": 1, "deflection": "on"})
+    );
+    let log = Reader::open_unchecked(&unreadable)
+        .private("launch.log")
+        .text()
+        .unwrap()
+        .unwrap();
+    assert!(
+        log.contains("settings could not be read, using question deflection on"),
+        "{log}"
+    );
+    // Legacy completion mode has no answer path; an unreadable record is unknown.
+    let store = Store::open_unchecked(&on);
+    for (bytes, unknown) in [
+        (&br#"{"schema":2,"deflection":"on"}"#[..], true),
+        (&b"{"[..], true),
+    ] {
+        store.private(QUESTION_MODE_FILE).remove().unwrap();
+        store
+            .private(QUESTION_MODE_FILE)
+            .write_private(bytes)
+            .unwrap();
+        assert_eq!(
+            matches!(question_response(&on), QuestionResponse::Unknown(_)),
+            unknown
+        );
+    }
+    store.private(QUESTION_MODE_FILE).remove().unwrap();
+    assert_eq!(
+        question_response(&on),
+        QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH)
+    );
+    store
+        .private(QUESTION_MODE_FILE)
+        .write_json(&json!({"schema": 1, "deflection": "on"}))
+        .unwrap();
+    store.private(MODE_FILE).remove().unwrap();
+    assert_eq!(
+        question_response(&on),
+        QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH)
+    );
+}
+
+#[test]
 fn missing_or_malformed_recorded_versions_never_configure_a_launch() {
     for windows in [false, true] {
         for manifest in [None, Some(b"{".as_slice()), Some(b"{}".as_slice())] {
