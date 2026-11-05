@@ -2,7 +2,9 @@
 use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
-use schema::{ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest};
+use schema::{
+    ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest, TerminalTombstone,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -221,7 +223,7 @@ impl Reader {
     pub(in crate::native) fn terminal(&self) -> Result<terminal::TerminalSession> {
         self.private(TERMINAL_HANDLE_FILE).json()
     }
-    pub(in crate::native) fn terminal_closed(&self) -> Result<terminal::TerminalSession> {
+    pub(in crate::native) fn terminal_closed(&self) -> Result<TerminalTombstone> {
         self.private(TERMINAL_TOMBSTONE_FILE).json()
     }
     pub(in crate::native) fn provider_process(&self) -> Result<ProviderProcessRecord> {

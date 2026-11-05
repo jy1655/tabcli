@@ -502,6 +502,46 @@ fn exact_title_lookup_never_selects_other_sessions_and_is_read_only() {
 }
 
 #[test]
+fn metadata_keeps_the_terminal_kind_after_close_consumes_the_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let installed = Installed {
+        executable: PathBuf::from("unused"),
+        root: root.path().to_owned(),
+        isolated: true,
+    };
+    let directory = root.path().join("session-owned");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    write_json_atomic(&directory.join("manifest.json"), &json!({"schema":1,"id":"session-owned","provider":"claude","provider_path":"unused","provider_version":"2.1.281","workspace":root.path(),"title":"unrelated","model":null,"effort":null,"yolo":false,"created_unix_ms":1})).unwrap();
+    write_json_atomic(&directory.join("status.json"), &json!({"schema":1,"state":"working","pid":std::process::id(),"updated_unix_ms":1,"error":null})).unwrap();
+    write_json_atomic(
+        &directory.join("terminal.json"),
+        &crate::native::terminal::TerminalSession {
+            kind: crate::native::terminal::TerminalKind::Iterm2,
+            id: "missing-iterm-session".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    let expected = ("2.1.281".to_owned(), Some("iterm2".to_owned()));
+    assert_eq!(installed.metadata("session-owned").unwrap(), expected);
+
+    crate::native::session::close::close(
+        &crate::native::session::Store::open_unchecked(&directory),
+        None,
+        crate::native::session::close::budget::close_deadline(),
+        |_| Ok(crate::native::terminal::CloseOutcome::Missing.into()),
+    )
+    .unwrap();
+    assert!(!directory.join("terminal.json").exists());
+    assert!(directory.join("terminal.closed.json").is_file());
+    assert_eq!(installed.metadata("session-owned").unwrap(), expected);
+}
+
+#[test]
 fn ambiguous_title_lookup_never_closes_anything() {
     for sessions in [
         vec![],
