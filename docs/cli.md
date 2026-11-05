@@ -763,7 +763,8 @@ queries use and releases the lock before it addresses the terminal, so a slow te
 hook or `tell`. It then makes the surface ownership check that `tell` and the launch's dialog
 check make before they address a surface, and reads the screen only if the check passes. After
 the read it reads the binding again under a fresh lock and repeats the ownership check, and it
-returns the text only if the binding is the same handle and the check passes again. It sends no
+returns the text only if the binding is the same handle and the second check verified the same
+owner record as the first. It sends no
 input, key, selection or activation request, starts no provider, and repairs, recovers, writes or
 closes nothing.
 
@@ -776,12 +777,19 @@ the console helper verifies the owner and the console root's identity again befo
 read the visible window of the console.
 
 The checks and the read are separate calls: the read addresses the recorded surface again without
-the owner. The second check shows that the same binding and the same live owner incarnation held
-the surface before and after the read. It is not atomic with the read, and a close that starts
-after the second check is not seen. When the second check fails, the session is closed or being
-closed, or its handle record changed or is gone, the command fails with `the terminal surface could
-not be confirmed as this session's after the read; the text is withheld` and its cause, and
-returns no text.
+the owner. After the read the binding must be the same handle, and the owner record that the
+second check verifies must be identical to the one the first check verified. That record names
+the owner process and its birth (on macOS its start time, TTY and process groups; on native
+Windows its creation time and executable path), and each check found that process alive with
+that identity, on macOS also on the surface's TTY; on native Windows the console helper checks
+the console root at the read. A record replaced by one for another process of the session, or for
+the same pid with another birth, is refused even when that owner passes the check. This shows
+that one owner incarnation held the surface at both checks. It does not show that the owner held
+it throughout the read, which is atomic with neither check, and a close that starts after the
+second check is not seen. When the second check fails or verifies another owner, the session is
+closed or being closed, or its handle record changed or is gone, the command fails with `the
+terminal surface could not be confirmed as this session's after the read; the text is withheld`
+and its cause, and returns no text.
 
 `screen` addresses no terminal application that is not running when it checks. The iTerm2 and
 Terminal.app scripts ask whether the application is running before they address it and report a

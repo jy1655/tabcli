@@ -37,6 +37,8 @@ struct Fake {
     /// What happens to the session's records while the terminal answers the read.
     during_read: Option<fn(&Path)>,
     calls: RefCell<Vec<Call>>,
+    /// The pid and birth of the owner each passing check verified.
+    verified_owners: RefCell<Vec<(u32, Option<u64>)>>,
 }
 
 impl Fake {
@@ -47,6 +49,7 @@ impl Fake {
             screen: Ok(TEXT.to_owned()),
             during_read: None,
             calls: RefCell::new(Vec::new()),
+            verified_owners: RefCell::new(Vec::new()),
         }
     }
 
@@ -69,7 +72,7 @@ impl SurfaceAccess for Fake {
         surface: &terminal::TerminalSession,
         deadline: Instant,
         requested: Duration,
-    ) -> Result<()> {
+    ) -> Result<Option<NativeSessionOwner>> {
         self.assert_unlocked();
         let checks = self
             .calls
@@ -88,7 +91,16 @@ impl SurfaceAccess for Fake {
             .get(checks)
             .copied()
             .unwrap_or(Ok(()))
-            .map_err(|error| anyhow::anyhow!(error))
+            .map_err(|error| anyhow::anyhow!(error))?;
+        // As the real check does, verify whatever owner the record names now.
+        let owner =
+            observation::SessionEvidence::read_owner(&Reader::open_unchecked(directory)).unwrap();
+        if let Some(owner) = &owner {
+            self.verified_owners
+                .borrow_mut()
+                .push((owner.pid, owner.process_start_seconds));
+        }
+        Ok(owner)
     }
 
     fn read(&self, surface: &terminal::TerminalSession, deadline: Instant) -> Result<String> {
@@ -121,6 +133,9 @@ impl Fixture {
                 .write_terminal(surface)
                 .unwrap();
         }
+        Store::open_unchecked(&directory)
+            .write_owner(&owner(4242, 1_790_000_000))
+            .unwrap();
         // The lifecycle lock exists, as in every current session, so that the query's
         // shared lock is real and the fake's exclusive probe creates nothing.
         drop(Store::open_unchecked(&directory).try_lock().unwrap());
@@ -144,6 +159,17 @@ impl Fixture {
         let deadline = Instant::now() + requested;
         let outcome = observe(&self.directory, ID, deadline, requested, access);
         (outcome, deadline, requested)
+    }
+}
+
+/// An owner record of this session; a check of the fake verifies whichever the record names.
+fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
+    NativeSessionOwner {
+        pid,
+        managed_session_id: Some(ID.into()),
+        process_start_seconds: Some(start_seconds),
+        process_start_microseconds: Some(0),
+        ..NativeSessionOwner::default()
     }
 }
 
@@ -305,6 +331,57 @@ fn a_second_ownership_check_that_fails_withholds_the_text() {
         access.calls.borrow().as_slice(),
         [Call::Verify { .. }, Call::Read { .. }, Call::Verify { .. }]
     ));
+}
+
+// The handle stays the same and each check passes for the owner its record names, but the
+// record names another incarnation after the read: another process of the session, or the
+// same pid with a later birth.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn an_owner_replaced_during_the_read_withholds_the_text() {
+    type Change = fn(&Path);
+    let replacements: [(Change, (u32, Option<u64>)); 2] = [
+        (
+            |directory| {
+                Store::open_unchecked(directory)
+                    .write_owner(&owner(5151, 1_790_000_000))
+                    .unwrap()
+            },
+            (5151, Some(1_790_000_000)),
+        ),
+        (
+            |directory| {
+                Store::open_unchecked(directory)
+                    .write_owner(&owner(4242, 1_790_000_009))
+                    .unwrap()
+            },
+            (4242, Some(1_790_000_009)),
+        ),
+    ];
+    for (replace, second) in replacements {
+        let surface = handle(host_kind(), Some(ID));
+        let fixture = Fixture::new(SessionState::Working, Some(&surface));
+        let mut access = Fake::new(&fixture);
+        access.during_read = Some(replace);
+        let error = withheld(&access, &fixture);
+        assert!(
+            error
+                .ends_with("the owner verified after the read is not the owner verified before it"),
+            "{error}"
+        );
+        assert_eq!(
+            *access.verified_owners.borrow(),
+            [(4242, Some(1_790_000_000)), second]
+        );
+        assert!(matches!(
+            access.calls.borrow().as_slice(),
+            [
+                Call::Verify { surface: first, .. },
+                Call::Read { .. },
+                Call::Verify { surface: again, .. },
+            ] if first == &surface && again == &surface
+        ));
+    }
 }
 
 #[cfg(any(target_os = "macos", windows))]

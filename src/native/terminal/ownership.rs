@@ -294,25 +294,43 @@ pub(in crate::native) fn verify_terminal_surface_ownership_with_timeout(
     session: &terminal::TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<()> {
+    verified_terminal_surface_owner(directory, expected_session_id, session, timeout).map(|_| ())
+}
+
+/// The same check, returning the owner record whose live incarnation it verified; `None`
+/// on a platform without a managed terminal, where no owner is verified.
+pub(in crate::native) fn verified_terminal_surface_owner(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    timeout: Option<Duration>,
+) -> Result<Option<NativeSessionOwner>> {
     session.verify_managed_session(expected_session_id)?;
     #[cfg(windows)]
-    {
+    let owner = {
         let _ = timeout;
-        verified_windows_native_owner(directory, expected_session_id)?;
-    }
+        Some(verified_windows_native_owner(
+            directory,
+            expected_session_id,
+        )?)
+    };
     #[cfg(target_os = "macos")]
-    {
+    let owner = {
         let surface_tty = terminal::verify_macos_surface(directory, session, timeout)?;
-        verified_macos_terminal_owner(
+        let (owner, _) = verified_macos_terminal_owner(
             directory,
             expected_session_id,
             session,
             surface_tty.as_deref(),
         )?;
-    }
+        Some(owner)
+    };
     #[cfg(not(any(target_os = "macos", windows)))]
-    let _ = (directory, timeout);
-    Ok(())
+    let owner = {
+        let _ = (directory, timeout);
+        None
+    };
+    Ok(owner)
 }
 
 pub(in crate::native) fn close_dead_owner_surface_until(

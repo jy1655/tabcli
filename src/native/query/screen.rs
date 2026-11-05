@@ -1,13 +1,15 @@
 //! `screen`: the visible text of a session's own terminal surface at one moment. The surface
 //! binding is read under the Snapshot's shared lifecycle lock, which is released before
 //! anything reaches the terminal. The surface is then proven with the ownership check that
-//! `tell` and the launch dialog make before they address it, read once through the shared
-//! dispatch, and the binding and the check are repeated before the text is returned. No
-//! input, key or selection request is sent and nothing is repaired or written. The text
-//! reaches no record, log or diagnostic, only each helper call's temporary output file.
+//! `tell` and the launch dialog make before they address it and read once through the shared
+//! dispatch. The text is returned only if the binding is still the same handle and a second
+//! check verifies the same owner record. No input, key or selection request is sent and
+//! nothing is repaired or written. The text reaches no record, log or diagnostic, only each
+//! helper call's temporary output file.
 use super::*;
 use crate::native::delivery;
 use crate::native::failure_kind::Unsupported;
+use crate::native::terminal::ownership::{NativeSessionOwner, verified_terminal_surface_owner};
 use observation::SurfaceRecord;
 use observation::judgment::{self, ActiveHandle, Surface};
 
@@ -66,7 +68,9 @@ pub(in crate::native) fn parse(args: &[String]) -> Result<NativeCommand> {
 /// The two terminal operations of a read. Production uses the installed terminals; tests
 /// replace both and observe what reaches them.
 trait SurfaceAccess {
-    /// The ownership check `tell` and the launch dialog make before they address a surface.
+    /// The ownership check `tell` and the launch dialog make before they address a surface,
+    /// returning the owner record whose live incarnation it verified (`None` where no
+    /// terminal is supported).
     fn verify(
         &self,
         directory: &Path,
@@ -74,7 +78,7 @@ trait SurfaceAccess {
         surface: &terminal::TerminalSession,
         deadline: Instant,
         requested: Duration,
-    ) -> Result<()>;
+    ) -> Result<Option<NativeSessionOwner>>;
     /// One read through the shared dispatch, which answers a declared refusal itself.
     fn read(&self, surface: &terminal::TerminalSession, deadline: Instant) -> Result<String>;
 }
@@ -89,10 +93,10 @@ impl SurfaceAccess for Installed {
         surface: &terminal::TerminalSession,
         deadline: Instant,
         requested: Duration,
-    ) -> Result<()> {
-        delivery::verify_terminal_surface_ownership_until(
-            directory, id, surface, deadline, requested,
-        )
+    ) -> Result<Option<NativeSessionOwner>> {
+        // As `delivery::verify_terminal_surface_ownership_until`, keeping the owner.
+        let timeout = delivery::remaining_turn_timeout(deadline, requested)?;
+        verified_terminal_surface_owner(directory, id, surface, Some(timeout))
     }
 
     fn read(&self, surface: &terminal::TerminalSession, deadline: Instant) -> Result<String> {
@@ -162,7 +166,7 @@ fn observe(
             surface.kind.display_name()
         ))));
     }
-    access
+    let owner = access
         .verify(directory, id, &surface, deadline, requested)
         .context(
             "the recorded terminal surface was not verified as this session's; nothing was read",
@@ -181,10 +185,10 @@ fn observe(
         );
     }
     // The adapters address the recorded ids again for the read, without the owner, and a
-    // close can begin after the first Snapshot. The same binding and the same live owner
-    // after the read show that this session held the surface on both sides of it; that is
-    // not atomic with the read.
-    confirm(directory, id, &surface, deadline, requested, access).context(
+    // close can begin after the first Snapshot. The same handle, and a second check of the
+    // same owner record, show that one owner incarnation held the surface at both checks;
+    // not that it held it throughout the read, and not a close begun after the second check.
+    confirm(directory, id, &surface, &owner, deadline, requested, access).context(
         "the terminal surface could not be confirmed as this session's after the read; the text is withheld",
     )?;
     Ok(Screen {
@@ -195,11 +199,13 @@ fn observe(
 }
 
 /// The binding read again under a fresh Snapshot's shared lock, required to be the handle
-/// that was read, then the same ownership check within the same deadline.
+/// that was read, then the same ownership check within the same deadline, required to have
+/// verified the owner record the first check verified.
 fn confirm(
     directory: &Path,
     id: &str,
     surface: &terminal::TerminalSession,
+    owner: &Option<NativeSessionOwner>,
     deadline: Instant,
     requested: Duration,
     access: &dyn SurfaceAccess,
@@ -207,7 +213,14 @@ fn confirm(
     if bound_surface(&Reader::open_unchecked(directory), id, deadline)? != *surface {
         bail!("the recorded terminal handle changed during the read");
     }
-    access.verify(directory, id, surface, deadline, requested)
+    let again = access.verify(directory, id, surface, deadline, requested)?;
+    // Each check verified the live process its record names; a replaced record can name
+    // another incarnation that passes too. Whole-record equality, as the owner teardown's
+    // second attestation requires, covers the pid and its birth.
+    if serde_json::to_value(&again)? != serde_json::to_value(owner)? {
+        bail!("the owner verified after the read is not the owner verified before it");
+    }
+    Ok(())
 }
 
 /// The active handle bound to this session, read with its status under the Snapshot's
