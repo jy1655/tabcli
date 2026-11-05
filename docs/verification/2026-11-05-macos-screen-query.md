@@ -37,6 +37,18 @@ root and with the screen still locked: after `ask codex` completed with
 and a 781-character screen containing that line in 0.73 s for the three terminal calls; after
 `close-session` it exited 1 with the closed-session refusal.
 
+## Re-check after the owner comparison
+
+`5901627` makes the ownership check return the owner record it verified and requires the record
+verified after the read to be identical to the one verified before it; `tell`, the launch dialog
+and close call the same check and discard that value. With a debug build of that commit, SHA-256
+`e860f6e9d16f074d0edf06b18dc49e0919700f2195e97e0c7c5af7774eaaf058`, in another empty state
+root with the screen locked: `ask codex` completed with `SCREEN_CHECK_9087 ready`;
+`screen <session> --json` returned `ok: true` and the Codex TUI text containing that line; a
+following `tell` on the same session completed with `TELL_STILL_WORKS`; `close-session`
+closed it. An owner replaced between the two checks was not produced live; the unit test
+covers it.
+
 ## Not verified
 
 - Terminal.app and WezTerm reads; the Ghostty and Warp refusals against a live session; native
