@@ -12,12 +12,12 @@ use super::macos::process::{
 #[cfg(windows)]
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
 #[cfg(all(test, target_os = "macos"))]
-use crate::native::process_identity::{Gone, ProcessObservation};
+use crate::native::process_identity::Gone;
+use crate::native::process_identity::{Attested, ProcessObservation};
 #[cfg(target_os = "macos")]
 use crate::native::session::Reader;
 use crate::native::session::close::budget::close_remaining;
-#[cfg(all(test, target_os = "macos"))]
-use crate::native::session::owner::OwnerAttestation;
+use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 #[cfg(target_os = "macos")]
 use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", test))]
@@ -85,6 +85,9 @@ pub(in crate::native) struct NativeProcessIdentity {
     pub(in crate::native) process_start_microseconds: u64,
 }
 
+// What this probe requires of the owner record is stated over its attestation by
+// `SurfaceProbe::owner_requirement` below; the parity tests in `ownership/tests.rs` hold
+// the two together.
 #[cfg(any(target_os = "macos", test))]
 pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
     expected_session_id: &str,
@@ -126,6 +129,87 @@ pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
     let live_shell = process(live.parent_pid)?;
     verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
     Ok((owner, live))
+}
+
+/// The surface probe `tell` runs to prove that the recorded owner controls its surface.
+/// The host's probe is chosen here, once, as [`SurfaceProbe::HOST`]; every probe stays a
+/// value so that each platform's requirement is tested on every host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum SurfaceProbe {
+    /// macOS (`verify_native_terminal_owner_with`): the recorded birth, controlling TTY
+    /// device and both process groups must be present and match the live owner.
+    MacosControl,
+    /// Native Windows (`verified_windows_native_owner`): the recorded process identity must
+    /// be present and match the live owner.
+    WindowsProcess,
+    /// No terminal is supported on this platform, so no probe runs.
+    Unprobed,
+}
+
+/// What a probe's owner requirement says of a recorded owner, judged from its attestation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum OwnerRequirement {
+    /// The live incarnation matched every identity this probe compares (none where no
+    /// probe runs).
+    Met,
+    /// The owner is live, but an identity this probe compares changed or was never
+    /// recorded. A changed control identity is not a death.
+    ControlUnverified,
+    /// The recorded incarnation is gone: the probe refuses it, and that is a death, not a
+    /// changed identity.
+    Gone,
+    /// Cannot be told: the incarnation or its control identity could not be inspected.
+    Uninspected,
+}
+
+impl SurfaceProbe {
+    pub(in crate::native) const HOST: Self = if cfg!(target_os = "macos") {
+        Self::MacosControl
+    } else if cfg!(windows) {
+        Self::WindowsProcess
+    } else {
+        Self::Unprobed
+    };
+
+    /// What this probe requires of an owner record already bound to the session, judged
+    /// from the record's attestation (CONTEXT.md Attestation) instead of running the probe;
+    /// the binding and the surface are the caller's to judge. An attestation does not say
+    /// which control fields were recorded: a record with only some of them attests verified
+    /// when those match, and is met here although the macOS probe requires all of them.
+    pub(in crate::native) fn owner_requirement(
+        self,
+        attestation: &OwnerAttestation,
+    ) -> OwnerRequirement {
+        match &attestation.process {
+            ProcessObservation::Live(Attested::Incarnation) => match &attestation.control {
+                #[cfg(any(target_os = "macos", windows, test))]
+                ControlAttestation::Verified => OwnerRequirement::Met,
+                // Only macOS records a control identity that can change; the Windows probe
+                // compares the process identity the incarnation already matched.
+                #[cfg(any(target_os = "macos", test))]
+                ControlAttestation::Changed(_) => match self {
+                    Self::MacosControl => OwnerRequirement::ControlUnverified,
+                    Self::WindowsProcess | Self::Unprobed => OwnerRequirement::Met,
+                },
+                #[cfg(any(target_os = "macos", test))]
+                ControlAttestation::Unknown(_) => OwnerRequirement::Uninspected,
+                ControlAttestation::NotRecorded => self.uncompared(),
+            },
+            // A Windows record without its process identity is attested PID-only.
+            ProcessObservation::Live(Attested::PidOnly) => self.uncompared(),
+            ProcessObservation::Gone(_) => OwnerRequirement::Gone,
+            ProcessObservation::Unknown(_) => OwnerRequirement::Uninspected,
+        }
+    }
+
+    /// A live owner with no identity to compare: a PID-only record, or a recorded birth
+    /// without TTY and process groups.
+    fn uncompared(self) -> OwnerRequirement {
+        match self {
+            Self::MacosControl | Self::WindowsProcess => OwnerRequirement::ControlUnverified,
+            Self::Unprobed => OwnerRequirement::Met,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
