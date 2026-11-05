@@ -1290,7 +1290,10 @@ this Bridge executable would inject, then sends stdio JSON-RPC `initialize`, `in
 It creates no Bridge scratch files or configuration writes. This is `source: current_probe`,
 not evidence about a session's live configuration or hook execution. Each of Bridge's two keys
 reports `trustStatus`, `currentHash`, `expected_hash`, `hash_matches`, and `diagnostic`:
-`normalization drift` when the hashes differ. Both trusted and matching means `available`;
+`normalization drift` when the hashes differ. The override and the report add the
+[question notice](#question-notice) hook's key as a third only when a new launch would inject it:
+`codex-question-notice` and `codex-lifecycle-hooks` both `on` and a stable Codex 0.166.0 or newer.
+All reported keys trusted and matching means `available`;
 untrusted/modified/mismatched means `unavailable`. Missing executable/keys, malformed replies,
 errors and timeouts report `codex_hook_trust_unavailable` with a reason. Batch-only launchers
 that require a disk forwarder are unavailable for this file-free probe.
