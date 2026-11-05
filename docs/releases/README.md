@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.36](0.4.36.md) (2026-11-05): Read-only `screen` query for a managed session's terminal (#346); Claude question deflection (#340, #343) and a Codex question notice (#342, #351), both on by default; fixes for a launch whose trust-dialog answer failed, timeline receipt reporting, the Codex doctor's receipt read and Ghostty's screen refusal wording (#348, #347, #345, #350).
 - [0.4.35](0.4.35.md) (2026-11-05): Per-command `--help` pages from the describe contract (#338), and read-only `capabilities.tell` and `capabilities.questions` in JSON inspection (#339).
 - [0.4.34](0.4.34.md) (2026-11-04): Static command contract discovery, integration skill adoption with older-binary fallback, and read-only cancel admission observation in JSON inspection.
 - [0.4.33](0.4.33.md) (2026-10-30): Isolates a Claude caller's session identity in Codex, Agy and Pi commands, including the Codex queue (#335).
