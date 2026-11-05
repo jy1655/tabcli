@@ -2,7 +2,7 @@ use super::correlation::{correlated_prompt, established_codex_thread, valid_code
 use super::{ADAPTER, codex_version_supports_native_queue, read_pending_turn};
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::provider::NativeProviderAdapter;
-use crate::native::session::{CoreRecord, Reader, requests};
+use crate::native::session::{Reader, requests};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -150,12 +150,12 @@ fn notify_payload_check(directory: Option<&Path>) -> crate::native::diagnostics:
             "Inspect codex_lifecycle for this request's recorded observer state.",
         );
     }
-    let pending_request = Reader::open_unchecked(directory)
-        .record(CoreRecord::Requests)
-        .child(&format!("{}.json", pending.claim_token))
-        .json::<requests::Receipt>()
-        .ok()
-        .map(|receipt| receipt.request_id);
+    // The decoder `result` and `inspect` use: a receipt they refuse names no request here.
+    let pending_request =
+        requests::for_claim(&Reader::open_unchecked(directory), &pending.claim_token)
+            .ok()
+            .flatten()
+            .map(|receipt| receipt.request_id);
     let executable_units = std::env::current_exe()
         .map(|path| path.to_string_lossy().encode_utf16().count())
         .unwrap_or(0);
