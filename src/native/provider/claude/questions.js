@@ -43,12 +43,14 @@ function observed(stream, step) {
 }
 
 // A refusal marks the retained emission only when the step's engine/core evidence holds the
-// same projected questions at the refused call's position. Otherwise no item is named.
+// same projected questions at the refused call's position. Otherwise no item is named. The
+// wire carries the refused questions: a repeated step can leave an earlier question retained
+// at this position, and Bridge sets the flag only on an item with the same text and labels.
 async function attribute($, step, refusal) {
   const evidence = step.keys.get(refusal.index);
   if (evidence !== undefined && evidence === refusal.key) {
-    await report($, "question.deflected",
-      { turnId: step.turnId, step: step.index, index: refusal.index }, step.conversation);
+    await report($, "question.deflected", { turnId: step.turnId, step: step.index,
+      index: refusal.index, questions: refusal.questions }, step.conversation);
   } else {
     await report($, "question.emissions",
       { turnId: step.turnId, step: step.index, items: [], incomplete: true }, step.conversation);
@@ -132,7 +134,8 @@ export function register(on) {
     // A hook above Bridge can dispatch the same call again: same refusal, recorded once.
     if (step?.denied.has(e.tool_use_id)) return { deny: REASON };
     if (!step?.calls.has(e.tool_use_id)) return next(e);
-    const refusal = { index: step.calls.get(e.tool_use_id), key: projection(e.questions) };
+    const refusal = { index: step.calls.get(e.tool_use_id), key: projection(e.questions),
+      questions: e.questions };
     step.calls.delete(e.tool_use_id);
     step.denied.add(e.tool_use_id);
     if (step.deferred) step.refused.push(refusal);

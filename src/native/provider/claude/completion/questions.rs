@@ -232,9 +232,12 @@ pub(super) fn publish(store: &Store, binding: &Binding, data: &Value) -> Result<
 
 // The question plugin refused the call at `step`/`index` before any dialog. Under the same
 // lock and binding rules as `publish`, this sets the deflected flag of the retained item at
-// that position: the one change a saved item may receive, still within the record limit. An
-// item the record lacks (its emission report was lost, or the record is full) is never
-// invented: the observation becomes incomplete. Repeats are idempotent.
+// that position: the one change a saved item may receive, still within the record limit. The
+// position alone does not name the call: a repeated step keeps the first question retained
+// there, so the flag is set only when the refused questions project to the retained item's
+// text and option labels. An item the record lacks (its emission report was lost, or the
+// record is full), a different question at the position and malformed data are never turned
+// into a flag: the observation becomes incomplete. Repeats are idempotent.
 pub(super) fn deflect(store: &Store, binding: &Binding, data: &Value) -> Result<()> {
     let Some((mut saved, before)) = self::saved(store, binding)? else {
         return Ok(());
@@ -244,10 +247,21 @@ pub(super) fn deflect(store: &Store, binding: &Binding, data: &Value) -> Result<
             .and_then(Value::as_u64)
             .filter(|value| *value <= MAX_INDEX)
     };
-    let id = number("step")
+    let refused = number("step")
         .zip(number("index"))
-        .map(|(step, index)| format!("step:{step}/tool:{index}"));
-    match id.and_then(|id| saved.items.iter().position(|item| item.id == id)) {
+        .and_then(|(step, index)| {
+            let questions = data.get("questions")?;
+            emission(
+                step,
+                &serde_json::json!({"index": index, "questions": questions}),
+            )
+        });
+    match refused.and_then(|refused| {
+        saved
+            .items
+            .iter()
+            .position(|item| item.id == refused.id && item.questions == refused.questions)
+    }) {
         Some(found) if !saved.items[found].deflected => {
             saved.items[found].deflected = true;
             if !fits(&saved) {

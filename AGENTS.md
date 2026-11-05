@@ -129,9 +129,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   is refused only when its `tool_use_id` matches a tool chunk this module passed in the
   observed main-loop step; the chunk's position among the step's tool chunks is its tool-use
   position. Claude 2.1.318 can start the tool while the step still streams, so the refusal is
-  attributed after that step's engine/core return: `question.deflected` marks the retained
-  item at that position only when the return holds the same question text and option labels
-  there, and otherwise marks the record incomplete; it never creates an item, and setting the
+  attributed after that step's engine/core return: `question.deflected` names the refused
+  questions and marks the retained item at that position only when the return and that item
+  both hold the same question text and option labels (a repeated step can keep an earlier
+  question there), and otherwise marks the record incomplete; it never creates an item, and setting the
   flag is the one change a saved item may receive. Recording follows the emission rules
   (bound turn of the current Claim under the lifecycle lock, never a Claim or outcome change).
   Subagent calls, a plugin's `$.ui.ask`, unobserved calls, a module that is not loaded, and a

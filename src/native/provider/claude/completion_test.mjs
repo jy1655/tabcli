@@ -131,7 +131,7 @@ if (scenario.startsWith("questions")) {
   async function step({ index = 0, agentId, origin = { plugin: "engine", tier: "core" },
       broken = false, mismatch = false, cancel = false, clear = false, large = false,
       empty = false, noTrace = false, rewritten = false, stopReason = "tool_use", sessionFailure = false,
-      handlers = questionHandlers, during } = {}) {
+      asked = question, cancelAfter = false, handlers = questionHandlers, during } = {}) {
     const e = { turnId, index, model: "fixture", messageCount: 1 };
     if (agentId !== undefined) e.agentId = agentId;
     const chunks = [{ kind: "text", index: 0, text: "Question follows", ref: 1 },
@@ -141,7 +141,7 @@ if (scenario.startsWith("questions")) {
       { kind: "input", index: 2, json: "{}", ref: 6 }, { kind: "engine", ref: 7 }];
     const core = { turnId: mismatch ? "foreign" : turnId, index, answer: "Question follows", stopReason,
       toolUses: [{ name: "Read", input: {} }, { name: "AskUserQuestion", input: { questions: [
-        large ? { ...question, question: "x".repeat(max + 1) } : question,
+        large ? { ...question, question: "x".repeat(max + 1) } : asked,
       ] } }], usage: null };
     if (empty) core.toolUses = [];
     const response = rewritten ? { ...core, toolUses: [] } : core;
@@ -162,6 +162,8 @@ if (scenario.startsWith("questions")) {
       if (cancel) { await stream.return(); return; }
       // Claude starts a tool when its block ends, while the response still streams.
       if (position === chunks.length - 1 && during) await during();
+      // The consumer closes the stream after the tool started, before any response.
+      if (position === chunks.length - 1 && cancelAfter) { await stream.return(); return; }
     }
     if (broken) { await assert.rejects(stream.next(), actual => actual === error); return; }
     const final = await stream.next();
@@ -287,18 +289,18 @@ if (scenario.startsWith("questions")) {
     } });
     assert.deepEqual(wires(from).map(wire => [wire.event, wire.data, wire.conversation]), [
       ["question.emissions", { turnId, step: 5, items: [{ index: 1, questions: [question] }], incomplete: false }, conversation],
-      ["question.deflected", { turnId, step: 5, index: 1 }, conversation],
+      ["question.deflected", { turnId, step: 5, index: 1, questions: [question] }, conversation],
     ]);
     // Refused after its step was evaluated: reported at once.
     await step({ index: 6 });
     from = calls.length;
     refused(await toolCall({ id: "toolu-question-6" }));
     assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]),
-      [["question.deflected", { turnId, step: 6, index: 1 }]]);
+      [["question.deflected", { turnId, step: 6, index: 1, questions: [question] }]]);
     // The same question in a later step is refused again.
     from = calls.length;
     await step({ index: 7, during: async () => refused(await toolCall({ id: "toolu-question-7" })) });
-    assert.deepEqual(wires(from).at(-1).data, { turnId, step: 7, index: 1 });
+    assert.deepEqual(wires(from).at(-1).data, { turnId, step: 7, index: 1, questions: [question] });
     // A call whose questions differ from the step's evidence at its position names no item.
     from = calls.length;
     await step({ index: 8, during: async () => refused(await toolCall({ id: "toolu-question-8",
@@ -314,6 +316,12 @@ if (scenario.startsWith("questions")) {
       during: async () => refused(await toolCall({ id: "toolu-question-16" })) });
     assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]),
       [["question.emissions", { turnId, step: 16, items: [], incomplete: true }]]);
+    // The same when the consumer closes the stream after the refusal.
+    from = calls.length;
+    await step({ index: 18, cancelAfter: true,
+      during: async () => refused(await toolCall({ id: "toolu-question-18" })) });
+    assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]),
+      [["question.emissions", { turnId, step: 18, items: [], incomplete: true }]]);
     // A deflection that cannot be recorded still refuses the call.
     await step({ index: 9 });
     from = calls.length;
@@ -324,13 +332,25 @@ if (scenario.startsWith("questions")) {
     assert.deepEqual(wires(from).map(wire => wire.event), ["question.deflected", "question.deflected"]);
     assert.deepEqual(logs.slice(logged),
       ["Agent Bridge could not record this question deflection; the question call was still refused."]);
+    // The record keeps items in step order, so this case follows step 9.
+    // A repeated step asks another question at the same position and that call is refused: the
+    // wire names the refused questions, so the first question retained there gets no flag.
+    await step({ index: 17 });
+    const other = { ...question, question: "Another question?" };
+    from = calls.length;
+    await step({ index: 17, asked: other,
+      during: async () => refused(await toolCall({ id: "toolu-question-17", questions: [other] })) });
+    assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]), [
+      ["question.emissions", { turnId, step: 17, items: [{ index: 1, questions: [other] }], incomplete: true }],
+      ["question.deflected", { turnId, step: 17, index: 1, questions: [other] }],
+    ]);
     const session = directory.split(/[\\/]/).at(-1);
     const query = spawnSync(executable, ["result", session, "--request", receipt.request_id, "--json"],
       { encoding: "utf8", env: process.env });
     assert.equal(query.status, 0, query.stderr);
     const result = JSON.parse(query.stdout);
     assert.equal(result.request_state, "pending");
-    assert.equal(result.question_emission_count, 7);
+    assert.equal(result.question_emission_count, 8);
     assert.equal(result.question_deflected, true);
     assert.equal(result.question_deflection_count, 3);
     assert.deepEqual(result.question_emissions.filter(item => item.deflected === true).map(item => item.id),

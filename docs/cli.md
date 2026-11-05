@@ -829,8 +829,8 @@ request as finished. Bridge neither strips nor parses the `QUESTION FOR CALLER:`
 is refused only when the plugin passed its streamed tool chunk in the observed main-loop step;
 subagent questions, a plugin's own questions and unobserved calls reach the dialog as before,
 and so does every call when the plugin's hook fails or overruns its budget. The flag is set only
-on an item whose step evidence holds the same question text and option labels at the refused
-call's position; a refusal that cannot be attributed marks `question_observation: "incomplete"`
+on a retained item that holds the refused call's question text and option labels at its position,
+which the step evidence must hold too; a refusal that cannot be attributed marks `question_observation: "incomplete"`
 instead. A refusal leaves no record at all when both attempts to record it fail, or when it
 happens outside the request's bound turn (an unattributed continuation turn, for example).
 `wait --questions` can return an emission before its `deflected` flag is recorded, and

@@ -155,7 +155,7 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
                 record["items"].as_array().unwrap().len(),
                 match *scenario {
                     "questions" => 2,
-                    "questions_deflection" => 7,
+                    "questions_deflection" => 8,
                     _ => 1,
                 }
             );

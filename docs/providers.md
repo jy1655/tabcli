@@ -423,9 +423,10 @@ The question then reaches the caller as the ordinary Result and the caller answe
 the step result's tool uses carry no call id, so the module refuses only a call whose
 `tool_use_id` matches a tool chunk it passed in the observed main-loop step. Claude can start
 the tool while that step still streams, so the refusal is attributed after the step's final
-engine/core return: `question.deflected` marks the retained item at the call's position only
-when that return holds the same question text and option labels there; otherwise the record is
-marked incomplete and no item is created. Recording uses the question helper's two 5-second
+engine/core return: `question.deflected` names the refused questions and marks the retained
+item at the call's position only when that return and the retained item both hold the same
+question text and option labels there (a repeated step can keep an earlier question at the
+position); otherwise the record is marked incomplete and no item is created. Recording uses the question helper's two 5-second
 attempts; a failure logs it and the call is still refused. Subagent calls, a plugin's own
 `$.ui.ask`, calls the module did not observe, deflection off, and a hook that throws or overruns
 its budget all leave the dialog as before; no `.catch` refuses in their place. Claude fires

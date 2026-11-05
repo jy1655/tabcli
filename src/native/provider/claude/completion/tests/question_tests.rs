@@ -299,8 +299,10 @@ fn claude_questions_limit_includes_the_entire_pretty_encoded_record() {
     }
 }
 
-fn deflected(step: u64, index: u64) -> Value {
-    json!({"turnId":TURN,"step":step,"index":index})
+// The refused call's own questions, in the shape the emission of `questions(step, label)` has.
+fn deflected(step: u64, index: u64, label: &str) -> Value {
+    json!({"turnId":TURN,"step":step,"index":index,
+        "questions":questions(step, label)["items"][0]["questions"]})
 }
 
 fn deflected_ids(f: &Fixture) -> Vec<String> {
@@ -330,7 +332,7 @@ fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
             .contains("deflected")
     );
     assert!(deflected_ids(&f).is_empty());
-    f.send("question.deflected", deflected(0, 0));
+    f.send("question.deflected", deflected(0, 0, "first"));
     assert_eq!(deflected_ids(&f), ["step:0/tool:0"]);
     assert!(matches!(
         observe(&f).unwrap().observation,
@@ -340,7 +342,7 @@ fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
     assert_eq!(saved["items"][0]["deflected"], true);
     // Repeats and a replay of the same emission change nothing; the flag is not a conflict.
     let before = snapshot(f.root.path());
-    f.send("question.deflected", deflected(0, 0));
+    f.send("question.deflected", deflected(0, 0, "first"));
     f.send("question.emissions", questions(0, "first"));
     assert_eq!(snapshot(f.root.path()), before);
     // A later emission is retained unflagged; the earlier flag stays.
@@ -348,7 +350,7 @@ fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
     assert_eq!(deflected_ids(&f), ["step:0/tool:0"]);
     assert_eq!(observe(&f).unwrap().items.len(), 2);
     // An item the record lacks is never invented: the observation becomes incomplete.
-    f.send("question.deflected", deflected(2, 0));
+    f.send("question.deflected", deflected(2, 0, "first"));
     let observation = observe(&f).unwrap();
     assert_eq!(observation.items.len(), 2);
     assert!(matches!(
@@ -366,9 +368,13 @@ fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
 }
 
 #[test]
-fn claude_deflection_without_a_record_or_with_malformed_data_marks_no_item_and_the_record_incomplete() {
+fn claude_deflection_without_a_record_or_with_malformed_data_marks_only_incomplete() {
     for data in [
-        deflected(0, 0),
+        deflected(0, 0, "first"),
+        // A repeated step can retain another question at the refused call's position.
+        deflected(0, 0, "another"),
+        json!({"turnId":TURN,"step":0,"index":0}),
+        json!({"turnId":TURN,"step":0,"index":0,"questions":[]}),
         json!({"turnId":TURN,"step":0}),
         json!({"turnId":TURN,"step":Value::Null,"index":0}),
         json!({"turnId":TURN,"step":-1,"index":0}),
@@ -377,7 +383,8 @@ fn claude_deflection_without_a_record_or_with_malformed_data_marks_no_item_and_t
     ] {
         let f = Fixture::new();
         f.start();
-        let first = data == deflected(0, 0);
+        // The first case has no record at all; every other case has the item "first" retained.
+        let first = data == deflected(0, 0, "first");
         if !first {
             f.send("question.emissions", questions(0, "first"));
         }
@@ -402,24 +409,24 @@ fn claude_deflection_without_a_record_or_with_malformed_data_marks_no_item_and_t
 #[test]
 fn claude_deflection_requires_the_original_turn_and_a_live_session() {
     let f = Fixture::new();
-    f.send("question.deflected", deflected(0, 0));
+    f.send("question.deflected", deflected(0, 0, "original"));
     assert!(observe(&f).is_none(), "before the binding");
     f.start();
     f.send("question.emissions", questions(0, "original"));
     let before = snapshot(f.root.path());
-    let mut other_turn = deflected(0, 0);
+    let mut other_turn = deflected(0, 0, "original");
     other_turn["turnId"] = json!("next-turn");
     f.send("question.deflected", other_turn);
-    let mut subagent = deflected(0, 0);
+    let mut subagent = deflected(0, 0, "original");
     subagent["agentId"] = json!("child");
     f.send("question.deflected", subagent);
-    let mut wire = f.wire("question.deflected", deflected(0, 0));
+    let mut wire = f.wire("question.deflected", deflected(0, 0, "original"));
     wire["conversation"] = json!("00000000-0000-4000-8000-000000000999");
     receive(f.root.path(), &wire).unwrap();
     assert_eq!(snapshot(f.root.path()), before);
     crate::native::session::update_status(f.root.path(), SessionState::Closed, None, None).unwrap();
     let before = snapshot(f.root.path());
-    f.send("question.deflected", deflected(0, 0));
+    f.send("question.deflected", deflected(0, 0, "original"));
     assert_eq!(snapshot(f.root.path()), before);
     assert!(deflected_ids(&f).is_empty());
 }
@@ -433,15 +440,13 @@ fn claude_deflection_that_would_exceed_the_record_limit_marks_the_record_full() 
     let baseline = f.store().private(&path).text().unwrap().unwrap().len();
     f.store().private(&path).remove().unwrap();
     // The largest record that fits: the flag no longer does.
-    f.send(
-        "question.emissions",
-        questions(0, &"x".repeat(65536 - baseline + 1)),
-    );
+    let label = "x".repeat(65536 - baseline + 1);
+    f.send("question.emissions", questions(0, &label));
     assert_eq!(
         f.store().private(&path).text().unwrap().unwrap().len(),
         65536
     );
-    f.send("question.deflected", deflected(0, 0));
+    f.send("question.deflected", deflected(0, 0, &label));
     let saved: Value = f.store().private(&path).json().unwrap();
     assert_eq!(saved["incomplete"], true);
     assert_eq!(saved["full"], true);
