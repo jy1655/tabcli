@@ -12,7 +12,7 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     },
     host_command: "native-ghostty-host",
     close_evidence: CloseEvidenceChoice::PresenceOnly,
-    screen_read_refusal: Some("managed dialog input unsupported for this terminal"),
+    screen_read_refusal: Some("Ghostty's scripting dictionary exposes no screen text"),
     guarded_input_refusal: Some("managed dialog input unsupported for this terminal"),
     #[cfg(target_os = "macos")]
     binding: None,
