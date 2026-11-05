@@ -102,9 +102,10 @@ Absent question fields do not prove that no question was asked.
   the user with your own question tool, or answer it from your own context, then continue the
   same session with `tell`. Never treat that result as a finished answer without reading it.
 - A Claude request still pending after an emission may be held by its question dialog. Check
-  the actual terminal surface, or ask the user to: if the dialog is shown, report the request
-  address and ask the user to answer it there; otherwise keep waiting or inspect the request.
-  Do not infer an open dialog from the emission alone.
+  the actual terminal surface (with `tabcli screen` where available; see below), or ask the user
+  to: if the dialog is shown, report the request address and ask the user to answer it there;
+  otherwise keep waiting or inspect the request. Do not infer an open dialog from the emission
+  alone.
 
 ## When an operation does not finish
 
@@ -116,6 +117,20 @@ tabcli inspect SESSION --json
 tabcli inspect SESSION --timeline --request REQUEST --json
 tabcli doctor SESSION --json
 ```
+
+If the adopted contract lists a `screen` command (with the help fallback: only if
+`tabcli --help` lists `screen <session>`), look at the child's terminal without touching it when
+a request stays pending:
+
+```sh
+tabcli screen SESSION --json
+```
+
+`screen` is the visible text of the child's own terminal at one moment, not the request's state;
+keep reading the request for that. Never type into the managed terminal to act on what it shows.
+When it shows something a person has to act on, such as a trust or permission dialog, a sign-in,
+an update or a quota message, report the session, the request address and what the screen shows
+to the user. The text can contain secrets the provider printed: relay only what the user needs.
 
 Never automatically resend an uncertain delivery or restart a request merely because a
 wait expired. A failed or unresolved request needs its recorded reason assessed; do not

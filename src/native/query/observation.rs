@@ -73,6 +73,28 @@ pub(in crate::native) enum SurfaceRecord {
     Active(Result<Option<terminal::TerminalSession>>),
 }
 
+impl SurfaceRecord {
+    /// The surface record in its precedence: the close tombstone, then a claimed close
+    /// handle, then the active handle. Reads only; the first record present decides.
+    pub(in crate::native) fn read(reader: &Reader) -> Self {
+        match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
+            .optional_json::<Value>()
+        {
+            Ok(Some(value)) => Self::Closed(Ok(value)),
+            Err(error) => Self::Closed(Err(error)),
+            Ok(None) => match RecordReader::at(reader.record(CoreRecord::TerminalClosing).path())
+                .optional_json::<terminal::TerminalSession>()
+            {
+                Ok(Some(value)) => Self::Closing(Ok(value)),
+                Err(error) => Self::Closing(Err(error)),
+                Ok(None) => Self::Active(
+                    RecordReader::at(reader.record(CoreRecord::Terminal).path()).optional_json(),
+                ),
+            },
+        }
+    }
+}
+
 /// The OS probe of a recorded surface. Tests replace it.
 pub(in crate::native) type SurfaceProbe<'a> =
     &'a dyn Fn(&Path, &terminal::TerminalSession, Duration) -> Result<bool>;
@@ -85,21 +107,7 @@ impl SessionEvidence {
 
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
         let owner = Self::read_owner(reader);
-        let surface = match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
-            .optional_json::<Value>()
-        {
-            Ok(Some(value)) => SurfaceRecord::Closed(Ok(value)),
-            Err(error) => SurfaceRecord::Closed(Err(error)),
-            Ok(None) => match RecordReader::at(reader.record(CoreRecord::TerminalClosing).path())
-                .optional_json::<terminal::TerminalSession>()
-            {
-                Ok(Some(value)) => SurfaceRecord::Closing(Ok(value)),
-                Err(error) => SurfaceRecord::Closing(Err(error)),
-                Ok(None) => SurfaceRecord::Active(
-                    RecordReader::at(reader.record(CoreRecord::Terminal).path()).optional_json(),
-                ),
-            },
-        };
+        let surface = SurfaceRecord::read(reader);
         // An interrupted close can have its tombstone before status.json catches up.
         let close_tombstone = matches!(held, Ok(true)).then(|| reader.closed_if_present());
         Self {

@@ -698,6 +698,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   fails when a record changed while it read. What it derives is marked: the request
   summaries are what `result` reports at the time of the query and carry `derived_from`.
   Do not add an entry for something no record holds.
+- `screen` observes the bound surface only. It reads the surface record under the Snapshot's
+  shared lock and releases the lock; a kind's declared screen-read refusal then answers before
+  any adapter, `tell`'s surface ownership check runs, and one read goes through the shared
+  dispatch. It returns the text without retaining it in records, logs or diagnostics, never
+  sends input or starts the terminal application, and claims nothing about the request.
 - `created_unix_ms` of a receipt and of an event is optional only when a record is read,
   so that a damaged record can be reported with a reason. Every writer writes it, and no
   path may publish an event without it: the completion-journal validation rejects one.

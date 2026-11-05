@@ -30,7 +30,7 @@ fn contract_is_repeatable_without_providers_or_state_and_lists_public_commands()
     assert_eq!(value["contract_version"], 1);
     assert_eq!(value["binary_version"], env!("CARGO_PKG_VERSION"));
     let commands = value["commands"].as_array().unwrap();
-    assert_eq!(commands.len(), 18);
+    assert_eq!(commands.len(), 19);
     assert!(
         commands
             .iter()

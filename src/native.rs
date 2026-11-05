@@ -66,6 +66,7 @@ pub(crate) enum NativeCommand {
         timeline: bool,
         request: Option<String>,
     },
+    Screen(query::screen::ScreenRequest),
     Result(query::ResultRequest),
     Wait(query::wait::WaitRequest),
     Search(query::search::SearchRequest),
@@ -178,6 +179,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         parse: |_, args| query::parse_inspect(args),
         hidden: false,
         contract: Some(&describe::INSPECT),
+    },
+    CommandSpec {
+        name: "screen",
+        parse: |_, args| query::screen::parse(args),
+        hidden: false,
+        contract: Some(&describe::SCREEN),
     },
     CommandSpec {
         name: "result",
@@ -352,6 +359,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             timeline,
             request,
         } => query::run_inspect(&id, json, timeline, request.as_deref()),
+        NativeCommand::Screen(request) => query::screen::run(request),
         NativeCommand::Result(request) => query::run_result(request),
         NativeCommand::Wait(request) => query::wait::run(request),
         NativeCommand::Search(request) => query::search::run_search(request),

@@ -19,6 +19,7 @@ pub(super) enum Effect {
     RepairsRecords,
     DeletesRecords,
     ReadsProviderState,
+    ReadsSurface,
     LaunchesProvider,
     SendsInput,
     RequestsInterruption,
@@ -56,6 +57,7 @@ pub(super) const ASK: Contract = Contract {
         ReadsRecords,
         WritesRecords,
         ReadsProviderState,
+        ReadsSurface,
         LaunchesProvider,
         SendsInput,
         ModelCalls,
@@ -86,6 +88,7 @@ pub(super) const SELF_TEST: Contract = Contract {
         ReadsRecords,
         WritesRecords,
         ReadsProviderState,
+        ReadsSurface,
         LaunchesProvider,
         SendsInput,
         ClosesSurface,
@@ -187,6 +190,7 @@ pub(super) const REOPEN: Contract = Contract {
         ReadsRecords,
         WritesRecords,
         ReadsProviderState,
+        ReadsSurface,
         LaunchesProvider,
         SendsInput,
         ModelCalls,
@@ -223,6 +227,17 @@ pub(super) const INSPECT: Contract = Contract {
         "Observes records without repair or publication. --request filters a timeline and requires --timeline.",
         "JSON capabilities.cancel reports what cancel's admission would decide at this snapshot; cancel rechecks it, and an admissible cancel records intent, not interruption or completion.",
         "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and the configured answer path: deflected_to_result (answer with tell) or unsupported.",
+    ],
+};
+pub(super) const SCREEN: Contract = Contract {
+    summary: "Read once the visible text of a session's own terminal surface.",
+    synopsis: &["screen <session> [--timeout-secs N] [--json]"],
+    possible_effects: &[ReadsRecords, ReadsSurface],
+    examples: &[&["screen", "session-example", "--json"]],
+    features: &[],
+    notes: &[
+        "Reads only the surface the session's records bind, after the ownership check tell makes; sends no input, changes no focus, starts no terminal application and writes no record. Closed sessions, Ghostty and Warp are refused. Default timeout is 10 seconds.",
+        "The text is what the terminal showed at one moment, not evidence of a request's state. It can contain secrets the provider printed; Bridge does not retain it.",
     ],
 };
 pub(super) const RESULT: Contract = Contract {
@@ -666,6 +681,19 @@ mod tests {
     fn effects_distinguish_observation_from_repair_and_execution() {
         for contract in [&INSPECT, &RESULT, &WAIT, &SEARCH, &STATUS] {
             assert_eq!(contract.possible_effects, &[ReadsRecords]);
+        }
+        // screen reads surface text and nothing else beyond records; the launches read a
+        // screen for their dialog and composer gates; no other command reads surface text.
+        assert_eq!(SCREEN.possible_effects, &[ReadsRecords, ReadsSurface]);
+        for entry in COMMANDS {
+            if let Some(contract) = entry.contract {
+                assert_eq!(
+                    contract.possible_effects.contains(&ReadsSurface),
+                    ["screen", "ask", "reopen", "self-test"].contains(&entry.name),
+                    "{}",
+                    entry.name
+                );
+            }
         }
         assert!(DESCRIBE.possible_effects.is_empty());
         assert!(SESSIONS.possible_effects.contains(&RepairsRecords));

@@ -615,6 +615,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["settings", "arbitrary", "--bad"], "Settings([\"arbitrary\", \"--bad\"])".into()),
         (vec!["reopen", "session-route", "--prompt", "hello"], "Reopen(ReopenRequest { id: \"session-route\", prompt: \"hello\", title: None, model: None, effort: None, terminal: None, yolo: false, timeout: 900s, detach: false, json: false })".into()),
         (vec!["inspect", "session-route", "--timeline", "--request", "request-1", "--json"], "Inspect { id: \"session-route\", json: true, timeline: true, request: Some(\"request-1\") }".into()),
+        (vec!["screen", "session-route", "--timeout-secs", "7", "--json"], "Screen(ScreenRequest { id: \"session-route\", timeout: 7s, json: true })".into()),
         (vec!["result", "session-route", "--request", "request-1", "--wait", "--json"], "Result(ResultRequest { id: \"session-route\", selector: Request(\"request-1\"), wait: true, timeout: 900s, json: true })".into()),
         (vec!["wait", "session-route/request-1", "--timeout-secs", "7", "--json"], "Wait(WaitRequest { addresses: [Address { session: \"session-route\", request: \"request-1\" }], timeout: 7s, json: true, questions: false, after_questions: [] })".into()),
         (vec!["search", "needle", "--all-workspaces", "--provider", "claude", "--json"], "Search(SearchRequest { query: \"needle\", scope: AllWorkspaces, provider: Some(Claude), limit: 20, byte_budget: 67108864, json: true })".into()),

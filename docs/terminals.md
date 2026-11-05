@@ -70,15 +70,15 @@ Bridge uses its terminal adapter to create the surface, check ownership, deliver
 where needed, and close it. The Windows rows below describe native Windows; the five application
 adapters above them are macOS-only.
 
-| Platform | Terminal | Creation | Fallback input | Close |
-| --- | --- | --- | --- | --- |
-| macOS | iTerm2 | Tab or window | Session scripting | Session |
-| macOS | Terminal.app | Window | Window/TTY scripting | Window |
-| macOS | Ghostty | Tab or window | Terminal scripting | Owned surface; proven failed-launch handle retained |
-| macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI |
-| macOS | Warp | Tab/window URI | Unsupported | Bound tab/window |
-| Windows | Terminal tab | Tab | Console input | Console and tab |
-| Windows | Console window | Window fallback | Console input | Console |
+| Platform | Terminal | Creation | Fallback input | Close | Screen read |
+| --- | --- | --- | --- | --- | --- |
+| macOS | iTerm2 | Tab or window | Session scripting | Session | Session contents |
+| macOS | Terminal.app | Window | Window/TTY scripting | Window | Tab contents |
+| macOS | Ghostty | Tab or window | Terminal scripting | Owned surface; proven failed-launch handle retained | Unsupported |
+| macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI | Exact-pane CLI text |
+| macOS | Warp | Tab/window URI | Unsupported | Bound tab/window | Unsupported |
+| Windows | Terminal tab | Tab | Console input | Console and tab | Console window text |
+| Windows | Console window | Window fallback | Console input | Console | Console window text |
 
 The legacy Codex console route for not-injected launches (#124) keeps delayed submission
 Returns: each waits for the console input buffer to drain before its existing 2 s delay,
@@ -104,6 +104,13 @@ For iTerm2, scripting writes the prompt to the exact session. Terminal.app targe
 window and TTY. Ghostty uses `input text` and submit; WezTerm's official CLI addresses the pane.
 Windows emits console input records. Close preserves unrelated sessions; a private WezTerm GUI can
 end only when no sibling panes remain. Warp requires exact proof within its bound instance.
+
+The screen read column is what `tabcli screen` and the launch's dialog checks read: iTerm2's
+`contents` of the exact session, Terminal.app's `contents` of the recorded window's TTY tab,
+WezTerm's `get-text` of the exact pane, and the visible window of the console's screen buffer on
+Windows. Each is the visible text only, not scrollback. `screen` reads only after the ownership
+check that `tell` makes, never starts the terminal application, and is refused for Ghostty and
+Warp, whose scripting exposes no screen text. See [screen](cli.md#screen).
 
 ## Requirements and first-run prompts
 

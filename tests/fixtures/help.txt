@@ -19,6 +19,7 @@ Usage:
       [--sort <id|updated>] [--json]
   tabcli status [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>] [--all] [--json]
   tabcli inspect <session> [--timeline [--request REQUEST]] [--json]
+  tabcli screen <session> [--timeout-secs N] [--json]
   tabcli result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
   tabcli result <session> --request REQUEST --wait [--timeout-secs N] [--json]
   tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
@@ -207,6 +208,11 @@ Session policy:
   inspect --timeline reads preserved request, launch, completion and close evidence.
   --request filters request entries; session diagnostics remain separate. Unknown
   times are not inferred. This query never repairs, resends or closes a session.
+  screen reads once the visible text of the terminal surface that a session's
+  records bind, after the ownership check tell makes (default 10 seconds). It sends
+  no input, changes no focus, starts no terminal application and keeps no copy. The
+  text is what the terminal showed, not a request state, and can contain secrets
+  the provider printed. Closed sessions, Ghostty and Warp are refused.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.
 

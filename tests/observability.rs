@@ -550,6 +550,67 @@ fn read_only_queries_preserve_closed_and_dead_owner_records() {
     assert_eq!(support::entries(fixture.root.path()), before);
 }
 
+// Each case is refused from the records alone, so no terminal application is addressed.
+#[test]
+fn screen_refuses_closed_and_unbound_sessions_from_records_without_writing() {
+    let closed = json!({"state": "closed", "generation": 3, "updated_unix_ms": 4,
+        "exit_code": null, "error": null});
+    let foreign = json!({
+        "terminal": if cfg!(windows) { "windows-console" } else { "apple-terminal" },
+        "session_id": "4242", "window_id": "1001", "managed_session_id": "session-other"
+    });
+    let unbound = if cfg!(any(target_os = "macos", windows)) {
+        "the recorded terminal handle is not bound to session session-observe"
+    } else {
+        "is not supported on this platform"
+    };
+    for (record, value, expected) in [
+        (
+            None,
+            Value::Null,
+            "session session-observe (ready) has no active terminal handle",
+        ),
+        (Some("terminal.json"), foreign, unbound),
+        (
+            Some("status.json"),
+            closed.clone(),
+            "session session-observe is closed",
+        ),
+        (
+            Some("closed.json"),
+            closed,
+            "session session-observe is closed",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        if let Some(name) = record {
+            write(&fixture.directory.join(name), &value);
+        }
+        let before = support::entries(fixture.root.path());
+        let output = fixture.run(&["screen", "session-observe", "--json"]);
+        assert!(!output.status.success(), "{expected}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["session"], "session-observe");
+        assert!(
+            value["error"].as_str().unwrap().contains(expected),
+            "{value}"
+        );
+        assert!(value.get("screen").is_none());
+        let human = fixture.run(&["screen", "session-observe"]);
+        assert!(!human.status.success());
+        assert!(human.stdout.is_empty(), "{expected}");
+        assert!(String::from_utf8_lossy(&human.stderr).contains(expected));
+        assert_eq!(support::entries(fixture.root.path()), before);
+    }
+    let fixture = Fixture::new();
+    let output = fixture.run(&["screen", "session-observe", "--bad", "--json"]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"], "unknown screen option: --bad");
+}
+
 #[test]
 fn result_reports_corrupt_events_instead_of_an_empty_success() {
     let fixture = Fixture::new();
