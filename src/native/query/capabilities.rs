@@ -4,8 +4,10 @@
 //! its Bridge record gates only; the gates it does not evaluate are named, never inferred.
 use super::*;
 use crate::native::session::cancel::{self, Refusal, RefusalReason};
+use crate::native::session::owner::OwnerAttestation;
 use crate::native::session::{self, close, hold};
-use observation::judgment::{ActiveHandle, BoundOwner, OwnerJudgment, Surface};
+use crate::native::terminal::ownership::{OwnerRequirement, SurfaceProbe};
+use observation::judgment::{ActiveHandle, OwnerJudgment, Surface};
 
 pub(super) const SCHEMA_VERSION: u32 = 1;
 
@@ -171,7 +173,9 @@ fn tell_gates(
     }
     let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
     surface_gate(evidence.surface)?;
-    owner_control_gate(evidence.owner, ProbedIdentity::HOST)?;
+    owner_control_gate(evidence.owner, |attestation| {
+        SurfaceProbe::HOST.owner_requirement(attestation)
+    })?;
     hold::ready_gate(&records.status.state, id)?;
     if records.claim.is_some() {
         return Err(Stop::refused("turn_claimed", session::TURN_ALREADY_CLAIMED));
@@ -214,51 +218,28 @@ fn owner_gate(owner: &OwnerJudgment) -> std::result::Result<(), Stop> {
     }
 }
 
-/// The owner identity `tell`'s surface probe requires on a platform, beyond the binding.
-#[derive(Clone, Copy, Debug)]
-enum ProbedIdentity {
-    /// macOS: the recorded birth, TTY and process groups must match the live owner.
-    MacosControl,
-    /// Native Windows: the recorded process identity must be present and match.
-    WindowsProcess,
-    /// No terminal is supported, so the probe is never reached.
-    Unprobed,
-}
-
-impl ProbedIdentity {
-    const HOST: Self = if cfg!(target_os = "macos") {
-        Self::MacosControl
-    } else if cfg!(windows) {
-        Self::WindowsProcess
-    } else {
-        Self::Unprobed
-    };
-}
-
 /// The owner side of `tell`'s surface ownership check, judged after the recorded handle as
 /// the probe that verifies it runs after `tell` reads that handle. The probe requires an
-/// owner bound to this session, so any other record is unattested. An attestation that
-/// could not inspect its control identity is unverified everywhere. A live owner without
-/// the identity the platform's probe requires is unknown: on macOS a changed or uncompared
-/// control identity, on native Windows a record without its process identity (attested
-/// PID-only, so uncompared). None of these is a death, so none is refused; a death and an
-/// unreadable record are the liveness gate's verdicts.
+/// owner bound to this session, so any other record is unattested. What the probe requires
+/// of a bound owner is stated beside it (`SurfaceProbe::owner_requirement`); this gate only
+/// maps that answer. An owner whose identity could not be inspected is unverified; a live
+/// owner without the identity the probe compares is unknown. None of these is a death, so
+/// none is refused; a death and an unreadable record are the liveness gate's verdicts.
 fn owner_control_gate(
     owner: &OwnerJudgment,
-    probed: ProbedIdentity,
+    requirement: impl FnOnce(&OwnerAttestation) -> OwnerRequirement,
 ) -> std::result::Result<(), Stop> {
     match owner {
-        OwnerJudgment::Bound(attestation) => match (BoundOwner::of(attestation), probed) {
+        OwnerJudgment::Bound(attestation) => match requirement(attestation) {
+            OwnerRequirement::Met | OwnerRequirement::Gone => Ok(()),
             // The identity could not be read; its projection carries why.
-            (BoundOwner::Unknown, _) => Err(Stop::unknown(
+            OwnerRequirement::Uninspected => Err(Stop::unknown(
                 "owner_unverified",
                 session::OwnerObservation::from(attestation).error,
             )),
-            (BoundOwner::ControlChanged | BoundOwner::Uncompared, ProbedIdentity::MacosControl)
-            | (BoundOwner::Uncompared, ProbedIdentity::WindowsProcess) => {
+            OwnerRequirement::ControlUnverified => {
                 Err(Stop::unknown("owner_control_unverified", None))
             }
-            _ => Ok(()),
         },
         owner if owner.gone() => Ok(()),
         OwnerJudgment::Unreadable(_) => Ok(()),
@@ -364,24 +345,22 @@ mod tests {
     use crate::native::session::owner::ControlAttestation;
 
     /// The liveness gate, then (past the recorded handle) the ownership gate, as tell_gates
-    /// orders them.
+    /// orders them, with the probe's requirement answering `answer`.
     fn gate(
         process: ProcessObservation,
         control: ControlAttestation,
-        probed: ProbedIdentity,
+        answer: OwnerRequirement,
     ) -> Value {
         let owner = OwnerJudgment::Bound(attestation(process, control, Some(true)));
-        match owner_gate(&owner).and_then(|()| owner_control_gate(&owner, probed)) {
+        match owner_gate(&owner).and_then(|()| owner_control_gate(&owner, |_| answer)) {
             Ok(()) => json!("pass"),
             Err(stop) => stop.value(),
         }
     }
 
-    const PLATFORMS: [ProbedIdentity; 3] = [
-        ProbedIdentity::MacosControl,
-        ProbedIdentity::WindowsProcess,
-        ProbedIdentity::Unprobed,
-    ];
+    fn unconsulted(_: &OwnerAttestation) -> OwnerRequirement {
+        panic!("only a bound owner is judged by the probe's requirement")
+    }
 
     // A record that lets convergence continue passes the liveness gate and is judged by
     // the ownership gate; a death or an unreadable record is the liveness gate's verdict.
@@ -394,13 +373,11 @@ mod tests {
             OwnerJudgment::Absent,
         ] {
             assert!(owner_gate(&owner).is_ok(), "{owner:?}");
-            for probed in PLATFORMS {
-                assert_eq!(
-                    owner_control_gate(&owner, probed).unwrap_err().value(),
-                    json!({"state": "unknown", "reason": "owner_unattested"}),
-                    "{owner:?}"
-                );
-            }
+            assert_eq!(
+                owner_control_gate(&owner, unconsulted).unwrap_err().value(),
+                json!({"state": "unknown", "reason": "owner_unattested"}),
+                "{owner:?}"
+            );
         }
         let gone = OwnerJudgment::UnboundLegacy { alive: Some(false) };
         assert_eq!(
@@ -412,77 +389,107 @@ mod tests {
             owner_gate(&unreadable).unwrap_err().value(),
             json!({"state": "unknown", "reason": "evidence_unreadable", "detail": "invalid JSON"})
         );
-        for probed in PLATFORMS {
-            assert!(owner_control_gate(&gone, probed).is_ok());
-            assert!(owner_control_gate(&unreadable, probed).is_ok());
-        }
+        assert!(owner_control_gate(&gone, unconsulted).is_ok());
+        assert!(owner_control_gate(&unreadable, unconsulted).is_ok());
     }
 
-    // Every platform mapping, on every host: a live owner passes only with the identity
-    // that platform's surface probe verifies; elsewhere repair's liveness rule decides.
+    // The gate maps the probe's answer for a bound owner and decides nothing of its own;
+    // what each platform's probe answers for each attestation is tested beside the probe
+    // (`terminal::ownership` tests). A death is the liveness gate's verdict, before this
+    // gate, and passes this gate where repair leaves the owner unexamined.
     #[test]
-    fn a_live_bound_owner_passes_only_where_the_probe_could_verify_it() {
+    fn a_bound_owner_is_judged_by_the_probes_requirement_and_nothing_else() {
         let unverified =
             json!({"state": "unknown", "reason": "owner_unverified", "detail": "tty unreadable"});
         let control = json!({"state": "unknown", "reason": "owner_control_unverified"});
         let ended = json!({"state": "refused", "reason": "owner_ended",
             "detail": "the recorded session owner is no longer running"});
-        for probed in PLATFORMS {
-            let macos = matches!(probed, ProbedIdentity::MacosControl);
-            let probing = !matches!(probed, ProbedIdentity::Unprobed);
-            let when = |unverifiable: bool| {
-                if unverifiable {
-                    control.clone()
-                } else {
-                    json!("pass")
-                }
-            };
-            let live = || ProcessObservation::Live(Attested::Incarnation);
-            let rows = [
-                (live(), ControlAttestation::Verified, json!("pass")),
-                (
-                    live(),
-                    ControlAttestation::Unknown("tty unreadable".into()),
-                    unverified.clone(),
-                ),
-                // Only macOS records a control identity that can change.
-                (
-                    live(),
-                    ControlAttestation::Changed("process group changed".into()),
-                    when(macos),
-                ),
-                (live(), ControlAttestation::NotRecorded, when(probing)),
-                // A Windows record without its process identity is attested PID-only.
-                (
-                    ProcessObservation::Live(Attested::PidOnly),
-                    ControlAttestation::NotRecorded,
-                    when(probing),
-                ),
-                (
-                    ProcessObservation::Gone(Gone::Exited),
-                    ControlAttestation::NotRecorded,
-                    ended.clone(),
-                ),
-                (
-                    ProcessObservation::Gone(Gone::Reused("another birth".into())),
-                    ControlAttestation::NotRecorded,
-                    ended.clone(),
-                ),
-                (
-                    ProcessObservation::Unknown("access denied".into()),
-                    ControlAttestation::NotRecorded,
-                    json!({"state": "unknown", "reason": "owner_unverified",
-                        "detail": "access denied"}),
-                ),
-            ];
-            for (process, control_attestation, expected) in rows {
-                let label = format!("{probed:?} {process:?} {control_attestation:?}");
-                assert_eq!(
-                    gate(process, control_attestation, probed),
-                    expected,
-                    "{label}"
-                );
-            }
+        let live = || ProcessObservation::Live(Attested::Incarnation);
+        let rows = [
+            (
+                live(),
+                ControlAttestation::Verified,
+                OwnerRequirement::Met,
+                json!("pass"),
+            ),
+            // The detail is the attestation's projected error, never the answer's.
+            (
+                live(),
+                ControlAttestation::Unknown("tty unreadable".into()),
+                OwnerRequirement::Uninspected,
+                unverified,
+            ),
+            (
+                live(),
+                ControlAttestation::Changed("process group changed".into()),
+                OwnerRequirement::ControlUnverified,
+                control.clone(),
+            ),
+            (
+                live(),
+                ControlAttestation::Changed("process group changed".into()),
+                OwnerRequirement::Met,
+                json!("pass"),
+            ),
+            (
+                live(),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::ControlUnverified,
+                control.clone(),
+            ),
+            (
+                live(),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::Met,
+                json!("pass"),
+            ),
+            (
+                ProcessObservation::Live(Attested::PidOnly),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::ControlUnverified,
+                control,
+            ),
+            (
+                ProcessObservation::Live(Attested::PidOnly),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::Met,
+                json!("pass"),
+            ),
+            (
+                ProcessObservation::Gone(Gone::Exited),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::Gone,
+                ended.clone(),
+            ),
+            (
+                ProcessObservation::Gone(Gone::Reused("another birth".into())),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::Gone,
+                ended,
+            ),
+            (
+                ProcessObservation::Unknown("access denied".into()),
+                ControlAttestation::NotRecorded,
+                OwnerRequirement::Uninspected,
+                json!({"state": "unknown", "reason": "owner_unverified",
+                    "detail": "access denied"}),
+            ),
+        ];
+        for (process, control_attestation, answer, expected) in rows {
+            let label = format!("{answer:?} {process:?} {control_attestation:?}");
+            assert_eq!(
+                gate(process, control_attestation, answer),
+                expected,
+                "{label}"
+            );
+        }
+        for process in [Gone::Exited, Gone::Reused("another birth".into())] {
+            let owner = OwnerJudgment::Bound(attestation(
+                ProcessObservation::Gone(process),
+                ControlAttestation::NotRecorded,
+                Some(true),
+            ));
+            assert!(owner_control_gate(&owner, |_| OwnerRequirement::Gone).is_ok());
         }
     }
 }

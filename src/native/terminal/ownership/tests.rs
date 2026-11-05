@@ -594,3 +594,304 @@ fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
     };
     assert!(verified_terminal_shell_process_group(&owner, &live_owner, &changed_shell).is_err());
 }
+
+/// What each platform's probe requires of a bound owner, stated over its attestation, on
+/// every host. The parity tests below hold the macOS and Windows rows to the real probes.
+#[test]
+fn each_surface_probe_states_what_it_requires_of_a_bound_owner() {
+    use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+    use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
+    use crate::native::terminal::ownership::{OwnerRequirement, SurfaceProbe};
+    let met = OwnerRequirement::Met;
+    let control = OwnerRequirement::ControlUnverified;
+    let gone = OwnerRequirement::Gone;
+    let uninspected = OwnerRequirement::Uninspected;
+    let live = || ProcessObservation::Live(Attested::Incarnation);
+    // The answers of [MacosControl, WindowsProcess, Unprobed].
+    let rows = [
+        (live(), ControlAttestation::Verified, [met, met, met]),
+        // Only macOS records a control identity that can change.
+        (
+            live(),
+            ControlAttestation::Changed("process group changed".into()),
+            [control, met, met],
+        ),
+        (
+            live(),
+            ControlAttestation::Unknown("tty unreadable".into()),
+            [uninspected; 3],
+        ),
+        // A recorded birth without TTY and process groups.
+        (
+            live(),
+            ControlAttestation::NotRecorded,
+            [control, control, met],
+        ),
+        // A PID-only record; on Windows, a record without its process identity.
+        (
+            ProcessObservation::Live(Attested::PidOnly),
+            ControlAttestation::NotRecorded,
+            [control, control, met],
+        ),
+        (
+            ProcessObservation::Gone(Gone::Exited),
+            ControlAttestation::NotRecorded,
+            [gone; 3],
+        ),
+        (
+            ProcessObservation::Gone(Gone::Reused("another birth".into())),
+            ControlAttestation::NotRecorded,
+            [gone; 3],
+        ),
+        (
+            ProcessObservation::Unknown("access denied".into()),
+            ControlAttestation::NotRecorded,
+            [uninspected; 3],
+        ),
+    ];
+    for (process, control_attestation, expected) in rows {
+        let attestation = OwnerAttestation {
+            process,
+            control: control_attestation,
+            pid_alive: Some(true),
+        };
+        for (probe, expected) in [
+            SurfaceProbe::MacosControl,
+            SurfaceProbe::WindowsProcess,
+            SurfaceProbe::Unprobed,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(
+                probe.owner_requirement(&attestation),
+                expected,
+                "{probe:?} {attestation:?}"
+            );
+        }
+    }
+    assert_eq!(
+        SurfaceProbe::HOST,
+        if cfg!(target_os = "macos") {
+            SurfaceProbe::MacosControl
+        } else if cfg!(windows) {
+            SurfaceProbe::WindowsProcess
+        } else {
+            SurfaceProbe::Unprobed
+        }
+    );
+}
+
+/// The macOS requirement agrees with the probe it states: for each owner record, the
+/// record's attestation meets the requirement exactly when `verify_native_terminal_owner_with`
+/// accepts the record. Both observe the same live processes, and the surface, TTY and shell
+/// are the probe's accepting fixture, so the owner record and its live process are the only
+/// differences. The attestation compares control identity on macOS only.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_macos_owner_requirement_agrees_with_the_probe() {
+    use crate::native::session::owner::{OwnerObservers, attest_owner_with};
+    use crate::native::terminal::ownership::{OwnerRequirement, SurfaceProbe};
+
+    /// The recorded owner's process as both observers see it.
+    #[derive(Clone, Copy, Debug)]
+    enum Owner {
+        Running(NativeProcessIdentity),
+        Exited,
+        /// Its birth could not be read.
+        Uninspectable,
+        /// Its birth was read, but not the snapshot carrying its control identity.
+        ControlUnreadable(NativeProcessIdentity),
+    }
+
+    let (terminal, full, live, shell) = owner_fixture();
+    let without_control = NativeSessionOwner {
+        terminal_tty_device: None,
+        process_group: None,
+        terminal_process_group: None,
+        ..full.clone()
+    };
+    let without_birth = NativeSessionOwner {
+        process_start_seconds: None,
+        process_start_microseconds: None,
+        ..full.clone()
+    };
+    let pid_only = NativeSessionOwner {
+        pid: full.pid,
+        managed_session_id: full.managed_session_id.clone(),
+        ..NativeSessionOwner::default()
+    };
+    let changed = |changed: NativeProcessIdentity| Owner::Running(changed);
+    let cases = [
+        (
+            "full control identity",
+            &full,
+            Owner::Running(live),
+            OwnerRequirement::Met,
+        ),
+        (
+            "changed TTY",
+            &full,
+            changed(NativeProcessIdentity {
+                terminal_tty_device: 8,
+                ..live
+            }),
+            OwnerRequirement::ControlUnverified,
+        ),
+        (
+            "changed process group",
+            &full,
+            changed(NativeProcessIdentity {
+                process_group: 7777,
+                ..live
+            }),
+            OwnerRequirement::ControlUnverified,
+        ),
+        (
+            "changed terminal process group",
+            &full,
+            changed(NativeProcessIdentity {
+                terminal_process_group: 7777,
+                ..live
+            }),
+            OwnerRequirement::ControlUnverified,
+        ),
+        (
+            "birth without TTY and process groups",
+            &without_control,
+            Owner::Running(live),
+            OwnerRequirement::ControlUnverified,
+        ),
+        (
+            "TTY and process groups without birth",
+            &without_birth,
+            Owner::Running(live),
+            OwnerRequirement::ControlUnverified,
+        ),
+        (
+            "PID only",
+            &pid_only,
+            Owner::Running(live),
+            OwnerRequirement::ControlUnverified,
+        ),
+        (
+            "reused PID",
+            &full,
+            changed(NativeProcessIdentity {
+                process_start_seconds: 101,
+                ..live
+            }),
+            OwnerRequirement::Gone,
+        ),
+        ("exited", &full, Owner::Exited, OwnerRequirement::Gone),
+        (
+            "uninspectable birth",
+            &full,
+            Owner::Uninspectable,
+            OwnerRequirement::Uninspected,
+        ),
+        (
+            "unreadable control identity",
+            &full,
+            Owner::ControlUnreadable(live),
+            OwnerRequirement::Uninspected,
+        ),
+    ];
+    for (label, record, owner, expected) in cases {
+        let snapshot = |pid: u32| -> anyhow::Result<Option<NativeProcessIdentity>> {
+            assert_eq!(pid, record.pid, "{label}");
+            match owner {
+                Owner::Running(identity) => Ok(Some(identity)),
+                Owner::Exited => Ok(None),
+                Owner::Uninspectable | Owner::ControlUnreadable(_) => {
+                    bail!("process {pid} could not be inspected")
+                }
+            }
+        };
+        let attestation = attest_owner_with(
+            record,
+            OwnerObservers {
+                pid_alive: &|_| !matches!(owner, Owner::Exited),
+                birth: &|pid| match owner {
+                    Owner::Running(identity) | Owner::ControlUnreadable(identity) => Ok(Some((
+                        identity.process_start_seconds,
+                        identity.process_start_microseconds,
+                    ))),
+                    Owner::Exited | Owner::Uninspectable => snapshot(pid).map(|identity| {
+                        identity.map(|i| (i.process_start_seconds, i.process_start_microseconds))
+                    }),
+                },
+                control: &snapshot,
+            },
+        );
+        let requirement = SurfaceProbe::MacosControl.owner_requirement(&attestation);
+        assert_eq!(requirement, expected, "{label}: {attestation:?}");
+        let probed = verify_native_terminal_owner_with(
+            SESSION_ID,
+            &terminal,
+            Some(OWNER_TTY),
+            record.clone(),
+            |pid| {
+                if pid == shell.pid {
+                    return Ok(shell);
+                }
+                snapshot(pid)?.context("no such process")
+            },
+            |_| Ok(live.terminal_tty_device),
+        );
+        assert_eq!(
+            requirement == OwnerRequirement::Met,
+            probed.is_ok(),
+            "{label}: {requirement:?} against the probe's {:?}",
+            probed.map(|_| ())
+        );
+    }
+}
+
+/// The Windows requirement agrees with `verified_windows_native_owner` for this test
+/// process's own owner record with, without and with a changed process identity.
+#[cfg(windows)]
+#[test]
+fn the_windows_owner_requirement_agrees_with_the_probe() {
+    use crate::native::session::owner::attest_owner;
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::session::test_support::SESSION_OWNER_FILE;
+    use crate::native::terminal::ownership::{
+        OwnerRequirement, SurfaceProbe, current_native_session_owner, verified_windows_native_owner,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let recorded = current_native_session_owner(SESSION_ID).unwrap();
+    assert!(recorded.windows_process_identity.is_some());
+    let without_identity = NativeSessionOwner {
+        windows_process_identity: None,
+        ..recorded.clone()
+    };
+    let mut changed_identity = recorded.clone();
+    changed_identity
+        .windows_process_identity
+        .as_mut()
+        .unwrap()
+        .creation_time += 1;
+    for (label, record, expected) in [
+        ("recorded identity", recorded, OwnerRequirement::Met),
+        (
+            "no recorded identity",
+            without_identity,
+            OwnerRequirement::ControlUnverified,
+        ),
+        ("changed identity", changed_identity, OwnerRequirement::Gone),
+    ] {
+        write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &record).unwrap();
+        let attestation = attest_owner(&record);
+        let requirement = SurfaceProbe::WindowsProcess.owner_requirement(&attestation);
+        assert_eq!(requirement, expected, "{label}: {attestation:?}");
+        let probed = verified_windows_native_owner(directory.path(), SESSION_ID);
+        assert_eq!(
+            requirement == OwnerRequirement::Met,
+            probed.is_ok(),
+            "{label}: {requirement:?} against the probe's {:?}",
+            probed.map(|_| ())
+        );
+    }
+}
