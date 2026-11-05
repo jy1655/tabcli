@@ -366,7 +366,7 @@ fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
 }
 
 #[test]
-fn claude_deflection_without_a_record_or_with_malformed_data_marks_nothing() {
+fn claude_deflection_without_a_record_or_with_malformed_data_marks_no_item_and_the_record_incomplete() {
     for data in [
         deflected(0, 0),
         json!({"turnId":TURN,"step":0}),

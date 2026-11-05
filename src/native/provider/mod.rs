@@ -22,7 +22,8 @@ pub(super) struct EmittedQuestion {
 pub(super) struct QuestionEmission {
     pub(super) id: String,
     pub(super) questions: Vec<EmittedQuestion>,
-    /// Set only by the Claude adapter: its question plugin refused this call before any dialog.
+    /// The provider's own adapter refused this call before any dialog and returned the question
+    /// to the caller in the Result. Only an adapter with such a route sets it (Claude today).
     /// Omitted when false, so other records and outputs keep their bytes; old records read.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(super) deflected: bool,

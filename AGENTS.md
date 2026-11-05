@@ -136,7 +136,12 @@ launch, observe, continue, and close without replacing the capabilities those CL
   (bound turn of the current Claim under the lifecycle lock, never a Claim or outcome change).
   Subagent calls, a plugin's `$.ui.ask`, unobserved calls, a module that is not loaded, and a
   hook that throws or overruns its budget all leave the dialog: no `.catch` refuses in their
-  place. A failed record still refuses. The flag proves a refused call, not that the Result is
+  place. A failed record still refuses and leaves no flag, as does a refusal outside the bound
+  turn: an absent flag is not evidence that no call was refused. A step whose stream breaks
+  after a refusal marks the record incomplete. Claude fires settings `PreToolUse` hooks beneath
+  plugin `tool.call` hooks, so a user's own `PreToolUse` hook for `AskUserQuestion` does not
+  run for a refused call; only the setting restores it. A second dispatch of a refused call
+  gets the same refusal, recorded once. The flag proves a refused call, not that the Result is
   a question or what the child wrote after it; `wait --questions` can return the emission
   before its flag. Replace the stream correlation when `tool.call` carries its turn and step
   identity or step tool uses carry their call id, and the fallback when Claude offers a

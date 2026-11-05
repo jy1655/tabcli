@@ -80,7 +80,7 @@ export function register(on) {
     // Claude can start a tool while its step still streams, before the response's evidence
     // exists: such a refusal is deferred and attributed after the emission report.
     const step = { conversation, turnId: e.turnId, index: e.index, blocks: new Map(),
-      calls: new Map(), keys: new Map(), refused: [], deferred: true };
+      calls: new Map(), denied: new Set(), keys: new Map(), refused: [], deferred: true };
     current = step;
     let response;
     let streamed = false;
@@ -88,7 +88,14 @@ export function register(on) {
       response = yield* observed(next(e), step);
       streamed = true;
     } finally {
-      if (!streamed) step.deferred = false;
+      if (!streamed) {
+        // A stream that throws or is closed leaves no step evidence, so a call refused
+        // meanwhile can name no item: each one marks the record incomplete.
+        step.deferred = false;
+        try {
+          while (step.refused.length) await attribute($, step, step.refused.shift());
+        } catch {}
+      }
     }
     try {
       // A lower hook may synthesize its own return. Only the engine's final trace
@@ -122,9 +129,12 @@ export function register(on) {
     if (deflect !== true || e.agentId !== undefined || next.origin?.plugin !== "engine" ||
         next.origin?.tier !== "core") return next(e);
     const step = current;
+    // A hook above Bridge can dispatch the same call again: same refusal, recorded once.
+    if (step?.denied.has(e.tool_use_id)) return { deny: REASON };
     if (!step?.calls.has(e.tool_use_id)) return next(e);
     const refusal = { index: step.calls.get(e.tool_use_id), key: projection(e.questions) };
     step.calls.delete(e.tool_use_id);
+    step.denied.add(e.tool_use_id);
     if (step.deferred) step.refused.push(refusal);
     else await attribute($, step, refusal);
     return { deny: REASON };

@@ -281,8 +281,9 @@ if (scenario.startsWith("questions")) {
         assert.equal(await toolCall(unrefused), "dialog", JSON.stringify(unrefused));
       }
       refused(await toolCall({ id: "toolu-question-5" }));
+      // A hook above Bridge can dispatch the same call again: same refusal, recorded once.
+      refused(await toolCall({ id: "toolu-question-5" }));
       assert.equal(calls.length, from);
-      assert.equal(await toolCall({ id: "toolu-question-5" }), "dialog", "a call is refused once");
     } });
     assert.deepEqual(wires(from).map(wire => [wire.event, wire.data, wire.conversation]), [
       ["question.emissions", { turnId, step: 5, items: [{ index: 1, questions: [question] }], incomplete: false }, conversation],
@@ -306,6 +307,13 @@ if (scenario.startsWith("questions")) {
       ["question.emissions", { turnId, step: 8, items: [{ index: 1, questions: [question] }], incomplete: false }],
       ["question.emissions", { turnId, step: 8, items: [], incomplete: true }],
     ]);
+    // Refused while its step streams, and the stream then breaks: no evidence names an item,
+    // so the refusal marks the record incomplete instead of leaving no trace.
+    from = calls.length;
+    await step({ index: 16, broken: true,
+      during: async () => refused(await toolCall({ id: "toolu-question-16" })) });
+    assert.deepEqual(wires(from).map(wire => [wire.event, wire.data]),
+      [["question.emissions", { turnId, step: 16, items: [], incomplete: true }]]);
     // A deflection that cannot be recorded still refuses the call.
     await step({ index: 9 });
     from = calls.length;

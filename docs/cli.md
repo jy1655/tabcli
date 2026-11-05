@@ -810,11 +810,17 @@ tells the child to end its turn with the question (`QUESTION FOR CALLER: <questi
 Result, the emission record still holds the structured question, and the caller answers with an
 ordinary `tell`. Bridge waits for nothing, injects no answer and adds no transport.
 
+Claude Code fires a settings `PreToolUse` hook beneath plugin `tool.call` hooks, so a `PreToolUse`
+hook of your own for `AskUserQuestion` (one that answers before display, for example) does not
+run for a call the plugin refuses. `settings claude-question-deflection off` keeps such a hook and
+the dialog for sessions launched afterwards.
+
 When the retained record holds a deflected call, the outputs that report question presence
 (waited `ask`, `tell` and `reopen`, `result`, `wait`, the `status` focus object and `inspect`
 request references) add `question_deflected: true` and `question_deflection_count`, and each
-deflected item in `question_emissions` carries `deflected: true`. Otherwise these fields are
-absent and the output is unchanged. Human output adds
+deflected item in `question_emissions` carries `deflected: true`. Without a recorded deflection
+these fields are absent and the output is unchanged; their absence does not prove that no call
+was refused. Human output adds
 `question calls deflected (refused before their dialog; read the result): N`.
 
 The evidence is that the plugin refused a call, not that the Result is a question or what the
@@ -825,13 +831,15 @@ subagent questions, a plugin's own questions and unobserved calls reach the dial
 and so does every call when the plugin's hook fails or overruns its budget. The flag is set only
 on an item whose step evidence holds the same question text and option labels at the refused
 call's position; a refusal that cannot be attributed marks `question_observation: "incomplete"`
-instead. `wait --questions` can return an emission before its `deflected` flag is recorded, and
+instead. A refusal leaves no record at all when both attempts to record it fail, or when it
+happens outside the request's bound turn (an unattributed continuation turn, for example).
+`wait --questions` can return an emission before its `deflected` flag is recorded, and
 its cursor does not return that emission again; read `result --request` for the current flags.
 Codex, Agy and Pi sessions never report deflection.
 
 Successful waited `ask`, `tell` and `reopen` read the record once and add only
-`question_emitted`, `question_emission_count`, and any `question_observation` diagnostic,
-without question content. `result --wait` and default `wait` do the same for any ended
+`question_emitted`, `question_emission_count`, the two deflection fields above when a call was
+deflected, and any `question_observation` diagnostic, without question content. `result --wait` and default `wait` do the same for any ended
 request. After a failed `ask`/`tell`/`reopen` wait, use `result --request` to inspect the
 retained questions. Human output then prints
 `question emissions retained: N` and the `result --request` command that shows them. A
@@ -967,7 +975,8 @@ Across addresses, input order still selects the first observed condition, whethe
 an ending or an emission. Every readable address in that pass is validated before selection;
 an invalid receipt or cursor is an error even if an earlier address has a question.
 `result --wait` and `wait` without `--questions` retain their waiting and exit contracts; an
-ended Request adds only the retained-emission count described in [result](#result).
+ended Request adds only the retained-emission and deflection counts described in
+[result](#result).
 
 ## search
 
@@ -1380,7 +1389,9 @@ tabcli settings
   "settings_file": "/path/to/home/.agent-bridge/native-sessions/settings.json",
   "windows_tab_window": "dedicated",
   "macos_open_mode": "tab-first",
-  "codex_memory_workspace": "refuse"
+  "codex_memory_workspace": "refuse",
+  "codex_lifecycle_hooks": "on",
+  "claude_question_deflection": "on"
 }
 ```
 
@@ -1398,7 +1409,8 @@ restores the default. It is a launch admission preference, read at each launch, 
 removes no close authority over existing sessions. Isolated `self-test` does not read it.
 
 `--json` is optional and has no format effect: output is always JSON, with `settings_file`,
-`windows_tab_window`, `macos_open_mode`, and `codex_memory_workspace`.
+`windows_tab_window`, `macos_open_mode`, `codex_memory_workspace`, `codex_lifecycle_hooks`, and
+`claude_question_deflection`.
 
 Successful reads/writes exit 0. Unknown setting names or values, duplicate `--json`, an invalid
 settings schema, and read/write failures fail. An invalid admission value fails with
@@ -1725,7 +1737,8 @@ compatibility field `iterm_session_id`, `result`, `provider_session_id`, `turn_i
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`. A detached success has
 `request_state: "accepted"` and a null `result`; a waited success has `request_state: "completed"`.
 For Codex and Claude, a waited success can add `question_emitted`, `question_emission_count`,
-and `question_observation`, as described in [result](#result); it never adds question content.
+and `question_observation`, and for Claude `question_deflected` and `question_deflection_count`,
+as described in [result](#result); it never adds question content.
 
 A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `session`, and `error`, without
 `request_id`; a claim-stage race can leave an unresolved receipt visible through `result --list`.
@@ -1783,8 +1796,9 @@ refused an isolated test before its private directory existed; that report has o
 ### settings
 
 Fields: `settings_file`, `windows_tab_window` (`dedicated` or `current`), `macos_open_mode`
-(`tab-first` or `new-window`), `codex_memory_workspace` (`refuse` or `allow`), and
-`claude_question_deflection` (`on` or `off`). There is no `schema_version`.
+(`tab-first` or `new-window`), `codex_memory_workspace` (`refuse` or `allow`),
+`codex_lifecycle_hooks` (`on` or `off`), and `claude_question_deflection` (`on` or `off`). There
+is no `schema_version`.
 
 ### sessions
 
@@ -1815,7 +1829,8 @@ with `hold_error` when the record cannot be read. A true value adds attention `h
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`.
 `latest_result` is null or contains `event_id`, `request_id`, `request_state`, and
 `created_unix_ms`; it never includes the body. Legacy results can have a null request id.
-The question focus among them can add `question_emitted` and `question_emission_count`.
+The question focus among them can add `question_emitted`, `question_emission_count`,
+`question_deflected`, and `question_deflection_count`.
 `owner` contains nullable `process_alive`, `identity_matches`, and `error`.
 `derived_from: "observation"` marks attention and the request objects as judgments.
 
@@ -1959,8 +1974,9 @@ journaled completion as not published, so do not downgrade `tabcli` while a sess
 written is open.
 
 Ordinary single-result JSON can also have `question_emissions`, `question_emitted`,
-`question_emission_count`, and `question_observation`, as described in [result](#result).
-An ended `result --wait` has only the last three; listed results have none. They do not
+`question_emission_count`, `question_deflected`, `question_deflection_count`, and
+`question_observation`, as described in [result](#result). An ended `result --wait` has all of
+these but `question_emissions`; listed results have none. They do not
 alter the completion event or journal schema.
 
 ### wait
@@ -1977,10 +1993,10 @@ remain in `remaining`. `question` contains the selected result observation plus 
 `question_emissions`, and `after_question`. `question_observation` is included when known
 incomplete. An ending return has no `question` field; its `ended` may carry those optional
 question fields, including `question_observation: "unreadable"`. See [wait](#wait) for cursor
-validation and precedence. Either form can add `question_emitted` and
-`question_emission_count` for the whole retained record. Without `--questions`, a pending
-poll reads no question record; an `ended` object adds only those two fields and any
-`question_observation`, never `question_emissions` or `after_question`.
+validation and precedence. Either form can add `question_emitted`, `question_emission_count`,
+`question_deflected`, and `question_deflection_count` for the whole retained record. Without
+`--questions`, a pending poll reads no question record; an `ended` object adds only those
+fields and any `question_observation`, never `question_emissions` or `after_question`.
 
 ### doctor
 

@@ -428,7 +428,10 @@ when that return holds the same question text and option labels there; otherwise
 marked incomplete and no item is created. Recording uses the question helper's two 5-second
 attempts; a failure logs it and the call is still refused. Subagent calls, a plugin's own
 `$.ui.ask`, calls the module did not observe, deflection off, and a hook that throws or overruns
-its budget all leave the dialog as before; no `.catch` refuses in their place. `inspect` reports
+its budget all leave the dialog as before; no `.catch` refuses in their place. Claude fires
+settings `PreToolUse` hooks beneath plugin `tool.call` hooks, so a user's own `PreToolUse` hook
+for `AskUserQuestion` does not run for a refused call; only turning the setting off keeps it. A
+refusal whose record fails, or one outside the request's bound turn, leaves no flag. `inspect` reports
 `capabilities.questions.response` as `deflected_to_result` for such a launch, which is
 configuration and not evidence of a refusal. A deflected flag says a call was refused, not that
 the Result is a question. Replace the stream correlation when `tool.call` carries its turn and
