@@ -258,6 +258,32 @@ nothing else to do kept its turn open waiting for the answer
 Component verification is recorded in
 [the focused verification note](verification/2026-10-19-codex-question-emissions.md).
 
+The question notice is a fallback for that wait. It is decided at launch from
+`settings codex-question-notice` (default `on`) and recorded in `codex-question-notice.json`,
+with the reason when the hook was not injected (setting off, lifecycle hooks not injected,
+launcher unavailable, Codex below 0.166.0). Later reads use the record, never the current
+setting. With the notice, the injected `-c hooks=` value also carries a `PreToolUse` group whose
+matcher selects only `request_user_input_async`, with its trust hash; Codex includes the matcher
+in that hash. For that tool the hook adds context for the model and makes no decision: the tool
+still runs, the question is emitted and the watcher records it as above. The notice says that no
+person is at the terminal, so no reply can arrive during the turn; that the child should not
+wait for one, should finish the work that does not depend on the answer, and should end its
+turn with the line `QUESTION FOR CALLER: <question> Options: <option labels>`, the format
+Claude's [question deflection](cli.md#question-deflection) uses. It is not a refusal, because
+the tool is asynchronous by design and a refusal would cut short the work the child does while
+its question is open. The caller answers with an ordinary `tell` once the request has ended
+([question notice](cli.md#question-notice)). The hook only reads the launch record: it writes
+nothing, takes no claim, and sets no `deflected` flag, so `question_deflected` stays
+Claude-only. `inspect --json` reports `capabilities.questions.response` as `answer_after_turn`
+for such a launch, which is configuration and not evidence that the child read or followed the
+notice. The notice is advice: a child that ignores it can still wait in its turn, and then the
+request stays pending as before. A trust hash Codex no longer accepts holds its hook-review
+picker before the composer, as for the two lifecycle hooks; `doctor --probe` checks the third
+hook whenever a new launch would inject it. Codex runs every matched `PreToolUse` handler, so a
+user's own hook for the tool still runs, and one that denies it blocks the question. The 0.166.0
+floor is the only version measured, not runtime proof. Replace the notice when Codex offers a
+verified addressed way to answer a question in the running turn of the injected TUI launch.
+
 Unbound claims retain the `notify` fallback: Bridge accepts an assistant result ending with
 the pending marker, or a completion whose string input begins with the delegation header and
 ends with that marker. A steered TUI input may follow Bridge's prompt; the answer serves both.

@@ -45,6 +45,14 @@ bounded at 60 s and logged to a per-scenario progress file outside the session d
 that times out or cannot start ends the harness with exit code 70. The Rust runner bounds each
 scenario at 300 s and prints Node's output and that progress log when a scenario fails.
 
+The Codex question notice tests pin the injected `-c hooks=` value for both platforms' syntaxes,
+the matcher-aware trust hash (the macOS vector is the value `hooks/list` of codex-cli 0.166.0
+reported trusted; the Windows vector is computed by the same normalization) and the hook's exact
+stdout line. One test runs the sibling `tabcli` binary that `cargo test --all-targets` builds as
+`native-hook codex` with a `PreToolUse` payload on stdin, and checks the exit code, stdout and
+that the session directory is unchanged. None of them runs Codex: they do not establish that Codex
+loads the hook, trusts its hash on Windows or hands the notice to the model.
+
 ### Claude inbound module coexistence
 
 Other Claude modules may consume or rewrite inbound input. The deterministic coexistence
