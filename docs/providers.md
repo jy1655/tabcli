@@ -258,8 +258,8 @@ nothing else to do kept its turn open waiting for the answer
 Component verification is recorded in
 [the focused verification note](verification/2026-10-19-codex-question-emissions.md).
 
-The question notice is a fallback for that wait. It is decided at launch from
-`settings codex-question-notice` (default `on`) and recorded in `codex-question-notice.json`,
+The question notice is an opt-in fallback for that wait. It is decided at launch from
+`settings codex-question-notice` (default `off`) and recorded in `codex-question-notice.json`,
 with the reason when the hook was not injected (setting off, lifecycle hooks not injected,
 launcher unavailable, Codex below 0.166.0). Later reads use the record, never the current
 setting. With the notice, the injected `-c hooks=` value also carries a `PreToolUse` group whose

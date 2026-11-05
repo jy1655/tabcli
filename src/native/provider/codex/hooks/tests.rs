@@ -317,7 +317,7 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
         (
             Some("codex-cli 0.164.0"),
             "on",
-            None,
+            Some("on"),
             available,
             None,
             BELOW,
@@ -325,13 +325,29 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
         (
             Some("codex-cli 0.165.9"),
             "on",
-            None,
+            Some("on"),
             available,
             None,
             BELOW,
         ),
-        // The notice hook's floor: 0.166.0 and newer, the setting's default on.
-        (Some("codex-cli 0.166.0"), "on", None, available, None, None),
+        // The notice hook is opt-in: the setting's default is off, and with it on the floor is
+        // 0.166.0 and newer.
+        (
+            Some("codex-cli 0.166.0"),
+            "on",
+            None,
+            available,
+            None,
+            Some("settings_off"),
+        ),
+        (
+            Some("codex-cli 0.170.3"),
+            "on",
+            None,
+            available,
+            None,
+            Some("settings_off"),
+        ),
         (
             Some("codex-cli 0.166.0"),
             "on",
@@ -340,8 +356,22 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
             None,
             None,
         ),
-        (Some("0.166.0+build.1"), "on", None, available, None, None),
-        (Some("codex-cli 0.170.3"), "on", None, available, None, None),
+        (
+            Some("0.166.0+build.1"),
+            "on",
+            Some("on"),
+            available,
+            None,
+            None,
+        ),
+        (
+            Some("codex-cli 0.170.3"),
+            "on",
+            Some("on"),
+            available,
+            None,
+            None,
+        ),
         (
             Some("codex-cli 0.166.0"),
             "on",
@@ -937,6 +967,14 @@ fn session_files(directory: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     entries
 }
 
+// The notice is opt-in. The launches below are ones that would carry the hook.
+fn turn_the_notice_on(root: &Path) {
+    Store::open_unchecked(root)
+        .private("settings.json")
+        .write_json(&serde_json::json!({"schema":1,"codex_question_notice":"on"}))
+        .unwrap();
+}
+
 fn launch_executable() -> &'static Path {
     Path::new(if cfg!(windows) {
         WINDOWS_EXE
@@ -1019,6 +1057,7 @@ fn a_notice_record_that_fails_before_or_after_its_rename_fails_preparation_witho
         (3, true, "syncing a renamed record"),
     ] {
         let root = tempfile::tempdir().unwrap();
+        turn_the_notice_on(root.path());
         let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
         crate::native::session::update_status(
             &directory,
@@ -1055,6 +1094,7 @@ fn the_launch_plan_propagates_a_failed_notice_record_instead_of_returning_argume
     use crate::native::session::primitives::{injected_fault, with_fault_budget};
     for (passed, present) in [(2, false), (3, true)] {
         let root = tempfile::tempdir().unwrap();
+        turn_the_notice_on(root.path());
         let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
         crate::native::session::update_status(
             &directory,
@@ -1114,6 +1154,7 @@ fn a_failed_notice_record_stops_the_launch_before_the_provider_is_spawned() {
     )
     .unwrap();
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+    turn_the_notice_on(root.path());
     let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
     Store::open_unchecked(&directory)
         .private("manifest.json")

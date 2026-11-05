@@ -171,13 +171,15 @@ impl FromStr for ClaudeQuestionDeflection {
 
 /// Whether new Codex launches inject the `PreToolUse` hook that lets the model's
 /// `request_user_input_async` call run and adds a notice: no reply can arrive during the turn, so
-/// finish what does not depend on the answer and end the turn with the question. Each session
-/// records its own launch decision; the setting is not evidence that a child read the notice.
+/// finish what does not depend on the answer and end the turn with the question. Off unless the
+/// user turns it on: the question tool is asynchronous by design and the notice is advice a
+/// caller may not need. Each session records its own launch decision; the setting is not
+/// evidence that a child read the notice.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum CodexQuestionNotice {
-    #[default]
     On,
+    #[default]
     Off,
 }
 
@@ -463,14 +465,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_question_notice_defaults_on_and_updates_preserve_other_settings() {
+    fn codex_question_notice_defaults_off_and_updates_preserve_other_settings() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("state");
         assert_eq!(
             codex_question_notice(&root).unwrap(),
-            CodexQuestionNotice::On
+            CodexQuestionNotice::Off
         );
-        assert_eq!(apply(&root, &[]).unwrap()["codex_question_notice"], "on");
+        assert_eq!(apply(&root, &[]).unwrap()["codex_question_notice"], "off");
         for invalid in [
             vec!["codex-question-notice"],
             vec!["codex-question-notice", "ON"],
@@ -487,7 +489,7 @@ mod tests {
             "codex-question-notice is on or off, not \"maybe\""
         );
         apply(&root, &arguments(&["claude-question-deflection", "off"])).unwrap();
-        for value in ["off", "on", "off"] {
+        for value in ["on", "off", "on"] {
             assert_eq!(
                 apply(
                     &root,
@@ -506,7 +508,7 @@ mod tests {
             serde_json::json!({
                 "schema": 1,
                 "claude_question_deflection": "off",
-                "codex_question_notice": "off",
+                "codex_question_notice": "on",
             })
         );
         // The two providers' settings are independent keys of one record.
@@ -521,7 +523,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             codex_question_notice(&root).unwrap(),
-            CodexQuestionNotice::On
+            CodexQuestionNotice::Off
         );
         fs::write(
             root.join(FILE),
@@ -654,7 +656,7 @@ mod tests {
                 "codex_memory_workspace": "refuse",
                 "codex_lifecycle_hooks": "on",
                 "claude_question_deflection": "on",
-                "codex_question_notice": "on",
+                "codex_question_notice": "off",
             })
         );
         assert!(!root.exists(), "reading defaults must not write settings");

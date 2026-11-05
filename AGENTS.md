@@ -520,7 +520,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   kept its turn open waiting, so its request stayed pending and no `tell` could reach it.
 - The question notice is a fallback for that wait (#342): no person is at a managed session's
   terminal, and Codex 0.166.0 offers no addressed way to answer a question in the running turn.
-  The state root's `codex-question-notice` setting (default on) is read once at launch, and
+  The state root's `codex-question-notice` setting is read once at launch. It defaults to off
+  (owner's decision, 2026-11-05, after 0.4.36 shipped it on): the hook only adds advice that a
+  caller may not need, so the user opts in. Do not turn the default on from a version check or
+  because Claude's deflection is on.
   `codex-question-notice.json` records whether the hook was injected and, if not, why (setting
   off, lifecycle hooks not injected, launcher unavailable, Codex below 0.166.0); every later
   read uses that record, and a session without it has no notice hook. When it is injected, the
@@ -553,7 +556,7 @@ launch, observe, continue, and close without replacing the capabilities those CL
   this one and subagent questions are unverified. Replace this fallback when Codex offers a
   verified addressed way to answer a question in the running turn of the injected TUI launch.
   The macOS owner check with codex-cli 0.166.0 (two requests with the notice on, their
-  follow-up answers, and one request with it off) is in
+  follow-up answers, and one request with it off; run while the default was on) is in
   `docs/verification/2026-11-05-macos-342-codex-question-notice.md`.
 - Lifecycle completion live verification on native Windows, 2026-10-18, codex-cli 0.163.0
   (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled

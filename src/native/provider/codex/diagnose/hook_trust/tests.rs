@@ -88,6 +88,7 @@ fn hook_trust_fake_responder_trusted_untrusted_and_modified_hashes() {
 
 #[test]
 fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
+    use crate::native::settings::CodexLifecycleHooks as Lifecycle;
     use crate::native::settings::CodexQuestionNotice::{Off, On};
     let command = hooks::hook_command(bridge()).unwrap();
     let matched = hooks::matched_trust_hash("pre_tool_use", Some(hooks::QUESTION_TOOL), &command);
@@ -126,22 +127,33 @@ fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
         2
     );
     assert!(summarize(&reply("trusted", false), bridge(), true).is_err());
-    for (version, setting, expected) in [
-        (Some("codex-cli 0.166.0"), Ok(On), true),
-        (Some("codex-cli 0.167.2"), Ok(On), true),
-        (Some("codex-cli 0.166.0"), Ok(Off), false),
-        (Some("codex-cli 0.166.0"), Err(()), true),
-        (Some("codex-cli 0.165.9"), Ok(On), false),
-        (Some("codex-cli 0.166.0-alpha.1"), Ok(On), false),
-        (Some("codex-cli 0.167.0-alpha.1"), Ok(On), false),
-        (Some("unparseable"), Ok(On), false),
-        (None, Ok(On), false),
+    for (version, settings, expected) in [
+        (Some("codex-cli 0.166.0"), Ok((Lifecycle::On, On)), true),
+        (Some("codex-cli 0.167.2"), Ok((Lifecycle::On, On)), true),
+        (Some("codex-cli 0.166.0"), Ok((Lifecycle::On, Off)), false),
+        // A launch with lifecycle hooks off injects no hooks value, so no notice hook either.
+        (Some("codex-cli 0.166.0"), Ok((Lifecycle::Off, On)), false),
+        (Some("codex-cli 0.166.0"), Ok((Lifecycle::Off, Off)), false),
+        (Some("codex-cli 0.166.0"), Err(()), false),
+        (Some("codex-cli 0.165.9"), Ok((Lifecycle::On, On)), false),
+        (
+            Some("codex-cli 0.166.0-alpha.1"),
+            Ok((Lifecycle::On, On)),
+            false,
+        ),
+        (
+            Some("codex-cli 0.167.0-alpha.1"),
+            Ok((Lifecycle::On, On)),
+            false,
+        ),
+        (Some("unparseable"), Ok((Lifecycle::On, On)), false),
+        (None, Ok((Lifecycle::On, On)), false),
     ] {
         assert_eq!(
-            proposes_notice_hook(version, || setting
+            proposes_notice_hook(version, || settings
                 .map_err(|()| anyhow::anyhow!("unreadable settings"))),
             expected,
-            "{version:?} {setting:?}"
+            "{version:?} {settings:?}"
         );
     }
 }

@@ -966,8 +966,9 @@ Codex, Agy and Pi sessions never report deflection; Codex has the
 
 Codex's `request_user_input_async` tool is asynchronous: it emits the question and returns at
 once, and the turn goes on. A Bridge-managed Codex session has nobody at its terminal, and a child
-that waits for a reply keeps its turn, and the request, open. A Codex session launched with
-`settings codex-question-notice on` (the default), with lifecycle hooks injected and a recorded
+that waits for a reply keeps its turn, and the request, open. The question notice is an opt-in
+answer to that wait and is `off` by default. A Codex session launched with
+`settings codex-question-notice on`, with lifecycle hooks injected and a recorded
 Codex version of 0.166.0 or newer, carries one more `PreToolUse` hook that runs for that tool only.
 It lets the tool run and adds this notice for the model:
 
@@ -995,7 +996,9 @@ as `answer_after_turn` for such a launch. The hook prints nothing for any other 
 record, and leaves your own `PreToolUse` hooks in place: Codex runs every matching hook, and one
 of yours that denies the tool blocks the question. If the hook cannot read its launch record it
 exits with status 1, which Codex reports as a failed hook before running the tool without the
-notice. `settings codex-question-notice off` launches later Codex sessions without it.
+notice. `settings codex-question-notice off`, the default, launches later Codex sessions without
+it. Without the notice Bridge adds nothing to the question tool, and a child that waits for a reply
+keeps its turn, and the request, open.
 Not verified: native Windows at runtime, Codex versions other than 0.166.0, more than one question
 in a turn, a `PreToolUse` hook of your own beside this one, and subagent questions.
 
@@ -1287,7 +1290,10 @@ this Bridge executable would inject, then sends stdio JSON-RPC `initialize`, `in
 It creates no Bridge scratch files or configuration writes. This is `source: current_probe`,
 not evidence about a session's live configuration or hook execution. Each of Bridge's two keys
 reports `trustStatus`, `currentHash`, `expected_hash`, `hash_matches`, and `diagnostic`:
-`normalization drift` when the hashes differ. Both trusted and matching means `available`;
+`normalization drift` when the hashes differ. The override and the report add the
+[question notice](#question-notice) hook's key as a third only when a new launch would inject it:
+`codex-question-notice` and `codex-lifecycle-hooks` both `on` and a stable Codex 0.166.0 or newer.
+All reported keys trusted and matching means `available`;
 untrusted/modified/mismatched means `unavailable`. Missing executable/keys, malformed replies,
 errors and timeouts report `codex_hook_trust_unavailable` with a reason. Batch-only launchers
 that require a disk forwarder are unavailable for this file-free probe.
@@ -1527,7 +1533,7 @@ tabcli settings macos-open-mode tab-first|new-window [--json]
 tabcli settings codex-memory-workspace refuse|allow [--json]
 tabcli settings codex-lifecycle-hooks on|off [--json] # default: on
 tabcli settings claude-question-deflection on|off [--json] # default: on
-tabcli settings codex-question-notice on|off [--json] # default: on
+tabcli settings codex-question-notice on|off [--json] # default: off
 ```
 
 `codex-lifecycle-hooks` controls hook injection for new Codex launches only. It writes Bridge's
@@ -1546,8 +1552,9 @@ and is noted in the session's launch log. The setting is not evidence that a cal
 `codex-question-notice` decides, for new Codex launches only, whether the injected hooks include
 the `PreToolUse` hook that lets a `request_user_input_async` call run with a notice that no reply
 can arrive during the turn ([question notice](#question-notice)). It applies only when lifecycle
-hooks are injected and the recorded Codex version is 0.166.0 or newer. Choose `off` for sessions
-a person watches and answers in the terminal. Each session keeps the decision recorded at its
+hooks are injected and the recorded Codex version is 0.166.0 or newer. It is `off` by default;
+choose `on` when nobody watches the sessions and a child's question should end its turn instead of
+keeping it open. Each session keeps the decision recorded at its
 launch (`codex-question-notice.json`, with the reason when the hook was not injected); a settings
 record that cannot be read fails the launch, as for `codex-lifecycle-hooks`. The setting is not
 evidence that a child read or followed the notice.
@@ -1564,7 +1571,7 @@ tabcli settings
   "codex_memory_workspace": "refuse",
   "codex_lifecycle_hooks": "on",
   "claude_question_deflection": "on",
-  "codex_question_notice": "on"
+  "codex_question_notice": "off"
 }
 ```
 

@@ -43,8 +43,11 @@ fn probe(context: &Context<'_>) -> Result<Value> {
     }
     let bridge = std::env::current_exe()?;
     let notice = proposes_notice_hook(context.current_version, || {
-        crate::native::session::Reader::state_root()
-            .and_then(|root| crate::native::settings::codex_question_notice(&root))
+        let root = crate::native::session::Reader::state_root()?;
+        Ok((
+            crate::native::settings::codex_lifecycle_hooks(&root)?,
+            crate::native::settings::codex_question_notice(&root)?,
+        ))
     });
     let override_value =
         hooks::hooks_override(&bridge, notice).context("hook launcher unavailable")?;
@@ -96,18 +99,23 @@ fn probe(context: &Context<'_>) -> Result<Value> {
     summarize(&result?, &bridge, notice)
 }
 
-// The value a new launch would inject: the notice hook only for Codex 0.166.0 or newer (not
-// a prerelease) with the setting on. An unreadable setting proposes the default, on.
+// Whether a new launch would inject the notice hook: Codex 0.166.0 or newer (not a prerelease),
+// lifecycle hooks on (the notice rides in their value) and the notice setting on. Unreadable
+// settings propose the notice's default, off. The two lifecycle hooks are proposed whatever
+// their setting says.
 fn proposes_notice_hook(
     version: Option<&str>,
-    setting: impl FnOnce() -> Result<crate::native::settings::CodexQuestionNotice>,
+    settings: impl FnOnce() -> Result<(
+        crate::native::settings::CodexLifecycleHooks,
+        crate::native::settings::CodexQuestionNotice,
+    )>,
 ) -> bool {
+    use crate::native::settings::{CodexLifecycleHooks, CodexQuestionNotice};
     version
         .and_then(|version| super::super::codex_version(version).ok())
         .is_some_and(|version| version >= semver::Version::new(0, 166, 0) && version.pre.is_empty())
-        && setting().map_or(true, |setting| {
-            setting == crate::native::settings::CodexQuestionNotice::On
-        })
+        && settings()
+            .is_ok_and(|settings| settings == (CodexLifecycleHooks::On, CodexQuestionNotice::On))
 }
 
 // Own both streams so even a blocked write/read cannot hold the caller past its
