@@ -659,19 +659,21 @@ mod adapter_tests {
             guard(TerminalKind::WezTerm),
             "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane"
         );
-        // Both declared unsupported.
-        for (kind, expected) in [
+        // Both declared unsupported, each operation with its own message.
+        for (kind, expected_read, expected_guard) in [
             (
                 TerminalKind::Ghostty,
+                "Ghostty's scripting dictionary exposes no screen text",
                 "managed dialog input unsupported for this terminal",
             ),
             (
                 TerminalKind::Warp,
                 "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
+                "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
             ),
         ] {
-            assert_eq!(read(kind), expected, "{kind:?}");
-            assert_eq!(guard(kind), expected, "{kind:?}");
+            assert_eq!(read(kind), expected_read, "{kind:?}");
+            assert_eq!(guard(kind), expected_guard, "{kind:?}");
         }
         // The adapters of the refusing kinds give only the invariant failure, so the
         // declared messages above can only have come from the shared dispatch.
