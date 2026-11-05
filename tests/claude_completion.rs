@@ -20,12 +20,33 @@ fn wait_bounded(node: &mut Child) -> Option<ExitStatus> {
             return Some(status);
         }
         if Instant::now() >= deadline {
-            let _ = node.kill();
+            kill_scenario(node);
             node.wait().unwrap();
             return None;
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// On Unix each scenario's Node leads its own process group (`own_process_group`), so an
+/// overrun also ends the tabcli call Node was waiting for. Left alone, that helper would
+/// outlive its timeout owner and keep the fixtures' files and locks while they are removed.
+/// Windows ends Node only: its helper can outlive this kill.
+fn kill_scenario(node: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill` takes no pointers. The negative id names the group that this child
+        // leads; the child has not been waited for, so its id cannot have been reused.
+        unsafe { libc::kill(-(node.id() as libc::pid_t), libc::SIGKILL) };
+    }
+    let _ = node.kill();
+}
+
+fn own_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 fn scenario_failure(scenario: &str, status: Option<ExitStatus>, scratch: &Path) -> String {
@@ -131,7 +152,8 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         let scratch = scratch_root.path().join(&id);
         fs::create_dir(&scratch).unwrap();
         let output = fs::File::create(scratch.join("node-output.txt")).unwrap();
-        let mut node = Command::new("node")
+        let mut command = Command::new("node");
+        command
             .arg(&harness)
             .arg(&module)
             .arg(&directory)
@@ -141,7 +163,9 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .stdin(Stdio::null())
             .stdout(output.try_clone().unwrap())
-            .stderr(output)
+            .stderr(output);
+        own_process_group(&mut command);
+        let mut node = command
             .spawn()
             .expect("Node is required for the official Claude module contract test");
         let status = wait_bounded(&mut node);

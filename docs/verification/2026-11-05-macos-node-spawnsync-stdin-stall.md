@@ -158,7 +158,9 @@ before or after the real call, as before; arguments, environment, output handlin
 emulated `$.process.run` result are unchanged.
 
 `tests/claude_completion.rs` spawns each scenario's Node process with its output in a file,
-polls it, and kills it after 300 s. A failed or killed scenario's panic names the scenario and
+polls it, and kills it after 300 s. On Unix the scenario runs in its own process group and the
+whole group is killed, so the `tabcli` call Node was waiting for does not outlive it; on
+Windows only Node is ended and such a helper can remain. A failed or killed scenario's panic names the scenario and
 includes Node's output and the progress log. The CI and Release serial test steps now have
 `timeout-minutes` bounds (see `docs/testing.md`).
 
@@ -178,6 +180,10 @@ call timeout, the harness exited with code 70 and the panic named scenario `unic
 `["native-hook","claude"]`, 117 stdin bytes, `SIGKILL` and `ETIMEDOUT`. A missing executable
 gave `ENOENT` and exit code 70. With a 200 ms scenario limit, the runner killed Node, and the
 progress log showed the call in flight as a start line without an end line.
+
+The group kill was checked the same way: with the first call replaced by `/bin/sleep 4242` and
+a 3 s scenario limit, no `sleep 4242` process remained after the overrun; with the group kill
+removed (Node alone killed), one remained.
 
 Gates after a rebuild: `cargo fmt -- --check`; all-target, all-feature Clippy with
 `-D warnings` on macOS and for `x86_64-pc-windows-msvc`; the full serial suite with 1,613
