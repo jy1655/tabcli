@@ -343,6 +343,12 @@ fn questions_value(reader: &Reader, records: &Snapshot) -> Value {
         provider::QuestionResponse::Unsupported(reason) => {
             json!({"state": "unsupported", "reason": reason})
         }
+        provider::QuestionResponse::DeflectedToResult(reason) => {
+            json!({"state": "deflected_to_result", "reason": reason, "answer_by": "tell"})
+        }
+        provider::QuestionResponse::Unknown(detail) => {
+            json!({"state": "unknown", "reason": "evidence_unreadable", "detail": detail})
+        }
     };
     json!({"emission_observation": emission, "response": response})
 }

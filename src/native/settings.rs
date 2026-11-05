@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 const FILE: &str = "settings.json";
-const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow> or codex-lifecycle-hooks <on|off> to change one; --json is accepted";
+const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow>, codex-lifecycle-hooks <on|off> or claude-question-deflection <on|off> to change one; --json is accepted";
 
 /// A creation preference, never cleanup authority. Each terminal handle records
 /// the surface that was actually created, even if this setting changes later.
@@ -138,6 +138,37 @@ impl FromStr for CodexLifecycleHooks {
     }
 }
 
+/// Whether new Claude launches refuse a model's main-loop `AskUserQuestion` call before its
+/// dialog and return the question in the Result. Each session records its own launch decision;
+/// the setting is not evidence that a call was refused.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ClaudeQuestionDeflection {
+    #[default]
+    On,
+    Off,
+}
+
+impl ClaudeQuestionDeflection {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl FromStr for ClaudeQuestionDeflection {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            _ => bail!("claude-question-deflection is on or off, not {value:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Record {
     schema: u32,
@@ -149,6 +180,8 @@ struct Record {
     codex_memory_workspace: Option<CodexMemoryWorkspace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex_lifecycle_hooks: Option<CodexLifecycleHooks>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_question_deflection: Option<ClaudeQuestionDeflection>,
 }
 
 fn read(root: &Path) -> Result<Record> {
@@ -160,6 +193,7 @@ fn read(root: &Path) -> Result<Record> {
             macos_open_mode: None,
             codex_memory_workspace: None,
             codex_lifecycle_hooks: None,
+            claude_question_deflection: None,
         });
     };
     let record: Record = serde_json::from_str(&text)
@@ -188,6 +222,10 @@ pub(super) fn codex_memory_workspace(root: &Path) -> Result<CodexMemoryWorkspace
 
 pub(super) fn codex_lifecycle_hooks(root: &Path) -> Result<CodexLifecycleHooks> {
     Ok(read(root)?.codex_lifecycle_hooks.unwrap_or_default())
+}
+
+pub(super) fn claude_question_deflection(root: &Path) -> Result<ClaudeQuestionDeflection> {
+    Ok(read(root)?.claude_question_deflection.unwrap_or_default())
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
@@ -240,6 +278,14 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
+        ["claude-question-deflection", value] => {
+            let value = value.parse::<ClaudeQuestionDeflection>()?;
+            Store::create_state_root(root, &Reader::home_directories())?;
+            let mut record = read(root)?;
+            record.claude_question_deflection = Some(value);
+            RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
+                .write_json(&record)?;
+        }
         _ => bail!(USAGE),
     }
     Ok(serde_json::json!({
@@ -248,6 +294,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         "macos_open_mode": macos_open_mode(root)?.as_str(),
         "codex_memory_workspace": codex_memory_workspace(root)?.as_str(),
         "codex_lifecycle_hooks": codex_lifecycle_hooks(root)?.as_str(),
+        "claude_question_deflection": claude_question_deflection(root)?.as_str(),
     }))
 }
 
@@ -292,6 +339,79 @@ mod tests {
         )
         .unwrap();
         assert!(codex_lifecycle_hooks(&root).is_err());
+    }
+
+    #[test]
+    fn question_deflection_defaults_on_and_updates_preserve_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        assert_eq!(
+            claude_question_deflection(&root).unwrap(),
+            ClaudeQuestionDeflection::On
+        );
+        assert_eq!(
+            apply(&root, &[]).unwrap()["claude_question_deflection"],
+            "on"
+        );
+        for invalid in [
+            vec!["claude-question-deflection"],
+            vec!["claude-question-deflection", "ON"],
+            vec!["claude-question-deflection", "yes"],
+            vec!["claude-question-deflection", "off", "extra"],
+        ] {
+            assert!(apply(&root, &arguments(&invalid)).is_err(), "{invalid:?}");
+        }
+        assert!(!root.exists(), "an invalid value must not create the root");
+        assert_eq!(
+            apply(&root, &arguments(&["claude-question-deflection", "maybe"]))
+                .unwrap_err()
+                .to_string(),
+            "claude-question-deflection is on or off, not \"maybe\""
+        );
+        apply(&root, &arguments(&["codex-lifecycle-hooks", "off"])).unwrap();
+        for value in ["off", "on", "off"] {
+            assert_eq!(
+                apply(
+                    &root,
+                    &arguments(&["claude-question-deflection", value, "--json"])
+                )
+                .unwrap()["claude_question_deflection"],
+                value
+            );
+            assert_eq!(
+                codex_lifecycle_hooks(&root).unwrap(),
+                CodexLifecycleHooks::Off
+            );
+        }
+        assert_eq!(
+            claude_question_deflection(&root).unwrap(),
+            ClaudeQuestionDeflection::Off
+        );
+        assert_eq!(
+            read_json::<serde_json::Value>(&root.join(FILE)).unwrap(),
+            serde_json::json!({
+                "schema": 1,
+                "codex_lifecycle_hooks": "off",
+                "claude_question_deflection": "off",
+            })
+        );
+        // A record written before this key existed keeps the default; an unknown value is
+        // an error for the getter, as for every setting.
+        fs::write(
+            root.join(FILE),
+            r#"{"schema":1,"codex_lifecycle_hooks":"off"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_question_deflection(&root).unwrap(),
+            ClaudeQuestionDeflection::On
+        );
+        fs::write(
+            root.join(FILE),
+            r#"{"schema":1,"claude_question_deflection":"sometimes"}"#,
+        )
+        .unwrap();
+        assert!(claude_question_deflection(&root).is_err());
     }
 
     #[test]
@@ -416,6 +536,7 @@ mod tests {
                 "macos_open_mode": "tab-first",
                 "codex_memory_workspace": "refuse",
                 "codex_lifecycle_hooks": "on",
+                "claude_question_deflection": "on",
             })
         );
         assert!(!root.exists(), "reading defaults must not write settings");

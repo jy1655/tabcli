@@ -18,7 +18,8 @@ export async function report($, event, data, observedConversation) {
           data: { turnId: data.turnId, utf8_len } });
       }
     }
-    const timeoutMs = event === "question.emissions" ? 5000 : 30000;
+    const question = event === "question.emissions" || event === "question.deflected";
+    const timeoutMs = question ? 5000 : 30000;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const result = await $.process.run([executable, "native-hook", "claude"], { stdin, timeoutMs });
@@ -27,6 +28,8 @@ export async function report($, event, data, observedConversation) {
     }
     $.ui.log(event === "question.emissions"
       ? "Agent Bridge could not retain this question observation; ordinary tool execution continues."
-      : `Agent Bridge could not record Claude ${event}; inspect the session before sending again.`);
+      : event === "question.deflected"
+        ? "Agent Bridge could not record this question deflection; the question call was still refused."
+        : `Agent Bridge could not record Claude ${event}; inspect the session before sending again.`);
   } catch {}
 }

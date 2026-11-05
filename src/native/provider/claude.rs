@@ -165,8 +165,9 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn question_capability(&self, reader: &Reader) -> super::QuestionCapability {
         super::QuestionCapability {
             emission: completion::emission_observation(reader.directory()),
-            // Claude Code 2.1.318 has no official addressed answer for an open TUI dialog.
-            response: super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
+            // Claude Code 2.1.318 has no official addressed answer for an open TUI dialog. A
+            // launch with deflection returns a refused question in the Result instead.
+            response: completion::question_response(reader.directory()),
         }
     }
 

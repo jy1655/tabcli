@@ -316,10 +316,17 @@ fn question_observation(value: &mut Value, questions: &QuestionEmissions) {
 }
 
 /// How many emissions the Request's retained record holds; neither pending nor answered.
+/// Deflection counts the retained items whose call the provider's plugin refused before any
+/// dialog: a refused call, not proof that the Result is a question.
 fn question_count(value: &mut Value, questions: &QuestionEmissions) {
     if !questions.items.is_empty() {
         value["question_emitted"] = json!(true);
         value["question_emission_count"] = json!(questions.items.len());
+    }
+    let deflected = questions.items.iter().filter(|item| item.deflected).count();
+    if deflected > 0 {
+        value["question_deflected"] = json!(true);
+        value["question_deflection_count"] = json!(deflected);
     }
 }
 
@@ -371,6 +378,11 @@ pub(super) fn question_lines(value: &Value) -> Vec<String> {
                 terminal_safe_text(request, false)
             ));
         }
+    }
+    if let Some(count) = value["question_deflection_count"].as_u64() {
+        lines.push(format!(
+            "question calls deflected (refused before their dialog; read the result): {count}"
+        ));
     }
     for item in value["question_emissions"].as_array().into_iter().flatten() {
         for question in item["questions"].as_array().into_iter().flatten() {

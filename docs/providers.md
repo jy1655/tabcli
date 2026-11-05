@@ -410,6 +410,35 @@ Other plugins, subagents, legacy sessions and unbound continuation turns supply 
 See the [official module reference](https://code.claude.com/docs/en/plugins/mods/reference)
 and [Claude question verification](verification/2026-10-23-claude-question-emissions.md).
 
+Question deflection is a fallback in the same plugin, decided at launch from
+`settings claude-question-deflection` (default `on`) and recorded in `claude-question-mode.json`;
+the module reads the decision from a switch file written beside it, and later queries read
+the record, never the current setting. With deflection on, a `tool.call` hook refuses a
+main-loop `AskUserQuestion` call raised by the engine with a fixed reason: no person is at the
+dialog, do not call the tool again in this turn, end the turn now with
+`QUESTION FOR CALLER: <question> Options: <option labels>`, expect the answer as a follow-up,
+and keep every requirement of the request's turn protocol, including its final-line marker.
+The question then reaches the caller as the ordinary Result and the caller answers with `tell`
+([question deflection](cli.md#question-deflection)). `tool.call` carries no turn identity and
+the step result's tool uses carry no call id, so the module refuses only a call whose
+`tool_use_id` matches a tool chunk it passed in the observed main-loop step. Claude can start
+the tool while that step still streams, so the refusal is attributed after the step's final
+engine/core return: `question.deflected` names the refused questions and marks the retained
+item at the call's position only when that return and the retained item both hold the same
+question text and option labels there (a repeated step can keep an earlier question at the
+position); otherwise the record is marked incomplete and no item is created. Recording uses the question helper's two 5-second
+attempts; a failure logs it and the call is still refused. Subagent calls, a plugin's own
+`$.ui.ask`, calls the module did not observe, deflection off, and a hook that throws or overruns
+its budget all leave the dialog as before; no `.catch` refuses in their place. Claude fires
+settings `PreToolUse` hooks beneath plugin `tool.call` hooks, so a user's own `PreToolUse` hook
+for `AskUserQuestion` does not run for a refused call; only turning the setting off keeps it. A
+refusal whose record fails, or one outside the request's bound turn, leaves no flag. `inspect` reports
+`capabilities.questions.response` as `deflected_to_result` for such a launch, which is
+configuration and not evidence of a refusal. A deflected flag says a call was refused, not that
+the Result is a question. Replace the stream correlation when `tool.call` carries its turn and
+step identity or step tool uses carry their call id, and the whole fallback when Claude offers a
+verified addressed question lifecycle.
+
 A normal nonempty bound answer without that marker is retained as a candidate. It does not
 release the claim or become a result. A later main-loop completion in the same conversation
 can finish it only with that candidate, the still-current request and a valid nonempty answer

@@ -103,7 +103,8 @@ launch, observe, continue, and close without replacing the capabilities those CL
   observation must not remove completion readiness. Evidence comes only from the final
   `next.trace` entry's engine/core return with `stopReason: tool_use`; an absent or short
   trace supplies no evidence. The event supplies the official turn id and step
-  index; do not infer a turn from `tool.call`, which lacks that identity. Pass streamed
+  index; do not infer a turn from `tool.call` alone, which lacks that identity (deflection
+  below ties a call to a step only through its streamed tool chunk's id). Pass streamed
   chunks and the response unchanged. Capture the conversation before awaiting the step,
   then require the exact original immutable binding and current Claim under the lifecycle
   lock. A continuation not yet attributed at completion supplies no question authority.
@@ -117,6 +118,39 @@ launch, observe, continue, and close without replacing the capabilities those CL
   The question helper gets two 5-second attempts; a failure logs unavailable observation
   and passes the stream's original response through. This adds no dialog-latency guarantee.
   Replace this observation path when Claude offers a verified addressed question lifecycle.
+- Question deflection is a fallback in the same question plugin (#340): no person is at a
+  managed session's dialog, and the owner ruled out a hook that waits for the caller's
+  answer. The state root's `claude-question-deflection` setting (default on) is read once at
+  launch; the adapter writes the module's switch and `claude-question-mode.json`, and every
+  later read uses that record. With it on, a `tool.call` hook refuses a main-loop
+  `AskUserQuestion` call raised by the engine with one fixed reason: end the turn with the
+  question, keep the turn protocol's marker, expect the answer as a follow-up `tell`.
+  `tool.call` carries no turn identity and `turn.step` tool uses carry no call id, so a call
+  is refused only when its `tool_use_id` matches a tool chunk this module passed in the
+  observed main-loop step; the chunk's position among the step's tool chunks is its tool-use
+  position. Claude 2.1.318 can start the tool while the step still streams, so the refusal is
+  attributed after that step's engine/core return: `question.deflected` names the refused
+  questions and marks the retained item at that position only when the return and that item
+  both hold the same question text and option labels (a repeated step can keep an earlier
+  question there), and otherwise marks the record incomplete; it never creates an item, and setting the
+  flag is the one change a saved item may receive. Recording follows the emission rules
+  (bound turn of the current Claim under the lifecycle lock, never a Claim or outcome change).
+  Subagent calls, a plugin's `$.ui.ask`, unobserved calls, a module that is not loaded, and a
+  hook that throws or overruns its budget all leave the dialog: no `.catch` refuses in their
+  place. A failed record still refuses and leaves no flag, as does a refusal outside the bound
+  turn: an absent flag is not evidence that no call was refused. A step whose stream breaks
+  after a refusal marks the record incomplete. Claude fires settings `PreToolUse` hooks beneath
+  plugin `tool.call` hooks, so a user's own `PreToolUse` hook for `AskUserQuestion` does not
+  run for a refused call; only the setting restores it. A second dispatch of a refused call
+  gets the same refusal, recorded once. The flag proves a refused call, not that the Result is
+  a question or what the child wrote after it; `wait --questions` can return the emission
+  before its flag. Replace the stream correlation when `tool.call` carries its turn and step
+  identity or step tool uses carry their call id, and the fallback when Claude offers a
+  verified addressed question lifecycle.
+  The macOS owner check with Claude Code 2.1.318 (one question, the follow-up answer, and the
+  same request with deflection off) is in
+  `docs/verification/2026-11-05-macos-340-claude-question-deflection.md`; native Windows, a
+  user's own `PreToolUse` hook, and subagent or plugin questions were not run.
 - An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
   version inference. Its pending Stop completion remains readable, but new tells on both
   platforms are refused. Windows supports close/reopen recovery. On macOS, inspect the
