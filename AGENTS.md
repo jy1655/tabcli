@@ -5,6 +5,14 @@
 Agent Bridge exists to make first-party Codex, Claude, Agy, and Pi sessions simple to
 launch, observe, continue, and close without replacing the capabilities those CLIs own.
 
+The installed skill carries the general delegation rule (owner's decision, 2026-11-05): a host
+uses its own subagents for a child on its own provider, and Bridge for another provider or
+when the user asks for Bridge. Per-user launch details (terminal, permission mode, model,
+effort, session budget) stay in the user's own instructions, not in the skill. The rule rides
+in the skill only: Bridge does not launch the host session, so it has no system prompt to
+extend, and an integration adds no hook or MCP server to carry it. Do not build a Bridge path
+that duplicates what a provider's own subagents do for a same-provider child.
+
 ## Provider-Native First
 
 - Prefer each provider's official session messaging, follow-up input, result identity,

@@ -6,6 +6,12 @@ read the exact result, send follow-ups and close the sessions it created. The in
 no transport of its own: every launch, delivery, consent decision and close still goes through
 the installed `tabcli` and its provider adapters.
 
+The skill carries the general delegation rule, so it applies wherever the integration is
+installed: Bridge for another provider's assistant, the assistant's own subagents for a child on
+its own provider. What differs per person or machine (the terminal, a permission mode, a model
+or effort, how many sessions to run at once) belongs in your own instructions, which the skill
+tells the assistant to follow.
+
 The skill guides the assistant; it does not guarantee anything after the assistant stops. If the
 host exits, crashes or loses context, sessions it opened may remain open or lose their owner.
 Inspect their state and close task-owned sessions with `tabcli close-session SESSION --explicit`.
@@ -92,6 +98,9 @@ it requires those native tools to be available and does not install a background
 
 The skill asks the assistant to:
 
+- use Bridge for another provider's assistant, and its own subagents for a child on its own
+  provider unless you ask for Agent Bridge, `tabcli` or a separate terminal session you can
+  watch; a request for subagents or parallel work does not select Bridge by itself;
 - find `tabcli`, check its version and select the workspace explicitly;
 - start work with `ask`, usually with `--prompt-file` and `--detach`, and continue it with
   `tell` on the returned session;

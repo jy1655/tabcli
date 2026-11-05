@@ -1,6 +1,6 @@
 ---
 name: agent-bridge
-description: Delegate work to installed Claude Code, Codex, Agy, or Pi CLI sessions through Agent Bridge; retrieve exact results, continue conversations, and close task-owned sessions. Use when the user asks to work with another coding assistant or manage a Bridge delegation, not for ordinary work by the current assistant alone.
+description: Delegate work to installed Claude Code, Codex, Agy, or Pi CLI sessions through Agent Bridge; retrieve exact results, continue conversations, and close task-owned sessions. Use when the user asks to work with another provider's coding assistant, names Agent Bridge or tabcli, asks for a separate terminal session they can watch, or has an existing Bridge session to read, continue, or close. Not for ordinary work by the current assistant alone. For a new child on the current assistant's own provider, use the assistant's own subagents unless the user named Bridge or asked for a watchable terminal session.
 ---
 
 # Agent Bridge
@@ -9,6 +9,25 @@ Use the installed `tabcli` engine to delegate the user's work. The invoking assi
 target provider are separate roles: any supported host can delegate to `codex`, `claude`,
 `agy`, or `pi`. Preserve the user's provider, workspace, scope, and permission choices.
 If this is itself a delegated task, do not delegate it again unless the task asks for that.
+
+## Choosing the route
+
+Decide this before any launch. These are the defaults; the user's own instructions about
+providers, models, terminals, and permissions refine them and win where they differ. The
+choice is about starting a new child: read, continue, and close an existing Bridge session
+through Bridge whatever its provider.
+
+- **Another provider than yours** (for example Claude Code delegating to Codex): use Bridge.
+- **Your own provider** (Codex to Codex, Claude Code to Claude Code): use your own subagent
+  tool. The provider already connects you to its subagents, and their results come back to
+  you without a terminal. A Bridge child is a separate terminal session of its own: you can
+  read a question it asks, but you cannot answer until its request has ended. Use Bridge for
+  a same-provider child only when the user asks for Agent Bridge or tabcli (invoking this
+  skill by name counts) or for a separate terminal session they can watch.
+- A request for subagents, parallel work, or orchestration does not select Bridge by itself,
+  even when another skill prefers it.
+- If you have no subagent tool, or it cannot do what was asked, say so or do the work
+  yourself. Do not substitute Bridge without telling the user.
 
 ## Before launching
 
