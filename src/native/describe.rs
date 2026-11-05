@@ -367,7 +367,7 @@ pub(super) const CLOSE: Contract = Contract {
 fn public_command(name: &str) -> Result<&'static super::CommandSpec> {
     COMMANDS
         .iter()
-        .find(|entry| entry.name == name && !entry.hidden)
+        .find(|entry| entry.name == name && entry.is_public())
         .ok_or_else(|| anyhow::anyhow!("unknown public command"))
 }
 
@@ -409,6 +409,14 @@ fn strings(array: &Value) -> impl Iterator<Item = &str> {
         .map(|item| item.as_str().unwrap())
 }
 
+/// The one format of a synopsis line, shared by describe's text mode, command help and the
+/// main help's Usage block.
+fn write_synopsis<'a>(text: &mut String, synopsis: impl IntoIterator<Item = &'a str>) {
+    for synopsis in synopsis {
+        writeln!(text, "  {} {synopsis}", agent_bridge::PUBLIC_COMMAND).unwrap();
+    }
+}
+
 /// The name, summary and synopsis block that describe's text mode prints for each command.
 fn summary_text(command: &Value) -> String {
     let mut text = format!(
@@ -416,8 +424,16 @@ fn summary_text(command: &Value) -> String {
         command["name"].as_str().unwrap(),
         command["summary"].as_str().unwrap()
     );
-    for synopsis in strings(&command["synopsis"]) {
-        writeln!(text, "  {} {synopsis}", agent_bridge::PUBLIC_COMMAND).unwrap();
+    write_synopsis(&mut text, strings(&command["synopsis"]));
+    text
+}
+
+/// The command lines of the main help's Usage block: every public entry's synopsis, in
+/// registry order, each line ending in a newline.
+pub(crate) fn usage_lines() -> String {
+    let mut text = String::new();
+    for contract in COMMANDS.iter().filter_map(|entry| entry.contract) {
+        write_synopsis(&mut text, contract.synopsis.iter().copied());
     }
     text
 }
@@ -494,7 +510,7 @@ pub(crate) fn command_help(name: &str) -> Result<String> {
 fn value(request: &Request) -> Value {
     let commands: Vec<_> = COMMANDS
         .iter()
-        .filter(|entry| !entry.hidden)
+        .filter(|entry| entry.is_public())
         .filter(|entry| {
             request
                 .command
@@ -554,18 +570,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contracts_cover_only_public_registry_and_examples_parse() {
-        let help = crate::help_text();
+    fn contract_examples_parse_through_the_real_parser() {
         for entry in COMMANDS {
-            assert_eq!(entry.contract.is_none(), entry.hidden, "{}", entry.name);
             if let Some(contract) = entry.contract {
-                for synopsis in contract.synopsis {
-                    assert!(
-                        help.contains(&format!("  {} {synopsis}", agent_bridge::PUBLIC_COMMAND)),
-                        "missing synopsis for {}",
-                        entry.name
-                    );
-                }
                 assert!(!contract.examples.is_empty());
                 for example in contract.examples {
                     assert_eq!(example[0], entry.name);
