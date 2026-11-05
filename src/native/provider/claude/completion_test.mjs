@@ -3,7 +3,49 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-const [modulePath, directory, executable, scenario] = process.argv.slice(2);
+const [modulePath, directory, executable, scenario, scratch] = process.argv.slice(2);
+// Every tabcli call goes through runTabcli. On macOS, spawnSync's `input` option has been seen
+// to stall until the child was killed, with both processes idle; a file descriptor avoids that
+// write path (docs/verification/2026-11-05-macos-node-spawnsync-stdin-stall.md). The slowest
+// healthy call is `wait --timeout-secs 1` (about 1.0 s) and the product gives the same helper
+// 30 s (report.js), so 60 s leaves a slow runner a wide margin and still bounds a stall.
+const CALL_TIMEOUT_MS = 60000;
+// Distinct from Node's own exit codes. A throw would not do: report.js retries on any error.
+const CALL_FAILURE_EXIT = 70;
+const progress = `${scratch}/progress.log`;
+let callNumber = 0;
+function runTabcli(args, { stdin, env = process.env } = {}) {
+  const call = ++callNumber;
+  const bytes = stdin === undefined ? 0 : Buffer.byteLength(stdin);
+  const label = `scenario=${scenario} call=${call} args=${JSON.stringify(args)} stdin_bytes=${bytes}`;
+  fs.appendFileSync(progress, `start ${label}\n`);
+  let fd = "ignore";
+  if (stdin !== undefined) {
+    const path = `${scratch}/stdin-${call}.json`;
+    fs.writeFileSync(path, stdin);
+    fd = fs.openSync(path, "r");
+  }
+  const started = Date.now();
+  let result;
+  try {
+    result = spawnSync(executable, args, { stdio: [fd, "pipe", "pipe"], encoding: "utf8", env,
+      timeout: CALL_TIMEOUT_MS, killSignal: "SIGKILL" });
+  } finally {
+    if (fd !== "ignore") fs.closeSync(fd);
+  }
+  const elapsed = Date.now() - started;
+  const outcome = `status=${result.status} signal=${result.signal} elapsed_ms=${elapsed}`
+    + (result.error ? ` error=${result.error.code ?? result.error.message}` : "");
+  fs.appendFileSync(progress, `end ${label} ${outcome}\n`);
+  if (result.error) {
+    const reason = result.error.code === "ETIMEDOUT"
+      ? `did not finish within ${CALL_TIMEOUT_MS} ms and was killed` : `failed: ${result.error.message}`;
+    fs.writeSync(2, `completion_test.mjs: tabcli ${label} ${reason} (${outcome})\n`
+      + `tabcli stderr: ${result.stderr ?? ""}\n`);
+    process.exit(CALL_FAILURE_EXIT);
+  }
+  return result;
+}
 const pending = JSON.parse(fs.readFileSync(`${directory}/claude-pending-turn.json`, "utf8"));
 const conversation = "00000000-0000-4000-8000-000000000249";
 const turnId = "00000000-0000-4000-8000-000000000250";
@@ -32,8 +74,8 @@ const $ = {
     }
     if (wire.event === "turn.complete" && wire.data.turnId !== turnId) continuationAttempts++;
     if (wire.event === "question.emissions") questionAttempts++;
-    const result = spawnSync(executable, ["native-hook", "claude"], {
-      input: init.stdin, encoding: "utf8", env: { ...process.env,
+    const result = runTabcli(["native-hook", "claude"], {
+      stdin: init.stdin, env: { ...process.env,
         AGENT_BRIDGE_NATIVE_SESSION_DIR: directory },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -85,8 +127,7 @@ if (scenario === "coexistence") {
       assert.equal(fs.existsSync(`${directory}/claude-mod-${kind}-${claim}.json`), false, label);
     }
     const before = snapshot();
-    const query = spawnSync(executable, ["result", session, "--request", receipt.request_id, "--json"],
-      { encoding: "utf8", env: process.env });
+    const query = runTabcli(["result", session, "--request", receipt.request_id, "--json"]);
     assert.equal(query.status, 0, query.stderr);
     const result = JSON.parse(query.stdout);
     assert.equal(result.request_state, "pending", label);
@@ -218,8 +259,7 @@ if (scenario.startsWith("questions")) {
   const receipt = JSON.parse(fs.readFileSync(`${directory}/requests/${claim}.json`, "utf8"));
   const address = `${directory.split(/[\\/]/).at(-1)}/${receipt.request_id}`;
   function wait(args) {
-    const result = spawnSync(executable, ["wait", address, "--timeout-secs", "1", "--json", ...args],
-      { encoding: "utf8", env: process.env });
+    const result = runTabcli(["wait", address, "--timeout-secs", "1", "--json", ...args]);
     return JSON.parse(result.stdout);
   }
   const observation = wait(["--questions"]);
@@ -345,8 +385,7 @@ if (scenario.startsWith("questions")) {
       ["question.deflected", { turnId, step: 17, index: 1, questions: [other] }],
     ]);
     const session = directory.split(/[\\/]/).at(-1);
-    const query = spawnSync(executable, ["result", session, "--request", receipt.request_id, "--json"],
-      { encoding: "utf8", env: process.env });
+    const query = runTabcli(["result", session, "--request", receipt.request_id, "--json"]);
     assert.equal(query.status, 0, query.stderr);
     const result = JSON.parse(query.stdout);
     assert.equal(result.request_state, "pending");
@@ -377,8 +416,7 @@ if (continuing || scenario === "unmarked") {
     .map(name => [name, fs.readFileSync(`${directory}/${name}`)]));
   for (const [name, bytes] of before) assert.deepEqual(fs.readFileSync(`${directory}/${name}`), bytes);
   const namesBeforeInspect = fs.readdirSync(directory).sort();
-  const inspection = spawnSync(executable, ["inspect", directory.split(/[\\/]/).at(-1), "--json"],
-    { encoding: "utf8", env: process.env });
+  const inspection = runTabcli(["inspect", directory.split(/[\\/]/).at(-1), "--json"]);
   assert.equal(inspection.status, 0, inspection.stderr);
   const evidence = JSON.parse(inspection.stdout).provider_completion;
   assert.equal(evidence.state, "unmarked_bound_turn");

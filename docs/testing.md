@@ -38,6 +38,12 @@ Its `questions_deflection` scenario raises synthetic `tool.call` events while a 
 streams and after it, with deflection on and off, and checks which calls are refused and what
 the record retains; it does not establish Claude's own dispatch order or that Claude loads the
 module.
+Its Node harness passes each native-hook payload to `tabcli` as a file descriptor, never through
+`spawnSync`'s `input`, which can stall on macOS
+([record](verification/2026-11-05-macos-node-spawnsync-stdin-stall.md)). Every `tabcli` call is
+bounded at 60 s and logged to a per-scenario progress file outside the session directory; a call
+that times out or cannot start ends the harness with exit code 70. The Rust runner bounds each
+scenario at 300 s and prints Node's output and that progress log when a scenario fails.
 
 ### Claude inbound module coexistence
 
@@ -221,6 +227,9 @@ trip rather than enabling every ignored test, which also runs the subprocess fix
 
 The formatting command in CI is `cargo fmt --all -- --check`; Clippy uses
 `cargo clippy --all-targets --all-features -- -D warnings`. Tests use the serial command above.
+Each serial test step has a `timeout-minutes` bound so that a hang fails in bounded time: 20
+minutes for the minimum Rust job, 30 for Linux and macOS, and 60 for Windows and for both Release
+test steps, one of which also runs Windows tests for historical tags.
 The macOS stable job installs Ghostty and iTerm2 for the AppleScript compile test.
 The release-candidate job packages the executable and license, checks the archive checksum,
 extracts it, and checks the extracted binary's version. This is not an authenticated live test.

@@ -131,9 +131,14 @@ jobs:
       - name: Run serial tests
         # Rehearsals check out historical tags, which may not have the recorder.
         if: runner.os != 'Windows' || hashFiles('scripts/ci_test_timing.py') == ''
+        # A hang fails here instead of at the 6-hour job limit. This step also runs Windows
+        # tests for historical tags, which took up to 22 minutes there, so it has Windows's bound.
+        timeout-minutes: 60
         run: cargo test --all-targets --all-features -- --test-threads=1
       - name: Run Windows serial tests with timing
         if: runner.os == 'Windows' && hashFiles('scripts/ci_test_timing.py') != ''
+        # Normally 7-11 minutes, and up to 22 before the in-process SID lookup.
+        timeout-minutes: 60
         env:
           TEST_TIMING_DIR: ${{ runner.temp }}/ci-test-timing
         run: python -I scripts/ci_test_timing.py run --output-dir "$env:TEST_TIMING_DIR"
