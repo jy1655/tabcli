@@ -1,6 +1,6 @@
 ---
 name: agent-bridge
-description: Delegate work to installed Claude Code, Codex, Agy, or Pi CLI sessions through Agent Bridge; retrieve exact results, continue conversations, and close task-owned sessions. Use when the user asks to work with another provider's coding assistant, names Agent Bridge or tabcli, or wants a Bridge delegation managed. Not for ordinary work by the current assistant alone, and not for a child on the current assistant's own provider unless the user asks for Bridge; use the assistant's own subagents for that.
+description: Delegate work to installed Claude Code, Codex, Agy, or Pi CLI sessions through Agent Bridge; retrieve exact results, continue conversations, and close task-owned sessions. Use when the user asks to work with another provider's coding assistant, names Agent Bridge or tabcli, asks for a separate terminal session they can watch, or has an existing Bridge session to read, continue, or close. Not for ordinary work by the current assistant alone. For a new child on the current assistant's own provider, use the assistant's own subagents unless the user named Bridge or asked for a watchable terminal session.
 ---
 
 # Agent Bridge
@@ -13,7 +13,9 @@ If this is itself a delegated task, do not delegate it again unless the task ask
 ## Choosing the route
 
 Decide this before any launch. These are the defaults; the user's own instructions about
-providers, models, terminals, and permissions refine them and win where they differ.
+providers, models, terminals, and permissions refine them and win where they differ. The
+choice is about starting a new child: read, continue, and close an existing Bridge session
+through Bridge whatever its provider.
 
 - **Another provider than yours** (for example Claude Code delegating to Codex): use Bridge.
 - **Your own provider** (Codex to Codex, Claude Code to Claude Code): use your own subagent
