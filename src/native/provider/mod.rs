@@ -5,6 +5,9 @@ mod capped_output;
 pub(super) mod claude;
 mod codex;
 mod pi;
+// Shared tests write a Codex session's launch decision without spelling its records.
+#[cfg(test)]
+pub(super) use codex::LaunchDecisionFixture as CodexLaunchDecisionFixture;
 
 use agent_bridge::FirstPartyCli;
 use anyhow::Result;
@@ -493,10 +496,7 @@ mod tests {
         }
         // The follow-up gate and the question capability dispatch to each adapter: a
         // malformed record an adapter reads is unknown, never refused or unavailable.
-        store
-            .private("codex-launch-mode.json")
-            .write_private(b"{")
-            .unwrap();
+        CodexLaunchDecisionFixture::LIFECYCLE_MALFORMED.write(directory.path());
         let answer = QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH);
         for (provider, follow_up, emission) in [
             (
@@ -587,29 +587,21 @@ mod tests {
                 ..
             }
         ));
-        for (record, expected) in [
+        for (decision, expected) in [
             (
-                r#"{"schema":1,"lifecycle_hooks":"injected","reason":null,"codex_version":"codex-cli 0.163.0","vector_codex_version":"0.163.0"}"#,
+                CodexLaunchDecisionFixture::LIFECYCLE_INJECTED,
                 EmissionObservation::Configured("hooks_injected_unverified"),
             ),
             (
-                r#"{"schema":1,"lifecycle_hooks":"not_injected","reason":"settings_off","codex_version":"codex-cli 0.163.0","vector_codex_version":"0.163.0"}"#,
+                CodexLaunchDecisionFixture::LIFECYCLE_NOT_INJECTED,
                 EmissionObservation::Unavailable("hooks_not_injected"),
             ),
         ] {
-            store.private("codex-launch-mode.json").remove().unwrap();
-            store
-                .private("codex-launch-mode.json")
-                .write_private(record.as_bytes())
-                .unwrap();
+            decision.write(directory.path());
             assert_eq!(emission(FirstPartyCli::Codex), expected);
         }
         // A record Codex's own reader rejects is unknown, not a configuration.
-        store.private("codex-launch-mode.json").remove().unwrap();
-        store
-            .private("codex-launch-mode.json")
-            .write_private(br#"{"schema":1,"lifecycle_hooks":"injected","reason":"settings_off","codex_version":null,"vector_codex_version":"0.163.0"}"#)
-            .unwrap();
+        CodexLaunchDecisionFixture::LIFECYCLE_INVALID.write(directory.path());
         assert!(matches!(
             emission(FirstPartyCli::Codex),
             EmissionObservation::Unknown(_)
