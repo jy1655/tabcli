@@ -236,8 +236,10 @@ pub(super) const SCREEN: Contract = Contract {
     examples: &[&["screen", "session-example", "--json"]],
     features: &[],
     notes: &[
-        "Reads only the surface the session's records bind, after the ownership check tell makes; sends no input, changes no focus, starts no terminal application and writes no record. Closed sessions, Ghostty and Warp are refused. Default timeout is 10 seconds.",
-        "The text is what the terminal showed at one moment, not evidence of a request's state. It can contain secrets the provider printed; Bridge does not retain it.",
+        "Reads only the surface the session's records bind, between two ownership checks like tell's, and withholds the text unless the same binding and owner hold after the read; sends no input or key and writes no record. Closed sessions, Ghostty and Warp are refused.",
+        "Addresses no terminal application that is not running when it checks; one that quits before the read can be started again by the scripting call. On native Windows a caller without a console can get a console window from the helper (unverified).",
+        "Default timeout is 10 seconds; on macOS a terminal call that times out is followed by a screen-lock probe of up to 0.5 s, so the command can return that much later.",
+        "The text is what the terminal showed at one moment, not evidence of a request's state, and can contain secrets the provider printed. It is not written to session records, logs or diagnostics; helper output passes only through a temporary file deleted when the call ends.",
     ],
 };
 pub(super) const RESULT: Contract = Contract {

@@ -127,7 +127,10 @@ tabcli screen SESSION --json
 ```
 
 `screen` is the visible text of the child's own terminal at one moment, not the request's state;
-keep reading the request for that. Never type into the managed terminal to act on what it shows.
+keep reading the request for that. It addresses no terminal application that is not running when
+it checks, but one that quits just before the read can be started again; on native Windows, a
+caller without a console can get a console window. Never type into the managed terminal to act
+on what it shows.
 When it shows something a person has to act on, such as a trust or permission dialog, a sign-in,
 an update or a quota message, report the session, the request address and what the screen shows
 to the user. The text can contain secrets the provider printed: relay only what the user needs.

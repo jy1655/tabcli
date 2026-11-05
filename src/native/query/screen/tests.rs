@@ -26,11 +26,16 @@ enum Call {
     },
 }
 
+const TEXT: &str = "$ codex\n> Allow this directory? (y/n)\n";
+
 /// Records what reaches the terminal and proves that no lifecycle lock is held then.
 struct Fake {
     directory: PathBuf,
-    verified: std::result::Result<(), &'static str>,
+    /// The outcome of each ownership check in turn; a check past the list passes.
+    verified: Vec<std::result::Result<(), &'static str>>,
     screen: std::result::Result<String, &'static str>,
+    /// What happens to the session's records while the terminal answers the read.
+    during_read: Option<fn(&Path)>,
     calls: RefCell<Vec<Call>>,
 }
 
@@ -38,8 +43,9 @@ impl Fake {
     fn new(fixture: &Fixture) -> Self {
         Self {
             directory: fixture.directory.clone(),
-            verified: Ok(()),
-            screen: Ok("$ codex\n> Allow this directory? (y/n)\n".to_owned()),
+            verified: Vec::new(),
+            screen: Ok(TEXT.to_owned()),
+            during_read: None,
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -65,6 +71,12 @@ impl SurfaceAccess for Fake {
         requested: Duration,
     ) -> Result<()> {
         self.assert_unlocked();
+        let checks = self
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| matches!(call, Call::Verify { .. }))
+            .count();
         self.calls.borrow_mut().push(Call::Verify {
             directory: directory.to_owned(),
             id: id.to_owned(),
@@ -72,7 +84,11 @@ impl SurfaceAccess for Fake {
             deadline,
             requested,
         });
-        self.verified.map_err(|error| anyhow::anyhow!(error))
+        self.verified
+            .get(checks)
+            .copied()
+            .unwrap_or(Ok(()))
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     fn read(&self, surface: &terminal::TerminalSession, deadline: Instant) -> Result<String> {
@@ -81,6 +97,9 @@ impl SurfaceAccess for Fake {
             surface: surface.clone(),
             deadline,
         });
+        if let Some(change) = self.during_read {
+            change(&self.directory);
+        }
         self.screen.clone().map_err(|error| anyhow::anyhow!(error))
     }
 }
@@ -109,15 +128,21 @@ impl Fixture {
     }
 
     fn observe(&self, access: &Fake) -> (Result<Screen>, Instant, Duration) {
-        let requested = Duration::from_secs(7);
-        let deadline = Instant::now() + requested;
         let before = entries(self.root.path());
-        let outcome = observe(&self.directory, ID, deadline, requested, access);
+        let observed = self.observe_while_records_change(access);
         assert_eq!(
             entries(self.root.path()),
             before,
             "screen changed the state root"
         );
+        observed
+    }
+
+    /// For a test whose fake changes the records itself, as a concurrent writer would.
+    fn observe_while_records_change(&self, access: &Fake) -> (Result<Screen>, Instant, Duration) {
+        let requested = Duration::from_secs(7);
+        let deadline = Instant::now() + requested;
+        let outcome = observe(&self.directory, ID, deadline, requested, access);
         (outcome, deadline, requested)
     }
 }
@@ -173,24 +198,31 @@ fn a_bound_surface_returns_the_adapter_text_in_every_unclosed_state() {
         let access = Fake::new(&fixture);
         let (outcome, deadline, requested) = fixture.observe(&access);
         let screen = outcome.unwrap_or_else(|error| panic!("{state}: {error:#}"));
-        assert_eq!(screen.text, "$ codex\n> Allow this directory? (y/n)\n");
+        assert_eq!(screen.text, TEXT);
         assert_eq!(screen.kind, host_kind());
         assert!(screen.observed_unix_ms > 0);
-        // One proof, then one read, both with the caller's one deadline; no retry.
-        assert_eq!(
-            *access.calls.borrow(),
-            [
-                Call::Verify {
-                    directory: fixture.directory.clone(),
-                    id: ID.into(),
-                    surface: surface.clone(),
-                    deadline,
-                    requested,
-                },
-                Call::Read { surface, deadline },
-            ],
-            "{state}"
-        );
+        // A proof, one read and the same proof again, all with the caller's one deadline;
+        // no retry.
+        let verify = Call::Verify {
+            directory: fixture.directory.clone(),
+            id: ID.into(),
+            surface: surface.clone(),
+            deadline,
+            requested,
+        };
+        let read = Call::Read { surface, deadline };
+        let ordinary = [
+            verify,
+            read,
+            Call::Verify {
+                directory: fixture.directory.clone(),
+                id: ID.into(),
+                surface: handle(host_kind(), Some(ID)),
+                deadline,
+                requested,
+            },
+        ];
+        assert_eq!(*access.calls.borrow(), ordinary, "{state}");
     }
 }
 
@@ -205,7 +237,9 @@ fn a_failed_identity_check_or_read_returns_no_text_and_is_not_retried() {
         let surface = handle(host_kind(), Some(ID));
         let fixture = Fixture::new(state.clone(), Some(&surface));
         let mut access = Fake::new(&fixture);
-        access.verified = Err("terminal surface is attached to a different native-session TTY");
+        access.verified = vec![Err(
+            "terminal surface is attached to a different native-session TTY",
+        )];
         let error = refusal(fixture.observe(&access).0);
         assert_eq!(
             format!("{error:#}"),
@@ -232,6 +266,139 @@ fn a_failed_identity_check_or_read_returns_no_text_and_is_not_retried() {
             [Call::Verify { .. }, Call::Read { .. }]
         ));
     }
+}
+
+/// The confirmation error of a read whose text is withheld, with its cause.
+#[cfg(any(target_os = "macos", windows))]
+fn withheld(access: &Fake, fixture: &Fixture) -> String {
+    let error = format!(
+        "{:#}",
+        refusal(fixture.observe_while_records_change(access).0)
+    );
+    assert!(
+        error.starts_with(
+            "the terminal surface could not be confirmed as this session's after the read; the text is withheld: "
+        ),
+        "{error}"
+    );
+    assert!(!error.contains("Allow this directory"), "{error}");
+    error
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_second_ownership_check_that_fails_withholds_the_text() {
+    let surface = handle(host_kind(), Some(ID));
+    let fixture = Fixture::new(SessionState::Working, Some(&surface));
+    let mut access = Fake::new(&fixture);
+    access.verified = vec![
+        Ok(()),
+        Err("native-session owner birth, TTY, or foreground identity changed"),
+    ];
+    let before = entries(fixture.root.path());
+    assert!(
+        withheld(&access, &fixture)
+            .ends_with("native-session owner birth, TTY, or foreground identity changed")
+    );
+    assert_eq!(entries(fixture.root.path()), before);
+    assert!(matches!(
+        access.calls.borrow().as_slice(),
+        [Call::Verify { .. }, Call::Read { .. }, Call::Verify { .. }]
+    ));
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_close_during_the_read_withholds_the_text_without_a_second_terminal_call() {
+    type Change = fn(&Path);
+    let closes: [(Change, &str); 2] = [
+        (
+            |directory| update_status(directory, SessionState::Closed, None, None).unwrap(),
+            "session session-screen is closed; its terminal surface is not read",
+        ),
+        (
+            |directory| {
+                fs::rename(
+                    directory.join(TERMINAL_HANDLE_FILE),
+                    directory.join(TERMINAL_CLOSING_FILE),
+                )
+                .unwrap()
+            },
+            "the terminal surface of session session-screen is closed or being closed",
+        ),
+    ];
+    for (close, cause) in closes {
+        let surface = handle(host_kind(), Some(ID));
+        let fixture = Fixture::new(SessionState::Working, Some(&surface));
+        let mut access = Fake::new(&fixture);
+        access.during_read = Some(close);
+        assert!(withheld(&access, &fixture).ends_with(cause), "{cause}");
+        assert!(
+            matches!(
+                access.calls.borrow().as_slice(),
+                [Call::Verify { .. }, Call::Read { .. }]
+            ),
+            "{cause}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_handle_record_that_changes_during_the_read_withholds_the_text() {
+    type Change = fn(&Path);
+    let changes: [(Change, &str); 2] = [
+        (
+            |directory| {
+                let mut replaced = handle(host_kind(), Some(ID));
+                replaced.id = "surface-2".into();
+                Store::open_unchecked(directory)
+                    .write_terminal(&replaced)
+                    .unwrap();
+            },
+            "the recorded terminal handle changed during the read",
+        ),
+        (
+            |directory| fs::remove_file(directory.join(TERMINAL_HANDLE_FILE)).unwrap(),
+            "has no active terminal handle",
+        ),
+    ];
+    for (change, cause) in changes {
+        let surface = handle(host_kind(), Some(ID));
+        let fixture = Fixture::new(SessionState::Working, Some(&surface));
+        let mut access = Fake::new(&fixture);
+        access.during_read = Some(change);
+        let error = withheld(&access, &fixture);
+        assert!(error.contains(cause), "{error}");
+        assert!(
+            matches!(
+                access.calls.borrow().as_slice(),
+                [Call::Verify { .. }, Call::Read { .. }]
+            ),
+            "{error}"
+        );
+    }
+}
+
+// The binding read after the capture runs late in the budget: a busy Snapshot is not
+// retried past the deadline (250 ms otherwise).
+#[test]
+fn a_busy_snapshot_is_not_retried_past_the_deadline() {
+    let surface = handle(terminal::TerminalKind::Iterm2, Some(ID));
+    let fixture = Fixture::new(SessionState::Working, Some(&surface));
+    let _writer = Store::open_unchecked(&fixture.directory)
+        .try_lock()
+        .unwrap()
+        .unwrap();
+    let started = Instant::now();
+    let error =
+        bound_surface(&Reader::open_unchecked(&fixture.directory), ID, started).unwrap_err();
+    assert!(error.is::<SnapshotBusy>(), "{error:#}");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -358,7 +525,7 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
         let declared = kind.registration().screen_read_refusal;
         if kind.supported_on_this_platform() && declared.is_none() {
             outcome.unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
-            assert_eq!(access.calls.borrow().len(), 2, "{kind:?}");
+            assert_eq!(access.calls.borrow().len(), 3, "{kind:?}");
             continue;
         }
         let error = refusal(outcome);

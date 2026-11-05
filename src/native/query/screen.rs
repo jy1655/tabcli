@@ -1,23 +1,27 @@
 //! `screen`: the visible text of a session's own terminal surface at one moment. The surface
 //! binding is read under the Snapshot's shared lifecycle lock, which is released before
 //! anything reaches the terminal. The surface is then proven with the ownership check that
-//! `tell` and the launch dialog make before they address it, and read once through the
-//! shared dispatch. Nothing is sent, focused, started, repaired, written or retained.
+//! `tell` and the launch dialog make before they address it, read once through the shared
+//! dispatch, and the binding and the check are repeated before the text is returned. No
+//! input, key or selection request is sent and nothing is repaired or written. The text
+//! reaches no record, log or diagnostic, only each helper call's temporary output file.
 use super::*;
 use crate::native::delivery;
 use crate::native::failure_kind::Unsupported;
 use observation::SurfaceRecord;
 use observation::judgment::{self, ActiveHandle, Surface};
 
-/// The default budget of the ownership proof and the read together: two bounded terminal
-/// calls that a responsive terminal answers in about a second, with room for a slow one,
-/// short enough that a caller observing a pending request is not kept waiting.
+/// The default budget of both ownership proofs and the read: three bounded terminal calls
+/// that a responsive terminal answers in about a second, with room for a slow one, short
+/// enough that a caller observing a pending request is not kept waiting. On macOS a call
+/// that times out is followed by the automation's screen-lock probe of up to 0.5 s, so the
+/// command can return that much after the deadline.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The largest screen accepted, in UTF-8 bytes. No adapter truncates its read, and the
-/// Windows console refuses a window over 131,072 cells, which is at most 512 KiB with its
-/// row breaks. A larger answer fails instead of being cut, so that no partial screen is
-/// presented as the screen.
+/// The largest screen returned, in UTF-8 bytes, checked after the capture: a limit on what is
+/// returned, not on memory. No adapter truncates its read, and the Windows console refuses a
+/// window over 131,072 cells, which is at most 512 KiB with its row breaks. A larger answer
+/// fails instead of being cut, so that no partial screen is presented as the screen.
 const MAX_SCREEN_BYTES: usize = 512 * 1024;
 
 #[derive(Debug)]
@@ -149,7 +153,7 @@ fn observe(
     requested: Duration,
     access: &dyn SurfaceAccess,
 ) -> Result<Screen> {
-    let surface = bound_surface(&Reader::open_unchecked(directory), id)?;
+    let surface = bound_surface(&Reader::open_unchecked(directory), id, deadline)?;
     // Declared before any adapter, as the shared dispatch answers it: the ownership proof
     // below would otherwise reach the adapter of a kind that cannot read its screen.
     if let Some(refusal) = surface.kind.registration().screen_read_refusal {
@@ -176,6 +180,13 @@ fn observe(
             text.len()
         );
     }
+    // The adapters address the recorded ids again for the read, without the owner, and a
+    // close can begin after the first Snapshot. The same binding and the same live owner
+    // after the read show that this session held the surface on both sides of it; that is
+    // not atomic with the read.
+    confirm(directory, id, &surface, deadline, requested, access).context(
+        "the terminal surface could not be confirmed as this session's after the read; the text is withheld",
+    )?;
     Ok(Screen {
         kind: surface.kind,
         text,
@@ -183,10 +194,36 @@ fn observe(
     })
 }
 
+/// The binding read again under a fresh Snapshot's shared lock, required to be the handle
+/// that was read, then the same ownership check within the same deadline.
+fn confirm(
+    directory: &Path,
+    id: &str,
+    surface: &terminal::TerminalSession,
+    deadline: Instant,
+    requested: Duration,
+    access: &dyn SurfaceAccess,
+) -> Result<()> {
+    if bound_surface(&Reader::open_unchecked(directory), id, deadline)? != *surface {
+        bail!("the recorded terminal handle changed during the read");
+    }
+    access.verify(directory, id, surface, deadline, requested)
+}
+
 /// The active handle bound to this session, read with its status under the Snapshot's
-/// shared lifecycle lock. The lock is released when this returns, before any terminal call.
-fn bound_surface(reader: &Reader, id: &str) -> Result<terminal::TerminalSession> {
-    let snapshot = observe_snapshot(reader)?;
+/// shared lifecycle lock. A busy Snapshot is retried no later than the deadline, and the lock
+/// is released when this returns, before any terminal call.
+fn bound_surface(
+    reader: &Reader,
+    id: &str,
+    deadline: Instant,
+) -> Result<terminal::TerminalSession> {
+    let snapshot = observe_snapshot_until(
+        reader,
+        PublicationRead::Within(EVENT_READ_LIMIT),
+        deadline,
+        &mut SystemClock,
+    )?;
     let state = snapshot.status.state.clone();
     // An interrupted close can leave its tombstone before status.json catches up.
     if state == SessionState::Closed || reader.closed_if_present()?.is_some() {

@@ -109,8 +109,12 @@ The screen read column is what `tabcli screen` and the launch's dialog checks re
 `contents` of the exact session, Terminal.app's `contents` of the recorded window's TTY tab,
 WezTerm's `get-text` of the exact pane, and the visible window of the console's screen buffer on
 Windows. Each is the visible text only, not scrollback. `screen` reads only after the ownership
-check that `tell` makes, never starts the terminal application, and is refused for Ghostty and
-Warp, whose scripting exposes no screen text. See [screen](cli.md#screen).
+check that `tell` makes and returns the text only if the binding and that check still hold after
+the read. It addresses no terminal application that is not running when it checks; an
+application that quits between that check and the read can be started again by the scripting
+call. On native Windows a caller without a console can get a console window from the console
+helper; this is not verified. `screen` is refused for Ghostty and Warp, whose scripting exposes
+no screen text. See [screen](cli.md#screen).
 
 ## Requirements and first-run prompts
 

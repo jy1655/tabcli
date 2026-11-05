@@ -235,10 +235,16 @@ Session policy:
   --request filters request entries; session diagnostics remain separate. Unknown
   times are not inferred. This query never repairs, resends or closes a session.
   screen reads once the visible text of the terminal surface that a session's
-  records bind, after the ownership check tell makes (default 10 seconds). It sends
-  no input, changes no focus, starts no terminal application and keeps no copy. The
-  text is what the terminal showed, not a request state, and can contain secrets
-  the provider printed. Closed sessions, Ghostty and Warp are refused.
+  records bind, between two ownership checks like tell's, and withholds it unless
+  the same binding and owner hold after the read. It sends no input or key and
+  writes no record; the text stays out of logs and diagnostics. It addresses no
+  terminal application that is not running when it checks; one that quits before
+  the read can be started again by the scripting call. On native Windows a caller
+  without a console can get a console window from the helper (unverified).
+  --timeout-secs (default 10) is the deadline of these calls; on macOS a call that
+  times out adds a screen-lock probe of up to 0.5 s. The text is what the terminal
+  showed, not a request state, and can contain secrets the provider printed.
+  Closed sessions, Ghostty and Warp are refused.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.
 
@@ -658,7 +664,10 @@ mod tests {
             "status [--workspace PATH | --all-workspaces]",
             "inspect <session> [--timeline [--request REQUEST]] [--json]",
             "screen <session> [--timeout-secs N] [--json]",
-            "starts no terminal application and keeps no copy",
+            "withholds it unless",
+            "terminal application that is not running when it checks",
+            "times out adds a screen-lock probe of up to 0.5 s",
+            "without a console can get a console window from the helper (unverified)",
             "result <session>",
             "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",

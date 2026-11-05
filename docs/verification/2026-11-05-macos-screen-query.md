@@ -31,8 +31,10 @@ The read worked with the screen locked, like iTerm2 session launches do.
 
 - Terminal.app and WezTerm reads; the Ghostty and Warp refusals against a live session; native
   Windows (Windows Terminal tab and console window).
-- That the command never starts a terminal application that is not running. It was not tried:
-  quitting iTerm2 on a locked, shared Mac would have ended other sessions.
+- The behaviour with iTerm2 not running: the scripts ask whether it is running and do not
+  address it otherwise, and an application that quits between that question and the read can
+  be started again by the scripting call. Neither was tried: quitting iTerm2 on a locked,
+  shared Mac would have ended other sessions.
 - Focus and selection on an unlocked desktop, a read during an active turn, a session whose
   launch failed with a live owner, and the 10-second deadline against a busy terminal.
 - A Claude, Agy or Pi session: the read is a terminal operation and does not depend on the

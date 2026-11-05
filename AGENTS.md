@@ -700,9 +700,13 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Do not add an entry for something no record holds.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
-  any adapter, `tell`'s surface ownership check runs, and one read goes through the shared
-  dispatch. It returns the text without retaining it in records, logs or diagnostics, never
-  sends input or starts the terminal application, and claims nothing about the request.
+  any adapter, `tell`'s surface ownership check runs, one read goes through the shared
+  dispatch, and the text is withheld unless a fresh binding read is the same handle and the
+  check passes again. This shows the same owner held the surface on both sides of the read; it
+  is not atomic with it. It sends no input, writes the text to no record, log or diagnostic,
+  addresses no terminal application that is not running when it checks (one that quits before
+  the read can be started again, as with the presence and close scripts), and claims nothing
+  about the request.
 - `created_unix_ms` of a receipt and of an event is optional only when a record is read,
   so that a damaged record can be reported with a reason. Every writer writes it, and no
   path may publish an event without it: the completion-journal validation rejects one.
