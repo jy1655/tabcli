@@ -130,7 +130,7 @@ fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
         (Some("codex-cli 0.166.0"), Ok(On), true),
         (Some("codex-cli 0.167.2"), Ok(On), true),
         (Some("codex-cli 0.166.0"), Ok(Off), false),
-        (Some("codex-cli 0.166.0"), Err(()), true),
+        (Some("codex-cli 0.166.0"), Err(()), false),
         (Some("codex-cli 0.165.9"), Ok(On), false),
         (Some("codex-cli 0.166.0-alpha.1"), Ok(On), false),
         (Some("codex-cli 0.167.0-alpha.1"), Ok(On), false),

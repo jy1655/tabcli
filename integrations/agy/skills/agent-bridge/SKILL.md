@@ -106,16 +106,20 @@ Absent question fields do not prove that no question was asked.
   to: if the dialog is shown, report the request address and ask the user to answer it there;
   otherwise keep waiting or inspect the request. Do not infer an open dialog from the emission
   alone.
-- Codex does not refuse its question tool: when the adopted contract's `inspect` features
-  include `question_notice` and the session reports `capabilities.questions.response.state`
-  `answer_after_turn`, Bridge only told the child that no reply can arrive during its turn and
-  to end the turn with a `QUESTION FOR CALLER:` line. A Codex request that has ended with
+- Codex does not refuse its question tool. A Codex request that has ended with
   `question_emitted: true` is answered with `tell`; read the whole result first, since it can
-  also hold finished work. A Codex request still `pending` with an emission means the child is
-  still working: read the question with `result --request` or `wait --questions` and wait for
-  the request to end, because `tell` is refused until then and a queued message does not join a
-  running turn. The notice is advice: a child that ignores it can keep its turn, and the
-  request, open.
+  also hold finished work. While a Codex request is `pending`, `tell` is refused and a queued
+  message does not join the running turn: read the question with `result --request` or
+  `wait --questions`. What the wait means depends on the session:
+  - When the adopted contract's `inspect` features include `question_notice` and the session
+    reports `capabilities.questions.response.state` `answer_after_turn`, Bridge told the child
+    that no reply can arrive during its turn and to end the turn with a `QUESTION FOR CALLER:`
+    line. Wait for the request to end. The notice is advice: a child that ignores it can keep
+    its turn, and the request, open.
+  - Without that state, which is the default (the user turns the notice on with
+    `settings codex-question-notice on`), Bridge told the child nothing: it may be working, or
+    waiting in its turn for a reply Bridge cannot deliver. If the request stays pending, report
+    the question and the request address to the user.
 
 ## When an operation does not finish
 

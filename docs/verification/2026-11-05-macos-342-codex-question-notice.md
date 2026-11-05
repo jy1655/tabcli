@@ -24,7 +24,9 @@ The measurement that led to the notice is in
 
 ## Notice on (default)
 
-`settings` in the empty state root reported `codex_question_notice: "on"`.
+`settings` in the empty state root reported `codex_question_notice: "on"`, the default of this
+build; later builds default to `off`, and the runs below then need
+`settings codex-question-notice on` first.
 
 First request: reply `CODENAME=<codename>`; only the caller knows whether it is `ALPHA` or
 `BRAVO`; ask with `request_user_input_async`. Nothing else to do, and no instruction about

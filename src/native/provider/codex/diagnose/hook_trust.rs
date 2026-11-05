@@ -97,7 +97,7 @@ fn probe(context: &Context<'_>) -> Result<Value> {
 }
 
 // The value a new launch would inject: the notice hook only for Codex 0.166.0 or newer (not
-// a prerelease) with the setting on. An unreadable setting proposes the default, on.
+// a prerelease) with the setting on. An unreadable setting proposes the default, off.
 fn proposes_notice_hook(
     version: Option<&str>,
     setting: impl FnOnce() -> Result<crate::native::settings::CodexQuestionNotice>,
@@ -105,9 +105,8 @@ fn proposes_notice_hook(
     version
         .and_then(|version| super::super::codex_version(version).ok())
         .is_some_and(|version| version >= semver::Version::new(0, 166, 0) && version.pre.is_empty())
-        && setting().map_or(true, |setting| {
-            setting == crate::native::settings::CodexQuestionNotice::On
-        })
+        && setting()
+            .is_ok_and(|setting| setting == crate::native::settings::CodexQuestionNotice::On)
 }
 
 // Own both streams so even a blocked write/read cannot hold the caller past its
