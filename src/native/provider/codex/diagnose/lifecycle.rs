@@ -1,5 +1,6 @@
 //! Historical session evidence only; never effective live configuration.
-use super::super::{codex_version, hooks, turn as codex_turn};
+use super::super::launch_decision::{self, Decision};
+use super::super::{codex_version, turn as codex_turn};
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::diagnostics::{Availability, Check};
 use crate::native::query::Selector;
@@ -25,8 +26,8 @@ pub(super) fn check(directory: Option<&Path>) -> Check {
         "launch_mode":absent(),"input_hook_observed":absent(),
         "stop_candidate_observed":absent(),"observer":absent(),"terminal_outcome":absent()});
     if let Some(directory) = directory {
-        match hooks::read_launch_mode(directory) {
-            Ok(Some(mode)) => {
+        match launch_decision::lifecycle(directory) {
+            Decision::Present(mode) => {
                 let differs = mode
                     .codex_version
                     .as_deref()
@@ -39,8 +40,8 @@ pub(super) fn check(directory: Option<&Path>) -> Check {
                     );
                 }
             }
-            Ok(None) => {}
-            Err(error) => evidence["launch_mode"] = unreadable(error),
+            Decision::Absent => {}
+            Decision::Unreadable(error) => evidence["launch_mode"] = unreadable(error),
         }
         if let Err(error) = claim_evidence(directory, &mut evidence) {
             evidence["claim_selection"] = unreadable(error);

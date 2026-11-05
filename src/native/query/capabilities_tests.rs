@@ -4,6 +4,7 @@
 //! names instead of evaluating. `questions`: each adapter's configuration. No record is
 //! changed by the observation.
 use super::*;
+use crate::native::provider::CodexLaunchDecisionFixture;
 use crate::native::reopen::tests::snapshot_directory;
 use crate::native::session::cancel::{self, Refusal};
 use crate::native::session::test_support::lifecycle::{
@@ -892,24 +893,13 @@ fn questions_report_each_adapters_configuration_and_no_answer_path() {
         );
     }
     let fixture = working("codex");
-    let store = Store::open_unchecked(&fixture.directory);
-    store
-        .private("codex-launch-mode.json")
-        .write_json(
-            &json!({"schema": 1, "lifecycle_hooks": "injected", "reason": null,
-            "codex_version": "codex-cli 0.163.0", "vector_codex_version": "0.163.0"}),
-        )
-        .unwrap();
+    CodexLaunchDecisionFixture::LIFECYCLE_INJECTED.write(&fixture.directory);
     assert_eq!(
         observe_all(&fixture.directory)["questions"],
         json!({"emission_observation":
             {"state": "configured", "reason": "hooks_injected_unverified"}, "response": answer})
     );
-    store.private("codex-launch-mode.json").remove().unwrap();
-    store
-        .private("codex-launch-mode.json")
-        .write_private(b"{")
-        .unwrap();
+    CodexLaunchDecisionFixture::LIFECYCLE_MALFORMED.write(&fixture.directory);
     let observed = observe_all(&fixture.directory)["questions"].clone();
     assert_eq!(observed["emission_observation"]["state"], "unknown");
     assert_eq!(
@@ -998,20 +988,12 @@ fn codex_question_response_reports_the_notice_recorded_at_launch() {
     let after_turn = json!({"state": "answer_after_turn",
         "reason": "hook_configured_unverified", "answer_by": "tell"});
     let fixture = working("codex");
-    let store = Store::open_unchecked(&fixture.directory);
-    let mode = "codex-question-notice.json";
     // A session launched before the record existed has no notice hook.
     assert_eq!(
         observe_all(&fixture.directory)["questions"]["response"],
         unsupported
     );
-    store
-        .private(mode)
-        .write_json(
-            &json!({"schema": 1, "notice_hook": "injected", "reason": null,
-            "vector_codex_version": "0.166.0"}),
-        )
-        .unwrap();
+    CodexLaunchDecisionFixture::NOTICE_INJECTED.write(&fixture.directory);
     let questions = observe_all(&fixture.directory)["questions"].clone();
     assert_eq!(questions["response"], after_turn);
     // Emission observation still follows the lifecycle record alone.
@@ -1019,49 +1001,25 @@ fn codex_question_response_reports_the_notice_recorded_at_launch() {
         questions["emission_observation"],
         json!({"state": "unavailable", "reason": "hooks_not_injected"})
     );
-    for reason in [
-        "settings_off",
-        "lifecycle_hooks_not_injected",
-        "version_below_0_166",
-        "launcher_unavailable",
-    ] {
-        store
-            .private(mode)
-            .write_json(
-                &json!({"schema": 1, "notice_hook": "not_injected", "reason": reason,
-                "vector_codex_version": "0.166.0"}),
-            )
-            .unwrap();
+    for decision in CodexLaunchDecisionFixture::NOTICE_NOT_INJECTED {
+        decision.write(&fixture.directory);
         assert_eq!(
             observe_all(&fixture.directory)["questions"]["response"],
             unsupported,
-            "{reason}"
+            "{decision:?}"
         );
     }
-    store.private(mode).remove().unwrap();
-    for record in [
-        &b"{"[..],
-        br#"{"schema":2,"notice_hook":"injected","reason":null,"vector_codex_version":"0.166.0"}"#,
-        br#"{"schema":1,"notice_hook":"maybe","reason":null,"vector_codex_version":"0.166.0"}"#,
-        br#"{"schema":1,"notice_hook":"injected","reason":null,"vector_codex_version":"0.163.0"}"#,
-    ] {
-        store.private(mode).write_private(record).unwrap();
+    for decision in CodexLaunchDecisionFixture::NOTICE_UNREADABLE {
+        decision.write(&fixture.directory);
         let response = observe_all(&fixture.directory)["questions"]["response"].clone();
         assert_eq!(response["state"], "unknown", "{response}");
         assert_eq!(response["reason"], "evidence_unreadable");
         assert!(response["detail"].as_str().is_some());
-        store.private(mode).remove().unwrap();
     }
     // Other providers never read the Codex record.
     for provider in ["claude", "agy", "pi"] {
         let fixture = working(provider);
-        Store::open_unchecked(&fixture.directory)
-            .private(mode)
-            .write_json(
-                &json!({"schema": 1, "notice_hook": "injected", "reason": null,
-                "vector_codex_version": "0.166.0"}),
-            )
-            .unwrap();
+        CodexLaunchDecisionFixture::NOTICE_INJECTED.write(&fixture.directory);
         assert_eq!(
             observe_all(&fixture.directory)["questions"]["response"],
             unsupported,

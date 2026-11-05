@@ -55,9 +55,9 @@ pub(super) fn send_initial_prompt(
             },
         )
         .map_err(terminal::TerminalSendFailure::not_sent)?;
-        if super::hooks::read_launch_mode(&directory)
+        if super::launch_decision::lifecycle(&directory)
+            .lifecycle_hooks_injected()
             .map_err(terminal::TerminalSendFailure::not_sent)?
-            .is_some_and(|mode| mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
         {
             #[cfg(windows)]
             return paste::send(session, &directory, prompt_path, deadline);
@@ -89,9 +89,7 @@ fn initial_readiness_with(
     read_screen: &mut impl FnMut() -> Result<String>,
     legacy: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    if !super::hooks::read_launch_mode(directory)?
-        .is_some_and(|mode| mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
-    {
+    if !super::launch_decision::lifecycle(directory).lifecycle_hooks_injected()? {
         return legacy();
     }
     let mut last_screen = String::new();

@@ -12,7 +12,7 @@
 //! Replace this when Codex offers a verified addressed way to answer a question in the running
 //! turn of the injected TUI launch.
 use super::correlation::codex_string;
-use super::hooks;
+use super::{hooks, launch_decision};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -45,7 +45,7 @@ pub(super) fn pre_tool_use(directory: &Path, payload: &Value) -> Result<Option<S
     }
     // The launch decision, never the current setting. A session without the record was launched
     // by an earlier binary, which injected no notice hook.
-    if !hooks::notice_hook_injected(directory)? {
+    if !launch_decision::notice(directory).notice_hook_injected()? {
         return Ok(None);
     }
     Ok(Some(serde_json::to_string(&Output {
