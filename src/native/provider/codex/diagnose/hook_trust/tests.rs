@@ -89,7 +89,7 @@ fn hook_trust_fake_responder_trusted_untrusted_and_modified_hashes() {
 #[test]
 fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
     use crate::native::settings::CodexLifecycleHooks as Lifecycle;
-    use crate::native::settings::CodexQuestionNotice::{Off, On};
+    use crate::native::settings::CodexQuestionNotice::{self as Notice, Off, On};
     let command = hooks::hook_command(bridge()).unwrap();
     let matched = hooks::matched_trust_hash("pre_tool_use", Some(hooks::QUESTION_TOOL), &command);
     let mut trusted = reply("trusted", false);
@@ -100,6 +100,14 @@ fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
     let evidence = summarize(&trusted, bridge(), true).unwrap();
     let rows = evidence["hooks"].as_array().unwrap();
     assert_eq!(rows.len(), 3);
+    // Rows follow the injected value's order, whatever order Codex lists the keys in.
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["key"].clone())
+            .collect::<Vec<_>>(),
+        ["stop", "user_prompt_submit", "pre_tool_use"]
+            .map(|label| json!(hooks::session_flags_state_key(label)))
+    );
     assert_eq!(
         rows[2]["key"],
         hooks::session_flags_state_key("pre_tool_use")
@@ -127,34 +135,88 @@ fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
         2
     );
     assert!(summarize(&reply("trusted", false), bridge(), true).is_err());
-    for (version, settings, expected) in [
-        (Some("codex-cli 0.166.0"), Ok((Lifecycle::On, On)), true),
-        (Some("codex-cli 0.167.2"), Ok((Lifecycle::On, On)), true),
-        (Some("codex-cli 0.166.0"), Ok((Lifecycle::On, Off)), false),
-        // A launch with lifecycle hooks off injects no hooks value, so no notice hook either.
-        (Some("codex-cli 0.166.0"), Ok((Lifecycle::Off, On)), false),
-        (Some("codex-cli 0.166.0"), Ok((Lifecycle::Off, Off)), false),
-        (Some("codex-cli 0.166.0"), Err(()), false),
-        (Some("codex-cli 0.165.9"), Ok((Lifecycle::On, On)), false),
-        (
-            Some("codex-cli 0.166.0-alpha.1"),
-            Ok((Lifecycle::On, On)),
-            false,
-        ),
-        (
-            Some("codex-cli 0.167.0-alpha.1"),
-            Ok((Lifecycle::On, On)),
-            false,
-        ),
-        (Some("unparseable"), Ok((Lifecycle::On, On)), false),
-        (None, Ok((Lifecycle::On, On)), false),
+    // The probe proposes the notice hook exactly when the launch rule injects it; the gates
+    // themselves are the launch tests' matrix.
+    let rule = |version, lifecycle, notice: Notice, launcher| {
+        matches!(
+            hooks::Eligibility::new(version, lifecycle, launcher).notice(|| Ok(notice)),
+            Ok(None)
+        )
+    };
+    for (version, lifecycle, notice, launcher, expected) in [
+        (Some("codex-cli 0.166.0"), Lifecycle::On, On, true, true),
+        (Some("codex-cli 0.166.0"), Lifecycle::On, On, false, false),
+        (Some("codex-cli 0.166.0"), Lifecycle::On, Off, true, false),
     ] {
+        let case = format!("{version:?} {lifecycle:?} {notice:?} {launcher}");
         assert_eq!(
-            proposes_notice_hook(version, || settings
-                .map_err(|()| anyhow::anyhow!("unreadable settings"))),
+            rule(version, lifecycle, notice, launcher),
             expected,
-            "{version:?} {settings:?}"
+            "{case}"
         );
+        assert_eq!(
+            proposes_notice(version, Ok((lifecycle, notice)), launcher),
+            expected,
+            "{case}"
+        );
+    }
+    // Unreadable settings enter as the settings' own defaults, which propose no notice hook.
+    let unreadable = || Err(anyhow::anyhow!("unreadable settings"));
+    for version in [Some("codex-cli 0.166.0"), Some("codex-cli 0.167.2")] {
+        assert!(!proposes_notice(version, unreadable(), true), "{version:?}");
+        assert_eq!(
+            proposes_notice(version, unreadable(), true),
+            rule(version, Lifecycle::default(), Notice::default(), true),
+            "{version:?}"
+        );
+    }
+}
+
+// For the same Codex version, settings and executable, a new launch records the notice hook as
+// injected exactly when the probe proposes it.
+#[test]
+fn hook_trust_proposes_the_notice_hook_a_launch_records() {
+    use crate::native::provider::codex::test_support;
+    use crate::native::session::Store;
+    let unavailable = Path::new(if cfg!(windows) {
+        r"C:\space dir\tabcli.exe"
+    } else {
+        ""
+    });
+    for (version, lifecycle, notice, executable, expected) in [
+        (Some("codex-cli 0.166.0"), "on", "on", bridge(), true),
+        (Some("codex-cli 0.170.3"), "on", "on", bridge(), true),
+        (Some("codex-cli 0.166.0"), "off", "on", bridge(), false),
+        (Some("codex-cli 0.166.0"), "on", "off", bridge(), false),
+        (Some("codex-cli 0.165.9"), "on", "on", bridge(), false),
+        (Some("codex-cli 0.163.0"), "on", "on", bridge(), false),
+        (Some("0.166.0-alpha.1"), "on", "on", bridge(), false),
+        (Some("0.167.0-alpha.1"), "on", "on", bridge(), false),
+        (Some("unparseable"), "on", "on", bridge(), false),
+        (None, "on", "on", bridge(), false),
+        (Some("codex-cli 0.166.0"), "on", "on", unavailable, false),
+    ] {
+        let case = format!("{version:?} {lifecycle} {notice} {}", executable.display());
+        let root = tempfile::tempdir().unwrap();
+        let directory = test_support::launch_session(root.path(), version);
+        Store::open_unchecked(root.path())
+            .private("settings.json")
+            .write_json(&json!({"schema":1,"codex_lifecycle_hooks":lifecycle,
+                "codex_question_notice":notice}))
+            .unwrap();
+        hooks::prepare(&directory, executable).unwrap();
+        let recorded = hooks::read_notice_mode(&directory)
+            .unwrap()
+            .unwrap()
+            .reason
+            .is_none();
+        let proposed = proposes_notice(
+            version,
+            settings(root.path()),
+            hooks::hook_command(executable).is_some(),
+        );
+        assert_eq!(recorded, expected, "{case}");
+        assert_eq!(proposed, recorded, "{case}");
     }
 }
 
@@ -185,6 +247,18 @@ fn hook_trust_fake_responder_rejects_malformed_missing_keys_and_rpc_errors() {
         let (result, _) = respond(result);
         assert!(summarize(&result.unwrap(), bridge(), false).is_err());
     }
+    // Keys are checked in the injected value's order, so a reply without any of Bridge's keys
+    // names the first of that order.
+    let (empty, _) = respond(json!({"data":[{"hooks":[]}]}));
+    assert_eq!(
+        summarize(&empty.unwrap(), bridge(), true)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "Bridge hook key missing or ambiguous: {}",
+            hooks::session_flags_state_key("stop")
+        )
+    );
 }
 
 #[test]

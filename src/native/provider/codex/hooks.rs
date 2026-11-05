@@ -27,6 +27,9 @@ const NOTICE_VECTOR_VERSION: &str = "0.166.0";
 /// (hooks/src/engine/matcher.rs, core/src/tools/hook_names.rs).
 pub(super) const QUESTION_TOOL: &str = "request_user_input_async";
 
+// The matcher-less identity under the name the vector tests use; production hashes go through
+// `Hook::trust_hash`.
+#[cfg(test)]
 pub(super) fn trust_hash(event_label: &str, command: &str) -> String {
     matched_trust_hash(event_label, None, command)
 }
@@ -97,8 +100,68 @@ pub(super) fn hook_command(bridge_executable: &Path) -> Option<String> {
     }
 }
 
-// The notice hook is one more group in the same value, with a matcher so that Codex runs it for
-// the question tool only. The two lifecycle groups and their state entries are unchanged.
+/// The hooks Bridge injects into a new launch, in the order of the `-c hooks=` value. The set is
+/// closed: the value, the hook-trust probe's rows and the native hook dispatch all go through it,
+/// so a new member is a compile error in the dispatch until it is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Hook {
+    Stop,
+    UserPromptSubmit,
+    /// The question notice: one group with a matcher, so that Codex runs it for the question
+    /// tool only, injected only when the launch decides on it.
+    QuestionNotice,
+}
+
+impl Hook {
+    const ALL: [Self; 3] = [Self::Stop, Self::UserPromptSubmit, Self::QuestionNotice];
+
+    /// Codex's event name: the group's table name in the value and `hook_event_name` in a payload.
+    const fn event(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::QuestionNotice => "PreToolUse",
+        }
+    }
+
+    /// The event label in the session-flags state key and in the trust hash identity.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::UserPromptSubmit => "user_prompt_submit",
+            Self::QuestionNotice => "pre_tool_use",
+        }
+    }
+
+    const fn matcher(self) -> Option<&'static str> {
+        match self {
+            Self::Stop | Self::UserPromptSubmit => None,
+            Self::QuestionNotice => Some(QUESTION_TOOL),
+        }
+    }
+
+    /// The member a hook payload's event name names; any other name is none of Bridge's hooks.
+    pub(super) fn from_event(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|hook| hook.event() == name)
+    }
+
+    /// The hooks a launch injects, in value order: the lifecycle hooks, and the notice hook only
+    /// with `notice`.
+    pub(super) fn injected(notice: bool) -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(move |hook| notice || *hook != Self::QuestionNotice)
+    }
+
+    pub(super) fn state_key(self) -> String {
+        session_flags_state_key(self.label())
+    }
+
+    pub(super) fn trust_hash(self, command: &str) -> String {
+        matched_trust_hash(self.label(), self.matcher(), command)
+    }
+}
+
 pub(super) fn hooks_override(bridge_executable: &Path, notice: bool) -> Option<String> {
     let command = hook_command(bridge_executable)?;
     #[cfg(windows)]
@@ -110,24 +173,24 @@ pub(super) fn hooks_override(bridge_executable: &Path, notice: bool) -> Option<S
         .expect("command serializes")
         .replace('\u{7f}', "\\u007f");
     let handler = format!("{{type='command',command={quoted},timeout=30,async=false}}");
-    let stop = session_flags_state_key("stop");
-    let ups = session_flags_state_key("user_prompt_submit");
-    let (group, state) = if notice {
-        (
-            format!(",PreToolUse=[{{matcher='{QUESTION_TOOL}',hooks=[{handler}]}}]"),
-            format!(
-                ",'{}'={{trusted_hash='{}'}}",
-                session_flags_state_key("pre_tool_use"),
-                matched_trust_hash("pre_tool_use", Some(QUESTION_TOOL), &command)
-            ),
-        )
-    } else {
-        (String::new(), String::new())
-    };
+    let mut groups = Vec::new();
+    let mut states = Vec::new();
+    for hook in Hook::injected(notice) {
+        let matcher = hook
+            .matcher()
+            .map(|matcher| format!("matcher='{matcher}',"))
+            .unwrap_or_default();
+        groups.push(format!("{}=[{{{matcher}hooks=[{handler}]}}]", hook.event()));
+        states.push(format!(
+            "'{}'={{trusted_hash='{}'}}",
+            hook.state_key(),
+            hook.trust_hash(&command)
+        ));
+    }
     Some(format!(
-        "hooks={{Stop=[{{hooks=[{handler}]}}],UserPromptSubmit=[{{hooks=[{handler}]}}]{group},state={{'{stop}'={{trusted_hash='{}'}},'{ups}'={{trusted_hash='{}'}}{state}}}}}",
-        trust_hash("stop", &command),
-        trust_hash("user_prompt_submit", &command)
+        "hooks={{{},state={{{}}}}}",
+        groups.join(","),
+        states.join(",")
     ))
 }
 
@@ -138,7 +201,7 @@ pub(super) enum LifecycleHooks {
     NotInjected,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Reason {
     #[serde(rename = "version_below_0_163")]
@@ -185,6 +248,69 @@ pub(super) struct NoticeMode {
     pub(super) vector_codex_version: String,
 }
 
+/// The first Codex version a new launch injects the lifecycle hooks for. A floor is eligibility;
+/// `VECTOR_VERSION` is the version the trust hashes were measured with. They are equal today, but
+/// neither is derived from the other.
+const LIFECYCLE_FLOOR: semver::Version = semver::Version::new(0, 163, 0);
+/// The first Codex version a new launch injects the question notice hook for: the only version
+/// measured. Like the lifecycle floor, it is independent of `NOTICE_VECTOR_VERSION`.
+const NOTICE_FLOOR: semver::Version = semver::Version::new(0, 166, 0);
+
+/// The one rule deciding which hooks a new launch injects, in the vocabulary of the two launch
+/// records: no reason injects, a reason does not. `prepare` records its decisions and the
+/// hook-trust probe proposes the notice hook from it. The lifecycle hooks are decided first;
+/// the notice hook rides in their value, so it is decided after them and its setting is read
+/// only when every other notice gate passes.
+pub(super) struct Eligibility {
+    version: Option<semver::Version>,
+    lifecycle: Option<Reason>,
+}
+
+impl Eligibility {
+    /// `version` is the Codex version output the launch records; one that does not parse is
+    /// unknown. `setting` is the lifecycle hooks setting, and `launcher` is whether this Bridge
+    /// executable has a hook command.
+    pub(super) fn new(version: Option<&str>, setting: CodexLifecycleHooks, launcher: bool) -> Self {
+        let version = version.and_then(|version| codex_version(version).ok());
+        let reason = match &version {
+            None => Some(Reason::VersionUnknown),
+            Some(v) if *v < LIFECYCLE_FLOOR => Some(Reason::VersionBelow0_163),
+            Some(v) if !v.pre.is_empty() => Some(Reason::Prerelease),
+            _ if setting == CodexLifecycleHooks::Off => Some(Reason::SettingsOff),
+            _ if !launcher => Some(Reason::LauncherUnavailable),
+            _ => None,
+        };
+        Self {
+            version,
+            lifecycle: reason,
+        }
+    }
+
+    /// Why the lifecycle hooks are not injected; `None` when they are.
+    pub(super) fn lifecycle(&self) -> Option<Reason> {
+        self.lifecycle
+    }
+
+    /// Why the notice hook is not injected; `None` when it is. A prerelease never reaches the
+    /// floor check: the lifecycle decision refuses it. `setting` runs only after every other gate
+    /// passes, and its failure is the decision's failure.
+    pub(super) fn notice(
+        &self,
+        setting: impl FnOnce() -> Result<CodexQuestionNotice>,
+    ) -> Result<Option<NoticeReason>> {
+        let reason = match (&self.lifecycle, &self.version) {
+            (Some(Reason::LauncherUnavailable), _) => Some(NoticeReason::LauncherUnavailable),
+            (Some(_), _) => Some(NoticeReason::LifecycleHooksNotInjected),
+            (None, Some(v)) if *v < NOTICE_FLOOR => Some(NoticeReason::VersionBelow0_166),
+            _ => None,
+        };
+        if reason.is_some() {
+            return Ok(reason);
+        }
+        Ok((setting()? == CodexQuestionNotice::Off).then_some(NoticeReason::SettingsOff))
+    }
+}
+
 pub(super) fn prepare(directory: &Path, executable: &Path) -> Result<Option<String>> {
     let version = match Reader::open_unchecked(directory).manifest() {
         Ok(manifest) => Some(manifest.provider_version),
@@ -200,19 +326,13 @@ pub(super) fn prepare(directory: &Path, executable: &Path) -> Result<Option<Stri
     let root = directory
         .parent()
         .context("Codex session has no state root")?;
-    let setting = settings::codex_lifecycle_hooks(root)?;
-    let parsed = version.as_deref().and_then(|v| codex_version(v).ok());
-    let launcher = hook_command(executable).is_some();
-    let reason = match &parsed {
-        None => Some(Reason::VersionUnknown),
-        Some(v) if *v < semver::Version::new(0, 163, 0) => Some(Reason::VersionBelow0_163),
-        Some(v) if !v.pre.is_empty() => Some(Reason::Prerelease),
-        _ if setting == CodexLifecycleHooks::Off => Some(Reason::SettingsOff),
-        _ if !launcher => Some(Reason::LauncherUnavailable),
-        _ => None,
-    };
+    let eligibility = Eligibility::new(
+        version.as_deref(),
+        settings::codex_lifecycle_hooks(root)?,
+        hook_command(executable).is_some(),
+    );
+    let reason = eligibility.lifecycle();
     let injected = reason.is_none();
-    let launcher_unavailable = reason == Some(Reason::LauncherUnavailable);
     let store = Store::open_unchecked(directory);
     store.private(FILE).write_json(&LaunchMode {
         schema: 1,
@@ -225,17 +345,8 @@ pub(super) fn prepare(directory: &Path, executable: &Path) -> Result<Option<Stri
         codex_version: version,
         vector_codex_version: VECTOR_VERSION.into(),
     })?;
-    // The notice hook rides in the lifecycle value and keeps its own floor: 0.166.0 is the only
-    // version measured. A prerelease never reaches here (the lifecycle decision refuses it).
-    let notice_reason = match parsed {
-        _ if launcher_unavailable => Some(NoticeReason::LauncherUnavailable),
-        _ if !injected => Some(NoticeReason::LifecycleHooksNotInjected),
-        Some(v) if v < semver::Version::new(0, 166, 0) => Some(NoticeReason::VersionBelow0_166),
-        _ if settings::codex_question_notice(root)? == CodexQuestionNotice::Off => {
-            Some(NoticeReason::SettingsOff)
-        }
-        _ => None,
-    };
+    // The notice setting is read only after the lifecycle record is published.
+    let notice_reason = eligibility.notice(|| settings::codex_question_notice(root))?;
     let notice = notice_reason.is_none();
     // Written before the value is returned, so a launch never carries a hook its record omits.
     store.private(NOTICE_FILE).write_json(&NoticeMode {
