@@ -48,7 +48,10 @@ that a dialog is pending, or that Bridge can answer it. A question return from `
 `question_deflection` in the features of `ask`, `tell`, `reopen`, `result`, `wait`, `status` and
 `inspect` advertises the [question deflection](#question-deflection) fields in that command's JSON,
 and in `settings.features` `claude_question_deflection` advertises the setting. Neither proves that a
-session was launched with deflection or that any call was refused.
+session was launched with deflection or that any call was refused. `question_notice` in
+`inspect.features` advertises the `answer_after_turn` response state of the Codex
+[question notice](#question-notice), and `codex_question_notice` in `settings.features` its
+setting; neither proves that a session was launched with the notice or that a child followed it.
 
 The `output` section describes common JSON envelope defaults and optional failure hints, not
 every command's result fields. A command may override the defaults; legacy `consent` and
@@ -724,13 +727,18 @@ one. `response` reports the answer path the session's own launch records configu
 |---|---|---|
 | Claude | `deflected_to_result` | `plugin_configured_unverified`, with `answer_by: "tell"` (native completion mode, launched with [question deflection](#question-deflection) on) |
 | Claude | `unsupported` | `no_addressed_answer_path` (deflection off, legacy completion mode, or a session launched before the deflection record existed) |
-| Codex, Agy, Pi | `unsupported` | `no_addressed_answer_path` |
+| Codex | `answer_after_turn` | `hook_configured_unverified`, with `answer_by: "tell"` (launched with the [question notice](#question-notice) hook) |
+| Codex | `unsupported` | `no_addressed_answer_path` (notice off, not injected, or a session launched before the notice record existed) |
+| Agy, Pi | `unsupported` | `no_addressed_answer_path` |
 
 `deflected_to_result` is configuration, not evidence: it does not prove that Claude loaded the
-plugin or that any call was refused. A Claude deflection record that cannot be read is `unknown`
-with `evidence_unreadable` and `detail`. Each provider's adapter states its answer path, so
-when the manifest's provider name is not recognized, both `emission_observation` and `response`
-are `unknown` with `evidence_unreadable`.
+plugin or that any call was refused. `answer_after_turn` means the question is emitted and
+observed, the child is told that no reply can arrive during the turn, and the caller answers with
+an ordinary `tell` after the request has ended. It is what was configured, not proof that Codex
+trusted or ran the hook or that the child complied. A Claude deflection record or a Codex notice
+record that cannot be read is `unknown` with `evidence_unreadable` and `detail`. Each provider's
+adapter states its answer path, so when the manifest's provider name is not recognized, both
+`emission_observation` and `response` are `unknown` with `evidence_unreadable`.
 
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.
@@ -951,7 +959,45 @@ instead. A refusal leaves no record at all when both attempts to record it fail,
 happens outside the request's bound turn (an unattributed continuation turn, for example).
 `wait --questions` can return an emission before its `deflected` flag is recorded, and
 its cursor does not return that emission again; read `result --request` for the current flags.
-Codex, Agy and Pi sessions never report deflection.
+Codex, Agy and Pi sessions never report deflection; Codex has the
+[question notice](#question-notice) instead.
+
+### Question notice
+
+Codex's `request_user_input_async` tool is asynchronous: it emits the question and returns at
+once, and the turn goes on. A Bridge-managed Codex session has nobody at its terminal, and a child
+that waits for a reply keeps its turn, and the request, open. A Codex session launched with
+`settings codex-question-notice on` (the default), with lifecycle hooks injected and a recorded
+Codex version of 0.166.0 or newer, carries one more `PreToolUse` hook that runs for that tool only.
+It lets the tool run and adds this notice for the model:
+
+```text
+No person is at this session's terminal, so no reply to this question can arrive during this turn. Do not wait or sleep for one. Finish the work that does not depend on the answer, then end your turn, and end your final message with the one line `QUESTION FOR CALLER: <question> Options: <option labels>`. The caller answers in a follow-up message.
+```
+
+The question is still emitted and Bridge records it as for any Codex emission. Unlike Claude's
+[question deflection](#question-deflection), nothing is refused, because a refusal would cut short
+work the child does while its question is open, and no `deflected` flag or deflection field is
+reported. Each session keeps the decision recorded at its launch.
+
+How to answer:
+
+- A request that has ended with `question_emitted: true` is answered with `tell`. Its Result
+  usually ends with the `QUESTION FOR CALLER:` line and can also hold finished work. Bridge
+  neither strips nor parses that line.
+- A request that is still `pending` with an emission means the child is still working. Read the
+  question with `result --request` or `wait --questions`, and wait for the request to end: `tell`
+  is refused until then, and a message queued with `codex queue` does not join a running turn.
+
+The notice is advice to the model. A child that ignores it can still wait in its turn, and then
+the request stays pending as before. `inspect --json` reports `capabilities.questions.response`
+as `answer_after_turn` for such a launch. The hook prints nothing for any other tool, writes no
+record, and leaves your own `PreToolUse` hooks in place: Codex runs every matching hook, and one
+of yours that denies the tool blocks the question. If the hook cannot read its launch record it
+exits with status 1, which Codex reports as a failed hook before running the tool without the
+notice. `settings codex-question-notice off` launches later Codex sessions without it.
+Not verified: native Windows at runtime, Codex versions other than 0.166.0, more than one question
+in a turn, a `PreToolUse` hook of your own beside this one, and subagent questions.
 
 Successful waited `ask`, `tell` and `reopen` read the record once and add only
 `question_emitted`, `question_emission_count`, the two deflection fields above when a call was
@@ -1481,6 +1527,7 @@ tabcli settings macos-open-mode tab-first|new-window [--json]
 tabcli settings codex-memory-workspace refuse|allow [--json]
 tabcli settings codex-lifecycle-hooks on|off [--json] # default: on
 tabcli settings claude-question-deflection on|off [--json] # default: on
+tabcli settings codex-question-notice on|off [--json] # default: on
 ```
 
 `codex-lifecycle-hooks` controls hook injection for new Codex launches only. It writes Bridge's
@@ -1496,6 +1543,15 @@ answers in the terminal. Each session keeps the decision recorded at its launch
 (`claude-question-mode.json`); a settings record that cannot be read at launch keeps the default
 and is noted in the session's launch log. The setting is not evidence that a call was refused.
 
+`codex-question-notice` decides, for new Codex launches only, whether the injected hooks include
+the `PreToolUse` hook that lets a `request_user_input_async` call run with a notice that no reply
+can arrive during the turn ([question notice](#question-notice)). It applies only when lifecycle
+hooks are injected and the recorded Codex version is 0.166.0 or newer. Choose `off` for sessions
+a person watches and answers in the terminal. Each session keeps the decision recorded at its
+launch (`codex-question-notice.json`, with the reason when the hook was not injected); a settings
+record that cannot be read fails the launch, as for `codex-lifecycle-hooks`. The setting is not
+evidence that a child read or followed the notice.
+
 ```sh
 tabcli settings
 ```
@@ -1507,7 +1563,8 @@ tabcli settings
   "macos_open_mode": "tab-first",
   "codex_memory_workspace": "refuse",
   "codex_lifecycle_hooks": "on",
-  "claude_question_deflection": "on"
+  "claude_question_deflection": "on",
+  "codex_question_notice": "on"
 }
 ```
 
@@ -1525,8 +1582,8 @@ restores the default. It is a launch admission preference, read at each launch, 
 removes no close authority over existing sessions. Isolated `self-test` does not read it.
 
 `--json` is optional and has no format effect: output is always JSON, with `settings_file`,
-`windows_tab_window`, `macos_open_mode`, `codex_memory_workspace`, `codex_lifecycle_hooks`, and
-`claude_question_deflection`.
+`windows_tab_window`, `macos_open_mode`, `codex_memory_workspace`, `codex_lifecycle_hooks`,
+`claude_question_deflection`, and `codex_question_notice`.
 
 Successful reads/writes exit 0. Unknown setting names or values, duplicate `--json`, an invalid
 settings schema, and read/write failures fail. An invalid admission value fails with
@@ -1914,8 +1971,8 @@ refused an isolated test before its private directory existed; that report has o
 
 Fields: `settings_file`, `windows_tab_window` (`dedicated` or `current`), `macos_open_mode`
 (`tab-first` or `new-window`), `codex_memory_workspace` (`refuse` or `allow`),
-`codex_lifecycle_hooks` (`on` or `off`), and `claude_question_deflection` (`on` or `off`). There
-is no `schema_version`.
+`codex_lifecycle_hooks` (`on` or `off`), `claude_question_deflection` (`on` or `off`), and
+`codex_question_notice` (`on` or `off`). There is no `schema_version`.
 
 ### sessions
 

@@ -517,9 +517,44 @@ launch, observe, continue, and close without replacing the capabilities those CL
   (`docs/verification/2026-11-05-macos-342-codex-question-answer.md`): the question tool
   returns at once and the turn goes on; a `codex queue` message sent during that turn never
   joined it and started the next turn (`turn_trigger: queue`); a child with nothing else to do
-  kept its turn open waiting, so its request stayed pending and no `tell` could reach it. A
-  temporary build's unmatched `PreToolUse` hook refused the tool with a reason and the child
-  ended its turn with the question. That probe is not a product path.
+  kept its turn open waiting, so its request stayed pending and no `tell` could reach it.
+- The question notice is a fallback for that wait (#342): no person is at a managed session's
+  terminal, and Codex 0.166.0 offers no addressed way to answer a question in the running turn.
+  The state root's `codex-question-notice` setting (default on) is read once at launch, and
+  `codex-question-notice.json` records whether the hook was injected and, if not, why (setting
+  off, lifecycle hooks not injected, launcher unavailable, Codex below 0.166.0); every later
+  read uses that record, and a session without it has no notice hook. When it is injected, the
+  one `-c hooks=` value also carries a `PreToolUse` group with the exact matcher
+  `request_user_input_async` (Codex compares a pattern of letters, digits and `_` with the tool
+  name and its aliases, and this tool has none) and its `trusted_hash` under the session-flags
+  `pre_tool_use` key. The matcher is part of Codex's trust identity: the `hooks/list` probe of
+  codex-cli 0.166.0 reported the pinned value `trusted` and the matcher-less hash on the same
+  group `modified` (2026-11-05). This replication shares the drift risk of the two lifecycle
+  hooks: a hash Codex no longer accepts holds the hook-review picker before the composer and
+  the initial prompt, so the doctor's probe proposes and checks this hook whenever a new launch
+  would inject it. For that tool the hook prints one `hookSpecificOutput` with
+  `additionalContext` only: no permission decision, reason or input rewrite. It is a notice, not
+  a refusal: the tool is asynchronous by design, the child may keep working while its question
+  is open, and a refusal would cut that work short. The tool still runs, the Cursor records the
+  emission as above, and the notice tells the child that no reply can arrive during the turn,
+  to finish what does not depend on the answer and to end the turn with the line
+  `QUESTION FOR CALLER: <question> Options: <option labels>` (Claude's deflection format). The
+  hook reads only that launch record: it takes no lock or Claim, writes nothing and sets no
+  `deflected` flag. An unreadable record exits 1, which Codex reports as a failed hook and then
+  runs the tool without the notice; it never exits 2. `inspect` reports
+  `capabilities.questions.response` as `answer_after_turn` (`hook_configured_unverified`,
+  `answer_by: tell`): configuration, not evidence that the child read or followed the notice.
+  The notice is advice to the model: a child that ignores it can still wait in its turn, and
+  then the Request stays pending, `tell` is refused and a queued message does not join the
+  turn, exactly as before. The 0.166.0 floor is eligibility, not runtime proof. Codex runs every
+  matched `PreToolUse` handler; Bridge's group neither removes nor reorders a user's own, and a
+  user's hook that denies the tool blocks it, leaving no emission. Native Windows at runtime,
+  other Codex versions, more than one question in a turn, a user's own `PreToolUse` hook beside
+  this one and subagent questions are unverified. Replace this fallback when Codex offers a
+  verified addressed way to answer a question in the running turn of the injected TUI launch.
+  The macOS owner check with codex-cli 0.166.0 (two requests with the notice on, their
+  follow-up answers, and one request with it off) is in
+  `docs/verification/2026-11-05-macos-342-codex-question-notice.md`.
 - Lifecycle completion live verification on native Windows, 2026-10-18, codex-cli 0.163.0
   (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
   from `task_complete` with and without a notify record (a 25,463-character prompt with a

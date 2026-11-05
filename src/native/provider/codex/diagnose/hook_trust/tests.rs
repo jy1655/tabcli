@@ -27,6 +27,11 @@ fn reply(status: &str, mismatch: bool) -> Value {
         "currentHash":if mismatch { "sha256:changed".into() } else { hooks::trust_hash(label, &command) }
     })))}]})
 }
+// The notice hook's row as Codex 0.166.0 reports it: the matcher is part of its hash.
+fn question_row(status: &str, hash: String) -> Value {
+    json!({"key":hooks::session_flags_state_key("pre_tool_use"),"trustStatus":status,
+        "matcher":hooks::QUESTION_TOOL,"currentHash":hash})
+}
 fn respond(result: Value) -> (Result<Value>, Capture) {
     let capture = Capture(Arc::default());
     let replies = format!(
@@ -49,7 +54,7 @@ fn respond(result: Value) -> (Result<Value>, Capture) {
 fn hook_trust_fake_responder_trusted_untrusted_and_modified_hashes() {
     for (status, mismatch) in [("trusted", false), ("untrusted", false), ("modified", true)] {
         let (result, capture) = respond(reply(status, mismatch));
-        let evidence = summarize(&result.unwrap(), bridge()).unwrap();
+        let evidence = summarize(&result.unwrap(), bridge(), false).unwrap();
         for hook in evidence["hooks"].as_array().unwrap() {
             assert_eq!(hook["trustStatus"], status);
             assert_eq!(hook["hash_matches"], !mismatch);
@@ -82,6 +87,66 @@ fn hook_trust_fake_responder_trusted_untrusted_and_modified_hashes() {
 }
 
 #[test]
+fn hook_trust_checks_the_notice_hook_only_when_a_launch_would_inject_it() {
+    use crate::native::settings::CodexQuestionNotice::{Off, On};
+    let command = hooks::hook_command(bridge()).unwrap();
+    let matched = hooks::matched_trust_hash("pre_tool_use", Some(hooks::QUESTION_TOOL), &command);
+    let mut trusted = reply("trusted", false);
+    trusted["data"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(question_row("trusted", matched.clone()));
+    let evidence = summarize(&trusted, bridge(), true).unwrap();
+    let rows = evidence["hooks"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[2]["key"],
+        hooks::session_flags_state_key("pre_tool_use")
+    );
+    assert_eq!(rows[2]["expected_hash"], matched);
+    assert_eq!(rows[2]["hash_matches"], true);
+    // The matcher-less hash of the same group is drift, as Codex reports it `modified`.
+    let mut drifted = reply("trusted", false);
+    drifted["data"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(question_row(
+            "modified",
+            hooks::trust_hash("pre_tool_use", &command),
+        ));
+    let rows = summarize(&drifted, bridge(), true).unwrap()["hooks"].clone();
+    assert_eq!(rows[2]["hash_matches"], false);
+    assert_eq!(rows[2]["diagnostic"], "normalization drift");
+    // Without the notice hook the third row is neither required nor reported.
+    assert_eq!(
+        summarize(&trusted, bridge(), false).unwrap()["hooks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(summarize(&reply("trusted", false), bridge(), true).is_err());
+    for (version, setting, expected) in [
+        (Some("codex-cli 0.166.0"), Ok(On), true),
+        (Some("codex-cli 0.167.2"), Ok(On), true),
+        (Some("codex-cli 0.166.0"), Ok(Off), false),
+        (Some("codex-cli 0.166.0"), Err(()), true),
+        (Some("codex-cli 0.165.9"), Ok(On), false),
+        (Some("codex-cli 0.166.0-alpha.1"), Ok(On), false),
+        (Some("codex-cli 0.167.0-alpha.1"), Ok(On), false),
+        (Some("unparseable"), Ok(On), false),
+        (None, Ok(On), false),
+    ] {
+        assert_eq!(
+            proposes_notice_hook(version, || setting
+                .map_err(|()| anyhow::anyhow!("unreadable settings"))),
+            expected,
+            "{version:?} {setting:?}"
+        );
+    }
+}
+
+#[test]
 fn hook_trust_fake_responder_rejects_malformed_missing_keys_and_rpc_errors() {
     for bytes in [
         b"not JSON\n".as_slice(),
@@ -106,7 +171,7 @@ fn hook_trust_fake_responder_rejects_malformed_missing_keys_and_rpc_errors() {
         json!({"data":[{}]}),
     ] {
         let (result, _) = respond(result);
-        assert!(summarize(&result.unwrap(), bridge()).is_err());
+        assert!(summarize(&result.unwrap(), bridge(), false).is_err());
     }
 }
 

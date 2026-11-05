@@ -173,10 +173,15 @@ pub(super) const SETTINGS: Contract = Contract {
         "settings codex-memory-workspace <refuse|allow> [--json]",
         "settings codex-lifecycle-hooks <on|off> [--json]",
         "settings claude-question-deflection <on|off> [--json]",
+        "settings codex-question-notice <on|off> [--json]",
     ],
     possible_effects: &[ReadsRecords, WritesRecords],
     examples: &[&["settings", "--json"]],
-    features: &["codex_lifecycle_hooks", "claude_question_deflection"],
+    features: &[
+        "codex_lifecycle_hooks",
+        "claude_question_deflection",
+        "codex_question_notice",
+    ],
     notes: &[
         "No setting arguments reads current settings; a name and value changes them. Success output is JSON without the common schema_version/ok envelope; errors are reported on stderr without a JSON error object.",
     ],
@@ -222,11 +227,12 @@ pub(super) const INSPECT: Contract = Contract {
         "tell_admission_observation",
         "question_capability_observation",
         "question_deflection",
+        "question_notice",
     ],
     notes: &[
         "Observes records without repair or publication. --request filters a timeline and requires --timeline.",
         "JSON capabilities.cancel reports what cancel's admission would decide at this snapshot; cancel rechecks it, and an admissible cancel records intent, not interruption or completion.",
-        "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and the configured answer path: deflected_to_result (answer with tell) or unsupported.",
+        "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and the configured answer path: deflected_to_result (answer with tell), answer_after_turn (answer with tell once the request has ended) or unsupported.",
     ],
 };
 pub(super) const SCREEN: Contract = Contract {

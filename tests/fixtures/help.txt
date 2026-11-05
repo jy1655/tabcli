@@ -34,6 +34,7 @@ Usage:
   tabcli settings codex-memory-workspace <refuse|allow> [--json]
   tabcli settings codex-lifecycle-hooks <on|off> [--json]
   tabcli settings claude-question-deflection <on|off> [--json]
+  tabcli settings codex-question-notice <on|off> [--json]
   tabcli prune-sessions --closed-before-days N --explicit [--json]
   tabcli close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
   tabcli --help | --version
@@ -76,6 +77,11 @@ Runtime:
   refuses the model's own AskUserQuestion call before any dialog and tells the
   child to end its turn with the question, which the caller answers with tell.
   Each session keeps the decision recorded at its launch.
+  A Codex session of 0.166.0 or newer with lifecycle hooks is launched with a
+  question notice unless settings codex-question-notice off was chosen before the
+  launch: its question tool still runs, and a hook tells the child that no reply
+  can arrive during the turn, so it finishes its other work and ends the turn with
+  the question. Answer with tell once the request has ended.
 
 Self-test:
   self-test makes real model calls and opens a real terminal. It runs in the

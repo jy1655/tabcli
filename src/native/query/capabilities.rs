@@ -346,6 +346,9 @@ fn questions_value(reader: &Reader, records: &Snapshot) -> Value {
         provider::QuestionResponse::DeflectedToResult(reason) => {
             json!({"state": "deflected_to_result", "reason": reason, "answer_by": "tell"})
         }
+        provider::QuestionResponse::AnswerAfterTurn(reason) => {
+            json!({"state": "answer_after_turn", "reason": reason, "answer_by": "tell"})
+        }
         provider::QuestionResponse::Unknown(detail) => {
             json!({"state": "unknown", "reason": "evidence_unreadable", "detail": detail})
         }

@@ -42,7 +42,12 @@ fn probe(context: &Context<'_>) -> Result<Value> {
         bail!("workspace unavailable");
     }
     let bridge = std::env::current_exe()?;
-    let override_value = hooks::hooks_override(&bridge).context("hook launcher unavailable")?;
+    let notice = proposes_notice_hook(context.current_version, || {
+        crate::native::session::Reader::state_root()
+            .and_then(|root| crate::native::settings::codex_question_notice(&root))
+    });
+    let override_value =
+        hooks::hooks_override(&bridge, notice).context("hook launcher unavailable")?;
     // This command constructor handles PowerShell shims without creating a forwarder.
     // Batch shims need a disk forwarder in the ordinary launcher; refuse them here.
     if executable
@@ -88,7 +93,21 @@ fn probe(context: &Context<'_>) -> Result<Value> {
     tree.terminate();
     let _ = child.kill();
     let _ = child.wait();
-    summarize(&result?, &bridge)
+    summarize(&result?, &bridge, notice)
+}
+
+// The value a new launch would inject: the notice hook only for Codex 0.166.0 or newer (not
+// a prerelease) with the setting on. An unreadable setting proposes the default, on.
+fn proposes_notice_hook(
+    version: Option<&str>,
+    setting: impl FnOnce() -> Result<crate::native::settings::CodexQuestionNotice>,
+) -> bool {
+    version
+        .and_then(|version| super::super::codex_version(version).ok())
+        .is_some_and(|version| version >= semver::Version::new(0, 166, 0) && version.pre.is_empty())
+        && setting().map_or(true, |setting| {
+            setting == crate::native::settings::CodexQuestionNotice::On
+        })
 }
 
 // Own both streams so even a blocked write/read cannot hold the caller past its
@@ -141,13 +160,22 @@ fn exchange(
         .context("hooks/list probe timed out or responder disconnected")?
 }
 
-fn summarize(result: &Value, bridge: &Path) -> Result<Value> {
+fn summarize(result: &Value, bridge: &Path, notice: bool) -> Result<Value> {
     let command = hooks::hook_command(bridge).context("hook launcher unavailable")?;
     let data = result["data"]
         .as_array()
         .context("hooks/list data missing")?;
     let mut rows = Vec::new();
-    for label in ["user_prompt_submit", "stop"] {
+    let labels: &[(&str, Option<&str>)] = if notice {
+        &[
+            ("user_prompt_submit", None),
+            ("stop", None),
+            ("pre_tool_use", Some(hooks::QUESTION_TOOL)),
+        ]
+    } else {
+        &[("user_prompt_submit", None), ("stop", None)]
+    };
+    for &(label, matcher) in labels {
         let key = hooks::session_flags_state_key(label);
         let mut matches = Vec::new();
         for entry in data {
@@ -170,7 +198,7 @@ fn summarize(result: &Value, bridge: &Path) -> Result<Value> {
         let status = hook["trustStatus"]
             .as_str()
             .context("trustStatus missing")?;
-        let expected = hooks::trust_hash(label, &command);
+        let expected = hooks::matched_trust_hash(label, matcher, &command);
         rows.push(json!({"key":key,"trustStatus":status,"currentHash":hash,
             "expected_hash":expected,"hash_matches":hash == expected,
             "diagnostic":if hash == expected { None } else { Some("normalization drift") }}));

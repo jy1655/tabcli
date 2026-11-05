@@ -2,6 +2,7 @@ mod correlation;
 mod diagnose;
 mod hooks;
 mod launch;
+mod question_notice;
 pub(super) mod questions;
 mod queue;
 mod runner;
@@ -242,10 +243,15 @@ impl NativeProviderAdapter for CodexAdapter {
             Ok(_) => super::EmissionObservation::Unavailable("hooks_not_injected"),
             Err(error) => super::EmissionObservation::Unknown(format!("{error:#}")),
         };
-        super::QuestionCapability {
-            emission,
-            response: super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
-        }
+        // Codex 0.166.0 has no addressed answer for a question in a running turn. A launch with
+        // the notice hook lets the question through and tells the child to end its turn with it,
+        // so the caller answers with `tell` once the Request has ended.
+        let response = match hooks::notice_hook_injected(reader.directory()) {
+            Ok(true) => super::QuestionResponse::AnswerAfterTurn("hook_configured_unverified"),
+            Ok(false) => super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
+            Err(error) => super::QuestionResponse::Unknown(format!("{error:#}")),
+        };
+        super::QuestionCapability { emission, response }
     }
 
     fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
@@ -329,6 +335,15 @@ impl NativeProviderAdapter for CodexAdapter {
                 return turn::bind(&Store::open_unchecked(directory), payload);
             }
             Some("Stop") => return turn::stop(&Store::open_unchecked(directory), payload),
+            Some("PreToolUse") => {
+                if let Some(output) = question_notice::pre_tool_use(directory, payload)? {
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout().lock();
+                    writeln!(stdout, "{output}")?;
+                    stdout.flush()?;
+                }
+                return Ok(());
+            }
             Some(_) => return Ok(()),
             None => {}
         }
