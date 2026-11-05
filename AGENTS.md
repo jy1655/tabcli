@@ -146,6 +146,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   before its flag. Replace the stream correlation when `tool.call` carries its turn and step
   identity or step tool uses carry their call id, and the fallback when Claude offers a
   verified addressed question lifecycle.
+  The macOS owner check with Claude Code 2.1.318 (one question, the follow-up answer, and the
+  same request with deflection off) is in
+  `docs/verification/2026-11-05-macos-340-claude-question-deflection.md`; native Windows, a
+  user's own `PreToolUse` hook, and subagent or plugin questions were not run.
 - An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
   version inference. Its pending Stop completion remains readable, but new tells on both
   platforms are refused. Windows supports close/reopen recovery. On macOS, inspect the
