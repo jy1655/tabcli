@@ -576,7 +576,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
     ] {
         assert_eq!(actual, expected);
         let row = COMMANDS.iter().find(|row| row.name == actual).unwrap();
-        assert!(row.hidden, "{expected}");
+        assert!(!row.is_public(), "{expected}");
     }
     // The host entries keep their registry order: the registrations supply the
     // names, the table supplies the order.
