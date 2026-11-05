@@ -365,6 +365,121 @@ fn timeline_reports_missing_and_damaged_evidence_without_success() {
     assert_eq!(support::entries(fixture.root.path()), before);
 }
 
+// Every receipt that the request index refuses has its own entry with the reason, so the
+// aggregate count and the per-file entries agree; a valid receipt has none.
+#[test]
+fn timeline_names_every_receipt_the_request_index_refuses() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-valid", "event-1.json");
+    let requests = fixture.directory.join("requests");
+    write(
+        &requests.join("123-457-1.json"),
+        &support::receipt("request-other-claim", "123-458-2", "event-2.json"),
+    );
+    write(
+        &requests.join("123-459-3.json"),
+        &support::receipt("not-a-request-id", "123-459-3", "event-3.json"),
+    );
+    fs::write(requests.join("123-460-4.json"), "{broken").unwrap();
+    fs::write(requests.join("123-461-5.json"), r#"{"schema":1}"#).unwrap();
+    fs::write(
+        requests.join("123-462-6.json"),
+        r#"{"schema":1,"request_id":"request-overflow","claim_token":"123-462-6","event_file":"event-6.json","created_unix_ms":18446744073709551616}"#,
+    )
+    .unwrap();
+    fs::write(requests.join("123-463-7.json"), [255]).unwrap();
+    fs::File::create(requests.join("123-464-8.json"))
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let before = support::entries(fixture.root.path());
+    let value = timeline(&fixture, None);
+    let unreadable = value["session_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(value["entries"].as_array().unwrap())
+        .filter(|e| e["stage"] == "request_receipt" && e["record_state"] == "unreadable")
+        .map(|e| {
+            assert!(e["request_id"].is_null(), "{e}");
+            (e["source"].as_str().unwrap(), e["detail"].as_str().unwrap())
+        })
+        .collect::<Vec<_>>();
+    // One entry per file: a map alone would hide a receipt reported twice.
+    let reported = unreadable.len();
+    let unreadable = unreadable
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(reported, unreadable.len(), "a receipt was reported twice");
+    assert_eq!(
+        unreadable,
+        std::collections::BTreeMap::from([
+            (
+                "requests/123-457-1.json",
+                "Bridge request receipt belongs to a different claim"
+            ),
+            ("requests/123-459-3.json", "invalid Bridge request receipt"),
+            (
+                "requests/123-460-4.json",
+                "key must be a string at line 1 column 2"
+            ),
+            (
+                "requests/123-461-5.json",
+                "invalid JSON record: missing field `request_id` at line 1 column 12"
+            ),
+            (
+                "requests/123-462-6.json",
+                "record timestamp is outside the JSON unsigned integer range"
+            ),
+            (
+                "requests/123-463-7.json",
+                "invalid UTF-8: invalid utf-8 sequence of 1 bytes from index 0"
+            ),
+            (
+                "requests/123-464-8.json",
+                "record is 67108865 bytes, over the 67108864 byte read limit"
+            ),
+        ])
+    );
+    assert_eq!(value["unreadable_requests"], unreadable.len());
+    assert_eq!(value["incomplete"], true);
+    assert_eq!(value["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(value["requests"][0]["request_id"], "request-valid");
+    let valid = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["source"] == "requests/123-456-0.json")
+        .collect::<Vec<_>>();
+    assert_eq!(valid.len(), 1);
+    assert_eq!(valid[0]["record_state"], "observed");
+    assert_eq!(valid[0]["request_id"], "request-valid");
+    assert_eq!(support::entries(fixture.root.path()), before);
+
+    // Only valid receipts: no unreadable receipt entry and nothing counted.
+    for name in [
+        "123-457-1.json",
+        "123-459-3.json",
+        "123-460-4.json",
+        "123-461-5.json",
+        "123-462-6.json",
+        "123-463-7.json",
+        "123-464-8.json",
+    ] {
+        fs::remove_file(requests.join(name)).unwrap();
+    }
+    let value = timeline(&fixture, None);
+    assert_eq!(value["unreadable_requests"], 0);
+    assert!(
+        !value["session_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["stage"] == "request_receipt"),
+        "{value}"
+    );
+}
+
 #[test]
 fn timeline_rejects_unknown_requests_invalid_options_and_corrupt_core_records() {
     let fixture = Fixture::new();
