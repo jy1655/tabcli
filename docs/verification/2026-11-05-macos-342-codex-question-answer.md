@@ -10,7 +10,8 @@ the product changed.
 ## Environment
 
 - macOS 26.5.2 (25F84), Apple Silicon, iTerm2 3.7.7, codex-cli 0.166.0, model `gpt-6-astra`
-  (the configured default) at `--effort medium`. The screen was unlocked.
+  (the configured default) at `--effort medium`. The screen was unlocked: `ioreg` showed no
+  `CGSSessionScreenIsLocked` key before the runs.
 - Debug build of main `14c1f48` plus a temporary patch in `src/native/hook.rs` that writes
   each `native-hook` payload to a file exactly as received, hook stdin and notify argv alike.
   SHA-256 `9d151df5006b0799d92a7b59345713f3ae95514dde194a6e97a711457d5f921b`. It was run by
@@ -19,10 +20,12 @@ the product changed.
 - Workspace: the repository checkout, already trusted by Codex. Options:
   `--terminal iterm2 --yolo --effort medium`. `codex-launch-mode.json` recorded
   `lifecycle_hooks: "injected"` for every session.
-- Every prompt told the child not to read or modify files. The raw lines below are copied from
-  the hook captures and the rollout transcripts. The home directory is written `<home>`, long
-  texts are cut where marked, and transcript lines leave out `ordinal`, record ids, `metadata`
-  and, where it only repeats the turn id, the metadata passthrough. Hook payloads are whole.
+- Every task prompt (the initial prompt of each run and the prose-question task) told the
+  child not to read or modify files; the answers did not repeat it. The raw lines below are
+  copied from the hook captures and the rollout transcripts. The home directory is written
+  `<home>`, long texts are cut where marked, and transcript lines leave out `ordinal`, record
+  ids, `metadata` and, where it holds only the turn id and `create_time`, the metadata
+  passthrough. Hook payloads are whole.
 
 Codex's own description of the tool, from the tool list in the transcript:
 
