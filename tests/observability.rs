@@ -404,7 +404,13 @@ fn timeline_names_every_receipt_the_request_index_refuses() {
             assert!(e["request_id"].is_null(), "{e}");
             (e["source"].as_str().unwrap(), e["detail"].as_str().unwrap())
         })
+        .collect::<Vec<_>>();
+    // One entry per file: a map alone would hide a receipt reported twice.
+    let reported = unreadable.len();
+    let unreadable = unreadable
+        .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(reported, unreadable.len(), "a receipt was reported twice");
     assert_eq!(
         unreadable,
         std::collections::BTreeMap::from([
