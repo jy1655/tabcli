@@ -119,17 +119,24 @@ fn status_maps_each_judgment_to_its_documented_output() {
         (Turn::DeliveryUnconfirmed, vec!["delivery_unconfirmed"]),
         (
             Turn::LaunchFailed {
-                reason: "launch_timeout",
+                verdict: launch::Verdict::Timeout,
                 detail: "deadline expired".into(),
             },
             vec!["launch_timeout"],
         ),
         (
             Turn::LaunchFailed {
-                reason: "launch_uncertain",
+                verdict: launch::Verdict::Uncertain,
                 detail: "spawning".into(),
             },
             vec!["launch_uncertain"],
+        ),
+        (
+            Turn::LaunchFailed {
+                verdict: launch::Verdict::Failed,
+                detail: "provider launch failed".into(),
+            },
+            vec!["launch_failed"],
         ),
         (Turn::TurnInProgress, vec![]),
         (Turn::NoActiveTurn, vec![]),

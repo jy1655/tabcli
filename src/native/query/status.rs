@@ -6,6 +6,7 @@ use crate::native::clock::{Clock, SystemClock};
 use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
+use crate::native::session::launch;
 use crate::native::session::origin::{ObservationCache, OriginEnvironment, OriginObservation};
 use agent_bridge::PUBLIC_COMMAND;
 use observation::judgment::{
@@ -22,6 +23,8 @@ macro_rules! attention_flags {
         }
 
         impl AttentionFlag {
+            // Only the public vocabulary fixture enumerates the flags; renderers name each one.
+            #[cfg(test)]
             pub(in crate::native) const ALL: &[Self] = &[$(Self::$variant,)*];
 
             pub(in crate::native) const fn name(self) -> &'static str {
@@ -171,12 +174,11 @@ fn attention(
     }
     match &judgments.turn {
         Turn::DeliveryUnconfirmed => flags.push(AttentionFlag::DeliveryUnconfirmed),
-        Turn::LaunchFailed { reason, .. } => flags.push(
-            *AttentionFlag::ALL
-                .iter()
-                .find(|flag| flag.name() == *reason)
-                .expect("known launch attention"),
-        ),
+        Turn::LaunchFailed { verdict, .. } => flags.push(match verdict {
+            launch::Verdict::Uncertain => AttentionFlag::LaunchUncertain,
+            launch::Verdict::Failed => AttentionFlag::LaunchFailed,
+            launch::Verdict::Timeout => AttentionFlag::LaunchTimeout,
+        }),
         Turn::TurnInProgress | Turn::NoActiveTurn => (),
     }
     if judgments.claim_without_receipt {

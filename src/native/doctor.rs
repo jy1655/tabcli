@@ -12,6 +12,7 @@ use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::process_env::{PROBE_TIMEOUT, probe};
 use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
+use crate::native::session::launch;
 use crate::native::session::launch::wrapper::{
     is_executable, provider_version_text, resolve_provider,
 };
@@ -664,13 +665,13 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
         &result_action,
     ));
     let (availability, reason, detail) = match &judgments.turn {
-        Turn::LaunchFailed { reason, detail } => (
+        Turn::LaunchFailed { verdict, detail } => (
             Unavailable,
-            Reason::ALL
-                .iter()
-                .copied()
-                .find(|word| word.name() == *reason)
-                .expect("known launch reason"),
+            match verdict {
+                launch::Verdict::Uncertain => Reason::LAUNCH_UNCERTAIN,
+                launch::Verdict::Failed => Reason::LAUNCH_FAILED,
+                launch::Verdict::Timeout => Reason::LAUNCH_TIMEOUT,
+            },
             detail.as_str(),
         ),
         Turn::DeliveryUnconfirmed => (
@@ -985,11 +986,27 @@ mod attestation_tests {
         for (turn, expected, detail) in [
             (
                 Turn::LaunchFailed {
-                    reason: "launch_uncertain",
+                    verdict: launch::Verdict::Uncertain,
                     detail: "spawn interrupted".into(),
                 },
                 json!(["unavailable", "launch_uncertain"]),
                 "spawn interrupted",
+            ),
+            (
+                Turn::LaunchFailed {
+                    verdict: launch::Verdict::Failed,
+                    detail: "provider launch failed".into(),
+                },
+                json!(["unavailable", "launch_failed"]),
+                "provider launch failed",
+            ),
+            (
+                Turn::LaunchFailed {
+                    verdict: launch::Verdict::Timeout,
+                    detail: "deadline expired".into(),
+                },
+                json!(["unavailable", "launch_timeout"]),
+                "deadline expired",
             ),
             (
                 Turn::DeliveryUnconfirmed,

@@ -1,5 +1,5 @@
 //! Query waits: one consistent read per session per pass, without lifecycle changes.
-use super::request::RequestState;
+use super::request::{RequestState, busy_request_value};
 use super::*;
 use crate::native::args::{option_value, parse_timeout, set_flag_once, set_once};
 use crate::native::clock::{Clock, SystemClock};
@@ -285,12 +285,15 @@ fn poll(
         .collect();
     let mut outcome = Outcome {
         selected: None,
-        last: addresses.iter().map(|address| (envelope::ok(json!({
-            "session": address.session,
-            "request_id": address.request, "request_state": RequestState::Busy, "result": null,
-            "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result",
-            "usage": null, "usage_reason": "no_published_result", "usage_error": null
-        }).as_object().unwrap().clone()), RequestState::Busy)).collect(),
+        last: addresses
+            .iter()
+            .map(|address| {
+                (
+                    busy_request_value(&address.session, &address.request),
+                    RequestState::Busy,
+                )
+            })
+            .collect(),
     };
     loop {
         for group in &groups {
@@ -815,6 +818,64 @@ mod tests {
         assert_eq!(value["timed_out"], true);
         assert!(value.get("owner").is_some());
         assert_eq!(value["session_state"], "working");
+    }
+
+    #[test]
+    fn a_session_busy_throughout_keeps_the_exact_busy_request_object() {
+        let fixture = seed_close_fixture(JournaledEventState::Absent);
+        let reader = Reader::open_unchecked(&fixture.directory);
+        let id = reader.snapshot().unwrap().receipts[0].request_id.clone();
+        // Read and write access: Windows refuses to lock a handle opened for append only.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(fixture.directory.join("turn.claim.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let mut clock = FakeClock::new(Instant::now());
+        let outcome = poll(
+            fixture.directory.parent().unwrap(),
+            &[Address {
+                session: "session-fault".to_owned(),
+                request: id.clone(),
+            }],
+            Duration::from_millis(50),
+            false,
+            &[],
+            &mut clock,
+        )
+        .unwrap();
+        drop(lock);
+        assert!(outcome.selected.is_none());
+        assert_eq!(clock.slept, Duration::from_millis(50));
+        let (value, state) = &outcome.last[0];
+        assert_eq!(*state, RequestState::Busy);
+        // The bytes `wait` prints for a request it never observed, pinned exactly.
+        assert_eq!(
+            serde_json::to_string_pretty(value).unwrap(),
+            serde_json::to_string_pretty(&json!({
+                "bridge_observed_elapsed_ms": null,
+                "bridge_observed_elapsed_reason": "no_published_result",
+                "ok": true,
+                "request_id": id,
+                "request_state": "busy",
+                "result": null,
+                "schema_version": 1,
+                "session": "session-fault",
+                "usage": null,
+                "usage_error": null,
+                "usage_reason": "no_published_result",
+            }))
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(value).unwrap(),
+            format!(
+                "{{\"bridge_observed_elapsed_ms\":null,\"bridge_observed_elapsed_reason\":\"no_published_result\",\"ok\":true,\"request_id\":\"{id}\",\"request_state\":\"busy\",\"result\":null,\"schema_version\":1,\"session\":\"session-fault\",\"usage\":null,\"usage_error\":null,\"usage_reason\":\"no_published_result\"}}"
+            )
+        );
     }
 
     #[test]
