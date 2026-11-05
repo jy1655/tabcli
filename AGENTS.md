@@ -513,6 +513,13 @@ launch, observe, continue, and close without replacing the capabilities those CL
   fallback when Codex provides a verified, addressed question event or lifecycle for the
   same injected TUI launch; never switch on a version check. Question component verification
   is recorded in `docs/verification/2026-10-19-codex-question-emissions.md`.
+  Measured on macOS with codex-cli 0.166.0, once per case
+  (`docs/verification/2026-11-05-macos-342-codex-question-answer.md`): the question tool
+  returns at once and the turn goes on; a `codex queue` message sent during that turn never
+  joined it and started the next turn (`turn_trigger: queue`); a child with nothing else to do
+  kept its turn open waiting, so its request stayed pending and no `tell` could reach it. A
+  temporary build's unmatched `PreToolUse` hook refused the tool with a reason and the child
+  ended its turn with the question. That probe is not a product path.
 - Lifecycle completion live verification on native Windows, 2026-10-18, codex-cli 0.163.0
   (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
   from `task_complete` with and without a notify record (a 25,463-character prompt with a
