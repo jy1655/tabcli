@@ -1,4 +1,5 @@
 use super::correlation::{correlated_prompt, established_codex_thread, valid_codex_thread_id};
+use super::launch_decision::Decision;
 use super::{ADAPTER, codex_version_supports_native_queue, read_pending_turn};
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::provider::NativeProviderAdapter;
@@ -136,7 +137,13 @@ fn notify_payload_check(directory: Option<&Path>) -> crate::native::diagnostics:
             .evidence(serde_json::json!({"error": format!("{error:#}")}));
         }
     };
-    if matches!(super::hooks::read_launch_mode(directory), Ok(Some(mode)) if mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
+    // An unreadable launch decision counts as not injected here, so the budget is still
+    // estimated; the `codex_lifecycle` row reports the unreadable record.
+    let injected = match super::launch_decision::lifecycle(directory) {
+        Decision::Present(mode) => mode.lifecycle_hooks_injected(),
+        Decision::Absent | Decision::Unreadable(_) => false,
+    };
+    if injected
         && matches!(
             super::turn::binding(&Reader::open_unchecked(directory), &pending.claim_token),
             Ok(Some(_))

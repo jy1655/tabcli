@@ -227,6 +227,55 @@ fn notify_budget_remains_for_injected_unbound_and_not_injected_claims() {
         assert_eq!(row["evidence"]["limit_units"], 32767);
     }
 }
+// The budget check reads an unreadable launch decision as "not injected" and still estimates the
+// budget, even with a binding; the `codex_lifecycle` row is where the fault is reported.
+#[test]
+fn notify_budget_treats_an_unreadable_launch_decision_as_not_injected() {
+    use crate::native::session::{SessionState, Store, turn, update_status};
+    let root = tempfile::tempdir().unwrap();
+    let dir = super::super::test_support::launch_session(root.path(), Some("0.163.0"));
+    let store = Store::open_unchecked(&dir);
+    update_status(&dir, SessionState::Working, None, None).unwrap();
+    let token = turn::current_claim_token(&Reader::open_unchecked(&dir))
+        .unwrap()
+        .unwrap();
+    super::super::install_pending_turn_for_prompt(&dir, &token, "hello").unwrap();
+    let exe = Path::new(if cfg!(windows) {
+        r"C:\tabcli.exe"
+    } else {
+        "/opt/tabcli"
+    });
+    super::super::hooks::prepare(&dir, exe).unwrap();
+    store
+        .private(&format!("codex-turn-{token}.json"))
+        .write_json(&super::super::turn::Binding {
+            schema: 1,
+            claim_token: token.clone(),
+            thread_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            turn_id: "turn-1".into(),
+            transcript_path: "rollout.jsonl".into(),
+            bound_unix_ms: 42,
+        })
+        .unwrap();
+    assert_eq!(
+        notify_payload_check(Some(&dir)).reason_code,
+        "codex_notify_payload_not_required"
+    );
+    let record = store.private(super::super::launch_decision::FILE);
+    record.remove().unwrap();
+    record.write_private(b"{").unwrap();
+    let row = serde_json::to_value(notify_payload_check(Some(&dir))).unwrap();
+    assert_ne!(row["reason_code"], "codex_notify_payload_not_required");
+    assert_eq!(row["evidence"]["source"], "pending_turn_record");
+    assert_eq!(row["evidence"]["limit_units"], 32767);
+    let evidence = lifecycle_evidence(&dir);
+    assert_eq!(
+        evidence["launch_mode"],
+        serde_json::json!({"observation":"unavailable",
+            "reason":"failed to parse Codex launch mode"})
+    );
+}
+
 #[cfg(unix)]
 use std::time::Instant;
 

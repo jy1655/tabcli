@@ -161,15 +161,17 @@
     "thread-id": 1
   },
   "src/native/provider/codex/hooks.rs": {
-    "const FILE: &str = \"codex-launch-mode.json\";": 1,
-    "codex-launch-mode.json": 1,
     "native-hook codex": 2,
     "const VECTOR_VERSION: &str = \"0.163.0\";": 1,
-    "const NOTICE_FILE: &str = \"codex-question-notice.json\";": 1,
-    "codex-question-notice.json": 1,
     "const NOTICE_VECTOR_VERSION: &str = \"0.166.0\";": 1,
     "pub(super) const QUESTION_TOOL: &str = \"request_user_input_async\";": 1,
     "request_user_input_async": 1
+  },
+  "src/native/provider/codex/launch_decision.rs": {
+    "const FILE: &str = \"codex-launch-mode.json\";": 1,
+    "codex-launch-mode.json": 1,
+    "const NOTICE_FILE: &str = \"codex-question-notice.json\";": 1,
+    "codex-question-notice.json": 1
   },
   "src/native/provider/codex/launch.rs": {
     "native-hook": 1,
