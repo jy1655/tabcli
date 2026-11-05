@@ -552,6 +552,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
   other Codex versions, more than one question in a turn, a user's own `PreToolUse` hook beside
   this one and subagent questions are unverified. Replace this fallback when Codex offers a
   verified addressed way to answer a question in the running turn of the injected TUI launch.
+  The macOS owner check with codex-cli 0.166.0 (two requests with the notice on, their
+  follow-up answers, and one request with it off) is in
+  `docs/verification/2026-11-05-macos-342-codex-question-notice.md`.
 - Lifecycle completion live verification on native Windows, 2026-10-18, codex-cli 0.163.0
   (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
   from `task_complete` with and without a notify record (a 25,463-character prompt with a

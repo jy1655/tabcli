@@ -283,6 +283,8 @@ hook whenever a new launch would inject it. Codex runs every matched `PreToolUse
 user's own hook for the tool still runs, and one that denies it blocks the question. The 0.166.0
 floor is the only version measured, not runtime proof. Replace the notice when Codex offers a
 verified addressed way to answer a question in the running turn of the injected TUI launch.
+The macOS live check is recorded in
+[the question notice verification](verification/2026-11-05-macos-342-codex-question-notice.md).
 
 Unbound claims retain the `notify` fallback: Bridge accepts an assistant result ending with
 the pending marker, or a completion whose string input begins with the delegation header and
