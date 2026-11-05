@@ -27,6 +27,16 @@ cover Terminal.app, WezTerm, the refused terminals in a live run, or native Wind
 
 The read worked with the screen locked, like iTerm2 session launches do.
 
+## Re-check after the post-read confirmation
+
+A later fix (`c654849`) reads the binding again and repeats the ownership check after the read
+before it returns the text. With a debug build of that commit, SHA-256
+`1719e6bb07c10f44cd2e60440091daac147364e3dfc63ff85be83b40fe0302a2`, in another empty state
+root and with the screen still locked: after `ask codex` completed with
+`SCREEN_CHECK_8452 ready`, `screen <session> --json` returned `ok: true`, `terminal: "iterm2"`
+and a 781-character screen containing that line in 0.73 s for the three terminal calls; after
+`close-session` it exited 1 with the closed-session refusal.
+
 ## Not verified
 
 - Terminal.app and WezTerm reads; the Ghostty and Warp refusals against a live session; native
