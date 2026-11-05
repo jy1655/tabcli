@@ -143,6 +143,12 @@ Claim, and which turn capabilities that extension offers (cancel, input acknowle
 It is evidence for one session, carried to later Claims, and never inferred from a version.
 _Avoid_: capability flag, handshake, version check
 
+**Launch decision**:
+A provider adapter's record of what it decided and configured for one launch, such as which hooks it
+injected and why it left one out. Every later command reads the record, never the current settings or a
+new probe. It records configuration, not evidence that the provider trusted or ran what was configured.
+_Avoid_: launch mode (one record's name), setting, capability flag
+
 **Initial prompt**:
 The first turn's prompt, delivered as part of launching the session.
 

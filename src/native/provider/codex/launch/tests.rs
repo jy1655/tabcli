@@ -203,6 +203,32 @@ mod positive_gate {
     }
 }
 
+// The readiness wait returns an unreadable launch decision as its error: it neither takes the
+// legacy consent route nor reads the screen, so no initial input is sent.
+#[test]
+fn an_unreadable_launch_decision_fails_the_initial_readiness_wait() {
+    use crate::native::session::Store;
+    let root = tempfile::tempdir().unwrap();
+    let dir = super::super::test_support::launch_session(root.path(), Some("0.163.0"));
+    Store::open_unchecked(&dir)
+        .private(super::super::launch_decision::FILE)
+        .write_private(b"{")
+        .unwrap();
+    let start = std::time::Instant::now();
+    let error = initial_readiness_with(
+        &dir,
+        start + Duration::from_secs(1),
+        &mut FakeClock::new(start),
+        &mut || panic!("an unreadable launch decision reads no screen"),
+        || panic!("an unreadable launch decision is not the legacy route"),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("failed to parse Codex launch mode: "),
+        "{error:#}"
+    );
+}
+
 #[test]
 fn workspace_trust_override_uses_a_toml_value_for_paths_with_dots_and_quotes() {
     for workspace in [

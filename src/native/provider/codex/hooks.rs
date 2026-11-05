@@ -8,19 +8,19 @@
 //! way on the Mac with codex-cli 0.166.0 (2026-11-05): `hooks/list` reported it `trusted` with
 //! the hash computed here, and `modified` for the hash of the same group without its matcher.
 use super::codex_version;
+use super::launch_decision::{self, NoticeReason, Reason};
 use crate::native::session::{Reader, Store};
 use crate::native::settings::{self, CodexLifecycleHooks, CodexQuestionNotice};
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-const FILE: &str = "codex-launch-mode.json";
-const VECTOR_VERSION: &str = "0.163.0";
-/// The question notice hook's launch decision; every later read uses it, never the setting.
-const NOTICE_FILE: &str = "codex-question-notice.json";
-/// The only Codex version the notice hook's matcher, hash and payload were checked with.
-const NOTICE_VECTOR_VERSION: &str = "0.166.0";
+/// The Codex version the lifecycle hooks' trust hashes were measured with. The launch decision
+/// carries it, and its reader refuses a record measured with another.
+pub(super) const VECTOR_VERSION: &str = "0.163.0";
+/// The only Codex version the notice hook's matcher, hash and payload were checked with; carried
+/// and checked the same way by the notice hook's launch decision.
+pub(super) const NOTICE_VECTOR_VERSION: &str = "0.166.0";
 /// The tool the notice hook runs for. Codex 0.166.0 matches a pattern of ASCII letters, digits
 /// and `_` exactly against the canonical tool name and its matcher aliases; this tool has none,
 /// so the pattern cannot select `request_user_input` or a shell tool (`Bash`)
@@ -194,60 +194,6 @@ pub(super) fn hooks_override(bridge_executable: &Path, notice: bool) -> Option<S
     ))
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum LifecycleHooks {
-    Injected,
-    NotInjected,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum Reason {
-    #[serde(rename = "version_below_0_163")]
-    VersionBelow0_163,
-    VersionUnknown,
-    Prerelease,
-    SettingsOff,
-    LauncherUnavailable,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-pub(super) struct LaunchMode {
-    pub(super) schema: u32,
-    pub(super) lifecycle_hooks: LifecycleHooks,
-    pub(super) reason: Option<Reason>,
-    pub(super) codex_version: Option<String>,
-    pub(super) vector_codex_version: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum NoticeHook {
-    Injected,
-    NotInjected,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum NoticeReason {
-    SettingsOff,
-    LifecycleHooksNotInjected,
-    #[serde(rename = "version_below_0_166")]
-    VersionBelow0_166,
-    LauncherUnavailable,
-}
-
-/// Whether this launch's `-c hooks=` value carried the question notice hook. It records
-/// configuration: neither that Codex trusted or ran the hook nor that a child read the notice.
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-pub(super) struct NoticeMode {
-    pub(super) schema: u32,
-    pub(super) notice_hook: NoticeHook,
-    pub(super) reason: Option<NoticeReason>,
-    pub(super) vector_codex_version: String,
-}
-
 /// The first Codex version a new launch injects the lifecycle hooks for. A floor is eligibility;
 /// `VECTOR_VERSION` is the version the trust hashes were measured with. They are equal today, but
 /// neither is derived from the other.
@@ -334,76 +280,17 @@ pub(super) fn prepare(directory: &Path, executable: &Path) -> Result<Option<Stri
     let reason = eligibility.lifecycle();
     let injected = reason.is_none();
     let store = Store::open_unchecked(directory);
-    store.private(FILE).write_json(&LaunchMode {
-        schema: 1,
-        lifecycle_hooks: if injected {
-            LifecycleHooks::Injected
-        } else {
-            LifecycleHooks::NotInjected
-        },
-        reason,
-        codex_version: version,
-        vector_codex_version: VECTOR_VERSION.into(),
-    })?;
+    launch_decision::record_lifecycle(&store, reason, version)?;
     // The notice setting is read only after the lifecycle record is published.
     let notice_reason = eligibility.notice(|| settings::codex_question_notice(root))?;
     let notice = notice_reason.is_none();
     // Written before the value is returned, so a launch never carries a hook its record omits.
-    store.private(NOTICE_FILE).write_json(&NoticeMode {
-        schema: 1,
-        notice_hook: if notice {
-            NoticeHook::Injected
-        } else {
-            NoticeHook::NotInjected
-        },
-        reason: notice_reason,
-        vector_codex_version: NOTICE_VECTOR_VERSION.into(),
-    })?;
+    launch_decision::record_notice(&store, notice_reason)?;
     Ok(if injected {
         hooks_override(executable, notice)
     } else {
         None
     })
-}
-
-// Read the launch decision without re-probing settings/version.
-pub(super) fn read_launch_mode(directory: &Path) -> Result<Option<LaunchMode>> {
-    let Some(text) = Reader::open_unchecked(directory).private(FILE).text()? else {
-        return Ok(None);
-    };
-    let mode: LaunchMode =
-        serde_json::from_str(&text).context("failed to parse Codex launch mode")?;
-    if mode.schema != 1
-        || mode.vector_codex_version != VECTOR_VERSION
-        || (mode.lifecycle_hooks == LifecycleHooks::Injected) != mode.reason.is_none()
-    {
-        bail!("Agent Bridge rejected invalid Codex launch mode")
-    }
-    Ok(Some(mode))
-}
-
-// The notice hook decision of this launch. A session without the record was launched by an
-// earlier binary, which injected no notice hook.
-pub(super) fn read_notice_mode(directory: &Path) -> Result<Option<NoticeMode>> {
-    let Some(text) = Reader::open_unchecked(directory)
-        .private(NOTICE_FILE)
-        .text()?
-    else {
-        return Ok(None);
-    };
-    let mode: NoticeMode =
-        serde_json::from_str(&text).context("failed to parse Codex question notice mode")?;
-    if mode.schema != 1
-        || mode.vector_codex_version != NOTICE_VECTOR_VERSION
-        || (mode.notice_hook == NoticeHook::Injected) != mode.reason.is_none()
-    {
-        bail!("Agent Bridge rejected invalid Codex question notice mode")
-    }
-    Ok(Some(mode))
-}
-
-pub(super) fn notice_hook_injected(directory: &Path) -> Result<bool> {
-    Ok(read_notice_mode(directory)?.is_some_and(|mode| mode.notice_hook == NoticeHook::Injected))
 }
 
 #[cfg(test)]

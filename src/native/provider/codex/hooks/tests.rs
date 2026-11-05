@@ -1,5 +1,8 @@
 use super::*;
 use crate::native::provider::LaunchContext;
+use crate::native::provider::codex::launch_decision::{
+    FILE, LifecycleHooks, NOTICE_FILE, NoticeHook, lifecycle, notice,
+};
 use crate::native::provider::codex::{self, test_support};
 use std::ffi::OsString;
 
@@ -503,7 +506,7 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
             notice_reason.is_none(),
             "{case}"
         );
-        let mode = read_launch_mode(&directory).unwrap().unwrap();
+        let mode = lifecycle(&directory).unwrap();
         assert_eq!(
             serde_json::to_value(mode).unwrap(),
             serde_json::json!({
@@ -512,9 +515,9 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
             }),
             "{case}"
         );
-        let notice = read_notice_mode(&directory).unwrap().unwrap();
+        let recorded = notice(&directory).unwrap();
         assert_eq!(
-            serde_json::to_value(notice).unwrap(),
+            serde_json::to_value(recorded).unwrap(),
             serde_json::json!({
                 "schema":1,
                 "notice_hook":if notice_reason.is_none() {"injected"} else {"not_injected"},
@@ -523,7 +526,7 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
             "{case}"
         );
         assert_eq!(
-            notice_hook_injected(&directory).unwrap(),
+            notice(&directory).notice_hook_injected().unwrap(),
             notice_reason.is_none(),
             "{case}"
         );
@@ -537,10 +540,10 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
                 "codex_question_notice": if notice_reason.is_none() {"off"} else {"on"}}),
             )
             .unwrap();
-        assert!(read_launch_mode(&directory).unwrap().is_some());
+        lifecycle(&directory).unwrap();
         assert_eq!(std::fs::read(directory.join(FILE)).unwrap(), before);
         assert_eq!(
-            notice_hook_injected(&directory).unwrap(),
+            notice(&directory).notice_hook_injected().unwrap(),
             notice_reason.is_none(),
             "{case}"
         );
@@ -570,96 +573,7 @@ fn an_unreadable_notice_setting_fails_the_launch_before_any_value_is_returned() 
         )
         .is_err()
     );
-    assert!(read_notice_mode(&directory).unwrap().is_none());
-}
-
-#[test]
-fn notice_mode_reader_rejects_invalid_schema_values_and_inconsistent_reason() {
-    let temp = tempfile::tempdir().unwrap();
-    // A session launched by an earlier binary has no record: no notice hook was injected.
-    assert_eq!(read_notice_mode(temp.path()).unwrap(), None);
-    assert!(!notice_hook_injected(temp.path()).unwrap());
-    let valid = serde_json::json!({"schema":1,"notice_hook":"injected","reason":null,
-        "vector_codex_version":"0.166.0"});
-    for (field, value) in [
-        ("schema", serde_json::json!(2)),
-        ("notice_hook", serde_json::json!("maybe")),
-        ("reason", serde_json::json!("settings_off")),
-        ("reason", serde_json::json!("version_below_0_163")),
-        ("vector_codex_version", serde_json::json!("0.163.0")),
-        ("vector_codex_version", serde_json::json!(166)),
-    ] {
-        let mut invalid = valid.clone();
-        invalid[field] = value;
-        Store::open_unchecked(temp.path())
-            .private(NOTICE_FILE)
-            .write_json(&invalid)
-            .unwrap();
-        assert!(read_notice_mode(temp.path()).is_err(), "{invalid}");
-        assert!(notice_hook_injected(temp.path()).is_err(), "{invalid}");
-    }
-    for reason in [
-        "lifecycle_hooks_not_injected",
-        "version_below_0_166",
-        "settings_off",
-    ] {
-        let off = serde_json::json!({"schema":1,"notice_hook":"not_injected","reason":reason,
-            "vector_codex_version":"0.166.0"});
-        Store::open_unchecked(temp.path())
-            .private(NOTICE_FILE)
-            .write_json(&off)
-            .unwrap();
-        let read = read_notice_mode(temp.path()).unwrap().unwrap();
-        assert_eq!(serde_json::to_value(read).unwrap(), off);
-        assert!(!notice_hook_injected(temp.path()).unwrap());
-    }
-    let off_without_reason = serde_json::json!({"schema":1,"notice_hook":"not_injected",
-        "reason":null,"vector_codex_version":"0.166.0"});
-    Store::open_unchecked(temp.path())
-        .private(NOTICE_FILE)
-        .write_json(&off_without_reason)
-        .unwrap();
-    assert!(read_notice_mode(temp.path()).is_err());
-    Store::open_unchecked(temp.path())
-        .private(NOTICE_FILE)
-        .write_json(&valid)
-        .unwrap();
-    assert!(notice_hook_injected(temp.path()).unwrap());
-    std::fs::write(temp.path().join(NOTICE_FILE), b"{").unwrap();
-    assert!(read_notice_mode(temp.path()).is_err());
-}
-
-#[test]
-fn launch_mode_reader_rejects_invalid_schema_values_and_inconsistent_reason() {
-    let temp = tempfile::tempdir().unwrap();
-    assert_eq!(read_launch_mode(temp.path()).unwrap(), None);
-    let valid = serde_json::json!({"schema":1,"lifecycle_hooks":"injected","reason":null,"codex_version":"0.163.0","vector_codex_version":"0.163.0"});
-    for (field, value) in [
-        ("schema", serde_json::json!(2)),
-        ("lifecycle_hooks", serde_json::json!("maybe")),
-        ("reason", serde_json::json!("settings_off")),
-        ("reason", serde_json::json!("prerelease")),
-        ("vector_codex_version", serde_json::json!("other")),
-        ("codex_version", serde_json::json!(3)),
-    ] {
-        let mut invalid = valid.clone();
-        invalid[field] = value;
-        Store::open_unchecked(temp.path())
-            .private(FILE)
-            .write_json(&invalid)
-            .unwrap();
-        assert!(read_launch_mode(temp.path()).is_err(), "{invalid}");
-    }
-    let prerelease = serde_json::json!({"schema":1,"lifecycle_hooks":"not_injected","reason":"prerelease","codex_version":"0.164.0-alpha.1","vector_codex_version":"0.163.0"});
-    Store::open_unchecked(temp.path())
-        .private(FILE)
-        .write_json(&prerelease)
-        .unwrap();
-    let read = read_launch_mode(temp.path()).unwrap().unwrap();
-    assert_eq!(read.reason, Some(Reason::Prerelease));
-    assert_eq!(serde_json::to_value(read).unwrap(), prerelease);
-    std::fs::write(temp.path().join(FILE), b"{").unwrap();
-    assert!(read_launch_mode(temp.path()).is_err());
+    assert!(notice(&directory).is_absent());
 }
 
 #[cfg(windows)]
@@ -990,22 +904,27 @@ fn assert_partial_notice_state(directory: &Path, present: bool, case: &str) {
     use crate::native::provider::codex::{ADAPTER, question_notice};
     // The lifecycle record was published before the notice record was attempted.
     assert_eq!(
-        read_launch_mode(directory)
-            .unwrap()
-            .unwrap()
-            .lifecycle_hooks,
+        lifecycle(directory).unwrap().lifecycle_hooks,
         LifecycleHooks::Injected,
         "{case}"
     );
     assert_eq!(directory.join(NOTICE_FILE).exists(), present, "{case}");
     let before = session_files(directory);
-    let mode = read_notice_mode(directory).unwrap();
+    let mode = notice(directory);
+    if present {
+        let mode = mode.unwrap();
+        assert_eq!(
+            (mode.notice_hook, mode.reason),
+            (NoticeHook::Injected, None)
+        );
+    } else {
+        assert!(mode.is_absent(), "{case}");
+    }
     assert_eq!(
-        mode.map(|mode| (mode.notice_hook, mode.reason)),
-        present.then_some((NoticeHook::Injected, None)),
+        notice(directory).notice_hook_injected().unwrap(),
+        present,
         "{case}"
     );
-    assert_eq!(notice_hook_injected(directory).unwrap(), present, "{case}");
     let reader = Reader::open_unchecked(directory);
     assert_eq!(
         ADAPTER.question_capability(&reader).response,
@@ -1189,18 +1108,15 @@ fn a_failed_notice_record_stops_the_launch_before_the_provider_is_spawned() {
     );
     assert!(!directory.join("provider-process.json").exists());
     assert_eq!(
-        read_launch_mode(&directory)
-            .unwrap()
-            .unwrap()
-            .lifecycle_hooks,
+        lifecycle(&directory).unwrap().lifecycle_hooks,
         LifecycleHooks::Injected
     );
     // No reader takes the obstruction for a decision: the record is unreadable, the capability
     // is unknown, and the hook fails (exit 1, never 2), so Codex would run the tool without the
     // notice. None of them writes.
     let before = session_files(&directory);
-    assert!(read_notice_mode(&directory).is_err());
-    assert!(notice_hook_injected(&directory).is_err());
+    assert!(notice(&directory).is_unreadable());
+    assert!(notice(&directory).notice_hook_injected().is_err());
     let reader = Reader::open_unchecked(&directory);
     assert!(matches!(
         ADAPTER.question_capability(&reader).response,

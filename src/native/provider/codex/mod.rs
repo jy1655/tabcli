@@ -2,12 +2,15 @@ mod correlation;
 mod diagnose;
 mod hooks;
 mod launch;
+mod launch_decision;
 mod question_notice;
 pub(super) mod questions;
 mod queue;
 mod runner;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+pub(in crate::native) use test_support::LaunchDecisionFixture;
 mod transcript;
 mod turn;
 use self::correlation::{
@@ -236,17 +239,16 @@ impl NativeProviderAdapter for CodexAdapter {
     fn question_capability(&self, reader: &Reader) -> super::QuestionCapability {
         // Emissions are observed only for turns bound through the injected lifecycle hooks;
         // the launch record says what was configured, not that Codex trusted or ran them.
-        let emission = match hooks::read_launch_mode(reader.directory()) {
-            Ok(Some(mode)) if mode.lifecycle_hooks == hooks::LifecycleHooks::Injected => {
-                super::EmissionObservation::Configured("hooks_injected_unverified")
-            }
-            Ok(_) => super::EmissionObservation::Unavailable("hooks_not_injected"),
-            Err(error) => super::EmissionObservation::Unknown(format!("{error:#}")),
-        };
+        let emission =
+            match launch_decision::lifecycle(reader.directory()).lifecycle_hooks_injected() {
+                Ok(true) => super::EmissionObservation::Configured("hooks_injected_unverified"),
+                Ok(false) => super::EmissionObservation::Unavailable("hooks_not_injected"),
+                Err(error) => super::EmissionObservation::Unknown(format!("{error:#}")),
+            };
         // Codex 0.166.0 has no addressed answer for a question in a running turn. A launch with
         // the notice hook lets the question through and tells the child to end its turn with it,
         // so the caller answers with `tell` once the Request has ended.
-        let response = match hooks::notice_hook_injected(reader.directory()) {
+        let response = match launch_decision::notice(reader.directory()).notice_hook_injected() {
             Ok(true) => super::QuestionResponse::AnswerAfterTurn("hook_configured_unverified"),
             Ok(false) => super::QuestionResponse::Unsupported(super::NO_ADDRESSED_ANSWER_PATH),
             Err(error) => super::QuestionResponse::Unknown(format!("{error:#}")),

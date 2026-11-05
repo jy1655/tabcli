@@ -205,8 +205,7 @@ fn hook_trust_proposes_the_notice_hook_a_launch_records() {
                 "codex_question_notice":notice}))
             .unwrap();
         hooks::prepare(&directory, executable).unwrap();
-        let recorded = hooks::read_notice_mode(&directory)
-            .unwrap()
+        let recorded = crate::native::provider::codex::launch_decision::notice(&directory)
             .unwrap()
             .reason
             .is_none();
