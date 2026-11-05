@@ -247,6 +247,18 @@ fn hook_trust_fake_responder_rejects_malformed_missing_keys_and_rpc_errors() {
         let (result, _) = respond(result);
         assert!(summarize(&result.unwrap(), bridge(), false).is_err());
     }
+    // Keys are checked in the injected value's order, so a reply without any of Bridge's keys
+    // names the first of that order.
+    let (empty, _) = respond(json!({"data":[{"hooks":[]}]}));
+    assert_eq!(
+        summarize(&empty.unwrap(), bridge(), true)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "Bridge hook key missing or ambiguous: {}",
+            hooks::session_flags_state_key("stop")
+        )
+    );
 }
 
 #[test]
