@@ -61,6 +61,18 @@ Session records: `{"schema":1,"deflection":"off"}` and `export const deflect = f
 dialog path is unchanged: the question is observed, nothing is refused, and the request
 stays pending until someone answers at the surface or the session is closed.
 
+## Re-check on the final change
+
+A later fix made the record compare the refused call's question text and option labels with
+the retained item (`e836ddd`). The deflection-on request was repeated with a debug build of
+that commit's tree, SHA-256
+`e28f7daade557d092970a371a73ed5ffade7fa5d380d6a8ac6cae53beef9688d`, in another empty state
+root: `ask` completed in 19 s with the same `QUESTION FOR CALLER:` Result,
+`question_deflected: true` and `question_deflection_count: 1`; the record held
+`step:0/tool:0` with `"deflected": true` and `incomplete: false`. So the questions that
+`tool.call` carries project to the same text and labels as the step's tool use in a live
+session. The follow-up `tell` and the deflection-off request were not repeated.
+
 ## Not verified
 
 - Native Windows, including a Windows `reopen` reading the setting again.
