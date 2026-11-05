@@ -663,9 +663,10 @@ fn an_owner_whose_process_cannot_be_inspected_is_unverified_not_ended() {
     );
 }
 
-/// A live bound owner passes only where tell's probe could verify it. Every platform
-/// mapping is covered on every host by `capabilities::tests`; these rows go through
-/// inspect on this host.
+/// A live bound owner passes only where tell's probe could verify it. What every platform's
+/// probe requires is tested on every host beside the probe (`terminal::ownership` tests),
+/// and the mapping of its answer by `capabilities::tests`; these rows go through inspect on
+/// this host.
 #[test]
 fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
     use crate::native::process_identity::{Attested, ProcessObservation};

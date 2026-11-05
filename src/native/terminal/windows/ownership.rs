@@ -3,6 +3,9 @@ use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
+// What this probe requires of the owner record is stated over its attestation by
+// `SurfaceProbe::owner_requirement` in `terminal::ownership`; its parity tests hold the two
+// together.
 #[cfg(windows)]
 pub(in crate::native) fn verified_windows_native_owner(
     directory: &Path,
