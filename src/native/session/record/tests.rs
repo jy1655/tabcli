@@ -771,7 +771,7 @@ fn a_malformed_status_wins_over_a_malformed_journal_in_every_source() {
 fn record_reader_characterization_event_text_and_timestamp_policies() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let reader = Reader::open_unchecked(&fixture.directory);
-    let path = fixture.directory.join("events/orphan.json");
+    let path = fixture.directory.join("events").join("orphan.json");
     for (bytes, message, strict_ok) in [
         (br#"{"provider":"codex","message":"legacy"}"#.to_vec(), "legacy", true),
         (b"{\"provider\":\"codex\",\"message\":\"\xff\"}".to_vec(), "\u{fffd}", false),
