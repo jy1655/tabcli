@@ -7,8 +7,9 @@ use super::super::test_support::{
     late_reload_startup_log, log_sequence, settled_startup_log, some_log, successful_startup_log,
 };
 use super::super::trust::workspace_customizations_loaded;
+use super::super::turn::PendingAgyTurn;
 use super::super::{
-    HOOKS_LOADED_SOURCE, MACOS_FOLLOW_UP_READINESS_TIMING, PendingAgyTurn, STARTUP_QUIET_PERIOD,
+    HOOKS_LOADED_SOURCE, MACOS_FOLLOW_UP_READINESS_TIMING, STARTUP_QUIET_PERIOD,
     WINDOWS_STARTUP_READINESS_TIMING,
 };
 use super::*;

@@ -305,7 +305,8 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
 
 fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Result<bool> {
     for path in Reader::open_unchecked(directory).events()? {
-        let event: SessionEvent = session::RecordReader::at(&path).json()?;
+        let event: SessionEvent =
+            session::RecordReader::at(&path).json_with(super::record::event)?;
         if event.provider == provider.as_str() {
             return Ok(true);
         }
@@ -366,7 +367,8 @@ fn provider_completion_is_current(
         return Ok(true);
     };
     for path in Reader::open_unchecked(directory).events()? {
-        let event: SessionEvent = session::RecordReader::at(&path).json()?;
+        let event: SessionEvent =
+            session::RecordReader::at(&path).json_with(super::record::event)?;
         if event.provider == provider.as_str()
             && event.provider_session_id.as_deref() == provider_session_id
             && event.turn_id.as_deref() == Some(turn_id)
@@ -1207,7 +1209,8 @@ fn wait_for_event_for_turn_until(
             let event = if let Some(expected_turn_id) = expected_turn_id {
                 let mut matched = None;
                 for path in candidates {
-                    let event: SessionEvent = session::RecordReader::at(path).json()?;
+                    let event: SessionEvent =
+                        session::RecordReader::at(path).json_with(super::record::event)?;
                     if event.turn_id.as_deref() == Some(expected_turn_id) {
                         matched = Some(event);
                         break;
@@ -1217,7 +1220,7 @@ fn wait_for_event_for_turn_until(
             } else {
                 Some(
                     RecordReader::at(candidates.first().context("event path disappeared")?)
-                        .json()?,
+                        .json_with(super::record::event)?,
                 )
             };
             if let Some(event) = event

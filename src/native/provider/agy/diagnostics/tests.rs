@@ -1,3 +1,4 @@
+use super::super::AGY_LOG_FILE;
 use super::super::monitor::{MonitorState, pending_turn_failure, pending_turn_log};
 use super::super::test_support::{
     REAL_DEFERRED_RELOAD_STARTUP, REAL_MACOS_INITIAL_TURN, REAL_QUIET_STARTUP,
@@ -6,7 +7,7 @@ use super::super::test_support::{
     late_reload_startup_log, marked, planner_line, receipt_line, settled_startup_log,
     successful_startup_log,
 };
-use super::super::{AGY_LOG_FILE, PendingAgyTurn, terminal_correlated_prompt};
+use super::super::turn::{PendingAgyTurn, terminal_correlated_prompt};
 use super::*;
 use crate::native::session::primitives::{event_paths, read_json};
 use crate::native::session::schema::SessionEvent;

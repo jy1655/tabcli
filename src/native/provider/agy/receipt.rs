@@ -1,6 +1,7 @@
+use super::INPUT_RECEIPT_WINDOW;
 use super::delivery::{Clock, input_receipt_window_end};
 use super::log::complete_log_lines;
-use super::{INPUT_RECEIPT_WINDOW, PendingAgyTurn};
+use super::turn::PendingAgyTurn;
 use crate::native::terminal;
 use anyhow::Result;
 use std::time::{Duration, Instant};

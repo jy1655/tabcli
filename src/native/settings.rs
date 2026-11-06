@@ -7,200 +7,162 @@ use std::path::Path;
 use std::str::FromStr;
 
 const FILE: &str = "settings.json";
-const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow>, codex-lifecycle-hooks <on|off>, claude-question-deflection <on|off> or codex-question-notice <on|off> to change one; --json is accepted";
-
-/// A creation preference, never cleanup authority. Each terminal handle records
-/// the surface that was actually created, even if this setting changes later.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(super) enum MacosOpenMode {
-    #[default]
-    TabFirst,
-    NewWindow,
-}
-
-impl MacosOpenMode {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::TabFirst => "tab-first",
-            Self::NewWindow => "new-window",
+// A setting's wire values, parser, default and usage share this declaration. The
+// record and its callers still own storage shape, read timing and error policy.
+macro_rules! setting {
+    (
+        $(#[$doc:meta])*
+        pub(super) enum $type:ident {
+            $(#[$first_doc:meta])* $first:ident => $first_wire:literal,
+            $(#[$second_doc:meta])* $second:ident => $second_wire:literal,
         }
-    }
-}
-
-impl FromStr for MacosOpenMode {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "tab-first" => Ok(Self::TabFirst),
-            "new-window" => Ok(Self::NewWindow),
-            _ => bail!("macos-open-mode is tab-first or new-window, not {value:?}"),
+        name: $name:literal; synopsis: $synopsis:ident;
+    ) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) enum $type {
+            $(#[$first_doc])*
+            #[serde(rename = $first_wire)]
+            $first,
+            $(#[$second_doc])*
+            #[serde(rename = $second_wire)]
+            $second,
         }
-    }
-}
 
-/// The Windows Terminal window in which a managed console opens its tab on native
-/// Windows. It has no effect on another platform.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(super) enum WindowsTabWindow {
-    /// The window named `agent-bridge`, which Windows Terminal creates when it does not
-    /// exist. No window the user works in is touched.
-    #[default]
-    Dedicated,
-    /// The most recently used Windows Terminal window. Windows Terminal selects the new
-    /// tab and offers no way to select the earlier one again, so the tab keeps the
-    /// keyboard inside that window until the user switches back.
-    Current,
-}
+        impl $type {
+            const NAME: &'static str = $name;
+            const ARGUMENT: &'static str = concat!($name, " <", $first_wire, "|", $second_wire, ">");
+            const SYNOPSIS: &'static str = setting!(@synopsis $synopsis, $name, $first_wire, $second_wire);
 
-impl WindowsTabWindow {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Dedicated => "dedicated",
-            Self::Current => "current",
+            pub(super) const fn as_str(self) -> &'static str {
+                match self {
+                    Self::$first => $first_wire,
+                    Self::$second => $second_wire,
+                }
+            }
         }
-    }
-}
 
-impl FromStr for WindowsTabWindow {
-    type Err = anyhow::Error;
+        impl FromStr for $type {
+            type Err = anyhow::Error;
 
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "dedicated" => Ok(Self::Dedicated),
-            "current" => Ok(Self::Current),
-            _ => bail!("windows-tab-window is dedicated or current, not {value:?}"),
+            fn from_str(value: &str) -> Result<Self> {
+                match value {
+                    $first_wire => Ok(Self::$first),
+                    $second_wire => Ok(Self::$second),
+                    _ => bail!(concat!($name, " is ", $first_wire, " or ", $second_wire, ", not {:?}"), value),
+                }
+            }
         }
+    };
+    (@synopsis optional, $name:literal, $first:literal, $second:literal) => {
+        concat!("settings [", $name, " <", $first, "|", $second, ">] [--json]")
+    };
+    (@synopsis required, $name:literal, $first:literal, $second:literal) => {
+        concat!("settings ", $name, " <", $first, "|", $second, "> [--json]")
+    };
+}
+
+setting! {
+    /// A creation preference, never cleanup authority. Each terminal handle records
+    /// the surface that was actually created, even if this setting changes later.
+    pub(super) enum MacosOpenMode {
+        #[default]
+        TabFirst => "tab-first",
+        NewWindow => "new-window",
     }
+    name: "macos-open-mode"; synopsis: required;
 }
 
-/// A launch admission preference, never close authority: whether `ask`, `reopen` and
-/// `self-test` start a session whose workspace is the Codex memory workspace or lies
-/// inside it. Codex's background memory consolidation delegated through Bridge from
-/// there and left sessions open (issue #216), so the default refuses.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(super) enum CodexMemoryWorkspace {
-    #[default]
-    Refuse,
-    Allow,
-}
-
-impl CodexMemoryWorkspace {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Refuse => "refuse",
-            Self::Allow => "allow",
-        }
+setting! {
+    /// The Windows Terminal window in which a managed console opens its tab on native
+    /// Windows. It has no effect on another platform.
+    pub(super) enum WindowsTabWindow {
+        /// The window named `agent-bridge`, which Windows Terminal creates when it does not
+        /// exist. No window the user works in is touched.
+        #[default]
+        Dedicated => "dedicated",
+        /// The most recently used Windows Terminal window. Windows Terminal selects the new
+        /// tab and offers no way to select the earlier one again, so the tab keeps the
+        /// keyboard inside that window until the user switches back.
+        Current => "current",
     }
+    name: "windows-tab-window"; synopsis: optional;
 }
 
-impl FromStr for CodexMemoryWorkspace {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "refuse" => Ok(Self::Refuse),
-            "allow" => Ok(Self::Allow),
-            _ => bail!("codex-memory-workspace is refuse or allow, not {value:?}"),
-        }
+setting! {
+    /// A launch admission preference, never close authority: whether `ask`, `reopen` and
+    /// `self-test` start a session whose workspace is the Codex memory workspace or lies
+    /// inside it. Codex's background memory consolidation delegated through Bridge from
+    /// there and left sessions open (issue #216), so the default refuses.
+    pub(super) enum CodexMemoryWorkspace {
+        #[default]
+        Refuse => "refuse",
+        Allow => "allow",
     }
+    name: "codex-memory-workspace"; synopsis: required;
 }
 
-/// Whether new Codex launches inject lifecycle hooks; not evidence of execution.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum CodexLifecycleHooks {
-    #[default]
-    On,
-    Off,
-}
-
-impl CodexLifecycleHooks {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
+setting! {
+    /// Whether new Codex launches inject lifecycle hooks; not evidence of execution.
+    pub(super) enum CodexLifecycleHooks {
+        #[default]
+        On => "on",
+        Off => "off",
     }
+    name: "codex-lifecycle-hooks"; synopsis: required;
 }
 
-impl FromStr for CodexLifecycleHooks {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "on" => Ok(Self::On),
-            "off" => Ok(Self::Off),
-            _ => bail!("codex-lifecycle-hooks is on or off, not {value:?}"),
-        }
+setting! {
+    /// Whether new Claude launches refuse a model's main-loop `AskUserQuestion` call before its
+    /// dialog and return the question in the Result. Each session records its own launch decision;
+    /// the setting is not evidence that a call was refused.
+    pub(super) enum ClaudeQuestionDeflection {
+        #[default]
+        On => "on",
+        Off => "off",
     }
+    name: "claude-question-deflection"; synopsis: required;
 }
 
-/// Whether new Claude launches refuse a model's main-loop `AskUserQuestion` call before its
-/// dialog and return the question in the Result. Each session records its own launch decision;
-/// the setting is not evidence that a call was refused.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum ClaudeQuestionDeflection {
-    #[default]
-    On,
-    Off,
-}
-
-impl ClaudeQuestionDeflection {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
+setting! {
+    /// Whether new Codex launches inject the `PreToolUse` hook that lets the model's
+    /// `request_user_input_async` call run and adds a notice: no reply can arrive during the turn, so
+    /// finish what does not depend on the answer and end the turn with the question. Off unless the
+    /// user turns it on: the question tool is asynchronous by design and the notice is advice a
+    /// caller may not need. Each session records its own launch decision; the setting is not
+    /// evidence that a child read the notice.
+    pub(super) enum CodexQuestionNotice {
+        On => "on",
+        #[default]
+        Off => "off",
     }
+    name: "codex-question-notice"; synopsis: required;
 }
 
-impl FromStr for ClaudeQuestionDeflection {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "on" => Ok(Self::On),
-            "off" => Ok(Self::Off),
-            _ => bail!("claude-question-deflection is on or off, not {value:?}"),
-        }
-    }
-}
+// Help/describe put the optional Windows setting first. Invalid-argument usage
+// retains its older macOS-first order below.
+pub(super) const SYNOPSIS: &[&str] = &[
+    WindowsTabWindow::SYNOPSIS,
+    MacosOpenMode::SYNOPSIS,
+    CodexMemoryWorkspace::SYNOPSIS,
+    CodexLifecycleHooks::SYNOPSIS,
+    ClaudeQuestionDeflection::SYNOPSIS,
+    CodexQuestionNotice::SYNOPSIS,
+];
 
-/// Whether new Codex launches inject the `PreToolUse` hook that lets the model's
-/// `request_user_input_async` call run and adds a notice: no reply can arrive during the turn, so
-/// finish what does not depend on the answer and end the turn with the question. Off unless the
-/// user turns it on: the question tool is asynchronous by design and the notice is advice a
-/// caller may not need. Each session records its own launch decision; the setting is not
-/// evidence that a child read the notice.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum CodexQuestionNotice {
-    On,
-    #[default]
-    Off,
-}
-
-impl CodexQuestionNotice {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl FromStr for CodexQuestionNotice {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "on" => Ok(Self::On),
-            "off" => Ok(Self::Off),
-            _ => bail!("codex-question-notice is on or off, not {value:?}"),
-        }
-    }
+fn usage() -> String {
+    let leading = [
+        MacosOpenMode::ARGUMENT,
+        WindowsTabWindow::ARGUMENT,
+        CodexMemoryWorkspace::ARGUMENT,
+        CodexLifecycleHooks::ARGUMENT,
+        ClaudeQuestionDeflection::ARGUMENT,
+    ]
+    .join(", ");
+    format!(
+        "settings takes no argument to show the settings, or {leading} or {} to change one; --json is accepted",
+        CodexQuestionNotice::ARGUMENT,
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -283,11 +245,11 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         .filter(|argument| *argument != "--json")
         .collect();
     if args.len() - named.len() > 1 {
-        bail!(USAGE);
+        bail!(usage());
     }
     match named.as_slice() {
         [] => {}
-        ["macos-open-mode", value] => {
+        [MacosOpenMode::NAME, value] => {
             let value = value.parse::<MacosOpenMode>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
@@ -295,7 +257,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
-        ["windows-tab-window", value] => {
+        [WindowsTabWindow::NAME, value] => {
             let value = value.parse::<WindowsTabWindow>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
@@ -303,7 +265,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
-        ["codex-lifecycle-hooks", value] => {
+        [CodexLifecycleHooks::NAME, value] => {
             let value = value.parse::<CodexLifecycleHooks>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
@@ -311,7 +273,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
-        ["codex-memory-workspace", value] => {
+        [CodexMemoryWorkspace::NAME, value] => {
             let value = value.parse::<CodexMemoryWorkspace>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
@@ -319,7 +281,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
-        ["claude-question-deflection", value] => {
+        [ClaudeQuestionDeflection::NAME, value] => {
             let value = value.parse::<ClaudeQuestionDeflection>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
@@ -327,7 +289,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
-        ["codex-question-notice", value] => {
+        [CodexQuestionNotice::NAME, value] => {
             let value = value.parse::<CodexQuestionNotice>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
@@ -335,7 +297,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
-        _ => bail!(USAGE),
+        _ => bail!(usage()),
     }
     Ok(serde_json::json!({
         "settings_file": Reader::open_unchecked(root).private(FILE).path().to_owned(),
@@ -353,6 +315,92 @@ mod tests {
     use super::*;
     use crate::native::session::primitives::read_json;
     use std::fs;
+
+    #[test]
+    fn setting_values_keep_their_parse_serde_order_and_defaults() {
+        macro_rules! check {
+            ($ty:ty, $name:literal, [$first:literal, $second:literal], $default:literal) => {{
+                assert_eq!(<$ty>::default().as_str(), $default);
+                for wire in [$first, $second] {
+                    let value = wire.parse::<$ty>().unwrap();
+                    assert_eq!(value.as_str(), wire);
+                    assert_eq!(serde_json::to_string(&value).unwrap(), format!("{wire:?}"));
+                    let decoded: $ty = serde_json::from_str(&format!("{wire:?}")).unwrap();
+                    assert_eq!(decoded, value);
+                }
+                assert_eq!(
+                    "invalid".parse::<$ty>().unwrap_err().to_string(),
+                    concat!($name, " is ", $first, " or ", $second, ", not \"invalid\"")
+                );
+                assert_eq!(
+                    serde_json::from_str::<$ty>("\"invalid\"")
+                        .unwrap_err()
+                        .to_string(),
+                    concat!(
+                        "unknown variant `invalid`, expected `",
+                        $first,
+                        "` or `",
+                        $second,
+                        "` at line 1 column 9"
+                    )
+                );
+            }};
+        }
+        check!(
+            MacosOpenMode,
+            "macos-open-mode",
+            ["tab-first", "new-window"],
+            "tab-first"
+        );
+        check!(
+            WindowsTabWindow,
+            "windows-tab-window",
+            ["dedicated", "current"],
+            "dedicated"
+        );
+        check!(
+            CodexMemoryWorkspace,
+            "codex-memory-workspace",
+            ["refuse", "allow"],
+            "refuse"
+        );
+        check!(
+            CodexLifecycleHooks,
+            "codex-lifecycle-hooks",
+            ["on", "off"],
+            "on"
+        );
+        check!(
+            ClaudeQuestionDeflection,
+            "claude-question-deflection",
+            ["on", "off"],
+            "on"
+        );
+        check!(
+            CodexQuestionNotice,
+            "codex-question-notice",
+            ["on", "off"],
+            "off"
+        );
+    }
+
+    #[test]
+    fn usage_keeps_its_order_and_invalid_requests_do_not_create_the_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        let expected = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow>, codex-lifecycle-hooks <on|off>, claude-question-deflection <on|off> or codex-question-notice <on|off> to change one; --json is accepted";
+        for invalid in [
+            vec!["unknown", "value"],
+            vec!["--json", "--json"],
+            vec!["macos-open-mode"],
+        ] {
+            assert_eq!(
+                apply(&root, &arguments(&invalid)).unwrap_err().to_string(),
+                expected
+            );
+            assert!(!root.exists());
+        }
+    }
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()

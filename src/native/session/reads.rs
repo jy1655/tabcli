@@ -1,7 +1,7 @@
 //! Event and timeline read policies: the strict attachment read, the budgeted event read,
 //! the timeline's bounded record read and the publication predicate's event read. Core
-//! Record decoding lives in `record.rs`; these reads keep their own byte budgets and event
-//! decoding.
+//! Record decoding lives in `record.rs`; these reads keep their own byte budgets and text
+//! policies.
 use super::*;
 
 /// The attached body must be the recorded bytes, so the event is decoded strictly here
@@ -18,7 +18,7 @@ pub(in crate::native) fn read_event_strictly(
         .ok_or_else(|| format!("recorded event {event_id} is missing"))?;
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("recorded event {event_id} is not valid UTF-8"))?;
-    serde_json::from_str(&text).map_err(|error| format!("invalid JSON in {event_id}: {error}"))
+    record::event(&text).map_err(|error| format!("invalid JSON in {event_id}: {error}"))
 }
 
 /// Reads one event without exceeding the remaining byte budget. `Ok(None)` means the

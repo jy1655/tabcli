@@ -8,7 +8,7 @@
 //! floor and one session-id rule hold for the initial-paste gate, the Windows input
 //! preflight, `cancel` support and the follow-up carry-forward. The receipt reader in
 //! `input.rs` shares [`valid_session_id`] and nothing else.
-use super::validate_claim_token;
+use super::turn::validate_claim_token;
 use crate::native::session::{Reader, Store};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

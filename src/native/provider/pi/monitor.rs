@@ -1,10 +1,9 @@
 use super::hook::record_correlated_failure;
-use super::read_pending_turn;
+use super::turn::read_pending_turn;
 use super::usage::reported_usage;
 use crate::native::session::{Reader, Store, turn};
 use agent_bridge::FirstPartyCli;
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
 use std::{
     path::Path,
     sync::{
@@ -16,23 +15,6 @@ use std::{
 };
 
 pub(super) const HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
-
-#[derive(Debug, Deserialize, Serialize)]
-struct HookFailureSignal {
-    error: String,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-    #[serde(default)]
-    claim_token: Option<String>,
-    /// What the extension's payload reported, kept when delivery failed; the same shape and
-    /// validation as the hook payload (`usage` or a bounded `usage_error`). Both are kept raw
-    /// so that a malformed field never rejects the signal before its claim is checked:
-    /// [`reported_usage`] bounds them after the claim matched.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage_error: Option<serde_json::Value>,
-}
 
 pub(in crate::native::provider) struct PiFailureMonitor {
     stop: Arc<AtomicBool>,
@@ -107,12 +89,8 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
     else {
         return Ok(false);
     };
-    let signal: HookFailureSignal =
-        serde_json::from_str(&text).context("invalid Pi hook failure recovery signal")?;
+    let signal = super::turn::decode_failure_signal(&text)?;
     let error = signal.error.trim();
-    if error.is_empty() {
-        bail!("Pi hook failure recovery signal has no error");
-    }
     Store::open_unchecked(directory)
         .private(HOOK_FAILURE_FILE)
         .remove()

@@ -356,9 +356,7 @@ fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_jso
         }))
         .unwrap();
     if native {
-        Store::open_unchecked(directory.path()).private("claude-completion-mode.json").write_json(
-            &serde_json::json!({"schema":1,"mode":"native_v1","reason":"windows_stable_2_1_302_or_newer","claude_version":"2.1.302"})
-        ).unwrap();
+        super::CompletionRecordFixture::NATIVE_MODE.write(directory.path());
     }
     (directory, token, start["event"].clone())
 }
@@ -509,12 +507,7 @@ fn legacy_stop_draft_completion_remains_compatible() {
     for explicit in [false, true] {
         let (directory, _, _) = mod_regression_fixture(false);
         if explicit {
-            Store::open_unchecked(directory.path())
-                .private("claude-completion-mode.json")
-                .write_json(&serde_json::json!({
-                    "schema":1,"mode":"legacy_stop","reason":"platform_legacy","claude_version":null
-                }))
-                .unwrap();
+            super::CompletionRecordFixture::LEGACY_STOP_MODE.write(directory.path());
         }
         let stop: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();

@@ -1,7 +1,7 @@
 #[cfg(any(windows, test))]
-use super::read_pending_turn;
-#[cfg(any(windows, test))]
 use super::startup_ready::{self, StartupReadiness};
+#[cfg(any(windows, test))]
+use super::turn::read_pending_turn;
 #[cfg(any(windows, test))]
 use crate::native::session::{Reader, turn};
 use crate::native::terminal;

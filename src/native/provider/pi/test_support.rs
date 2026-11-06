@@ -1,4 +1,4 @@
-use super::{PendingPiTurn, install_pending_turn};
+use super::turn::{PendingPiTurn, install_pending_turn};
 use crate::native::session::{Store, turn};
 #[cfg(windows)]
 use crate::native::terminal;

@@ -13,16 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MODE_FILE: &str = "claude-completion-mode.json";
-const READY_FILE: &str = "claude-mod-ready.json";
-const DIAGNOSTIC_FILE: &str = "claude-mod-diagnostic.json";
 /// The question plugin's manifest that `prepare` writes for a native-mode launch.
 const QUESTION_PLUGIN_MANIFEST: &str = "claude-question-mod/.claude-plugin/plugin.json";
 /// The plugin name that manifest carries.
 const QUESTION_PLUGIN_NAME: &str = "agent-bridge-questions";
-/// The question deflection decided at launch; later reads use it, never the current setting.
-const QUESTION_MODE_FILE: &str = "claude-question-mode.json";
-const REVISION: u32 = 1;
 const MAX_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FROM_BYTES: usize = 1024;
 const MAX_NAME_BYTES: usize = 256;
@@ -32,53 +26,15 @@ const MODULE: &str = include_str!("completion.js");
 
 mod diagnose;
 mod questions;
+mod records;
+#[cfg(test)]
+mod test_support;
 pub(super) use diagnose::checks as doctor_checks;
 pub(in crate::native::provider) use questions::read as question_emissions;
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum Mode {
-    NativeV1,
-    LegacyStop,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-struct LaunchMode {
-    schema: u32,
-    mode: Mode,
-    reason: String,
-    claude_version: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum Deflection {
-    On,
-    Off,
-}
-
-/// Whether the question plugin of this launch refuses a model's main-loop `AskUserQuestion`
-/// call and returns the question in the Result. It records configuration, not execution.
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-struct QuestionMode {
-    schema: u32,
-    deflection: Deflection,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Ready {
-    schema: u32,
-    revision: u32,
-    conversation: String,
-}
-
-// The latest rejected module signal. It names no request and no time.
-#[derive(Deserialize, Serialize)]
-struct Diagnostic {
-    schema: u32,
-    event: String,
-    reason: String,
-}
+pub(super) use records::native_mode;
+use records::{Deflection, Diagnostic, LaunchMode, QuestionMode, Ready};
+#[cfg(test)]
+pub(in crate::native) use test_support::CompletionRecordFixture;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct Binding {
@@ -119,17 +75,6 @@ enum Outcome {
     Failed(String),
 }
 
-pub(super) fn native_mode(directory: &Path) -> Result<bool> {
-    match Reader::open_unchecked(directory)
-        .private(MODE_FILE)
-        .optional_json::<LaunchMode>()?
-    {
-        Some(mode) if mode.schema == 1 => Ok(mode.mode == Mode::NativeV1),
-        Some(_) => bail!("unsupported Claude completion mode schema"),
-        None => Ok(false),
-    }
-}
-
 pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> {
     let version = Reader::open_unchecked(directory)
         .manifest()
@@ -146,24 +91,14 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
             "{platform} Claude completion requires stable Claude Code 2.1.302 or newer; recorded version: {version}"
         );
     }
-    let mode = LaunchMode {
-        schema: 1,
-        mode: Mode::NativeV1,
-        reason: if windows {
-            "windows_stable_2_1_302_or_newer"
-        } else {
-            "macos_stable_2_1_302_or_newer"
-        }
-        .into(),
-        claude_version: Some(version),
-    };
+    let mode = LaunchMode::native(windows, version);
     let store = Store::open_unchecked(directory);
-    if let Some(existing) = store.private(MODE_FILE).optional_json::<LaunchMode>()? {
+    if let Some(existing) = records::read_live::<LaunchMode>(&store)? {
         if existing != mode {
             bail!("a different Claude completion mode was already recorded for this launch");
         }
     } else {
-        store.private(MODE_FILE).write_json(&mode)?;
+        records::write(&store, &mode)?;
     }
     let plugin = directory.join("claude-mod");
     std::fs::create_dir_all(plugin.join(".claude-plugin"))?;
@@ -220,12 +155,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
             format!("export const deflect = {};\n", deflection == Deflection::On).as_bytes(),
         )?;
     // Written after the module switch, so the record never names a switch that was not written.
-    store
-        .private(QUESTION_MODE_FILE)
-        .write_json(&QuestionMode {
-            schema: 1,
-            deflection,
-        })?;
+    records::write(&store, &QuestionMode::new(deflection))?;
     Ok(vec![
         "--plugin-dir".into(),
         plugin.into_os_string(),
@@ -314,18 +244,11 @@ pub(super) fn question_response(directory: &Path) -> crate::native::provider::Qu
     use crate::native::provider::{NO_ADDRESSED_ANSWER_PATH, QuestionResponse};
     let observe = || -> Result<QuestionResponse> {
         if native_mode(directory)?
-            && let Some(mode) = Reader::open_unchecked(directory)
-                .private(QUESTION_MODE_FILE)
-                .optional_json::<QuestionMode>()?
+            && records::question_deflection(directory)? == Some(Deflection::On)
         {
-            if mode.schema != 1 {
-                bail!("unsupported Claude question mode schema");
-            }
-            if mode.deflection == Deflection::On {
-                return Ok(QuestionResponse::DeflectedToResult(
-                    "plugin_configured_unverified",
-                ));
-            }
+            return Ok(QuestionResponse::DeflectedToResult(
+                "plugin_configured_unverified",
+            ));
         }
         Ok(QuestionResponse::Unsupported(NO_ADDRESSED_ANSWER_PATH))
     };
@@ -346,14 +269,8 @@ pub(super) fn admit(
         claude_turn::require_current(&Reader::open_unchecked(directory), token)?;
         let remaining = deadline.checked_duration_since(clock.now()).filter(|remaining| !remaining.is_zero())
             .context("Claude completion module readiness was not observed before the delivery deadline; inspect module load, plugin trust and provider policy; no message was sent")?;
-        if let Some(ready) = Reader::open_unchecked(directory)
-            .private(READY_FILE)
-            .optional_json::<Ready>()?
-        {
-            if ready.schema != 1
-                || ready.revision != REVISION
-                || !valid_claude_conversation_id(&ready.conversation)
-            {
+        if let Some(ready) = records::read_live::<Ready>(&Reader::open_unchecked(directory))? {
+            if !ready.valid() {
                 bail!("Claude completion module readiness record is invalid; no message was sent");
             }
             return Ok(());
@@ -452,13 +369,14 @@ fn matches_peer_quoted_body(body: &str, expected: &str) -> bool {
 }
 
 fn diagnostic(directory: &Path, event: &str, reason: &str) -> Result<()> {
-    Store::open_unchecked(directory)
-        .private(DIAGNOSTIC_FILE)
-        .write_json(&Diagnostic {
+    records::write(
+        &Store::open_unchecked(directory),
+        &Diagnostic {
             schema: 1,
             event: bounded(event),
             reason: bounded(reason),
-        })
+        },
+    )
 }
 
 fn bounded(text: &str) -> String {
@@ -636,11 +554,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
         return Ok(());
     }
     if event == "session.start" {
-        return store.private(READY_FILE).write_json(&Ready {
-            schema: 1,
-            revision: REVISION,
-            conversation: conversation.into(),
-        });
+        return records::write(&store, &Ready::new(conversation));
     }
     let Some(token) = turn::current_claim_token(&store)? else {
         return Ok(());

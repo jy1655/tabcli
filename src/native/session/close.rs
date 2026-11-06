@@ -524,14 +524,14 @@ where
         }
     }
 
-    let terminal =
-        match session::RecordReader::at(&closing_path).json::<terminal::TerminalSession>() {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                restore_terminal_handle(&closing_path, &terminal_path)?;
-                return Err(error);
-            }
-        };
+    let terminal = match session::RecordReader::at(&closing_path).json_with(super::record::terminal)
+    {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            restore_terminal_handle(&closing_path, &terminal_path)?;
+            return Err(error);
+        }
+    };
     let result = match crate::native::session::close::budget::close_remaining(deadline)
         .and_then(|_| close_terminal(&terminal))
         .and_then(|result| {
@@ -579,13 +579,7 @@ fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
         Ok(store
             .record(CoreRecord::TerminalClosed)
             .text()?
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| {
-                value
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            }))
+            .and_then(|text| super::record::terminal_consumption_reason(&text)))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -954,7 +948,7 @@ where
             CoreRecord::TerminalClosing.name(),
         ] {
             if let Some(bytes) = store.private(name).bytes()? {
-                let surface: terminal::TerminalSession = serde_json::from_slice(&bytes)
+                let surface: terminal::TerminalSession = super::record::terminal_bytes(&bytes)
                     .with_context(|| format!("invalid retained terminal handle {name}"))?;
                 if retain_surface(&surface) {
                     return untouched(recovery_damage);

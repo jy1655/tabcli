@@ -1,5 +1,6 @@
+use super::super::ADAPTER;
 use super::super::test_support::{claim_pending_turn, marked};
-use super::super::{ADAPTER, PENDING_TURN_FILE};
+use super::super::turn::PENDING_TURN_FILE;
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
 use crate::native::session::test_support::TURN_CLAIM_FILE;

@@ -59,9 +59,6 @@ pub(in crate::native) fn parse(args: &[String]) -> Result<NativeCommand> {
             json,
         })
     })();
-    if let Err(error) = &parsed {
-        envelope::parse_failure(args, error, serde_json::Map::new())?;
-    }
     parsed.map(NativeCommand::Screen)
 }
 
@@ -131,7 +128,8 @@ pub(in crate::native) fn run(request: ScreenRequest) -> Result<()> {
         }),
         Err(error) => {
             if request.json {
-                envelope::print(&envelope::error(
+                envelope::print(&crate::native::failure_policy::runtime_error(
+                    "screen",
                     &error,
                     serde_json::Map::from_iter([("session".into(), json!(request.id))]),
                 ))?;

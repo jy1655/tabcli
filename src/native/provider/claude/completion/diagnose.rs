@@ -1,9 +1,9 @@
 //! Doctor's read-only view of the completion module's own records. Each record is one
 //! bounded read without the lifecycle lock, so the rows are not one snapshot. Nothing
 //! here repairs, locks, starts a helper, reads provider policy or sends anything.
-use super::{
-    DIAGNOSTIC_FILE, Diagnostic, LaunchMode, MODE_FILE, Mode, READY_FILE, REVISION, Ready,
-    valid_claude_conversation_id,
+use super::records::{
+    self, DIAGNOSTIC_FILE, DOCTOR_READ_LIMIT, Diagnostic, LaunchMode, MODE_FILE, Mode, READY_FILE,
+    REVISION, Ready, Record,
 };
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::diagnostics::{
@@ -12,12 +12,9 @@ use crate::native::diagnostics::{
 };
 use crate::native::session::Reader;
 use agent_bridge::terminal_safe_text;
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::path::Path;
 
-// The records hold a few short fields; a diagnostic holds two 1024-character texts.
-const RECORD_BYTES: u64 = 16 * 1024;
 const TEXT_CHARS: usize = 1024;
 const NAME_CHARS: usize = 64;
 
@@ -67,22 +64,23 @@ fn number(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
 }
 
-/// Decodes exactly as the live reader does (the same struct straight from the bytes).
+/// Decodes into the struct the live reader decodes, from doctor's own read policy
+/// ([`records::read_doctor`]: bounded and strict, where the live read is whole and lossy).
 /// Only after that fails is the generic JSON inspected, to name an unknown schema,
 /// revision or mode instead of calling it malformed.
-fn read<T: DeserializeOwned>(
+fn read<T: Record>(
     reader: &Reader,
-    file: &str,
     classify: impl FnOnce(&Value) -> Option<Value>,
 ) -> Result<Option<T>, Field> {
-    let bytes = match reader.private(file).timeline(RECORD_BYTES) {
+    let file = T::FILE;
+    let bytes = match records::read_doctor::<T>(reader) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(None),
         Err(error) => {
             return Err(Field::new(
                 State::Unreadable,
                 file,
-                json!({"reason": sanitized(&format!("{error:#}"), TEXT_CHARS), "limit_bytes": RECORD_BYTES}),
+                json!({"reason": sanitized(&format!("{error:#}"), TEXT_CHARS), "limit_bytes": DOCTOR_READ_LIMIT}),
             ));
         }
     };
@@ -116,7 +114,7 @@ fn unknown_schema(value: &Value) -> Option<Value> {
 
 fn observe_mode(reader: &Reader) -> (Field, Option<Mode>) {
     // A schema-1 record whose mode is text that `Mode` does not name is unrecognized.
-    let record = read::<LaunchMode>(reader, MODE_FILE, |value| {
+    let record = read::<LaunchMode>(reader, |value| {
         unknown_schema(value).or_else(|| {
             let mode = value.get("mode")?.as_str()?;
             (number(value, "schema") == Some(1)
@@ -127,7 +125,7 @@ fn observe_mode(reader: &Reader) -> (Field, Option<Mode>) {
     match record {
         Ok(None) => (Field::new(State::NotObserved, MODE_FILE, json!({})), None),
         Err(field) => (field, None),
-        Ok(Some(mode)) if mode.schema != 1 => (
+        Ok(Some(mode)) if !mode.supported() => (
             Field::new(
                 State::Unrecognized,
                 MODE_FILE,
@@ -161,7 +159,7 @@ fn unknown_revision(schema: u64, revision: Option<u64>) -> Value {
 }
 
 fn observe_readiness(reader: &Reader) -> Field {
-    let record = read::<Ready>(reader, READY_FILE, |value| {
+    let record = read::<Ready>(reader, |value| {
         match (number(value, "schema")?, number(value, "revision")) {
             (1, Some(revision)) if revision != u64::from(REVISION) => {
                 Some(unknown_revision(1, Some(revision)))
@@ -173,12 +171,12 @@ fn observe_readiness(reader: &Reader) -> Field {
     match record {
         Ok(None) => Field::new(State::NotObserved, READY_FILE, json!({})),
         Err(field) => field,
-        Ok(Some(ready)) if ready.schema != 1 || ready.revision != REVISION => Field::new(
+        Ok(Some(ready)) if !ready.recognized() => Field::new(
             State::Unrecognized,
             READY_FILE,
             unknown_revision(ready.schema.into(), Some(ready.revision.into())),
         ),
-        Ok(Some(ready)) if !valid_claude_conversation_id(&ready.conversation) => Field::new(
+        Ok(Some(ready)) if !ready.valid() => Field::new(
             State::Malformed,
             READY_FILE,
             json!({"fault": "invalid_conversation"}),
@@ -194,10 +192,10 @@ fn observe_readiness(reader: &Reader) -> Field {
 }
 
 fn observe_diagnostic(reader: &Reader) -> Field {
-    match read::<Diagnostic>(reader, DIAGNOSTIC_FILE, unknown_schema) {
+    match read::<Diagnostic>(reader, unknown_schema) {
         Ok(None) => Field::new(State::NotObserved, DIAGNOSTIC_FILE, json!({})),
         Err(field) => field,
-        Ok(Some(diagnostic)) if diagnostic.schema != 1 => Field::new(
+        Ok(Some(diagnostic)) if !diagnostic.supported() => Field::new(
             State::Unrecognized,
             DIAGNOSTIC_FILE,
             json!({"schema": diagnostic.schema, "expected_schema": 1}),
@@ -371,5 +369,5 @@ pub(in crate::native::provider::claude) fn checks(directory: Option<&Path>) -> [
 
 #[cfg(test)]
 pub(super) fn record_limit() -> u64 {
-    RECORD_BYTES
+    DOCTOR_READ_LIMIT
 }

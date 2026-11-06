@@ -167,14 +167,7 @@ pub(super) const CONSENT: Contract = Contract {
 };
 pub(super) const SETTINGS: Contract = Contract {
     summary: "Read settings or change a named setting for future operations.",
-    synopsis: &[
-        "settings [windows-tab-window <dedicated|current>] [--json]",
-        "settings macos-open-mode <tab-first|new-window> [--json]",
-        "settings codex-memory-workspace <refuse|allow> [--json]",
-        "settings codex-lifecycle-hooks <on|off> [--json]",
-        "settings claude-question-deflection <on|off> [--json]",
-        "settings codex-question-notice <on|off> [--json]",
-    ],
+    synopsis: super::settings::SYNOPSIS,
     possible_effects: &[ReadsRecords, WritesRecords],
     examples: &[&["settings", "--json"]],
     features: &[
@@ -378,7 +371,7 @@ fn public_command(name: &str) -> Result<&'static super::CommandSpec> {
 }
 
 pub(super) fn parse(arguments: &[String]) -> Result<NativeCommand> {
-    let parsed = (|| {
+    (|| {
         let mut command = None;
         let mut json = false;
         for argument in arguments {
@@ -392,11 +385,7 @@ pub(super) fn parse(arguments: &[String]) -> Result<NativeCommand> {
             }
         }
         Ok(NativeCommand::Describe(Request { command, json }))
-    })();
-    if let Err(error) = &parsed {
-        envelope::parse_failure(arguments, error, serde_json::Map::new())?;
-    }
-    parsed
+    })()
 }
 
 /// One public registry entry as describe publishes it; text output and command help read this.
@@ -541,7 +530,7 @@ fn value(request: &Request) -> Value {
                 "success_defaults": envelope::ok(serde_json::Map::new()),
                 "error_example": envelope::error(&anyhow::anyhow!("example error"), serde_json::Map::new()),
                 "failure_kinds": FailureKind::ALL.map(FailureKind::as_str),
-            "notes": ["Common defaults are not universal: consent, settings, sessions, prune-sessions and close-session print JSON without schema_version, and self-test's report has outcome instead of ok; consent, settings, sessions, prune-sessions, close-session, doctor and self-test report errors on stderr without a JSON error object. With --json, an argument-parsing failure prints a JSON error object only for describe, hold, cancel, screen, wait, status and search; other commands report it on stderr only. Other command fields may override defaults. Consult result fields; exit status alone does not identify request completion.", "failure_kind is optional, diagnostic only, and never authorizes retry. Absence is unknown, not proof of non-delivery."]
+            "notes": [super::failure_policy::output_note(), "failure_kind is optional, diagnostic only, and never authorizes retry. Absence is unknown, not proof of non-delivery."]
             }),
         ),
         (

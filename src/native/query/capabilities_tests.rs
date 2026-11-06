@@ -4,7 +4,7 @@
 //! names instead of evaluating. `questions`: each adapter's configuration. No record is
 //! changed by the observation.
 use super::*;
-use crate::native::provider::CodexLaunchDecisionFixture;
+use crate::native::provider::{ClaudeCompletionRecordFixture, CodexLaunchDecisionFixture};
 use crate::native::reopen::tests::snapshot_directory;
 use crate::native::session::cancel::{self, Refusal};
 use crate::native::session::test_support::lifecycle::{
@@ -814,12 +814,7 @@ fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
             },
         )
     );
-    let native = json!({"schema": 1, "mode": "native_v1",
-        "reason": "windows_stable_2_1_302_or_newer", "claude_version": "2.1.302"});
-    store
-        .private("claude-completion-mode.json")
-        .write_json(&native)
-        .unwrap();
+    ClaudeCompletionRecordFixture::NATIVE_MODE.write(directory);
     assert_eq!(
         observe_past_owner_and_surface(directory)["tell"],
         admissible(&[
@@ -828,24 +823,14 @@ fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
             "claude_native_readiness",
         ])
     );
-    store
-        .private("claude-completion-mode.json")
-        .remove()
-        .unwrap();
-    store
-        .private("claude-completion-mode.json")
-        .write_private(b"{")
-        .unwrap();
+    ClaudeCompletionRecordFixture::MALFORMED_MODE.write(directory);
     let observed = observe_past_owner_and_surface(directory)["tell"].clone();
     assert_eq!(observed["state"], "unknown");
     assert_eq!(observed["reason"], "evidence_unreadable");
     assert!(observed["detail"].as_str().is_some());
 
     // A reopened session names the exclusivity check it cannot evaluate from records.
-    store
-        .private("claude-completion-mode.json")
-        .write_json(&native)
-        .unwrap();
+    ClaudeCompletionRecordFixture::NATIVE_MODE.write(directory);
     let mut manifest: Value = store.record(CoreRecord::Manifest).json().unwrap();
     manifest["resumed_from"] = json!({"session": "session-source",
         "provider_session_id": "conversation-1", "event_id": "event-1-1.json"});
@@ -920,60 +905,40 @@ fn claude_question_response_reports_the_deflection_recorded_at_launch() {
     let deflected = json!({"state": "deflected_to_result",
         "reason": "plugin_configured_unverified", "answer_by": "tell"});
     let fixture = working("claude");
-    let store = Store::open_unchecked(&fixture.directory);
-    let mode = "claude-question-mode.json";
     // Legacy completion mode has no deflecting plugin, whatever a record says.
-    store
-        .private(mode)
-        .write_json(&json!({"schema": 1, "deflection": "on"}))
-        .unwrap();
+    ClaudeCompletionRecordFixture::DEFLECTION_ON.write(&fixture.directory);
     assert_eq!(
         observe_all(&fixture.directory)["questions"]["response"],
         unsupported
     );
-    store
-        .private("claude-completion-mode.json")
-        .write_json(&json!({"schema": 1, "mode": "native_v1",
-            "reason": "macos_stable_2_1_302_or_newer", "claude_version": "2.1.318"}))
-        .unwrap();
+    ClaudeCompletionRecordFixture::NATIVE_MODE.write(&fixture.directory);
     assert_eq!(
         observe_all(&fixture.directory)["questions"]["response"],
         deflected
     );
-    store.private(mode).remove().unwrap();
-    store
-        .private(mode)
-        .write_json(&json!({"schema": 1, "deflection": "off"}))
-        .unwrap();
+    ClaudeCompletionRecordFixture::DEFLECTION_OFF.write(&fixture.directory);
     assert_eq!(
         observe_all(&fixture.directory)["questions"]["response"],
         unsupported
     );
     // A session launched before the record existed keeps the earlier answer.
-    store.private(mode).remove().unwrap();
+    ClaudeCompletionRecordFixture::NO_QUESTION_MODE.write(&fixture.directory);
     assert_eq!(
         observe_all(&fixture.directory)["questions"]["response"],
         unsupported
     );
-    for record in [
-        &b"{"[..],
-        br#"{"schema":2,"deflection":"on"}"#,
-        br#"{"schema":1,"deflection":"maybe"}"#,
-    ] {
-        store.private(mode).write_private(record).unwrap();
+    for record in ClaudeCompletionRecordFixture::UNREADABLE_QUESTION_MODES {
+        record.write(&fixture.directory);
         let response = observe_all(&fixture.directory)["questions"]["response"].clone();
         assert_eq!(response["state"], "unknown", "{response}");
         assert_eq!(response["reason"], "evidence_unreadable");
         assert!(response["detail"].as_str().is_some());
-        store.private(mode).remove().unwrap();
+        ClaudeCompletionRecordFixture::NO_QUESTION_MODE.write(&fixture.directory);
     }
     // Other providers never read the Claude record.
     for provider in ["codex", "agy", "pi"] {
         let fixture = working(provider);
-        Store::open_unchecked(&fixture.directory)
-            .private(mode)
-            .write_json(&json!({"schema": 1, "deflection": "on"}))
-            .unwrap();
+        ClaudeCompletionRecordFixture::DEFLECTION_ON.write(&fixture.directory);
         assert_eq!(
             observe_all(&fixture.directory)["questions"]["response"],
             unsupported,
@@ -1031,11 +996,7 @@ fn codex_question_response_reports_the_notice_recorded_at_launch() {
 #[test]
 fn a_snapshot_without_the_lifecycle_lock_leaves_every_capability_unknown() {
     let fixture = ready("claude");
-    Store::open_unchecked(&fixture.directory)
-        .private("claude-completion-mode.json")
-        .write_json(&json!({"schema": 1, "mode": "native_v1",
-            "reason": "windows_stable_2_1_302_or_newer", "claude_version": "2.1.302"}))
-        .unwrap();
+    ClaudeCompletionRecordFixture::NATIVE_MODE.write(&fixture.directory);
     fs::remove_file(fixture.directory.join(TURN_CLAIM_LOCK_FILE)).unwrap();
     let unknown = json!({"state": "unknown", "reason": "lifecycle_lock_absent"});
     let capabilities = observe_all(&fixture.directory);

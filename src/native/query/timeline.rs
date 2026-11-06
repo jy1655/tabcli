@@ -7,7 +7,6 @@ use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::session::turn::{self, valid_turn_claim_token};
 use crate::native::session::{CoreRecord, Reader};
 use agent_bridge::PUBLIC_COMMAND;
-use serde::de::DeserializeOwned;
 
 // Auxiliary launch diagnostics retain at most 1 MiB; all other reads use
 // the existing 64 MiB event limit. Oversized files are evidence gaps.
@@ -104,11 +103,13 @@ fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
     Ok(records)
 }
 
-/// The timeline's own strict parser of a retained record that is not a core Record (the
-/// cancel record, the terminal records, an event) or a deserialize-only diagnostic: strict
-/// UTF-8, the `_unix_ms` range rule, then the shape, with the `invalid JSON record`
-/// context. A retained read fault is the error it was retained as.
-fn parsed<T: DeserializeOwned>(records: &Records, source: &str) -> Result<Option<T>> {
+/// Select retained bytes only; interpretation belongs to the record decoder. Never
+/// refill an absent/faulted cached record from disk.
+fn decoded<T>(
+    records: &Records,
+    source: &str,
+    shape: impl FnOnce(&str) -> serde_json::Result<T>,
+) -> Result<Option<T>> {
     let bytes = records
         .get(source)
         .context("record not selected")?
@@ -116,11 +117,7 @@ fn parsed<T: DeserializeOwned>(records: &Records, source: &str) -> Result<Option
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     bytes
         .as_ref()
-        .map(|b| {
-            let text = std::str::from_utf8(b).context("invalid UTF-8")?;
-            record::timestamps_in_range(&serde_json::from_str::<Value>(text)?)?;
-            serde_json::from_str(text).context("invalid JSON record")
-        })
+        .map(|bytes| record::timeline(bytes, shape))
         .transpose()
 }
 
@@ -156,7 +153,7 @@ fn event(records: &Records, snapshot: &Snapshot, name: &str) -> Result<Option<Se
     if !records.contains_key(&source) {
         return Ok(None);
     }
-    parsed(records, &source)
+    decoded(records, &source, record::event)
 }
 
 struct Entry<'a> {
@@ -223,7 +220,10 @@ fn unreadable_receipts(before: &Records, id: &str, session_entries: &mut Vec<Val
         else {
             continue;
         };
-        let refused = parsed::<requests::Receipt>(before, source).and_then(|_| match read {
+        let refused = decoded(before, source, |text| {
+            serde_json::from_str::<requests::Receipt>(text)
+        })
+        .and_then(|_| match read {
             Ok(Some(bytes)) => record::receipt(bytes, token).map(drop).map_err(Into::into),
             _ => Ok(()),
         });
@@ -248,13 +248,12 @@ fn render_cancel(
     incomplete: &mut bool,
 ) {
     let source = CoreRecord::Cancel.name();
-    let cancel =
-        parsed::<crate::native::session::cancel::Cancel>(before, source).and_then(|record| {
-            if let Some(record) = &record {
-                record.validate()?;
-            }
-            Ok(record)
-        });
+    let cancel = decoded(before, source, record::cancel).and_then(|record| {
+        if let Some(record) = &record {
+            record.validate()?;
+        }
+        Ok(record)
+    });
     match cancel {
         Ok(Some(cancel)) if request.is_none_or(|r| r == cancel.request_id) => {
             let receipt = snapshot
@@ -666,9 +665,9 @@ fn render_close_and_log(
                         _ => unreachable!("matched a present record"),
                     }
                 } else if source == CoreRecord::TerminalClosing.name() {
-                    parsed::<terminal::TerminalSession>(before, source).map(|v| v.map(|v| json!(v)))
+                    decoded(before, source, record::terminal).map(|v| v.map(|v| json!(v)))
                 } else {
-                    parsed::<Value>(before, source)
+                    decoded(before, source, record::terminal_tombstone_value)
                 };
                 match parsed {
                     Ok(Some(detail)) => {

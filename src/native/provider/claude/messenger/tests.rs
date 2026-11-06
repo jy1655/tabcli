@@ -610,12 +610,7 @@ fn native_messenger_success_without_target_turn_keeps_the_claim() {
     let store = Store::open_unchecked(&directory);
     let mut claim = turn::claim(&store, &[]).unwrap();
     let token = claim.token().to_owned();
-    store
-        .private("claude-completion-mode.json")
-        .write_json(&serde_json::json!({
-            "schema":1,"mode":"native_v1","reason":"fixture","claude_version":"2.1.302"
-        }))
-        .unwrap();
+    crate::native::provider::claude::CompletionRecordFixture::NATIVE_MODE.write(&directory);
     // Each handoff closes its payload before it creates an empty ready flag, and the reader
     // waits for the flag: no rename, no partial read. The wrapper and Node record their start
     // before stdin is read. The fake has no watchdog; the Messenger deadline bounds it.

@@ -1,7 +1,9 @@
 use super::monitor::HOOK_FAILURE_FILE;
 use super::startup_ready::{STARTUP_READY_FILE, StartupReady};
 use super::test_support::{claim_pending_turn, marked};
+use super::turn::*;
 use super::*;
+use crate::native::session::Store;
 use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
 use crate::native::session::test_support::TURN_CLAIM_FILE;
 use crate::native::session::update_status;
@@ -323,7 +325,7 @@ fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
             assert!(payloads.is_empty());
             assert!(event_paths(&dir).unwrap().is_empty());
             assert_eq!(
-                turn::current_claim_token(&Reader::open_unchecked(&dir))
+                session_turn::current_claim_token(&Reader::open_unchecked(&dir))
                     .unwrap()
                     .unwrap(),
                 inputs[name][0]["token"]
@@ -734,7 +736,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         let workspace = root.path().join("workspace");
                         fs::create_dir(&workspace).unwrap();
                         let workspace = workspace.canonicalize().unwrap();
-                        turn::claim(&Store::open_unchecked(&directory), &[])
+                        session_turn::claim(&Store::open_unchecked(&directory), &[])
                             .unwrap()
                             .retain();
                         super::test_support::launching_status(&directory);
@@ -768,7 +770,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         let pending = read_pending_turn(&directory).unwrap().unwrap();
                         assert_eq!(
                             pending.claim_token,
-                            turn::current_claim_token(&Reader::open_unchecked(&directory))
+                            session_turn::current_claim_token(&Reader::open_unchecked(&directory))
                                 .unwrap()
                                 .unwrap(),
                             "{label}"
@@ -853,7 +855,7 @@ fn launch_plan_watcher_starts_the_hook_failure_monitor_only_when_started() {
     let directory = root.path().join("session-safe123");
     fs::create_dir(&directory).unwrap();
     fs::create_dir(directory.join("events")).unwrap();
-    turn::claim(&Store::open_unchecked(&directory), &[])
+    session_turn::claim(&Store::open_unchecked(&directory), &[])
         .unwrap()
         .retain();
     super::test_support::launching_status(&directory);

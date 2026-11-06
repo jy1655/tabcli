@@ -75,21 +75,11 @@ pub(crate) struct StatusRequest {
 }
 
 fn error_value(error: &anyhow::Error) -> Value {
-    envelope::error(error, json!({"sessions": []}).as_object().unwrap().clone())
+    crate::native::failure_policy::runtime_error("status", error, serde_json::Map::new())
 }
 
 pub(in crate::native) fn parse(args: &[String]) -> Result<NativeCommand> {
-    match parse_options(args) {
-        Ok(request) => Ok(NativeCommand::Status(request)),
-        Err(error) => {
-            envelope::parse_failure(
-                args,
-                &error,
-                json!({"sessions": []}).as_object().unwrap().clone(),
-            )?;
-            Err(error)
-        }
-    }
+    parse_options(args).map(NativeCommand::Status)
 }
 
 fn parse_options(args: &[String]) -> Result<StatusRequest> {

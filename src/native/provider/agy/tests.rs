@@ -1,4 +1,6 @@
+use super::turn::*;
 use super::*;
+use crate::native::session::Store;
 use crate::native::terminal;
 use std::path::Path;
 
@@ -264,7 +266,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                     let directory = root.path().join("session-safe123");
                     std::fs::create_dir(&directory).unwrap();
                     std::fs::create_dir(directory.join("events")).unwrap();
-                    turn::claim(&Store::open_unchecked(&directory), &[])
+                    session_turn::claim(&Store::open_unchecked(&directory), &[])
                         .unwrap()
                         .retain();
                     let plan = prepare_launch_for_platform(
@@ -286,7 +288,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                     let pending = read_pending_turn(&directory).unwrap().unwrap();
                     assert_eq!(
                         pending.claim_token,
-                        turn::current_claim_token(&Reader::open_unchecked(&directory))
+                        session_turn::current_claim_token(&Reader::open_unchecked(&directory))
                             .unwrap()
                             .unwrap(),
                         "{label}"
@@ -342,7 +344,7 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
     let directory = root.path().join("session-safe123");
     std::fs::create_dir(&directory).unwrap();
     std::fs::create_dir(directory.join("events")).unwrap();
-    turn::claim(&Store::open_unchecked(&directory), &[])
+    session_turn::claim(&Store::open_unchecked(&directory), &[])
         .unwrap()
         .retain();
     let log_path = directory.join(AGY_LOG_FILE);

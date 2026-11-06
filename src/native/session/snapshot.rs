@@ -287,7 +287,7 @@ impl Snapshot {
                 hook(record.path());
             }
         });
-        RecordReader::at(record.path()).optional_json()
+        RecordReader::at(record.path()).optional_json_with(super::record::event)
     }
 
     pub(in crate::native) fn active_receipt(&self) -> Option<&requests::Receipt> {

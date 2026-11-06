@@ -14,7 +14,7 @@ pub(crate) struct Request {
 }
 
 pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
-    let parsed = (|| {
+    (|| {
         let mut id = None;
         let mut release = false;
         let mut json = false;
@@ -34,11 +34,7 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
             release,
             json,
         }))
-    })();
-    if let Err(error) = &parsed {
-        envelope::parse_failure(args, error, serde_json::Map::new())?;
-    }
-    parsed
+    })()
 }
 
 pub(super) fn run(request: Request) -> Result<()> {
@@ -63,7 +59,8 @@ pub(super) fn run(request: Request) -> Result<()> {
         }
         Err(error) => {
             if request.json {
-                envelope::print(&envelope::error(
+                envelope::print(&crate::native::failure_policy::runtime_error(
+                    "hold",
                     &error,
                     serde_json::Map::from_iter([("session".into(), json!(request.id))]),
                 ))?;

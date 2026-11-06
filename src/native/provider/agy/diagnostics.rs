@@ -4,9 +4,9 @@ use super::monitor::{ResultReader, brain_root, parse_conversation_id, pending_tu
 use super::readiness::observe_startup;
 use super::receipt::{input_receipts, receipt_matches};
 use super::trust::workspace_trust_missing;
+use super::turn::read_pending_turn;
 use super::{
     AGY_LOG_FILE, FULL_TRANSCRIPT_FILE, TRANSCRIPT_FILE, TRUST_RECOVERY, TRUST_STORE_MISSING,
-    read_pending_turn,
 };
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::session::{Reader, SessionState};

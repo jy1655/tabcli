@@ -764,3 +764,189 @@ fn a_malformed_status_wins_over_a_malformed_journal_in_every_source() {
         "owner_unverified"
     );
 }
+
+// These cross-reader characterizations run unchanged before and after decoder extraction.
+// Differences between the callers characterize the current retained-record read policies.
+#[test]
+fn record_reader_characterization_event_text_and_timestamp_policies() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let path = fixture.directory.join("events").join("orphan.json");
+    for (bytes, message, strict_ok) in [
+        (br#"{"provider":"codex","message":"legacy"}"#.to_vec(), "legacy", true),
+        (b"{\"provider\":\"codex\",\"message\":\"\xff\"}".to_vec(), "\u{fffd}", false),
+        (br#"{"provider":"codex","message":"large time","created_unix_ms":18446744073709551616}"#.to_vec(), "large time", true),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        let event = snapshot.event(&reader, "orphan.json").unwrap().unwrap();
+        assert_eq!(event.message, message);
+        assert_eq!(reader.event_strict("orphan.json").is_ok(), strict_ok);
+        if message == "large time" {
+            // Pin current acceptance only. The latent overflow on JSON rendering is a
+            // separate bugfix, not a timestamp compatibility requirement.
+            assert_eq!(event.created_unix_ms, Some(u64::MAX as u128 + 1));
+        }
+        let text = reader.event("orphan.json").event_within_budget(1024).unwrap().unwrap();
+        assert_eq!(text, String::from_utf8_lossy(&bytes));
+    }
+    fs::write(&path, "{}").unwrap();
+    let error = reader
+        .snapshot()
+        .unwrap()
+        .event(&reader, "orphan.json")
+        .unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "invalid JSON in {}: missing field `provider` at line 1 column 2",
+            path.display()
+        )
+    );
+    fs::remove_file(&path).unwrap();
+    assert!(
+        reader
+            .snapshot()
+            .unwrap()
+            .event(&reader, "orphan.json")
+            .unwrap()
+            .is_none()
+    );
+    fs::create_dir(&path).unwrap();
+    assert!(
+        format!(
+            "{:#}",
+            reader
+                .snapshot()
+                .unwrap()
+                .event(&reader, "orphan.json")
+                .unwrap_err()
+        )
+        .contains("refusing non-regular session file")
+    );
+}
+
+#[test]
+fn record_reader_characterization_cancel_validation_and_lossy_unknown_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let reader = Reader::open_unchecked(root.path());
+    let path = root.path().join("cancel.json");
+    assert!(
+        crate::native::session::cancel::read(&reader)
+            .unwrap()
+            .is_none()
+    );
+    let valid = br#"{"schema":1,"request_id":"request-1","claim_token":"1-2-3","created_unix_ms":1,"extra":"X"}"#;
+    let mut bytes = valid.to_vec();
+    *bytes.iter_mut().find(|b| **b == b'X').unwrap() = 0xff;
+    fs::write(&path, bytes).unwrap();
+    assert_eq!(
+        crate::native::session::cancel::read(&reader)
+            .unwrap()
+            .unwrap()
+            .request_id,
+        "request-1"
+    );
+    for text in [
+        String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("\"schema\":1", "\"schema\":2"),
+        String::from_utf8(valid.to_vec()).unwrap().replace(
+            "\"created_unix_ms\":1",
+            "\"created_unix_ms\":18446744073709551616",
+        ),
+    ] {
+        fs::write(&path, text).unwrap();
+        assert_eq!(
+            format!(
+                "{:#}",
+                crate::native::session::cancel::read(&reader).unwrap_err()
+            ),
+            "invalid cancel record"
+        );
+    }
+    fs::write(&path, "{}").unwrap();
+    assert_eq!(
+        format!(
+            "{:#}",
+            crate::native::session::cancel::read(&reader).unwrap_err()
+        ),
+        format!(
+            "invalid JSON in {}: missing field `schema` at line 1 column 2",
+            path.display()
+        )
+    );
+}
+
+#[test]
+fn record_reader_characterization_terminal_projections_keep_unknown_fields() {
+    use crate::native::query::observation::SurfaceRecord;
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let path = fixture.directory.join("terminal.closed.json");
+    let marker = serde_json::json!({"consumed":true,"terminal":"future-terminal","reason":"kept","extra":{"opaque":1}});
+    fs::write(&path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    assert!(reader.terminal_closed().is_err());
+    match SurfaceRecord::read(&reader) {
+        SurfaceRecord::Closed(Ok(value)) => assert_eq!(value, marker),
+        _ => panic!("raw observation must retain an unknown terminal kind"),
+    }
+    let timeline = crate::native::query::timeline_value(&reader, "session-fault", None).unwrap();
+    let entry = timeline["session_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stage"] == "terminal_closed")
+        .unwrap();
+    assert_eq!(entry["detail"], marker);
+    fs::write(&path, r#"{"consumed":true,"terminal":null}"#).unwrap();
+    let typed = reader.terminal_closed().unwrap();
+    assert!(typed.consumed);
+    assert_eq!(typed.terminal, None);
+    assert_eq!(typed.reason, None);
+    fs::write(
+        fixture.directory.join("terminal.json"),
+        r#"{"iterm_session_id":"legacy","extra":1}"#,
+    )
+    .unwrap();
+    assert_eq!(reader.terminal().unwrap().id, "legacy");
+}
+
+#[test]
+fn record_reader_characterization_timeline_retains_range_and_error_contexts() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let path = fixture.directory.join("terminal.closed.json");
+    for (text, reason) in [
+        (
+            r#"{"consumed":true,"extra":{"created_unix_ms":18446744073709551616}}"#,
+            "record timestamp is outside the JSON unsigned integer range",
+        ),
+        ("{", "EOF while parsing an object at line 1 column 1"),
+    ] {
+        fs::write(&path, text).unwrap();
+        let timeline =
+            crate::native::query::timeline_value(&reader, "session-fault", None).unwrap();
+        let entry = timeline["session_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["stage"] == "terminal_closed")
+            .unwrap();
+        assert_eq!(entry["record_state"], "unreadable");
+        assert_eq!(entry["detail"], reason);
+    }
+    fs::remove_file(&path).unwrap();
+    fs::write(fixture.directory.join("terminal.closing.json"), "{}").unwrap();
+    let timeline = crate::native::query::timeline_value(&reader, "session-fault", None).unwrap();
+    let entry = timeline["session_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stage"] == "terminal_closing")
+        .unwrap();
+    assert_eq!(
+        entry["detail"],
+        "invalid JSON record: missing field `session_id` at line 1 column 2"
+    );
+}

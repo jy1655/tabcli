@@ -218,7 +218,7 @@ fn run_with(
     let session: terminal::TerminalSession = RecordReader::at(
         &terminal::windows_console_handle_path(&directory, request.is_close()),
     )
-    .json()?;
+    .json_with(crate::native::session::record::terminal)?;
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
