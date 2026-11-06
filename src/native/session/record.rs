@@ -1,12 +1,13 @@
 //! One decoder per JSON core Record, the byte source a Snapshot is assembled from, and
 //! the Live adapter over a session directory.
 //!
-//! A Snapshot decoder is pure over bytes: strict UTF-8, the `*_unix_ms` unsigned-range rule, the
-//! Record's shape, then the Record's own rules, one error each. It carries no path and no
-//! caller context; every caller adds its own and keeps its own missing-record policy. The
-//! Claim is a text token, not a decoded Record, and keeps its readers.
-//! Reopen's auxiliary shapes retain their older text-decoding policy, documented below.
-use super::schema::{SESSION_SCHEMA, SessionManifest};
+//! A core Snapshot record decoder is pure over bytes: strict UTF-8, the `*_unix_ms`
+//! unsigned-range rule, the Record's shape, then the Record's own rules, one error each.
+//! It carries no path or caller context; each caller keeps its own missing-record policy.
+//! The Claim is a text token, not a decoded Record, and keeps its readers.
+//! Auxiliary, event, cancel and terminal projections retain their older text-decoding
+//! policies, documented below. I/O, byte budgets, cache selection and locks stay with readers.
+use super::schema::{SESSION_SCHEMA, SessionEvent, SessionManifest, TerminalTombstone};
 use super::turn::{
     JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
 };
@@ -169,6 +170,67 @@ pub(in crate::native) fn provider_process(
     text: &str,
 ) -> serde_json::Result<super::schema::ProviderProcessRecord> {
     serde_json::from_str(text)
+}
+
+// These projections preserve the callers' older text policies. In particular, event and
+// cancel text may already be lossy, while attachments and required terminal reads are
+// strict. Neither shape decoding nor a tombstone projection adds timestamp/schema rules.
+pub(in crate::native) fn event(text: &str) -> serde_json::Result<SessionEvent> {
+    serde_json::from_str(text)
+}
+
+pub(in crate::native) fn cancel(text: &str) -> serde_json::Result<super::cancel::Cancel> {
+    serde_json::from_str(text)
+}
+
+/// Active and claimed-closing handles have the same shape, including legacy aliases.
+pub(in crate::native) fn terminal(
+    text: &str,
+) -> serde_json::Result<crate::native::terminal::TerminalSession> {
+    serde_json::from_str(text)
+}
+
+/// Retained-handle repair historically decodes directly from bytes, preserving serde's
+/// UTF-8 diagnostics rather than the text reader's I/O diagnostic.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminal_bytes(
+    bytes: &[u8],
+) -> serde_json::Result<crate::native::terminal::TerminalSession> {
+    serde_json::from_slice(bytes)
+}
+
+/// The self-test's typed projection of the handle consumed by close.
+pub(in crate::native) fn terminal_tombstone(text: &str) -> serde_json::Result<TerminalTombstone> {
+    serde_json::from_str(text)
+}
+
+/// Observation and timeline retain the full value, including unknown terminal kinds
+/// and fields. A typed self-test projection must not narrow these readers.
+pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(text)
+}
+
+/// Close only asks for a reason. Malformed JSON or a non-string reason means none;
+/// neither a typed terminal kind nor a consumed fact is required by this projection.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminal_consumption_reason(text: &str) -> Option<String> {
+    terminal_tombstone_value(text)
+        .ok()?
+        .get("reason")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Timeline's retained-byte policy, including its historical error contexts: invalid
+/// UTF-8, then JSON syntax, then recursive timestamp range, then the selected shape.
+/// Unlike `decode`, only the shape error receives `invalid JSON record` here.
+pub(in crate::native) fn timeline<T>(
+    bytes: &[u8],
+    shape: impl FnOnce(&str) -> serde_json::Result<T>,
+) -> Result<T> {
+    let text = std::str::from_utf8(bytes).context("invalid UTF-8")?;
+    timestamps_in_range(&serde_json::from_str::<Value>(text)?)?;
+    shape(text).context("invalid JSON record")
 }
 
 /// What a source holds for one core Record.

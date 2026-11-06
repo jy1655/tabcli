@@ -1,9 +1,9 @@
 use super::readiness::{ReadinessTiming, wait_for_startup_readiness_with};
 use super::receipt::confirm_input_receipt_with;
 use super::trust::wait_for_workspace_trust;
-use super::{
-    AGY_LOG_FILE, INPUT_RECEIPT_WINDOW, PendingAgyTurn, STARTUP_POLL_INTERVAL, read_pending_turn,
-};
+use super::turn::{PendingAgyTurn, read_pending_turn};
+use super::{AGY_LOG_FILE, INPUT_RECEIPT_WINDOW, STARTUP_POLL_INTERVAL};
+
 use crate::native::consent::Environment;
 use crate::native::session::{Reader, RecordReader, Store};
 use crate::native::terminal;

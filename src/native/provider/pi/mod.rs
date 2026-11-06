@@ -1,3 +1,6 @@
+use self::turn::{cancel_pending_turn, correlated_prompt, install_pending_turn};
+#[cfg(any(not(windows), test))]
+use self::turn::{read_pending_turn, terminal_correlated_prompt};
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 mod credentials;
 mod hook;
@@ -7,6 +10,7 @@ mod startup;
 mod startup_ready;
 #[cfg(test)]
 mod test_support;
+mod turn;
 mod usage;
 use super::super::terminal;
 use super::{
@@ -16,20 +20,17 @@ use super::{
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
-use crate::native::session::turn;
-use crate::native::session::{Reader, RecordStore, Store};
+use crate::native::session::turn as session_turn;
+use crate::native::session::{Reader, RecordStore};
 use agent_bridge::{
     FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
 };
 use anyhow::{Context, Result, bail};
 use credentials::credential_diagnosis;
-use hook::{pi_owned_string, pi_string, record_correlated_failure};
 use monitor::PiFailureMonitor;
-use serde::{Deserialize, Serialize};
 use startup::send_initial_prompt;
 use startup_ready::StartupReadiness;
 use std::{cell::RefCell, ffi::OsString, path::Path, sync::LazyLock, time::Duration};
-use usage::reported_usage;
 
 pub(super) static ADAPTER: PiAdapter = PiAdapter;
 
@@ -44,31 +45,6 @@ fn launch_environment_removals() -> &'static [&'static str] {
         .concat()
     });
     &REMOVALS
-}
-
-const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
-
-const CANCEL_ACCEPTED_FILE: &str = "pi-cancel-accepted.json";
-
-#[derive(Debug, Deserialize, Serialize)]
-struct PendingPiTurn {
-    schema: u32,
-    claim_token: String,
-    marker: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    windows_input: Option<input::Fingerprint>,
-}
-
-impl PendingPiTurn {
-    fn new(claim_token: &str) -> Result<Self> {
-        validate_claim_token(claim_token)?;
-        Ok(Self {
-            schema: 1,
-            claim_token: claim_token.to_owned(),
-            marker: format!("<!-- agent-bridge-pi-turn:{claim_token} -->"),
-            windows_input: None,
-        })
-    }
 }
 
 // Pi 0.84.4 keeps only transcript files under ~/.pi; no lock, pid, or registry identifies
@@ -286,7 +262,7 @@ impl NativeProviderAdapter for PiAdapter {
         // A legacy record is unsupported before the Claim is read, as before this module.
         if let StartupReadiness::Present(ready) = startup_ready::read(&reader)
             && ready.offers_cancel()
-            && turn::current_claim_token(&reader)?
+            && session_turn::current_claim_token(&reader)?
                 .is_some_and(|claim| ready.supports_cancel_for(&claim))
         {
             return Ok(super::CancelSupport::Supported);
@@ -399,77 +375,12 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
-        let Some(pending) = read_pending_turn(directory)? else {
-            return Ok(());
-        };
-        if pi_string(payload, "agent_bridge_claim_token") != Some(pending.claim_token.as_str()) {
-            return Ok(());
-        }
-        if payload
-            .get("agent_bridge_prompt_correlated")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        {
-            return Ok(());
-        }
-        let provider_session_id = pi_owned_string(payload, "session_id");
-        let turn_id = pi_owned_string(payload, "turn_id");
-        // Usage is information beside the outcome; a malformed usage never changes it.
-        let usage = reported_usage(payload);
-        if let Some(error) = pi_string(payload, "agent_bridge_error")
-            .map(str::trim)
-            .filter(|error| !error.is_empty())
-        {
-            if pi_string(payload, "agent_bridge_cancel_claim_token")
-                == Some(pending.claim_token.as_str())
-            {
-                // Report rechecks cancel.json under the lifecycle lock. Missing,
-                // damaged or different-claim intent remains an ordinary failure.
-                return turn::Report::for_claim(
-                    &Store::open_unchecked(directory),
-                    FirstPartyCli::Pi,
-                    Some(&pending.claim_token),
-                )
-                .with_usage(usage.usage, usage.usage_error)
-                .cancelled(error, provider_session_id, turn_id)
-                .context("failed to record the correlated Pi interruption");
-            }
-            return record_correlated_failure(
-                directory,
-                error,
-                provider_session_id,
-                turn_id,
-                &pending,
-                usage,
-            );
-        }
-        let raw_message = pi_string(payload, "last_assistant_message")
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-            .context("Pi hook payload has no assistant result")?;
-        let Ok(message) = correlated_response(raw_message, &pending) else {
-            return Ok(());
-        };
-        turn::Report::for_claim(
-            &Store::open_unchecked(directory),
-            FirstPartyCli::Pi,
-            Some(&pending.claim_token),
-        )
-        .with_usage(usage.usage, usage.usage_error)
-        .complete(message, provider_session_id, turn_id)
-        .context("failed to record the correlated Pi result")
+        turn::handle_hook(directory, payload)
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Pi does not expose Agent Bridge provider controls")
     }
-}
-
-fn validate_claim_token(claim_token: &str) -> Result<()> {
-    if !turn::valid_turn_claim_token(claim_token) {
-        bail!("invalid Pi turn claim token")
-    }
-    Ok(())
 }
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
@@ -491,8 +402,9 @@ fn prepare_launch_for_platform(
     windows: bool,
     authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
 ) -> Result<LaunchPlan> {
-    let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
-        .context("Pi launch has no native turn claim")?;
+    let claim_token =
+        session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
+            .context("Pi launch has no native turn claim")?;
     let pending = install_pending_turn(context.directory, &claim_token)?;
     let extension_path = context.directory.join("pi-agent-bridge.js");
     RecordStore::at(&extension_path).write_private(bridge_extension().as_bytes())?;
@@ -555,123 +467,6 @@ impl ActiveWatcher for PiFailureMonitor {
     fn stop(self: Box<Self>) -> Result<()> {
         PiFailureMonitor::stop(*self)
     }
-}
-
-fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {
-    install_pending_turn_bound(directory, claim_token, None)
-}
-
-fn install_pending_turn_bound(
-    directory: &Path,
-    claim_token: &str,
-    windows_input: Option<input::Fingerprint>,
-) -> Result<PendingPiTurn> {
-    let mut pending = PendingPiTurn::new(claim_token)?;
-    pending.windows_input = windows_input;
-    let store = Store::open_unchecked(directory);
-    // Both installations (the launch plan while the session is Launching, and a
-    // follow-up before delivery) require the current Claim of a session that has no
-    // close tombstone and whose stored state is not ended; the rollback cancel below
-    // checks the token only, because cleanup must run in any state.
-    let result = (turn::ClaimCurrency {
-        expected: Some(claim_token),
-        state: turn::ClaimState::NotEnded,
-        tombstone: turn::ClaimTombstone::Refused,
-        expires: None,
-    })
-    .run(&store, || {
-        store.private(CANCEL_ACCEPTED_FILE).remove()?;
-        // Startup proves the installed extension's capability for the whole session.
-        // Carry that evidence to a follow-up claim before delivery, including after a
-        // rolled-back delivery; never upgrade a legacy extension's schema.
-        startup_ready::carry_forward(&store, claim_token)?;
-        store.private(PENDING_TURN_FILE).write_json(&pending)?;
-        Ok(pending)
-    })?;
-    match result {
-        Ok(pending) => Ok(pending),
-        Err(turn::StaleClaim::Changed) => {
-            bail!("Pi pending turn no longer holds the session claim")
-        }
-        Err(_) => bail!("Pi session ended; no pending turn installed"),
-    }
-}
-
-fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn>> {
-    let Some(text) = Reader::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .timeline(4096)?
-    else {
-        return Ok(None);
-    };
-    let pending: PendingPiTurn =
-        serde_json::from_slice(&text).context("failed to parse the pending Pi turn")?;
-    let expected = PendingPiTurn::new(&pending.claim_token)?;
-    if pending.schema != expected.schema || pending.marker != expected.marker {
-        bail!("Agent Bridge rejected invalid Pi turn correlation state")
-    }
-    if let Some(fingerprint) = &pending.windows_input {
-        fingerprint.validate()?;
-    }
-    Ok(Some(pending))
-}
-
-fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
-    let store = Store::open_unchecked(directory);
-    let _lock = store.lock()?;
-    if (turn::ClaimCurrency {
-        expected: Some(claim_token),
-        state: turn::ClaimState::Any,
-        tombstone: turn::ClaimTombstone::Ignored,
-        expires: None,
-    })
-    .check(&store)?
-    .is_err()
-    {
-        return Ok(());
-    }
-    let Some(pending) = read_pending_turn(directory)? else {
-        return Ok(());
-    };
-    if pending.claim_token != claim_token {
-        return Ok(());
-    }
-    store.private(CANCEL_ACCEPTED_FILE).remove()?;
-    store.private(PENDING_TURN_FILE).remove()
-}
-
-fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
-    format!(
-        "{prompt}\n\n[Agent Bridge Pi turn protocol]\nCorrelation marker for the Agent Bridge extension:\n{}",
-        pending.marker
-    )
-}
-
-fn terminal_correlated_prompt(
-    prompt: &str,
-    pending: &PendingPiTurn,
-    windows: bool,
-) -> Result<String> {
-    if !windows {
-        return Ok(correlated_prompt(prompt, pending));
-    }
-    let encoded = serde_json::to_string(prompt)?;
-    Ok(format!(
-        "[Agent Bridge Pi Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs, and complete it as one turn. Request JSON: {encoded} Correlation marker for the Agent Bridge extension: {}",
-        pending.marker
-    ))
-}
-
-fn correlated_response<'a>(message: &'a str, pending: &PendingPiTurn) -> Result<&'a str> {
-    let message = message.trim_end();
-    let body = message
-        .strip_suffix(&pending.marker)
-        .unwrap_or(message)
-        .trim_end();
-    if body.is_empty() {
-        bail!("Pi correlated response contained no assistant text")
-    }
-    Ok(body)
 }
 
 fn bridge_extension() -> &'static str {

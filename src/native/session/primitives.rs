@@ -138,9 +138,16 @@ pub(in crate::native) fn read_manifest(directory: &Path) -> Result<SessionManife
 }
 
 pub(in crate::native) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    read_json_with(path, |text| serde_json::from_str(text))
+}
+
+pub(in crate::native) fn read_json_with<T>(
+    path: &Path,
+    shape: impl FnOnce(&str) -> serde_json::Result<T>,
+) -> Result<T> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("invalid JSON in {}", path.display()))
+    shape(&text).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
 // Observe the actual I/O boundary, not time spent reaching it. Test callbacks

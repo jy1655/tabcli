@@ -1,7 +1,7 @@
 use super::super::test_support::{
     claim_pending_turn, go_quoted, marked, parse_transcript_line, planner_line, receipt_line,
 };
-use super::super::{PENDING_TURN_FILE, PendingAgyTurn, terminal_correlated_prompt};
+use super::super::turn::{PENDING_TURN_FILE, PendingAgyTurn, terminal_correlated_prompt};
 use super::*;
 use crate::native::session::SessionState;
 use crate::native::session::primitives::{event_paths, read_json};

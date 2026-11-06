@@ -1,7 +1,9 @@
 use super::startup_ready::{STARTUP_READY_FILE, StartupReady};
 #[cfg(windows)]
 use super::test_support::InputScenario;
+use super::turn::*;
 use super::*;
+use crate::native::session::Store;
 use crate::native::session::{CoreRecord, SessionState, update_status};
 use std::fs;
 
@@ -208,7 +210,7 @@ fn delivery_without_pi_event(initial: bool) {
         "console batch success alone must remain Uncertain, got {result:?}"
     );
     assert_eq!(
-        turn::current_claim_token(&fixture.store)
+        session_turn::current_claim_token(&fixture.store)
             .unwrap()
             .as_deref(),
         Some(token.as_str())
@@ -258,7 +260,7 @@ fn input_ack_capability_survives_two_followups_and_rollback() {
         .unwrap();
     for _ in 0..2 {
         store.record(CoreRecord::TurnClaim).remove().unwrap();
-        let next = turn::claim(&store, &[]).unwrap();
+        let next = session_turn::claim(&store, &[]).unwrap();
         let token = next.token().to_owned();
         next.retain();
         install_pending_turn(directory.path(), &token).unwrap();
@@ -415,7 +417,7 @@ fn input_ack_shipping_extension_round_trips_real_core_and_pending_records() {
 #[cfg(windows)]
 fn deliver_pi(
     fixture: &delivery::test_support::Fixture,
-    claim: turn::Claim,
+    claim: session_turn::Claim,
     initial: bool,
     scenario: &mut InputScenario,
 ) -> Result<delivery::Delivered> {
@@ -500,7 +502,11 @@ fn initial_transport_rechecks_startup_before_input_receipt_delivery() {
     assert!(format!("{error:#}").contains("Pi initial turn is missing"));
     assert_eq!(scenario.sends, 0);
     assert_eq!(scenario.reads, 0);
-    assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
+    assert!(
+        session_turn::current_claim_token(&fixture.store)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -535,7 +541,11 @@ fn input_ack_legacy_or_unknown_capability_refuses_both_transports_before_input()
                 other => panic!("{record:?} was observed as {other:?}"),
             }
             assert_eq!(scenario.sends, 0);
-            assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
+            assert!(
+                session_turn::current_claim_token(&fixture.store)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 }
@@ -559,7 +569,11 @@ fn input_ack_proven_prewrite_refusal_rolls_back_without_waiting() {
         assert_eq!(scenario.sends, 1);
         assert_eq!(scenario.reads, 0);
         assert_eq!(scenario.clock.slept, Duration::ZERO);
-        assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
+        assert!(
+            session_turn::current_claim_token(&fixture.store)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             fixture.store.private(PENDING_TURN_FILE).path().exists(),
             initial
@@ -582,10 +596,12 @@ fn input_ack_fast_completion_and_next_claim_preserve_the_first_senders_receipt()
             let prompt = fs::read_to_string(path).unwrap();
             publish_receipt(&directory, &first, &prompt);
             let store = Store::open_unchecked(&directory);
-            turn::Report::for_claim(&store, FirstPartyCli::Pi, Some(&first))
+            session_turn::Report::for_claim(&store, FirstPartyCli::Pi, Some(&first))
                 .complete("done", None, None)
                 .unwrap();
-            let next = turn::claim_ready(&store, "session-test", &[]).unwrap().0;
+            let next = session_turn::claim_ready(&store, "session-test", &[])
+                .unwrap()
+                .0;
             let surface = serde_json::from_value(
                 serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
             )
@@ -603,7 +619,9 @@ fn input_ack_fast_completion_and_next_claim_preserve_the_first_senders_receipt()
         deliver_pi(&fixture, claim, initial, &mut scenario).unwrap();
         assert_eq!(scenario.sends, 1);
         assert_eq!(scenario.reads, 1);
-        let next = turn::current_claim_token(&fixture.store).unwrap().unwrap();
+        let next = session_turn::current_claim_token(&fixture.store)
+            .unwrap()
+            .unwrap();
         assert_ne!(next, token);
         assert_eq!(
             read_pending_turn(fixture.store.directory())
@@ -747,7 +765,7 @@ fn input_ack_invalid_receipts_are_uncertain_and_never_roll_back_dispatched_input
         assert_eq!(outcome.is_ok(), kind == "uncertain_write", "{kind}");
         assert_eq!(scenario.sends, 1);
         assert_eq!(
-            turn::current_claim_token(&fixture.store)
+            session_turn::current_claim_token(&fixture.store)
                 .unwrap()
                 .as_deref(),
             Some(token.as_str())
@@ -808,7 +826,7 @@ fn input_ack_receipt_observed_after_the_original_deadline_cannot_report_sent() {
         "a receipt observed after the original deadline cannot be Sent"
     );
     assert_eq!(
-        turn::current_claim_token(&fixture.store)
+        session_turn::current_claim_token(&fixture.store)
             .unwrap()
             .as_deref(),
         Some(token.as_str())

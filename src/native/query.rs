@@ -461,7 +461,7 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
         }
         Err(error) => {
             if request.json {
-                envelope::print(&envelope::error(&error, json!({"session": request.id, "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
+                envelope::print(&super::failure_policy::runtime_error("result", &error, json!({"session": request.id, "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
                 "result": null }).as_object().unwrap().clone()))?;
             }
             Err(error)
@@ -545,7 +545,8 @@ pub(super) fn run_inspect(
     if let Err(error) = &outcome
         && json
     {
-        envelope::print(&envelope::error(
+        envelope::print(&super::failure_policy::runtime_error(
+            "inspect",
             error,
             json!({"session": id,
             "stored_state": "unknown", })

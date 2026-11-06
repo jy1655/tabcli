@@ -1,3 +1,4 @@
+use super::records::*;
 use super::*;
 use crate::native::clock::FakeClock;
 use crate::native::session::{CoreRecord, SessionState, schema::SessionEvent};
@@ -985,3 +986,4 @@ mod continuation_tests;
 
 mod doctor_tests;
 mod question_tests;
+mod record_tests;

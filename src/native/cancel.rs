@@ -13,7 +13,7 @@ pub(crate) struct Request {
 }
 
 pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
-    let parsed = (|| {
+    (|| {
         let mut id = None;
         let mut json = false;
         for arg in args {
@@ -30,11 +30,7 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
             id: id.context("cancel requires one session id")?,
             json,
         }))
-    })();
-    if let Err(error) = &parsed {
-        envelope::parse_failure(args, error, serde_json::Map::new())?;
-    }
-    parsed
+    })()
 }
 
 pub(super) fn run(request: Request) -> Result<()> {
@@ -66,7 +62,8 @@ pub(super) fn run(request: Request) -> Result<()> {
         ),
         Err(error) => {
             if request.json {
-                envelope::print(&envelope::error(
+                envelope::print(&crate::native::failure_policy::runtime_error(
+                    "cancel",
                     &error,
                     serde_json::Map::from_iter([("session".into(), json!(request.id))]),
                 ))?;

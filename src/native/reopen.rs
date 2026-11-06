@@ -517,7 +517,7 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
                 ),
             ));
         }
-        let event = session::RecordReader::at(&event_path).json::<SessionEvent>().map_err(|error| {
+        let event = session::RecordReader::at(&event_path).json_with(session::record::event).map_err(|error| {
             reopen_refusal(
                 ReopenGate::RequestUnresolved,
                 format!(
@@ -566,17 +566,19 @@ fn latest_provider_event_identity(
 ) -> Result<Option<(String, String)>> {
     let mut newest = None;
     for path in Reader::open_unchecked(directory).events()? {
-        let event: SessionEvent = session::RecordReader::at(&path).json().map_err(|error| {
-            reopen_refusal(
-                ReopenGate::RequestUnresolved,
-                format!(
-                    "session {id} has a recorded result {} that cannot be read: {error:#}",
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default()
-                ),
-            )
-        })?;
+        let event: SessionEvent = session::RecordReader::at(&path)
+            .json_with(session::record::event)
+            .map_err(|error| {
+                reopen_refusal(
+                    ReopenGate::RequestUnresolved,
+                    format!(
+                        "session {id} has a recorded result {} that cannot be read: {error:#}",
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default()
+                    ),
+                )
+            })?;
         if event.provider != provider.as_str() {
             continue;
         }

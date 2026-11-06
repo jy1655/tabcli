@@ -22,6 +22,7 @@ mod diagnostics;
 mod doctor;
 mod envelope;
 mod failure_kind;
+mod failure_policy;
 mod hold;
 mod hook;
 #[cfg(unix)]
@@ -116,6 +117,7 @@ pub(crate) struct CommandSpec {
     parse: fn(&str, &[String]) -> Result<NativeCommand>,
     // A public command is one with a contract, whose synopsis is the only source of its Usage lines.
     contract: Option<&'static describe::Contract>,
+    failure: Option<failure_policy::Policy>,
 }
 
 impl CommandSpec {
@@ -130,147 +132,252 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "describe",
         parse: |_, args| describe::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(0),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::DESCRIBE),
     },
     CommandSpec {
         name: "ask",
         parse: |_, args| session_start::parse_ask(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::TurnReport,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::ASK),
     },
     CommandSpec {
         name: "self-test",
         parse: |_, args| self_test::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(6),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::SELF_TEST),
     },
     CommandSpec {
         name: "tell",
         parse: |_, args| tell::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::TurnReport,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::TELL),
     },
     CommandSpec {
         name: "hold",
         parse: |_, args| hold::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(1),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::HOLD),
     },
     CommandSpec {
         name: "cancel",
         parse: |_, args| cancel::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(2),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::CANCEL),
     },
     CommandSpec {
         name: "reopen",
         parse: |_, args| reopen::parse_reopen(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::TurnReport,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::REOPEN),
     },
     CommandSpec {
         name: "sessions",
         parse: |_, args| sessions::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(2),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::SESSIONS),
     },
     CommandSpec {
         name: "status",
         parse: |_, args| query::status::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(5),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Sessions,
+        }),
         contract: Some(&describe::STATUS),
     },
     CommandSpec {
         name: "inspect",
         parse: |_, args| query::parse_inspect(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::INSPECT),
     },
     CommandSpec {
         name: "screen",
         parse: |_, args| query::screen::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(3),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::SCREEN),
     },
     CommandSpec {
         name: "result",
         parse: |_, args| query::parse_result(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::RESULT),
     },
     CommandSpec {
         name: "wait",
         parse: |_, args| query::wait::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(4),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Wait,
+        }),
         contract: Some(&describe::WAIT),
     },
     CommandSpec {
         name: "search",
         parse: |_, args| query::search::parse_search(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: Some(6),
+            runtime: failure_policy::RuntimeFailure::Envelope,
+            fields: failure_policy::Fields::Search,
+        }),
         contract: Some(&describe::SEARCH),
     },
     CommandSpec {
         name: "doctor",
         parse: |_, args| doctor::parse_args(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(5),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::DOCTOR),
     },
     CommandSpec {
         name: "consent",
         parse: |_, args| parse_consent(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(0),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::CONSENT),
     },
     CommandSpec {
         name: "settings",
         parse: |_, args| parse_settings(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(1),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::SETTINGS),
     },
     CommandSpec {
         name: "prune-sessions",
         parse: |_, args| prune::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(3),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::PRUNE),
     },
     CommandSpec {
         name: "close-session",
         parse: |_, args| close::parse(args),
+        failure: Some(failure_policy::Policy {
+            parse_order: None,
+            runtime: failure_policy::RuntimeFailure::Stderr(4),
+            fields: failure_policy::Fields::Empty,
+        }),
         contract: Some(&describe::CLOSE),
     },
     CommandSpec {
         name: "native-session",
         parse: |_, args| parse_session(args),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: "native-hook",
         parse: |_, args| hook::parse(args),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: "native-provider-control",
         parse: |_, args| parse_provider_control(args),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: "native-console-control",
         parse: |_, args| console_control::parse(args),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: terminal::host::CONSOLE_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: terminal::host::ITERM2_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: terminal::host::APPLE_TERMINAL_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: terminal::host::WEZTERM_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: terminal::host::GHOSTTY_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,
+        failure: None,
     },
     CommandSpec {
         name: terminal::host::WARP_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,
+        failure: None,
     },
 ];
 
@@ -292,7 +399,13 @@ where
         .iter()
         .find(|entry| entry.name == command)
         .with_context(|| format!("unknown native command: {command}"))?;
-    (entry.parse)(command, rest)
+    let parsed = (entry.parse)(command, rest);
+    if let Err(error) = &parsed
+        && let Some(policy) = entry.failure
+    {
+        policy.emit_parse_failure(rest, error)?;
+    }
+    parsed
 }
 
 fn parse_consent(rest: &[String]) -> Result<NativeCommand> {

@@ -139,6 +139,13 @@ impl RecordReader {
     pub(in crate::native) fn json<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
         read_json(&self.path)
     }
+    /// Required strict-text I/O, with interpretation owned by the selected record decoder.
+    pub(in crate::native) fn json_with<T>(
+        &self,
+        shape: impl FnOnce(&str) -> serde_json::Result<T>,
+    ) -> Result<T> {
+        read_json_with(&self.path, shape)
+    }
     pub(in crate::native) fn text(&self) -> Result<Option<String>> {
         read_regular_text_if_present(&self.path)
     }
@@ -221,10 +228,12 @@ impl Reader {
         self.private(SESSION_OWNER_FILE).json()
     }
     pub(in crate::native) fn terminal(&self) -> Result<terminal::TerminalSession> {
-        self.private(TERMINAL_HANDLE_FILE).json()
+        self.private(TERMINAL_HANDLE_FILE)
+            .json_with(record::terminal)
     }
     pub(in crate::native) fn terminal_closed(&self) -> Result<TerminalTombstone> {
-        self.private(TERMINAL_TOMBSTONE_FILE).json()
+        self.private(TERMINAL_TOMBSTONE_FILE)
+            .json_with(record::terminal_tombstone)
     }
     pub(in crate::native) fn provider_process(&self) -> Result<ProviderProcessRecord> {
         let path = self.private(PROVIDER_PROCESS_FILE).path;
@@ -514,10 +523,17 @@ impl RecordReader {
     pub(in crate::native) fn optional_json<T: for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<T>> {
+        self.optional_json_with(|text| serde_json::from_str(text))
+    }
+    /// Optional regular-file I/O retains its legacy lossy text policy; the record owns
+    /// only interpretation. Missing files and I/O context remain this reader's policy.
+    pub(in crate::native) fn optional_json_with<T>(
+        &self,
+        shape: impl FnOnce(&str) -> serde_json::Result<T>,
+    ) -> Result<Option<T>> {
         read_regular_text_if_present(&self.path)?
             .map(|text| {
-                serde_json::from_str(&text)
-                    .with_context(|| format!("invalid JSON in {}", self.path.display()))
+                shape(&text).with_context(|| format!("invalid JSON in {}", self.path.display()))
             })
             .transpose()
     }

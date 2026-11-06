@@ -244,7 +244,7 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
                     "Ghostty launch was cancelled, timed out or is not the one sent to this terminal"
                 );
             }
-            let surface: TerminalSession = serde_json::from_str(
+            let surface: TerminalSession = crate::native::session::record::terminal(
                 &Reader::open_unchecked(directory)
                     .record(CoreRecord::Terminal)
                     .text()?

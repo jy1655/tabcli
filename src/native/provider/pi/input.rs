@@ -33,15 +33,15 @@ impl Fingerprint {
     }
 }
 
-#[cfg(any(windows, test))]
-use super::PendingPiTurn;
 use super::TurnContext;
 #[cfg(any(windows, test))]
 use super::startup_ready::valid_session_id;
 #[cfg(windows)]
 use super::startup_ready::{self, WindowsInput};
+#[cfg(any(windows, test))]
+use super::turn::PendingPiTurn;
 #[cfg(windows)]
-use super::{Prepared, turn};
+use super::{Prepared, session_turn};
 #[cfg(windows)]
 use crate::native::clock::{Clock, SystemClock};
 #[cfg(any(windows, test))]
@@ -56,15 +56,15 @@ use std::time::Duration;
 #[cfg(any(windows, test))]
 pub(super) fn prepare_windows(turn: &TurnContext<'_>, initial: bool) -> Result<String> {
     let pending = if initial {
-        super::read_pending_turn(turn.directory)?.context("Pi initial turn is missing")?
+        super::turn::read_pending_turn(turn.directory)?.context("Pi initial turn is missing")?
     } else {
         PendingPiTurn::new(turn.claim_token)?
     };
     if pending.claim_token != turn.claim_token {
         bail!("Pi input does not identify this turn claim");
     }
-    let prompt = super::terminal_correlated_prompt(turn.prompt, &pending, true)?;
-    super::install_pending_turn_bound(
+    let prompt = super::turn::terminal_correlated_prompt(turn.prompt, &pending, true)?;
+    super::turn::install_pending_turn_bound(
         turn.directory,
         turn.claim_token,
         Some(Fingerprint::of(&prompt)),
@@ -90,7 +90,7 @@ pub(super) fn read_accepted(
     claim: &str,
     fingerprint: &Fingerprint,
 ) -> Result<bool> {
-    super::validate_claim_token(claim)?;
+    super::turn::validate_claim_token(claim)?;
     let reader = Reader::open_unchecked(directory);
     let Some(bytes) = reader
         .private(&format!("pi-input-accepted-{claim}.json"))
@@ -114,16 +114,16 @@ pub(super) fn read_accepted(
 #[cfg(windows)]
 pub(super) fn current(turn: &TurnContext<'_>) -> Result<()> {
     let reader = Reader::open_unchecked(turn.directory);
-    match (turn::ClaimCurrency {
+    match (session_turn::ClaimCurrency {
         expected: Some(turn.claim_token),
-        state: turn::ClaimState::NotEnded,
-        tombstone: turn::ClaimTombstone::Refused,
+        state: session_turn::ClaimState::NotEnded,
+        tombstone: session_turn::ClaimTombstone::Refused,
         expires: None,
     })
     .check(&reader)?
     {
         Ok(()) => {}
-        Err(turn::StaleClaim::Changed) => bail!("Pi turn claim retired or changed"),
+        Err(session_turn::StaleClaim::Changed) => bail!("Pi turn claim retired or changed"),
         Err(_) => bail!("Pi session ended"),
     }
     Ok(())
@@ -192,7 +192,7 @@ pub(super) fn send_windows(
 ) -> terminal::TerminalSendResult {
     let fingerprint = Fingerprint::of(&prepared.prompt);
     let mut preflight = || -> Result<()> {
-        super::validate_claim_token(turn.claim_token)?;
+        super::turn::validate_claim_token(turn.claim_token)?;
         let reader = Reader::open_unchecked(turn.directory);
         let capability = (|| -> Result<()> {
             let ready = match startup_ready::windows_input(&reader) {

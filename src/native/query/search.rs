@@ -55,23 +55,9 @@ pub(crate) struct SearchRequest {
     json: bool,
 }
 
-/// Argument errors keep the documented `--json` contract: when the raw options carry
-/// `--json`, the structured failure is printed to stdout before the error propagates.
+/// Parse only; the command registry owns structured argument-failure output.
 pub(in crate::native) fn parse_search(args: &[String]) -> Result<NativeCommand> {
-    match parse_search_options(args) {
-        Ok(command) => Ok(command),
-        Err(error) => {
-            envelope::parse_failure(
-                args.get(1..).unwrap_or_default(),
-                &error,
-                json!({"query": args.first().filter(|query| !query.trim().is_empty()), "hits": []})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )?;
-            Err(error)
-        }
-    }
+    parse_search_options(args)
 }
 
 /// Environment variable that opens the search test aids (`--max-bytes`) for the
@@ -85,13 +71,10 @@ fn search_test_aids_enabled() -> bool {
 }
 
 fn search_error_value(query: Option<&String>, error: &anyhow::Error) -> Value {
-    envelope::error(
+    crate::native::failure_policy::runtime_error(
+        "search",
         error,
-        json!({"query": query,
-        "hits": []})
-        .as_object()
-        .unwrap()
-        .clone(),
+        json!({"query": query}).as_object().unwrap().clone(),
     )
 }
 
@@ -409,7 +392,7 @@ fn search_session(
         let event: SessionEvent = match read {
             Ok(Some(text)) => {
                 scan.events_read += 1;
-                match serde_json::from_str(&text) {
+                match crate::native::session::record::event(&text) {
                     Ok(event) => event,
                     Err(error) => {
                         scan.incomplete(Some(id), format!("{name}: invalid JSON: {error}"));

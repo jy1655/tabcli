@@ -78,17 +78,18 @@ impl SurfaceRecord {
     /// handle, then the active handle. Reads only; the first record present decides.
     pub(in crate::native) fn read(reader: &Reader) -> Self {
         match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
-            .optional_json::<Value>()
+            .optional_json_with(session::record::terminal_tombstone_value)
         {
             Ok(Some(value)) => Self::Closed(Ok(value)),
             Err(error) => Self::Closed(Err(error)),
             Ok(None) => match RecordReader::at(reader.record(CoreRecord::TerminalClosing).path())
-                .optional_json::<terminal::TerminalSession>()
+                .optional_json_with(session::record::terminal)
             {
                 Ok(Some(value)) => Self::Closing(Ok(value)),
                 Err(error) => Self::Closing(Err(error)),
                 Ok(None) => Self::Active(
-                    RecordReader::at(reader.record(CoreRecord::Terminal).path()).optional_json(),
+                    RecordReader::at(reader.record(CoreRecord::Terminal).path())
+                        .optional_json_with(session::record::terminal),
                 ),
             },
         }
@@ -145,7 +146,7 @@ impl SessionEvidence {
                         .record(CoreRecord::Terminal)
                         .path(),
                 )
-                .optional_json::<terminal::TerminalSession>()?
+                .optional_json_with(session::record::terminal)?
                 .context("no active terminal handle is recorded")?;
                 session.verify_managed_session(
                     directory

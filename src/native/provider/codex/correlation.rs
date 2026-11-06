@@ -115,7 +115,8 @@ pub(super) fn codex_input_correlates(
 
 pub(super) fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
     for path in Reader::open_unchecked(directory).events()? {
-        let event: crate::native::session::schema::SessionEvent = RecordReader::at(&path).json()?;
+        let event: crate::native::session::schema::SessionEvent =
+            RecordReader::at(&path).json_with(crate::native::session::record::event)?;
         if event.provider == FirstPartyCli::Codex.as_str()
             && let Some(thread_id) = event.provider_session_id
         {

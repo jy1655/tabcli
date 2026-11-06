@@ -1,5 +1,5 @@
-use super::super::PendingAgyTurn;
 use super::super::test_support::{marked, planner_line};
+use super::super::turn::PendingAgyTurn;
 use super::*;
 use std::fs;
 

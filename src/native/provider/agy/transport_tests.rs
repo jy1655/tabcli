@@ -1,9 +1,11 @@
 use super::delivery::{Clock, Io, Runtime};
 use super::test_support::{claim_pending_turn, receipt_line};
+use super::turn::*;
 use super::*;
 use crate::native::clock::FakeClock;
 use crate::native::consent::{Environment, native_key};
 use crate::native::delivery::TurnKind;
+use crate::native::session::Store;
 use crate::native::session::primitives::{read_json, write_json_atomic, write_private};
 use crate::native::session::schema::SessionManifest;
 use crate::native::session::{SessionState, update_status};
@@ -202,7 +204,7 @@ impl Fixture {
     }
     fn assert_retained(&self) {
         assert_eq!(
-            turn::current_claim_token(&Reader::open_unchecked(&self.directory))
+            session_turn::current_claim_token(&Reader::open_unchecked(&self.directory))
                 .unwrap()
                 .as_deref(),
             Some(self.pending.claim_token.as_str())

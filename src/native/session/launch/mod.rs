@@ -146,8 +146,9 @@ pub(in crate::native) fn wait_for_binding(
         #[cfg(test)]
         binding_tests::checkpoint(binding_tests::Point::BeforeBinding);
         if let Some(text) = reader.record(CoreRecord::Terminal).text()? {
-            let surface: terminal::TerminalSession = serde_json::from_str(&text)
-                .with_context(|| format!("invalid {name} surface binding"))?;
+            let surface: terminal::TerminalSession =
+                crate::native::session::record::terminal(&text)
+                    .with_context(|| format!("invalid {name} surface binding"))?;
             surface.verify_managed_session(session_id)?;
             return Ok(surface);
         }

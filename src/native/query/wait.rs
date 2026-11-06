@@ -73,31 +73,11 @@ enum WakeReason {
 }
 
 fn error_value(error: &anyhow::Error) -> Value {
-    envelope::error(
-        error,
-        json!({"ended": null,
-        "remaining": [], "timed_out": false, })
-        .as_object()
-        .unwrap()
-        .clone(),
-    )
+    crate::native::failure_policy::runtime_error("wait", error, serde_json::Map::new())
 }
 
 pub(in crate::native) fn parse(args: &[String]) -> Result<NativeCommand> {
-    match parse_options(args) {
-        Ok(request) => Ok(NativeCommand::Wait(request)),
-        Err(error) => {
-            envelope::parse_failure(
-                args,
-                &error,
-                json!({"ended": null, "remaining": [], "timed_out": false})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )?;
-            Err(error)
-        }
-    }
+    parse_options(args).map(NativeCommand::Wait)
 }
 
 fn parse_options(args: &[String]) -> Result<WaitRequest> {

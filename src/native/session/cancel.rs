@@ -32,7 +32,9 @@ impl Cancel {
 }
 
 pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Cancel>> {
-    let record: Option<Cancel> = reader.record(CoreRecord::Cancel).optional_json()?;
+    let record: Option<Cancel> = reader
+        .record(CoreRecord::Cancel)
+        .optional_json_with(super::record::cancel)?;
     if let Some(record) = &record {
         record.validate()?;
     }

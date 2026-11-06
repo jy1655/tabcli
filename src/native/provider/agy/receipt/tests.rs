@@ -1,3 +1,4 @@
+use super::super::INPUT_RECEIPT_WINDOW;
 use super::super::delivery::input_receipt_window_end;
 use super::super::log::glog_timestamp;
 use super::super::readiness::SKILLS_RELOAD_MARKER;
@@ -7,7 +8,7 @@ use super::super::test_support::{
     framed_receipt_line, go_quoted, late_reload_completion, late_reload_startup_log, log_sequence,
     receipt_line, settled_startup_log, some_log, successful_startup_log,
 };
-use super::super::{INPUT_RECEIPT_WINDOW, PendingAgyTurn, terminal_correlated_prompt};
+use super::super::turn::{PendingAgyTurn, terminal_correlated_prompt};
 use super::*;
 use anyhow::Result;
 use std::time::{Duration, Instant};

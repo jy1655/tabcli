@@ -5,7 +5,10 @@ mod capped_output;
 pub(super) mod claude;
 mod codex;
 mod pi;
-// Shared tests write a Codex session's launch decision without spelling its records.
+// Shared tests write a Claude session's completion records and a Codex session's launch
+// decision without spelling their records.
+#[cfg(test)]
+pub(super) use claude::CompletionRecordFixture as ClaudeCompletionRecordFixture;
 #[cfg(test)]
 pub(super) use codex::LaunchDecisionFixture as CodexLaunchDecisionFixture;
 
@@ -463,13 +466,10 @@ mod tests {
             context_sources: Vec::new(),
         };
         // Malformed private records distinguish an adapter read from an unsupported operation.
-        for name in [
-            "codex-questions-1-2-3.json",
-            "claude-questions-1-2-3.json",
-            "claude-completion-mode.json",
-        ] {
+        for name in ["codex-questions-1-2-3.json", "claude-questions-1-2-3.json"] {
             store.private(name).write_private(b"{").unwrap();
         }
+        ClaudeCompletionRecordFixture::MALFORMED_MODE.write(directory.path());
         let reader = Reader::open_unchecked(directory.path());
         for (provider, questions, completion) in [
             (FirstPartyCli::Codex.as_str(), true, false),
@@ -606,12 +606,7 @@ mod tests {
             emission(FirstPartyCli::Codex),
             EmissionObservation::Unknown(_)
         ));
-        store
-            .private("claude-completion-mode.json")
-            .write_private(
-                br#"{"schema":1,"mode":"native_v1","reason":"windows_stable_2_1_302_or_newer","claude_version":"2.1.302"}"#,
-            )
-            .unwrap();
+        ClaudeCompletionRecordFixture::NATIVE_MODE.write(directory.path());
         // Native mode records the plugin prepared at launch only with its manifest; a
         // v0.4.25 native launch has none.
         assert_eq!(

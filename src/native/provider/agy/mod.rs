@@ -1,6 +1,10 @@
 use self::delivery::{Console, Io, Runtime, deliver_terminal_turn};
 use self::diagnostics::{input_receipt_check, tool_confirmation_check, workspace_trust_check};
 use self::readiness::ReadinessTiming;
+use self::turn::{
+    cancel_pending_turn, correlated_prompt, install_pending_turn, read_pending_turn,
+    terminal_correlated_prompt,
+};
 use crate::native::delivery as native_delivery;
 use crate::native::delivery::{
     Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
@@ -10,14 +14,13 @@ use crate::native::provider::{
     ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
     NativeProviderAdapter, ReopenSupport,
 };
-use crate::native::session::{Reader, Store, turn};
+use crate::native::session::{Reader, turn as session_turn};
 use crate::native::terminal;
 use agent_bridge::{
     FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
 };
 use anyhow::{Context, Result, bail};
 use monitor::AgyMonitor;
-use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -32,6 +35,7 @@ mod monitor;
 mod readiness;
 mod receipt;
 mod trust;
+mod turn;
 
 #[cfg(test)]
 mod test_support;
@@ -67,7 +71,6 @@ fn launch_environment_removals() -> &'static [&'static str] {
     &REMOVALS
 }
 
-const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 const TRANSCRIPT_FILE: &str = "transcript.jsonl";
 const FULL_TRANSCRIPT_FILE: &str = "transcript_full.jsonl";
 
@@ -102,24 +105,6 @@ fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::Dial
         return None;
     }
     Some(terminal::DialogKey::Enter)
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PendingAgyTurn {
-    schema: u32,
-    claim_token: String,
-    marker: String,
-}
-
-impl PendingAgyTurn {
-    fn new(claim_token: &str) -> Result<Self> {
-        validate_claim_token(claim_token)?;
-        Ok(Self {
-            schema: 1,
-            claim_token: claim_token.to_owned(),
-            marker: format!("<!-- agent-bridge-agy-turn:{claim_token} -->"),
-        })
-    }
 }
 
 // Agy 1.2.10 writes a presence lock for every conversation but no running process holds it,
@@ -429,13 +414,6 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 }
 
-fn validate_claim_token(claim_token: &str) -> Result<()> {
-    if !turn::valid_turn_claim_token(claim_token) {
-        bail!("invalid Agy turn claim token")
-    }
-    Ok(())
-}
-
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
     if windows {
         Box::new(AgyInitialPaste::new())
@@ -448,8 +426,9 @@ fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
 // requested, then effort, then model), the private log file, and off Windows the
 // correlated prompt as the interactive prompt argument.
 fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
-    let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
-        .context("Agy launch has no native turn claim")?;
+    let claim_token =
+        session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
+            .context("Agy launch has no native turn claim")?;
     let pending = install_pending_turn(context.directory, &claim_token)?;
     let log_path = Reader::open_unchecked(context.directory)
         .private(AGY_LOG_FILE)
@@ -512,76 +491,6 @@ impl ActiveWatcher for AgyMonitor {
     fn stop(self: Box<Self>) -> Result<()> {
         AgyMonitor::stop(*self)
     }
-}
-
-fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {
-    let pending = PendingAgyTurn::new(claim_token)?;
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .write_json(&pending)?;
-    Ok(pending)
-}
-
-fn read_pending_turn(directory: &Path) -> Result<Option<PendingAgyTurn>> {
-    let Some(text) = Reader::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .text()?
-    else {
-        return Ok(None);
-    };
-    let pending: PendingAgyTurn =
-        serde_json::from_str(&text).context("failed to parse the pending Agy turn")?;
-    let expected = PendingAgyTurn::new(&pending.claim_token)?;
-    if pending.schema != expected.schema || pending.marker != expected.marker {
-        bail!("Agent Bridge rejected invalid Agy turn correlation state")
-    }
-    Ok(Some(pending))
-}
-
-fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
-    let Some(pending) = read_pending_turn(directory)? else {
-        return Ok(());
-    };
-    if pending.claim_token != claim_token {
-        return Ok(());
-    }
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .remove()
-}
-
-fn correlated_prompt(prompt: &str, pending: &PendingAgyTurn) -> String {
-    format!(
-        "{prompt}\n\n[Agent Bridge Agy turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
-        pending.marker
-    )
-}
-
-fn terminal_correlated_prompt(
-    prompt: &str,
-    pending: &PendingAgyTurn,
-    windows: bool,
-) -> Result<String> {
-    if !windows {
-        return Ok(correlated_prompt(prompt, pending));
-    }
-    let encoded = serde_json::to_string(prompt)?;
-    Ok(format!(
-        "[Agent Bridge Agy Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker {} on its own final line; do not alter or omit it. Request JSON: {encoded}",
-        pending.marker
-    ))
-}
-
-fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result<&'a str> {
-    let body = message
-        .trim_end()
-        .strip_suffix(&pending.marker)
-        .context("Agy response did not end with the expected turn marker")?
-        .trim_end();
-    if body.is_empty() {
-        bail!("Agy correlated response contained no assistant text")
-    }
-    Ok(body)
 }
 
 const AGY_LOG_FILE: &str = "agy.log";

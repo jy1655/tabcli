@@ -347,3 +347,51 @@ fn a_parse_failure_prints_json_only_for_the_commands_describe_names() {
     );
     assert!(!state.exists(), "no case may create the state root");
 }
+
+#[test]
+fn search_parse_json_option_boundary_preserves_exact_output() {
+    const CHILD: &str = "AGENT_BRIDGE_SEARCH_PARSE_BOUNDARY_TEST";
+    const CASES: &[(&[&str], &str)] = &[
+        (&["--json", "--bogus"], "unknown search option: --bogus"),
+        (
+            &["--json", "--bogus", "--json"],
+            "unknown search option: --bogus",
+        ),
+        (&["", "--json"], "search requires a non-empty query"),
+        (
+            &["needle", "--json", "--json"],
+            "--json may only be specified once",
+        ),
+    ];
+    if std::env::var_os(CHILD).is_some() {
+        for (args, expected_error) in CASES {
+            let error =
+                parse_args(std::iter::once("search").chain(args.iter().copied())).unwrap_err();
+            assert_eq!(format!("{error:#}"), *expected_error);
+        }
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "native::tests::output::search_parse_json_option_boundary_preserves_exact_output",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let start = text.find("{\n").unwrap();
+    let end = text.rfind("}\n").unwrap() + 2;
+    assert_eq!(
+        &text[start..end],
+        concat!(
+            "{\n  \"error\": \"unknown search option: --bogus\",\n  \"hits\": [],\n  \"ok\": false,\n  \"query\": \"--json\",\n  \"schema_version\": 1\n}\n",
+            "{\n  \"error\": \"search requires a non-empty query\",\n  \"hits\": [],\n  \"ok\": false,\n  \"query\": null,\n  \"schema_version\": 1\n}\n",
+            "{\n  \"error\": \"--json may only be specified once\",\n  \"hits\": [],\n  \"ok\": false,\n  \"query\": \"needle\",\n  \"schema_version\": 1\n}\n",
+        )
+    );
+}

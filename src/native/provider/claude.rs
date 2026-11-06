@@ -22,6 +22,9 @@ use std::{ffi::OsString, path::Path};
 use super::super::terminal;
 
 mod completion;
+// Tests outside the completion module write its records without spelling them.
+#[cfg(test)]
+pub(in crate::native) use completion::CompletionRecordFixture;
 mod messenger;
 mod registry;
 mod trust;

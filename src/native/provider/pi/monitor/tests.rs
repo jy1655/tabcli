@@ -1,4 +1,5 @@
 use super::super::test_support::claim_pending_turn;
+use super::super::turn::HookFailureSignal;
 use super::*;
 use crate::native::session::SessionState;
 use crate::native::session::primitives::{read_json, write_json_atomic};
