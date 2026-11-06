@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "host": "claude",
-  "version": "0.4.37",
+  "version": "0.4.38",
   "tabcli_min_version": "0.4.22",
   "platforms": [
     "macos",
