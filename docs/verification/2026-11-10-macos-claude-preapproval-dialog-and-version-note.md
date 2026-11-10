@@ -38,6 +38,8 @@ Both tables are from the first commit of the branch. After review the dialog mat
 narrowed to exactly two listed permissions, and the version scan was bounded and made to end
 without a note on anything it cannot read. The narrowed matcher was run once against the
 captured text of the screen above (answer under bypass, none without); no launch was repeated,
-because the workspace had become trusted by Claude. The bounded scan was covered by tests only.
+because the workspace had become trusted by Claude. The bounded scan was covered by tests, and
+run once from a debug test binary against the ordinary root (4,713 session directories): it
+answered in 1.1 s, inside the 5 s the caller waits.
 
 Every session these checks created was closed, and the private root was removed.

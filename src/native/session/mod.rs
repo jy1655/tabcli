@@ -213,6 +213,8 @@ impl Reader {
     /// The session's event file names, sorted, when `events` holds at most `limit`
     /// entries: `Ok(None)` past the limit. `events` must be a real directory of the
     /// session (a link is an error, as for a publication read); none is an empty list.
+    /// An entry that bears an event name without being a regular file is an error too:
+    /// this listing is for a reader that must not pass over history it cannot read.
     pub(in crate::native) fn event_names_within(
         &self,
         limit: usize,
@@ -228,8 +230,13 @@ impl Reader {
             let entry = entry?;
             if let Some(name) = entry.file_name().to_str()
                 && valid_event_file_name(name)
-                && entry.file_type()?.is_file()
             {
+                if !entry.file_type()?.is_file() {
+                    bail!(
+                        "refusing non-regular session file: {}",
+                        entry.path().display()
+                    );
+                }
                 names.push(name.to_owned());
             }
         }

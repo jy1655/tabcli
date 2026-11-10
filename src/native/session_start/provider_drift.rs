@@ -4,18 +4,22 @@
 //! not say so. The note states the two recorded versions and nothing about the cause; it
 //! reads manifests and events only and writes nothing.
 //!
-//! The start's own error must not wait on this read or depend on it, so every step is
-//! bounded and anything the scan cannot read ends it without a note: a comparison that
-//! skipped an unreadable newer session could name an older one as the last that worked.
-use crate::native::session::enumerate::{CheckOrder, enumerate};
+//! The start's own error must not wait on this read or depend on it. The scan runs on a
+//! thread of its own and the caller waits for it at most `TIME`; a scan that has not
+//! answered by then is abandoned and there is no note. Every step is bounded as well, and
+//! anything the scan cannot read ends it without a note: a comparison that skipped an
+//! unreadable newer session could name an older one as the last that worked.
+use crate::native::session::primitives::valid_session_id;
 use crate::native::session::{Reader, record};
 use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, terminal_safe_text};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-// Bounds of one scan. Past any of them there is no note.
-const TIME: Duration = Duration::from_secs(2);
-const DIRECTORIES: usize = 20_000;
+// Bounds of one scan. Past any of them there is no note. A debug build read a state root of
+// 4,700 sessions in 1.1 s (2026-11-10).
+const TIME: Duration = Duration::from_secs(5);
+// Entries of the state root looked at, whatever they are.
+const ENTRIES: usize = 20_000;
 const MANIFEST_BYTES: u64 = 64 * 1024;
 // Newest sessions of the provider examined for a completed request.
 const SESSIONS_EXAMINED: usize = 64;
@@ -28,7 +32,19 @@ pub(super) fn note(
     provider: FirstPartyCli,
     version: &str,
 ) -> Option<String> {
-    note_until(root, session, provider, version, Instant::now() + TIME)
+    let (root, session, version) = (root.to_owned(), session.to_owned(), version.to_owned());
+    let (answer, waiting) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("provider-version-note".into())
+        .spawn(move || {
+            let deadline = Instant::now() + TIME;
+            let note = note_until(&root, &session, provider, &version, deadline)
+                .filter(|_| Instant::now() < deadline);
+            // The caller may have stopped waiting.
+            let _ = answer.send(note);
+        })
+        .ok()?;
+    waiting.recv_timeout(TIME).ok().flatten()
 }
 
 fn note_until(
@@ -44,18 +60,23 @@ fn note_until(
         sessions.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         sessions.truncate(SESSIONS_EXAMINED);
     };
-    for (seen, entry) in enumerate(root, CheckOrder::IdFirst).ok()?.enumerate() {
-        if seen >= DIRECTORIES || Instant::now() >= deadline {
+    for (seen, entry) in std::fs::read_dir(root).ok()?.enumerate() {
+        if seen >= ENTRIES || Instant::now() >= deadline {
             return None;
         }
         let entry = entry.ok()?;
-        if entry.id == session {
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // Bridge creates session directories only; another name or kind is not history.
+        if !valid_session_id(&id) || id == session || !entry.file_type().ok()?.is_dir() {
             continue;
         }
+        let directory = entry.path();
         // A directory without a manifest is not a session; one that cannot be read or
         // decoded within the bound may be a newer session of this provider.
-        let Some(manifest) = Reader::open_unchecked(&entry.directory)
-            .manifest_within(&entry.id, MANIFEST_BYTES)
+        let Some(manifest) = Reader::open_unchecked(&directory)
+            .manifest_within(&id, MANIFEST_BYTES)
             .ok()?
         else {
             continue;
@@ -65,8 +86,8 @@ fn note_until(
         }
         sessions.push((
             manifest.created_unix_ms,
-            entry.id,
-            entry.directory,
+            id,
+            directory,
             manifest.provider_version,
         ));
         if sessions.len() >= SESSIONS_EXAMINED * 2 {
@@ -106,11 +127,13 @@ fn completed(directory: &Path, remaining: &mut u64, deadline: Instant) -> Option
         if Instant::now() >= deadline {
             return None;
         }
-        let Some(text) = reader.event(name).event_within_budget(*remaining).ok()? else {
+        // Strict UTF-8 within the remaining bytes: a lossy read could turn a damaged event
+        // into a completed one.
+        let Some(bytes) = reader.event(name).timeline(*remaining).ok()? else {
             continue;
         };
-        *remaining = remaining.saturating_sub(text.len() as u64);
-        let event = record::event(&text).ok()?;
+        *remaining = remaining.saturating_sub(bytes.len() as u64);
+        let event = record::event(std::str::from_utf8(&bytes).ok()?).ok()?;
         if event.error.is_none() && !event.cancelled {
             return Some(true);
         }
@@ -124,6 +147,28 @@ mod tests {
     use crate::native::session::primitives::write_json_atomic;
     use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
     use std::fs;
+
+    // The scan itself, without the caller's bounded wait, so that a slow runner cannot
+    // turn an expected note into none.
+    fn note(root: &Path, session: &str, provider: FirstPartyCli, version: &str) -> Option<String> {
+        note_until(
+            root,
+            session,
+            provider,
+            version,
+            Instant::now() + Duration::from_secs(120),
+        )
+    }
+
+    // The caller's entry point answers from its own thread within the wait.
+    #[test]
+    fn the_callers_entry_point_returns_the_scans_note() {
+        let root = seeded();
+        assert_eq!(
+            super::note(root.path(), "session-new", FirstPartyCli::Claude, "2.1.322"),
+            note(root.path(), "session-new", FirstPartyCli::Claude, "2.1.322")
+        );
+    }
 
     fn session(root: &Path, id: &str, provider: &str, version: &str, created: u128) {
         let directory = root.join(id);
@@ -288,6 +333,39 @@ mod tests {
             .unwrap();
             assert!(silent(root.path()));
         }
+
+        let root = seeded();
+        session(root.path(), "session-newer", "claude", "2.1.321", 20);
+        let mut invalid = br#"{"provider":"claude","message":""#.to_vec();
+        invalid.extend_from_slice(&[0xff, 0xfe]);
+        invalid.extend_from_slice(
+            br#"","error":null,"provider_session_id":null,"turn_id":null,"created_unix_ms":1}"#,
+        );
+        fs::write(
+            root.path().join("session-newer/events/event-1-1.json"),
+            invalid,
+        )
+        .unwrap();
+        assert!(silent(root.path()));
+
+        #[cfg(unix)]
+        {
+            let root = seeded();
+            session(root.path(), "session-newer", "claude", "2.1.321", 20);
+            std::os::unix::fs::symlink(
+                root.path().join("session-old/events/event-1-1.json"),
+                root.path().join("session-newer/events/event-9-1.json"),
+            )
+            .unwrap();
+            assert!(silent(root.path()));
+        }
+
+        // Entries that are not sessions count toward the bound on the state root.
+        let root = seeded();
+        for index in 0..ENTRIES {
+            fs::write(root.path().join(format!("stray-{index}")), b"").unwrap();
+        }
+        assert!(silent(root.path()));
 
         let root = seeded();
         assert_eq!(

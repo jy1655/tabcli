@@ -809,10 +809,12 @@ that duplicates what a provider's own subagents do for a same-provider child.
   completed a request on the state root, when the two differ. It is a read of manifests
   and events at failure time, written to no record and added to the returned error only.
   It states the two recorded versions and never that the update caused the failure. The
-  start's own error must not wait on it: the scan is bounded (2 s, 20,000 directories,
-  64 KiB a manifest, the 64 newest sessions of the provider, 1,024 events a session,
-  16 MiB of events), and a spent bound, a manifest or event it cannot read or decode, or
-  an `events` that is not a real directory ends it without a note, because the unread
+  start's own error must not wait on it: the scan runs on its own thread, the caller waits
+  at most 5 s and abandons a scan that has not answered, and the scan is bounded (20,000
+  entries of the state root, 64 KiB a manifest, the 64 newest sessions of the provider,
+  1,024 events a session, 16 MiB of events read as strict UTF-8). A spent bound, a
+  manifest or event it cannot read or decode, an `events` that is not a real directory or
+  an event name that is not a regular file ends it without a note, because the unread
   session could be the newest one. The same version adds nothing.
 - The self-test runs in the ordinary state root by default and in a private directory
   only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
