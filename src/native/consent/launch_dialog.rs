@@ -39,7 +39,11 @@ pub(in crate::native) fn complete_launch(
             authorized(directory, target)
         },
         || Reader::open_unchecked(directory).manifest(),
-        |signal| signal(directory),
+        |signal| {
+            bypass_start_on(terminal::guards_dialog_input(session.kind), || {
+                signal(directory)
+            })
+        },
         |manifest, bypass_start| {
             let id = manifest.id.clone();
             LaunchDialog {
@@ -62,6 +66,19 @@ pub(in crate::native) fn complete_launch(
             )
         },
     )
+}
+
+// A surface that takes no guarded key cannot answer the dialog, and reading it is refused:
+// a launch under bypass there waits for the provider's readiness as it did before the
+// start signal existed, and that wait's diagnostic names the dialog as a possibility.
+fn bypass_start_on(
+    guards_dialog_input: bool,
+    signal: impl FnOnce() -> Result<Option<bool>>,
+) -> Result<Option<bool>> {
+    if !guards_dialog_input {
+        return Ok(None);
+    }
+    signal()
 }
 
 fn complete_launch_with(
@@ -183,6 +200,12 @@ impl LaunchDialog<'_> {
                 return Ok(());
             }
             if clock.now() >= deadline {
+                // Under bypass an unanswered wait is not a trust failure: the provider may
+                // show no dialog and never report its start. The delivery that follows
+                // reports the missing readiness, which is the provider's own prerequisite.
+                if self.bypass_start.is_some() && !responded {
+                    return Ok(());
+                }
                 return Err(launch_dialog_error(
                     "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal",
                     responded,
@@ -423,18 +446,44 @@ mod tests {
             (self.dispatch)()
         }
     }
-    // The loop under bypass: a provider that reports its start ends the wait without a
-    // screen read or a key, although its store never shows trust; a dialog that is there
-    // is answered once, and after the answer only the store confirms trust.
+    #[test]
+    fn a_surface_without_a_guarded_key_reads_no_start_signal() {
+        assert_eq!(bypass_start_on(false, || panic!("signal")).unwrap(), None);
+        assert_eq!(
+            bypass_start_on(true, || Ok(Some(false))).unwrap(),
+            Some(false)
+        );
+        assert!(bypass_start_on(true, || bail!("unreadable")).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Bypass {
+        Started,
+        StartsAfterTheFirstPoll,
+        NeverReports,
+        Dialog,
+        DialogAnswerUnconfirmed,
+    }
+    // The loop under bypass. A provider that reports its start, at once or later, ends the
+    // wait without a key although its store never shows trust. One that never reports is
+    // left to the delivery's readiness wait, not failed as a trust failure. A dialog that
+    // is there is answered once, and after the answer only the store confirms trust: the
+    // start report alone does not.
     #[cfg(target_os = "macos")]
     #[test]
-    fn bypass_dialog_loop_stops_at_the_start_signal_and_answers_a_dialog_that_is_there() {
+    fn bypass_dialog_loop_follows_the_start_signal_until_it_answers() {
         use super::super::record::{observe, record};
         use super::super::store::native_key;
         use super::super::tests::trust_pi;
         use crate::native::clock::FakeClock;
-        for dialog_shown in [false, true] {
-            let (temp, workspace, stores) = setup();
+        for case in [
+            Bypass::Started,
+            Bypass::StartsAfterTheFirstPoll,
+            Bypass::NeverReports,
+            Bypass::Dialog,
+            Bypass::DialogAnswerUnconfirmed,
+        ] {
+            let (_temp, workspace, stores) = setup();
             let (root, directory) = session(&workspace, "launching");
             trust_pi(&stores, &workspace);
             let assessment = assess_with(root.path(), &workspace, &stores.env).unwrap();
@@ -452,13 +501,15 @@ mod tests {
             let dialog = format!(
                 "Accessing workspace:\n{key}\nQuick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.\nClaude Code'll be able to read, edit, and execute files here.\nSecurity guide\n❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel\n"
             );
+            let shows_dialog = matches!(case, Bypass::Dialog | Bypass::DialogAnswerUnconfirmed);
             let (reads, answers) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
             let mut clock = FakeClock::new(Instant::now());
-            let deadline = clock.now() + Duration::from_secs(30);
-            if !dialog_shown {
-                fs::write(directory.join("started"), b"").unwrap();
+            let deadline = clock.now() + Duration::from_secs(3);
+            let started = directory.join("started");
+            if case == Bypass::Started {
+                fs::write(&started, b"").unwrap();
             }
-            LaunchDialog {
+            let result = LaunchDialog {
                 directory: &directory,
                 target: FirstPartyCli::Claude,
                 session: &surface,
@@ -473,31 +524,58 @@ mod tests {
                 &mut Scripted {
                     screen: || {
                         reads.set(reads.get() + 1);
-                        Ok(dialog.clone())
+                        if case == Bypass::StartsAfterTheFirstPoll {
+                            fs::write(&started, b"").unwrap();
+                        }
+                        Ok(if shows_dialog {
+                            dialog.clone()
+                        } else {
+                            "starting".to_owned()
+                        })
                     },
                     dispatch: || {
                         answers.set(answers.get() + 1);
-                        // Claude saves the approval and only then starts the session.
-                        write_json_atomic(
-                            &stores.claude,
-                            &serde_json::json!({"projects": {&key: {"hasTrustDialogAccepted": true}}}),
-                        )
-                        .unwrap();
-                        fs::write(directory.join("started"), b"").unwrap();
+                        if case == Bypass::Dialog {
+                            write_json_atomic(
+                                &stores.claude,
+                                &serde_json::json!({"projects": {&key: {"hasTrustDialogAccepted": true}}}),
+                            )
+                            .unwrap();
+                        }
+                        fs::write(&started, b"").unwrap();
                         Ok(true)
                     },
                 },
-            )
-            .unwrap();
-            let applied = observe(&directory);
-            if dialog_shown {
-                assert_eq!((reads.get(), answers.get()), (1, 1));
-                assert_eq!(applied.applied_marker(), Some("provider-workspace-dialog"));
-            } else {
-                assert_eq!((reads.get(), answers.get()), (0, 0));
-                assert_eq!(applied.applied_marker(), None);
+            );
+            let marker = observe(&directory);
+            let marker = marker.applied_marker();
+            match case {
+                Bypass::Started => {
+                    result.unwrap();
+                    assert_eq!((reads.get(), answers.get(), marker), (0, 0, None));
+                }
+                Bypass::StartsAfterTheFirstPoll => {
+                    result.unwrap();
+                    assert_eq!((reads.get(), answers.get(), marker), (1, 0, None));
+                }
+                Bypass::NeverReports => {
+                    result.unwrap();
+                    assert!(reads.get() > 1, "{case:?}");
+                    assert_eq!((answers.get(), marker), (0, None));
+                    assert!(clock.now() >= deadline);
+                }
+                Bypass::Dialog => {
+                    result.unwrap();
+                    assert_eq!((reads.get(), answers.get()), (1, 1));
+                    assert_eq!(marker, Some("provider-workspace-dialog"));
+                }
+                Bypass::DialogAnswerUnconfirmed => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(error.contains("trust unconfirmed"), "{error}");
+                    assert_eq!((reads.get(), answers.get()), (1, 1));
+                    assert_eq!(marker, Some("workspace-dialog-response-pending"));
+                }
             }
-            drop(temp);
         }
     }
     #[test]
