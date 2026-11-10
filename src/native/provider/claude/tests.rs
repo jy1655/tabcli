@@ -40,6 +40,7 @@ fn windows_workspace_trust_dialog_accepts_the_observed_native_path() {
             ADAPTER.workspace_trust_key(
                 &windows_workspace_trust_screen(&native, yes_selected),
                 &workspace,
+                false,
             ),
             Some(key),
         );
@@ -62,6 +63,7 @@ fn windows_workspace_trust_dialog_keeps_forward_slash_compatibility() {
             ADAPTER.workspace_trust_key(
                 &windows_workspace_trust_screen(&forward, yes_selected),
                 &workspace,
+                false,
             ),
             Some(key),
         );
@@ -84,7 +86,7 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
                 temp.path().join("workspace-sibling"),
                 workspace.join("child"),
             ] {
-                assert_eq!(ADAPTER.workspace_trust_key(&screen, &other), None);
+                assert_eq!(ADAPTER.workspace_trust_key(&screen, &other, false), None);
                 let other_key = crate::native::consent::native_key(&other).unwrap();
                 let other_key = if displayed.contains('/') {
                     other_key.replace('\\', "/")
@@ -92,8 +94,11 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
                     other_key
                 };
                 assert_eq!(
-                    ADAPTER
-                        .workspace_trust_key(&screen.replace(&displayed, &other_key), &workspace),
+                    ADAPTER.workspace_trust_key(
+                        &screen.replace(&displayed, &other_key),
+                        &workspace,
+                        false
+                    ),
                     None,
                 );
             }
@@ -104,7 +109,11 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
             ] {
                 assert_ne!(alias, displayed);
                 assert_eq!(
-                    ADAPTER.workspace_trust_key(&screen.replace(&displayed, &alias), &workspace),
+                    ADAPTER.workspace_trust_key(
+                        &screen.replace(&displayed, &alias),
+                        &workspace,
+                        false
+                    ),
                     None,
                 );
             }
@@ -112,7 +121,10 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
                 format!("{screen}Allow Bash?\n"),
                 screen.replace("Enter to confirm", "Allow Bash?\nEnter to confirm"),
             ] {
-                assert_eq!(ADAPTER.workspace_trust_key(&extra_prompt, &workspace), None);
+                assert_eq!(
+                    ADAPTER.workspace_trust_key(&extra_prompt, &workspace, false),
+                    None
+                );
             }
         }
     }
@@ -162,14 +174,72 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
         "Accessing workspace:\n{key}\nQuick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.\nClaude Code'll be able to read, edit, and execute files here.\nSecurity guide\n❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel"
     );
     assert_eq!(
-        trust::dialog_key(&screen, &workspace),
+        trust::dialog_key(&screen, &workspace, false),
         Some(terminal::DialogKey::DownEnter)
     );
-    assert_eq!(trust::dialog_key(&screen, &workspace.join("child")), None);
     assert_eq!(
-        trust::dialog_key(&(screen.clone() + "\nAllow Bash?"), &workspace),
+        trust::dialog_key(&screen, &workspace.join("child"), false),
         None
     );
+    assert_eq!(
+        trust::dialog_key(&(screen.clone() + "\nAllow Bash?"), &workspace, false),
+        None
+    );
+    // Claude 2.1.322: a folder whose settings pre-approve tool permissions adds a paragraph.
+    // Only a session under bypass answers it, and only in the observed wording.
+    let notice = "⚠ This folder pre-approves 2 tool permissions in .claude/settings.local.json:\nRead(//Users/example/.tool/pending/**) and\nRead(//Users/example/.tool/pending/code/**)\nThese will apply without asking. Only proceed if you trust this configuration.\n";
+    let with_notice =
+        |notice: &str| screen.replace("Security guide", &format!("{notice}Security guide"));
+    let pre_approved = with_notice(notice);
+    assert_eq!(trust::dialog_key(&pre_approved, &workspace, false), None);
+    assert_eq!(
+        trust::dialog_key(&pre_approved, &workspace, true),
+        Some(terminal::DialogKey::DownEnter)
+    );
+    assert_eq!(
+        trust::dialog_key(&screen, &workspace, true),
+        Some(terminal::DialogKey::DownEnter)
+    );
+    // A bare tool name is a permission too.
+    assert_eq!(
+        trust::dialog_key(
+            &with_notice(&notice.replace("Read(//Users/example/.tool/pending/**)", "WebSearch")),
+            &workspace,
+            true
+        ),
+        Some(terminal::DialogKey::DownEnter)
+    );
+    assert_eq!(
+        trust::dialog_key(&pre_approved, &workspace.join("child"), true),
+        None
+    );
+    for changed in [
+        notice.replace("2 tool permissions", "tool permissions"),
+        notice.replace("2 tool permissions", "0 tool permissions"),
+        notice.replace("2 tool permissions", "1 tool permission"),
+        notice.replace("settings.local.json", "settings.json"),
+        notice.replace("pre-approves", "pre-approves and runs"),
+        notice.replace("Only proceed if you trust this configuration.", "Only proceed."),
+        notice.replace("Read(//Users/example/.tool/pending/**) and\nRead(//Users/example/.tool/pending/code/**)\n", ""),
+        format!("{notice}Allow Bash?\n"),
+        "This folder runs hooks.\n".to_owned(),
+        // More than the observed paragraph before its closing sentence.
+        notice.replace("These will apply", "This folder also runs 3 hooks.\nThese will apply"),
+        notice.replace("These will apply", "Bash(rm -rf /) and more.\nThese will apply"),
+        format!("{notice}{notice}"),
+        notice.replace(") and\nRead(", ") and\nRead(a) and\nRead("),
+        notice.replace("2 tool permissions", "3 tool permissions"),
+        notice.replace(") and\nRead(", "), Read(a) and\nRead(").replace("2 tool", "3 tool"),
+        notice.replace("Read(//Users/example/.tool/pending/code/**)", "Read(//Users/example/a b)"),
+        notice.replace("Read(//Users/example/.tool/pending/code/**)", "Read(//Users/example/a"),
+        notice.replace("Read(//Users/example/.tool/pending/code/**)", "(x)"),
+    ] {
+        assert_eq!(
+            trust::dialog_key(&with_notice(&changed), &workspace, true),
+            None,
+            "{changed}"
+        );
+    }
     // Claude 2.1.284 shows cwd but persists this dialog's decision at the
     // Git root. An exact child consent must never approve the parent repo.
     let child = workspace.join("child");
@@ -189,7 +259,7 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
         child_key
     };
     let child_screen = screen.replace(&key, &child_key);
-    assert_eq!(trust::dialog_key(&child_screen, &child), None);
+    assert_eq!(trust::dialog_key(&child_screen, &child, false), None);
     assert!(ADAPTER.workspace_trust(&child, &env, None).is_err());
     assert!(matches!(
         ADAPTER.workspace_trust(&workspace, &env, None).unwrap(),
@@ -205,7 +275,7 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
             .success()
     );
     assert_eq!(
-        trust::dialog_key(&child_screen, &child),
+        trust::dialog_key(&child_screen, &child, false),
         Some(terminal::DialogKey::DownEnter)
     );
     std::fs::write(&store, b"{\"projects\":[]}").unwrap();

@@ -67,6 +67,18 @@ that duplicates what a provider's own subagents do for a same-provider child.
   the start signal with an official workspace-approval capability or launch option. The macOS
   owner check is in `docs/verification/2026-11-10-macos-claude-trust-dialog-under-bypass.md`;
   native Windows keeps its store-only wait and was not run.
+- Claude Code 2.1.322 adds a paragraph to the workspace trust dialog when the folder's
+  `.claude/settings.local.json` pre-approves tool permissions ("This folder pre-approves N
+  tool permissions ... These will apply without asking"). "Yes" there also accepts those
+  pre-approvals, so the guarded answer takes this variant only for a session launched under
+  bypass, where Claude asks for no tool permission anyway (owner's decision, 2026-11-10),
+  and only in the observed form: the count 2, the plural "tool permissions", that file
+  name, and exactly two permissions (`Tool` or `Tool(rule)`, no whitespace) joined by
+  " and " before the closing sentence. Without bypass the variant stays unanswered. Do not
+  widen the matcher to an unobserved wording, a longer list whose separators were never
+  seen, or another added paragraph: such a screen stays unanswered and the launch fails at
+  its deadline with the readiness diagnostic. One permission, three or more, a permission
+  wrapped across rows, another settings file and native Windows were not observed.
 - Claude Code v2.1.224+ provides official cross-session messaging on macOS and Linux,
   including WSL 2. Native Windows support is official from v2.1.234 and uses a
   per-session named pipe. Prefer the official path only when every runtime availability
@@ -792,6 +804,16 @@ that duplicates what a provider's own subagents do for a same-provider child.
   Historical receipts without an event stay `unresolved`: never infer a refusal from
   `status.error`, never repair such a receipt, and the reopened-conversation refusal in
   `reopen.rs` still leaves one on purpose.
+- An initial prompt that was not delivered can carry a version note: the provider version
+  of the failing session beside that of the newest other session of the same provider that
+  completed a request on the state root, when the two differ. It is a read of manifests
+  and events at failure time, written to no record and added to the returned error only.
+  It states the two recorded versions and never that the update caused the failure. The
+  start's own error must not wait on it: the scan is bounded (2 s, 20,000 directories,
+  64 KiB a manifest, the 64 newest sessions of the provider, 1,024 events a session,
+  16 MiB of events), and a spent bound, a manifest or event it cannot read or decode, or
+  an `events` that is not a real directory ends it without a note, because the unread
+  session could be the newest one. The same version adds nothing.
 - The self-test runs in the ordinary state root by default and in a private directory
   only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
   installed setup as it is. It closes only what it created, bounds every command it

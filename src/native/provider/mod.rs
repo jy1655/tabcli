@@ -321,7 +321,14 @@ trait NativeProviderAdapter: Sync {
         env: &super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
-    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey>;
+    // `bypass` says the session was launched with the provider's bypass option. An adapter
+    // may recognize a dialog variant only then; it never widens what a variant asks.
+    fn workspace_trust_key(
+        &self,
+        screen: &str,
+        workspace: &Path,
+        bypass: bool,
+    ) -> Option<terminal::DialogKey>;
     fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
     // Caller-environment variables removed from every short-lived provider query the
@@ -376,8 +383,9 @@ pub(super) fn workspace_trust_key(
     provider: FirstPartyCli,
     screen: &str,
     workspace: &Path,
+    bypass: bool,
 ) -> Option<terminal::DialogKey> {
-    adapter(provider).workspace_trust_key(screen, workspace)
+    adapter(provider).workspace_trust_key(screen, workspace, bypass)
 }
 
 pub(super) fn diagnose(

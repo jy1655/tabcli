@@ -185,8 +185,13 @@ impl NativeProviderAdapter for ClaudeAdapter {
         }
     }
 
-    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
-        trust::dialog_key(screen, workspace)
+    fn workspace_trust_key(
+        &self,
+        screen: &str,
+        workspace: &Path,
+        bypass: bool,
+    ) -> Option<terminal::DialogKey> {
+        trust::dialog_key(screen, workspace, bypass)
     }
     fn workspace_trust(
         &self,

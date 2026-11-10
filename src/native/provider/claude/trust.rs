@@ -78,7 +78,18 @@ pub(super) fn workspace_trust(
 // Claude exposes no documented process-local trust switch. Use only its exact
 // startup workspace dialog; no config write, permission dialog, or generic Enter
 // fallback. Delete when Claude ships an official trust launch option.
-pub(super) fn dialog_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+//
+// Claude Code 2.1.322 adds a paragraph to the same dialog when the folder's
+// `.claude/settings.local.json` pre-approves tool permissions (observed 2026-11-10, macOS).
+// "Yes" there also accepts those pre-approvals, so the variant is answered only for a
+// session launched under bypass, where Claude asks for no tool permission anyway (owner's
+// decision, 2026-11-10). Only the observed form is recognized: two permissions, the plural
+// "tool permissions" and that file name.
+pub(super) fn dialog_key(
+    screen: &str,
+    workspace: &Path,
+    bypass: bool,
+) -> Option<terminal::DialogKey> {
     require_exact_claude_trust_scope(workspace).ok()?;
     let lines: Vec<_> = screen
         .lines()
@@ -100,13 +111,16 @@ pub(super) fn dialog_key(screen: &str, workspace: &Path) -> Option<terminal::Dia
         return None;
     }
     let guide = lines.iter().position(|s| *s == "Security guide")?;
-    if guide < 4
-        || guide + 4 != lines.len()
-        || lines[guide - 1] != "Claude Code'll be able to read, edit, and execute files here."
-    {
+    let access = lines
+        .iter()
+        .position(|s| *s == "Claude Code'll be able to read, edit, and execute files here.")?;
+    if access < 3 || access >= guide || guide + 4 != lines.len() {
         return None;
     }
-    let safety = lines[2..guide - 1].join(" ");
+    if access + 1 != guide && !(bypass && pre_approval_notice(&lines[access + 1..guide])) {
+        return None;
+    }
+    let safety = lines[2..access].join(" ");
     if safety
         != "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first."
     {
@@ -117,6 +131,43 @@ pub(super) fn dialog_key(screen: &str, workspace: &Path) -> Option<terminal::Dia
         ("No, exit", "❯ Yes, I trust this folder") => Some(terminal::DialogKey::Enter),
         _ => None,
     }
+}
+
+// The paragraph between the access sentence and the guide link, joined across wrapped rows:
+// the count, then exactly that many permissions joined by " and ", then the closing
+// sentence. A permission is `Tool` or `Tool(rule)` without whitespace, so further prose, a
+// second notice or a permission wrapped across rows does not match. Only two permissions
+// were observed; the separators of a longer list are unknown and not guessed.
+fn pre_approval_notice(lines: &[&str]) -> bool {
+    let notice = lines.join(" ");
+    let Some(rest) = notice.strip_prefix("⚠ This folder pre-approves ") else {
+        return false;
+    };
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let Ok(count) = rest[..digits].parse::<usize>() else {
+        return false;
+    };
+    let Some(listed) = rest[digits..]
+        .strip_prefix(" tool permissions in .claude/settings.local.json: ")
+        .and_then(|rest| {
+            rest.strip_suffix(
+                " These will apply without asking. Only proceed if you trust this configuration.",
+            )
+        })
+    else {
+        return false;
+    };
+    let permissions: Vec<_> = listed.split(" and ").collect();
+    count == 2 && permissions.len() == count && permissions.iter().all(|p| permission(p))
+}
+
+fn permission(text: &str) -> bool {
+    let name = text.split('(').next().unwrap_or_default();
+    let rule = &text[name.len()..];
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !text.chars().any(char::is_whitespace)
+        && (rule.is_empty() || (rule.len() > 2 && rule.ends_with(')')))
 }
 
 pub(super) fn git_workspace_command(workspace: &Path) -> Result<std::process::Command> {

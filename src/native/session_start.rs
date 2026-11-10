@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 pub(super) mod admission;
+mod provider_drift;
 
 pub(super) type ResultExtra = serde_json::Map<String, serde_json::Value>;
 
@@ -415,11 +416,11 @@ impl Start {
             &expected_claim_token,
             deadline,
         ) {
-            return Err(settle_consent_failure(
-                &created.directory,
-                &mut initial_claim,
-                error,
-            ));
+            let error = settle_consent_failure(&created.directory, &mut initial_claim, error);
+            return Err(match version_note(created, provider) {
+                Some(note) => error.context(note),
+                None => error,
+            });
         }
         initial_claim.startup_confirmed();
         let mut gate = |gate| source.gate(&created.directory, gate, deadline);
@@ -453,6 +454,7 @@ impl Start {
                     uncertain,
                     provider,
                     &created.id,
+                    version_note(created, provider),
                 )
             },
         )
@@ -490,6 +492,17 @@ pub(super) fn settle_consent_failure(
     }
 }
 
+// What the records say about the provider's version when a start's prompt was not delivered;
+// see `provider_drift`. The note is added to the returned error only, never to a record.
+fn version_note(created: &CreatedSession, provider: FirstPartyCli) -> Option<String> {
+    provider_drift::note(
+        created.directory.parent()?,
+        &created.id,
+        provider,
+        &created.manifest.provider_version,
+    )
+}
+
 // The sentence ask and reopen add to every initial Delivery failure; an uncertain one
 // marks it for the hint without changing its text or the source's error below it.
 pub(super) fn initial_delivery_failure(
@@ -497,11 +510,15 @@ pub(super) fn initial_delivery_failure(
     uncertain: bool,
     provider: FirstPartyCli,
     session: &str,
+    version_note: Option<String>,
 ) -> anyhow::Error {
-    let message = format!(
+    let mut message = format!(
         "failed to deliver the initial prompt to {} session {session}",
         provider.as_str()
     );
+    if let Some(note) = version_note {
+        message.push_str(&format!(" ({note})"));
+    }
     if uncertain {
         failed.context(DeliveryUncertain::new(message))
     } else {
