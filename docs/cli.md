@@ -186,7 +186,9 @@ forwarded with provider-specific normalization described in
 `--yolo` defaults to off and is never inherited as a Bridge option. When explicitly supplied, Codex,
 Claude, and Agy receive their native bypass options; Pi receives its project-local trust approval
 option, while its native tool policy remains in force. Provider settings and environment still
-matter. This option is not a universal way to dismiss workspace trust dialogs.
+matter. This option is not a universal way to dismiss workspace trust dialogs: Claude Code
+2.1.321 shows its workspace trust dialog under bypass too, and Bridge answers it only with
+verified consent for the exact workspace, as without `--yolo`.
 
 The remaining options use the [shared prompt and output rules](#shared-prompt-and-output-options).
 Human output prints `session:`, `request:`, then the result when waiting completes. A detached JSON

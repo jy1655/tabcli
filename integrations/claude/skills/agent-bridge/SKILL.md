@@ -168,6 +168,12 @@ When it shows something a person has to act on, such as a trust or permission di
 an update or a quota message, report the session, the request address and what the screen shows
 to the user. The text can contain secrets the provider printed: relay only what the user needs.
 
+When a new session's first request fails before delivery (the error says no message was sent),
+read that session's screen before starting another session: a provider that stopped at a dialog
+or changed after an update stops the next `ask` in that workspace the same way. Report the
+session, the provider version from `tabcli inspect` and what the screen shows to the user instead
+of launching again.
+
 Never automatically resend an uncertain delivery or restart a request merely because a
 wait expired. A failed or unresolved request needs its recorded reason assessed; do not
 rewrite Bridge records, synthesize a completion, or type directly into the managed terminal.

@@ -646,7 +646,16 @@ mod tests {
         ] {
             let facts = launch_trust(provider);
             assert_eq!(facts.answers_launch_dialog, answers, "{provider:?}");
-            assert_eq!(facts.bypass_suppresses_dialog, bypass, "{provider:?}");
+            assert_eq!(facts.bypass_start.is_some(), bypass, "{provider:?}");
+            // The unanswered deadline under bypass ends with the adapter's readiness text.
+            if let Some(start) = facts.bypass_start {
+                let directory = tempfile::tempdir().unwrap();
+                assert_eq!((start.started)(directory.path()).unwrap(), None);
+                assert!(
+                    (start.not_started)(directory.path())
+                        .contains("readiness was not observed before the delivery deadline")
+                );
+            }
             assert_eq!(facts.applied_marker, marker, "{provider:?}");
             assert_eq!(
                 facts.dialog_settle,

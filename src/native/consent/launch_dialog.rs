@@ -1,5 +1,5 @@
 use super::record::{applied, authorized, authorized_with};
-use super::store::{Environment, LaunchTrust, Trust, user_home};
+use super::store::{BypassStart, Environment, LaunchTrust, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
 use crate::native::session::{Reader, schema::SessionManifest};
@@ -39,7 +39,12 @@ pub(in crate::native) fn complete_launch(
             authorized(directory, target)
         },
         || Reader::open_unchecked(directory).manifest(),
-        |manifest| {
+        |signal| {
+            bypass_start_on(terminal::guards_dialog_input(session.kind), || {
+                (signal.started)(directory)
+            })
+        },
+        |manifest, bypass_start| {
             let id = manifest.id.clone();
             LaunchDialog {
                 directory,
@@ -48,6 +53,7 @@ pub(in crate::native) fn complete_launch(
                 expected_claim,
                 deadline,
                 manifest,
+                bypass_start,
             }
             .complete(
                 &Environment::current(),
@@ -62,20 +68,41 @@ pub(in crate::native) fn complete_launch(
     )
 }
 
+// A surface that takes no guarded key cannot answer the dialog, and reading it is refused:
+// a launch under bypass there waits for the provider's readiness as it did before the
+// start signal existed, and that wait's diagnostic names the dialog as a possibility.
+fn bypass_start_on(
+    guards_dialog_input: bool,
+    signal: impl FnOnce() -> Result<Option<bool>>,
+) -> Result<Option<bool>> {
+    if !guards_dialog_input {
+        return Ok(None);
+    }
+    signal()
+}
+
 fn complete_launch_with(
     facts: LaunchTrust,
     authorized: impl FnOnce() -> Result<bool>,
     manifest: impl FnOnce() -> Result<SessionManifest>,
-    dialog: impl FnOnce(SessionManifest) -> Result<()>,
+    started: impl FnOnce(BypassStart) -> Result<Option<bool>>,
+    dialog: impl FnOnce(SessionManifest, Option<BypassStart>) -> Result<()>,
 ) -> Result<()> {
     if !facts.answers_launch_dialog || !authorized()? {
         return Ok(());
     }
     let manifest = manifest()?;
-    if facts.bypass_suppresses_dialog && manifest.yolo {
-        return Ok(());
-    }
-    dialog(manifest)
+    // Under bypass the provider may show no dialog, and then its trust store never changes:
+    // only its own start report ends the wait. A launch without that report keeps the
+    // dialog unanswered, as before the report existed.
+    let bypass_start = match facts.bypass_start {
+        Some(signal) if manifest.yolo => match started(signal)? {
+            None | Some(true) => return Ok(()),
+            Some(false) => Some(signal),
+        },
+        _ => None,
+    };
+    dialog(manifest, bypass_start)
 }
 
 pub(super) trait DialogSurface {
@@ -113,6 +140,8 @@ pub(super) struct LaunchDialog<'a> {
     pub(super) expected_claim: &'a str,
     pub(super) deadline: Instant,
     pub(super) manifest: SessionManifest,
+    // Set only for a launch under bypass whose provider reports its own start.
+    pub(super) bypass_start: Option<BypassStart>,
 }
 
 fn require_launch_dialog_live(directory: &Path, responded: bool) -> Result<()> {
@@ -171,12 +200,29 @@ impl LaunchDialog<'_> {
                 return Ok(());
             }
             if clock.now() >= deadline {
+                // Under bypass an unanswered wait is not a trust failure: the provider may
+                // show no dialog and never report its start. The delivery cannot say so
+                // after the deadline, so the adapter's own diagnostic ends the launch here.
+                if let Some(signal) = self.bypass_start
+                    && !responded
+                {
+                    return Err(launch_dialog_error((signal.not_started)(directory), false));
+                }
                 return Err(launch_dialog_error(
                     "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal",
                     responded,
                 ));
             }
             if !responded {
+                // The provider started without the dialog: nothing to answer, and its
+                // store will not change. After a response only the store confirms trust.
+                if let Some(signal) = self.bypass_start
+                    && (signal.started)(directory)
+                        .map_err(|error| launch_dialog_error(error, false))?
+                        == Some(true)
+                {
+                    return Ok(());
+                }
                 if !authorized_with(directory, target, env)
                     .map_err(|error| launch_dialog_error(error, false))?
                 {
@@ -314,42 +360,235 @@ mod tests {
         complete_launch_with(
             LaunchTrust {
                 answers_launch_dialog: false,
-                bypass_suppresses_dialog: false,
+                bypass_start: None,
                 applied_marker: None,
                 dialog_settle: Duration::ZERO,
             },
             || panic!("authorization"),
             || panic!("manifest"),
-            |_| panic!("trust or surface"),
+            |_| panic!("start signal"),
+            |_, _| panic!("trust or surface"),
         )
         .unwrap();
     }
+    fn unused_signal(_: &Path) -> Result<Option<bool>> {
+        panic!("the decision reads the signal through its seam")
+    }
+    // Under bypass the provider's own start report decides: no report for this launch or a
+    // started provider leaves the dialog alone, and a provider that has not started yet
+    // reaches the dialog with the signal, so a dialog that is there is answered (Claude
+    // Code 2.1.321 on macOS shows it under bypass; 2.1.319 did not).
     #[test]
-    fn complete_launch_bypass_reads_authorization_then_manifest_only() {
+    fn complete_launch_bypass_follows_the_provider_start_signal() {
         let (_temp, workspace, _fixture) = setup();
         let (_root, directory) = session(&workspace, "launching");
-        let order = std::cell::RefCell::new(Vec::new());
-        complete_launch_with(
-            LaunchTrust {
-                answers_launch_dialog: true,
-                bypass_suppresses_dialog: true,
-                applied_marker: None,
-                dialog_settle: Duration::ZERO,
-            },
-            || {
-                order.borrow_mut().push("authorization");
-                Ok(true)
-            },
-            || {
-                order.borrow_mut().push("manifest");
-                let mut manifest = Reader::open_unchecked(&directory).manifest()?;
-                manifest.yolo = true;
-                Ok(manifest)
-            },
-            |_| panic!("trust or surface"),
-        )
-        .unwrap();
-        assert_eq!(*order.borrow(), ["authorization", "manifest"]);
+        for (yolo, started, expected) in [
+            (true, None, &["authorization", "manifest", "signal"][..]),
+            (true, Some(true), &["authorization", "manifest", "signal"]),
+            (
+                true,
+                Some(false),
+                &["authorization", "manifest", "signal", "dialog with signal"],
+            ),
+            (false, None, &["authorization", "manifest", "dialog"]),
+        ] {
+            let order = std::cell::RefCell::new(Vec::new());
+            complete_launch_with(
+                LaunchTrust {
+                    answers_launch_dialog: true,
+                    bypass_start: Some(BypassStart {
+                        started: unused_signal,
+                        not_started: |_| panic!("diagnostic"),
+                    }),
+                    applied_marker: None,
+                    dialog_settle: Duration::ZERO,
+                },
+                || {
+                    order.borrow_mut().push("authorization");
+                    Ok(true)
+                },
+                || {
+                    order.borrow_mut().push("manifest");
+                    let mut manifest = Reader::open_unchecked(&directory).manifest()?;
+                    manifest.yolo = yolo;
+                    Ok(manifest)
+                },
+                |_| {
+                    order.borrow_mut().push("signal");
+                    Ok(started)
+                },
+                |_, signal| {
+                    order.borrow_mut().push(if signal.is_some() {
+                        "dialog with signal"
+                    } else {
+                        "dialog"
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                *order.borrow(),
+                expected,
+                "yolo {yolo}, started {started:?}"
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn started_marker(directory: &Path) -> Result<Option<bool>> {
+        Ok(Some(directory.join("started").exists()))
+    }
+    #[cfg(target_os = "macos")]
+    struct Scripted<S, D> {
+        screen: S,
+        dispatch: D,
+    }
+    #[cfg(target_os = "macos")]
+    impl<S: FnMut() -> Result<String>, D: FnMut() -> Result<bool>> DialogSurface for Scripted<S, D> {
+        fn screen(&mut self, _: Instant) -> Result<String> {
+            (self.screen)()
+        }
+        fn answer(&mut self, _: &terminal::GuardedDialogInput, _: Instant) -> Result<bool> {
+            (self.dispatch)()
+        }
+    }
+    #[test]
+    fn a_surface_without_a_guarded_key_reads_no_start_signal() {
+        assert_eq!(bypass_start_on(false, || panic!("signal")).unwrap(), None);
+        assert_eq!(
+            bypass_start_on(true, || Ok(Some(false))).unwrap(),
+            Some(false)
+        );
+        assert!(bypass_start_on(true, || bail!("unreadable")).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Bypass {
+        Started,
+        StartsAfterTheFirstPoll,
+        NeverReports,
+        Dialog,
+        DialogAnswerUnconfirmed,
+    }
+    // The loop under bypass. A provider that reports its start, at once or later, ends the
+    // wait without a key although its store never shows trust. One that never reports fails
+    // with the adapter's own diagnostic, not as a trust failure. A dialog that
+    // is there is answered once, and after the answer only the store confirms trust: the
+    // start report alone does not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bypass_dialog_loop_follows_the_start_signal_until_it_answers() {
+        use super::super::record::{observe, record};
+        use super::super::store::native_key;
+        use super::super::tests::trust_pi;
+        use crate::native::clock::FakeClock;
+        for case in [
+            Bypass::Started,
+            Bypass::StartsAfterTheFirstPoll,
+            Bypass::NeverReports,
+            Bypass::Dialog,
+            Bypass::DialogAnswerUnconfirmed,
+        ] {
+            let (_temp, workspace, stores) = setup();
+            let (root, directory) = session(&workspace, "launching");
+            trust_pi(&stores, &workspace);
+            let assessment = assess_with(root.path(), &workspace, &stores.env).unwrap();
+            assert_eq!(assessment.state, "verified");
+            record(&directory, &assessment).unwrap();
+            let surface: terminal::TerminalSession = serde_json::from_value(serde_json::json!({
+                "terminal": "iterm2", "session_id": "1",
+                "managed_session_id": "session-trustwait"
+            }))
+            .unwrap();
+            let mut manifest = Reader::open_unchecked(&directory).manifest().unwrap();
+            manifest.provider = "claude".into();
+            manifest.yolo = true;
+            let key = native_key(&workspace).unwrap();
+            let dialog = format!(
+                "Accessing workspace:\n{key}\nQuick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.\nClaude Code'll be able to read, edit, and execute files here.\nSecurity guide\n❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel\n"
+            );
+            let shows_dialog = matches!(case, Bypass::Dialog | Bypass::DialogAnswerUnconfirmed);
+            let (reads, answers) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+            let mut clock = FakeClock::new(Instant::now());
+            let deadline = clock.now() + Duration::from_secs(3);
+            let started = directory.join("started");
+            if case == Bypass::Started {
+                fs::write(&started, b"").unwrap();
+            }
+            let result = LaunchDialog {
+                directory: &directory,
+                target: FirstPartyCli::Claude,
+                session: &surface,
+                expected_claim: "1-2-3",
+                deadline,
+                manifest,
+                bypass_start: Some(BypassStart {
+                    started: started_marker,
+                    not_started: |_| "the provider did not report its start".to_owned(),
+                }),
+            }
+            .complete(
+                &stores.env,
+                &mut clock,
+                &mut Scripted {
+                    screen: || {
+                        reads.set(reads.get() + 1);
+                        if case == Bypass::StartsAfterTheFirstPoll {
+                            fs::write(&started, b"").unwrap();
+                        }
+                        Ok(if shows_dialog {
+                            dialog.clone()
+                        } else {
+                            "starting".to_owned()
+                        })
+                    },
+                    dispatch: || {
+                        answers.set(answers.get() + 1);
+                        if case == Bypass::Dialog {
+                            write_json_atomic(
+                                &stores.claude,
+                                &serde_json::json!({"projects": {&key: {"hasTrustDialogAccepted": true}}}),
+                            )
+                            .unwrap();
+                        }
+                        fs::write(&started, b"").unwrap();
+                        Ok(true)
+                    },
+                },
+            );
+            let marker = observe(&directory);
+            let marker = marker.applied_marker();
+            match case {
+                Bypass::Started => {
+                    result.unwrap();
+                    assert_eq!((reads.get(), answers.get(), marker), (0, 0, None));
+                }
+                Bypass::StartsAfterTheFirstPoll => {
+                    result.unwrap();
+                    assert_eq!((reads.get(), answers.get(), marker), (1, 0, None));
+                }
+                Bypass::NeverReports => {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "the provider did not report its start; no response sent"
+                    );
+                    assert!(reads.get() > 1, "{case:?}");
+                    assert_eq!((answers.get(), marker), (0, None));
+                    assert!(clock.now() >= deadline);
+                }
+                Bypass::Dialog => {
+                    result.unwrap();
+                    assert_eq!((reads.get(), answers.get()), (1, 1));
+                    assert_eq!(marker, Some("provider-workspace-dialog"));
+                }
+                Bypass::DialogAnswerUnconfirmed => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(error.contains("trust unconfirmed"), "{error}");
+                    assert_eq!((reads.get(), answers.get()), (1, 1));
+                    assert_eq!(marker, Some("workspace-dialog-response-pending"));
+                }
+            }
+        }
     }
     #[test]
     fn complete_launch_propagates_authorization_errors_before_bypass() {
@@ -357,7 +596,8 @@ mod tests {
             provider::launch_trust(FirstPartyCli::Claude),
             || bail!("authorization error"),
             || panic!("manifest"),
-            |_| panic!("trust or surface"),
+            |_| panic!("start signal"),
+            |_, _| panic!("trust or surface"),
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "authorization error");
@@ -379,7 +619,9 @@ mod tests {
                 manifest.yolo = true;
                 Ok(manifest)
             },
-            |_| {
+            |_| panic!("start signal"),
+            |_, signal| {
+                assert!(signal.is_none());
                 order.borrow_mut().push("dialog");
                 Ok(())
             },
@@ -405,7 +647,9 @@ mod tests {
                     manifest.yolo = true;
                     Ok(manifest)
                 },
-                |manifest| {
+                |_| panic!("start signal"),
+                |manifest, signal| {
+                    assert!(signal.is_none());
                     assert!(manifest.yolo);
                     assert_eq!(manifest.workspace, workspace);
                     dialogs += 1;

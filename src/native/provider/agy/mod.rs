@@ -287,7 +287,7 @@ impl NativeProviderAdapter for AgyAdapter {
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: true,
-            bypass_suppresses_dialog: false,
+            bypass_start: None,
             applied_marker: None,
             dialog_settle: std::time::Duration::ZERO,
         }

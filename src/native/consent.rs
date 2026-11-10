@@ -13,8 +13,8 @@ pub(in crate::native) use record::{
     record, run,
 };
 pub(in crate::native) use store::{
-    Environment, Evidence, Identity, LaunchTrust, Trust, identity, native_key, read_store,
-    user_home,
+    BypassStart, Environment, Evidence, Identity, LaunchTrust, Trust, identity, native_key,
+    read_store, user_home,
 };
 pub(in crate::native) use wait::{
     SleepBound, TrustPoll, TrustReadiness, wait_for_native_trust, wait_until_trusted,

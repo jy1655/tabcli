@@ -134,8 +134,19 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: true,
-            // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows (#28).
-            bypass_suppresses_dialog: !cfg!(windows),
+            // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows
+            // (#28), and so does 2.1.321 on macOS (2026-11-10); 2.1.319 on macOS started
+            // without it. A version does not say which, so a macOS launch under bypass
+            // answers a dialog that is there and stops waiting once the completion module
+            // reports the session's start.
+            bypass_start: if cfg!(windows) {
+                None
+            } else {
+                Some(crate::native::consent::BypassStart {
+                    started: completion::started_under_bypass,
+                    not_started: completion::readiness_timeout,
+                })
+            },
             applied_marker: None,
             // 2.1.302 guards input for 150 ms and remounts its selector. One second
             // allows margin for an idle renderer; equal pixels do not prove settlement.

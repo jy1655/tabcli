@@ -255,6 +255,45 @@ pub(super) fn question_response(directory: &Path) -> crate::native::provider::Qu
     observe().unwrap_or_else(|error| QuestionResponse::Unknown(format!("{error:#}")))
 }
 
+/// Whether Claude started past its launch dialogs, for a launch under bypass: the module's
+/// `session.start` report is written only by a running session. A launch without native
+/// completion has no such report.
+pub(super) fn started_under_bypass(directory: &Path) -> Result<Option<bool>> {
+    if !native_mode(directory)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        records::read_live::<Ready>(&Reader::open_unchecked(directory))?.is_some(),
+    ))
+}
+
+// What Claude's own store says when readiness never came. The store is evidence about the
+// workspace, not about the screen: the sentence names the dialog as a possibility only.
+pub(super) fn readiness_timeout(directory: &Path) -> String {
+    readiness_timeout_with(directory, &crate::native::consent::Environment::current())
+}
+
+fn readiness_timeout_with(directory: &Path, env: &crate::native::consent::Environment) -> String {
+    let mut message = String::from(
+        "Claude completion module readiness was not observed before the delivery deadline; inspect module load, plugin trust and provider policy; no message was sent",
+    );
+    let Ok(manifest) = Reader::open_unchecked(directory).manifest() else {
+        return message;
+    };
+    if matches!(
+        super::trust::workspace_trust(&manifest.workspace, env, None),
+        Ok(crate::native::consent::Trust::Absent | crate::native::consent::Trust::Declined)
+    ) {
+        message.push_str(&format!(
+            "; Claude's own store records no trust for workspace {}, so the session may be waiting at Claude's workspace trust dialog: read it with `{} screen {}` and answer it in the managed terminal",
+            terminal_safe_text(&manifest.workspace.to_string_lossy(), false),
+            agent_bridge::PUBLIC_COMMAND,
+            manifest.id
+        ));
+    }
+    message
+}
+
 pub(super) fn admit(
     directory: &Path,
     token: &str,
@@ -267,8 +306,10 @@ pub(super) fn admit(
     }
     loop {
         claude_turn::require_current(&Reader::open_unchecked(directory), token)?;
-        let remaining = deadline.checked_duration_since(clock.now()).filter(|remaining| !remaining.is_zero())
-            .context("Claude completion module readiness was not observed before the delivery deadline; inspect module load, plugin trust and provider policy; no message was sent")?;
+        let remaining = deadline
+            .checked_duration_since(clock.now())
+            .filter(|remaining| !remaining.is_zero())
+            .with_context(|| readiness_timeout(directory))?;
         if let Some(ready) = records::read_live::<Ready>(&Reader::open_unchecked(directory))? {
             if !ready.valid() {
                 bail!("Claude completion module readiness record is invalid; no message was sent");

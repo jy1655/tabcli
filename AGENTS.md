@@ -53,6 +53,20 @@ that duplicates what a provider's own subagents do for a same-provider child.
   only Claude's private trust store does. Never retry uncertain input or answer the
   dangerous-mode warning. Replace this fallback when an official addressed workspace
   approval capability provides acceptance; the pinned source is not a runtime version gate.
+- `--dangerously-skip-permissions` does not decide whether Claude shows its workspace trust
+  dialog: on macOS 2.1.319 started without it and 2.1.321 shows it (2026-11-10), and native
+  Windows shows it since 2.1.302. Do not skip the guarded answer from the bypass flag or a
+  version. A macOS launch under bypass with verified consent answers a dialog that is on the
+  screen and stops waiting when the completion module reports `session.start`, because a
+  session that started without the dialog never writes its trust store; a launch without
+  native completion has no such report and leaves the dialog alone, as does a surface that
+  takes no guarded key (its screen read is refused). An unanswered wait under bypass that
+  reaches the deadline is not a trust failure: it ends as not sent with the readiness
+  timeout, which names the dialog as a possibility only from Claude's own store. After an answer
+  only the store confirms trust. Replace
+  the start signal with an official workspace-approval capability or launch option. The macOS
+  owner check is in `docs/verification/2026-11-10-macos-claude-trust-dialog-under-bypass.md`;
+  native Windows keeps its store-only wait and was not run.
 - Claude Code v2.1.224+ provides official cross-session messaging on macOS and Linux,
   including WSL 2. Native Windows support is official from v2.1.234 and uses a
   per-session named pipe. Prefer the official path only when every runtime availability
