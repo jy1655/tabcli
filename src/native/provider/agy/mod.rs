@@ -320,7 +320,12 @@ impl NativeProviderAdapter for AgyAdapter {
         }
     }
 
-    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+    fn workspace_trust_key(
+        &self,
+        screen: &str,
+        workspace: &Path,
+        _bypass: bool,
+    ) -> Option<terminal::DialogKey> {
         agy_trust_prompt_key(screen, workspace)
     }
     fn workspace_trust(

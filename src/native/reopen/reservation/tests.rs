@@ -1299,6 +1299,7 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
             true,
             agent_bridge::FirstPartyCli::Claude,
             "session-reopenrefuse",
+            None,
         );
         assert_eq!(reopen_refusal_gate(&marked), Some(gate));
         assert_eq!(

@@ -188,7 +188,16 @@ Claude, and Agy receive their native bypass options; Pi receives its project-loc
 option, while its native tool policy remains in force. Provider settings and environment still
 matter. This option is not a universal way to dismiss workspace trust dialogs: Claude Code
 2.1.321 shows its workspace trust dialog under bypass too, and Bridge answers it only with
-verified consent for the exact workspace, as without `--yolo`.
+verified consent for the exact workspace, as without `--yolo`. When the folder's
+`.claude/settings.local.json` pre-approves tool permissions, Claude Code 2.1.322 adds a
+paragraph about them to that dialog; Bridge answers that form only for a session launched with
+`--yolo`, because "Yes" there accepts those pre-approvals too, and only when the paragraph
+lists exactly two permissions, the one form observed so far.
+
+When the initial prompt of a new session is not delivered and the provider's version differs
+from the one that last completed a request on the state root, the error names both versions.
+This is a comparison of recorded versions, not a diagnosis, and it is left out whenever the
+bounded read of the session records cannot make the comparison reliably.
 
 The remaining options use the [shared prompt and output rules](#shared-prompt-and-output-options).
 Human output prints `session:`, `request:`, then the result when waiting completes. A detached JSON

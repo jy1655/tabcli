@@ -233,6 +233,7 @@ fn run_case(root: &Path, case: &Case) {
                 undelivered.uncertain,
                 FirstPartyCli::Pi,
                 &id,
+                None,
             )
         };
         run_with(

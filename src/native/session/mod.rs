@@ -195,6 +195,54 @@ impl Reader {
     pub(in crate::native) fn manifest(&self) -> Result<SessionManifest> {
         read_manifest(&self.directory)
     }
+    /// The manifest of the session `id`, read within `limit` bytes. `Ok(None)` is a
+    /// directory without a manifest; a larger, non-regular or undecodable one is an error.
+    pub(in crate::native) fn manifest_within(
+        &self,
+        id: &str,
+        limit: u64,
+    ) -> Result<Option<SessionManifest>> {
+        let record = self.private(MANIFEST_FILE);
+        let Some(bytes) = record.timeline(limit)? else {
+            return Ok(None);
+        };
+        record::manifest(&bytes, id)
+            .map(Some)
+            .map_err(|error| error.in_path(record.path()))
+    }
+    /// The session's event file names, sorted, when `events` holds at most `limit`
+    /// entries: `Ok(None)` past the limit. `events` must be a real directory of the
+    /// session (a link is an error, as for a publication read); none is an empty list.
+    /// An entry that bears an event name without being a regular file is an error too:
+    /// this listing is for a reader that must not pass over history it cannot read.
+    pub(in crate::native) fn event_names_within(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<String>>> {
+        let mut names = Vec::new();
+        if self.events_directory_state()? == EventsDirectory::Missing {
+            return Ok(Some(names));
+        }
+        for (seen, entry) in fs::read_dir(self.directory.join(EVENTS_DIRECTORY))?.enumerate() {
+            if seen >= limit {
+                return Ok(None);
+            }
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str()
+                && valid_event_file_name(name)
+            {
+                if !entry.file_type()?.is_file() {
+                    bail!(
+                        "refusing non-regular session file: {}",
+                        entry.path().display()
+                    );
+                }
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(Some(names))
+    }
     pub(in crate::native) fn closed_if_present(&self) -> Result<Option<SessionStatus>> {
         read_regular_status_if_present(&self.directory.join(CLOSED_STATUS_FILE))
     }

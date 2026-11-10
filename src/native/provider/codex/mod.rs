@@ -256,7 +256,12 @@ impl NativeProviderAdapter for CodexAdapter {
         super::QuestionCapability { emission, response }
     }
 
-    fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
+    fn workspace_trust_key(
+        &self,
+        _screen: &str,
+        _workspace: &Path,
+        _bypass: bool,
+    ) -> Option<terminal::DialogKey> {
         None
     }
     fn workspace_trust(

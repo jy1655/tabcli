@@ -691,3 +691,37 @@ mod consent_failure {
         }
     }
 }
+
+// The version note rides in the sentence of the initial Delivery failure, after the session
+// and before the cause, and leaves the uncertain marker and the cause as they were.
+#[test]
+fn the_initial_delivery_failure_carries_the_version_note_beside_the_session() {
+    for uncertain in [false, true] {
+        let error = initial_delivery_failure(
+            anyhow::anyhow!("cause"),
+            uncertain,
+            FirstPartyCli::Claude,
+            "session-note",
+            Some("this session runs claude 2".to_owned()),
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to deliver the initial prompt to claude session session-note (this session runs claude 2): cause"
+        );
+        assert_eq!(
+            error.is::<crate::native::failure_kind::DeliveryUncertain>(),
+            uncertain
+        );
+    }
+    let error = initial_delivery_failure(
+        anyhow::anyhow!("cause"),
+        false,
+        FirstPartyCli::Claude,
+        "session-note",
+        None,
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "failed to deliver the initial prompt to claude session session-note: cause"
+    );
+}

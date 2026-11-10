@@ -235,9 +235,12 @@ impl LaunchDialog<'_> {
                     .map_err(|error| launch_dialog_error(error, false))?;
                 let observed_at = clock.now();
                 require_launch_dialog_live(directory, false)?;
-                if let Some(key) =
-                    provider::workspace_trust_key(target, &screen, &manifest.workspace)
-                {
+                if let Some(key) = provider::workspace_trust_key(
+                    target,
+                    &screen,
+                    &manifest.workspace,
+                    manifest.yolo,
+                ) {
                     let since = match &stable {
                         Some((previous, since)) if previous == &screen => *since,
                         _ => {
