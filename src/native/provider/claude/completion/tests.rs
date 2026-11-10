@@ -981,6 +981,69 @@ fn peer_quoting_preserves_the_whole_body_and_existing_literal_backslashes() {
     assert!(start_wire_size("<\\").unwrap() == start_wire_size("<").unwrap());
 }
 
+// Under bypass the dialog wait ends on the module's own start report, and only a launch
+// with native completion has one.
+#[test]
+fn the_bypass_start_signal_is_the_modules_session_start_report() {
+    let f = Fixture::new();
+    assert_eq!(started_under_bypass(f.root.path()).unwrap(), Some(false));
+    f.send("session.start", json!({}));
+    assert_eq!(started_under_bypass(f.root.path()).unwrap(), Some(true));
+    let legacy = tempfile::tempdir().unwrap();
+    assert_eq!(started_under_bypass(legacy.path()).unwrap(), None);
+}
+
+// The timeout names Claude's workspace trust dialog only from Claude's own store, and only
+// as a possibility: a trusted workspace or a session without a manifest adds nothing.
+#[test]
+fn the_readiness_timeout_names_the_trust_dialog_only_when_claudes_store_has_no_trust() {
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let workspace = home_path.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let env = crate::native::consent::Environment::at_home(&home_path);
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-readiness");
+    std::fs::create_dir(&directory).unwrap();
+    let base = "readiness was not observed before the delivery deadline; inspect module load, plugin trust and provider policy; no message was sent";
+    assert!(readiness_timeout_with(&directory, &env).ends_with(base));
+    write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-readiness".to_owned(),
+            provider: "claude".to_owned(),
+            provider_path: "claude".into(),
+            provider_version: "2.1.321 (Claude Code)".to_owned(),
+            workspace: workspace.clone(),
+            title: "readiness".to_owned(),
+            model: None,
+            effort: None,
+            yolo: true,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let message = readiness_timeout_with(&directory, &env);
+    assert!(message.contains(base), "{message}");
+    assert!(
+        message.ends_with("may be waiting at Claude's workspace trust dialog: read it with `tabcli screen session-readiness` and answer it in the managed terminal"),
+        "{message}"
+    );
+    assert!(message.contains(&*workspace.to_string_lossy()), "{message}");
+    let key = crate::native::consent::native_key(&workspace).unwrap();
+    crate::native::session::primitives::write_private(
+        &home_path.join(".claude.json"),
+        json!({"projects": {key: {"hasTrustDialogAccepted": true}}})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(readiness_timeout_with(&directory, &env).ends_with(base));
+}
+
 #[path = "continuation_tests.rs"]
 mod continuation_tests;
 

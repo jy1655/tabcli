@@ -646,7 +646,7 @@ mod tests {
         ] {
             let facts = launch_trust(provider);
             assert_eq!(facts.answers_launch_dialog, answers, "{provider:?}");
-            assert_eq!(facts.bypass_suppresses_dialog, bypass, "{provider:?}");
+            assert_eq!(facts.bypass_start.is_some(), bypass, "{provider:?}");
             assert_eq!(facts.applied_marker, marker, "{provider:?}");
             assert_eq!(
                 facts.dialog_settle,

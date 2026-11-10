@@ -208,7 +208,7 @@ impl NativeProviderAdapter for CodexAdapter {
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: false,
-            bypass_suppresses_dialog: false,
+            bypass_start: None,
             applied_marker: Some(APPLIED_MARKER),
             dialog_settle: std::time::Duration::ZERO,
         }

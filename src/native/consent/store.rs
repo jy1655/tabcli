@@ -36,10 +36,18 @@ pub(in crate::native) enum Trust {
     Declined,
 }
 
+// How a launch under the provider's bypass option learns that no workspace dialog is open.
+// `None` in `LaunchTrust` means the bypass option does not change whether the dialog is
+// shown. An adapter whose provider may start without the dialog under bypass supplies a
+// reader of the session's own records: `Some(true)` when the provider reported its start
+// (no dialog is open), `Some(false)` while it has not, and `None` when this launch has no
+// start signal, in which case the dialog is not answered under bypass.
+pub(in crate::native) type BypassStart = fn(&Path) -> Result<Option<bool>>;
+
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native) struct LaunchTrust {
     pub(in crate::native) answers_launch_dialog: bool,
-    pub(in crate::native) bypass_suppresses_dialog: bool,
+    pub(in crate::native) bypass_start: Option<BypassStart>,
     pub(in crate::native) applied_marker: Option<&'static str>,
     pub(in crate::native) dialog_settle: Duration,
 }

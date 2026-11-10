@@ -82,6 +82,7 @@ impl Harness {
             expected_claim: "1-2-3",
             deadline: clock.now() + timeout,
             manifest,
+            bypass_start: None,
         }
         .complete(
             &self.stores.env,
@@ -530,6 +531,7 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
                     expected_claim: claim.token(),
                     deadline: start + Duration::from_secs(3),
                     manifest,
+                    bypass_start: None,
                 }
                 .complete(
                     &h.stores.env,
