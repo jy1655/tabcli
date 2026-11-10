@@ -42,4 +42,7 @@ because the workspace had become trusted by Claude. The bounded scan was covered
 run once from a debug test binary against the ordinary root (4,713 session directories): it
 answered in 1.1 s, inside the 5 s the caller waits.
 
+With the final build of the branch, the private-root launch was repeated once and failed at
+30 s with the same note, and a launch in a workspace Claude trusts completed in 10 s.
+
 Every session these checks created was closed, and the private root was removed.
