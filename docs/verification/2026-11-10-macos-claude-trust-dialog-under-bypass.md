@@ -37,4 +37,11 @@ within 3 seconds. Whether 2.1.320 shows the dialog was not checked.
 | trusted by Claude | completed in 10 s; no dialog, no answer |
 | new empty directory, no provider trust | failed at the 30 s deadline; the error added that Claude's own store records no trust for the workspace and that the session may be waiting at the dialog, with the `screen` command for that session |
 
+The table is from the first commit of the branch (`c2a3d55`). After the two review fixes
+(`2fef699`: no start signal on a surface without a guarded key, and an unanswered wait that ends
+with the readiness diagnostic), one more launch in another workspace trusted by Codex only
+completed in 15 s with `applied: provider-workspace-dialog`. A Claude under bypass that shows no
+dialog and never reports its start, and a terminal without a guarded key, were covered by tests
+only.
+
 Every session these checks created was closed.
