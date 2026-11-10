@@ -142,7 +142,10 @@ impl NativeProviderAdapter for ClaudeAdapter {
             bypass_start: if cfg!(windows) {
                 None
             } else {
-                Some(completion::started_under_bypass)
+                Some(crate::native::consent::BypassStart {
+                    started: completion::started_under_bypass,
+                    not_started: completion::readiness_timeout,
+                })
             },
             applied_marker: None,
             // 2.1.302 guards input for 150 ms and remounts its selector. One second

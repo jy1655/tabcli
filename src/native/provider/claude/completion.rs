@@ -269,7 +269,7 @@ pub(super) fn started_under_bypass(directory: &Path) -> Result<Option<bool>> {
 
 // What Claude's own store says when readiness never came. The store is evidence about the
 // workspace, not about the screen: the sentence names the dialog as a possibility only.
-fn readiness_timeout(directory: &Path) -> String {
+pub(super) fn readiness_timeout(directory: &Path) -> String {
     readiness_timeout_with(directory, &crate::native::consent::Environment::current())
 }
 

@@ -61,8 +61,8 @@ that duplicates what a provider's own subagents do for a same-provider child.
   session that started without the dialog never writes its trust store; a launch without
   native completion has no such report and leaves the dialog alone, as does a surface that
   takes no guarded key (its screen read is refused). An unanswered wait under bypass that
-  reaches the deadline is not a trust failure: it returns to the delivery, whose readiness
-  timeout names the dialog as a possibility only from Claude's own store. After an answer
+  reaches the deadline is not a trust failure: it ends as not sent with the readiness
+  timeout, which names the dialog as a possibility only from Claude's own store. After an answer
   only the store confirms trust. Replace
   the start signal with an official workspace-approval capability or launch option. The macOS
   owner check is in `docs/verification/2026-11-10-macos-claude-trust-dialog-under-bypass.md`;

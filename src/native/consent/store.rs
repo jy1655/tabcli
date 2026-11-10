@@ -41,8 +41,13 @@ pub(in crate::native) enum Trust {
 // shown. An adapter whose provider may start without the dialog under bypass supplies a
 // reader of the session's own records: `Some(true)` when the provider reported its start
 // (no dialog is open), `Some(false)` while it has not, and `None` when this launch has no
-// start signal, in which case the dialog is not answered under bypass.
-pub(in crate::native) type BypassStart = fn(&Path) -> Result<Option<bool>>;
+// start signal, in which case the dialog is not answered under bypass. `not_started` is the
+// adapter's own diagnostic for a launch that reached its deadline unanswered and unstarted.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::native) struct BypassStart {
+    pub(in crate::native) started: fn(&Path) -> Result<Option<bool>>,
+    pub(in crate::native) not_started: fn(&Path) -> String,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native) struct LaunchTrust {

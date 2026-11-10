@@ -41,7 +41,7 @@ pub(in crate::native) fn complete_launch(
         || Reader::open_unchecked(directory).manifest(),
         |signal| {
             bypass_start_on(terminal::guards_dialog_input(session.kind), || {
-                signal(directory)
+                (signal.started)(directory)
             })
         },
         |manifest, bypass_start| {
@@ -201,10 +201,12 @@ impl LaunchDialog<'_> {
             }
             if clock.now() >= deadline {
                 // Under bypass an unanswered wait is not a trust failure: the provider may
-                // show no dialog and never report its start. The delivery that follows
-                // reports the missing readiness, which is the provider's own prerequisite.
-                if self.bypass_start.is_some() && !responded {
-                    return Ok(());
+                // show no dialog and never report its start. The delivery cannot say so
+                // after the deadline, so the adapter's own diagnostic ends the launch here.
+                if let Some(signal) = self.bypass_start
+                    && !responded
+                {
+                    return Err(launch_dialog_error((signal.not_started)(directory), false));
                 }
                 return Err(launch_dialog_error(
                     "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal",
@@ -215,7 +217,8 @@ impl LaunchDialog<'_> {
                 // The provider started without the dialog: nothing to answer, and its
                 // store will not change. After a response only the store confirms trust.
                 if let Some(signal) = self.bypass_start
-                    && signal(directory).map_err(|error| launch_dialog_error(error, false))?
+                    && (signal.started)(directory)
+                        .map_err(|error| launch_dialog_error(error, false))?
                         == Some(true)
                 {
                     return Ok(());
@@ -393,7 +396,10 @@ mod tests {
             complete_launch_with(
                 LaunchTrust {
                     answers_launch_dialog: true,
-                    bypass_start: Some(unused_signal),
+                    bypass_start: Some(BypassStart {
+                        started: unused_signal,
+                        not_started: |_| panic!("diagnostic"),
+                    }),
                     applied_marker: None,
                     dialog_settle: Duration::ZERO,
                 },
@@ -465,8 +471,8 @@ mod tests {
         DialogAnswerUnconfirmed,
     }
     // The loop under bypass. A provider that reports its start, at once or later, ends the
-    // wait without a key although its store never shows trust. One that never reports is
-    // left to the delivery's readiness wait, not failed as a trust failure. A dialog that
+    // wait without a key although its store never shows trust. One that never reports fails
+    // with the adapter's own diagnostic, not as a trust failure. A dialog that
     // is there is answered once, and after the answer only the store confirms trust: the
     // start report alone does not.
     #[cfg(target_os = "macos")]
@@ -516,7 +522,10 @@ mod tests {
                 expected_claim: "1-2-3",
                 deadline,
                 manifest,
-                bypass_start: Some(started_marker),
+                bypass_start: Some(BypassStart {
+                    started: started_marker,
+                    not_started: |_| "the provider did not report its start".to_owned(),
+                }),
             }
             .complete(
                 &stores.env,
@@ -559,7 +568,10 @@ mod tests {
                     assert_eq!((reads.get(), answers.get(), marker), (1, 0, None));
                 }
                 Bypass::NeverReports => {
-                    result.unwrap();
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "the provider did not report its start; no response sent"
+                    );
                     assert!(reads.get() > 1, "{case:?}");
                     assert_eq!((answers.get(), marker), (0, None));
                     assert!(clock.now() >= deadline);
