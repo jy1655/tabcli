@@ -2,24 +2,18 @@
 //! runs it in the surface. Admission, the fd handoff, the owner record, the version gate,
 //! the provider plan, the spawn with its durable identity and the exit settlement.
 use super::WRAPPER_EXIT_CODE_MARKER;
-use crate::native::failure_kind::Unsupported;
+use crate::native::provider_installation::check_provider_version;
 use crate::native::reopen::{ReopenGate, read_resumed_from, record_reopen_refusal};
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
 use crate::native::session::state::{SessionState, update_status};
 use crate::native::session::{self, CoreRecord, Reader, Store};
 use crate::native::{process_env, provider, terminal};
-use agent_bridge::{FirstPartyCli, cli_version_is_supported};
+use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use std::fs::File;
-use std::{
-    io::IsTerminal,
-    path::{Path, PathBuf},
-    process::Command,
-    str::FromStr,
-    time::Instant,
-};
+use std::{io::IsTerminal, path::Path, process::Command, str::FromStr};
 
 pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
 pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
@@ -231,49 +225,6 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(in crate::native) fn resolve_provider(provider: FirstPartyCli) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").context("PATH is not set")?;
-    resolve_provider_from_path(provider, &path)
-}
-
-pub(in crate::native) fn resolve_provider_from_path(
-    provider: FirstPartyCli,
-    path: &std::ffi::OsStr,
-) -> Result<PathBuf> {
-    for directory in std::env::split_paths(&path) {
-        if !directory.is_absolute() {
-            continue;
-        }
-        #[cfg(windows)]
-        let names = [
-            format!("{}.exe", provider.command()),
-            format!("{}.ps1", provider.command()),
-            format!("{}.cmd", provider.command()),
-            format!("{}.bat", provider.command()),
-        ];
-        #[cfg(not(windows))]
-        let names = [provider.command().to_owned()];
-        for name in names {
-            let candidate = directory.join(name);
-            if candidate.is_file() && is_executable(&candidate) {
-                let canonical = candidate.canonicalize().with_context(|| {
-                    format!(
-                        "failed to canonicalize provider path {}",
-                        candidate.display()
-                    )
-                })?;
-                if canonical.is_file() && is_executable(&canonical) {
-                    return Ok(canonical);
-                }
-            }
-        }
-    }
-    bail!(
-        "{} was not found on an absolute PATH entry",
-        provider.command()
-    )
-}
-
 pub(in crate::native) fn configure_provider_launch(
     command: &mut Command,
     workspace: &Path,
@@ -287,77 +238,6 @@ pub(in crate::native) fn configure_provider_launch(
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", id)
         .env("AGENT_BRIDGE_EXECUTABLE", executable);
     provider_stderr(command);
-}
-
-pub(in crate::native) fn provider_version_text(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut version = String::from_utf8_lossy(stdout).trim().to_owned();
-    if version.is_empty() {
-        version = String::from_utf8_lossy(stderr).trim().to_owned();
-    }
-    version
-}
-
-pub(in crate::native) fn version_probe_command(
-    provider: FirstPartyCli,
-    executable: &Path,
-) -> Result<Command> {
-    let mut command = process_env::provider_version_command(
-        executable,
-        provider::probe_environment_removals(provider),
-    )?;
-    command.arg("--version");
-    Ok(command)
-}
-
-pub(in crate::native) fn check_provider_version(
-    provider: FirstPartyCli,
-    executable: &Path,
-) -> Result<String> {
-    check_provider_version_until(provider, executable, None)
-}
-
-pub(in crate::native) fn check_provider_version_until(
-    provider: FirstPartyCli,
-    executable: &Path,
-    deadline: Option<Instant>,
-) -> Result<String> {
-    let mut command = version_probe_command(provider, executable)?;
-    let label = format!("{} --version", executable.display());
-    let output = match deadline {
-        Some(deadline) => process_env::command_output_until(&mut command, deadline, &label),
-        None => command
-            .output()
-            .with_context(|| format!("failed to query {label}")),
-    }?;
-    if !output.status.success() {
-        bail!(
-            "{} --version exited with {}",
-            executable.display(),
-            output.status
-        );
-    }
-    let version = provider_version_text(&output.stdout, &output.stderr);
-    if !cli_version_is_supported(provider, &version)? {
-        bail!(Unsupported::new(format!(
-            "{} is too old: found {version:?}, require >= {}",
-            provider.as_str(),
-            provider.minimum_version()
-        )));
-    }
-    Ok(version)
-}
-
-#[cfg(unix)]
-pub(in crate::native) fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-pub(in crate::native) fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 /// The shell redirects only Bridge's stderr. The provider keeps the original terminal

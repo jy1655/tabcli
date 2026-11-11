@@ -1,12 +1,13 @@
 use super::*;
-use crate::native::session::launch::launcher::bridge_shell_command;
-use crate::native::session::launch::wrapper::{
-    STDERR_ENV, STDOUT_ENV, configure_provider_launch, provider_version_text, version_probe_command,
-};
 #[cfg(unix)]
-use crate::native::session::launch::wrapper::{
-    check_provider_version, check_provider_version_until, provision, resolve_provider_from_path,
+use crate::native::provider_installation::{
+    check_provider_version, check_provider_version_until, resolve_provider_from_path,
 };
+use crate::native::provider_installation::{provider_version_text, version_probe_command};
+use crate::native::session::launch::launcher::bridge_shell_command;
+#[cfg(unix)]
+use crate::native::session::launch::wrapper::provision;
+use crate::native::session::launch::wrapper::{STDERR_ENV, STDOUT_ENV, configure_provider_launch};
 #[cfg(unix)]
 use crate::native::session::primitives::{read_json, write_json_atomic, write_private};
 #[cfg(unix)]
@@ -436,4 +437,81 @@ fn provider_version_check_preserves_output_selection_and_failures() {
             );
         }
     }
+}
+
+// The launch gates keep the texts of their own executors when the probe cannot start.
+#[cfg(unix)]
+#[test]
+fn provider_version_check_keeps_each_executors_start_failure_text() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("absent-provider");
+    let unbounded = check_provider_version(FirstPartyCli::Agy, &executable).unwrap_err();
+    let bounded = check_provider_version_until(
+        FirstPartyCli::Agy,
+        &executable,
+        Some(Instant::now() + Duration::from_secs(5)),
+    )
+    .unwrap_err();
+    for error in [&unbounded, &bounded] {
+        assert_eq!(
+            crate::native::failure_kind::classify(error),
+            None,
+            "{error:#}"
+        );
+    }
+    assert_eq!(
+        format!("{unbounded:#}"),
+        format!(
+            "failed to query {} --version: No such file or directory (os error 2)",
+            executable.display()
+        )
+    );
+    assert_eq!(
+        format!("{bounded:#}"),
+        format!(
+            "failed to start {} --version: No such file or directory (os error 2)",
+            executable.display()
+        )
+    );
+}
+
+// Resolution reads only absolute PATH entries and returns the first executable regular file
+// by its canonical path; otherwise it refuses with one text.
+#[cfg(unix)]
+#[test]
+fn provider_resolution_keeps_its_candidate_rules_and_refusal_text() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("directory");
+    fs::create_dir_all(directory.join("codex")).unwrap();
+    fs::set_permissions(directory.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+    let plain = root.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    fs::write(plain.join("codex"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(plain.join("codex"), fs::Permissions::from_mode(0o600)).unwrap();
+    let skipped = std::env::join_paths([&directory, &plain]).unwrap();
+    assert_eq!(
+        format!(
+            "{:#}",
+            resolve_provider_from_path(FirstPartyCli::Codex, &skipped).unwrap_err()
+        ),
+        "codex was not found on an absolute PATH entry"
+    );
+    let installed = root.path().join("installed");
+    fs::create_dir(&installed).unwrap();
+    fs::write(installed.join("codex-real"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        installed.join("codex-real"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let linked = root.path().join("linked");
+    fs::create_dir(&linked).unwrap();
+    std::os::unix::fs::symlink(installed.join("codex-real"), linked.join("codex")).unwrap();
+    let path = std::env::join_paths([&directory, &plain, &linked]).unwrap();
+    assert_eq!(
+        resolve_provider_from_path(FirstPartyCli::Codex, &path).unwrap(),
+        installed.join("codex-real").canonicalize().unwrap()
+    );
 }

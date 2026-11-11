@@ -59,9 +59,16 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `native.rs`. After their pre-checks, `tell` and session-start hand the claimed turn to
   `turn_run`. The launch protocol is two operations in `session::launch`: `launcher.rs`
   holds the start-in-surface operation and both bootstrap builders; `wrapper.rs` holds the
-  native-session wrapper with its admission and provision steps, the fd handoff consumer,
-  provider resolution and the version gate; `mod.rs` keeps the launch records and their rules
-  (receipt, phases, failure handoff, repair, wait, spawn, finalize).
+  native-session wrapper with its admission and provision steps (including its re-check of the
+  recorded executable's version) and the fd handoff consumer; `mod.rs` keeps the launch
+  records and their rules (receipt, phases, failure handoff, repair, wait, spawn, finalize).
+- `src/native/provider_installation.rs` observes the installed provider CLI: resolving its
+  executable from absolute `PATH` entries, the validity test (an absolute path to a regular,
+  executable file), the version text of a `--version` probe, and the support verdict against
+  the adapter's minimum (supported, too old, unrecognized). Each caller runs the probe with its own executor and keeps its own
+  vocabulary: the `ask`/`reopen` preflight (bounded by the start deadline) and the wrapper's
+  re-check (unbounded) refuse through `check_provider_version_until`, a version below the
+  minimum as `Unsupported`; `doctor` runs `process_env::probe` and reports rows.
 - `src/native/process_identity.rs` classifies process evidence as Live (Incarnation or PID-only
   compatibility), Gone (Exited or Reused), or Unknown. It performs no OS or record reads;
   platform adapters own absence and identity observations. A reused incarnation grants no
@@ -323,7 +330,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `doctor`, `consent`, and `self_test`, retain their separate formats. The `sessions` array and
   `settings` output are also separate and are not wrapped in an envelope.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
-  optional bounded probes. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
+  optional bounded probes. `assemble_checks` performs its record reads and probes in one fixed
+  order; `doctor/installation.rs` computes the provider executable, version and workspace rows
+  from what it observed. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
   `ResultTimeoutDiagnostic`) lives in `src/native/diagnostics.rs`; provider adapters and the
   Reopen marker observation depend on it rather than on the command. `process_env` owns `probe`
   and the shared bounded executor, including optional output limits, process-tree containment,

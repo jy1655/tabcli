@@ -30,6 +30,7 @@ mod private_to_user;
 mod process_env;
 mod process_identity;
 mod provider;
+mod provider_installation;
 mod provider_process;
 mod prune;
 mod query;

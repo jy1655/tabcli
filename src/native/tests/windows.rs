@@ -1,11 +1,11 @@
 use super::*;
+#[cfg(windows)]
+use crate::native::provider_installation::{check_provider_version, resolve_provider_from_path};
 use crate::native::provider_process::command as provider_process_command;
 #[cfg(windows)]
 use crate::native::session::launch::launcher::bridge_shell_command;
 #[cfg(windows)]
-use crate::native::session::launch::wrapper::{
-    check_provider_version, configure_provider_launch, resolve_provider_from_path,
-};
+use crate::native::session::launch::wrapper::configure_provider_launch;
 #[cfg(windows)]
 use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::primitives::{
