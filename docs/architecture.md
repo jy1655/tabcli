@@ -164,11 +164,16 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   tests substitute that runtime while retaining the real Record readers and delivery settlement.
   Pi's startup-readiness record (its reader, validity floor and carry-forward) lives in
   `pi/startup_ready.rs`.
-  Claude's completion records (the completion and question modes recorded at launch, the
-  module's readiness and its latest rejection: their names, schemas, validity, writers and the
-  answers read from them) live in `claude/completion/records.rs`, with the two read policies
-  that differ on purpose: the live read takes the whole file through lossy UTF-8, and doctor's
-  read takes at most 16 KiB of strict UTF-8.
+  Claude's completion records live in `claude/completion/records.rs`: the completion and
+  question modes recorded at launch, the module's readiness and its latest rejection, and each
+  Claim's binding, candidate, selected continuation and retained questions. It owns their names,
+  schemas and writers, the validity floor each must meet and the answers read from them;
+  `claude/completion.rs` and `claude/completion/questions.rs` keep the decisions and add each
+  caller's own condition on top of a floor (the pending correlation id of a binding, the
+  incoming or bound turn of a selected continuation). The read policies differ on purpose: the
+  live read takes the whole file through lossy UTF-8, inspection requires a candidate's binding
+  and reads it as strict UTF-8, the question record is read within 64 KiB of strict UTF-8, and
+  doctor's read takes at most 16 KiB of strict UTF-8.
   It uses the session seam and terminal operations. Keep provider schemas and transport selection
   in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
   orchestration.

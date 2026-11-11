@@ -474,9 +474,11 @@ mod tests {
             context_sources: Vec::new(),
         };
         // Malformed private records distinguish an adapter read from an unsupported operation.
-        for name in ["codex-questions-1-2-3.json", "claude-questions-1-2-3.json"] {
-            store.private(name).write_private(b"{").unwrap();
-        }
+        store
+            .private("codex-questions-1-2-3.json")
+            .write_private(b"{")
+            .unwrap();
+        ClaudeCompletionRecordFixture::write_malformed_questions(directory.path(), "1-2-3");
         ClaudeCompletionRecordFixture::MALFORMED_MODE.write(directory.path());
         let reader = Reader::open_unchecked(directory.path());
         for (provider, questions, completion) in [

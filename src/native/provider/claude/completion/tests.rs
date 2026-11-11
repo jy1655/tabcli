@@ -106,7 +106,7 @@ impl Fixture {
 fn unmarked_interim_waits_for_marked_continuation_and_keeps_waiter_identity() {
     let f = Fixture::new();
     f.start();
-    let binding_path = format!("claude-mod-bound-{}.json", f.token);
+    let binding_path = binding_name(&f.token);
     let binding = f.store().private(&binding_path).text().unwrap();
     f.complete("The background task is still running");
     f.retained();
@@ -295,7 +295,7 @@ fn late_old_frames_and_markers_cannot_settle_a_successor_claim() {
         PENDING_TURN_FILE.to_owned(),
         format!("requests/{token}.json"),
         format!("requests/{}.json", f.token),
-        format!("claude-mod-bound-{}.json", f.token),
+        binding_name(&f.token),
     ]
     .map(|name| {
         let path = f.root.path().join(name);
@@ -317,13 +317,12 @@ fn late_old_frames_and_markers_cannot_settle_a_successor_claim() {
     for (path, bytes) in protected {
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
     }
-    for kind in ["bound", "candidate", "continuation"] {
-        assert!(
-            !f.root
-                .path()
-                .join(format!("claude-mod-{kind}-{token}.json"))
-                .exists()
-        );
+    for name in [
+        binding_name(&token),
+        candidate_name(&token),
+        continuation_name(&token),
+    ] {
+        assert!(!f.root.path().join(name).exists());
     }
 
     let successor_turn = "00000000-0000-4000-8000-000000000251";
@@ -1047,6 +1046,8 @@ fn the_readiness_timeout_names_the_trust_dialog_only_when_claudes_store_has_no_t
 #[path = "continuation_tests.rs"]
 mod continuation_tests;
 
+mod claim_floor_tests;
+mod claim_record_tests;
 mod doctor_tests;
 mod question_tests;
 mod record_tests;

@@ -1,11 +1,10 @@
 use super::turn::{self as claude_turn, ClaudeTurn, Installed};
 use super::valid_claude_conversation_id;
 use crate::native::clock::Clock;
-use crate::native::session::{Reader, Store, primitives::unix_ms, turn};
+use crate::native::session::{Reader, Store, turn};
 use crate::native::settings::{self, ClaudeQuestionDeflection};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -32,43 +31,11 @@ mod test_support;
 pub(super) use diagnose::checks as doctor_checks;
 pub(in crate::native::provider) use questions::read as question_emissions;
 pub(super) use records::native_mode;
-use records::{Deflection, Diagnostic, LaunchMode, QuestionMode, Ready};
+use records::{
+    Binding, Candidate, Continuation, Deflection, Diagnostic, LaunchMode, QuestionMode, Ready,
+};
 #[cfg(test)]
 pub(in crate::native) use test_support::CompletionRecordFixture;
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-struct Binding {
-    schema: u32,
-    claim: String,
-    correlation_id: String,
-    conversation: String,
-    turn_id: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Candidate {
-    schema: u32,
-    binding: Binding,
-    answer_preview: String,
-    created_unix_ms: u128,
-}
-
-impl Candidate {
-    fn matches(&self, binding: &Binding) -> bool {
-        self.schema == 1
-            && self.binding == *binding
-            && self.created_unix_ms > 0
-            && self.answer_preview.chars().count() <= 1024
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-struct Continuation {
-    schema: u32,
-    binding: Binding,
-    turn_id: String,
-    created_unix_ms: u128,
-}
 
 enum Outcome {
     Answer { text: String, marked: bool },
@@ -443,21 +410,11 @@ fn valid_identity(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
 
-fn candidate_name(token: &str) -> String {
-    format!("claude-mod-candidate-{token}.json")
-}
-
 fn remember_candidate(store: &Store, binding: &Binding, answer: &str) -> Result<()> {
-    let record = store.private(&candidate_name(&binding.claim));
-    match record.optional_json::<Candidate>()? {
+    match Candidate::read(store, &binding.claim)? {
         Some(candidate) if candidate.matches(binding) => Ok(()),
         Some(_) => bail!("Claude completion candidate does not match the immutable binding"),
-        None => record.write_json(&Candidate {
-            schema: 1,
-            binding: binding.clone(),
-            answer_preview: bounded(answer),
-            created_unix_ms: unix_ms(),
-        }),
+        None => Candidate::new(binding, bounded(answer)).write(store),
     }
 }
 
@@ -468,40 +425,25 @@ fn select_continuation(
     binding: &Binding,
     turn_id: &str,
 ) -> Result<Option<Continuation>> {
-    let candidate: Candidate = store
-        .private(&candidate_name(&binding.claim))
-        .optional_json()?
+    let candidate = Candidate::read(store, &binding.claim)?
         .context("Claude continuation has no unmarked bound-turn candidate")?;
     if !candidate.matches(binding) {
         bail!("Claude continuation candidate does not match the immutable binding");
     }
-    let record = store.private(&format!("claude-mod-continuation-{}.json", binding.claim));
-    if let Some(selected) = record.optional_json::<Continuation>()? {
-        if selected.schema != 1
-            || selected.binding != *binding
-            || selected.turn_id != turn_id
-            || selected.created_unix_ms == 0
-        {
+    if let Some(selected) = Continuation::read(store, &binding.claim)? {
+        if !selected.matches(binding) || selected.turn_id != turn_id {
             bail!("Claude continuation conflicts with the already selected completion identity");
         }
         return Ok(None);
     }
     // Preserve both official identities before publication. A helper retry can repeat
     // this selection, but another turn cannot replace it if publication was interrupted.
-    Ok(Some(Continuation {
-        schema: 1,
-        binding: binding.clone(),
-        turn_id: turn_id.into(),
-        created_unix_ms: unix_ms(),
-    }))
+    Ok(Some(Continuation::new(binding, turn_id)))
 }
 
+// Completion's binding: the floor for this Claim, and the pending request's correlation id.
 fn binding_matches_request(binding: &Binding, pending: &ClaudeTurn, token: &str) -> bool {
-    binding.schema == 1
-        && binding.claim == token
-        && binding.correlation_id == pending.id()
-        && valid_claude_conversation_id(&binding.conversation)
-        && valid_identity(&binding.turn_id)
+    binding.valid_for(token) && binding.correlation_id == pending.id()
 }
 
 /// Called only under inspect's existing lifecycle reader lock. This observes private
@@ -514,28 +456,20 @@ pub(super) fn observe_candidate(reader: &Reader, token: &str) -> Option<Value> {
         if !native_mode(reader.directory())? {
             return Ok(None);
         }
-        let Some(candidate) = reader
-            .private(&candidate_name(token))
-            .optional_json::<Candidate>()?
-        else {
+        let Some(candidate) = Candidate::read(reader, token)? else {
             return Ok(None);
         };
         let pending = claude_turn::read_native(reader, token)?;
-        let binding: Binding = reader
-            .private(&format!("claude-mod-bound-{token}.json"))
-            .json()?;
+        let binding = Binding::require(reader, token)?;
         if !binding_matches_request(&binding, &pending, token) || !candidate.matches(&binding) {
             bail!("Claude candidate does not match the current request and original binding");
         }
-        let selected = reader
-            .private(&format!("claude-mod-continuation-{token}.json"))
-            .optional_json::<Continuation>()?;
+        let selected = Continuation::read(reader, token)?;
+        // Inspection's condition: the selection names a turn other than the bound one.
         if let Some(selected) = &selected
-            && (selected.schema != 1
-                || selected.binding != binding
+            && (!selected.matches(&binding)
                 || !valid_identity(&selected.turn_id)
-                || selected.turn_id == binding.turn_id
-                || selected.created_unix_ms == 0)
+                || selected.turn_id == binding.turn_id)
         {
             bail!("Claude selected continuation identity is invalid");
         }
@@ -611,15 +545,8 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
         Ok(id) => id,
         Err(error) => return diagnostic(directory, event, &format!("{error:#}")),
     };
-    let binding_path = format!("claude-mod-bound-{token}.json");
-    let proposed = Binding {
-        schema: 1,
-        claim: token.clone(),
-        correlation_id: pending.id().to_owned(),
-        conversation: conversation.into(),
-        turn_id: turn_id.into(),
-    };
-    let binding: Option<Binding> = match store.private(&binding_path).optional_json() {
+    let proposed = Binding::new(&token, pending.id(), conversation, turn_id);
+    let binding = match Binding::read(&store, &token) {
         Ok(binding) => binding,
         Err(error) => {
             return diagnostic(
@@ -644,7 +571,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             );
         }
         return match binding {
-            None => store.private(&binding_path).write_json(&proposed),
+            None => proposed.write(&store),
             Some(binding) if binding == proposed => Ok(()),
             Some(_) => diagnostic(
                 directory,
@@ -731,9 +658,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             Err(error) => return diagnostic(directory, event, &format!("{error:#}")),
         };
         if let Some(selection) = selection {
-            store
-                .private(&format!("claude-mod-continuation-{token}.json"))
-                .write_json(&selection)?;
+            selection.write(&store)?;
         }
         (outcome, "claude_mod_marked_continuation")
     };

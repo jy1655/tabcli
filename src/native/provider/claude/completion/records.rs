@@ -1,22 +1,43 @@
 //! The completion module's own records: their names and schemas, the validity each one must
-//! meet, the answers callers read from them, and the two ways they are read.
+//! meet, the answers callers read from them, and the ways they are read.
 //!
+//! Launch records, one file each:
 //! - `claude-completion-mode.json` and `claude-question-mode.json` are this launch's decisions
 //!   (**Launch decision** in CONTEXT.md): `prepare` records them once, and every later command
 //!   reads them, never the current version or setting.
 //! - `claude-mod-ready.json` is the module's readiness evidence, replaced at each
 //!   `session.start`; `claude-mod-diagnostic.json` is the module signal rejected last.
 //!
-//! The two read policies differ on purpose, and the completion tests pin the difference:
-//! - [`read_live`]: delivery, hooks and capability observations read the whole file and decode
-//!   it after lossy UTF-8 conversion. The completion-mode record carries the whole
-//!   `claude --version` output, which has no limit of its own.
+//! Per-Claim records, one file per Claim token, written under the lifecycle lock. Each names
+//! its file from its own Claim:
+//! - `claude-mod-bound-<token>.json` ([`Binding`]): the exact-frame `turn.start` of the
+//!   pending request, written once and never replaced.
+//! - `claude-mod-candidate-<token>.json` ([`Candidate`]): the first unmarked bound answer.
+//! - `claude-mod-continuation-<token>.json` ([`Continuation`]): the selected marked
+//!   continuation, kept so that an interrupted publication cannot select another turn.
+//! - `claude-questions-<token>.json` ([`QuestionRecord`]): the question emissions retained
+//!   from the bound turn.
+//!
+//! Each per-Claim record has one floor here; a caller adds its own condition on top of it
+//! (completion requires the pending request's correlation id of a binding, selection the
+//! incoming turn of a continuation, inspection a valid identity other than the bound turn).
+//!
+//! The read policies differ on purpose, and the completion tests pin the difference:
+//! - [`read_live`], and the per-Claim `read` of a binding, candidate or continuation: delivery,
+//!   hooks, completion and capability observations read the whole file and decode it after
+//!   lossy UTF-8 conversion, an absent file being no record. The completion-mode record carries
+//!   the whole `claude --version` output, which has no limit of its own.
+//! - [`Binding::require`]: inspection requires the binding of a retained candidate and reads
+//!   the whole file as strict UTF-8.
+//! - [`QuestionRecord::read`]: at most [`QUESTION_RECORD_BYTES`] of strict UTF-8, held to the
+//!   record's floor for the Receipt it is read for.
 //! - [`read_doctor`]: doctor reads at most [`DOCTOR_READ_LIMIT`] bytes of strict UTF-8 and
 //!   classifies what does not decode. A record past that bound tells doctor nothing; admission
 //!   reads it again with the live policy.
-use super::valid_claude_conversation_id;
-use crate::native::session::{Reader, Store};
-use anyhow::{Result, bail};
+use super::{valid_claude_conversation_id, valid_identity};
+use crate::native::provider::QuestionEmission;
+use crate::native::session::{Reader, Store, primitives::unix_ms, requests::Receipt};
+use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -198,4 +219,270 @@ pub(super) fn question_deflection(directory: &Path) -> Result<Option<Deflection>
         Some(_) => bail!("unsupported Claude question mode schema"),
         None => Ok(None),
     }
+}
+
+// A name takes the token as given: the caller supplies the current Claim's or a Receipt's.
+pub(super) fn binding_name(token: &str) -> String {
+    format!("claude-mod-bound-{token}.json")
+}
+
+pub(super) fn candidate_name(token: &str) -> String {
+    format!("claude-mod-candidate-{token}.json")
+}
+
+pub(super) fn continuation_name(token: &str) -> String {
+    format!("claude-mod-continuation-{token}.json")
+}
+
+pub(super) fn questions_name(token: &str) -> String {
+    format!("claude-questions-{token}.json")
+}
+
+/// The immutable binding of a Claim to the official turn whose `turn.start` carried the pending
+/// request's exact frame.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub(super) struct Binding {
+    pub(super) schema: u32,
+    pub(super) claim: String,
+    pub(super) correlation_id: String,
+    pub(super) conversation: String,
+    pub(super) turn_id: String,
+}
+
+impl Binding {
+    pub(super) fn new(
+        token: &str,
+        correlation_id: &str,
+        conversation: &str,
+        turn_id: &str,
+    ) -> Self {
+        Self {
+            schema: 1,
+            claim: token.into(),
+            correlation_id: correlation_id.into(),
+            conversation: conversation.into(),
+            turn_id: turn_id.into(),
+        }
+    }
+
+    /// The floor of every binding read for the Claim `token`: this schema, that Claim, a Claude
+    /// conversation and a turn identity. The correlation id is the caller's condition.
+    pub(super) fn valid_for(&self, token: &str) -> bool {
+        self.schema == 1
+            && self.claim == token
+            && valid_claude_conversation_id(&self.conversation)
+            && valid_identity(&self.turn_id)
+    }
+
+    /// The live read.
+    pub(super) fn read(reader: &Reader, token: &str) -> Result<Option<Self>> {
+        reader.private(&binding_name(token)).optional_json()
+    }
+
+    /// Inspection's read: a retained candidate requires its binding, read whole as strict UTF-8.
+    pub(super) fn require(reader: &Reader, token: &str) -> Result<Self> {
+        reader.private(&binding_name(token)).json()
+    }
+
+    pub(super) fn write(&self, store: &Store) -> Result<()> {
+        store.private(&binding_name(&self.claim)).write_json(self)
+    }
+}
+
+/// The first unmarked answer of the bound turn: not a result, and never replaced.
+#[derive(Deserialize, Serialize)]
+pub(super) struct Candidate {
+    pub(super) schema: u32,
+    pub(super) binding: Binding,
+    pub(super) answer_preview: String,
+    pub(super) created_unix_ms: u128,
+}
+
+impl Candidate {
+    /// A candidate observed now; `answer_preview` is already bounded by the caller.
+    pub(super) fn new(binding: &Binding, answer_preview: String) -> Self {
+        Self {
+            schema: 1,
+            binding: binding.clone(),
+            answer_preview,
+            created_unix_ms: unix_ms(),
+        }
+    }
+
+    /// The floor every reader of a candidate requires: this schema, the original binding, a
+    /// creation time and a preview of at most 1024 characters.
+    pub(super) fn matches(&self, binding: &Binding) -> bool {
+        self.schema == 1
+            && self.binding == *binding
+            && self.created_unix_ms > 0
+            && self.answer_preview.chars().count() <= 1024
+    }
+
+    /// The live read.
+    pub(super) fn read(reader: &Reader, token: &str) -> Result<Option<Self>> {
+        reader.private(&candidate_name(token)).optional_json()
+    }
+
+    pub(super) fn write(&self, store: &Store) -> Result<()> {
+        store
+            .private(&candidate_name(&self.binding.claim))
+            .write_json(self)
+    }
+}
+
+/// The marked continuation selected to settle the Claim, with both official turn identities.
+#[derive(Deserialize, Serialize)]
+pub(super) struct Continuation {
+    pub(super) schema: u32,
+    pub(super) binding: Binding,
+    pub(super) turn_id: String,
+    pub(super) created_unix_ms: u128,
+}
+
+impl Continuation {
+    /// The continuation `turn_id` of `binding`, selected now.
+    pub(super) fn new(binding: &Binding, turn_id: &str) -> Self {
+        Self {
+            schema: 1,
+            binding: binding.clone(),
+            turn_id: turn_id.into(),
+            created_unix_ms: unix_ms(),
+        }
+    }
+
+    /// The floor every reader of a selection requires: this schema, the original binding and a
+    /// creation time. Which turn it may name is the caller's condition.
+    pub(super) fn matches(&self, binding: &Binding) -> bool {
+        self.schema == 1 && self.binding == *binding && self.created_unix_ms != 0
+    }
+
+    /// The live read.
+    pub(super) fn read(reader: &Reader, token: &str) -> Result<Option<Self>> {
+        reader.private(&continuation_name(token)).optional_json()
+    }
+
+    pub(super) fn write(&self, store: &Store) -> Result<()> {
+        store
+            .private(&continuation_name(&self.binding.claim))
+            .write_json(self)
+    }
+}
+
+/// The whole pretty-encoded question record's bound, Request identity included.
+pub(super) const QUESTION_RECORD_BYTES: u64 = 64 * 1024;
+/// The largest step or tool index of a retained item's position.
+pub(super) const MAX_INDEX: u64 = 9_007_199_254_740_991;
+
+pub(super) use question_record::Record as QuestionRecord;
+
+// The struct keeps the name `Record`: the decoder's refusals name it ("expected struct Record"),
+// and their text reaches the hook's error.
+mod question_record {
+    use super::{Binding, QuestionEmission};
+    use serde::{Deserialize, Serialize};
+
+    /// The question emissions retained from the bound turn of a Request's Claim: a prefix in
+    /// position order, and whether the observation is incomplete or the record full.
+    #[derive(Deserialize, Serialize)]
+    pub(in crate::native::provider::claude::completion) struct Record {
+        pub(in crate::native::provider::claude::completion) schema: u32,
+        pub(in crate::native::provider::claude::completion) request_id: String,
+        pub(in crate::native::provider::claude::completion) binding: Binding,
+        pub(in crate::native::provider::claude::completion) items: Vec<QuestionEmission>,
+        pub(in crate::native::provider::claude::completion) incomplete: bool,
+        pub(in crate::native::provider::claude::completion) full: bool,
+    }
+}
+
+impl QuestionRecord {
+    /// The record of `request_id` before any emission.
+    pub(super) fn empty(request_id: String, binding: &Binding) -> Self {
+        Self {
+            schema: 1,
+            request_id,
+            binding: binding.clone(),
+            items: vec![],
+            incomplete: false,
+            full: false,
+        }
+    }
+
+    /// The floor of a record read for `receipt`: this schema and Request, a binding of the
+    /// Receipt's Claim with a valid correlation identity, `full` only when incomplete, the
+    /// record bound, and a prefix of valid items in strictly increasing position.
+    pub(super) fn check(&self, receipt: &Receipt) -> Result<()> {
+        if self.schema != 1
+            || self.request_id != receipt.request_id
+            || !self.binding.valid_for(&receipt.claim_token)
+            || !valid_identity(&self.binding.correlation_id)
+            || (self.full && !self.incomplete)
+            || !self.fits()
+        {
+            bail!("invalid Claude question record");
+        }
+        let mut previous = None;
+        for item in &self.items {
+            let current = position(&item.id).context("invalid Claude question position")?;
+            if previous.is_some_and(|previous| previous >= current)
+                || !(1..=4).contains(&item.questions.len())
+                || item.questions.iter().any(|q| {
+                    q.title.trim().is_empty()
+                        || q.options.as_ref().is_none_or(|options| {
+                            !(2..=4).contains(&options.len())
+                                || options.iter().any(|label| label.trim().is_empty())
+                        })
+                })
+            {
+                bail!("invalid Claude retained question prefix");
+            }
+            previous = Some(current);
+        }
+        Ok(())
+    }
+
+    /// Whether the pretty encoding stays within [`QUESTION_RECORD_BYTES`].
+    pub(super) fn fits(&self) -> bool {
+        struct Limit(u64);
+        impl std::io::Write for Limit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_sub(bytes.len() as u64)
+                    .ok_or_else(|| std::io::Error::other("Claude question record limit"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        serde_json::to_writer_pretty(Limit(QUESTION_RECORD_BYTES), self).is_ok()
+    }
+
+    /// The record of the Receipt's Claim, read within its bound and held to its floor.
+    pub(super) fn read(reader: &Reader, receipt: &Receipt) -> Result<Option<Self>> {
+        let Some(bytes) = reader
+            .private(&questions_name(&receipt.claim_token))
+            .timeline(QUESTION_RECORD_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let record: Self = serde_json::from_slice(&bytes)?;
+        record.check(receipt)?;
+        Ok(Some(record))
+    }
+
+    pub(super) fn write(&self, store: &Store) -> Result<()> {
+        store
+            .private(&questions_name(&self.binding.claim))
+            .write_json(self)
+    }
+}
+
+/// The step and tool index of a retained item's id, `step:<step>/tool:<index>` in canonical form.
+pub(super) fn position(id: &str) -> Option<(u64, u64)> {
+    let (step, tool) = id.strip_prefix("step:")?.split_once("/tool:")?;
+    let step: u64 = step.parse().ok()?;
+    let tool: u64 = tool.parse().ok()?;
+    (step <= MAX_INDEX && tool <= MAX_INDEX && id == format!("step:{step}/tool:{tool}"))
+        .then_some((step, tool))
 }

@@ -1,12 +1,14 @@
 use super::records::{
-    self, Deflection, LaunchMode, MODE_FILE, Mode, QUESTION_MODE_FILE, QuestionMode,
+    self, Binding, Deflection, LaunchMode, MODE_FILE, Mode, QUESTION_MODE_FILE, QuestionMode,
+    QuestionRecord,
 };
-use crate::native::session::Store;
-use std::path::Path;
+use crate::native::provider::QuestionEmission;
+use crate::native::session::{Store, requests::Receipt};
+use std::path::{Path, PathBuf};
 
 /// A Claude completion record that a test outside the completion module writes into a session
-/// directory. The module owns the records' names and schemas; such a test chooses only what a
-/// launch recorded.
+/// directory, or locates there. The module owns the records' names and schemas; such a test
+/// chooses only what a launch recorded or what a Claim's records hold.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native) struct CompletionRecordFixture(Fixture);
 
@@ -68,6 +70,38 @@ impl CompletionRecordFixture {
             Fixture::QuestionBytes(bytes) => replace(&store, QUESTION_MODE_FILE, bytes),
             Fixture::NoQuestionMode => store.private(QUESTION_MODE_FILE).remove().unwrap(),
         }
+    }
+
+    /// Where the module records the turn binding of the Claim `token`.
+    pub(in crate::native) fn binding_path(directory: &Path, token: &str) -> PathBuf {
+        directory.join(records::binding_name(token))
+    }
+
+    /// Writes, through the module's own writer, a valid question record of the Receipt's
+    /// Request that retains `items`, bound to a turn of the Receipt's Claim.
+    pub(in crate::native) fn write_questions(
+        directory: &Path,
+        receipt: &Receipt,
+        items: Vec<QuestionEmission>,
+    ) {
+        let binding = Binding::new(
+            &receipt.claim_token,
+            "claude-turn-fixture",
+            "00000000-0000-4000-8000-000000000249",
+            "turn-1",
+        );
+        let mut record = QuestionRecord::empty(receipt.request_id.clone(), &binding);
+        record.items = items;
+        record.write(&Store::open_unchecked(directory)).unwrap();
+    }
+
+    /// Replaces the question record of the Claim `token` with bytes that are not JSON.
+    pub(in crate::native) fn write_malformed_questions(directory: &Path, token: &str) {
+        replace(
+            &Store::open_unchecked(directory),
+            &records::questions_name(token),
+            b"{",
+        );
     }
 }
 
