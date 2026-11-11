@@ -107,6 +107,40 @@ fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::Dial
     Some(terminal::DialogKey::Enter)
 }
 
+// Agy's launch-dialog policy: Agy answers its exact workspace trust prompt. The bypass option
+// does not decide whether Agy shows that prompt and Agy reports no start of its own, so a
+// launch under `--yolo` checks the prompt as one without, answering at its first observation.
+struct AgyLaunchDialog;
+
+impl crate::native::consent::LaunchDialogAnswerer for AgyLaunchDialog {
+    fn policy<'a>(
+        &'a self,
+        launch: crate::native::consent::LaunchFacts<'a>,
+    ) -> Box<dyn crate::native::consent::LaunchDialogPolicy + 'a> {
+        Box::new(AgyDialogPolicy {
+            workspace: launch.workspace,
+        })
+    }
+}
+
+struct AgyDialogPolicy<'a> {
+    workspace: &'a Path,
+}
+
+impl crate::native::consent::LaunchDialogPolicy for AgyDialogPolicy<'_> {
+    fn dialog_key(&self, screen: &str) -> Option<terminal::DialogKey> {
+        agy_trust_prompt_key(screen, self.workspace)
+    }
+
+    fn bypass_start(&self) -> Option<&dyn crate::native::consent::BypassStart> {
+        None
+    }
+
+    fn settle(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
 // Agy 1.2.10 writes a presence lock for every conversation but no running process holds it,
 // so presence cannot prove ownership, and the transcript monitor binds only to a newly
 // created conversation. Replace this refusal when Agy exposes a live-session registry or
@@ -284,13 +318,12 @@ impl NativeProviderAdapter for AgyAdapter {
         })
     }
 
-    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
-        crate::native::consent::LaunchTrust {
-            answers_launch_dialog: true,
-            bypass_start: None,
-            applied_marker: None,
-            dialog_settle: std::time::Duration::ZERO,
-        }
+    fn launch_dialog(&self) -> crate::native::consent::LaunchDialogSupport<'static> {
+        crate::native::consent::LaunchDialogSupport::Answered(&AgyLaunchDialog)
+    }
+
+    fn applied_marker(&self) -> Option<&'static str> {
+        None
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
@@ -320,14 +353,6 @@ impl NativeProviderAdapter for AgyAdapter {
         }
     }
 
-    fn workspace_trust_key(
-        &self,
-        screen: &str,
-        workspace: &Path,
-        _bypass: bool,
-    ) -> Option<terminal::DialogKey> {
-        agy_trust_prompt_key(screen, workspace)
-    }
     fn workspace_trust(
         &self,
         workspace: &Path,

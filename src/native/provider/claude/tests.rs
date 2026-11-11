@@ -2,6 +2,7 @@ use super::turn::ClaudeTurn;
 use crate::native::process_env::tests::{CODEX_CALLER_MARKERS, CODEX_CONTEXT_KEPT};
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 use crate::native::session::{Store, turn};
+use crate::native::terminal;
 use std::{path::PathBuf, time::Duration};
 
 #[test]
@@ -10,6 +11,22 @@ fn git_probe_drops_caller_session_environment() {
         &super::trust::git_workspace_command(std::path::Path::new("/workspace")).unwrap(),
         &[],
     );
+}
+
+// The key Claude's launch-dialog policy gives a screen for a launch without bypass.
+#[cfg(windows)]
+fn launch_dialog_key(screen: &str, workspace: &std::path::Path) -> Option<terminal::DialogKey> {
+    use crate::native::consent::{Bypass, LaunchDialogSupport, LaunchFacts};
+    let LaunchDialogSupport::Answered(answerer) = ADAPTER.launch_dialog() else {
+        panic!("Claude answers its launch dialog");
+    };
+    answerer
+        .policy(LaunchFacts {
+            directory: std::path::Path::new("unused"),
+            workspace,
+            bypass: Bypass::Off,
+        })
+        .dialog_key(screen)
 }
 
 #[cfg(windows)]
@@ -37,10 +54,9 @@ fn windows_workspace_trust_dialog_accepts_the_observed_native_path() {
         (true, terminal::DialogKey::Enter),
     ] {
         assert_eq!(
-            ADAPTER.workspace_trust_key(
+            launch_dialog_key(
                 &windows_workspace_trust_screen(&native, yes_selected),
                 &workspace,
-                false,
             ),
             Some(key),
         );
@@ -60,10 +76,9 @@ fn windows_workspace_trust_dialog_keeps_forward_slash_compatibility() {
         (true, terminal::DialogKey::Enter),
     ] {
         assert_eq!(
-            ADAPTER.workspace_trust_key(
+            launch_dialog_key(
                 &windows_workspace_trust_screen(&forward, yes_selected),
                 &workspace,
-                false,
             ),
             Some(key),
         );
@@ -86,7 +101,7 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
                 temp.path().join("workspace-sibling"),
                 workspace.join("child"),
             ] {
-                assert_eq!(ADAPTER.workspace_trust_key(&screen, &other, false), None);
+                assert_eq!(launch_dialog_key(&screen, &other), None);
                 let other_key = crate::native::consent::native_key(&other).unwrap();
                 let other_key = if displayed.contains('/') {
                     other_key.replace('\\', "/")
@@ -94,11 +109,7 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
                     other_key
                 };
                 assert_eq!(
-                    ADAPTER.workspace_trust_key(
-                        &screen.replace(&displayed, &other_key),
-                        &workspace,
-                        false
-                    ),
+                    launch_dialog_key(&screen.replace(&displayed, &other_key), &workspace,),
                     None,
                 );
             }
@@ -109,11 +120,7 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
             ] {
                 assert_ne!(alias, displayed);
                 assert_eq!(
-                    ADAPTER.workspace_trust_key(
-                        &screen.replace(&displayed, &alias),
-                        &workspace,
-                        false
-                    ),
+                    launch_dialog_key(&screen.replace(&displayed, &alias), &workspace,),
                     None,
                 );
             }
@@ -121,10 +128,7 @@ fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
                 format!("{screen}Allow Bash?\n"),
                 screen.replace("Enter to confirm", "Allow Bash?\nEnter to confirm"),
             ] {
-                assert_eq!(
-                    ADAPTER.workspace_trust_key(&extra_prompt, &workspace, false),
-                    None
-                );
+                assert_eq!(launch_dialog_key(&extra_prompt, &workspace), None);
             }
         }
     }

@@ -992,6 +992,39 @@ fn the_bypass_start_signal_is_the_modules_session_start_report() {
     assert_eq!(started_under_bypass(legacy.path()).unwrap(), None);
 }
 
+// Any readiness record that decodes is a start report for the launch dialog: a running session
+// wrote it. Whether it is valid is admission's question, which refuses the same record.
+#[test]
+fn an_invalid_readiness_record_counts_as_started_and_fails_admission() {
+    for record in [
+        json!({"schema":1,"revision":REVISION + 1,"conversation":CONVERSATION}),
+        json!({"schema":2,"revision":REVISION,"conversation":CONVERSATION}),
+        json!({"schema":1,"revision":REVISION,"conversation":""}),
+    ] {
+        let f = Fixture::new();
+        f.store().private(READY_FILE).write_json(&record).unwrap();
+        assert_eq!(
+            started_under_bypass(f.root.path()).unwrap(),
+            Some(true),
+            "{record}"
+        );
+        let now = Instant::now();
+        let error = admit(
+            f.root.path(),
+            &f.token,
+            now + Duration::from_secs(1),
+            false,
+            &mut FakeClock::new(now),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Claude completion module readiness record is invalid; no message was sent",
+            "{record}"
+        );
+    }
+}
+
 // The timeout names Claude's workspace trust dialog only from Claude's own store, and only
 // as a possibility: a trusted workspace or a session without a manifest adds nothing.
 #[test]

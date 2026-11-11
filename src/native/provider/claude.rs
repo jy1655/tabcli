@@ -19,8 +19,6 @@ use std::sync::LazyLock;
 use std::time::Instant;
 use std::{ffi::OsString, path::Path};
 
-use super::super::terminal;
-
 mod completion;
 // Tests outside the completion module write its records without spelling them.
 #[cfg(test)]
@@ -131,32 +129,12 @@ impl NativeProviderAdapter for ClaudeAdapter {
         None
     }
 
-    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
-        crate::native::consent::LaunchTrust {
-            answers_launch_dialog: true,
-            // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows
-            // (#28), and so does 2.1.321 on macOS (2026-11-10); 2.1.319 on macOS started
-            // without it. A version does not say which, so a macOS launch under bypass
-            // answers a dialog that is there and stops waiting once the completion module
-            // reports the session's start.
-            bypass_start: if cfg!(windows) {
-                None
-            } else {
-                Some(crate::native::consent::BypassStart {
-                    started: completion::started_under_bypass,
-                    not_started: completion::readiness_timeout,
-                })
-            },
-            applied_marker: None,
-            // 2.1.302 guards input for 150 ms and remounts its selector. One second
-            // allows margin for an idle renderer; equal pixels do not prove settlement.
-            // Replace with an official addressed workspace-approval capability.
-            dialog_settle: if cfg!(windows) {
-                std::time::Duration::from_secs(1)
-            } else {
-                std::time::Duration::ZERO
-            },
-        }
+    fn launch_dialog(&self) -> crate::native::consent::LaunchDialogSupport<'static> {
+        crate::native::consent::LaunchDialogSupport::Answered(&trust::ClaudeLaunchDialog)
+    }
+
+    fn applied_marker(&self) -> Option<&'static str> {
+        None
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
@@ -185,14 +163,6 @@ impl NativeProviderAdapter for ClaudeAdapter {
         }
     }
 
-    fn workspace_trust_key(
-        &self,
-        screen: &str,
-        workspace: &Path,
-        bypass: bool,
-    ) -> Option<terminal::DialogKey> {
-        trust::dialog_key(screen, workspace, bypass)
-    }
     fn workspace_trust(
         &self,
         workspace: &Path,

@@ -5,7 +5,10 @@ mod record;
 mod store;
 mod wait;
 
-pub(in crate::native) use launch_dialog::complete_launch;
+pub(in crate::native) use launch_dialog::{
+    Bypass, BypassStart, LaunchDialogAnswerer, LaunchDialogPolicy, LaunchDialogSupport,
+    LaunchFacts, ProviderStart, complete_launch,
+};
 #[cfg(test)]
 pub(in crate::native) use record::prepare;
 pub(in crate::native) use record::{
@@ -13,8 +16,7 @@ pub(in crate::native) use record::{
     record, run,
 };
 pub(in crate::native) use store::{
-    BypassStart, Environment, Evidence, Identity, LaunchTrust, Trust, identity, native_key,
-    read_store, user_home,
+    Environment, Evidence, Identity, Trust, identity, native_key, read_store, user_home,
 };
 pub(in crate::native) use wait::{
     SleepBound, TrustPoll, TrustReadiness, wait_for_native_trust, wait_until_trusted,

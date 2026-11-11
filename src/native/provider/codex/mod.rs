@@ -205,13 +205,12 @@ impl NativeProviderAdapter for CodexAdapter {
         None
     }
 
-    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
-        crate::native::consent::LaunchTrust {
-            answers_launch_dialog: false,
-            bypass_start: None,
-            applied_marker: Some(APPLIED_MARKER),
-            dialog_settle: std::time::Duration::ZERO,
-        }
+    fn launch_dialog(&self) -> crate::native::consent::LaunchDialogSupport<'static> {
+        crate::native::consent::LaunchDialogSupport::NotAnswered
+    }
+
+    fn applied_marker(&self) -> Option<&'static str> {
+        Some(APPLIED_MARKER)
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
@@ -256,14 +255,6 @@ impl NativeProviderAdapter for CodexAdapter {
         super::QuestionCapability { emission, response }
     }
 
-    fn workspace_trust_key(
-        &self,
-        _screen: &str,
-        _workspace: &Path,
-        _bypass: bool,
-    ) -> Option<terminal::DialogKey> {
-        None
-    }
     fn workspace_trust(
         &self,
         workspace: &Path,

@@ -1,4 +1,4 @@
-use super::launch_dialog::{DialogSurface, LaunchDialog, complete_launch};
+use super::launch_dialog::{DialogSurface, GuardedKey, LaunchDialog, complete_launch};
 use super::record::{SESSION_FILE, assess_with, observe, record, with_record};
 use super::store::{Trust, native_key};
 use super::tests::{Fixture, session, setup, trust_pi};
@@ -24,7 +24,12 @@ where
     S: FnMut() -> Result<String>,
     D: FnMut(&terminal::GuardedDialogInput) -> Result<bool>,
 {
-    fn screen(&mut self, _deadline: Instant) -> Result<String> {
+    // The managed Windows console takes a guarded key.
+    fn guarded_key(&self) -> GuardedKey {
+        GuardedKey::Taken
+    }
+
+    fn screen(&mut self, _session_id: &str, _deadline: Instant) -> Result<String> {
         (self.screen)()
     }
 
@@ -73,18 +78,14 @@ impl Harness {
         screen: impl FnMut() -> Result<String>,
         dispatch: impl FnMut(&terminal::GuardedDialogInput) -> Result<bool>,
     ) -> Result<()> {
-        let mut manifest = Reader::open_unchecked(&self.directory).manifest()?;
-        manifest.provider = target.as_str().into();
         LaunchDialog {
             directory: &self.directory,
             target,
-            session: &self.surface,
             expected_claim: "1-2-3",
             deadline: clock.now() + timeout,
-            manifest,
-            bypass_start: None,
         }
         .complete(
+            provider::launch_dialog(target),
             &self.stores.env,
             clock,
             &mut ScriptedSurface { screen, dispatch },
@@ -527,13 +528,11 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
                 let error = LaunchDialog {
                     directory: &directory,
                     target: FirstPartyCli::Claude,
-                    session: &surface,
                     expected_claim: claim.token(),
                     deadline: start + Duration::from_secs(3),
-                    manifest,
-                    bypass_start: None,
                 }
                 .complete(
+                    provider::launch_dialog(FirstPartyCli::Claude),
                     &h.stores.env,
                     &mut clock,
                     &mut ScriptedSurface {

@@ -280,3 +280,10 @@ _Avoid_: error code, failure phase
 A provider's own recorded consent to work in an exact workspace, read from a store only the
 user can change.
 _Avoid_: approval, permission (Bridge's own permission mode is a different axis)
+
+**Launch dialog**:
+The dialog a provider shows at startup, asking whether to trust the workspace. Bridge answers
+it at most once with a guarded key, and only for a launch whose Workspace trust consent is
+verified; which screens count and what the provider's bypass option changes is each provider
+adapter's own policy.
+_Avoid_: trust prompt, popup, permission dialog (a tool-permission dialog is never answered)

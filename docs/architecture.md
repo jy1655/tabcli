@@ -337,17 +337,22 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   root unless isolation is requested; it is not called implicitly by another command.
 - `src/native/consent.rs` preserves the public consent path and re-exports four concerns:
   `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
-  `consent/record.rs` owns Bridge's consent Record and command; `consent/launch_dialog.rs`
-  coordinates launch dialogs through its `DialogSurface` seam and the provider and terminal
-  adapters, consuming their declared `LaunchTrust` facts; and `consent/wait.rs` owns the one
-  trust wait. Consent snapshots the caller's environment once per boundary and asks each
+  `consent/record.rs` owns Bridge's consent Record and command; `consent/launch_dialog.rs` owns
+  a launch's workspace dialog step in one entry, from the decision whether to wait for the
+  dialog at all to the one guarded response, through its `DialogSurface` seam (which also
+  answers whether the surface takes a guarded key) and each provider adapter's launch-dialog
+  policy: an adapter states that it does not answer the dialog, or builds the policy for one
+  launch from that launch's facts (session directory, workspace, bypass), which answers the key
+  for a screen, the provider's start report under bypass and its deadline diagnostic, and the
+  settle time (an adapter's applied marker is a separate fact); and `consent/wait.rs` owns the
+  one trust wait. Consent snapshots the caller's environment once per boundary and asks each
   adapter for a workspace's trust against the adapter's own home, or the recorded source store
   for a recheck; it knows no provider path. Provider stores are still read through consent's
   store reader and never written by Bridge. The wait checks the ended-session rule first and
   serves the Codex paste gate and the Agy delivery gate with their own readiness and messages.
   Its `SessionConsentObservation` preserves the raw diagnostic JSON while exposing known state
-  and applied-marker accessors. Unknown or damaged diagnostic records are not authorization;
-  the strict consent record and current-source revalidation remain separate. Doctor retains its
+  and applied-marker accessors. Unknown or damaged diagnostic records are not authorization; the
+  strict consent record and current-source revalidation remain separate. Doctor retains its
   later normal-path consent reread.
 - `src/native/settings.rs` owns user preferences for surface creation and one launch admission
   preference, `codex-memory-workspace`. A preference cannot grant or remove close authority over
