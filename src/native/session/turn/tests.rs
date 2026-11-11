@@ -2374,3 +2374,665 @@ fn claim_currency_policy_table_and_locked_execution() {
     );
     assert!(store.try_lock().unwrap().is_some());
 }
+
+const REPORT_OUTCOMES: [&str; 3] = ["complete", "fail", "cancelled"];
+
+/// Sends one outcome through the adapters' `Report` interface.
+fn report_outcome(
+    report: &Report<'_>,
+    outcome: &str,
+    provider_session_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<()> {
+    let provider_session_id = provider_session_id.map(str::to_owned);
+    let turn_id = turn_id.map(str::to_owned);
+    match outcome {
+        "complete" => report.complete("admitted answer", provider_session_id, turn_id),
+        "fail" => report.fail("admitted failure", provider_session_id, turn_id),
+        "cancelled" => report.cancelled("admitted interruption", provider_session_id, turn_id),
+        other => unreachable!("{other}"),
+    }
+}
+
+/// Writes any session state without the transition table, as a concurrent lifecycle writer
+/// can leave it between a provider signal and its report.
+fn force_state(store: &Store, state: SessionState) {
+    let mut status = store.status().unwrap();
+    status.state = state;
+    store.write_status(&status).unwrap();
+}
+
+/// Snapshot taken after the lifecycle lock file exists, so a refused report that takes the
+/// lock compares equal when it writes nothing else.
+fn locked_snapshot(directory: &Path, store: &Store) -> std::collections::BTreeMap<String, Vec<u8>> {
+    drop(store.lock().unwrap());
+    snapshot_directory(directory)
+}
+
+fn write_cancel_intent(store: &Store, request_id: &str, claim_token: &str) {
+    store
+        .record(CoreRecord::Cancel)
+        .write_json(&serde_json::json!({
+            "schema": 1,
+            "request_id": request_id,
+            "claim_token": claim_token,
+            "created_unix_ms": 1
+        }))
+        .unwrap();
+}
+
+#[test]
+fn report_without_a_claim_or_token_is_a_silent_no_op_for_every_outcome() {
+    for outcome in REPORT_OUTCOMES {
+        for initial in [false, true] {
+            let (directory, store) = fixture(SessionState::Working);
+            // Recovery refuses this journal (no claim, no committed event), so a report that
+            // reached recovery would fail instead of returning.
+            let pending = PendingTurnCompletion::new("1-2-3", event("unpublished"), None).unwrap();
+            store.write_completion(&pending).unwrap();
+            let before = snapshot_directory(directory.path());
+            let report = if initial {
+                Report::initial(&store, FirstPartyCli::Claude)
+            } else {
+                Report::for_claim(&store, FirstPartyCli::Claude, None)
+            };
+            report_outcome(
+                &report,
+                outcome,
+                Some("provider-session"),
+                Some("provider-turn"),
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot_directory(directory.path()),
+                before,
+                "{outcome}/{initial}"
+            );
+            assert!(recover_pending_completion(store.directory()).is_err());
+        }
+    }
+}
+
+#[test]
+fn report_claim_reads_keep_their_error_modes_for_every_outcome() {
+    for outcome in REPORT_OUTCOMES {
+        // Without a report token the claim is read before the lifecycle lock is taken.
+        let (directory, store) = fixture(SessionState::Working);
+        fs::create_dir(store.record(CoreRecord::TurnClaim).path()).unwrap();
+        let before = snapshot_directory(directory.path());
+        let error = report_outcome(
+            &Report::for_claim(&store, FirstPartyCli::Codex, None),
+            outcome,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to inspect native turn claim",
+            "{outcome}"
+        );
+        assert_eq!(snapshot_directory(directory.path()), before, "{outcome}");
+
+        // With a report token the claim is read only after the state is accepted.
+        for state in [SessionState::Working, SessionState::Ready] {
+            let (directory, store) = fixture(SessionState::Working);
+            fs::create_dir(store.record(CoreRecord::TurnClaim).path()).unwrap();
+            force_state(&store, state.clone());
+            let before = locked_snapshot(directory.path(), &store);
+            let result = report_outcome(
+                &Report::for_claim(&store, FirstPartyCli::Codex, Some("1-2-3")),
+                outcome,
+                None,
+                None,
+            );
+            if state == SessionState::Working {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "failed to inspect native turn claim",
+                    "{outcome}"
+                );
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(snapshot_directory(directory.path()), before, "{outcome}");
+        }
+
+        // A missing claim file is not current.
+        let (directory, store) = fixture(SessionState::Working);
+        let before = locked_snapshot(directory.path(), &store);
+        report_outcome(
+            &Report::for_claim(&store, FirstPartyCli::Codex, Some("1-2-3")),
+            outcome,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(snapshot_directory(directory.path()), before, "{outcome}");
+    }
+}
+
+#[test]
+fn stale_report_tokens_are_refused_for_every_outcome() {
+    for outcome in REPORT_OUTCOMES {
+        let (directory, store) = fixture(SessionState::Working);
+        let stale = claim(&store, &[]).unwrap();
+        let stale_token = stale.token().to_owned();
+        drop(stale);
+        let current = claim(&store, &[]).unwrap();
+        let current_token = current.token().to_owned();
+        // Intent recorded for the stale token cannot make its report current.
+        write_cancel_intent(&store, &current.receipt().request_id, &stale_token);
+        current.retain();
+        let before = locked_snapshot(directory.path(), &store);
+        report_outcome(
+            &Report::for_claim(&store, FirstPartyCli::Pi, Some(&stale_token)),
+            outcome,
+            Some("provider-session"),
+            Some("provider-turn"),
+        )
+        .unwrap();
+        assert_eq!(snapshot_directory(directory.path()), before, "{outcome}");
+        assert_eq!(
+            current_claim_token(&store).unwrap().as_deref(),
+            Some(current_token.as_str()),
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn reports_are_admitted_only_in_the_turn_state_set_for_every_outcome() {
+    let states = [
+        (SessionState::Launching, false),
+        (SessionState::Running, true),
+        (SessionState::AwaitingInitialInput, false),
+        (SessionState::Ready, false),
+        (SessionState::Claimed, false),
+        (SessionState::Working, true),
+        (SessionState::ResumePending, true),
+        (SessionState::Exited, false),
+        (SessionState::Failed, false),
+        (SessionState::Closed, false),
+        (SessionState::Unknown("future-state".into()), false),
+    ];
+    for outcome in REPORT_OUTCOMES {
+        for (state, turn) in states.clone() {
+            let (directory, store) = fixture(SessionState::Working);
+            let claimed = claim(&store, &[]).unwrap();
+            let token = claimed.token().to_owned();
+            claimed.retain();
+            force_state(&store, state.clone());
+            let before = locked_snapshot(directory.path(), &store);
+            report_outcome(
+                &Report::for_claim(&store, FirstPartyCli::Codex, Some(&token)),
+                outcome,
+                None,
+                None,
+            )
+            .unwrap();
+            if turn {
+                assert_eq!(store.events().unwrap().len(), 1, "{outcome}/{state}");
+                assert!(current_claim_token(&store).unwrap().is_none());
+                assert_eq!(store.status().unwrap().state, SessionState::Ready);
+            } else {
+                assert_eq!(
+                    snapshot_directory(directory.path()),
+                    before,
+                    "{outcome}/{state}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_reports_are_refused_after_the_providers_first_event_for_every_outcome() {
+    for outcome in REPORT_OUTCOMES {
+        for (earlier_provider, admitted) in
+            [(FirstPartyCli::Claude, false), (FirstPartyCli::Codex, true)]
+        {
+            let (directory, store) = fixture(SessionState::Working);
+            let first = claim(&store, &[]).unwrap();
+            let first_token = first.token().to_owned();
+            first.retain();
+            Report::for_claim(&store, earlier_provider, Some(&first_token))
+                .complete("earlier", None, None)
+                .unwrap();
+            let next = claim(&store, &[]).unwrap();
+            let token = next.token().to_owned();
+            next.retain();
+            update_status(store.directory(), SessionState::Claimed, None, None).unwrap();
+            update_status(store.directory(), SessionState::Working, None, None).unwrap();
+            let before = locked_snapshot(directory.path(), &store);
+            report_outcome(
+                &Report::initial(&store, FirstPartyCli::Claude),
+                outcome,
+                Some("claude-session"),
+                None,
+            )
+            .unwrap();
+            if admitted {
+                assert_eq!(store.events().unwrap().len(), 2, "{outcome}");
+                assert!(current_claim_token(&store).unwrap().is_none());
+            } else {
+                assert_eq!(snapshot_directory(directory.path()), before, "{outcome}");
+                assert_eq!(
+                    current_claim_token(&store).unwrap().as_deref(),
+                    Some(token.as_str())
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_provider_turns_are_refused_for_every_outcome() {
+    for outcome in REPORT_OUTCOMES {
+        for (provider, provider_session_id, turn_id, admitted) in [
+            (FirstPartyCli::Codex, Some("thread"), Some("turn"), false),
+            (FirstPartyCli::Pi, Some("thread"), Some("turn"), true),
+            (FirstPartyCli::Codex, None, Some("turn"), true),
+            (FirstPartyCli::Codex, Some("thread"), None, true),
+        ] {
+            let (directory, store) = fixture(SessionState::Working);
+            let first = claim(&store, &[]).unwrap();
+            let first_token = first.token().to_owned();
+            first.retain();
+            Report::for_claim(&store, FirstPartyCli::Codex, Some(&first_token))
+                .complete("first", Some("thread".into()), Some("turn".into()))
+                .unwrap();
+            let next = claim(&store, &[]).unwrap();
+            let token = next.token().to_owned();
+            next.retain();
+            update_status(store.directory(), SessionState::Claimed, None, None).unwrap();
+            update_status(store.directory(), SessionState::Working, None, None).unwrap();
+            let before = locked_snapshot(directory.path(), &store);
+            report_outcome(
+                &Report::for_claim(&store, provider, Some(&token)),
+                outcome,
+                provider_session_id,
+                turn_id,
+            )
+            .unwrap();
+            let case = format!("{outcome}/{provider:?}/{provider_session_id:?}/{turn_id:?}");
+            if admitted {
+                assert_eq!(store.events().unwrap().len(), 2, "{case}");
+                assert!(current_claim_token(&store).unwrap().is_none(), "{case}");
+            } else {
+                assert_eq!(snapshot_directory(directory.path()), before, "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn unreadable_status_fails_every_outcome_before_the_claim_is_compared() {
+    for outcome in REPORT_OUTCOMES {
+        for missing in [true, false] {
+            for stale in [false, true] {
+                let (directory, store) = fixture(SessionState::Working);
+                let claimed = claim(&store, &[]).unwrap();
+                let token = claimed.token().to_owned();
+                claimed.retain();
+                let status_path = store.record(CoreRecord::Status).path().to_owned();
+                if missing {
+                    fs::remove_file(&status_path).unwrap();
+                } else {
+                    fs::write(&status_path, b"{").unwrap();
+                }
+                let report_token = if stale {
+                    "stale-token".to_owned()
+                } else {
+                    token.clone()
+                };
+                let before = locked_snapshot(directory.path(), &store);
+                let error = report_outcome(
+                    &Report::for_claim(&store, FirstPartyCli::Codex, Some(&report_token)),
+                    outcome,
+                    Some("thread"),
+                    Some("turn"),
+                )
+                .unwrap_err();
+                let expected = if missing {
+                    format!("failed to read {}", status_path.display())
+                } else {
+                    format!("invalid JSON in {}", status_path.display())
+                };
+                let case = format!("{outcome}/missing={missing}/stale={stale}");
+                assert_eq!(error.to_string(), expected, "{case}");
+                assert_eq!(snapshot_directory(directory.path()), before, "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn report_admission_runs_recovery_then_initial_gate_then_currency_then_duplicate_scan() {
+    for outcome in REPORT_OUTCOMES {
+        // Recovery runs before every gate: a journal of another claim fails each report,
+        // including one that a gate would refuse.
+        for refused_by in ["stale-token", "initial", "state"] {
+            let (directory, store) = fixture(SessionState::Working);
+            let first = claim(&store, &[]).unwrap();
+            let first_token = first.token().to_owned();
+            first.retain();
+            Report::for_claim(&store, FirstPartyCli::Claude, Some(&first_token))
+                .complete("earlier", None, None)
+                .unwrap();
+            let next = claim(&store, &[]).unwrap();
+            let token = next.token().to_owned();
+            next.retain();
+            update_status(store.directory(), SessionState::Claimed, None, None).unwrap();
+            update_status(store.directory(), SessionState::Working, None, None).unwrap();
+            let pending = PendingTurnCompletion::new("1-2-3", event("other claim"), None).unwrap();
+            store.write_completion(&pending).unwrap();
+            let report = match refused_by {
+                "stale-token" => Report::for_claim(&store, FirstPartyCli::Claude, Some("1-2-4")),
+                "initial" => Report::initial(&store, FirstPartyCli::Claude),
+                _ => {
+                    force_state(&store, SessionState::Ready);
+                    Report::for_claim(&store, FirstPartyCli::Claude, Some(&token))
+                }
+            };
+            let before = locked_snapshot(directory.path(), &store);
+            let error = report_outcome(&report, outcome, None, None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "pending native completion belongs to a different turn claim",
+                "{outcome}/{refused_by}"
+            );
+            assert_eq!(
+                snapshot_directory(directory.path()),
+                before,
+                "{outcome}/{refused_by}"
+            );
+        }
+
+        // The initial gate runs before the status is read.
+        let (directory, store) = fixture(SessionState::Working);
+        let first = claim(&store, &[]).unwrap();
+        let first_token = first.token().to_owned();
+        first.retain();
+        Report::for_claim(&store, FirstPartyCli::Claude, Some(&first_token))
+            .complete("earlier", None, None)
+            .unwrap();
+        let next = claim(&store, &[]).unwrap();
+        next.retain();
+        fs::remove_file(store.record(CoreRecord::Status).path()).unwrap();
+        let before = locked_snapshot(directory.path(), &store);
+        report_outcome(
+            &Report::initial(&store, FirstPartyCli::Claude),
+            outcome,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(snapshot_directory(directory.path()), before, "{outcome}");
+
+        // Currency runs before the duplicate scan reads any event.
+        for current in [false, true] {
+            let (directory, store) = fixture(SessionState::Working);
+            let claimed = claim(&store, &[]).unwrap();
+            let token = claimed.token().to_owned();
+            claimed.retain();
+            fs::write(
+                store
+                    .record(CoreRecord::Events)
+                    .path()
+                    .join(Store::new_event_file_name().unwrap()),
+                b"{",
+            )
+            .unwrap();
+            let report_token = if current { token } else { "1-2-4".to_owned() };
+            let before = locked_snapshot(directory.path(), &store);
+            let result = report_outcome(
+                &Report::for_claim(&store, FirstPartyCli::Codex, Some(&report_token)),
+                outcome,
+                Some("thread"),
+                Some("turn"),
+            );
+            assert_eq!(result.is_err(), current, "{outcome}/current={current}");
+            assert_eq!(
+                snapshot_directory(directory.path()),
+                before,
+                "{outcome}/current={current}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_outcome_waits_for_the_lock_and_recovers_a_prior_completion_first() {
+    use crate::native::session::primitives::close_io_test::{self, Point};
+    use std::sync::mpsc;
+    for outcome in REPORT_OUTCOMES {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let name = claimed.receipt().event_file.clone();
+        // Matching intent would confirm a cancellation if the report were admitted.
+        write_cancel_intent(&store, &claimed.receipt().request_id, &token);
+        claimed.retain();
+        let lock = store.lock().unwrap();
+        let mut pending =
+            PendingTurnCompletion::new(&token, event("earlier completion"), None).unwrap();
+        pending.event_file = name.clone();
+        store.write_completion(&pending).unwrap();
+        let directory = store.directory().to_owned();
+        let (reached, lock_attempt) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let store = Store::open_unchecked(directory);
+            // The checkpoint runs right before the blocking call of every lock; only the
+            // lifecycle lock's attempt is reported, and only the first one.
+            let mut acquiring = None;
+            let mut reached = Some(reached);
+            let result = close_io_test::during(
+                move |point| match point {
+                    Point::BeforeLock(name) => acquiring = Some(name),
+                    Point::BlockingLock if acquiring == Some("turn claim lifecycle") => {
+                        if let Some(reached) = reached.take() {
+                            reached.send(()).unwrap();
+                        }
+                    }
+                    _ => {}
+                },
+                || {
+                    report_outcome(
+                        &Report::for_claim(&store, FirstPartyCli::Codex, Some(&token)),
+                        outcome,
+                        Some("provider-session"),
+                        Some("provider-turn"),
+                    )
+                },
+            );
+            finished.send(result).unwrap();
+        });
+        // The timeout only bounds a report that never attempts the lifecycle lock.
+        lock_attempt
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                panic!("{outcome}: the report never attempted the lifecycle lock: {error}")
+            });
+        // The report is at the lock this test holds: nothing it does under the lock has run.
+        let journal = store
+            .record(CoreRecord::Completion)
+            .bytes()
+            .unwrap()
+            .unwrap_or_else(|| panic!("{outcome}: recovery ran before the lifecycle lock"));
+        let journal: PendingTurnCompletion = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(
+            (journal.claim_token, journal.event_file, journal.event),
+            (
+                pending.claim_token.clone(),
+                pending.event_file.clone(),
+                pending.event.clone()
+            ),
+            "{outcome}"
+        );
+        assert!(store.events().unwrap().is_empty(), "{outcome}");
+        assert_eq!(
+            current_claim_token(&store).unwrap().as_deref(),
+            Some(pending.claim_token.as_str()),
+            "{outcome}"
+        );
+        assert!(
+            matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "{outcome}: the report finished while the lifecycle lock was held"
+        );
+        drop(lock);
+        done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            store.event_strict(&name).unwrap(),
+            event("earlier completion"),
+            "{outcome}"
+        );
+        assert_eq!(store.events().unwrap().len(), 1, "{outcome}");
+        assert!(current_claim_token(&store).unwrap().is_none());
+        assert_eq!(store.status().unwrap().state, SessionState::Ready);
+        assert!(store.status().unwrap().error.is_none());
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+/// Runs `report` and, at each status-lock attempt, asks a second handle in this process
+/// whether the lifecycle lock is held. Recovery and the commit write the status only under
+/// the lifecycle lock, so every attempt must find it held. Returns one entry per attempt.
+fn lifecycle_lock_held_at_status_writes(
+    store: &Store,
+    report: impl FnOnce() -> Result<()>,
+) -> (Result<()>, Vec<bool>) {
+    use crate::native::session::primitives::close_io_test::{self, Point};
+    use std::{cell::RefCell, rc::Rc};
+    let directory = store.directory().to_owned();
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let record = Rc::clone(&observed);
+    let result = close_io_test::during(
+        move |point| {
+            if point == Point::BeforeLock("status") {
+                let held = Store::open_unchecked(&directory)
+                    .try_lock()
+                    .unwrap()
+                    .is_none();
+                record.borrow_mut().push(held);
+            }
+        },
+        report,
+    );
+    let observed = observed.borrow().clone();
+    (result, observed)
+}
+
+#[test]
+fn every_outcome_holds_the_lifecycle_lock_while_it_recovers_a_prior_completion() {
+    for outcome in REPORT_OUTCOMES {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let name = claimed.receipt().event_file.clone();
+        claimed.retain();
+        let mut pending =
+            PendingTurnCompletion::new(&token, event("earlier completion"), None).unwrap();
+        pending.event_file = name.clone();
+        store.write_completion(&pending).unwrap();
+        let (result, held) = lifecycle_lock_held_at_status_writes(&store, || {
+            report_outcome(
+                &Report::for_claim(&store, FirstPartyCli::Codex, Some(&token)),
+                outcome,
+                Some("provider-session"),
+                Some("provider-turn"),
+            )
+        });
+        result.unwrap();
+        assert!(!held.is_empty(), "{outcome}: recovery wrote no status");
+        assert!(
+            held.iter().all(|held| *held),
+            "{outcome}: the lifecycle lock was free during recovery: {held:?}"
+        );
+        assert!(store.try_lock().unwrap().is_some(), "{outcome}");
+        assert_eq!(
+            store.event_strict(&name).unwrap(),
+            event("earlier completion"),
+            "{outcome}"
+        );
+        assert_eq!(store.events().unwrap().len(), 1, "{outcome}");
+        assert!(current_claim_token(&store).unwrap().is_none());
+        assert_eq!(store.status().unwrap().state, SessionState::Ready);
+        assert!(store.status().unwrap().error.is_none());
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn every_admitted_outcome_holds_the_lifecycle_lock_while_it_commits() {
+    for (outcome, message, error, cancelled) in [
+        ("complete", "admitted answer", None, false),
+        ("fail", "", Some("admitted failure"), false),
+        (
+            "cancelled",
+            "",
+            Some("cancelled: admitted interruption"),
+            true,
+        ),
+    ] {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let name = claimed.receipt().event_file.clone();
+        if cancelled {
+            write_cancel_intent(&store, &claimed.receipt().request_id, &token);
+        }
+        claimed.retain();
+        let (result, held) = lifecycle_lock_held_at_status_writes(&store, || {
+            report_outcome(
+                &Report::for_claim(&store, FirstPartyCli::Codex, Some(&token)),
+                outcome,
+                Some("provider-session"),
+                Some("provider-turn"),
+            )
+        });
+        result.unwrap();
+        assert!(!held.is_empty(), "{outcome}: the commit wrote no status");
+        assert!(
+            held.iter().all(|held| *held),
+            "{outcome}: the lifecycle lock was free during the commit: {held:?}"
+        );
+        assert!(store.try_lock().unwrap().is_some(), "{outcome}");
+        let published = store.event_strict(&name).unwrap();
+        assert_eq!(published.provider, "codex", "{outcome}");
+        assert_eq!(published.message, message, "{outcome}");
+        assert_eq!(published.error.as_deref(), error, "{outcome}");
+        assert_eq!(published.cancelled, cancelled, "{outcome}");
+        assert_eq!(
+            published.provider_session_id.as_deref(),
+            Some("provider-session")
+        );
+        assert_eq!(published.turn_id.as_deref(), Some("provider-turn"));
+        assert_eq!(store.events().unwrap().len(), 1, "{outcome}");
+        assert!(current_claim_token(&store).unwrap().is_none());
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Ready, "{outcome}");
+        assert_eq!(status.error.as_deref(), error, "{outcome}");
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
