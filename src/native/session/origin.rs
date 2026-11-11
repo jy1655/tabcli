@@ -15,7 +15,7 @@ use super::turn::valid_turn_claim_token;
 use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy};
 use crate::native::clock::Clock;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
-use crate::native::terminal::ownership::NativeSessionOwner;
+use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -684,7 +684,7 @@ fn owner_verdict(
         }
         Err(fault) => return (fault_target(fault, "owner_unverified"), None),
     };
-    let verdict = match serde_json::from_slice::<NativeSessionOwner>(&bytes) {
+    let verdict = match super::record::owner_bytes(&bytes) {
         Ok(owner) => owner_attested(&owner, id, attest),
         Err(error) => target(
             None,
@@ -703,16 +703,16 @@ fn owner_attested(
     id: &str,
     attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
 ) -> Target {
-    match owner.managed_session_id.as_deref() {
-        Some(bound) if bound == id => (),
-        None => {
+    match owner.binding(id) {
+        OwnerBinding::Bound => (),
+        OwnerBinding::Unbound => {
             return target(
                 None,
                 "owner_unverified",
                 Some("owner record is unbound".to_owned()),
             );
         }
-        Some(_) => {
+        OwnerBinding::Foreign => {
             return target(
                 None,
                 "owner_unverified",

@@ -12,6 +12,7 @@ use super::turn::{
     JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
 };
 use super::{CoreRecord, Reader, SessionStatus, SnapshotBusy, launch, requests};
+use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Error, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -170,6 +171,20 @@ pub(in crate::native) fn provider_process(
     text: &str,
 ) -> serde_json::Result<super::schema::ProviderProcessRecord> {
     serde_json::from_str(text)
+}
+
+/// `native-session.json`, the Owner record: serde's shape decoder, without the snapshot
+/// timestamp-range rule or a schema check. Every reader keeps its own I/O policy (required or
+/// optional, strict or lossy text, byte budget, regular-file check) and error context, and
+/// judges the record with the binding and control rules beside `NativeSessionOwner`.
+pub(in crate::native) fn owner(text: &str) -> serde_json::Result<NativeSessionOwner> {
+    serde_json::from_str(text)
+}
+
+/// The Owner record from bytes, for Origin's budgeted read, preserving serde's UTF-8
+/// diagnostics rather than a text reader's.
+pub(in crate::native) fn owner_bytes(bytes: &[u8]) -> serde_json::Result<NativeSessionOwner> {
+    serde_json::from_slice(bytes)
 }
 
 // These projections preserve the callers' older text policies. In particular, event and

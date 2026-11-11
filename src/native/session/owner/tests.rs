@@ -605,3 +605,119 @@ pub(in crate::native) fn intermediate_attestation(control: &str) -> OwnerAttesta
         },
     )
 }
+
+// Attestation compares the control identity when any of the TTY device and the two process
+// groups is recorded; the birth fields alone do not make it compare.
+#[cfg(target_os = "macos")]
+#[test]
+fn attestation_compares_control_when_any_of_tty_device_and_both_process_groups_is_recorded() {
+    use std::cell::Cell;
+    for recorded in 0..8u8 {
+        let (mut owner, live) = fixture();
+        owner.terminal_tty_device = (recorded & 1 != 0).then_some(9);
+        owner.process_group = (recorded & 2 != 0).then_some(4242);
+        owner.terminal_process_group = (recorded & 4 != 0).then_some(4242);
+        let observed = Cell::new(0);
+        let a = attest_owner_with(
+            &owner,
+            OwnerObservers {
+                pid_alive: &|_| true,
+                birth: &|_| Ok(Some((10, 20))),
+                control: &|_| {
+                    observed.set(observed.get() + 1);
+                    Ok(Some(live))
+                },
+            },
+        );
+        assert!(
+            matches!(a.process, ProcessObservation::Live(Attested::Incarnation)),
+            "{recorded:03b}"
+        );
+        assert_eq!(observed.get(), usize::from(recorded != 0), "{recorded:03b}");
+        if recorded == 0 {
+            assert!(
+                matches!(a.control, ControlAttestation::NotRecorded),
+                "{recorded:03b}"
+            );
+        } else {
+            assert!(
+                matches!(a.control, ControlAttestation::Verified),
+                "{recorded:03b}"
+            );
+        }
+    }
+}
+
+// Launch repair reads the recorded owner through this attestation whatever Session the record
+// names: an unbound legacy record and one bound to another Session are both attested.
+#[test]
+fn recorded_owner_is_attested_whatever_session_it_names() {
+    for binding in [None, Some("session-foreign")] {
+        let root = tempfile::tempdir().unwrap();
+        crate::native::session::Store::open_unchecked(root.path())
+            .write_owner(&NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: binding.map(str::to_owned),
+                ..NativeSessionOwner::default()
+            })
+            .unwrap();
+        let attestation = attest_recorded_owner(&Reader::open_unchecked(root.path()))
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(attestation.process, ProcessObservation::Live(_)),
+            "{binding:?}: {attestation:?}"
+        );
+    }
+}
+
+// The macOS running wait attests the recorded owner whatever Session the record names.
+#[cfg(target_os = "macos")]
+#[test]
+fn running_wait_attests_an_owner_record_whatever_session_it_names() {
+    for binding in [None, Some("session-foreign")] {
+        let root = tempfile::tempdir().unwrap();
+        crate::native::session::Store::open_unchecked(root.path())
+            .write_owner(&NativeSessionOwner {
+                pid: 4242,
+                managed_session_id: binding.map(str::to_owned),
+                ..NativeSessionOwner::default()
+            })
+            .unwrap();
+        let error = crate::native::session::turn::running_wait_owner_with(root.path(), |owner| {
+            assert_eq!(owner.managed_session_id.as_deref(), binding);
+            OwnerAttestation {
+                process: ProcessObservation::Gone(Gone::Exited),
+                control: ControlAttestation::NotRecorded,
+                pid_alive: Some(false),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "native session process 4242 is no longer running; terminal cleanup remains unverified"
+        );
+    }
+}
+
+// Prune attests the recorded owner whatever Session the record names: a live owner bound to
+// another Session, or to none, blocks it.
+#[test]
+fn prune_attests_an_owner_record_whatever_session_it_names() {
+    for binding in [None, Some("session-foreign")] {
+        let root = tempfile::tempdir().unwrap();
+        crate::native::session::Store::open_unchecked(root.path())
+            .write_owner(&NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: binding.map(str::to_owned),
+                ..NativeSessionOwner::default()
+            })
+            .unwrap();
+        assert!(
+            Reader::open_unchecked(root.path())
+                .native_owner_blocks_prune()
+                .unwrap(),
+            "{binding:?}"
+        );
+    }
+}

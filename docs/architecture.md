@@ -199,8 +199,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   and close. Windows retains console attachment, Win32 effects, and lifecycle-locked input dispatch.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
-  adapter and an in-memory test adapter; `ownership` keeps the owner record types, control
-  proof and the owner-teardown action, and the platform adapters keep the surface close.
+  adapter and an in-memory test adapter; `ownership` keeps the owner record types with the
+  rules that judge an owner record (its binding to an expected Session as bound, unbound or
+  foreign; the five-field control record of the ownership proof and close authority; and
+  attestation's narrower rule, which compares control when any of the TTY device and the two
+  process groups is recorded), control proof and the owner-teardown action, and the platform
+  adapters keep the surface close. Each reader maps the rules' answers itself.
   The macOS owner wrapper reads the record and calls the same ordered verifier as portable tests;
   live-process and TTY observations are lazy so that an earlier refusal prevents later OS reads.
   `session::owner` owns process observation and
@@ -260,8 +264,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   (per-record cap, byte and time allowance, selective reads, no Snapshot). Every other reader
   of those Records (the lifecycle paths, reopen provenance, the Claude projection) calls the
   same decoders while keeping its own missing-record policy and error context. The auxiliary
-  reopen-marker, reopen-refusal and provider-process shape decoders also live here, preserving
-  their historical serde policy; the Snapshot timestamp rule is not added to those records.
+  reopen-marker, reopen-refusal and provider-process shape decoders, and the Owner record's,
+  also live here, preserving their historical serde policy; the Snapshot timestamp rule is not
+  added to those records.
   Reopen still judges refusal validity and release authority after decoding. Then `reads.rs`
   for event reads and read budgets, `primitives.rs` for filesystem durability and
   private-record permissions, and `owner.rs` for read-only attestation of the recorded owner.
@@ -513,7 +518,9 @@ marks its interpretation as derived. Replacement removes the earlier intent from
 
 `RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
 Core Record decoding is not an adapter concern: it lives in `session/record.rs`, one decoder per
-Record, and every reader of a core Record calls it.
+Record, and every reader of a core Record calls it. The Owner record's decoder there checks
+only its shape; the rules that judge an owner record stay beside its type in
+`terminal::ownership`, and each reader keeps its own I/O policy and error text.
 
 The native provider contract requires explicit launch configuration, initial delivery,
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every

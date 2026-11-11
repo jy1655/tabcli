@@ -77,6 +77,7 @@ pub(super) fn write_prune_test_session(
 }
 
 // An owner that passed the live Terminal.app verification has its whole identity recorded.
+// This helper's surface, its owner and the id its callers expect all name `session-owner123`.
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn write_attested_apple_terminal_state(
     directory: &Path,
@@ -84,6 +85,11 @@ pub(in crate::native) fn write_attested_apple_terminal_state(
     owner_pid: u32,
 ) -> NativeSessionOwner {
     write_owned_terminal_state(directory, state, owner_pid);
+    let handle_path = directory.join(TERMINAL_HANDLE_FILE);
+    let mut surface: terminal::TerminalSession =
+        crate::native::session::primitives::read_json(&handle_path).unwrap();
+    surface.managed_session_id = Some("session-owner123".to_owned());
+    write_json_atomic(&handle_path, &surface).unwrap();
     let owner = NativeSessionOwner {
         pid: owner_pid,
         managed_session_id: Some("session-owner123".to_owned()),

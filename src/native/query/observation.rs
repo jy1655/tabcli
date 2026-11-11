@@ -103,7 +103,8 @@ pub(in crate::native) type SurfaceProbe<'a> =
 impl SessionEvidence {
     /// The raw Owner record read, shared with `wait`'s per-poll judgment.
     pub(super) fn read_owner(reader: &Reader) -> Result<Option<NativeSessionOwner>> {
-        RecordReader::at(reader.record(CoreRecord::Owner).path()).optional_json()
+        RecordReader::at(reader.record(CoreRecord::Owner).path())
+            .optional_json_with(session::record::owner)
     }
 
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {

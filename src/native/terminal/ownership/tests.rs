@@ -3,9 +3,10 @@
 
 use crate::native::terminal;
 use crate::native::terminal::ownership::{
-    MacTerminalShellIdentity, NativeProcessIdentity, NativeSessionOwner,
-    native_owner_identity_matches, verified_terminal_owner_process_group,
-    verified_terminal_shell_process_group, verify_native_terminal_owner_with,
+    ControlRecord, MacTerminalShellIdentity, NativeProcessIdentity, NativeSessionOwner,
+    OwnerBinding, RecordedControl, native_owner_identity_matches,
+    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
+    verify_native_terminal_owner_with,
 };
 use anyhow::{Context, bail};
 use std::{cell::RefCell, path::Path};
@@ -892,6 +893,63 @@ fn the_windows_owner_requirement_agrees_with_the_probe() {
             probed.is_ok(),
             "{label}: {requirement:?} against the probe's {:?}",
             probed.map(|_| ())
+        );
+    }
+}
+
+#[test]
+fn owner_binding_answers_bound_unbound_or_foreign_for_the_expected_session() {
+    for (recorded, expected) in [
+        (Some(SESSION_ID), OwnerBinding::Bound),
+        (None, OwnerBinding::Unbound),
+        (Some("session-other456"), OwnerBinding::Foreign),
+        (Some(""), OwnerBinding::Foreign),
+    ] {
+        let owner = NativeSessionOwner {
+            managed_session_id: recorded.map(str::to_owned),
+            ..NativeSessionOwner::default()
+        };
+        assert_eq!(owner.binding(SESSION_ID), expected, "{recorded:?}");
+    }
+}
+
+// Every subset of the five control fields: none recorded, all five, or partial; and
+// attestation's rule, which compares control when any of the TTY device and the two process
+// groups is recorded. The two rules differ: a birth-only record is partial for the first and
+// compares nothing for the second.
+#[test]
+fn control_record_and_attestation_rules_classify_every_subset_of_the_control_fields() {
+    let (_, full, _, _) = owner_fixture();
+    for present in 0..32u8 {
+        let mut owner = full.clone();
+        owner.terminal_tty_device = owner.terminal_tty_device.filter(|_| present & 1 != 0);
+        owner.process_start_seconds = owner.process_start_seconds.filter(|_| present & 2 != 0);
+        owner.process_start_microseconds = owner
+            .process_start_microseconds
+            .filter(|_| present & 4 != 0);
+        owner.process_group = owner.process_group.filter(|_| present & 8 != 0);
+        owner.terminal_process_group = owner.terminal_process_group.filter(|_| present & 16 != 0);
+        let expected = match present {
+            0 => ControlRecord::NotRecorded,
+            31 => ControlRecord::Complete(RecordedControl {
+                terminal_tty_device: 7,
+                process_start_seconds: 100,
+                process_start_microseconds: 200,
+                process_group: 4242,
+                terminal_process_group: 4242,
+            }),
+            _ => ControlRecord::Partial,
+        };
+        assert_eq!(owner.control_record(), expected, "{present:05b}");
+        assert_eq!(
+            owner.control_record().is_complete(),
+            present == 31,
+            "{present:05b}"
+        );
+        assert_eq!(
+            owner.attestation_compares_control(),
+            present & (1 | 8 | 16) != 0,
+            "{present:05b}"
         );
     }
 }

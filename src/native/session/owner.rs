@@ -31,8 +31,10 @@ pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
 
 /// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
 pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
+    // Launch repair reads the owner here and attests the recorded process whatever Session
+    // the record names; whether it should consult the binding first is an open follow-up.
     Ok(RecordReader::at(reader.record(CoreRecord::Owner).path())
-        .optional_json::<NativeSessionOwner>()?
+        .optional_json_with(super::record::owner)?
         .map(|owner| attest_owner(&owner)))
 }
 
@@ -117,9 +119,7 @@ pub(in crate::native) fn attest_owner_with(
     let process = classify::<()>(owner.pid, None, || pid_alive, || unreachable!());
     #[cfg(target_os = "macos")]
     let control = if matches!(process, ProcessObservation::Live(Attested::Incarnation))
-        && (owner.terminal_tty_device.is_some()
-            || owner.process_group.is_some()
-            || owner.terminal_process_group.is_some())
+        && owner.attestation_compares_control()
     {
         match (observers.control)(owner.pid) {
             Ok(Some(live)) => {

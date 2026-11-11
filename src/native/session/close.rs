@@ -16,6 +16,8 @@ use crate::native::session::turn::{
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
+#[cfg(target_os = "macos")]
+use crate::native::terminal::ownership::OwnerBinding;
 
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
@@ -236,9 +238,11 @@ pub(in crate::native) fn terminal_teardown_intent(
     let intent: TerminalCloseIntent = serde_json::from_value(value)?;
     let owner: NativeSessionOwner = reader.owner()?;
     let teardown = intent.teardown.context("missing teardown intent")?;
+    // A complete control record also needs both process groups, which the clauses comparing
+    // them with the intent's group already require.
     if intent.terminal != *surface
         || surface.managed_session_id.as_deref() != Some(&intent.managed_session_id)
-        || owner.managed_session_id.as_deref() != Some(&intent.managed_session_id)
+        || owner.binding(&intent.managed_session_id) != OwnerBinding::Bound
         || serde_json::to_value(&owner)? != serde_json::to_value(&intent.owner)?
         || owner.process_group != Some(teardown.process_group)
         || owner.pid != teardown.process_group
@@ -246,9 +250,7 @@ pub(in crate::native) fn terminal_teardown_intent(
         || teardown.process_group > i32::MAX as u32
         || teardown.reason.is_empty()
         || owner.terminal_tty.as_deref().is_none_or(str::is_empty)
-        || owner.terminal_tty_device.is_none()
-        || owner.process_start_seconds.is_none()
-        || owner.process_start_microseconds.is_none()
+        || !owner.control_record().is_complete()
         || owner.terminal_process_group != Some(teardown.process_group)
     {
         bail!("terminal teardown intent does not match the attested owner and exact handle");
@@ -279,22 +281,13 @@ pub(in crate::native) fn terminal_close_intent_owner(
     };
     let (Ok(intent), Ok(owner)) = (
         serde_json::from_str::<TerminalCloseIntent>(&intent),
-        serde_json::from_str::<NativeSessionOwner>(&owner),
+        super::record::owner(&owner),
     ) else {
         return Ok(None);
     };
-    let attested = matches!(
-        (
-            owner.terminal_tty_device,
-            owner.process_start_seconds,
-            owner.process_start_microseconds,
-            owner.process_group,
-            owner.terminal_process_group,
-        ),
-        (Some(_), Some(_), Some(_), Some(_), Some(_))
-    );
+    let attested = owner.control_record().is_complete();
     let bound = session.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str())
-        && owner.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str());
+        && owner.binding(&intent.managed_session_id) == OwnerBinding::Bound;
     let exact = intent.terminal == *session
         && serde_json::to_value(&intent.owner)? == serde_json::to_value(&owner)?;
     Ok((attested && bound && exact && intent.teardown.is_none()).then_some(owner))
@@ -339,13 +332,15 @@ impl Reader {
 
 impl Reader {
     pub(in crate::native) fn native_owner_blocks_prune(&self) -> Result<bool> {
+        // Prune attests the recorded process whatever Session the record names; whether it
+        // should consult the binding first is an open follow-up.
         let path = self.record(CoreRecord::Owner).path().to_owned();
         let text = match session::RecordReader::at(&path).text() {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(false),
             Err(_) => return Ok(true),
         };
-        let owner = match serde_json::from_str::<NativeSessionOwner>(&text) {
+        let owner = match super::record::owner(&text) {
             Ok(owner) => owner,
             Err(_) => return Ok(true),
         };
@@ -882,9 +877,11 @@ where
     if !repair_examines_owner(&status.state) {
         return untouched(recovery_damage);
     }
+    // Repair attests the recorded process whatever Session the record names; whether it
+    // should consult the binding first is an open follow-up.
     let owner_path = store.record(CoreRecord::Owner).path().to_owned();
     let owner = match session::RecordReader::at(&owner_path).raw_text() {
-        Ok(text) => serde_json::from_str::<NativeSessionOwner>(&text)
+        Ok(text) => super::record::owner(&text)
             .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return untouched(recovery_damage);

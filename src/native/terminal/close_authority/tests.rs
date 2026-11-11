@@ -694,6 +694,61 @@ fn dead_owner_incomplete_foreign_or_reused_pid_refused_before_surface() {
     }
 }
 
+// The dead-owner route requires the owner record bound to this Session and all five control
+// fields recorded: an unbound legacy record, one with none of them, and one missing any single
+// field are refused before any surface observation.
+#[test]
+fn dead_owner_unbound_or_without_all_five_control_fields_refused_before_surface() {
+    for case in [
+        "unbound",
+        "no control fields",
+        "tty device",
+        "start seconds",
+        "start microseconds",
+        "process group",
+        "terminal process group",
+    ] {
+        let mut row = Row::new(Iterm2);
+        let owner = row.owner.as_mut().unwrap();
+        match case {
+            "unbound" => owner.managed_session_id = None,
+            "no control fields" => {
+                owner.terminal_tty_device = None;
+                owner.process_start_seconds = None;
+                owner.process_start_microseconds = None;
+                owner.process_group = None;
+                owner.terminal_process_group = None;
+            }
+            "tty device" => owner.terminal_tty_device = None,
+            "start seconds" => owner.process_start_seconds = None,
+            "start microseconds" => owner.process_start_microseconds = None,
+            "process group" => owner.process_group = None,
+            _ => owner.terminal_process_group = None,
+        }
+        row.check(
+            Err(DEAD_IDENTITY),
+            &with(&OWNED, &["resumable", "owner", "mac-live", "pid-alive"]),
+        );
+    }
+}
+
+// The failed-start shortcut requires the owner record bound to this Session: an unbound
+// legacy record falls through to the dead-owner route, which refuses it as well.
+#[test]
+fn failed_start_shortcut_refuses_an_unbound_owner() {
+    let mut row = Row::new(Iterm2);
+    row.state = SessionState::Failed;
+    row.phase = Some(launch::Phase::Spawning);
+    row.owner.as_mut().unwrap().managed_session_id = None;
+    row.check(
+        Err(DEAD_IDENTITY),
+        &with(
+            &FAILED_START,
+            &["resumable", "owner", "mac-live", "pid-alive"],
+        ),
+    );
+}
+
 #[test]
 fn dead_owner_surface_absent_or_present() {
     for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {

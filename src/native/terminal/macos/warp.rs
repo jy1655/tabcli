@@ -10,7 +10,7 @@ use crate::native::session::{Reader, RecordReader, RecordStore};
 use crate::native::terminal;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
-    NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
+    NativeProcessIdentity, NativeSessionOwner, OwnerBinding, native_owner_identity_matches,
     verified_terminal_owner_process_group, verified_terminal_shell_process_group,
 };
 #[cfg(unix)]
@@ -2071,7 +2071,7 @@ pub(in crate::native) fn prepare_warp_close(
 ) -> Result<()> {
     session.verify_managed_session(id)?;
     if session.kind != terminal::TerminalKind::Warp
-        || owner.managed_session_id.as_deref() != Some(id)
+        || owner.binding(id) != OwnerBinding::Bound
         || !native_owner_identity_matches(owner, live)
     {
         bail!("Warp close owner identity changed");

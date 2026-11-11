@@ -12,7 +12,9 @@ use super::process::macos_process_start;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use crate::native::terminal;
 use crate::native::terminal::ownership;
-use crate::native::terminal::ownership::{MacTerminalAppIdentity, NativeSessionOwner};
+use crate::native::terminal::ownership::{
+    MacTerminalAppIdentity, NativeSessionOwner, OwnerBinding,
+};
 use agent_bridge::process_is_alive;
 use std::{
     path::Path,
@@ -580,22 +582,18 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
     let owner = Reader::open_unchecked(directory)
         .record(CoreRecord::Owner)
         .text()?
-        .map(|text| serde_json::from_str::<NativeSessionOwner>(&text))
+        .map(|text| crate::native::session::record::owner(&text))
         .transpose()
         .context("invalid Terminal.app startup owner record; the binding is retained")?;
     if let Some(owner) = &owner {
-        if bound.managed_session_id != owner.managed_session_id
+        // The handle's binding is present: it was refused above when absent.
+        if bound
+            .managed_session_id
+            .as_deref()
+            .map(|expected| owner.binding(expected))
+            != Some(OwnerBinding::Bound)
             || owner.terminal_tty.as_deref() != Some(surface.id.as_str())
-            || !matches!(
-                (
-                    owner.terminal_tty_device,
-                    owner.process_start_seconds,
-                    owner.process_start_microseconds,
-                    owner.process_group,
-                    owner.terminal_process_group
-                ),
-                (Some(_), Some(_), Some(_), Some(_), Some(_))
-            )
+            || !owner.control_record().is_complete()
         {
             bail!(
                 "Terminal.app startup owner/surface identity is incomplete or changed; the binding is retained"

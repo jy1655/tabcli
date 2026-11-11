@@ -13,9 +13,9 @@ use super::TerminalSession;
 use super::macos::OwnedSurfaceClose;
 #[cfg(target_os = "macos")]
 use super::macos::ownership::verified_macos_terminal_owner;
-#[cfg(any(target_os = "macos", windows))]
-use super::ownership::NativeSessionOwner;
 use super::ownership::verify_terminal_surface_ownership_with_timeout;
+#[cfg(any(target_os = "macos", windows))]
+use super::ownership::{NativeSessionOwner, OwnerBinding};
 #[cfg(target_os = "macos")]
 use super::ownership::{
     owner_group_gone, teardown_absent_owner_with, terminate_owned_foreground_group_until,
@@ -249,7 +249,7 @@ pub(in crate::native) fn decide(
                 let owner: NativeSessionOwner = observation.owner()?;
                 let observed = observation.observe_owner_record(&owner);
                 if status.state == SessionState::Failed
-                    && owner.managed_session_id.as_deref() == Some(expected_session_id)
+                    && owner.binding(expected_session_id) == OwnerBinding::Bound
                     && matches!(observed.process, ProcessObservation::Gone(_))
                 {
                     session.verify_managed_session(expected_session_id)?;
@@ -299,17 +299,8 @@ pub(in crate::native) fn decide(
                         attestation.process,
                         ProcessObservation::Gone(Gone::Reused(_))
                     ) || observation.pid_alive(owner.pid)
-                        || owner.managed_session_id.as_deref() != Some(expected_session_id)
-                        || !matches!(
-                            (
-                                owner.terminal_tty_device,
-                                owner.process_start_seconds,
-                                owner.process_start_microseconds,
-                                owner.process_group,
-                                owner.terminal_process_group
-                            ),
-                            (Some(_), Some(_), Some(_), Some(_), Some(_))
-                        )
+                        || owner.binding(expected_session_id) != OwnerBinding::Bound
+                        || !owner.control_record().is_complete()
                         || owner.terminal_tty.as_deref().is_none_or(str::is_empty)
                     {
                         bail!(
