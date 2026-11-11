@@ -10,22 +10,23 @@ use super::{NativeCommand, consent, provider, query, reopen, terminal};
 use crate::native::clock::SystemClock;
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::process_env::{PROBE_TIMEOUT, probe};
+use crate::native::provider_installation::{Executable, read_version_probe, resolve_provider};
 use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
 use crate::native::session::launch;
-use crate::native::session::launch::wrapper::{
-    is_executable, provider_version_text, resolve_provider,
-};
 use crate::native::session::origin::{OriginEnvironment, OriginObservation, SourceKind};
 use crate::native::session::primitives::{require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
 use agent_bridge::PUBLIC_COMMAND;
-use agent_bridge::{FirstPartyCli, cli_version_is_supported, terminal_safe_text};
+use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Result, bail};
+use installation::{VersionProbe, executable_check, version_check, workspace_check};
 use serde_json::{Value, json};
 use std::fs;
 use std::str::FromStr;
 use std::time::Instant;
+
+mod installation;
 
 #[derive(Debug)]
 pub(crate) struct DoctorRequest {
@@ -224,78 +225,36 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             Some(manifest) => Ok(manifest.provider_path.clone()),
             None => resolve_provider(provider),
         };
-        match resolved {
-            Ok(path) if path.is_absolute() && path.is_file() && is_executable(&path) => {
-                checks.push(Check::new(CheckId::PROVIDER_EXECUTABLE, Available, Reason::EXECUTABLE_FOUND, "Provider executable found; presence alone does not establish runtime capability.", "Use --probe to read its current version.").evidence(json!({"path": path})));
-                executable = Some(path);
-            }
-            Ok(path) if !path.is_absolute() => {
-                checks.push(Check::new(CheckId::PROVIDER_EXECUTABLE, Unknown, Reason::EXECUTABLE_PATH_UNVERIFIED, "The recorded executable path is relative; doctor does not substitute a PATH lookup for it.", "Inspect the original launch configuration.").evidence(json!({"path": path})));
-            }
-            outcome => {
-                let detail = match outcome {
-                    Ok(path) => format!(
-                        "Provider executable is missing, not executable, or not absolute: {}",
-                        path.display()
-                    ),
-                    Err(error) => format!("{error:#}"),
-                };
-                checks.push(Check::new(CheckId::PROVIDER_EXECUTABLE, Unavailable, Reason::EXECUTABLE_UNAVAILABLE, detail, "Check the provider installation and PATH; existing sessions retain their recorded executable path."));
-            }
-        }
-        if request.probe {
-            if let Some(path) = &executable {
-                match probe(
-                    path,
-                    &["--version"],
-                    None,
-                    provider::probe_environment_removals(provider),
-                    deadline,
-                ) {
-                    Ok(output) if output.status.success() => {
-                        let version = provider_version_text(&output.stdout, &output.stderr);
-                        let (availability, reason) =
-                            match cli_version_is_supported(provider, &version) {
-                                Ok(true) => (Available, Reason::VERSION_SUPPORTED),
-                                Ok(false) => (Unavailable, Reason::VERSION_UNSUPPORTED),
-                                Err(_) => (Unknown, Reason::VERSION_UNRECOGNIZED),
-                            };
-                        checks.push(Check::new(CheckId::PROVIDER_VERSION, availability, reason, format!("Current CLI version; required minimum {}", provider.minimum_version()), "CLI version is only one gate; inspect the provider-specific checks.").evidence(json!({"current_version": version})));
-                        current_version = Some(version);
-                    }
-                    outcome => {
-                        let detail = match outcome {
-                            Ok(output) => format!("Version probe exited with {}", output.status),
-                            Err(error) => format!("{error:#}"),
-                        };
-                        checks.push(Check::new(CheckId::PROVIDER_VERSION, Unknown, Reason::VERSION_PROBE_FAILED, detail, "Inspect the provider installation; a failed probe does not prove availability."));
-                    }
-                }
-            } else {
-                checks.push(Check::new(
-                    CheckId::PROVIDER_VERSION,
-                    Unknown,
-                    Reason::EXECUTABLE_UNAVAILABLE,
-                    "No unambiguous executable is available for a version probe.",
-                    "Inspect the provider_executable check.",
-                ));
+        let (check, usable) = executable_check(resolved.map(Executable::observe));
+        checks.push(check);
+        executable = usable;
+        let version_probe = if !request.probe {
+            VersionProbe::NotRequested
+        } else if let Some(path) = &executable {
+            match probe(
+                path,
+                &["--version"],
+                None,
+                provider::probe_environment_removals(provider),
+                deadline,
+            ) {
+                Ok(output) => VersionProbe::Completed(read_version_probe(provider, &output)),
+                Err(error) => VersionProbe::Failed(error),
             }
         } else {
-            checks.push(Check::new(CheckId::PROVIDER_VERSION, Unknown, Reason::PROBE_NOT_REQUESTED, "Current CLI version was not queried. A launch-recorded version is historical evidence only.", "Add --probe for bounded local version checks; no model or message is sent.").evidence(json!({"minimum_version": provider.minimum_version().to_string()})));
-        }
+            VersionProbe::NoExecutable
+        };
+        let (check, version) = version_check(provider, version_probe);
+        checks.push(check);
+        current_version = version;
         let workspace = manifest
             .as_ref()
             .map(|m| m.workspace.clone())
             .map_or_else(std::env::current_dir, Ok)?;
-        let (availability, reason) = match fs::metadata(&workspace) {
-            Ok(metadata) if metadata.is_dir() => (Available, Reason::WORKSPACE_PRESENT),
-            Ok(_) => (Unavailable, Reason::WORKSPACE_NOT_DIRECTORY),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (Unavailable, Reason::WORKSPACE_MISSING)
-            }
-            Err(_) => (Unknown, Reason::WORKSPACE_UNREADABLE),
-        };
-        checks.push(Check::new(CheckId::WORKSPACE, availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
+        checks.push(workspace_check(
+            &workspace,
+            fs::metadata(&workspace).map(|metadata| metadata.is_dir()),
+        ));
         if let Some(directory) = &directory {
             let consent = consent::observe(directory);
             consent_state = consent.value()["state"].clone();

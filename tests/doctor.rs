@@ -1618,3 +1618,433 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     assert_eq!(row["next_action"], recovering_next_action);
     assert_eq!(row["evidence"], evidence);
 }
+
+// A whole check as the report prints it, without its observation time: every other field,
+// including an absent next command, is part of the row.
+fn row(report: &Value, id: &str) -> Value {
+    let mut row = check(report, id).clone();
+    let observed = row.as_object_mut().unwrap().remove("observed_unix_ms");
+    assert!(
+        observed.and_then(|value| value.as_u64()).unwrap() > 0,
+        "{id}"
+    );
+    row
+}
+
+fn expected_row(
+    id: &str,
+    availability: &str,
+    reason: &str,
+    detail: &str,
+    next_action: &str,
+    evidence: Value,
+) -> Value {
+    json!({
+        "id": id, "availability": availability, "reason_code": reason, "detail": detail,
+        "next_action": next_action, "evidence": evidence,
+    })
+}
+
+const EXECUTABLE_FOUND: (&str, &str) = (
+    "Provider executable found; presence alone does not establish runtime capability.",
+    "Use --probe to read its current version.",
+);
+const EXECUTABLE_UNAVAILABLE_NEXT: &str = "Check the provider installation and PATH; existing sessions retain their recorded executable path.";
+const NO_EXECUTABLE_FOR_PROBE: (&str, &str) = (
+    "No unambiguous executable is available for a version probe.",
+    "Inspect the provider_executable check.",
+);
+const PROBE_NOT_REQUESTED: (&str, &str) = (
+    "Current CLI version was not queried. A launch-recorded version is historical evidence only.",
+    "Add --probe for bounded local version checks; no model or message is sent.",
+);
+
+// The executable row of a session comes from its recorded path alone, and the version row
+// of an unusable path names the executable row instead of probing.
+#[test]
+fn provider_executable_rows_keep_each_recorded_path_outcome() {
+    let fixture = Fixture::new("pi");
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let usable = PathBuf::from(env!("CARGO_BIN_EXE_tabcli"));
+    // A regular file without an execute bit; Windows has no such bit to lack.
+    let plain = cfg!(unix).then(|| {
+        let plain = fixture.root.path().join("plain-pi");
+        fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        plain
+    });
+    let unusable = [
+        fixture.root.path().join("missing-pi"),
+        fixture.root.path().to_path_buf(),
+    ]
+    .into_iter()
+    .chain(plain)
+    .collect::<Vec<_>>();
+    let mut rows = |executable: &PathBuf, probe: bool| {
+        manifest["provider_path"] = json!(executable);
+        write(&path, &manifest);
+        let before = entries(fixture.root.path());
+        let mut args = vec!["doctor", "session-doctor", "--json"];
+        if probe {
+            args.push("--probe");
+        }
+        let value = report(fixture.run(&args));
+        assert_eq!(entries(fixture.root.path()), before);
+        (
+            row(&value, "provider_executable"),
+            row(&value, "provider_version"),
+        )
+    };
+
+    let (executable, version) = rows(&usable, false);
+    assert_eq!(
+        executable,
+        expected_row(
+            "provider_executable",
+            "available",
+            "executable_found",
+            EXECUTABLE_FOUND.0,
+            EXECUTABLE_FOUND.1,
+            json!({"path": usable}),
+        )
+    );
+    assert_eq!(
+        version,
+        expected_row(
+            "provider_version",
+            "unknown",
+            "probe_not_requested",
+            PROBE_NOT_REQUESTED.0,
+            PROBE_NOT_REQUESTED.1,
+            json!({"minimum_version": "0.84.1"}),
+        )
+    );
+
+    let relative = PathBuf::from("relative-pi");
+    let (executable, version) = rows(&relative, true);
+    assert_eq!(
+        executable,
+        expected_row(
+            "provider_executable",
+            "unknown",
+            "executable_path_unverified",
+            "The recorded executable path is relative; doctor does not substitute a PATH lookup for it.",
+            "Inspect the original launch configuration.",
+            json!({"path": "relative-pi"}),
+        )
+    );
+    assert_eq!(
+        version,
+        expected_row(
+            "provider_version",
+            "unknown",
+            "executable_unavailable",
+            NO_EXECUTABLE_FOR_PROBE.0,
+            NO_EXECUTABLE_FOR_PROBE.1,
+            Value::Null,
+        )
+    );
+
+    for executable_path in &unusable {
+        let (executable, version) = rows(executable_path, true);
+        assert_eq!(
+            executable,
+            expected_row(
+                "provider_executable",
+                "unavailable",
+                "executable_unavailable",
+                &format!(
+                    "Provider executable is missing, not executable, or not absolute: {}",
+                    executable_path.display()
+                ),
+                EXECUTABLE_UNAVAILABLE_NEXT,
+                Value::Null,
+            ),
+            "{executable_path:?}"
+        );
+        assert_eq!(
+            version,
+            expected_row(
+                "provider_version",
+                "unknown",
+                "executable_unavailable",
+                NO_EXECUTABLE_FOR_PROBE.0,
+                NO_EXECUTABLE_FOR_PROBE.1,
+                Value::Null,
+            ),
+            "{executable_path:?}"
+        );
+    }
+}
+
+// Without a session the executable is resolved from PATH: only an executable regular file
+// on an absolute entry counts, and a resolution failure is reported with its own text.
+#[test]
+fn provider_executable_rows_keep_each_path_resolution_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    let empty = root.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let run = |path: Option<&std::ffi::OsStr>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
+        command
+            .args(["doctor", "--provider", "pi", "--probe", "--json"])
+            .env(
+                "AGENT_BRIDGE_NATIVE_STATE_DIR",
+                root.path().join("absent-store"),
+            )
+            .current_dir(root.path());
+        match path {
+            Some(path) => command.env("PATH", path),
+            None => command.env_remove("PATH"),
+        };
+        let value = report(command.output().unwrap());
+        (
+            row(&value, "provider_executable"),
+            row(&value, "provider_version"),
+        )
+    };
+    let unavailable = |detail: &str| {
+        (
+            expected_row(
+                "provider_executable",
+                "unavailable",
+                "executable_unavailable",
+                detail,
+                EXECUTABLE_UNAVAILABLE_NEXT,
+                Value::Null,
+            ),
+            expected_row(
+                "provider_version",
+                "unknown",
+                "executable_unavailable",
+                NO_EXECUTABLE_FOR_PROBE.0,
+                NO_EXECUTABLE_FOR_PROBE.1,
+                Value::Null,
+            ),
+        )
+    };
+    let not_found = unavailable("pi was not found on an absolute PATH entry");
+    assert_eq!(run(Some(empty.as_os_str())), not_found);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(run(None), unavailable("PATH is not set"));
+        // A relative entry, a directory named like the provider and a regular file without
+        // an execute bit are all skipped.
+        let relative = tempfile::Builder::new()
+            .prefix("relative-provider-")
+            .tempdir_in(root.path())
+            .unwrap();
+        let skipped_executable = relative.path().join("pi");
+        fs::write(&skipped_executable, "#!/bin/sh\nprintf '1.0.0\\n'\n").unwrap();
+        fs::set_permissions(&skipped_executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = root.path().join("directory");
+        fs::create_dir_all(directory.join("pi")).unwrap();
+        fs::set_permissions(directory.join("pi"), fs::Permissions::from_mode(0o700)).unwrap();
+        let plain = root.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        fs::write(plain.join("pi"), "#!/bin/sh\nprintf '1.0.0\\n'\n").unwrap();
+        fs::set_permissions(plain.join("pi"), fs::Permissions::from_mode(0o600)).unwrap();
+        let skipped = std::env::join_paths([
+            relative.path().strip_prefix(root.path()).unwrap(),
+            &directory,
+            &plain,
+        ])
+        .unwrap();
+        assert_eq!(run(Some(&skipped)), not_found);
+
+        // The first usable candidate is reported by its canonical path.
+        let installed = root.path().join("installed");
+        fs::create_dir(&installed).unwrap();
+        fs::write(installed.join("pi-real"), "#!/bin/sh\nprintf '1.0.0\\n'\n").unwrap();
+        fs::set_permissions(installed.join("pi-real"), fs::Permissions::from_mode(0o700)).unwrap();
+        let linked = root.path().join("linked");
+        fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(installed.join("pi-real"), linked.join("pi")).unwrap();
+        let path = std::env::join_paths([&directory, &plain, &linked, &installed]).unwrap();
+        let canonical = installed.join("pi-real").canonicalize().unwrap();
+        let (executable, version) = run(Some(&path));
+        assert_eq!(
+            executable,
+            expected_row(
+                "provider_executable",
+                "available",
+                "executable_found",
+                EXECUTABLE_FOUND.0,
+                EXECUTABLE_FOUND.1,
+                json!({"path": canonical}),
+            )
+        );
+        assert_eq!(
+            version,
+            expected_row(
+                "provider_version",
+                "available",
+                "version_supported",
+                "Current CLI version; required minimum 0.84.1",
+                "CLI version is only one gate; inspect the provider-specific checks.",
+                json!({"current_version": "1.0.0"}),
+            )
+        );
+    }
+}
+
+// Every outcome of the opt-in version probe, as whole rows: the text read, the verdict, a
+// nonzero exit, a probe that failed before it produced an output, and no probe at all.
+#[cfg(unix)]
+#[test]
+fn provider_version_rows_keep_each_probe_outcome() {
+    use std::os::unix::fs::PermissionsExt;
+    const READ: (&str, &str) = (
+        "Current CLI version; required minimum 1.1.12",
+        "CLI version is only one gate; inspect the provider-specific checks.",
+    );
+    const FAILED_NEXT: &str =
+        "Inspect the provider installation; a failed probe does not prove availability.";
+    let fixture = Fixture::new("agy");
+    let executable = fixture.root.path().join("provider");
+    let oversized = "dd if=/dev/zero bs=1024 count=80 2>/dev/null | tr '\\000' a";
+    for (body, availability, reason, detail, next_action, evidence, scope) in [
+        (
+            "printf 'agy 1.1.12\\n'",
+            "available",
+            "version_supported",
+            READ.0.to_owned(),
+            READ.1,
+            json!({"current_version": "agy 1.1.12"}),
+            json!("agy 1.1.12"),
+        ),
+        (
+            "printf 'agy 1.1.11\\n'",
+            "unavailable",
+            "version_unsupported",
+            READ.0.to_owned(),
+            READ.1,
+            json!({"current_version": "agy 1.1.11"}),
+            json!("agy 1.1.11"),
+        ),
+        (
+            "printf 'development build\\n'",
+            "unknown",
+            "version_unrecognized",
+            READ.0.to_owned(),
+            READ.1,
+            json!({"current_version": "development build"}),
+            json!("development build"),
+        ),
+        (
+            "printf 'agy 1.1.12\\n'; exit 3",
+            "unknown",
+            "version_probe_failed",
+            "Version probe exited with exit status: 3".to_owned(),
+            FAILED_NEXT,
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            oversized,
+            "unknown",
+            "version_probe_failed",
+            "diagnostic probe output limit exceeded".to_owned(),
+            FAILED_NEXT,
+            Value::Null,
+            Value::Null,
+        ),
+    ] {
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = '--version' ] || exit 99\n{body}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = entries(fixture.root.path());
+        let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+        assert_eq!(
+            row(&value, "provider_version"),
+            expected_row(
+                "provider_version",
+                availability,
+                reason,
+                &detail,
+                next_action,
+                evidence
+            ),
+            "{body}"
+        );
+        assert_eq!(value["scope"]["current_version"], scope, "{body}");
+        assert_eq!(value["scope"]["executable"], json!(executable), "{body}");
+        assert_eq!(entries(fixture.root.path()), before);
+    }
+    // Without --probe the executable is not run.
+    fs::write(
+        &executable,
+        "#!/bin/sh\nprintf called > \"$0.called\"\nexit 99\n",
+    )
+    .unwrap();
+    let value = fixture.doctor();
+    assert_eq!(
+        row(&value, "provider_version"),
+        expected_row(
+            "provider_version",
+            "unknown",
+            "probe_not_requested",
+            PROBE_NOT_REQUESTED.0,
+            PROBE_NOT_REQUESTED.1,
+            json!({"minimum_version": "1.1.12"}),
+        )
+    );
+    assert!(value["scope"]["current_version"].is_null());
+    assert!(!fixture.root.path().join("provider.called").exists());
+}
+
+// The workspace row observes the recorded directory without touching it.
+#[test]
+fn workspace_rows_keep_each_directory_outcome() {
+    const DETAIL: &str =
+        "Working directory observation; CLI version checks do not depend on this directory.";
+    const NEXT: &str =
+        "Restore or inspect the recorded directory before workspace-relative operations.";
+    let fixture = Fixture::new("pi");
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let file = fixture.root.path().join("workspace-file");
+    fs::write(&file, "not a directory").unwrap();
+    // On Unix a path below a regular file fails with another error than not-found.
+    let unreadable = cfg!(unix).then(|| (file.join("child"), "unknown", "workspace_unreadable"));
+    let cases = [
+        (
+            fixture.root.path().to_path_buf(),
+            "available",
+            "workspace_present",
+        ),
+        (file.clone(), "unavailable", "workspace_not_directory"),
+        (
+            fixture.root.path().join("removed-worktree"),
+            "unavailable",
+            "workspace_missing",
+        ),
+    ]
+    .into_iter()
+    .chain(unreadable);
+    for (workspace, availability, reason) in cases {
+        manifest["workspace"] = json!(workspace);
+        write(&path, &manifest);
+        let before = entries(fixture.root.path());
+        let value = fixture.doctor();
+        assert_eq!(
+            row(&value, "workspace"),
+            expected_row(
+                "workspace",
+                availability,
+                reason,
+                DETAIL,
+                NEXT,
+                json!({"path": workspace})
+            ),
+            "{workspace:?}"
+        );
+        assert_eq!(value["scope"]["workspace"], json!(workspace));
+        assert_eq!(entries(fixture.root.path()), before);
+    }
+}

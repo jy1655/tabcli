@@ -4,7 +4,7 @@ use super::args::{
     set_once, validate_start_options,
 };
 use crate::native::failure_kind::DeliveryUncertain;
-use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
+use crate::native::provider_installation::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::delegation_source;
 use crate::native::session::{Reader, SessionState, Store, launch, requests, turn, update_status};
 use crate::native::turn_report::TurnReport;
