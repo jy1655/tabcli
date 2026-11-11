@@ -75,6 +75,67 @@ pub(super) fn workspace_trust(
     }
 }
 
+// Claude's launch-dialog policy: Claude answers its exact startup workspace dialog.
+pub(super) struct ClaudeLaunchDialog;
+
+impl consent::LaunchDialogAnswerer for ClaudeLaunchDialog {
+    fn policy<'a>(
+        &'a self,
+        launch: consent::LaunchFacts<'a>,
+    ) -> Box<dyn consent::LaunchDialogPolicy + 'a> {
+        Box::new(ClaudeDialogPolicy { launch })
+    }
+}
+
+struct ClaudeDialogPolicy<'a> {
+    launch: consent::LaunchFacts<'a>,
+}
+
+impl consent::LaunchDialogPolicy for ClaudeDialogPolicy<'_> {
+    fn dialog_key(&self, screen: &str) -> Option<terminal::DialogKey> {
+        dialog_key(
+            screen,
+            self.launch.workspace,
+            self.launch.bypass == consent::Bypass::On,
+        )
+    }
+
+    // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows (#28),
+    // and so does 2.1.321 on macOS (2026-11-10); 2.1.319 on macOS started without it. A
+    // version does not say which, so a macOS launch under bypass answers a dialog that is
+    // there and stops waiting once the completion module reports the session's start.
+    fn bypass_start(&self) -> Option<&dyn consent::BypassStart> {
+        if cfg!(windows) { None } else { Some(self) }
+    }
+
+    // 2.1.302 guards input for 150 ms and remounts its selector. One second allows margin
+    // for an idle renderer; equal pixels do not prove settlement. Replace with an official
+    // addressed workspace-approval capability.
+    fn settle(&self) -> Duration {
+        if cfg!(windows) {
+            Duration::from_secs(1)
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+impl consent::BypassStart for ClaudeDialogPolicy<'_> {
+    fn started(&self) -> Result<consent::ProviderStart> {
+        Ok(
+            match super::completion::started_under_bypass(self.launch.directory)? {
+                None => consent::ProviderStart::NoSignal,
+                Some(false) => consent::ProviderStart::NotStarted,
+                Some(true) => consent::ProviderStart::Started,
+            },
+        )
+    }
+
+    fn not_started(&self) -> String {
+        super::completion::readiness_timeout(self.launch.directory)
+    }
+}
+
 // Claude exposes no documented process-local trust switch. Use only its exact
 // startup workspace dialog; no config write, permission dialog, or generic Enter
 // fallback. Delete when Claude ships an official trust launch option.

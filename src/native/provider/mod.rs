@@ -16,7 +16,7 @@ use agent_bridge::FirstPartyCli;
 use anyhow::Result;
 use std::{ffi::OsString, fmt::Debug, path::Path, path::PathBuf, str::FromStr, time::Instant};
 
-use super::{delivery::Transport, terminal};
+use super::delivery::Transport;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub(super) struct EmittedQuestion {
@@ -311,7 +311,12 @@ trait NativeProviderAdapter: Sync {
     // Whether question emission observation was configured for this session, and the
     // answer path. Reads only; no lock.
     fn question_capability(&self, reader: &super::session::Reader) -> QuestionCapability;
-    fn launch_trust(&self) -> super::consent::LaunchTrust;
+    // How this adapter treats its provider's startup workspace dialog: its policy for a
+    // launch, or that it does not answer the dialog.
+    fn launch_dialog(&self) -> super::consent::LaunchDialogSupport<'static>;
+    // The consent applied marker this adapter records when its own launch applies workspace
+    // trust, if any.
+    fn applied_marker(&self) -> Option<&'static str>;
     // Exact-workspace trust from the provider's own store. The adapter resolves the store
     // from its home in `env`; `store` is consent's recorded source store, which the recheck
     // reads in its place. The returned evidence names the store that was read.
@@ -321,14 +326,6 @@ trait NativeProviderAdapter: Sync {
         env: &super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
-    // `bypass` says the session was launched with the provider's bypass option. An adapter
-    // may recognize a dialog variant only then; it never widens what a variant asks.
-    fn workspace_trust_key(
-        &self,
-        screen: &str,
-        workspace: &Path,
-        bypass: bool,
-    ) -> Option<terminal::DialogKey>;
     fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
     // Caller-environment variables removed from every short-lived provider query the
@@ -352,8 +349,10 @@ fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
     }
 }
 
-pub(super) fn launch_trust(provider: FirstPartyCli) -> super::consent::LaunchTrust {
-    adapter(provider).launch_trust()
+pub(super) fn launch_dialog(
+    provider: FirstPartyCli,
+) -> super::consent::LaunchDialogSupport<'static> {
+    adapter(provider).launch_dialog()
 }
 
 // Native trust waits accept any adapter-declared application marker, independently
@@ -361,7 +360,7 @@ pub(super) fn launch_trust(provider: FirstPartyCli) -> super::consent::LaunchTru
 pub(super) fn launch_trust_markers() -> impl Iterator<Item = &'static str> {
     agent_bridge::supported_clis()
         .iter()
-        .filter_map(|provider| launch_trust(*provider).applied_marker)
+        .filter_map(|provider| adapter(*provider).applied_marker())
 }
 
 pub(super) fn workspace_trust(
@@ -377,15 +376,6 @@ pub(super) fn workspace_trust(
 // declares it; the admission applies the user's setting to it for every target provider.
 pub(super) fn codex_memory_workspace(env: &super::consent::Environment) -> Result<PathBuf> {
     codex::memory_workspace(env)
-}
-
-pub(super) fn workspace_trust_key(
-    provider: FirstPartyCli,
-    screen: &str,
-    workspace: &Path,
-    bypass: bool,
-) -> Option<terminal::DialogKey> {
-    adapter(provider).workspace_trust_key(screen, workspace, bypass)
 }
 
 pub(super) fn diagnose(
@@ -438,7 +428,7 @@ pub(super) fn follow_up_transport(provider: FirstPartyCli) -> Box<dyn Transport>
 #[cfg(test)]
 fn transport_test_context<'a>(
     directory: &'a Path,
-    surface: &'a terminal::TerminalSession,
+    surface: &'a super::terminal::TerminalSession,
     kind: super::delivery::TurnKind,
 ) -> super::delivery::TurnContext<'a> {
     super::delivery::TurnContext {
@@ -642,8 +632,10 @@ mod tests {
     }
 
     #[test]
-    fn adapters_declare_launch_trust_facts() {
-        for (provider, answers, bypass, marker) in [
+    fn adapters_declare_launch_dialog_policies() {
+        use super::super::consent::{Bypass, LaunchDialogSupport, LaunchFacts, ProviderStart};
+        let directory = tempfile::tempdir().unwrap();
+        for (provider, answers, bypass_start, marker) in [
             (
                 FirstPartyCli::Codex,
                 false,
@@ -654,28 +646,43 @@ mod tests {
             (FirstPartyCli::Agy, true, false, None),
             (FirstPartyCli::Pi, false, false, Some("pi-approve-once")),
         ] {
-            let facts = launch_trust(provider);
-            assert_eq!(facts.answers_launch_dialog, answers, "{provider:?}");
-            assert_eq!(facts.bypass_start.is_some(), bypass, "{provider:?}");
-            // The unanswered deadline under bypass ends with the adapter's readiness text.
-            if let Some(start) = facts.bypass_start {
-                let directory = tempfile::tempdir().unwrap();
-                assert_eq!((start.started)(directory.path()).unwrap(), None);
-                assert!(
-                    (start.not_started)(directory.path())
-                        .contains("readiness was not observed before the delivery deadline")
+            assert_eq!(adapter(provider).applied_marker(), marker, "{provider:?}");
+            let answerer = match launch_dialog(provider) {
+                LaunchDialogSupport::NotAnswered => None,
+                LaunchDialogSupport::Answered(answerer) => Some(answerer),
+            };
+            assert_eq!(answerer.is_some(), answers, "{provider:?}");
+            let Some(answerer) = answerer else {
+                continue;
+            };
+            for bypass in [Bypass::On, Bypass::Off] {
+                let policy = answerer.policy(LaunchFacts {
+                    directory: directory.path(),
+                    workspace: directory.path(),
+                    bypass,
+                });
+                let start = policy.bypass_start();
+                assert_eq!(start.is_some(), bypass_start, "{provider:?} {bypass:?}");
+                // An empty session directory has no start signal, and the unanswered deadline
+                // under bypass ends with the adapter's readiness text.
+                if let Some(start) = start {
+                    assert_eq!(start.started().unwrap(), ProviderStart::NoSignal);
+                    assert!(
+                        start
+                            .not_started()
+                            .contains("readiness was not observed before the delivery deadline")
+                    );
+                }
+                assert_eq!(
+                    policy.settle(),
+                    if provider == FirstPartyCli::Claude && cfg!(windows) {
+                        std::time::Duration::from_secs(1)
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+                    "{provider:?} {bypass:?}",
                 );
             }
-            assert_eq!(facts.applied_marker, marker, "{provider:?}");
-            assert_eq!(
-                facts.dialog_settle,
-                if provider == FirstPartyCli::Claude && cfg!(windows) {
-                    std::time::Duration::from_secs(1)
-                } else {
-                    std::time::Duration::ZERO
-                },
-                "{provider:?}",
-            );
         }
     }
 }
