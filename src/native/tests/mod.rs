@@ -36,5 +36,7 @@ mod state_root;
 mod support;
 #[cfg(windows)]
 mod windows;
+#[cfg(unix)]
+mod wrapper_version_check;
 
 mod start_parse;

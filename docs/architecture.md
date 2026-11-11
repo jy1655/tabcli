@@ -67,8 +67,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   executable file), the version text of a `--version` probe, and the support verdict against
   the adapter's minimum (supported, too old, unrecognized). Each caller runs the probe with its own executor and keeps its own
   vocabulary: the `ask`/`reopen` preflight (bounded by the start deadline) and the wrapper's
-  re-check (unbounded) refuse through `check_provider_version_until`, a version below the
-  minimum as `Unsupported`; `doctor` runs `process_env::probe` and reports rows.
+  re-check refuse through `check_provider_version_until`, a version below the minimum as
+  `Unsupported`; `doctor` runs `process_env::probe` and reports rows. The wrapper's re-check
+  is bounded by the launch record's deadline plus a short grace, so that the launcher's
+  deadline settles the launch first, through the preflight's executor, which ends only the
+  probe's direct child at that bound (a runtime under a shim script can outlive it); a
+  session without a launch record keeps an unbounded re-check.
 - `src/native/process_identity.rs` classifies process evidence as Live (Incarnation or PID-only
   compatibility), Gone (Exited or Reused), or Unknown. It performs no OS or record reads;
   platform adapters own absence and identity observations. A reused incarnation grants no
