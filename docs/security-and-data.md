@@ -167,6 +167,12 @@ and the receipts already were: a symbolic link or a non-file at either path is r
 meaning (a missing `closed.json` is an open session; a missing `status.json` fails the read
 that requires it).
 
+The `events/` directory is held to the same rule. Every command that lists it refuses a
+symbolic link (on Windows, also a junction) or a non-directory at `events` with an error
+(`events directory is a symlink`, `events is not a directory`) instead of reading the results
+behind it: `result`, `inspect` and `wait` fail, `status` reports the session as incomplete with
+that reason, and `sessions` shows `"results": 0` for it. A missing `events/` lists no results.
+
 Bridge makes private directories mode `0700` and private records mode `0600` on Unix. On Windows,
 it installs a protected access list giving the current user full control, with inheritance for
 private directories. Administrators and the operating system can still access the data.

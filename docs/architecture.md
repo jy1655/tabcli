@@ -240,8 +240,13 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `macos/selection.rs`), compiled and tested on every target.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, reopen-marker and reopen-refusal records and
-  their constants; `primitives` owns session environment names, identity validation, and time
-  helpers. `close::budget` owns the close deadline scope and its optional test clock. `requests`
+  their constants; `primitives` owns session environment names, identity validation, time
+  helpers, and the one listing of a session's `events` directory. That listing refuses a link,
+  a junction or a non-directory at `events` rather than following it or listing it as empty,
+  lists a missing directory as empty, and takes the caller's `EventListing` policy: the
+  general listing passes over entries that are not regular event files, while the bounded one
+  gives no answer past its entry bound and refuses an event-named entry that is not a regular
+  file. `close::budget` owns the close deadline scope and its optional test clock. `requests`
   binds public requests to claims and events; `turn` owns delivery settlement, completion and
   recovery; `close` owns
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
