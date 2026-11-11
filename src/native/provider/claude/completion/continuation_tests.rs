@@ -128,7 +128,7 @@ fn unrelated_or_unattributable_continuations_cannot_settle_a_candidate() {
         f.retained();
         assert!(
             f.store()
-                .private(&format!("claude-mod-continuation-{}.json", f.token))
+                .private(&continuation_name(&f.token))
                 .text()
                 .unwrap()
                 .is_none(),
@@ -191,7 +191,7 @@ fn unmarked_candidate_is_bounded_stable_and_survives_a_waiter_timeout() {
     assert_eq!(f.events()[0].message, "final result");
     let selected: Continuation = f
         .store()
-        .private(&format!("claude-mod-continuation-{}.json", f.token))
+        .private(&continuation_name(&f.token))
         .json()
         .unwrap();
     assert_eq!(selected.binding.turn_id, TURN);
@@ -204,17 +204,11 @@ fn a_selected_continuation_cannot_be_replaced_before_publication() {
     let f = Fixture::new();
     f.start();
     f.complete("interim");
-    let binding: Binding = f
-        .store()
-        .private(&format!("claude-mod-bound-{}.json", f.token))
-        .json()
-        .unwrap();
+    let binding: Binding = f.store().private(&binding_name(&f.token)).json().unwrap();
     let selected = select_continuation(&f.store(), &binding, CONTINUED)
         .unwrap()
         .unwrap();
-    let record = f
-        .store()
-        .private(&format!("claude-mod-continuation-{}.json", f.token));
+    let record = f.store().private(&continuation_name(&f.token));
     // Deterministic interruption after selection, before core publication.
     record.write_json(&selected).unwrap();
     let before = record.text().unwrap();
@@ -252,17 +246,11 @@ fn damaged_selection_is_not_repaired_by_completion_or_inspection() {
         let f = Fixture::new();
         f.start();
         f.complete("interim");
-        let binding: Binding = f
-            .store()
-            .private(&format!("claude-mod-bound-{}.json", f.token))
-            .json()
-            .unwrap();
+        let binding: Binding = f.store().private(&binding_name(&f.token)).json().unwrap();
         let selected = select_continuation(&f.store(), &binding, CONTINUED)
             .unwrap()
             .unwrap();
-        let record = f
-            .store()
-            .private(&format!("claude-mod-continuation-{}.json", f.token));
+        let record = f.store().private(&continuation_name(&f.token));
         let mut value = serde_json::to_value(selected).unwrap();
         match change {
             "corrupt" => record.write_private(b"{").unwrap(),

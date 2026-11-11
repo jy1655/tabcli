@@ -191,7 +191,7 @@ fn claude_questions_damaged_records_do_not_change_completion_and_unlocked_reads_
     f.send("question.emissions", questions(0, "first"));
     let receipt = receipt(&f);
     assert!(provider::question_emissions(&f.store(), "claude", false, &receipt).is_none());
-    let path = format!("claude-questions-{}.json", f.token);
+    let path = questions_name(&f.token);
     f.store()
         .private(&path)
         .write_json(&json!("broken record"))
@@ -266,7 +266,7 @@ fn claude_questions_limit_includes_the_entire_pretty_encoded_record() {
         let f = Fixture::new();
         f.start();
         f.send("question.emissions", questions(0, "x"));
-        let path = format!("claude-questions-{}.json", f.token);
+        let path = questions_name(&f.token);
         let baseline = f.store().private(&path).text().unwrap().unwrap().len();
         f.store().private(&path).remove().unwrap();
         f.send(
@@ -320,7 +320,7 @@ fn claude_deflection_marks_only_a_retained_item_once_and_never_settles() {
     let f = Fixture::new();
     f.start();
     f.send("question.emissions", questions(0, "first"));
-    let path = format!("claude-questions-{}.json", f.token);
+    let path = questions_name(&f.token);
     // A record without the flag (any record written before deflection existed) reads as not
     // deflected, and an item that is not deflected is written without the field.
     assert!(
@@ -436,7 +436,7 @@ fn claude_deflection_that_would_exceed_the_record_limit_marks_the_record_full() 
     let f = Fixture::new();
     f.start();
     f.send("question.emissions", questions(0, "x"));
-    let path = format!("claude-questions-{}.json", f.token);
+    let path = questions_name(&f.token);
     let baseline = f.store().private(&path).text().unwrap().unwrap().len();
     f.store().private(&path).remove().unwrap();
     // The largest record that fits: the flag no longer does.
@@ -464,7 +464,7 @@ fn claude_questions_reject_mismatched_historical_identity_and_invalid_prefix() {
     let f = Fixture::new();
     f.start();
     f.send("question.emissions", questions(0, "first"));
-    let path = format!("claude-questions-{}.json", f.token);
+    let path = questions_name(&f.token);
     let saved: Value = f.store().private(&path).json().unwrap();
     for pointer in ["/request_id", "/binding/claim", "/items/0/id", "/full"] {
         let mut damaged = saved.clone();
@@ -481,6 +481,170 @@ fn claude_questions_reject_mismatched_historical_identity_and_invalid_prefix() {
         ));
         assert_eq!(snapshot(f.root.path()), before);
     }
+    f.complete_marked("completion is independent");
+    assert_eq!(f.events()[0].message, "completion is independent");
+}
+
+// The nested binding of a question record meets the binding floor for the Receipt's Claim and
+// carries any valid correlation identity. A record below it is unreadable to the query and
+// refused by the next emission with the reader's text; neither changes the record.
+#[test]
+fn claude_question_record_binding_keeps_its_own_correlation_check() {
+    for (pointer, value) in [
+        ("/schema", json!(2)),
+        ("/binding/schema", json!(2)),
+        ("/binding/claim", json!("999-999-999")),
+        ("/binding/conversation", json!("not-a-conversation")),
+        ("/binding/turn_id", json!("../invalid")),
+        ("/binding/correlation_id", json!("../invalid")),
+        ("/binding/correlation_id", json!("")),
+    ] {
+        let f = Fixture::new();
+        f.start();
+        f.send("question.emissions", questions(0, "first"));
+        let path = questions_name(&f.token);
+        let mut saved: Value = f.store().private(&path).json().unwrap();
+        *saved.pointer_mut(pointer).unwrap() = value;
+        f.store().private(&path).write_json(&saved).unwrap();
+        let before = f.store().private(&path).text().unwrap();
+        assert!(
+            matches!(
+                observe(&f).unwrap().observation,
+                provider::QuestionObservation::Unreadable
+            ),
+            "{pointer}"
+        );
+        let error = receive(
+            f.root.path(),
+            &f.wire("question.emissions", questions(1, "second")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "invalid Claude question record",
+            "{pointer}"
+        );
+        assert_eq!(
+            f.store().private(&path).text().unwrap(),
+            before,
+            "{pointer}"
+        );
+        f.retained();
+    }
+    // A valid correlation identity other than the pending request's is read, never replaced.
+    let f = Fixture::new();
+    f.start();
+    f.send("question.emissions", questions(0, "first"));
+    let path = questions_name(&f.token);
+    let mut saved: Value = f.store().private(&path).json().unwrap();
+    saved["binding"]["correlation_id"] = json!("claude-turn-other");
+    f.store().private(&path).write_json(&saved).unwrap();
+    let before = f.store().private(&path).text().unwrap();
+    let observation = observe(&f).unwrap();
+    assert_eq!(observation.items.len(), 1);
+    assert!(matches!(
+        observation.observation,
+        provider::QuestionObservation::Complete
+    ));
+    for event in ["question.emissions", "question.deflected"] {
+        let data = if event == "question.emissions" {
+            questions(1, "second")
+        } else {
+            deflected(0, 0, "first")
+        };
+        let error = receive(f.root.path(), &f.wire(event, data)).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Claude question binding cannot be replaced",
+            "{event}"
+        );
+    }
+    assert_eq!(f.store().private(&path).text().unwrap(), before);
+    f.retained();
+}
+
+// The question record is read within 64 KiB of strict UTF-8 and its prefix is validated; each
+// refusal keeps its text, and the decoder's text names the record's struct.
+#[test]
+fn claude_question_record_refusals_keep_their_texts() {
+    let f = Fixture::new();
+    f.start();
+    f.send("question.emissions", questions(0, "first"));
+    let path = questions_name(&f.token);
+    let saved = f.store().private(&path).text().unwrap().unwrap();
+    let file = f.root.path().join(&path);
+    let mut oversized = saved.trim_end().strip_suffix('}').unwrap().to_owned();
+    oversized.push_str(&format!(",\"pad\":\"{}\"}}", "p".repeat(65536)));
+    let oversized_len = oversized.len();
+    let mut not_utf8 = saved
+        .trim_end()
+        .strip_suffix('}')
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    not_utf8.extend_from_slice(b",\"pad\":\"\xff\"}");
+    let utf8_error = std::str::from_utf8(&not_utf8).unwrap_err();
+    let edited = |pointer: &str, value: Value| {
+        let mut record: Value = serde_json::from_str(&saved).unwrap();
+        *record.pointer_mut(pointer).unwrap() = value;
+        serde_json::to_vec_pretty(&record).unwrap()
+    };
+    for (bytes, expected) in [
+        (
+            br#""broken record""#.to_vec(),
+            "invalid type: string \"broken record\", expected struct Record at line 1 column 15"
+                .to_owned(),
+        ),
+        (
+            edited("/request_id", json!("other")),
+            "invalid Claude question record".to_owned(),
+        ),
+        (
+            edited("/full", json!(true)),
+            "invalid Claude question record".to_owned(),
+        ),
+        (
+            edited("/items/0/id", json!("step:01/tool:0")),
+            "invalid Claude question position".to_owned(),
+        ),
+        (
+            edited("/items/0/questions", json!([])),
+            "invalid Claude retained question prefix".to_owned(),
+        ),
+        (
+            oversized.into_bytes(),
+            format!("record is {oversized_len} bytes, over the 65536 byte read limit"),
+        ),
+        (not_utf8, format!("invalid UTF-8: {utf8_error}")),
+    ] {
+        std::fs::write(&file, &bytes).unwrap();
+        assert!(
+            matches!(
+                observe(&f).unwrap().observation,
+                provider::QuestionObservation::Unreadable
+            ),
+            "{expected}"
+        );
+        let error = receive(
+            f.root.path(),
+            &f.wire("question.emissions", questions(1, "second")),
+        )
+        .unwrap_err();
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(std::fs::read(&file).unwrap(), bytes, "{expected}");
+    }
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let error = receive(
+        f.root.path(),
+        &f.wire("question.emissions", questions(1, "second")),
+    )
+    .unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        format!("refusing non-regular session file: {}", file.display())
+    );
+    f.retained();
     f.complete_marked("completion is independent");
     assert_eq!(f.events()[0].message, "completion is independent");
 }

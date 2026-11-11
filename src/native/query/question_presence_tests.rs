@@ -220,30 +220,22 @@ fn status_keeps_question_evidence_when_the_latest_event_disappears_before_decode
 
 /// A Claude record whose items at steps 0.. carry `deflected` as given.
 fn claude_record(directory: &Path, receipt: &requests::Receipt, deflected: &[bool]) {
-    let items: Vec<Value> = deflected
+    use crate::native::provider::{
+        ClaudeCompletionRecordFixture, EmittedQuestion, QuestionEmission,
+    };
+    let items = deflected
         .iter()
         .enumerate()
-        .map(|(step, deflected)| {
-            let mut item = json!({"id": format!("step:{step}/tool:0"), "questions": [
-                {"title": "Which baseline?", "options": ["Current", "Previous"]}]});
-            if *deflected {
-                item["deflected"] = json!(true);
-            }
-            item
+        .map(|(step, deflected)| QuestionEmission {
+            id: format!("step:{step}/tool:0"),
+            questions: vec![EmittedQuestion {
+                title: "Which baseline?".into(),
+                options: Some(vec!["Current".into(), "Previous".into()]),
+            }],
+            deflected: *deflected,
         })
         .collect();
-    fs::write(
-        directory.join(format!("claude-questions-{}.json", receipt.claim_token)),
-        serde_json::to_vec_pretty(&json!({
-            "schema": 1, "request_id": receipt.request_id,
-            "binding": {"schema": 1, "claim": receipt.claim_token,
-                "correlation_id": "claude-turn-presence",
-                "conversation": "00000000-0000-4000-8000-000000000249", "turn_id": "turn-1"},
-            "items": items, "incomplete": false, "full": false
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    ClaudeCompletionRecordFixture::write_questions(directory, receipt, items);
 }
 
 #[test]

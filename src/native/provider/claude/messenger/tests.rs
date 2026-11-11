@@ -791,8 +791,7 @@ const timer = setInterval(() => {
     );
     assert!(store.events().unwrap().is_empty());
     assert!(
-        !directory
-            .join(format!("claude-mod-bound-{token}.json"))
+        !crate::native::provider::claude::CompletionRecordFixture::binding_path(&directory, &token)
             .exists()
     );
 }
