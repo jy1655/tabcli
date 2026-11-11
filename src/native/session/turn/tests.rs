@@ -3036,3 +3036,172 @@ fn every_admitted_outcome_holds_the_lifecycle_lock_while_it_commits() {
         );
     }
 }
+
+// The three report admissions that list `events`: a correlated success and failure (the
+// duplicate provider-turn scan runs only with a turn id) and Claude's initial report.
+const LISTING_REPORTS: [&str; 3] = ["complete", "fail", "initial"];
+
+fn listing_report(store: &Store, token: &str, case: &str) -> Result<()> {
+    let correlated = Report::for_claim(store, FirstPartyCli::Codex, Some(token));
+    match case {
+        "complete" => correlated.complete(
+            "done",
+            Some("provider-session".to_owned()),
+            Some("provider-turn".to_owned()),
+        ),
+        "fail" => correlated.fail(
+            "failed",
+            Some("provider-session".to_owned()),
+            Some("provider-turn".to_owned()),
+        ),
+        "initial" => Report::initial(store, FirstPartyCli::Claude).complete("done", None, None),
+        _ => unreachable!("{case}"),
+    }
+}
+
+/// Moves the session's `events` directory outside it and leaves a directory link in its place.
+#[cfg(unix)]
+fn link_events_outside(store: &Store) -> (tempfile::TempDir, std::path::PathBuf) {
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("events");
+    let events = store.record(CoreRecord::Events).path().to_owned();
+    fs::rename(&events, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &events).unwrap();
+    (outside, target)
+}
+
+#[test]
+fn reports_list_a_missing_events_directory_as_empty_and_fail_at_their_commit() {
+    // The empty listing admits the report; the commit's recovery then requires `events`,
+    // so the journal and the Claim stay installed and nothing is created.
+    for case in LISTING_REPORTS {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        claimed.retain();
+        fs::remove_dir(store.record(CoreRecord::Events).path()).unwrap();
+        let error = listing_report(&store, &token, case).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "events directory is missing",
+            "{case}"
+        );
+        assert!(
+            store.record(CoreRecord::Completion).path().exists(),
+            "{case}"
+        );
+        assert_eq!(
+            current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str()),
+            "{case}"
+        );
+        assert!(!store.record(CoreRecord::Events).path().exists(), "{case}");
+        assert_eq!(
+            store.status().unwrap().state,
+            SessionState::Working,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_follow_up_claim_counts_a_missing_events_directory_as_no_events() {
+    let (_directory, store) = fixture(SessionState::Ready);
+    fs::remove_dir(store.record(CoreRecord::Events).path()).unwrap();
+    let (claimed, baseline) = claim_ready(&store, "session-test", &[]).unwrap();
+    assert_eq!(baseline, 0);
+    assert_eq!(store.status().unwrap().state, SessionState::Claimed);
+    assert_eq!(
+        current_claim_token(&store).unwrap().as_deref(),
+        Some(claimed.token())
+    );
+    drop(claimed);
+    assert!(current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
+fn the_turn_wait_reads_a_missing_events_directory_as_no_result_yet() {
+    let (_directory, store) = fixture(SessionState::Ready);
+    fs::remove_dir(store.record(CoreRecord::Events).path()).unwrap();
+    update_status(
+        store.directory(),
+        SessionState::Failed,
+        None,
+        Some("provider exited".to_owned()),
+    )
+    .unwrap();
+    let error = turn::wait(
+        &store,
+        0,
+        None,
+        Some("1-2-3"),
+        Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), "provider exited");
+}
+
+#[cfg(unix)]
+#[test]
+fn reports_refuse_a_linked_events_directory_before_their_journal() {
+    for case in LISTING_REPORTS {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        claimed.retain();
+        let (_outside, target) = link_events_outside(&store);
+        let error = listing_report(&store, &token, case).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "events directory is a symlink",
+            "{case}"
+        );
+        assert!(
+            !store.record(CoreRecord::Completion).path().exists(),
+            "{case}"
+        );
+        assert_eq!(
+            current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str()),
+            "{case}"
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0, "{case}");
+        assert_eq!(
+            store.status().unwrap().state,
+            SessionState::Working,
+            "{case}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_follow_up_claim_refuses_a_linked_events_directory_and_releases_its_claim() {
+    let (_directory, store) = fixture(SessionState::Ready);
+    let (_outside, target) = link_events_outside(&store);
+    write_json_atomic(&target.join("event-1-1.json"), &event("behind the link")).unwrap();
+    let error = claim_ready(&store, "session-test", &[]).err().unwrap();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_turn_wait_refuses_a_linked_events_directory() {
+    let (_directory, store) = fixture(SessionState::Ready);
+    let (_outside, target) = link_events_outside(&store);
+    // Behind the link stands a published result the wait would otherwise return.
+    write_json_atomic(&target.join("event-1-1.json"), &event("behind the link")).unwrap();
+    let error = turn::wait(
+        &store,
+        0,
+        None,
+        Some("1-2-3"),
+        Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+}

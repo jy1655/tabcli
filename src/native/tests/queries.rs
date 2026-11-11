@@ -699,3 +699,93 @@ fn ownership_listing_observes_origins_without_changing_any_record() {
     tree(root.path(), &mut after);
     assert_eq!(after, before);
 }
+
+/// A session whose only request has a published result: the journal and the Claim of
+/// its completion are gone, as after a completed turn.
+fn seed_published_result(root: &Path, id: &str) -> (PathBuf, String) {
+    let directory = root.join(id);
+    let (request_id, _) = seed_event_written_completion_with(&directory, "result", "result");
+    fs::remove_file(directory.join(TURN_COMPLETION_FILE)).unwrap();
+    fs::remove_file(directory.join(TURN_CLAIM_FILE)).unwrap();
+    (directory, request_id)
+}
+
+#[test]
+fn queries_without_a_journal_list_a_missing_events_directory_as_no_events() {
+    let root = tempfile::tempdir().unwrap();
+    let (directory, request_id) = seed_published_result(root.path(), "session-missing");
+    let reader = Reader::open_unchecked(&directory);
+    assert_eq!(
+        query::request_result(&reader, &request_id).unwrap()["request_state"],
+        "completed"
+    );
+    fs::remove_dir_all(directory.join("events")).unwrap();
+    let result = query::request_result(&reader, &request_id).unwrap();
+    assert_eq!(result["request_state"], "unresolved", "{result}");
+    let inspected = query::inspect_value(&reader, "session-missing").unwrap();
+    assert_eq!(inspected["recorded_events"], 0, "{inspected}");
+    let status = query::status::test_value_in(root.path());
+    assert_eq!(status["incomplete"], false, "{status}");
+    assert_eq!(reader.published_result_count().unwrap(), 0);
+    let rows = cli_sessions(root.path());
+    assert_eq!(rows[0]["results"], 0, "{rows:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn queries_without_a_journal_reject_an_events_directory_link() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (directory, request_id) = seed_published_result(root.path(), "session-link");
+    let target = outside.path().join("events");
+    fs::rename(directory.join("events"), &target).unwrap();
+    assert!(link_directory(&target, &directory.join("events")));
+    let reader = Reader::open_unchecked(&directory);
+    let error = query::request_result(&reader, &request_id).unwrap_err();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+    let error = query::inspect_value(&reader, "session-link").unwrap_err();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+    let status = query::status::test_value_in(root.path());
+    assert_eq!(status["incomplete"], true, "{status}");
+    assert_eq!(
+        status["incomplete_reasons"][0],
+        serde_json::json!({"session": "session-link", "reason": "events directory is a symlink"}),
+        "{status}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_counts_no_results_behind_an_events_directory_link() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (directory, _) = seed_published_result(root.path(), "session-link");
+    let reader = Reader::open_unchecked(&directory);
+    assert_eq!(reader.published_result_count().unwrap(), 1);
+    let target = outside.path().join("events");
+    fs::rename(directory.join("events"), &target).unwrap();
+    assert!(link_directory(&target, &directory.join("events")));
+    let error = reader.published_result_count().unwrap_err();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+    let rows = cli_sessions(root.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["results"], 0, "{rows:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_timeline_keeps_refusing_an_events_directory_link_with_its_own_text() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (directory, request_id) = seed_published_result(root.path(), "session-link");
+    let target = outside.path().join("events");
+    fs::rename(directory.join("events"), &target).unwrap();
+    assert!(link_directory(&target, &directory.join("events")));
+    let error = query::timeline_value(
+        &Reader::open_unchecked(&directory),
+        "session-link",
+        Some(&request_id),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+}

@@ -280,8 +280,8 @@ fn excerpt(message: &str, match_start: usize, match_chars: usize) -> String {
     }
 }
 
-/// The shared event listing turns a missing or non-directory `events` path into an
-/// empty list; a search must not present that damage as "no results".
+/// The shared event listing turns a missing `events` directory into an empty list; a
+/// search must not present that damage as "no results".
 fn check_events_directory(reader: &Reader) -> Result<(), String> {
     let directory = reader.directory();
     Reader::open_unchecked(directory)

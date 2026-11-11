@@ -210,38 +210,12 @@ impl Reader {
             .map(Some)
             .map_err(|error| error.in_path(record.path()))
     }
-    /// The session's event file names, sorted, when `events` holds at most `limit`
-    /// entries: `Ok(None)` past the limit. `events` must be a real directory of the
-    /// session (a link is an error, as for a publication read); none is an empty list.
-    /// An entry that bears an event name without being a regular file is an error too:
-    /// this listing is for a reader that must not pass over history it cannot read.
-    pub(in crate::native) fn event_names_within(
+    /// The session's event file names under `listing`; see [`event_names`].
+    pub(in crate::native) fn event_names(
         &self,
-        limit: usize,
+        listing: EventListing,
     ) -> Result<Option<Vec<String>>> {
-        let mut names = Vec::new();
-        if self.events_directory_state()? == EventsDirectory::Missing {
-            return Ok(Some(names));
-        }
-        for (seen, entry) in fs::read_dir(self.directory.join(EVENTS_DIRECTORY))?.enumerate() {
-            if seen >= limit {
-                return Ok(None);
-            }
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str()
-                && valid_event_file_name(name)
-            {
-                if !entry.file_type()?.is_file() {
-                    bail!(
-                        "refusing non-regular session file: {}",
-                        entry.path().display()
-                    );
-                }
-                names.push(name.to_owned());
-            }
-        }
-        names.sort();
-        Ok(Some(names))
+        event_names(&self.directory, listing)
     }
     pub(in crate::native) fn closed_if_present(&self) -> Result<Option<SessionStatus>> {
         read_regular_status_if_present(&self.directory.join(CLOSED_STATUS_FILE))
@@ -261,6 +235,7 @@ impl Reader {
     pub(in crate::native) fn initial_prompt(&self) -> std::io::Result<String> {
         fs::read_to_string(self.directory.join(INITIAL_PROMPT_FILE))
     }
+    /// The paths of the session's regular event files; see [`event_paths`].
     pub(in crate::native) fn events(&self) -> Result<Vec<PathBuf>> {
         event_paths(&self.directory)
     }
@@ -614,7 +589,7 @@ impl RecordStore {
     }
 }
 
-pub(in crate::native) use primitives::{EventsDirectory, StatusLock, TurnClaimLock};
+pub(in crate::native) use primitives::{EventListing, EventsDirectory, StatusLock, TurnClaimLock};
 
 impl Store {
     pub(in crate::native) fn claim_terminal_handle(&self) -> Result<std::io::Result<()>> {

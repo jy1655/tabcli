@@ -215,10 +215,10 @@ pub(in crate::native) fn events_directory_state(directory: &Path) -> Result<Even
 }
 
 /// A session's `events` must be a real directory inside the session directory before any
-/// record under it is opened: the shared event listing turns a missing or non-directory
-/// `events` path into an empty list, a search must not present that damage as "no
-/// results", and a link planted there would carry a publication read outside the state
-/// root. Built on [`events_directory_state`], so a link is rejected rather than followed.
+/// record under it is opened: the shared event listing turns a missing `events` directory
+/// into an empty list, a search must not present that damage as "no results", and a link
+/// planted there would carry a publication read outside the state root. Built on
+/// [`events_directory_state`], so a link is rejected rather than followed.
 pub(in crate::native) fn require_events_directory(directory: &Path) -> Result<()> {
     match events_directory_state(directory)? {
         EventsDirectory::Present => Ok(()),
@@ -254,23 +254,70 @@ pub(in crate::native) fn valid_event_file_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
 }
 
-pub(in crate::native) fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
-    let events = directory.join(crate::native::session::EVENTS_DIRECTORY);
-    let mut paths = Vec::new();
-    if !events.is_dir() {
-        return Ok(paths);
+/// What a listing of a session's `events` directory does with the entries it finds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum EventListing {
+    /// Every regular file with an event name; any other entry is passed over.
+    Regular,
+    /// The whole listing or no answer: past `limit` entries, each counted whatever its
+    /// name, the listing gives none, and an entry with an event name that is not a regular
+    /// file is an error. For a reader that must not pass over history it cannot read.
+    Complete { limit: usize },
+}
+
+/// The one listing of a session's `events` directory: its event file names, sorted.
+/// `events` must be a real directory of the session, checked as [`events_directory_state`]
+/// does, so a link (or a Windows junction), a non-directory or an unreadable path is an
+/// error rather than followed or listed as empty; a missing directory lists nothing.
+/// `Ok(None)` is an [`EventListing::Complete`] listing past its limit.
+pub(super) fn event_names(directory: &Path, listing: EventListing) -> Result<Option<Vec<String>>> {
+    let mut names = Vec::new();
+    if events_directory_state(directory)? == EventsDirectory::Missing {
+        return Ok(Some(names));
     }
-    for entry in fs::read_dir(events)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(valid_event_file_name)
+    let events = directory.join(crate::native::session::EVENTS_DIRECTORY);
+    for (seen, entry) in fs::read_dir(events)?.enumerate() {
+        if let EventListing::Complete { limit } = listing
+            && seen >= limit
         {
-            paths.push(entry.path());
+            return Ok(None);
+        }
+        let entry = entry?;
+        match listing {
+            EventListing::Regular => {
+                if entry.file_type()?.is_file()
+                    && let Some(name) = entry.file_name().to_str()
+                    && valid_event_file_name(name)
+                {
+                    names.push(name.to_owned());
+                }
+            }
+            EventListing::Complete { .. } => {
+                if let Some(name) = entry.file_name().to_str()
+                    && valid_event_file_name(name)
+                {
+                    if !entry.file_type()?.is_file() {
+                        bail!(
+                            "refusing non-regular session file: {}",
+                            entry.path().display()
+                        );
+                    }
+                    names.push(name.to_owned());
+                }
+            }
         }
     }
-    paths.sort();
-    Ok(paths)
+    names.sort();
+    Ok(Some(names))
+}
+
+/// The paths of a session's regular event files: [`event_names`] with
+/// [`EventListing::Regular`], which has no entry bound and so always answers.
+pub(in crate::native) fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
+    let events = directory.join(crate::native::session::EVENTS_DIRECTORY);
+    Ok(event_names(directory, EventListing::Regular)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| events.join(name))
+        .collect())
 }

@@ -10,7 +10,7 @@
 //! anything the scan cannot read ends it without a note: a comparison that skipped an
 //! unreadable newer session could name an older one as the last that worked.
 use crate::native::session::primitives::valid_session_id;
-use crate::native::session::{Reader, record};
+use crate::native::session::{EventListing, Reader, record};
 use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, terminal_safe_text};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -119,7 +119,9 @@ fn note_until(
 fn completed(directory: &Path, remaining: &mut u64, deadline: Instant) -> Option<bool> {
     let reader = Reader::open_unchecked(directory);
     for name in reader
-        .event_names_within(EVENTS_PER_SESSION)
+        .event_names(EventListing::Complete {
+            limit: EVENTS_PER_SESSION,
+        })
         .ok()??
         .iter()
         .rev()

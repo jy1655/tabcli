@@ -495,3 +495,40 @@ fn split_marker_line_tolerates_one_trailing_lf_and_verifies_the_claim() {
         );
     }
 }
+
+fn write_codex_event(events: &Path) {
+    std::fs::create_dir_all(events).unwrap();
+    std::fs::write(
+        events.join("event-1-1.json"),
+        br#"{"provider":"codex","message":"done","error":null,"provider_session_id":"codex-thread","turn_id":"codex-turn","created_unix_ms":9}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_established_thread_reads_its_events_and_a_missing_directory_as_none() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(established_codex_thread(directory.path()).unwrap(), None);
+    write_codex_event(&directory.path().join("events"));
+    assert_eq!(
+        established_codex_thread(directory.path())
+            .unwrap()
+            .as_deref(),
+        Some("codex-thread")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_established_thread_is_never_read_through_an_events_directory_link() {
+    let directory = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write_codex_event(&outside.path().join("events"));
+    std::os::unix::fs::symlink(
+        outside.path().join("events"),
+        directory.path().join("events"),
+    )
+    .unwrap();
+    let error = established_codex_thread(directory.path()).unwrap_err();
+    assert_eq!(format!("{error:#}"), "events directory is a symlink");
+}

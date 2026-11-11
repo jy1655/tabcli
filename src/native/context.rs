@@ -990,6 +990,26 @@ mod tests {
         assert!(prompt.contains("résumé — 完了 ✓"), "{prompt}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_events_directory_leaves_every_result_unattachable() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let directory = fixture_session(root.path(), "session-src", "closed");
+        fixture_receipt(&directory, "1-2-3", "request-done", "event-1.json");
+        fixture_event(&directory, "event-1.json", "recorded answer", None);
+        let target = outside.path().join("events");
+        fs::rename(directory.join("events"), &target).unwrap();
+        std::os::unix::fs::symlink(&target, directory.join("events")).unwrap();
+        for address in ["session-src/request-done", "session-src/event-1.json"] {
+            let error = resolve_error(root.path(), address);
+            assert!(
+                error.contains("request_state is unreadable (events directory is a symlink)"),
+                "{address}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn resolution_requires_the_exact_recorded_event_filename() {
         let root = tempfile::tempdir().unwrap();

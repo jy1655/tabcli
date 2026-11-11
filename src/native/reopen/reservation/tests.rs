@@ -720,9 +720,8 @@ fn reopen_refuses_a_source_whose_events_path_is_not_a_directory() {
         Some(REOPEN_TEST_CONVERSATION),
         true,
     );
-    // The closed source is otherwise healthy; only its `events` path is damaged. The
-    // shared listing would report such a path as "no events", which is not an
-    // identity-less source but an unreadable one.
+    // The closed source is otherwise healthy; only its `events` path is damaged. Such a
+    // path is not an identity-less source but an unreadable one.
     let events = source.join("events");
     fs::remove_dir_all(&events).unwrap();
     fs::write(&events, b"not a directory").unwrap();
@@ -749,6 +748,35 @@ fn reopen_refuses_a_source_whose_events_path_is_not_a_directory() {
     let rendered = format!("{error:#}");
     assert!(rendered.contains("has no recorded result"), "{rendered}");
     assert!(!rendered.contains("cannot be read"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[test]
+fn reopen_refuses_a_source_whose_events_directory_is_a_link() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = write_closed_reopen_source(
+        root.path(),
+        "session-reopenevlink",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let target = outside.path().join("events");
+    fs::rename(source.join("events"), &target).unwrap();
+    std::os::unix::fs::symlink(&target, source.join("events")).unwrap();
+    let error = inspect_reopen_source(&source, "session-reopenevlink").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some(ReopenGate::RequestUnresolved),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains(
+            "the recorded results of session session-reopenevlink cannot be read: events directory is a symlink"
+        ),
+        "{error:#}"
+    );
 }
 
 #[test]
