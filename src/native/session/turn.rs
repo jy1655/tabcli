@@ -26,13 +26,27 @@ use std::{
 
 pub(in crate::native) static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// State policy for Claim currency; Turn names the provider turn-state set once.
+/// State policy for Claim currency; Turn names the provider turn-state set once, for
+/// [`ClaimCurrency`] and for Report admission alike.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native) enum ClaimState {
     Any,
     #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
     NotEnded,
     Turn,
+}
+
+impl ClaimState {
+    fn accepts(self, state: &SessionState) -> bool {
+        match self {
+            Self::Any => true,
+            Self::NotEnded => !state.ended(),
+            Self::Turn => matches!(
+                state,
+                SessionState::Running | SessionState::Working | SessionState::ResumePending
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,15 +92,7 @@ impl ClaimCurrency<'_> {
         }
         if !matches!(self.state, ClaimState::Any) {
             let state = reader.status()?.state;
-            let accepted = match self.state {
-                ClaimState::Any => unreachable!(),
-                ClaimState::NotEnded => !state.ended(),
-                ClaimState::Turn => matches!(
-                    state,
-                    SessionState::Running | SessionState::Working | SessionState::ResumePending
-                ),
-            };
-            if !accepted {
+            if !self.state.accepts(&state) {
                 return Ok(Err(StaleClaim::State(state)));
             }
         }
@@ -214,58 +220,6 @@ impl EventOutcome {
     }
 }
 
-fn record_provider_result_for_claim_condition(
-    report: &Report<'_>,
-    message: &str,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-) -> Result<()> {
-    let directory = report.store.directory();
-    let provider = report.provider;
-    let require_no_prior_provider_event = report.initial;
-    let usage = report.usage.clone();
-    let expected_claim_token = match report.claim_token {
-        Some(token) => token.to_owned(),
-        None => match read_claim_token(directory)? {
-            Some(token) => token,
-            None => return Ok(()),
-        },
-    };
-    let expected_claim_token = Some(expected_claim_token.as_str());
-    let claim_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TurnClaim)
-        .path()
-        .to_owned();
-    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
-    recover_pending_completion_locked(directory, &claim_path)?;
-    if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
-        return Ok(());
-    }
-    if !provider_completion_is_current(
-        directory,
-        provider,
-        provider_session_id.as_deref(),
-        turn_id.as_deref(),
-        expected_claim_token,
-    )? {
-        return Ok(());
-    }
-    let event = EventOutcome::Success(message.to_owned()).into_event(
-        report.provenance.map(str::to_owned),
-        provider.as_str().to_owned(),
-        provider_session_id,
-        turn_id,
-        unix_ms(),
-        usage,
-    );
-    commit_completion_locked(
-        directory,
-        &claim_path,
-        expected_claim_token.context("provider completion has no claim token")?,
-        event,
-    )
-}
-
 fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str) -> Result<()> {
     let claim_path = Reader::open_unchecked(directory)
         .record(CoreRecord::TurnClaim)
@@ -325,28 +279,14 @@ fn read_claim_token(directory: &Path) -> Result<Option<String>> {
     }
 }
 
-fn claim_is_current(directory: &Path, expected_claim_token: Option<&str>) -> Result<bool> {
+// The status is read before the Claim token: an unreadable status fails the report even
+// when its token is stale. `ClaimCurrency::check` reads in the other order.
+fn claim_is_current(directory: &Path, expected_claim_token: &str) -> Result<bool> {
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if !matches!(
-        status.state,
-        SessionState::Running | SessionState::Working | SessionState::ResumePending
-    ) {
+    if !ClaimState::Turn.accepts(&status.state) {
         return Ok(false);
     }
-    if let Some(expected_claim_token) = expected_claim_token {
-        let current = match Reader::open_unchecked(directory)
-            .record(CoreRecord::TurnClaim)
-            .raw_text()
-        {
-            Ok(current) => current,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error).context("failed to inspect native turn claim"),
-        };
-        if current.trim() != expected_claim_token {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(read_claim_token(directory)?.as_deref() == Some(expected_claim_token))
 }
 
 // These historical identity checks remain inside the report's lifecycle critical
@@ -358,7 +298,7 @@ fn provider_completion_is_current(
     provider: FirstPartyCli,
     provider_session_id: Option<&str>,
     turn_id: Option<&str>,
-    expected_claim_token: Option<&str>,
+    expected_claim_token: &str,
 ) -> Result<bool> {
     if !claim_is_current(directory, expected_claim_token)? {
         return Ok(false);
@@ -1380,7 +1320,12 @@ impl<'a> Report<'a> {
         provider_session_id: Option<String>,
         turn_id: Option<String>,
     ) -> Result<()> {
-        record_provider_result_for_claim_condition(self, message, provider_session_id, turn_id)
+        self.admit(provider_session_id, turn_id, |_| {
+            (
+                EventOutcome::Success(message.to_owned()),
+                self.usage.clone(),
+            )
+        })
     }
 
     pub(in crate::native) fn fail(
@@ -1407,66 +1352,74 @@ impl<'a> Report<'a> {
         turn_id: Option<String>,
         cancellation: bool,
     ) -> Result<()> {
+        self.admit(provider_session_id, turn_id, |claim_token| {
+            let cancelled = cancellation
+                && session::cancel::read(self.store)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.claim_token == claim_token);
+            let error = if cancelled {
+                format!("cancelled: {error}")
+            } else {
+                error.to_owned()
+            };
+            let error = terminal_safe_text(&error, true);
+            let outcome = if cancelled {
+                EventOutcome::ConfirmedCancelled(error)
+            } else {
+                EventOutcome::Failure(error)
+            };
+            (outcome, self.usage.clone())
+        })
+    }
+
+    /// The admission step every outcome passes through. Resolves the expected Claim token
+    /// (none means nothing to record) and, under the lifecycle lock held until the commit
+    /// returns: recovers a pending completion, applies the initial-report gate, then Claim
+    /// currency and the duplicate provider-turn scan. Only an admitted report calls `decide`,
+    /// with the admitted token, and its outcome is committed against that Claim.
+    fn admit(
+        &self,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        decide: impl FnOnce(&str) -> (EventOutcome, Usage),
+    ) -> Result<()> {
         let directory = self.store.directory();
-        let provider = self.provider;
-        let expected_claim_token = self.claim_token;
-        let require_no_prior_provider_event = self.initial;
-        let expected_claim_token = match expected_claim_token {
+        let expected_claim_token = match self.claim_token {
             Some(token) => token.to_owned(),
             None => match read_claim_token(directory)? {
                 Some(token) => token,
                 None => return Ok(()),
             },
         };
-        let expected_claim_token = Some(expected_claim_token.as_str());
         let claim_path = Reader::open_unchecked(directory)
             .record(CoreRecord::TurnClaim)
             .path()
             .to_owned();
         let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
         recover_pending_completion_locked(directory, &claim_path)?;
-        if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
+        if self.initial && provider_has_completed_turn(directory, self.provider)? {
             return Ok(());
         }
         if !provider_completion_is_current(
             directory,
-            provider,
+            self.provider,
             provider_session_id.as_deref(),
             turn_id.as_deref(),
-            expected_claim_token,
+            &expected_claim_token,
         )? {
             return Ok(());
         }
-        let cancelled = cancellation
-            && session::cancel::read(self.store)
-                .ok()
-                .flatten()
-                .is_some_and(|record| Some(record.claim_token.as_str()) == expected_claim_token);
-        let error = if cancelled {
-            format!("cancelled: {error}")
-        } else {
-            error.to_owned()
-        };
-        let error = terminal_safe_text(&error, true);
-        let outcome = if cancelled {
-            EventOutcome::ConfirmedCancelled(error)
-        } else {
-            EventOutcome::Failure(error)
-        };
+        let (outcome, usage) = decide(&expected_claim_token);
         let event = outcome.into_event(
             self.provenance.map(str::to_owned),
-            provider.as_str().to_owned(),
+            self.provider.as_str().to_owned(),
             provider_session_id,
             turn_id,
             unix_ms(),
-            self.usage.clone(),
+            usage,
         );
-        commit_completion_locked(
-            directory,
-            &claim_path,
-            expected_claim_token.context("provider completion has no claim token")?,
-            event,
-        )
+        commit_completion_locked(directory, &claim_path, &expected_claim_token, event)
     }
 }
 
