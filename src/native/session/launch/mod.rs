@@ -76,6 +76,25 @@ pub(in crate::native) struct Record {
     pub(in crate::native) phase: Phase,
 }
 
+// The launcher's deadline settles a launch that is still unconfirmed; the wrapper's later
+// bound only ends a version re-check that is still running, so the launcher's failure is the
+// one recorded. The grace orders the two and guarantees nothing: a launcher delayed past it
+// can still find the wrapper's failure recorded first, or the lock held by its settlement.
+const RECHECK_GRACE: Duration = Duration::from_secs(2);
+
+impl Record {
+    // The wrapper's re-check bound on the monotonic clock: the recorded deadline plus the
+    // grace, converted once. A bound already past is now; one the monotonic clock cannot
+    // represent is none.
+    fn recheck_bound(&self) -> Option<Instant> {
+        let remaining = self
+            .deadline_unix_ms
+            .saturating_add(RECHECK_GRACE.as_millis())
+            .saturating_sub(unix_ms());
+        Instant::now().checked_add(Duration::from_millis(u64::try_from(remaining).ok()?))
+    }
+}
+
 pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
     reader
         .record(CoreRecord::Launch)
@@ -1009,6 +1028,63 @@ mod tests {
             turn::current_claim_token(&store).unwrap().as_deref(),
             Some(token.as_str())
         );
+    }
+
+    // The wall clock is fixed, so the bound is bracketed by the monotonic readings around the
+    // call: the recorded deadline plus the grace, never earlier than now, none past the clock.
+    #[test]
+    fn the_wrappers_recheck_bound_is_the_recorded_deadline_plus_the_grace() {
+        struct Reset(Option<u128>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::native::session::tests::FIXED_UNIX_MS.set(self.0);
+            }
+        }
+        const NOW: u128 = 1_000_000;
+        let _reset = Reset(crate::native::session::tests::FIXED_UNIX_MS.replace(Some(NOW)));
+        let bound = |deadline_unix_ms| {
+            let record = Record {
+                schema: 1,
+                claim_token: "claim".to_owned(),
+                deadline_unix_ms,
+                phase: Phase::Pending,
+            };
+            let before = Instant::now();
+            let bound = record.recheck_bound();
+            (before, bound, Instant::now())
+        };
+        assert_eq!(RECHECK_GRACE, Duration::from_secs(2));
+        for (deadline, remaining_ms) in [
+            (NOW + 500, 2_500),
+            // A deadline already past still leaves the rest of the grace.
+            (NOW - 500, 1_500),
+            (NOW - 2_000, 0),
+            // A deadline older than the grace is now.
+            (NOW - 5_000, 0),
+            (0, 0),
+        ] {
+            let (before, bound, after) = bound(deadline);
+            let bound = bound.unwrap();
+            let remaining = Duration::from_millis(remaining_ms);
+            assert!(
+                before + remaining <= bound && bound <= after + remaining,
+                "deadline {deadline}: {:?} after the call began",
+                bound.saturating_duration_since(before)
+            );
+        }
+        assert_eq!(bound(u128::MAX).1, None);
+        // The largest deadline a launch record can be read with: a bound where the monotonic
+        // clock can represent it, none where it cannot, and never a panic.
+        let largest = u128::from(u64::MAX);
+        let (before, bound, _) = bound(largest);
+        if let Some(bound) = bound {
+            let remaining = u64::try_from(largest + RECHECK_GRACE.as_millis() - NOW).unwrap();
+            assert!(
+                before
+                    .checked_add(Duration::from_millis(remaining))
+                    .is_some_and(|earliest| earliest <= bound)
+            );
+        }
     }
 
     #[test]

@@ -166,6 +166,8 @@ pub(in crate::native) fn version_probe_command(
     Ok(command)
 }
 
+// The gate without a deadline, as the tests of both executors call it.
+#[cfg(test)]
 pub(in crate::native) fn check_provider_version(
     provider: FirstPartyCli,
     executable: &Path,

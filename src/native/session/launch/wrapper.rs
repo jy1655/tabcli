@@ -2,7 +2,7 @@
 //! runs it in the surface. Admission, the fd handoff, the owner record, the version gate,
 //! the provider plan, the spawn with its durable identity and the exit settlement.
 use super::WRAPPER_EXIT_CODE_MARKER;
-use crate::native::provider_installation::check_provider_version;
+use crate::native::provider_installation::check_provider_version_until;
 use crate::native::reopen::{ReopenGate, read_resumed_from, record_reopen_refusal};
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
@@ -13,7 +13,7 @@ use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use std::fs::File;
-use std::{io::IsTerminal, path::Path, process::Command, str::FromStr};
+use std::{io::IsTerminal, path::Path, process::Command, str::FromStr, time::Instant};
 
 pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
 pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
@@ -84,9 +84,27 @@ pub(in crate::native) fn run(id: &str) -> Result<()> {
 }
 
 pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
+    provision_with(directory, check_provider_version_until)
+}
+
+// `provision` with its version gate supplied, so a test can observe the bound the gate gets.
+pub(in crate::native) fn provision_with(
+    directory: &Path,
+    check: impl FnOnce(FirstPartyCli, &Path, Option<Instant>) -> Result<String>,
+) -> Result<()> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    check_provider_version(provider, &manifest.provider_path)?;
+    // The launch record's deadline, which the launcher waits on, plus a grace bounds the
+    // re-check through the preflight's executor. At that bound the executor ends only its
+    // direct child: a descendant, such as a runtime under a shim script, can outlive it. A
+    // session without a launch record keeps the unbounded check, and so does one whose record
+    // cannot be read here: the spawn fence reads it again under the lifecycle lock and
+    // refuses with that error, as before.
+    let deadline = super::read(&Reader::open_unchecked(directory))
+        .ok()
+        .flatten()
+        .and_then(|record| record.recheck_bound());
+    check(provider, &manifest.provider_path, deadline)?;
     let prompt_path = Reader::open_unchecked(directory)
         .record(CoreRecord::InitialPrompt)
         .path()
