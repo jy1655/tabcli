@@ -55,6 +55,108 @@ pub(in crate::native) struct NativeSessionOwner {
     pub(in crate::native) windows_process_identity: Option<terminal::WindowsProcessIdentity>,
 }
 
+/// What an owner record says about the Session it belongs to, for one expected Session.
+/// Each reader maps the three answers itself; the record's writer always binds it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum OwnerBinding {
+    /// The record names the expected Session.
+    Bound,
+    /// A legacy record that names no Session.
+    Unbound,
+    /// The record names another Session.
+    Foreign,
+}
+
+/// Which of the five macOS control fields an owner record holds: the controlling TTY
+/// device, the birth (seconds and microseconds) and both process groups.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum ControlRecord {
+    /// None of them: a legacy record, or one written on another platform.
+    NotRecorded,
+    /// All five, as the macOS writer records them.
+    Complete(RecordedControl),
+    /// Some but not all of them.
+    Partial,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) struct RecordedControl {
+    pub(in crate::native) terminal_tty_device: u64,
+    pub(in crate::native) process_start_seconds: u64,
+    pub(in crate::native) process_start_microseconds: u64,
+    pub(in crate::native) process_group: u32,
+    pub(in crate::native) terminal_process_group: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ControlRecord {
+    pub(in crate::native) fn is_complete(self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+
+impl NativeSessionOwner {
+    /// Whether this record is bound to `expected_session_id`.
+    pub(in crate::native) fn binding(&self, expected_session_id: &str) -> OwnerBinding {
+        match self.managed_session_id.as_deref() {
+            Some(bound) if bound == expected_session_id => OwnerBinding::Bound,
+            Some(_) => OwnerBinding::Foreign,
+            None => OwnerBinding::Unbound,
+        }
+    }
+
+    // Two rules read the macOS control fields, and they differ on purpose (CONTEXT.md
+    // Attestation, Close authority):
+    // - `control_record` classifies all five. The macOS ownership proof
+    //   (`verify_native_terminal_owner_with`), the dead-owner close authority, the close and
+    //   teardown intents, Terminal.app's failed-start absence and Warp's close require it to be
+    //   complete; `native_owner_identity_matches` also treats a record with none of the five
+    //   as a legacy match and a partial one as a mismatch.
+    // - `attestation_compares_control` is attestation's: it compares the control identity of a
+    //   live incarnation when any of the TTY device and the two process groups is recorded,
+    //   and compares only the recorded ones. A partial record can attest verified although
+    //   the ownership proof refuses it (`SurfaceProbe::owner_requirement`).
+
+    /// The five control fields, classified for the ownership proof and close authority.
+    #[cfg(any(target_os = "macos", test))]
+    pub(in crate::native) fn control_record(&self) -> ControlRecord {
+        match (
+            self.terminal_tty_device,
+            self.process_start_seconds,
+            self.process_start_microseconds,
+            self.process_group,
+            self.terminal_process_group,
+        ) {
+            (None, None, None, None, None) => ControlRecord::NotRecorded,
+            (
+                Some(terminal_tty_device),
+                Some(process_start_seconds),
+                Some(process_start_microseconds),
+                Some(process_group),
+                Some(terminal_process_group),
+            ) => ControlRecord::Complete(RecordedControl {
+                terminal_tty_device,
+                process_start_seconds,
+                process_start_microseconds,
+                process_group,
+                terminal_process_group,
+            }),
+            _ => ControlRecord::Partial,
+        }
+    }
+
+    /// Attestation's rule: a live incarnation's control identity is compared when any of
+    /// the TTY device and the two process groups is recorded; the birth does not count.
+    #[cfg(any(target_os = "macos", test))]
+    pub(in crate::native) fn attestation_compares_control(&self) -> bool {
+        self.terminal_tty_device.is_some()
+            || self.process_group.is_some()
+            || self.terminal_process_group.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(in crate::native) struct MacTerminalShellIdentity {
     pub(in crate::native) pid: u32,
@@ -99,20 +201,10 @@ pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
 ) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
     let live = process(owner.pid)?;
     session.verify_managed_session(expected_session_id)?;
-    if owner.managed_session_id.as_deref() != Some(expected_session_id) {
+    if owner.binding(expected_session_id) != OwnerBinding::Bound {
         bail!("native-session owner is not bound to this managed session")
     }
-    if !matches!(
-        (
-            owner.terminal_tty_device,
-            owner.process_start_seconds,
-            owner.process_start_microseconds,
-            owner.process_group,
-            owner.terminal_process_group,
-        ),
-        (Some(_), Some(_), Some(_), Some(_), Some(_))
-    ) || !native_owner_identity_matches(&owner, &live)
-    {
+    if !owner.control_record().is_complete() || !native_owner_identity_matches(&owner, &live) {
         bail!("native-session owner birth, TTY, or foreground identity changed")
     }
     let owner_tty = owner
@@ -281,28 +373,16 @@ pub(in crate::native) fn native_owner_identity_matches(
     if owner.pid != live.pid {
         return false;
     }
-    match (
-        owner.terminal_tty_device,
-        owner.process_start_seconds,
-        owner.process_start_microseconds,
-        owner.process_group,
-        owner.terminal_process_group,
-    ) {
-        (None, None, None, None, None) => true,
-        (
-            Some(terminal_tty_device),
-            Some(process_start_seconds),
-            Some(process_start_microseconds),
-            Some(process_group),
-            Some(terminal_process_group),
-        ) => {
-            terminal_tty_device == live.terminal_tty_device
-                && process_start_seconds == live.process_start_seconds
-                && process_start_microseconds == live.process_start_microseconds
-                && process_group == live.process_group
-                && terminal_process_group == live.terminal_process_group
+    match owner.control_record() {
+        ControlRecord::NotRecorded => true,
+        ControlRecord::Complete(recorded) => {
+            recorded.terminal_tty_device == live.terminal_tty_device
+                && recorded.process_start_seconds == live.process_start_seconds
+                && recorded.process_start_microseconds == live.process_start_microseconds
+                && recorded.process_group == live.process_group
+                && recorded.terminal_process_group == live.terminal_process_group
         }
-        _ => false,
+        ControlRecord::Partial => false,
     }
 }
 

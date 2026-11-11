@@ -45,7 +45,10 @@ pub(in crate::native) fn reaped_child_pid() -> u32 {
     pid
 }
 
+// The surface and the owner are both bound to the Session the directory belongs to, as their
+// writers bind them; the owner records neither a birth nor a control identity.
 pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
+    let session_id = directory.file_name().unwrap().to_str().unwrap().to_owned();
     fs::create_dir(directory.join("events")).unwrap();
     update_status(directory, state.parse().unwrap(), None, None).unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
@@ -71,7 +74,7 @@ pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &st
             },
             tab_id: None,
             window_id: (!cfg!(windows)).then(|| "1001".to_owned()),
-            managed_session_id: Some("session-owner123".to_owned()),
+            managed_session_id: Some(session_id.clone()),
             wezterm_mux: None,
             windows_process_identity: windows_process_identity.clone(),
         },
@@ -81,7 +84,7 @@ pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &st
         &directory.join(SESSION_OWNER_FILE),
         &NativeSessionOwner {
             pid: owner_pid,
-            managed_session_id: Some("session-owner123".to_owned()),
+            managed_session_id: Some(session_id),
             terminal_tty: (!cfg!(windows)).then(|| "/dev/ttys999".to_owned()),
             windows_process_identity,
             ..NativeSessionOwner::default()

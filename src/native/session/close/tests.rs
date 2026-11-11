@@ -2350,6 +2350,147 @@ fn wezterm_close_retry_preserves_authority_after_partial_surface_cleanup() {
     assert_closed_without_terminal_records(directory.path());
 }
 
+// The owner records the close-intent readers tell apart: bound to the session with all five
+// macOS control fields, or not bound, or missing some or all of those fields.
+#[cfg(target_os = "macos")]
+const OWNER_RECORD_CASES: [&str; 9] = [
+    "bound complete",
+    "unbound",
+    "foreign",
+    "no control fields",
+    "tty device",
+    "start seconds",
+    "start microseconds",
+    "process group",
+    "terminal process group",
+];
+
+#[cfg(target_os = "macos")]
+fn owner_record_case(owner: &mut NativeSessionOwner, case: &str) {
+    match case {
+        "bound complete" => {}
+        "unbound" => owner.managed_session_id = None,
+        "foreign" => owner.managed_session_id = Some("session-other456".to_owned()),
+        "no control fields" => {
+            owner.terminal_tty_device = None;
+            owner.process_start_seconds = None;
+            owner.process_start_microseconds = None;
+            owner.process_group = None;
+            owner.terminal_process_group = None;
+        }
+        "tty device" => owner.terminal_tty_device = None,
+        "start seconds" => owner.process_start_seconds = None,
+        "start microseconds" => owner.process_start_microseconds = None,
+        "process group" => owner.process_group = None,
+        "terminal process group" => owner.terminal_process_group = None,
+        _ => unreachable!("{case}"),
+    }
+}
+
+// An exact close intent resumes only an owner bound to this session with all five control
+// fields recorded; the intent and the owner record carry the same owner in every case.
+#[cfg(target_os = "macos")]
+#[test]
+fn close_intent_resumes_only_a_bound_owner_with_all_five_control_fields() {
+    for case in OWNER_RECORD_CASES {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner =
+            write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+        owner_record_case(&mut owner, case);
+        write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
+        let handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        session_close::record_terminal_close_intent(
+            &Store::open_unchecked(directory.path()),
+            "session-owner123",
+            &handle,
+            &owner,
+        )
+        .unwrap();
+        let resumed = session_close::terminal_close_intent_owner(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            true,
+        )
+        .unwrap();
+        assert_eq!(resumed.is_some(), case == "bound complete", "{case}");
+    }
+}
+
+// A teardown intent validates only for an owner bound to this session with all five control
+// fields recorded; the intent and the owner record carry the same owner in every case.
+#[cfg(target_os = "macos")]
+#[test]
+fn teardown_intent_validates_only_a_bound_owner_with_all_five_control_fields() {
+    for case in OWNER_RECORD_CASES {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
+        owner_record_case(&mut owner, case);
+        write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
+        let handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        session_close::record_terminal_teardown_intent(
+            &Store::open_unchecked(directory.path()),
+            "session-owner123",
+            &handle,
+            &owner,
+            4242,
+            "characterization teardown",
+        )
+        .unwrap();
+        let result = session_close::terminal_teardown_intent(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+        );
+        if case == "bound complete" {
+            let teardown = result.unwrap().unwrap();
+            assert_eq!(
+                (teardown.process_group, teardown.reason.as_str()),
+                (4242, "characterization teardown")
+            );
+        } else {
+            assert_eq!(
+                result.err().map(|error| error.to_string()).as_deref(),
+                Some("terminal teardown intent does not match the attested owner and exact handle"),
+                "{case}"
+            );
+        }
+    }
+}
+
+// Repair attests the recorded owner whatever Session the record names: the binding is not
+// consulted before the owner's liveness decides.
+#[test]
+fn repair_attests_an_owner_record_whatever_session_it_names() {
+    for binding in [None, Some("session-foreign")] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), "working", std::process::id());
+        write_json_atomic(
+            &directory.path().join(SESSION_OWNER_FILE),
+            &NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: binding.map(str::to_owned),
+                ..NativeSessionOwner::default()
+            },
+        )
+        .unwrap();
+        let attested = std::cell::RefCell::new(Vec::new());
+        let repaired = repair_dead_owner_with(
+            &Store::open_unchecked(directory.path()),
+            |owner| {
+                attested.borrow_mut().push(owner.managed_session_id.clone());
+                Ok(true)
+            },
+            |_| panic!("a live owner retains nothing"),
+            |_| panic!("a live owner's surface is not closed"),
+            budget::close_deadline(),
+        )
+        .unwrap();
+        assert!(!repaired, "{binding:?}");
+        assert_eq!(attested.into_inner(), [binding.map(str::to_owned)]);
+    }
+}
+
 // An invalid intent grants no close authority, but is not evidence that the surface
 // disappeared. An owner that died before any explicit close also leaves cleanup unverified.
 #[cfg(target_os = "macos")]

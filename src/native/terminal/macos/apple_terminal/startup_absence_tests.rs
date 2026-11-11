@@ -150,3 +150,78 @@ fn apple_terminal_failed_start_without_app_incarnation_needs_one_stable_instance
         }
     }
 }
+
+// A recorded startup owner is used only when it is bound to the handle's session and records
+// all five control fields; otherwise the binding is retained before any observation.
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_terminal_failed_start_refuses_an_owner_not_bound_or_without_all_five_control_fields() {
+    for case in [
+        "bound complete",
+        "unbound",
+        "foreign",
+        "no control fields",
+        "tty device",
+        "start seconds",
+        "start microseconds",
+        "process group",
+        "terminal process group",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner =
+            write_attested_apple_terminal_state(directory.path(), "failed", reaped_child_pid());
+        match case {
+            "bound complete" => {}
+            "unbound" => owner.managed_session_id = None,
+            "foreign" => owner.managed_session_id = Some("session-other456".into()),
+            "no control fields" => {
+                owner.terminal_tty_device = None;
+                owner.process_start_seconds = None;
+                owner.process_start_microseconds = None;
+                owner.process_group = None;
+                owner.terminal_process_group = None;
+            }
+            "tty device" => owner.terminal_tty_device = None,
+            "start seconds" => owner.process_start_seconds = None,
+            "start microseconds" => owner.process_start_microseconds = None,
+            "process group" => owner.process_group = None,
+            _ => owner.terminal_process_group = None,
+        }
+        write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
+        let mut handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        handle.managed_session_id = None; // creation-time copy, before bind mutated its peer
+        let liveness = std::cell::Cell::new(0);
+        let result = apple_terminal_startup_absent_with(
+            directory.path(),
+            &handle,
+            |_| {
+                liveness.set(liveness.get() + 1);
+                true
+            },
+            |_| -> anyhow::Result<Option<(u64, u64)>> {
+                panic!("{case}: no app birth observation")
+            },
+            || -> anyhow::Result<Vec<MacTerminalAppIdentity>> {
+                panic!("{case}: no app instance observation")
+            },
+            || -> anyhow::Result<bool> { panic!("{case}: no surface observation") },
+        );
+        let error = result.unwrap_err().to_string();
+        if case == "bound complete" {
+            assert_eq!(
+                error,
+                "Terminal.app startup owner is still live; cleanup is unverified and the binding is retained"
+            );
+            assert_eq!(liveness.get(), 1);
+        } else {
+            assert_eq!(
+                error,
+                "Terminal.app startup owner/surface identity is incomplete or changed; the binding is retained",
+                "{case}"
+            );
+            assert_eq!(liveness.get(), 0, "{case}");
+        }
+        assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+    }
+}

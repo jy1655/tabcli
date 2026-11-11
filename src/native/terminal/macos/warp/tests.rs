@@ -3064,3 +3064,49 @@ fn warp_close_records_intent_before_stopping_only_attested_group() {
     );
     assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
 }
+
+// Warp stops only an owner bound to this session: an unbound legacy record and one bound to
+// another session are refused before any intent is recorded or signal sent.
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_close_refuses_an_unbound_or_foreign_owner_before_recording_an_intent() {
+    for binding in [None, Some("session-other456")] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
+        owner.managed_session_id = binding.map(str::to_owned);
+        let mut handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        handle.kind = terminal::TerminalKind::Warp;
+        let live = NativeProcessIdentity {
+            pid: 4242,
+            parent_pid: 4000,
+            terminal_tty_device: 7,
+            process_group: 4242,
+            terminal_process_group: 4242,
+            process_start_seconds: 1_790_000_000,
+            process_start_microseconds: 42,
+        };
+        let shell = NativeProcessIdentity {
+            pid: 4000,
+            parent_pid: 3000,
+            terminal_tty_device: 7,
+            process_group: 4000,
+            terminal_process_group: 4242,
+            process_start_seconds: 1,
+            process_start_microseconds: 0,
+        };
+        let error = prepare_warp_close(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            &owner,
+            &live,
+            &shell,
+            |_| panic!("{binding:?}: an owner not bound to this session is not signalled"),
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Warp close owner identity changed");
+        assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+    }
+}

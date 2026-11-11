@@ -9,7 +9,7 @@ use crate::native::session::owner::{ControlAttestation, OwnerAttestation, attest
 use crate::native::session::snapshot::Snapshot;
 use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalKind;
-use crate::native::terminal::ownership::NativeSessionOwner;
+use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
 use agent_bridge::process_is_alive;
 use anyhow::Result;
 use serde_json::Value;
@@ -79,10 +79,10 @@ pub(in crate::native) fn owner(
     match record {
         Err(error) => OwnerJudgment::Unreadable(format!("{error:#}")),
         Ok(None) => OwnerJudgment::Absent,
-        Ok(Some(owner)) => match owner.managed_session_id.as_deref() {
-            Some(bound) if bound == session => OwnerJudgment::Bound((observers.attest)(owner)),
-            Some(_) => OwnerJudgment::Foreign,
-            None => OwnerJudgment::UnboundLegacy {
+        Ok(Some(owner)) => match owner.binding(session) {
+            OwnerBinding::Bound => OwnerJudgment::Bound((observers.attest)(owner)),
+            OwnerBinding::Foreign => OwnerJudgment::Foreign,
+            OwnerBinding::Unbound => OwnerJudgment::UnboundLegacy {
                 alive: (observers.pid_alive)(owner.pid),
             },
         },

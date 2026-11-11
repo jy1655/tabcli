@@ -1,5 +1,5 @@
 use crate::native::session::{self, CoreRecord, Reader, launch};
-use crate::native::terminal::ownership::NativeSessionOwner;
+use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -18,9 +18,9 @@ pub(in crate::native) fn verified_windows_native_owner(
     let owner_text = session::RecordReader::at(&owner_path)
         .text()?
         .with_context(|| "Windows terminal ownership requires a live native-session owner")?;
-    let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
+    let owner: NativeSessionOwner = session::record::owner(&owner_text)
         .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
-    if owner.managed_session_id.as_deref() != Some(expected_session_id) {
+    if owner.binding(expected_session_id) != OwnerBinding::Bound {
         bail!("native-session owner is not bound to this managed session")
     }
     let identity = owner

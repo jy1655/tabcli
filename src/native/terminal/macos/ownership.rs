@@ -21,7 +21,7 @@ pub(in crate::native) fn verified_macos_terminal_owner(
     let owner_text = session::RecordReader::at(&owner_path)
         .text()?
         .with_context(|| "Terminal.app ownership requires a live native-session owner")?;
-    let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
+    let owner: NativeSessionOwner = session::record::owner(&owner_text)
         .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
     verify_native_terminal_owner_with(
         expected_session_id,

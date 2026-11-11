@@ -1459,3 +1459,47 @@ fn reaching_a_scan_cap_exactly_stops_and_marks_the_scan_incomplete() {
     assert_eq!(scan.scanned.sessions, SCAN_OPEN as u64);
     assert_eq!(examined.get(), SCAN_OPEN as u64);
 }
+
+// The Origin's owner verdict names each binding answer: only a record bound to the Origin is
+// attested, and an unbound legacy record or one bound to another Session says which it is.
+#[test]
+fn origin_owner_verdict_names_each_binding_answer() {
+    let _hooks = Hooks::new();
+    let mut environment = Environment::new();
+    let root = tempfile::tempdir().unwrap();
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let origin = Session::new(root.path(), "session-origin", "ready");
+    environment.attest(|_| panic!("an owner not bound to the Origin is not attested"));
+    for (managed, detail) in [
+        (None, "owner record is unbound"),
+        (
+            Some("session-other"),
+            "owner record belongs to another session",
+        ),
+    ] {
+        origin.owner(managed, 7);
+        let observation = observed(&mut environment, root.path(), &child);
+        assert_eq!(
+            (
+                observation.ended,
+                observation.reason.as_str(),
+                observation.detail.as_deref()
+            ),
+            (None, "owner_unverified", Some(detail)),
+            "{managed:?}"
+        );
+    }
+    environment.attest(|owner| {
+        assert_eq!(owner.managed_session_id.as_deref(), Some("session-origin"));
+        attestation(
+            ProcessObservation::Gone(Gone::Exited),
+            ControlAttestation::NotRecorded,
+        )
+    });
+    origin.owner(Some("session-origin"), 7);
+    let observation = observed(&mut environment, root.path(), &child);
+    assert_eq!(
+        (observation.ended, observation.reason.as_str()),
+        (Some(true), "owner_exited")
+    );
+}
