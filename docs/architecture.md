@@ -115,7 +115,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   operation for an already prepared Session. Fresh and Reopen resolution and creation finish
   before that operation; their explicit `InitialSource` implementations supply result fields,
   holder gates, and phase-specific failure handling. Consent failure remains separate from
-  launcher and Delivery failures. The launchable-spec resolution that `ask` and `reopen`
+  launcher and Delivery failures. A Fresh launch failure before the launcher fences the
+  initial Claim is settled in `session::launch` (`settle_unfenced_start`) as a fenced launch
+  failure is; a failure after the fence keeps the launcher's own settlement, and Reopen
+  settles its launch failures itself. The launchable-spec resolution that `ask` and `reopen`
   share (`resolve`, fed a `Resolution` of what each supplies) lives here, the common option
   validation they share lives in `args.rs`, and `tell` parses through the same option helper
   with the follow-up option set.

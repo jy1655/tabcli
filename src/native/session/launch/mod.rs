@@ -265,6 +265,56 @@ fn fence_failed_start_locked(store: &Store, expected_token: &str, reason: &str) 
     update_status(store.directory(), SessionState::Failed, None, Some(reason))
 }
 
+/// Settles a fresh start whose launch failed before the launcher fenced its Claim, as a
+/// fenced launch failure is settled. The Claim is fenced first, so that this settlement and
+/// not the Claim's Drop owns its release. Under the lifecycle lock, and only while the
+/// Session is still launching with this Claim current, a receipt for the Claim fails through
+/// the launch failure publication; without one, the status alone records the failure (the
+/// receipt's read error follows the launch error when the receipt cannot be read) and the
+/// Claim is released. A settlement that cannot write the failure keeps the Claim installed,
+/// so that repair past the receipt's deadline still settles it. Returns the launch error,
+/// with the settlement's own failure as context when it did not complete.
+pub(in crate::native) fn settle_unfenced_start(
+    store: &Store,
+    claim: &mut turn::Claim,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    claim.fence_launch();
+    let reason = format!("{error:#}");
+    let settled = store
+        .lock()
+        .and_then(|_lock| settle_unfenced_start_locked(store, claim.token(), &reason));
+    match settled {
+        Ok(()) => error,
+        Err(settlement) => error.context(format!(
+            "the failed launch could not be settled: {settlement:#}"
+        )),
+    }
+}
+
+fn settle_unfenced_start_locked(store: &Store, token: &str, reason: &str) -> Result<()> {
+    if turn::current_claim_token(store)?.as_deref() != Some(token) {
+        return Ok(());
+    }
+    let claim_path = Reader::open_unchecked(store.directory())
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    if store.status()?.state != SessionState::Launching {
+        // Another writer ended the Session first; release the Claim as its Drop would.
+        return remove_turn_claim_locked(&claim_path);
+    }
+    let reason = match read(store) {
+        Ok(Some(record)) if record.claim_token == token => {
+            return fail_locked(store, &record, reason);
+        }
+        Ok(_) => reason.to_owned(),
+        Err(receipt_error) => format!("{reason}; {receipt_error:#}"),
+    };
+    update_status(store.directory(), SessionState::Failed, None, Some(reason))?;
+    remove_turn_claim_locked(&claim_path)
+}
+
 pub(in crate::native) enum FailedStartEvidence {
     NoUnresolvedSpawn,
     SpawnAttempted,
