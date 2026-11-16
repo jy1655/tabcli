@@ -155,17 +155,7 @@ fn executable(root: &Path) -> std::path::PathBuf {
     let path = root.join("host '\" $$ \\ fixture");
     // --all-targets builds the real entry point beside the unit-test executable.
     // Exercise production argument dispatch and exec rather than a libtest-specific route.
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tabcli");
-    assert!(
-        binary.is_file(),
-        "run this regression with cargo test --all-targets"
-    );
+    let binary = crate::native::tests::package_binary();
     fs::write(
         &path,
         format!(

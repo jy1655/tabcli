@@ -145,18 +145,7 @@ fn only_the_question_tool_reads_the_launch_record_and_an_unreadable_one_is_an_er
 fn the_hook_binary_prints_one_line_for_the_question_tool_and_exits_zero() {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let executable = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(format!("tabcli{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        executable.is_file(),
-        "missing {}: run cargo test --all-targets to build the sibling binary",
-        executable.display()
-    );
+    let executable = crate::native::tests::package_binary();
     let root = tempfile::tempdir().unwrap();
     let directory = test_support::launch_session(root.path(), Some("codex-cli 0.166.0"));
     let run = |payload: &Value| {
