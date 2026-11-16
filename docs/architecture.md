@@ -72,8 +72,13 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   decoder (whose `terminal` is a `TerminalKind` that uses the launch host) and identity
   judgment, which the timeline and doctor share, and the forward-only, lock-held writers
   through which the macOS launch host records its stages and failure, with the check that the
-  admitted host incarnation may still act for the pending launch. Doctor judges the record
-  once, in its Observation, and takes the probe's terminal from that judgment.
+  admitted host incarnation may still act for the pending launch. It also owns what the
+  renderers share about the record: the words of its stages and failure reasons, the one
+  responsibility class of each reason (startup files, deadline, surface identity or Bridge's
+  host step), which status.error and doctor's action each map to their own words, the
+  capture timeout's detail, and the record fields that the timeline and doctor both show
+  (each places `updated_unix_ms` itself). Doctor judges the record once, in its Observation,
+  and takes the probe's terminal from that judgment.
 - `src/native/provider_installation.rs` observes the installed provider CLI: resolving its
   executable from absolute `PATH` entries, the validity test (an absolute path to a regular,
   executable file), the version text of a `--version` probe, and the support verdict against

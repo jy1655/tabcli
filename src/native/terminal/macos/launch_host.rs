@@ -21,14 +21,6 @@ use std::{
 /// The host's wait between two observations of the capture and the binding.
 const POLL: Duration = Duration::from_millis(10);
 
-pub(super) fn word(value: impl serde::Serialize) -> String {
-    serde_json::to_value(value)
-        .expect("enum serialization")
-        .as_str()
-        .expect("string enum")
-        .into()
-}
-
 pub(in crate::native::terminal) fn run(
     directory: &Path,
     command: &str,
@@ -277,7 +269,7 @@ impl Recorder<'_> {
                 self.store,
                 &format!(
                     "shell_environment_failed reason={} elapsed_ms={}",
-                    word(reason),
+                    reason.word(),
                     elapsed.as_millis()
                 ),
             );
@@ -287,13 +279,13 @@ impl Recorder<'_> {
             &format!(
                 "{}_host_refused reason={}",
                 self.kind.as_str(),
-                word(reason)
+                reason.word()
             ),
         );
         anyhow::anyhow!(
             "{} launch host refused: {}",
             self.kind.display_name(),
-            word(reason)
+            reason.word()
         )
     }
 

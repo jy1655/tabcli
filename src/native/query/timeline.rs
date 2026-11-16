@@ -547,14 +547,10 @@ fn render_launch_host(
     let (time, state, detail) =
         match launch::host::judge(bytes.clone(), snapshot.launch.as_ref(), id) {
             HostObservation::NotRecorded => return,
-            HostObservation::Recorded(host) => (
-                Some(host.updated_unix_ms),
-                "observed",
-                json!({"terminal": host.terminal, "stage": host.stage, "failure": host.failure,
-                    "elapsed_ms": host.elapsed_ms, "capture_budget_ms": host.capture_budget_ms,
-                    "capture_elapsed_ms": host.capture_elapsed_ms, "variables": host.variables,
-                    "background_children_stopped": host.background_children_stopped}),
-            ),
+            // The update time is the entry's time, not part of its detail.
+            HostObservation::Recorded(host) => {
+                (Some(host.updated_unix_ms), "observed", host.evidence())
+            }
             HostObservation::Unreadable(error) => (None, "unreadable", json!(error)),
             HostObservation::SchemaUnsupported(schema) => (
                 None,
