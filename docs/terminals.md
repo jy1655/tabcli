@@ -229,7 +229,8 @@ terminal input, such as Oh My Zsh's update prompt, therefore cannot hold the lau
   once, and the failure names the stage; `tabcli doctor SESSION` shows it as `launch_stage`.
 - Exports that a startup file makes only when it is attached to a terminal (for example under
   `[[ -t 0 ]]` or after `tty`) are not carried, and neither are shell functions, options or
-  limits. Put what a provider needs in an unconditional export.
+  limits. Put what a provider needs in an unconditional export. As before, zsh does not pass
+  on variables whose names are not shell identifiers; such a variable no longer fails anything.
 - Processes a startup file leaves running in that run's process group are stopped and counted
   (`background_children_stopped`); the launch continues. A daemon that detaches itself is not
   touched.
