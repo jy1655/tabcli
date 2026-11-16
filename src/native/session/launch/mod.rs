@@ -538,12 +538,23 @@ fn host_decision_locked(store: &Store) -> Result<HostDecision> {
         } else {
             format!("launch host failed at {stage}")
         };
+        let message = match failure.reason {
+            host::FailureReason::LaunchBudgetExhausted
+            | host::FailureReason::CaptureSpawnFailed
+            | host::FailureReason::CaptureTimeout
+            | host::FailureReason::CaptureExitNonzero
+            | host::FailureReason::CaptureSignaled
+            | host::FailureReason::CaptureNoOutput
+            | host::FailureReason::CaptureOversized
+            | host::FailureReason::CaptureInvalid => {
+                format!("terminal shell environment could not be prepared: {detail}")
+            }
+            _ => format!("terminal launch host failed: {reason} at {stage}"),
+        };
         fail_locked(
             store,
             &receipt,
-            &format!(
-                "terminal shell environment could not be prepared: {detail} ({reason}); last recorded launch stage: {stage}"
-            ),
+            &format!("{message} ({reason}); last recorded launch stage: {stage}"),
         )?;
         return Ok(HostDecision::Failed);
     }
@@ -1719,6 +1730,36 @@ mod host_decision_tests {
         assert!(errors[0].contains(
             "10000 ms (capture_timeout); last recorded launch stage: environment_preparing"
         ));
+    }
+    #[test]
+    fn non_capture_failure_names_the_host_instead_of_environment_preparation() {
+        let (_dir, store, token) = fixture();
+        host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+        host::fail(
+            &store,
+            &token,
+            None,
+            host::Failure {
+                reason: host::FailureReason::IdentityUnavailable,
+                exit_code: None,
+                signal: None,
+            },
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            repair_with_owner(&store, |_| panic!(
+                "host failure precedes owner observation"
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            store.status().unwrap().error.as_deref(),
+            Some(
+                "terminal launch host failed: identity_unavailable at awaiting_host (identity_unavailable); last recorded launch stage: awaiting_host"
+            )
+        );
     }
     #[test]
     fn stale_late_and_confirmed_records_never_override_current_state() {

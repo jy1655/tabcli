@@ -103,7 +103,9 @@ pub(in crate::native::terminal) fn run(
         launch::log(&store, &format!("{prefix}_host_started"));
         let budget = deadline
             .saturating_duration_since(Instant::now())
-            .saturating_sub(Duration::from_millis(2500))
+            .saturating_sub(
+                shell_environment::HANDOFF_RESERVE.saturating_add(shell_environment::CLEANUP),
+            )
             .min(Duration::from_secs(10));
         let budget_ms = budget.as_millis() as u64;
         host::advance(
@@ -203,7 +205,7 @@ pub(in crate::native::terminal) fn run(
             if binding == Some(true) && captured.is_some() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(10));
         }
         let captured = captured.expect("capture completed before handoff");
         let flushed = {
