@@ -66,7 +66,7 @@ pub(super) fn value(
     environment: &mut OriginEnvironment<'_>,
 ) -> Result<Value> {
     let origin = observation.observe_origin(reader, None, environment);
-    let owner_judgment = observation.evidence.judge_owner(id);
+    let owner_judgment = observation.evidence.judge_owner();
     let owner = owner_judgment.observation();
     let owner_verified = owner_identity_verified(owner_judgment);
     let judgments = &observation.judgments;
@@ -201,10 +201,32 @@ mod tests {
                 )),
                 Some(BoundOwner::Unknown),
             ),
-            (OwnerJudgment::UnboundLegacy { alive: Some(true) }, None),
-            (OwnerJudgment::UnboundLegacy { alive: Some(false) }, None),
-            (OwnerJudgment::UnboundLegacy { alive: None }, None),
-            (OwnerJudgment::Foreign, None),
+            // A record not bound to this session is never verified, whatever its liveness.
+            (
+                OwnerJudgment::UnboundLegacy(attestation(
+                    ProcessObservation::Live(Attested::Incarnation),
+                    Verified,
+                    Some(true),
+                )),
+                None,
+            ),
+            (
+                OwnerJudgment::UnboundLegacy(attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    NotRecorded,
+                    Some(false),
+                )),
+                None,
+            ),
+            (OwnerJudgment::UnboundLegacy(reused_attestation()), None),
+            (
+                OwnerJudgment::Foreign(attestation(
+                    ProcessObservation::Live(Attested::Incarnation),
+                    Verified,
+                    Some(true),
+                )),
+                None,
+            ),
             (OwnerJudgment::Absent, None),
             (OwnerJudgment::Unreadable("invalid".into()), None),
         ];
@@ -267,13 +289,9 @@ mod tests {
             let mut observation = Observation::read_locked(&reader).unwrap();
             observation.judgments.recovery_required = recovery;
             observation.judgments.residual_surface = residual;
-            let owner = observation.evidence.judge_owner_with(
-                "session-fault",
-                &judgment::Observers {
-                    attest: &|_| attested(),
-                    pid_alive: &|_| panic!("a bound record is attested"),
-                },
-            );
+            let owner = observation.evidence.judge_owner_with(&judgment::Observers {
+                attest: &|_| attested(),
+            });
             assert!(matches!(owner, OwnerJudgment::Bound(_)));
             let mut clock = SystemClock;
             let value = value(

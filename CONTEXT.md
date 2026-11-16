@@ -212,6 +212,14 @@ _Avoid_: console owner, input policy
 The Bridge process that launched a session and is attested as controlling its surface.
 _Avoid_: parent, launcher process
 
+**Owner record**:
+The record of a session's owner, read under one policy by every reader (no link, a regular
+file, a bound size, UTF-8; anything else is unreadable) and judged by its binding: bound to the
+session, unbound (a legacy record) or foreign (naming another session). Repair attests the
+recorded process whatever the binding, and queries report that liveness; only a bound record
+grants control authority.
+_Avoid_: owner file, native-session record
+
 **Residual surface**:
 A surface left by a failed launch whose cleanup has not been confirmed. Recording it does
 not grant close authority; a closed session can still have a residual surface.

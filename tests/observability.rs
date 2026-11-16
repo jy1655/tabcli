@@ -833,7 +833,7 @@ fn dead_owner_ends_wait_without_repairing_or_releasing_the_claim() {
 }
 
 #[test]
-fn wait_ends_on_a_bound_dead_owner_but_not_on_a_foreign_record() {
+fn wait_ends_on_a_dead_owner_whatever_session_its_record_names() {
     let fixture = Fixture::new();
     request(&fixture, "123-456-0", "request-dead", "event-1.json");
     fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
@@ -858,10 +858,21 @@ fn wait_ends_on_a_bound_dead_owner_but_not_on_a_foreign_record() {
     assert_eq!(value["ended"]["request_state"], "unresolved");
     assert_eq!(value["ended"]["owner_process_alive"], false);
     assert_eq!(support::entries(fixture.root.path()), before);
-    // B2: a record naming another session is not observed, so its dead PID ends nothing.
+    // A record naming another session is attested as dead-owner repair attests it: its
+    // dead PID ends the wait, and a live one does not.
     write(
         &fixture.directory.join("native-session.json"),
         &json!({"pid": u32::MAX, "managed_session_id": "session-other"}),
+    );
+    let before = support::entries(fixture.root.path());
+    let value = wait();
+    assert_eq!(value["timed_out"], false);
+    assert_eq!(value["ended"]["request_state"], "unresolved");
+    assert_eq!(value["ended"]["owner_process_alive"], false);
+    assert_eq!(support::entries(fixture.root.path()), before);
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": std::process::id(), "managed_session_id": "session-other"}),
     );
     let before = support::entries(fixture.root.path());
     let value = wait();
@@ -917,9 +928,9 @@ fn an_unknown_attestation_is_unverified_and_keeps_a_wait() {
 }
 
 #[test]
-fn inspect_does_not_attest_an_owner_record_of_another_session() {
+fn inspect_reports_only_the_liveness_of_an_owner_record_of_another_session() {
     let fixture = Fixture::new();
-    // B1: a live PID would be observed alive if the record were attested.
+    // The record is attested as dead-owner repair attests it, for its liveness only.
     write(
         &fixture.directory.join("native-session.json"),
         &json!({"pid": std::process::id(), "managed_session_id": "session-other"}),
@@ -929,10 +940,10 @@ fn inspect_does_not_attest_an_owner_record_of_another_session() {
     let value = success(fixture.run(&["inspect", "session-observe", "--json"]));
     assert_eq!(
         value["owner"],
-        json!({"process_alive": null, "identity_matches": null,
+        json!({"process_alive": true, "identity_matches": null,
             "error": "owner record belongs to another session"})
     );
-    assert_eq!(value["owner_process_alive"], Value::Null);
+    assert_eq!(value["owner_process_alive"], true);
     assert_eq!(value["owner_identity_verified"], false);
     assert_eq!(support::entries(fixture.root.path()), before);
     // An unbound legacy record keeps its observed liveness and no identity.

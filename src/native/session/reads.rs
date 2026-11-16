@@ -69,6 +69,54 @@ pub(in crate::native) fn read_event_within_budget(
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
+/// A regular session file, never followed through a link at its final component, read
+/// within `limit` bytes and only when it is UTF-8. A missing file is `Ok(Err(absence))`,
+/// with the platform's own report of that absence for a reader that requires the file.
+/// Unlike the timeline read, a file replaced during the read is not refused: the bytes
+/// come from the one opened file.
+pub(in crate::native) fn read_bounded_regular_bytes(
+    path: &Path,
+    limit: u64,
+) -> Result<std::result::Result<Vec<u8>, std::io::Error>> {
+    use std::io::Read as _;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Err(error)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("refusing non-regular session file: {}", path.display());
+    }
+    let over_limit = |size: u64| {
+        anyhow::anyhow!(
+            "record is {size} bytes, over the {limit} byte read limit: {}",
+            path.display()
+        )
+    };
+    if metadata.len() > limit {
+        return Err(over_limit(metadata.len()));
+    }
+    let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(over_limit(bytes.len() as u64));
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        // The text readers' own report of invalid UTF-8 (`fs::read_to_string`).
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
+        .with_context(|| format!("failed to read {}", path.display()));
+    }
+    Ok(Ok(bytes))
+}
+
 pub(in crate::native) fn read_timeline_record(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
     use std::io::Read as _;
     let metadata = match fs::symlink_metadata(path) {

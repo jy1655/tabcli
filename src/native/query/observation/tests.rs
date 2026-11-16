@@ -104,7 +104,7 @@ fn partial_observation_keeps_lock_failures_local_and_tombstone_reads_lazy() {
                 judgment::Hold::Unreadable("lock attempt 2".into())
             );
         }
-        assert!(observed.evidence.owner.is_ok());
+        assert!(!observed.evidence.owner.unreadable());
         assert!(!matches!(
             observed.surface,
             judgment::Surface::Unreadable { .. }
@@ -226,7 +226,7 @@ fn damage_keeps_inspect_and_doctor_failure_scopes() {
                     assert_eq!(inspect["latest_result"]["request_state"], "completed");
                 }
                 "owner" => {
-                    assert!(observation.evidence.owner.is_err());
+                    assert!(observation.evidence.owner.unreadable());
                     assert!(inspect.is_ok());
                     assert_eq!(reason(&checks, "owner"), "owner_unreadable");
                 }
@@ -272,7 +272,7 @@ fn observation_is_read_only_and_releases_its_lock() {
         let observation = Observation::read(&reader).unwrap();
         assert!(observation.evidence.owner_judgment.get().is_none());
         if owner {
-            observation.evidence.judge_owner("session-fault");
+            observation.evidence.judge_owner();
             assert!(observation.evidence.owner_judgment.get().unwrap().gone());
         }
         assert!(observation.evidence.surface_presence.get().is_none());
@@ -654,12 +654,9 @@ fn owner_judgment_is_made_once_per_observation() {
                 Some(true),
             )
         },
-        pid_alive: &|_| panic!("a bound record is attested"),
     };
     for _ in 0..3 {
-        let owner = observation
-            .evidence
-            .judge_owner_with("session-fault", &observers);
+        let owner = observation.evidence.judge_owner_with(&observers);
         assert_eq!(owner.observation().process_alive, Some(true));
     }
     assert_eq!(calls.get(), 1);
@@ -667,7 +664,7 @@ fn owner_judgment_is_made_once_per_observation() {
     assert_eq!(
         observation
             .evidence
-            .judge_owner("session-fault")
+            .judge_owner()
             .observation()
             .process_alive,
         Some(true)

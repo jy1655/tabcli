@@ -7,7 +7,7 @@ use crate::native::session::state::{
     ResidualSurface, SessionState, SessionStatus, update_status, update_status_with_residual,
 };
 
-use super::owner::{OwnerAttestation, attest_owner};
+use super::owner::{OwnerAttestation, OwnerRecord, attest_owner};
 use crate::native::process_identity::ProcessObservation;
 use crate::native::session::turn::{
     JournaledEventState, journaled_event_state, recover_pending_completion,
@@ -273,16 +273,18 @@ pub(in crate::native) fn terminal_close_intent_owner(
     if !surface_outlives_owner {
         return Ok(None);
     }
-    let (Some(intent), Some(owner)) = (
-        reader.record(CoreRecord::TerminalCloseIntent).text()?,
-        reader.record(CoreRecord::Owner).text()?,
-    ) else {
+    let intent = reader.record(CoreRecord::TerminalCloseIntent).text()?;
+    // A malformed owner grants nothing, as a malformed intent does; an unreadable one is the
+    // read's error.
+    let owner = match super::owner::observe(reader) {
+        OwnerRecord::Recorded(recorded) => Some(recorded.owner),
+        OwnerRecord::Unreadable(error) => return Err(error),
+        OwnerRecord::Absent | OwnerRecord::Malformed { .. } => None,
+    };
+    let (Some(intent), Some(owner)) = (intent, owner) else {
         return Ok(None);
     };
-    let (Ok(intent), Ok(owner)) = (
-        serde_json::from_str::<TerminalCloseIntent>(&intent),
-        super::record::owner(&owner),
-    ) else {
+    let Ok(intent) = serde_json::from_str::<TerminalCloseIntent>(&intent) else {
         return Ok(None);
     };
     let attested = owner.control_record().is_complete();
@@ -331,21 +333,14 @@ impl Reader {
 }
 
 impl Reader {
+    /// Prune attests the recorded process whatever Session the record names; a record that
+    /// cannot be read or decoded blocks it.
     pub(in crate::native) fn native_owner_blocks_prune(&self) -> Result<bool> {
-        // Prune attests the recorded process whatever Session the record names; whether it
-        // should consult the binding first is an open follow-up.
-        let path = self.record(CoreRecord::Owner).path().to_owned();
-        let text = match session::RecordReader::at(&path).text() {
-            Ok(Some(text)) => text,
-            Ok(None) => return Ok(false),
-            Err(_) => return Ok(true),
-        };
-        let owner = match super::record::owner(&text) {
-            Ok(owner) => owner,
-            Err(_) => return Ok(true),
-        };
-
-        Ok(prune_blocked_by(&attest_owner(&owner)))
+        Ok(match super::owner::observe(self) {
+            OwnerRecord::Absent => false,
+            OwnerRecord::Unreadable(_) | OwnerRecord::Malformed { .. } => true,
+            OwnerRecord::Recorded(recorded) => prune_blocked_by(&attest_owner(&recorded.owner)),
+        })
     }
 }
 
@@ -839,6 +834,22 @@ pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instan
     )
 }
 
+/// Repair's decision over the session's records with the owner attested by `attest`: what a
+/// prediction of Repair is compared with. A dead owner's surface is never closed here.
+#[cfg(test)]
+pub(in crate::native) fn repair_dead_owner_attested_with(
+    store: &Store,
+    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+) -> Result<bool> {
+    repair_dead_owner_with(
+        store,
+        |owner| repair_owner_is_live(&attest(owner)),
+        |_| false,
+        |_| bail!("a parity row records no surface"),
+        budget::close_deadline(),
+    )
+}
+
 fn repair_dead_owner_with<F>(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
@@ -877,19 +888,11 @@ where
     if !repair_examines_owner(&status.state) {
         return untouched(recovery_damage);
     }
-    // Repair attests the recorded process whatever Session the record names; whether it
-    // should consult the binding first is an open follow-up.
-    let owner_path = store.record(CoreRecord::Owner).path().to_owned();
-    let owner = match session::RecordReader::at(&owner_path).raw_text() {
-        Ok(text) => super::record::owner(&text)
-            .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return untouched(recovery_damage);
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
-        }
+    // Repair attests the recorded process whatever Session the record names.
+    let Some(owner) = super::owner::observe(store).decoded()? else {
+        return untouched(recovery_damage);
     };
+    let owner = owner.owner;
     let owner_live = owner_is_live(&owner)?;
     if owner_live {
         return untouched(recovery_damage);
@@ -957,6 +960,8 @@ where
     }
 }
 
+#[cfg(test)]
+mod owner_read_tests;
 #[cfg(test)]
 mod tests;
 

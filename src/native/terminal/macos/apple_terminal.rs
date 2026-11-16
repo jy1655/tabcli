@@ -9,7 +9,8 @@ mod startup_absence_tests;
 
 use super::process;
 use super::process::macos_process_start;
-use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
+use crate::native::session::owner::OwnerRecord;
+use crate::native::session::{Reader, RecordStore, Store};
 use crate::native::terminal;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
@@ -579,12 +580,15 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
     }
     // The wrapper records itself only once it runs: a start command that was never
     // typed, or a wrapper that failed first, leaves no owner and no app incarnation.
-    let owner = Reader::open_unchecked(directory)
-        .record(CoreRecord::Owner)
-        .text()?
-        .map(|text| crate::native::session::record::owner(&text))
-        .transpose()
-        .context("invalid Terminal.app startup owner record; the binding is retained")?;
+    let owner = match crate::native::session::owner::observe(&Reader::open_unchecked(directory)) {
+        OwnerRecord::Absent => None,
+        OwnerRecord::Unreadable(error) => return Err(error),
+        OwnerRecord::Malformed { error, .. } => {
+            return Err(anyhow::Error::new(error)
+                .context("invalid Terminal.app startup owner record; the binding is retained"));
+        }
+        OwnerRecord::Recorded(recorded) => Some(recorded.owner),
+    };
     if let Some(owner) = &owner {
         // The handle's binding is present: it was refused above when absent.
         if bound

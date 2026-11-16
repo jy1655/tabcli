@@ -214,7 +214,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   adapters keep the surface close. Each reader maps the rules' answers itself.
   The macOS owner wrapper reads the record and calls the same ordered verifier as portable tests;
   live-process and TTY observations are lazy so that an earlier refusal prevents later OS reads.
-  `session::owner` owns process observation and
+  `session::owner` owns the one observation of the Owner record and
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
   Each terminal kind is registered once: its portable `facts.rs` declares its surface facts,
@@ -280,8 +280,18 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   also live here, preserving their historical serde policy; the Snapshot timestamp rule is not
   added to those records.
   Reopen still judges refusal validity and release authority after decoding. Then `reads.rs`
-  for event reads and read budgets, `primitives.rs` for filesystem durability and
-  private-record permissions, and `owner.rs` for read-only attestation of the recorded owner.
+  for event reads, read budgets and the bounded regular-file read, `primitives.rs` for
+  filesystem durability and private-record permissions, and `owner.rs` for the Owner record.
+  `owner.rs` owns its one observation, shaped like `launch::host::observe`/`judge`: `read`
+  yields the record's bytes under one policy (no link at the final component, a regular file,
+  at most 128 KiB, strict UTF-8; any violation is unreadable), `judge` decodes them and judges
+  their binding to the Session (bound, unbound or foreign), and attestation is made on request.
+  Every reader uses it: Repair, launch repair, prune and the macOS running wait attest the
+  recorded process whatever the binding; the close authority and the surface-ownership probe
+  keep requiring a bound record; Origin feeds its budgeted bytes (read
+  within the same 128 KiB bound) to the same decoder; and the query Judgment attests every
+  recorded owner, reporting an unbound or foreign one for its liveness only, so `tell`'s
+  prediction and `wait` agree with Repair.
   Owner attestation separates incarnation birth from recorded TTY/process-group control,
   preserves inspection errors, and projects the
   public OwnerObservation. It takes only an owner value and OS observations, never a Store
@@ -292,7 +302,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   from the receipt of the claim its launch record names (from a read Snapshot or by a bounded
   direct read), and judges whether that one Origin, in the same state root, ended: a valid close
   tombstone first, then a recorded `closed`, `failed` or `exited` status, then
-  `attest_owner(owner).process` for a bound owner, never the projected liveness bools. A missing
+  `attest_owner(owner).process` for a bound owner, never the projected liveness bools. The owner
+  record is read within the Owner record's own 128 KiB bound inside the observation budget. A missing
   Origin directory is undecided, not ended. It reads through `RecordReader`'s bounded strict
   regular-file reads within a `ReadBudget`, rechecks the tombstone and status after the verdict,
   and opens no Store, takes no lock, repairs, recovers or writes nothing. It renders the public
@@ -531,8 +542,9 @@ marks its interpretation as derived. Replacement removes the earlier intent from
 `RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
 Core Record decoding is not an adapter concern: it lives in `session/record.rs`, one decoder per
 Record, and every reader of a core Record calls it. The Owner record's decoder there checks
-only its shape; the rules that judge an owner record stay beside its type in
-`terminal::ownership`, and each reader keeps its own I/O policy and error text.
+only its shape; its one read policy and binding judgment are `session::owner`'s, the rules that
+judge an owner record stay beside its type in `terminal::ownership`, and each reader keeps its
+own error text and authority.
 
 The native provider contract requires explicit launch configuration, initial delivery,
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every

@@ -93,8 +93,10 @@ impl SurfaceAccess for Fake {
             .unwrap_or(Ok(()))
             .map_err(|error| anyhow::anyhow!(error))?;
         // As the real check does, verify whatever owner the record names now.
-        let owner =
-            observation::SessionEvidence::read_owner(&Reader::open_unchecked(directory)).unwrap();
+        let owner = crate::native::session::owner::observe(&Reader::open_unchecked(directory))
+            .decoded()
+            .unwrap()
+            .map(|recorded| recorded.owner);
         if let Some(owner) = &owner {
             self.verified_owners
                 .borrow_mut()

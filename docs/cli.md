@@ -556,7 +556,10 @@ null. Attention does not change session or request state. Owner exit, identity m
 missing observations are distinct facts; closed sessions have no owner liveness flags. A live
 owner whose identity was not observed is not flagged; a failed identity check is reported as
 `owner_unverified`. A bound owner whose attestation could not decide is `owner_unverified` only,
-never `owner_exited`, even when its process id looked absent.
+never `owner_exited`, even when its process id looked absent. An unbound legacy owner record, or
+one of another managed session, is flagged by the death dead-owner repair acts on: `owner_exited`
+when its recorded process exited, `owner_identity_mismatch` when its process id now belongs to
+another process, and `owner_unverified` otherwise.
 Each session carries `origin` and `origin_observation`: the managed session recorded as the
 source of its initial request, and whether that session's records show it ended (see
 [origin observation](#origin-observation)). A session whose recorded state is not `closed` and
@@ -688,22 +691,26 @@ for `pi_input_ack_unsupported`.
 not offer Windows input acknowledgement (schema 2 with `input_ack_schema: 1`), as with an older
 extension.
 
-`owner_ended` means the recorded owner is verified gone, and `tell` refuses. Its dead-owner repair
+`owner_ended` means the recorded owner is verified gone, and `tell` refuses. Dead-owner repair
+attests the recorded process whatever session the owner record names, so this applies to an
+unbound legacy record and to one of another managed session as well. Its dead-owner repair
 usually closes such a session, but may leave it open for an explicit `close-session`. On macOS this
 happens when a close is already pending, or when the terminal can outlive its owner (Terminal.app,
 Ghostty, Warp, WezTerm). On any platform it happens for a launch that was never confirmed, which
 launch repair settles instead. `recovery_required` means a completion journal is pending, and
-recovery can change every later gate. `owner_unverified` means the bound owner's process could not
-be inspected, which dead-owner repair also cannot judge, or, past the terminal handle, that its
-control identity could not be read. The other two owner reasons are judged only past the
+recovery can change every later gate. `owner_unverified` means the recorded owner's process could
+not be inspected (whatever session the record names), which dead-owner repair also cannot judge,
+or, past the terminal handle, that a bound owner's control identity could not be read. The other two owner reasons are judged only past the
 terminal handle, as part of the surface ownership check: a missing or unusable handle refuses
 first. `owner_control_unverified` means the owner is live, but the identity `tell`'s surface probe
 requires is missing or changed: on macOS its recorded birth, TTY or process groups, and on native
 Windows its recorded process identity, without which the Windows probe refuses the owner record.
-`owner_unattested` means the owner record is absent, belongs to another session, or is a
-legacy record without a binding whose process is not observed gone; the probe requires an owner
-bound to the session. `evidence_unreadable` covers an unreadable owner record, terminal handle,
-adapter record or provider name, with the read error in `detail`.
+`owner_unattested` means the owner record is absent, or is a live record of another session or a
+legacy record without a binding; the probe requires an owner bound to the session.
+`evidence_unreadable` covers an unreadable owner record, terminal handle, adapter record or
+provider name, with the read error in `detail`. Every reader of the owner record, repair and the
+probe included, refuses a link at its final component, anything other than a regular file, a
+record over 128 KiB and one that is not UTF-8.
 
 An admissible `tell` adds `unevaluated`, the gates this observation does not evaluate, in the
 command's order: `terminal_surface_probe`; `reopened_conversation_exclusivity` for a reopened
@@ -1091,10 +1098,11 @@ later record deletion or damage is an error, not a pending request.
 
 The wait ends on `completed`, `failed`, `cancelled`, `unresolved`, or `recovery_required`, or when a recorded
 owner is no longer live or a closed, failed, or exited session leaves the request unresolved.
-An owner is no longer live only when a bound owner's process exited or its process id now belongs
-to another process, or an unbound legacy owner's process id is gone. A live owner with a changed
-TTY or process group, an attestation that could not decide, and an owner record of another
-session keep the wait going; `result --wait` follows the same rule.
+An owner is no longer live only when the recorded owner's process exited or its process id now
+belongs to another process, whatever session the owner record names, as dead-owner repair attests
+it. A live owner with a changed TTY or process group, an attestation that could not decide (an
+unbound legacy record whose recorded birth could not be inspected included), and an unreadable
+owner record keep the wait going; `result --wait` follows the same rule.
 As with `result --wait`, only `completed` exits successfully. If more than one address ends in
 the same pass, the original input order wins, even across session groups. Sessions are observed
 sequentially: there is **no global ordering guarantee** about actual completion times.
@@ -2094,7 +2102,7 @@ authenticated identity.
 | `owner_exited` | managed | true | The origin's bound owner process is attested gone. |
 | `owner_reused` | managed | true | The owner's process id now belongs to another process, which grants no authority. |
 | `owner_live` | managed | false | The owner is attested live; `detail` notes a process-id-only record. |
-| `owner_unverified` | managed | null | No owner record, an unbound or foreign one, or an attestation that could not decide. |
+| `owner_unverified` | managed | null | No owner record, an unbound or foreign one, an unreadable one (the 128 KiB owner bound included), or an attestation that could not decide. |
 | `origin_missing` | managed | null | No session directory with that id in this state root; a pruned, deleted or foreign session looks the same. |
 | `origin_unreadable` | managed | null | A linked or damaged directory, manifest, status or tombstone. |
 | `origin_unverified` | managed | null | A recorded state this version does not know. |
@@ -2160,9 +2168,12 @@ record can therefore report an available owner in doctor; an inspection failure 
 unverified. These effects apply to macOS intermediate records as well as Windows records.
 Completed Results still take precedence. These observations alone grant no general Surface
 close authority.
-Only an owner record bound to the session is attested. A record of another managed session is not
-observed: `owner.error` is `owner record belongs to another session`, `owner.process_alive`,
-`owner.identity_matches` and `owner_process_alive` are null, and `owner_identity_verified` is false.
+Every owner record is attested as dead-owner repair attests it, whatever session it names. An
+unbound legacy record, and a record of another managed session, report only that liveness:
+`owner.process_alive` (with `owner.identity_matches: false` when the process id now belongs to
+another process, and the reason in `owner.error` when the attestation could not decide), never a
+verified control identity, and `owner_identity_verified` is false. For a record of another session
+`owner.error` is otherwise `owner record belongs to another session`.
 
 `held` is true, false, or null with `hold_error`, using the same rules as `status`.
 `cancel` is null when absent, otherwise `{request_id, requested_unix_ms, state}`; `state`

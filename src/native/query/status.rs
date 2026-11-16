@@ -3,6 +3,7 @@ use super::search::{IncompleteReason, SEARCH_TIME_BUDGET, SearchScope};
 use super::*;
 use crate::native::args::{option_value, set_flag_once, set_once, workspace_scope};
 use crate::native::clock::{Clock, SystemClock};
+use crate::native::process_identity::{Gone, ProcessObservation};
 use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
@@ -119,7 +120,8 @@ fn parse_options(args: &[String]) -> Result<StatusRequest> {
 }
 
 /// Status's owner attention: a live owner whose identity was not compared is not flagged,
-/// and an Unknown attestation is unverified, never exited (B3).
+/// and an Unknown attestation is unverified, never exited (B3). A record not bound to this
+/// session is flagged by the death Repair acts on, and is otherwise unverified.
 fn owner_flag(owner: &OwnerJudgment) -> Option<AttentionFlag> {
     match owner.bound() {
         Some(BoundOwner::Exited) => Some(AttentionFlag::OwnerExited),
@@ -127,17 +129,26 @@ fn owner_flag(owner: &OwnerJudgment) -> Option<AttentionFlag> {
             Some(AttentionFlag::OwnerIdentityMismatch)
         }
         Some(BoundOwner::Verified | BoundOwner::Uncompared) => None,
-        Some(BoundOwner::Unknown) | None => Some(AttentionFlag::OwnerUnverified),
+        Some(BoundOwner::Unknown) => Some(AttentionFlag::OwnerUnverified),
+        None => Some(
+            match owner.attestation().map(|attestation| &attestation.process) {
+                Some(ProcessObservation::Gone(Gone::Exited)) => AttentionFlag::OwnerExited,
+                Some(ProcessObservation::Gone(Gone::Reused(_))) => {
+                    AttentionFlag::OwnerIdentityMismatch
+                }
+                _ => AttentionFlag::OwnerUnverified,
+            },
+        ),
     }
 }
 
 /// Status's `owner` object: the attestation's projection for a bound record, otherwise
-/// null facts with the reason no attestation was made.
+/// null facts with the reason it carries no attestation of this session's owner.
 fn owner_value(owner: &OwnerJudgment) -> OwnerObservation {
     let reason = match owner {
         OwnerJudgment::Bound(_) => return owner.observation(),
-        OwnerJudgment::UnboundLegacy { .. } => "owner record is unbound",
-        OwnerJudgment::Foreign => FOREIGN_OWNER,
+        OwnerJudgment::UnboundLegacy(_) => "owner record is unbound",
+        OwnerJudgment::Foreign(_) => FOREIGN_OWNER,
         OwnerJudgment::Absent => "no owner record",
         OwnerJudgment::Unreadable(reason) => reason,
     };
@@ -230,7 +241,7 @@ fn result_command(candidate: ResultCandidate, id: &str) -> Option<String> {
 }
 
 fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
-    let judgment = observed.observation.evidence.judge_owner(id);
+    let judgment = observed.observation.evidence.judge_owner();
     let owner = owner_value(judgment);
     let flags = attention(&observed, judgment, &origin);
     let observation = &observed.observation;

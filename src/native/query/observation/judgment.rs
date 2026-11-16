@@ -5,29 +5,29 @@ use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::query::request::RequestState;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session::ResidualSurface;
-use crate::native::session::owner::{ControlAttestation, OwnerAttestation, attest_owner};
+use crate::native::session::owner::{
+    ControlAttestation, OwnerAttestation, OwnerRecord, attest_owner,
+};
 use crate::native::session::snapshot::Snapshot;
 use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalKind;
 use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
-use agent_bridge::process_is_alive;
 use anyhow::Result;
 use serde_json::Value;
 
 pub(in crate::native) const FOREIGN_OWNER: &str = "owner record belongs to another session";
 
 /// The Owner record judged against the session it was read for (CONTEXT.md Attestation).
-/// Only a record bound to this session is attested.
+/// Every recorded owner is attested, as Repair attests it whatever Session the record
+/// names; only a record bound to this session is judged for control authority.
 #[derive(Debug)]
 pub(in crate::native) enum OwnerJudgment {
     /// The record names this session; its incarnation and control identity were attested.
     Bound(OwnerAttestation),
-    /// A legacy record without a binding: its PID is observed alive or gone, never attested.
-    UnboundLegacy {
-        alive: Option<bool>,
-    },
-    /// The record names another managed session and was not observed at all.
-    Foreign,
+    /// A legacy record without a binding, attested for liveness only.
+    UnboundLegacy(OwnerAttestation),
+    /// The record names another managed session, attested for liveness only.
+    Foreign(OwnerAttestation),
     Absent,
     Unreadable(String),
 }
@@ -53,39 +53,34 @@ pub(in crate::native) enum BoundOwner {
     Unknown,
 }
 
-/// The OS observations an owner judgment may make. Tests replace them.
+/// The OS observation an owner judgment makes. Tests replace it.
 pub(in crate::native) struct Observers<'a> {
     pub(in crate::native) attest: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
-    pub(in crate::native) pid_alive: &'a dyn Fn(u32) -> Option<bool>,
 }
 
 impl Observers<'static> {
     pub(in crate::native) const SYSTEM: Self = Self {
         attest: &attest_owner,
-        pid_alive: &system_pid_alive,
     };
 }
 
-fn system_pid_alive(pid: u32) -> Option<bool> {
-    Some(process_is_alive(pid))
-}
-
-/// Judges the raw Owner read for `session`. Reads no record and takes no lock.
-pub(in crate::native) fn owner(
-    record: &Result<Option<NativeSessionOwner>>,
-    session: &str,
-    observers: &Observers<'_>,
-) -> OwnerJudgment {
+/// Judges one observation of the Owner record. Reads no record and takes no lock.
+pub(in crate::native) fn owner(record: &OwnerRecord, observers: &Observers<'_>) -> OwnerJudgment {
     match record {
-        Err(error) => OwnerJudgment::Unreadable(format!("{error:#}")),
-        Ok(None) => OwnerJudgment::Absent,
-        Ok(Some(owner)) => match owner.binding(session) {
-            OwnerBinding::Bound => OwnerJudgment::Bound((observers.attest)(owner)),
-            OwnerBinding::Foreign => OwnerJudgment::Foreign,
-            OwnerBinding::Unbound => OwnerJudgment::UnboundLegacy {
-                alive: (observers.pid_alive)(owner.pid),
-            },
-        },
+        OwnerRecord::Absent => OwnerJudgment::Absent,
+        OwnerRecord::Unreadable(error) => OwnerJudgment::Unreadable(format!("{error:#}")),
+        // The readers' shared `invalid JSON in {path}` context, rendered as its chain.
+        OwnerRecord::Malformed { path, error } => {
+            OwnerJudgment::Unreadable(format!("invalid JSON in {}: {error}", path.display()))
+        }
+        OwnerRecord::Recorded(recorded) => {
+            let attestation = (observers.attest)(&recorded.owner);
+            match recorded.binding {
+                OwnerBinding::Bound => OwnerJudgment::Bound(attestation),
+                OwnerBinding::Unbound => OwnerJudgment::UnboundLegacy(attestation),
+                OwnerBinding::Foreign => OwnerJudgment::Foreign(attestation),
+            }
+        }
     }
 }
 
@@ -118,31 +113,36 @@ impl OwnerJudgment {
         }
     }
 
-    /// The recorded owner is verified gone: a Bound incarnation that exited or whose PID was
-    /// reused, or an unbound legacy PID observed absent.
-    pub(in crate::native) fn gone(&self) -> bool {
+    /// The attestation of a recorded owner, whatever Session the record names.
+    pub(in crate::native) fn attestation(&self) -> Option<&OwnerAttestation> {
         match self {
-            Self::Bound(attestation) => matches!(
-                BoundOwner::of(attestation),
-                BoundOwner::Exited | BoundOwner::Reused
-            ),
-            Self::UnboundLegacy { alive } => *alive == Some(false),
-            Self::Foreign | Self::Absent | Self::Unreadable(_) => false,
+            Self::Bound(attestation)
+            | Self::UnboundLegacy(attestation)
+            | Self::Foreign(attestation) => Some(attestation),
+            Self::Absent | Self::Unreadable(_) => None,
         }
     }
 
-    /// The renderer-side JSON shape of the judgment.
+    /// The recorded owner is verified gone: its incarnation exited or its PID was reused,
+    /// whatever Session the record names. This is the death Repair acts on.
+    pub(in crate::native) fn gone(&self) -> bool {
+        self.attestation()
+            .is_some_and(|attestation| matches!(attestation.process, ProcessObservation::Gone(_)))
+    }
+
+    /// The renderer-side JSON shape of the judgment. A record not bound to this session
+    /// reports only its liveness.
     pub(in crate::native) fn observation(&self) -> OwnerObservation {
         match self {
             Self::Bound(attestation) => OwnerObservation::from(attestation),
-            Self::UnboundLegacy { alive } => OwnerObservation {
-                process_alive: *alive,
-                ..OwnerObservation::default()
-            },
-            Self::Foreign => OwnerObservation {
-                error: Some(FOREIGN_OWNER.to_owned()),
-                ..OwnerObservation::default()
-            },
+            Self::UnboundLegacy(attestation) => OwnerObservation::liveness(attestation),
+            Self::Foreign(attestation) => {
+                let mut observation = OwnerObservation::liveness(attestation);
+                observation
+                    .error
+                    .get_or_insert_with(|| FOREIGN_OWNER.to_owned());
+                observation
+            }
             Self::Absent => OwnerObservation::default(),
             Self::Unreadable(reason) => OwnerObservation {
                 error: Some(reason.clone()),
@@ -416,7 +416,7 @@ pub(in crate::native) enum UnreadablePart {
 
 pub(in crate::native) fn unreadable_parts(
     held: &Result<bool>,
-    owner: &Result<Option<NativeSessionOwner>>,
+    owner: &OwnerRecord,
     surface: &Surface,
     resumed_from: &Result<Option<ResumedFrom>>,
     request_index: Option<&IndexIncomplete>,
@@ -425,7 +425,7 @@ pub(in crate::native) fn unreadable_parts(
     if held.is_err() {
         parts.push(UnreadablePart::Hold);
     }
-    if owner.is_err() {
+    if owner.unreadable() {
         parts.push(UnreadablePart::Owner);
     }
     if matches!(surface, Surface::Unreadable { .. }) {
@@ -566,12 +566,16 @@ pub(in crate::native) mod tests {
         json!([o.process_alive, o.identity_matches, o.error])
     }
 
-    fn record(binding: Option<&str>) -> Result<Option<NativeSessionOwner>> {
-        Ok(Some(NativeSessionOwner {
+    fn record(binding: Option<&str>) -> OwnerRecord {
+        let owner = NativeSessionOwner {
             pid: 4242,
             managed_session_id: binding.map(str::to_owned),
             ..Default::default()
-        }))
+        };
+        OwnerRecord::Recorded(crate::native::session::owner::RecordedOwner {
+            binding: owner.binding(SESSION),
+            owner,
+        })
     }
 
     /// An in-memory Snapshot of a session in `state` with no Claim, Receipt or journal.
@@ -645,7 +649,7 @@ pub(in crate::native) mod tests {
     /// Evidence with every auxiliary record readable and absent.
     pub(in crate::native) fn evidence() -> SessionEvidence {
         SessionEvidence {
-            owner: Ok(None),
+            owner: OwnerRecord::Absent,
             held: Ok(false),
             close_tombstone: None,
             surface: SurfaceRecord::Active(Ok(None)),
@@ -769,10 +773,8 @@ pub(in crate::native) mod tests {
         for (index, (make, verdict, expected, gone)) in rows.into_iter().enumerate() {
             let judgment = owner(
                 &record(Some(SESSION)),
-                SESSION,
                 &Observers {
                     attest: &|_| make(),
-                    pid_alive: &|_| panic!("a bound record is attested, not PID-observed"),
                 },
             );
             assert!(matches!(judgment, OwnerJudgment::Bound(_)), "{index}");
@@ -782,57 +784,133 @@ pub(in crate::native) mod tests {
         }
     }
 
+    // A record not bound to this session is attested as Repair attests it, and reports its
+    // liveness only: no control identity, and a foreign record says whose it is not.
     #[test]
-    fn unbound_foreign_absent_and_unreadable_records_are_never_attested() {
-        let no_attestation = |_: &NativeSessionOwner| -> OwnerAttestation {
-            panic!("only a bound record is attested")
-        };
-        for (alive, expected, gone) in [
-            (Some(true), json!([true, null, null]), false),
-            (Some(false), json!([false, null, null]), true),
-            (None, json!([null, null, null]), false),
-        ] {
-            let judgment = owner(
-                &record(None),
-                SESSION,
-                &Observers {
-                    attest: &no_attestation,
-                    pid_alive: &|pid| {
-                        assert_eq!(pid, 4242);
-                        alive
-                    },
+    fn unbound_and_foreign_records_are_attested_for_liveness_only() {
+        type Make = fn() -> OwnerAttestation;
+        let rows: [(&str, Make, Value, bool); 5] = [
+            (
+                "live, control verified",
+                || live(Verified),
+                json!([true, null, null]),
+                false,
+            ),
+            (
+                "exited",
+                || {
+                    attestation(
+                        ProcessObservation::Gone(Gone::Exited),
+                        NotRecorded,
+                        Some(false),
+                    )
                 },
-            );
-            assert!(matches!(judgment, OwnerJudgment::UnboundLegacy { alive: a } if a == alive));
-            assert_eq!(judgment.bound(), None);
-            assert_eq!(projection(&judgment), expected);
-            assert_eq!(judgment.gone(), gone);
-        }
-        let unobserved = Observers {
-            attest: &no_attestation,
-            pid_alive: &|_| panic!("a foreign, absent or unreadable record is not observed"),
-        };
-        let unreadable = Err(anyhow::anyhow!("invalid JSON").context("owner record"));
-        for (read, expected) in [
-            (
-                record(Some("session-other")),
-                json!([null, null, FOREIGN_OWNER]),
+                json!([false, null, null]),
+                true,
             ),
-            (Ok(None), json!([null, null, null])),
             (
-                unreadable,
-                json!([null, null, "owner record: invalid JSON"]),
+                "reused",
+                || {
+                    attestation(
+                        ProcessObservation::Gone(Gone::Reused("birth".into())),
+                        NotRecorded,
+                        Some(true),
+                    )
+                },
+                json!([true, false, null]),
+                true,
+            ),
+            // A failed birth inspection is never a death, whatever the PID hint.
+            (
+                "unknown, dead hint",
+                || {
+                    attestation(
+                        ProcessObservation::Unknown("birth denied".into()),
+                        NotRecorded,
+                        Some(false),
+                    )
+                },
+                json!([false, null, "birth denied"]),
+                false,
+            ),
+            (
+                "unknown, live hint",
+                || {
+                    attestation(
+                        ProcessObservation::Unknown("birth denied".into()),
+                        NotRecorded,
+                        Some(true),
+                    )
+                },
+                json!([true, null, "birth denied"]),
+                false,
+            ),
+        ];
+        for (name, make, expected, gone) in rows {
+            for binding in [None, Some("session-other")] {
+                let attested = std::cell::Cell::new(0);
+                let judgment = owner(
+                    &record(binding),
+                    &Observers {
+                        attest: &|owner| {
+                            assert_eq!(owner.managed_session_id.as_deref(), binding);
+                            attested.set(attested.get() + 1);
+                            make()
+                        },
+                    },
+                );
+                assert_eq!(attested.get(), 1, "{name} {binding:?}");
+                match binding {
+                    None => assert!(matches!(judgment, OwnerJudgment::UnboundLegacy(_))),
+                    Some(_) => assert!(matches!(judgment, OwnerJudgment::Foreign(_))),
+                }
+                assert_eq!(judgment.bound(), None, "{name} {binding:?}");
+                assert_eq!(judgment.gone(), gone, "{name} {binding:?}");
+                let mut expected = expected.clone();
+                if binding.is_some() && expected[2].is_null() {
+                    expected[2] = json!(FOREIGN_OWNER);
+                }
+                assert_eq!(projection(&judgment), expected, "{name} {binding:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_and_unreadable_records_are_never_attested() {
+        let unobserved = Observers {
+            attest: &|_| panic!("an absent or unreadable record is not attested"),
+        };
+        let malformed = OwnerRecord::Malformed {
+            path: "owner.json".into(),
+            error: serde_json::from_slice::<NativeSessionOwner>(b"{").unwrap_err(),
+        };
+        for (read, expected) in [
+            (OwnerRecord::Absent, json!([null, null, null])),
+            (
+                OwnerRecord::Unreadable(anyhow::anyhow!("denied").context("owner record")),
+                json!([null, null, "owner record: denied"]),
+            ),
+            (
+                malformed,
+                json!([
+                    null,
+                    null,
+                    "invalid JSON in owner.json: EOF while parsing an object at line 1 column 1"
+                ]),
             ),
         ] {
-            let judgment = owner(&read, SESSION, &unobserved);
-            match &judgment {
-                OwnerJudgment::Foreign => assert!(read.as_ref().is_ok_and(Option::is_some)),
-                OwnerJudgment::Absent => assert!(read.as_ref().is_ok_and(Option::is_none)),
-                OwnerJudgment::Unreadable(reason) => {
-                    assert_eq!(reason, "owner record: invalid JSON")
-                }
-                other => panic!("unexpected judgment {other:?}"),
-            }
+            let judgment = owner(&read, &unobserved);
+            assert!(
+                matches!(
+                    (&read, &judgment),
+                    (OwnerRecord::Absent, OwnerJudgment::Absent)
+                        | (
+                            OwnerRecord::Unreadable(_) | OwnerRecord::Malformed { .. },
+                            OwnerJudgment::Unreadable(_)
+                        )
+                ),
+                "{judgment:?}"
+            );
             assert_eq!(judgment.bound(), None);
             assert_eq!(projection(&judgment), expected);
             assert!(!judgment.gone());
@@ -1334,7 +1412,7 @@ pub(in crate::native) mod tests {
         assert!(
             unreadable_parts(&readable.held, &readable.owner, &surface, &Ok(None), None).is_empty()
         );
-        let unreadable_owner: Result<Option<NativeSessionOwner>> = Err(error("owner"));
+        let unreadable_owner = OwnerRecord::Unreadable(error("owner"));
         let resumed: Result<Option<ResumedFrom>> = Err(error("resumed_from"));
         let index = IndexIncomplete {
             unreadable: 1,

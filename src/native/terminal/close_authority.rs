@@ -28,11 +28,11 @@ use crate::native::process_identity::ProcessObservation;
 use crate::native::session::SessionStatus;
 use crate::native::session::close::budget::close_remaining;
 #[cfg(any(target_os = "macos", windows))]
-use crate::native::session::owner::{OwnerAttestation, attest_owner};
+use crate::native::session::owner::{OwnerAttestation, OwnerRecord, attest_owner};
 #[cfg(target_os = "macos")]
 use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", windows))]
-use crate::native::session::{CoreRecord, Reader, SessionState, launch};
+use crate::native::session::{Reader, SessionState, launch};
 #[cfg(target_os = "macos")]
 use agent_bridge::process_is_alive;
 #[cfg(target_os = "macos")]
@@ -126,7 +126,15 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", windows))]
     fn owner_present(&self) -> Result<bool> {
-        Ok(self.reader().record(CoreRecord::Owner).text()?.is_some())
+        // A record that cannot be read is refused here, before anything else is read; a
+        // malformed one is present and the owner read reports it.
+        Ok(
+            match crate::native::session::owner::observe(&self.reader()) {
+                OwnerRecord::Absent => false,
+                OwnerRecord::Unreadable(error) => return Err(error),
+                OwnerRecord::Malformed { .. } | OwnerRecord::Recorded(_) => true,
+            },
+        )
     }
 
     #[cfg(any(target_os = "macos", windows))]
@@ -474,6 +482,7 @@ mod projected_authority_tests {
     use super::test_support::{RecordValues, TestObservation};
     use super::*;
     use crate::native::process_identity::{Attested, Gone};
+    use crate::native::session::CoreRecord;
     use crate::native::session::launch;
     use crate::native::session::owner::ControlAttestation;
 

@@ -5,7 +5,6 @@ use crate::native::reopen::ResumedFrom;
 use crate::native::session;
 use crate::native::session::origin;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
-use crate::native::terminal::ownership::NativeSessionOwner;
 use judgment::{Cancel, CancelState, Hold, Judgments, OwnerJudgment, Surface, SurfacePresence};
 use serde::Serialize;
 use std::cell::OnceCell;
@@ -55,7 +54,8 @@ impl PartialObservation {
 /// Hold, Owner and Surface records are separate observations from the four lifecycle records.
 /// They remain readable when the lifecycle records cannot form a consistent Observation.
 pub(in crate::native) struct SessionEvidence {
-    pub(in crate::native) owner: Result<Option<NativeSessionOwner>>,
+    /// The Owner record judged against the session whose directory was read.
+    pub(in crate::native) owner: session::owner::OwnerRecord,
     pub(in crate::native) held: Result<bool>,
     /// The session close tombstone, read for a held session only: the hold release gate
     /// is its one reader. None when it was not read.
@@ -101,14 +101,8 @@ pub(in crate::native) type SurfaceProbe<'a> =
     &'a dyn Fn(&Path, &terminal::TerminalSession, Duration) -> Result<bool>;
 
 impl SessionEvidence {
-    /// The raw Owner record read, shared with `wait`'s per-poll judgment.
-    pub(super) fn read_owner(reader: &Reader) -> Result<Option<NativeSessionOwner>> {
-        RecordReader::at(reader.record(CoreRecord::Owner).path())
-            .optional_json_with(session::record::owner)
-    }
-
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
-        let owner = Self::read_owner(reader);
+        let owner = session::owner::observe(reader);
         let surface = SurfaceRecord::read(reader);
         // An interrupted close can have its tombstone before status.json catches up.
         let close_tombstone = matches!(held, Ok(true)).then(|| reader.closed_if_present());
@@ -166,19 +160,18 @@ impl SessionEvidence {
         })
     }
 
-    /// The owner judgment for `session`, made on the first request. One Observation
-    /// describes one session, so later requests return the first judgment.
-    pub(in crate::native) fn judge_owner(&self, session: &str) -> &OwnerJudgment {
-        self.judge_owner_with(session, &judgment::Observers::SYSTEM)
+    /// The owner judgment, made on the first request. One Observation describes one
+    /// session, so later requests return the first judgment.
+    pub(in crate::native) fn judge_owner(&self) -> &OwnerJudgment {
+        self.judge_owner_with(&judgment::Observers::SYSTEM)
     }
 
     pub(in crate::native) fn judge_owner_with(
         &self,
-        session: &str,
         observers: &judgment::Observers<'_>,
     ) -> &OwnerJudgment {
         self.owner_judgment
-            .get_or_init(|| judgment::owner(&self.owner, session, observers))
+            .get_or_init(|| judgment::owner(&self.owner, observers))
     }
 }
 

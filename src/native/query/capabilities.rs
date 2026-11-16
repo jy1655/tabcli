@@ -196,13 +196,17 @@ fn tell_gates(
     Ok(unevaluated)
 }
 
-/// The liveness verdict dead-owner repair would act on, judged where convergence runs. A
-/// bound record is judged by repair's own liveness rule; an unbound record observed gone is
-/// the same death the repair finds. Repair reads an unreadable record and fails there. Any
-/// other record lets convergence continue, and is judged with the surface ownership below.
+/// The liveness verdict dead-owner repair would act on, judged where convergence runs.
+/// Repair reads the Owner record under the same read policy and attests the recorded process
+/// whatever Session the record names, so every recorded owner (bound, unbound or foreign) is
+/// judged by Repair's own liveness rule: a death is Repair's, and an attestation that cannot
+/// decide fails Repair. An unreadable record fails Repair too. Without a record convergence
+/// continues; a live record and an absent one are judged with the surface ownership below.
 fn owner_gate(owner: &OwnerJudgment) -> std::result::Result<(), Stop> {
     match owner {
-        OwnerJudgment::Bound(attestation) => match close::repair_owner_is_live(attestation) {
+        OwnerJudgment::Bound(attestation)
+        | OwnerJudgment::UnboundLegacy(attestation)
+        | OwnerJudgment::Foreign(attestation) => match close::repair_owner_is_live(attestation) {
             Ok(true) => Ok(()),
             Ok(false) => Err(owner_ended()),
             Err(error) => Err(Stop::unknown(
@@ -210,11 +214,8 @@ fn owner_gate(owner: &OwnerJudgment) -> std::result::Result<(), Stop> {
                 Some(format!("{error:#}")),
             )),
         },
-        owner if owner.gone() => Err(owner_ended()),
         OwnerJudgment::Unreadable(reason) => Err(Stop::unreadable(reason.clone())),
-        OwnerJudgment::UnboundLegacy { .. } | OwnerJudgment::Foreign | OwnerJudgment::Absent => {
-            Ok(())
-        }
+        OwnerJudgment::Absent => Ok(()),
     }
 }
 
@@ -243,7 +244,7 @@ fn owner_control_gate(
         },
         owner if owner.gone() => Ok(()),
         OwnerJudgment::Unreadable(_) => Ok(()),
-        OwnerJudgment::UnboundLegacy { .. } | OwnerJudgment::Foreign | OwnerJudgment::Absent => {
+        OwnerJudgment::UnboundLegacy(_) | OwnerJudgment::Foreign(_) | OwnerJudgment::Absent => {
             Err(Stop::unknown("owner_unattested", None))
         }
     }
@@ -362,35 +363,226 @@ mod tests {
         panic!("only a bound owner is judged by the probe's requirement")
     }
 
-    // A record that lets convergence continue passes the liveness gate and is judged by
-    // the ownership gate; a death or an unreadable record is the liveness gate's verdict.
+    fn unbound_and_foreign(attestation: fn() -> OwnerAttestation) -> [OwnerJudgment; 2] {
+        [
+            OwnerJudgment::UnboundLegacy(attestation()),
+            OwnerJudgment::Foreign(attestation()),
+        ]
+    }
+
+    // Every recorded owner is judged by Repair's liveness rule whatever Session it names; a
+    // live record that is not bound to this session is judged by the ownership gate, which
+    // grants it nothing. A death or an unreadable record is the liveness gate's verdict.
     #[test]
     fn the_liveness_gate_stops_only_where_repair_would() {
-        for owner in [
-            OwnerJudgment::UnboundLegacy { alive: Some(true) },
-            OwnerJudgment::UnboundLegacy { alive: None },
-            OwnerJudgment::Foreign,
-            OwnerJudgment::Absent,
-        ] {
+        let live = || {
+            attestation(
+                ProcessObservation::Live(Attested::Incarnation),
+                ControlAttestation::NotRecorded,
+                Some(true),
+            )
+        };
+        let exited = || {
+            attestation(
+                ProcessObservation::Gone(Gone::Exited),
+                ControlAttestation::NotRecorded,
+                Some(false),
+            )
+        };
+        let reused = || {
+            attestation(
+                ProcessObservation::Gone(Gone::Reused("birth".into())),
+                ControlAttestation::NotRecorded,
+                Some(true),
+            )
+        };
+        let unknown = || {
+            attestation(
+                ProcessObservation::Unknown("birth denied".into()),
+                ControlAttestation::NotRecorded,
+                Some(false),
+            )
+        };
+        let unattested = json!({"state": "unknown", "reason": "owner_unattested"});
+        for owner in unbound_and_foreign(live)
+            .into_iter()
+            .chain([OwnerJudgment::Absent])
+        {
             assert!(owner_gate(&owner).is_ok(), "{owner:?}");
             assert_eq!(
                 owner_control_gate(&owner, unconsulted).unwrap_err().value(),
-                json!({"state": "unknown", "reason": "owner_unattested"}),
+                unattested,
                 "{owner:?}"
             );
         }
-        let gone = OwnerJudgment::UnboundLegacy { alive: Some(false) };
-        assert_eq!(
-            owner_gate(&gone).unwrap_err().value()["reason"],
-            "owner_ended"
-        );
+        for owner in unbound_and_foreign(exited)
+            .into_iter()
+            .chain(unbound_and_foreign(reused))
+        {
+            assert_eq!(
+                owner_gate(&owner).unwrap_err().value()["reason"],
+                "owner_ended",
+                "{owner:?}"
+            );
+            assert!(owner_control_gate(&owner, unconsulted).is_ok(), "{owner:?}");
+        }
+        for owner in unbound_and_foreign(unknown) {
+            assert_eq!(
+                owner_gate(&owner).unwrap_err().value(),
+                json!({"state": "unknown", "reason": "owner_unverified", "detail": "birth denied"}),
+                "{owner:?}"
+            );
+            // Where Repair leaves the owner unexamined, the record still grants nothing.
+            assert_eq!(
+                owner_control_gate(&owner, unconsulted).unwrap_err().value(),
+                unattested,
+                "{owner:?}"
+            );
+        }
         let unreadable = OwnerJudgment::Unreadable("invalid JSON".into());
         assert_eq!(
             owner_gate(&unreadable).unwrap_err().value(),
             json!({"state": "unknown", "reason": "evidence_unreadable", "detail": "invalid JSON"})
         );
-        assert!(owner_control_gate(&gone, unconsulted).is_ok());
         assert!(owner_control_gate(&unreadable, unconsulted).is_ok());
+    }
+
+    /// What one side of the parity table decided about the owner.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Decision {
+        /// Convergence goes on past the owner.
+        Continues,
+        /// The owner is dead: Repair closes the session, the prediction refuses.
+        Ended,
+        /// Neither can decide: Repair fails, the prediction is unknown.
+        Fails,
+    }
+
+    /// One row of record shape and attestation answer, judged by `tell`'s prediction, by
+    /// Repair and (on macOS) by the running wait, each with the same injected attestation.
+    fn parity_row(shape: &str, answer: fn() -> OwnerAttestation) -> Vec<Decision> {
+        use crate::native::session::{SessionState, Store, close, update_status};
+        use crate::native::terminal::ownership::NativeSessionOwner;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-parity");
+        std::fs::create_dir_all(directory.join("events")).unwrap();
+        update_status(&directory, SessionState::Exited, None, None).unwrap();
+        let store = Store::open_unchecked(&directory);
+        let owner = |binding: Option<&str>| NativeSessionOwner {
+            pid: 4242,
+            managed_session_id: binding.map(str::to_owned),
+            ..NativeSessionOwner::default()
+        };
+        match shape {
+            "bound" => store.write_owner(&owner(Some("session-parity"))).unwrap(),
+            "unbound" => store.write_owner(&owner(None)).unwrap(),
+            "foreign" => store.write_owner(&owner(Some("session-other"))).unwrap(),
+            "absent" => (),
+            "unreadable" => {
+                std::fs::create_dir(store.record(session::CoreRecord::Owner).path()).unwrap()
+            }
+            _ => unreachable!("{shape}"),
+        }
+        let reader = Reader::open_unchecked(&directory);
+        let evidence = crate::native::query::observation::SessionEvidence::read(&reader, Ok(false));
+        let attest = |_: &NativeSessionOwner| answer();
+        let predicted = match owner_gate(evidence.judge_owner_with(
+            &crate::native::query::observation::judgment::Observers { attest: &attest },
+        ))
+        .map_err(|stop| stop.value())
+        {
+            Ok(()) => Decision::Continues,
+            Err(stop) if stop["reason"] == "owner_ended" => Decision::Ended,
+            Err(stop) => {
+                assert_eq!(stop["state"], "unknown", "{shape}");
+                Decision::Fails
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let waited = match crate::native::session::turn::running_wait_owner_with(&directory, attest)
+        {
+            Ok(()) => Decision::Continues,
+            Err(error) if format!("{error:#}").starts_with("native session process 4242") => {
+                Decision::Ended
+            }
+            Err(_) => Decision::Fails,
+        };
+        let repaired = match close::repair_dead_owner_attested_with(&store, attest) {
+            Ok(false) => Decision::Continues,
+            Ok(true) => {
+                assert_eq!(store.status().unwrap().state, SessionState::Closed);
+                Decision::Ended
+            }
+            Err(_) => Decision::Fails,
+        };
+        vec![
+            predicted,
+            repaired,
+            #[cfg(target_os = "macos")]
+            waited,
+        ]
+    }
+
+    // tell's prediction, Repair and the macOS running wait agree on every record shape and
+    // every attestation answer, the foreign record with a dead process included.
+    #[test]
+    fn the_owner_prediction_agrees_with_repair_on_every_record_and_answer() {
+        type Answer = fn() -> OwnerAttestation;
+        let answers: [(&str, Answer); 4] = [
+            ("live", || {
+                attestation(
+                    ProcessObservation::Live(Attested::Incarnation),
+                    ControlAttestation::NotRecorded,
+                    Some(true),
+                )
+            }),
+            ("exited", || {
+                attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    ControlAttestation::NotRecorded,
+                    Some(false),
+                )
+            }),
+            ("reused", || {
+                attestation(
+                    ProcessObservation::Gone(Gone::Reused("birth".into())),
+                    ControlAttestation::NotRecorded,
+                    Some(true),
+                )
+            }),
+            ("unknown", || {
+                attestation(
+                    ProcessObservation::Unknown("birth denied".into()),
+                    ControlAttestation::NotRecorded,
+                    Some(false),
+                )
+            }),
+        ];
+        for shape in ["bound", "unbound", "foreign", "absent", "unreadable"] {
+            for (name, answer) in answers {
+                let expected = match (shape, name) {
+                    ("absent", _) => Decision::Continues,
+                    ("unreadable", _) => Decision::Fails,
+                    (_, "live") => Decision::Continues,
+                    (_, "exited" | "reused") => Decision::Ended,
+                    _ => Decision::Fails,
+                };
+                let decisions = parity_row(shape, answer);
+                assert_eq!(decisions[..2], [expected, expected], "{shape} {name}");
+                // The running wait ends on the same deaths; it keeps waiting on an owner
+                // it cannot decide, where Repair fails.
+                #[cfg(target_os = "macos")]
+                assert_eq!(
+                    decisions[2],
+                    if shape == "unreadable" || expected != Decision::Fails {
+                        expected
+                    } else {
+                        Decision::Continues
+                    },
+                    "{shape} {name}"
+                );
+            }
+        }
     }
 
     // The gate maps the probe's answer for a bound owner and decides nothing of its own;

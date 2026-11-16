@@ -225,3 +225,45 @@ fn apple_terminal_failed_start_refuses_an_owner_not_bound_or_without_all_five_co
         assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
     }
 }
+
+// The failed-start absence reads the owner the wrapper may have recorded before it compares
+// that owner with the startup surface.
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_terminal_failed_start_owner_read_answers_for_each_damaged_shape() {
+    use crate::native::session::owner::damaged_tests::{
+        DAMAGED, owner_path, read_error, write_damaged_owner,
+    };
+    for &damaged in DAMAGED {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner =
+            write_attested_apple_terminal_state(directory.path(), "failed", reaped_child_pid());
+        owner.terminal_app = Some(MacTerminalAppIdentity {
+            pid: 1234,
+            start_seconds: 100,
+            start_microseconds: 42,
+        });
+        let path = owner_path(directory.path());
+        write_damaged_owner(directory.path(), &owner, damaged);
+        let mut handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        handle.managed_session_id = None;
+        let result = apple_terminal_startup_absent_with(
+            directory.path(),
+            &handle,
+            |_| false,
+            |_| Ok(None),
+            || Ok(vec![terminal_instance(1234, 100)]),
+            || Ok(true),
+        );
+        let observed = match result {
+            Ok(absent) => format!("ok {absent}"),
+            Err(error) => format!("error {error:#}"),
+        };
+        assert_eq!(
+            observed,
+            format!("error {}", read_error(&path, damaged)),
+            "{damaged:?}"
+        );
+    }
+}
