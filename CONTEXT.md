@@ -20,6 +20,8 @@ _Avoid_: state dir, workdir
 **Record**:
 One durable fact about a session that Bridge wrote and later reads back (status, manifest,
 owner, claim, receipt, event, journal, tombstone). A record is evidence, never a cache.
+Bridge's own (core) records are read under one policy: a regular file reached without a link
+at its path, its text strict UTF-8; anything else is unreadable, never followed or guessed.
 _Avoid_: file, state file, metadata
 
 **Reader**:

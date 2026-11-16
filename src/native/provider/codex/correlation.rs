@@ -1,5 +1,5 @@
 use super::PendingCodexTurn;
-use crate::native::session::{Reader, RecordReader};
+use crate::native::session::{CoreRecordReader, Reader};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -116,7 +116,7 @@ pub(super) fn codex_input_correlates(
 pub(super) fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
     for path in Reader::open_unchecked(directory).events()? {
         let event: crate::native::session::schema::SessionEvent =
-            RecordReader::at(&path).json_with(crate::native::session::record::event)?;
+            CoreRecordReader::at(&path).json_with(crate::native::session::record::event)?;
         if event.provider == FirstPartyCli::Codex.as_str()
             && let Some(thread_id) = event.provider_session_id
         {

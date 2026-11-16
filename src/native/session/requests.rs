@@ -2,7 +2,7 @@
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::turn::valid_turn_claim_token;
 
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record};
+use crate::native::session::{CoreRecord, CoreRecordReader, Reader, RecordStore, Store, record};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -155,7 +155,7 @@ pub(in crate::native) fn requests_directory_present(reader: &Reader) -> Result<b
 }
 
 /// The receipt record of one claim. The caller validates the token and the directory.
-pub(in crate::native) fn receipt_record(reader: &Reader, claim_token: &str) -> RecordReader {
+pub(in crate::native) fn receipt_record(reader: &Reader, claim_token: &str) -> CoreRecordReader {
     reader
         .record(CoreRecord::Requests)
         .child(&format!("{claim_token}.json"))

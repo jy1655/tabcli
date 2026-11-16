@@ -5,12 +5,12 @@ use super::envelope;
 use super::provider::{self, QuestionEmissions, QuestionObservation};
 use super::{DEFAULT_TIMEOUT_SECS, NativeCommand, consent, terminal};
 use crate::native::reopen::read_resumed_from;
+use crate::native::session::CoreRecord;
 use crate::native::session::SessionState;
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 #[cfg(test)]
 use crate::native::session::turn::JournaledEventState;
-use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::session::{Reader, SessionStatus, launch, requests};
 use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, checked_deadline_from, terminal_safe_text};
 use anyhow::Context;

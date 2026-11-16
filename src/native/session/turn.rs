@@ -6,7 +6,7 @@ use crate::native::session::schema::{
     EVENT_READ_LIMIT, ProviderUsage, SessionEvent, USAGE_OMITTED_SIZE,
 };
 use crate::native::session::state::{SessionState, SessionStatus, update_status};
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, requests};
+use crate::native::session::{CoreRecord, CoreRecordReader, Reader, RecordStore, Store, requests};
 #[cfg(target_os = "macos")]
 use crate::native::terminal::ownership::NativeSessionOwner;
 
@@ -260,7 +260,7 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
 fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Result<bool> {
     for path in Reader::open_unchecked(directory).events()? {
         let event: SessionEvent =
-            session::RecordReader::at(&path).json_with(super::record::event)?;
+            session::CoreRecordReader::at(&path).json_with(super::record::event)?;
         if event.provider == provider.as_str() {
             return Ok(true);
         }
@@ -269,14 +269,11 @@ fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Res
 }
 
 fn read_claim_token(directory: &Path) -> Result<Option<String>> {
-    match Reader::open_unchecked(directory)
+    Ok(Reader::open_unchecked(directory)
         .record(CoreRecord::TurnClaim)
-        .raw_text()
-    {
-        Ok(token) => Ok(Some(token.trim().to_owned())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("failed to inspect native turn claim"),
-    }
+        .text()
+        .context("failed to inspect native turn claim")?
+        .map(|token| token.trim().to_owned()))
 }
 
 // The status is read before the Claim token: an unreadable status fails the report even
@@ -308,7 +305,7 @@ fn provider_completion_is_current(
     };
     for path in Reader::open_unchecked(directory).events()? {
         let event: SessionEvent =
-            session::RecordReader::at(&path).json_with(super::record::event)?;
+            session::CoreRecordReader::at(&path).json_with(super::record::event)?;
         if event.provider == provider.as_str()
             && event.provider_session_id.as_deref() == provider_session_id
             && event.turn_id.as_deref() == Some(turn_id)
@@ -380,7 +377,7 @@ fn commit_completion_within_locked(
         .record(CoreRecord::Completion)
         .path()
         .to_owned();
-    if completion_path.exists() {
+    if CoreRecordReader::at(&completion_path).present()? {
         bail!("a pending native turn completion is still awaiting recovery")
     }
     // The journal is published by rename so that a partial journal never exists at its
@@ -704,12 +701,11 @@ fn rollback_turn_claim_token_with_error_locked(
     state: SessionState,
     error: Option<String>,
 ) -> Result<bool> {
-    let current = match session::RecordReader::at(path).raw_text() {
-        Ok(current) => current,
-        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(false);
-        }
-        Err(read_error) => return Err(read_error).context("failed to inspect native turn claim"),
+    let Some(current) = CoreRecordReader::at(path)
+        .text()
+        .context("failed to inspect native turn claim")?
+    else {
+        return Ok(false);
     };
     if current.trim() != expected_token {
         return Ok(false);
@@ -781,8 +777,8 @@ where
         return Err(error);
     }
     let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
-    let current = session::RecordReader::at(&path)
-        .raw_text()
+    let current = CoreRecordReader::at(&path)
+        .required_text()
         .with_context(|| "native turn claim disappeared before it could start")?;
     if current.trim() != claim.token {
         bail!("native turn claim changed before it could start");
@@ -840,10 +836,11 @@ fn release_claim_token(path: &Path, expected_token: &str) -> Result<()> {
 }
 
 fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<()> {
-    let token = match session::RecordReader::at(path).raw_text() {
-        Ok(token) => token,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("failed to inspect native turn claim"),
+    let Some(token) = CoreRecordReader::at(path)
+        .text()
+        .context("failed to inspect native turn claim")?
+    else {
+        return Ok(());
     };
     if token.trim() != expected_token {
         return Ok(());
@@ -905,14 +902,17 @@ pub(super) fn recover_pending_completion_locked(
             &tombstone,
         );
     }
-    let Some(bytes) = session::RecordReader::at(&completion_path).bytes()? else {
+    let Some(bytes) = CoreRecordReader::at(&completion_path).bytes()? else {
         return Ok(false);
     };
     let pending = super::record::journal(&bytes)
         .map_err(|error| error.context("invalid pending native turn completion"))?;
 
-    match session::RecordReader::at(claim_path).raw_text() {
-        Ok(current) if current.trim() == pending.claim_token => {
+    match CoreRecordReader::at(claim_path)
+        .text()
+        .context("failed to inspect pending completion turn claim")?
+    {
+        Some(current) if current.trim() == pending.claim_token => {
             write_completion_event(directory, &pending)?;
             update_status(
                 directory,
@@ -924,8 +924,8 @@ pub(super) fn recover_pending_completion_locked(
             RecordStore::at(&completion_path).remove()?;
             Ok(true)
         }
-        Ok(_) => bail!("pending native completion belongs to a different turn claim"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Some(_) => bail!("pending native completion belongs to a different turn claim"),
+        None => {
             // The same byte-match predicate every other lifecycle path uses: a semantically
             // equal event stored in another encoding is not the journal's committed write.
             match journaled_event_state(directory, &pending)? {
@@ -948,7 +948,6 @@ pub(super) fn recover_pending_completion_locked(
             RecordStore::at(&completion_path).remove()?;
             Ok(true)
         }
-        Err(error) => Err(error).context("failed to inspect pending completion turn claim"),
     }
 }
 
@@ -1160,7 +1159,7 @@ fn wait_for_event_for_turn_until(
                 let mut matched = None;
                 for path in candidates {
                     let event: SessionEvent =
-                        session::RecordReader::at(path).json_with(super::record::event)?;
+                        CoreRecordReader::at(path).json_with(super::record::event)?;
                     if event.turn_id.as_deref() == Some(expected_turn_id) {
                         matched = Some(event);
                         break;
@@ -1169,7 +1168,7 @@ fn wait_for_event_for_turn_until(
                 matched
             } else {
                 Some(
-                    RecordReader::at(candidates.first().context("event path disappeared")?)
+                    CoreRecordReader::at(candidates.first().context("event path disappeared")?)
                         .json_with(super::record::event)?,
                 )
             };
@@ -1210,11 +1209,11 @@ pub(in crate::native) fn published(
     expected_claim_token: Option<&str>,
 ) -> Result<bool> {
     if let Some(expected_token) = expected_claim_token {
-        return match reader.record(CoreRecord::TurnClaim).raw_text() {
-            Ok(current_token) => Ok(current_token.trim() != expected_token),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error).context("failed to inspect native turn claim"),
-        };
+        return Ok(reader
+            .record(CoreRecord::TurnClaim)
+            .text()
+            .context("failed to inspect native turn claim")?
+            .is_none_or(|current_token| current_token.trim() != expected_token));
     }
     Ok(reader
         .status()

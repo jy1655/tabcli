@@ -162,9 +162,9 @@ pub(in crate::native) fn admission(
             None,
         )
     })?;
-    let pending = reader
+    let pending: Option<turn::PendingTurnCompletion> = reader
         .record(CoreRecord::Completion)
-        .optional_json::<turn::PendingTurnCompletion>()?;
+        .optional_json_with(|text| serde_json::from_str(text))?;
     if let Some(pending) = &pending {
         turn::validate_pending_completion(pending)?;
     }

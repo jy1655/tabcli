@@ -1,7 +1,7 @@
 //! Origin observation: the managed Session recorded as the Request source of a Session's
 //! Initial prompt, and whether that Origin's own records show it ended.
 //!
-//! Read-only. Every record is read through `RecordReader` as a regular file, strictly as
+//! Read-only. Every record is read through `CoreRecordReader` as a regular file, strictly as
 //! UTF-8 and within a `ReadBudget`; nothing here opens a `Store`, takes a lifecycle lock,
 //! repairs, recovers, closes or writes. The answer describes the records at the time of
 //! the read and is never a close authority.
@@ -13,7 +13,7 @@ use super::record::{self, DecodeError};
 use super::requests::{self, Receipt};
 use super::snapshot::Snapshot;
 use super::turn::valid_turn_claim_token;
-use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy};
+use super::{CoreRecord, CoreRecordReader, Reader, SessionState, SessionStatus, SnapshotBusy};
 use crate::native::clock::Clock;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
@@ -134,7 +134,7 @@ impl ReadBudget {
 
     fn read(
         &mut self,
-        record: &RecordReader,
+        record: &CoreRecordReader,
         clock: &mut dyn Clock,
     ) -> Result<Option<Vec<u8>>, ReadFault> {
         self.read_within(record, clock, RECORD_LIMIT)
@@ -143,7 +143,7 @@ impl ReadBudget {
     /// `read` with the record's own bound, which the allowance can only lower.
     fn read_within(
         &mut self,
-        record: &RecordReader,
+        record: &CoreRecordReader,
         clock: &mut dyn Clock,
         record_limit: u64,
     ) -> Result<Option<Vec<u8>>, ReadFault> {
@@ -197,7 +197,7 @@ impl ReadBudget {
     /// message; the read's own faults keep their kind and charging.
     fn decoded<T>(
         &mut self,
-        record: &RecordReader,
+        record: &CoreRecordReader,
         clock: &mut dyn Clock,
         decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
     ) -> Result<Option<T>, ReadFault> {
@@ -210,7 +210,7 @@ impl ReadBudget {
     /// verification compares against.
     fn decoded_with_bytes<T>(
         &mut self,
-        record: &RecordReader,
+        record: &CoreRecordReader,
         clock: &mut dyn Clock,
         decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
     ) -> Result<Option<(Vec<u8>, T)>, ReadFault> {
@@ -964,7 +964,10 @@ fn examine(
     // as unreadable, so that the unflagged scan classifies the session as before.
     let claim = match budget.read(&reader.record(CoreRecord::TurnClaim), clock) {
         Ok(None) => ClaimEvidence::Absent,
-        Ok(Some(bytes)) => ClaimEvidence::Token(String::from_utf8_lossy(&bytes).trim().to_owned()),
+        Ok(Some(bytes)) => match record::claim(&bytes) {
+            Ok(token) => ClaimEvidence::Token(token),
+            Err(_) => ClaimEvidence::Unreadable,
+        },
         Err(ReadFault::Exhausted(why)) => return Examined::Stop(why),
         Err(ReadFault::Busy | ReadFault::Unreadable(_)) => ClaimEvidence::Unreadable,
     };

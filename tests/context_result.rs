@@ -497,15 +497,30 @@ fn invalid_utf8_in_a_recorded_event_is_never_repaired_or_attached() {
     )
     .unwrap();
     let before = fixture.files();
-    let result = success(fixture.run(&["result", SOURCE, "--request", "request-done", "--json"]));
-    assert_eq!(result["request_state"], "completed");
+    // The result query reads the event strictly: it reports the event unreadable instead of
+    // a repaired success.
+    let output = fixture.run(&["result", SOURCE, "--request", "request-done", "--json"]);
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    assert!(
+        text.contains("event-1.json") && text.contains("stream did not contain valid UTF-8"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{fffd}'), "{text}");
     for address in [
         format!("{SOURCE}/request-done"),
         format!("{SOURCE}/event-1.json"),
     ] {
         let output = tell_with(&fixture, &address);
         let text = stderr(&output);
-        assert!(text.contains("not valid UTF-8"), "{address}: {text}");
+        assert!(
+            text.contains("stream did not contain valid UTF-8"),
+            "{address}: {text}"
+        );
         assert!(!text.contains('\u{fffd}'), "{address}: {text}");
         assert_unattachable(&fixture, output, &address, "unreadable");
         assert_eq!(fixture.files(), before);

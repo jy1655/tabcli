@@ -4,9 +4,10 @@
 //! A core Snapshot record decoder is pure over bytes: strict UTF-8, the `*_unix_ms`
 //! unsigned-range rule, the Record's shape, then the Record's own rules, one error each.
 //! It carries no path or caller context; each caller keeps its own missing-record policy.
-//! The Claim is a text token, not a decoded Record, and keeps its readers.
-//! Auxiliary, event, cancel and terminal projections retain their older text-decoding
-//! policies, documented below. I/O, byte budgets, cache selection and locks stay with readers.
+//! The Claim is a text token, not a JSON Record: `claim` decodes it for the readers that hold
+//! its bytes. Auxiliary, event, cancel and terminal projections keep serde's shape decoder over
+//! the strict text their reader supplies (`session::core_record`). I/O, byte budgets, cache
+//! selection and locks stay with readers.
 use super::schema::{SESSION_SCHEMA, SessionEvent, SessionManifest, TerminalTombstone};
 use super::turn::{
     JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
@@ -111,6 +112,14 @@ pub(in crate::native) fn manifest(
     Ok(manifest)
 }
 
+/// `turn.claim`: the Claim's token, strict UTF-8 and trimmed.
+pub(in crate::native) fn claim(bytes: &[u8]) -> Result<String, DecodeError> {
+    std::str::from_utf8(bytes)
+        .map(|token| token.trim().to_owned())
+        .context("invalid UTF-8")
+        .map_err(DecodeError::Malformed)
+}
+
 /// `status.json` and `closed.json`. Legacy content stays readable: an absent
 /// `generation` defaults, the diagnostics are optional, and an unknown state string is
 /// kept as it was recorded.
@@ -190,7 +199,8 @@ pub(in crate::native) fn receipt(
 
 // These auxiliary records historically use serde's shape decoder directly, without
 // the snapshot timestamp-range rule or added schema validation. Keep that policy here;
-// readers retain strict UTF-8 and their own I/O/error context, and Reopen judges release.
+// readers supply strict UTF-8 text and keep their own error context, and Reopen judges
+// release.
 pub(in crate::native) fn reopen_marker(
     text: &str,
 ) -> serde_json::Result<super::schema::ReopenMarker> {
@@ -216,9 +226,8 @@ pub(in crate::native) fn owner(bytes: &[u8]) -> serde_json::Result<NativeSession
     serde_json::from_slice(bytes)
 }
 
-// These projections preserve the callers' older text policies. In particular, event and
-// cancel text may already be lossy, while attachments and required terminal reads are
-// strict. Neither shape decoding nor a tombstone projection adds timestamp/schema rules.
+// These projections decode the strict text the core read policy supplies. Neither shape
+// decoding nor a tombstone projection adds timestamp/schema rules.
 pub(in crate::native) fn event(text: &str) -> serde_json::Result<SessionEvent> {
     serde_json::from_str(text)
 }

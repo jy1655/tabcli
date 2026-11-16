@@ -77,18 +77,21 @@ impl SurfaceRecord {
     /// The surface record in its precedence: the close tombstone, then a claimed close
     /// handle, then the active handle. Reads only; the first record present decides.
     pub(in crate::native) fn read(reader: &Reader) -> Self {
-        match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
+        match reader
+            .record(CoreRecord::TerminalClosed)
             .optional_json_with(session::record::terminal_tombstone_value)
         {
             Ok(Some(value)) => Self::Closed(Ok(value)),
             Err(error) => Self::Closed(Err(error)),
-            Ok(None) => match RecordReader::at(reader.record(CoreRecord::TerminalClosing).path())
+            Ok(None) => match reader
+                .record(CoreRecord::TerminalClosing)
                 .optional_json_with(session::record::terminal)
             {
                 Ok(Some(value)) => Self::Closing(Ok(value)),
                 Err(error) => Self::Closing(Err(error)),
                 Ok(None) => Self::Active(
-                    RecordReader::at(reader.record(CoreRecord::Terminal).path())
+                    reader
+                        .record(CoreRecord::Terminal)
                         .optional_json_with(session::record::terminal),
                 ),
             },
@@ -136,13 +139,10 @@ impl SessionEvidence {
         self.surface_presence.get_or_init(|| {
             let directory = reader.directory();
             SurfacePresence::of((|| -> Result<bool> {
-                let session = RecordReader::at(
-                    Reader::open_unchecked(directory)
-                        .record(CoreRecord::Terminal)
-                        .path(),
-                )
-                .optional_json_with(session::record::terminal)?
-                .context("no active terminal handle is recorded")?;
+                let session = Reader::open_unchecked(directory)
+                    .record(CoreRecord::Terminal)
+                    .optional_json_with(session::record::terminal)?
+                    .context("no active terminal handle is recorded")?;
                 session.verify_managed_session(
                     directory
                         .file_name()

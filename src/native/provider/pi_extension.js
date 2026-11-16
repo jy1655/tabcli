@@ -260,6 +260,22 @@ export default function (pi) {
     catch { return undefined; }
   }
 
+  // The declared reads of Bridge's core records take Bridge's core read policy: a link at
+  // the record's path, or anything but a regular file, is refused, and the text must be
+  // UTF-8. A refusal throws, and every caller reads it as no record. A byte-order mark
+  // stays in the text, as the earlier "utf8" read kept it.
+  function readCoreText(directory, name) {
+    const path = join(directory, name);
+    if (!lstatSync(path).isFile()) throw new Error(`refusing non-regular session file: ${name}`);
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(readFileSync(path));
+  }
+
+  function readCoreRecord(directory, name) {
+    if (!directory) return undefined;
+    try { return JSON.parse(readCoreText(directory, name)); }
+    catch { return undefined; }
+  }
+
   function startCancelTimer(ctx) {
     const thisRun = runId;
     const claimToken = activeClaimToken;
@@ -270,12 +286,12 @@ export default function (pi) {
       if (thisRun !== runId || claimToken !== activeClaimToken
           || !activePromptCorrelated || abortClaimToken === claimToken
           || readActiveClaimToken() !== claimToken) return;
-      const cancel = readRecord("cancel.json");
+      const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+      const cancel = readCoreRecord(directory, "cancel.json");
       if (cancel?.schema !== 1 || cancel.claim_token !== claimToken) return;
       // Calling abort and publishing acceptance cannot be atomic. Never retry
       // this claim after a thrown abort or a failed publication.
       abortClaimToken = claimToken;
-      const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
       const temporary = join(directory, `.pi-cancel-${process.pid}-${Date.now()}.tmp`);
       try {
         ctx.abort();
@@ -292,7 +308,7 @@ export default function (pi) {
     const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
     if (!directory) return undefined;
     try {
-      const token = readFileSync(join(directory, "turn.claim"), "utf8").trim();
+      const token = readCoreText(directory, "turn.claim").trim();
       return token || undefined;
     } catch {
       return undefined;

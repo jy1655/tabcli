@@ -2,6 +2,8 @@ use super::parse as parse_console_control;
 use super::*;
 use crate::native::parse_args;
 #[cfg(windows)]
+use crate::native::session::RecordReader;
+#[cfg(windows)]
 use crate::native::session::test_support::{TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE};
 #[cfg(windows)]
 use std::{fs, time::Instant};
@@ -1260,8 +1262,17 @@ fn console_control_requests_preserve_surface_verification_and_handle_selection()
     let directory = tempfile::tempdir().unwrap();
     let closing = directory.path().join(TERMINAL_CLOSING_FILE);
     fs::create_dir(&closing).unwrap();
+    // The close handle's path is checked under the core read policy: a directory there is
+    // refused, not passed over for the active handle.
+    assert!(
+        format!(
+            "{:#}",
+            terminal::windows_console_handle_path(directory.path(), true).unwrap_err()
+        )
+        .contains("refusing non-regular session file")
+    );
     assert_eq!(
-        terminal::windows_console_handle_path(directory.path(), true),
+        terminal::windows_console_handle_path(directory.path(), false).unwrap(),
         directory.path().join(TERMINAL_HANDLE_FILE)
     );
     fs::remove_dir(&closing).unwrap();
@@ -1299,7 +1310,7 @@ fn console_control_requests_preserve_surface_verification_and_handle_selection()
             TERMINAL_HANDLE_FILE
         };
         assert_eq!(
-            terminal::windows_console_handle_path(directory.path(), request.is_close()),
+            terminal::windows_console_handle_path(directory.path(), request.is_close()).unwrap(),
             directory.path().join(expected)
         );
     }

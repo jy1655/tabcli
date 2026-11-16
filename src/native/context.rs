@@ -960,23 +960,31 @@ mod tests {
               \"provider_session_id\":\"thread\",\"turn_id\":\"turn\",\"created_unix_ms\":9}",
         )
         .unwrap();
-        // The lossy snapshot reader still reports the record as a published success.
+        // The Snapshot's event read is strict too: the result query reports the event as
+        // unreadable instead of a repaired success.
         let reader = Reader::open_unchecked(&directory);
         let snapshot = query::observe_snapshot(&reader).unwrap();
-        let value = snapshot
+        let error = snapshot
             .result(
                 &Reader::open_unchecked(&directory),
                 &query::Selector::Request("request-done".to_owned()),
             )
-            .unwrap();
-        assert_eq!(value["request_state"], "completed");
-        assert_eq!(value["result"], "bad\u{fffd}text");
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "failed to read {}: stream did not contain valid UTF-8",
+                directory.join("events/event-1.json").display()
+            )
+        );
         drop(snapshot);
+        // The request's own observation now reports the event unreadable, with the
+        // Snapshot's read error, before the attachment's strict re-read is reached.
         for address in ["session-src/request-done", "session-src/event-1.json"] {
             let error = resolve_error(root.path(), address);
             assert!(
                 error.contains("request_state is unreadable")
-                    && error.contains("not valid UTF-8")
+                    && error.contains("stream did not contain valid UTF-8")
                     && !error.contains('\u{fffd}'),
                 "{address}: {error}"
             );

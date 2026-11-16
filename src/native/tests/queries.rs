@@ -789,3 +789,58 @@ fn the_timeline_keeps_refusing_an_events_directory_link_with_its_own_text() {
     .unwrap_err();
     assert_eq!(format!("{error:#}"), "events directory is a symlink");
 }
+
+// Q47: an event that is not UTF-8 is charged to the byte budget and counted as read, so a
+// scan over several of them stops where their bytes exhaust the budget, before a valid event
+// the budget can no longer hold.
+#[test]
+fn search_charges_events_that_are_not_utf8_to_its_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-search");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    write_test_manifest(&directory);
+    update_status(&directory, SessionState::Ready, None, None).unwrap();
+    let invalid = b"{\"provider\":\"codex\",\"message\":\"needle \xff\",\"error\":null,\"created_unix_ms\":1}";
+    let valid =
+        br#"{"provider":"codex","message":"needle valid","error":null,"created_unix_ms":2}"#;
+    for name in ["event-1.json", "event-2.json", "event-3.json"] {
+        fs::write(directory.join("events").join(name), invalid).unwrap();
+    }
+    fs::write(directory.join("events/event-4.json"), valid).unwrap();
+    // The three invalid events' bytes, then one byte less than the valid event needs.
+    let budget = 3 * invalid.len() + valid.len() - 1;
+    let value = cli_search(
+        root.path(),
+        &[
+            "search",
+            "needle",
+            "--all-workspaces",
+            "--max-bytes",
+            &budget.to_string(),
+            "--json",
+        ],
+    );
+    assert_eq!(value["scanned"]["events"], 3, "{value:#}");
+    assert_eq!(value["incomplete"], true, "{value:#}");
+    let reasons: Vec<&str> = value["incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reason| reason["reason"].as_str().unwrap())
+        .collect();
+    // Each invalid event is unreadable, after its bytes were charged.
+    let index = invalid.iter().position(|byte| *byte == 0xff).unwrap();
+    let mut expected: Vec<String> = ["event-1.json", "event-2.json", "event-3.json"]
+        .iter()
+        .map(|name| {
+            format!("{name}: invalid UTF-8: invalid utf-8 sequence of 1 bytes from index {index}")
+        })
+        .collect();
+    expected.push(format!(
+        "scan stopped: byte budget of {budget} bytes exhausted; session-search/event-4.json is {} bytes with {} bytes remaining",
+        valid.len(),
+        valid.len() - 1
+    ));
+    assert_eq!(reasons, expected, "{value:#}");
+    assert_eq!(value["hits"], serde_json::json!([]), "{value:#}");
+}

@@ -6,7 +6,7 @@ use std::{num::NonZeroUsize, path::Path, time::Duration};
 #[cfg(windows)]
 use crate::native::{
     provider,
-    session::{Reader, RecordReader},
+    session::{CoreRecordReader, Reader},
     terminal::{self, ownership::verify_terminal_surface_ownership},
 };
 #[cfg(windows)]
@@ -215,8 +215,8 @@ fn run_with(
 ) -> Result<()> {
     let directory = Reader::session_directory(id)?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
-    let session: terminal::TerminalSession = RecordReader::at(
-        &terminal::windows_console_handle_path(&directory, request.is_close()),
+    let session: terminal::TerminalSession = CoreRecordReader::at(
+        &terminal::windows_console_handle_path(&directory, request.is_close())?,
     )
     .json_with(crate::native::session::record::terminal)?;
     if session.kind != terminal::TerminalKind::WindowsConsole {

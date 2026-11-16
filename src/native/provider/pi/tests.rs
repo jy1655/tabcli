@@ -231,6 +231,10 @@ fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
         "tool_abort_message_not_exact",
         "tool_abort_wrong_accepted_claim",
         "normal_complete",
+        "linked_claim",
+        "linked_cancel",
+        "invalid_claim",
+        "invalid_cancel",
     ];
     let mut inputs = serde_json::Map::new();
     // Each case keeps its own live claim. Secondary claims supply mismatch/replacement bytes.

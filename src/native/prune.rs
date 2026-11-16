@@ -1,7 +1,7 @@
 //! Removal of closed session records past their retention window.
 use super::args::{option_value, set_flag_once, set_once};
 use crate::native::session::primitives::unix_ms;
-use crate::native::session::{CoreRecord, Reader, RecordReader, SessionState};
+use crate::native::session::{CoreRecord, Reader, SessionState};
 use crate::native::{NativeCommand, session};
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -95,12 +95,9 @@ pub(super) fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result
         let entry = entry.map_err(session::enumerate::Fault::into_io)?;
         let id = entry.id;
         let directory = entry.directory;
-        if !RecordReader::at(
-            Reader::open_unchecked(&directory)
-                .record(CoreRecord::Manifest)
-                .path(),
-        )
-        .is_regular_file()?
+        if !Reader::open_unchecked(&directory)
+            .record(CoreRecord::Manifest)
+            .is_regular_file()?
         {
             continue;
         }

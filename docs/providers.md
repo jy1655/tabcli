@@ -644,7 +644,11 @@ fails either is unreadable, which refuses Windows input and leaves `cancel` unsu
 
 The extension uses Pi's official `ctx.abort()` API through an adapter-local fallback:
 every 200 ms during a run it reads Bridge's `cancel.json`, checks the active Claim and
-the correlated prompt, and calls abort at most once for that Claim. This is a polling
+the correlated prompt, and calls abort at most once for that Claim. It reads
+`turn.claim` and `cancel.json` under Bridge's core read policy: a link at the record's
+path or an entry that is not a regular file is refused, and the text must be UTF-8;
+a refused record reads as no Claim or no cancel intent. A Pi session launched by an
+earlier Bridge keeps the extension it was launched with until it is relaunched. This is a polling
 interval, not a response-time guarantee. `pi-cancel-accepted.json` records the call;
 it is published with a temporary file and rename. A failed write never causes another
 abort. The adapter removes acceptance when installing the next Claim or rolling back

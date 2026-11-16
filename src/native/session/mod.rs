@@ -20,6 +20,8 @@ use std::{
 mod adapter;
 pub(in crate::native) mod cancel;
 pub(in crate::native) mod close;
+mod core_record;
+pub(in crate::native) use core_record::{CoreRecordReader, CoreRecordStore};
 pub(in crate::native) mod enumerate;
 pub(in crate::native) mod hold;
 mod names;
@@ -108,6 +110,8 @@ impl std::ops::Deref for RecordStore {
     }
 }
 impl RecordReader {
+    // Read by the Windows console's prompt payload, which is not a session record.
+    #[cfg(windows)]
     pub(in crate::native) fn raw_text(&self) -> std::io::Result<String> {
         fs::read_to_string(&self.path)
     }
@@ -119,32 +123,14 @@ impl RecordReader {
         }
     }
 
-    pub(in crate::native) fn child(&self, name: &str) -> RecordReader {
-        RecordReader {
-            path: self.path.join(name),
-        }
-    }
     pub(in crate::native) fn timeline(&self, limit: u64) -> Result<Option<Vec<u8>>> {
         read_timeline_record(&self.path, limit)
-    }
-    pub(in crate::native) fn event_within_budget(
-        &self,
-        limit: u64,
-    ) -> Result<Option<String>, Result<u64>> {
-        read_event_within_budget(&self.path, limit)
     }
     pub(in crate::native) fn path(&self) -> &Path {
         &self.path
     }
     pub(in crate::native) fn json<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
         read_json(&self.path)
-    }
-    /// Required strict-text I/O, with interpretation owned by the selected record decoder.
-    pub(in crate::native) fn json_with<T>(
-        &self,
-        shape: impl FnOnce(&str) -> serde_json::Result<T>,
-    ) -> Result<T> {
-        read_json_with(&self.path, shape)
     }
     pub(in crate::native) fn text(&self) -> Result<Option<String>> {
         read_regular_text_if_present(&self.path)
@@ -158,12 +144,6 @@ impl RecordStore {
     pub(in crate::native) fn at(path: &Path) -> Self {
         Self {
             reader: RecordReader::at(path),
-        }
-    }
-
-    pub(in crate::native) fn child(&self, name: &str) -> RecordStore {
-        RecordStore {
-            reader: self.reader.child(name),
         }
     }
 
@@ -202,13 +182,13 @@ impl Reader {
         id: &str,
         limit: u64,
     ) -> Result<Option<SessionManifest>> {
-        let record = self.private(MANIFEST_FILE);
-        let Some(bytes) = record.timeline(limit)? else {
+        let handle = self.record(CoreRecord::Manifest);
+        let Some(bytes) = handle.timeline(limit)? else {
             return Ok(None);
         };
         record::manifest(&bytes, id)
             .map(Some)
-            .map_err(|error| error.in_path(record.path()))
+            .map_err(|error| error.in_path(handle.path()))
     }
     /// The session's event file names under `listing`; see [`event_names`].
     pub(in crate::native) fn event_names(
@@ -218,10 +198,18 @@ impl Reader {
         event_names(&self.directory, listing)
     }
     pub(in crate::native) fn closed_if_present(&self) -> Result<Option<SessionStatus>> {
-        read_regular_status_if_present(&self.directory.join(CLOSED_STATUS_FILE))
+        self.status_record_if_present(CoreRecord::Closed)
     }
-    pub(in crate::native) fn event(&self, name: &str) -> RecordReader {
-        self.private(EVENTS_DIRECTORY).child(name)
+    /// `status.json` or `closed.json` when present, decoded strictly.
+    fn status_record_if_present(&self, which: CoreRecord) -> Result<Option<SessionStatus>> {
+        let handle = self.record(which);
+        handle
+            .bytes()?
+            .map(|bytes| record::status(&bytes).map_err(|error| error.in_path(handle.path())))
+            .transpose()
+    }
+    pub(in crate::native) fn event(&self, name: &str) -> CoreRecordReader {
+        self.record(CoreRecord::Events).child(name)
     }
     pub(in crate::native) fn event_strict(
         &self,
@@ -230,10 +218,12 @@ impl Reader {
         read_event_strictly(&self.directory, name)
     }
     pub(in crate::native) fn status_if_present(&self) -> Result<Option<SessionStatus>> {
-        read_regular_status_if_present(&self.directory.join(STATUS_FILE))
+        self.status_record_if_present(CoreRecord::Status)
     }
-    pub(in crate::native) fn initial_prompt(&self) -> std::io::Result<String> {
-        fs::read_to_string(self.directory.join(INITIAL_PROMPT_FILE))
+    /// The required initial prompt. A missing record is the platform's report of the absence
+    /// alone, for the caller's context.
+    pub(in crate::native) fn initial_prompt(&self) -> Result<String> {
+        self.record(CoreRecord::InitialPrompt).required_text()
     }
     /// The paths of the session's regular event files; see [`event_paths`].
     pub(in crate::native) fn events(&self) -> Result<Vec<PathBuf>> {
@@ -251,43 +241,28 @@ impl Reader {
         owner::required(self).map(|recorded| recorded.owner)
     }
     pub(in crate::native) fn terminal(&self) -> Result<terminal::TerminalSession> {
-        self.private(TERMINAL_HANDLE_FILE)
+        self.record(CoreRecord::Terminal)
             .json_with(record::terminal)
     }
     pub(in crate::native) fn terminal_closed(&self) -> Result<TerminalTombstone> {
-        self.private(TERMINAL_TOMBSTONE_FILE)
+        self.record(CoreRecord::TerminalClosed)
             .json_with(record::terminal_tombstone)
     }
     pub(in crate::native) fn provider_process(&self) -> Result<ProviderProcessRecord> {
-        let path = self.private(PROVIDER_PROCESS_FILE).path;
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        record::provider_process(&text)
-            .with_context(|| format!("invalid JSON in {}", path.display()))
+        self.record(CoreRecord::ProviderProcess)
+            .json_with(record::provider_process)
     }
     pub(in crate::native) fn provider_process_if_present(
         &self,
     ) -> Result<Option<ProviderProcessRecord>> {
-        let record = self.record(CoreRecord::ProviderProcess);
-        record
-            .text()?
-            .map(|text| {
-                record::provider_process(&text)
-                    .with_context(|| format!("invalid JSON in {}", record.path().display()))
-            })
-            .transpose()
+        self.record(CoreRecord::ProviderProcess)
+            .optional_json_with(record::provider_process)
     }
     pub(in crate::native) fn reopen_marker_if_present(
         &self,
     ) -> Result<Option<schema::ReopenMarker>> {
-        let record = self.record(CoreRecord::ReopenMarker);
-        record
-            .text()?
-            .map(|text| {
-                record::reopen_marker(&text)
-                    .with_context(|| format!("invalid JSON in {}", record.path().display()))
-            })
-            .transpose()
+        self.record(CoreRecord::ReopenMarker)
+            .optional_json_with(record::reopen_marker)
     }
     pub(in crate::native) fn lock_shared(&self) -> Result<Option<File>> {
         let directory = self.directory();
@@ -489,8 +464,9 @@ impl CoreRecord {
 }
 
 impl Reader {
-    pub(in crate::native) fn record(&self, record: CoreRecord) -> RecordReader {
-        self.private(record.name())
+    /// A core Record of this session, read under the core read policy.
+    pub(in crate::native) fn record(&self, record: CoreRecord) -> CoreRecordReader {
+        CoreRecordReader::at(&self.directory.join(record.name()))
     }
     pub(in crate::native) fn state_root() -> Result<PathBuf> {
         state_root()
@@ -525,8 +501,9 @@ impl Reader {
     }
 }
 impl Store {
-    pub(in crate::native) fn record(&self, record: CoreRecord) -> RecordStore {
-        self.private(record.name())
+    /// A core Record of this session opened for writing; its reads keep the core read policy.
+    pub(in crate::native) fn record(&self, record: CoreRecord) -> CoreRecordStore {
+        CoreRecordStore::at(&self.directory.join(record.name()))
     }
     pub(in crate::native) fn create_directory(
         root: &Path,
@@ -545,20 +522,15 @@ impl Store {
     }
 }
 impl RecordReader {
+    /// An adapter-private record's optional regular-file read, with its legacy lossy text
+    /// policy. Missing files and I/O context remain this reader's policy.
     pub(in crate::native) fn optional_json<T: for<'de> Deserialize<'de>>(
         &self,
     ) -> Result<Option<T>> {
-        self.optional_json_with(|text| serde_json::from_str(text))
-    }
-    /// Optional regular-file I/O retains its legacy lossy text policy; the record owns
-    /// only interpretation. Missing files and I/O context remain this reader's policy.
-    pub(in crate::native) fn optional_json_with<T>(
-        &self,
-        shape: impl FnOnce(&str) -> serde_json::Result<T>,
-    ) -> Result<Option<T>> {
         read_regular_text_if_present(&self.path)?
             .map(|text| {
-                shape(&text).with_context(|| format!("invalid JSON in {}", self.path.display()))
+                serde_json::from_str(&text)
+                    .with_context(|| format!("invalid JSON in {}", self.path.display()))
             })
             .transpose()
     }
@@ -605,8 +577,8 @@ impl Store {
         }
         Ok(result)
     }
-    pub(in crate::native) fn unpublished_event(&self, name: &str) -> RecordStore {
-        self.private(EVENTS_DIRECTORY)
+    pub(in crate::native) fn unpublished_event(&self, name: &str) -> CoreRecordStore {
+        self.record(CoreRecord::Events)
             .child(&format!("{UNPUBLISHED_EVENT_PREFIX}{name}"))
     }
     pub(in crate::native) fn sync_set_aside_event_directory(&self) -> Result<()> {
@@ -665,6 +637,8 @@ impl RecordStore {
     }
 }
 
+#[cfg(test)]
+mod read_policy_tests;
 #[cfg(test)]
 pub(super) mod tests;
 

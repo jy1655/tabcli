@@ -2,7 +2,7 @@
 use super::record::{self, Live, Read, ReceiptNames, Source, Tolerance};
 use super::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
 use super::turn::{JournaledEventRead, PendingTurnCompletion};
-use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, launch, requests};
+use super::{CoreRecord, Reader, SessionState, SessionStatus, launch, requests};
 use anyhow::{Context, Result, bail};
 use std::{
     fs::File,
@@ -209,9 +209,11 @@ impl Snapshot {
             None => bail!("session has no manifest"),
         };
         let paths = source.event_paths()?;
-        // The Claim is a text token, read as the lifecycle readers read it.
         let claim = present(&mut source, CoreRecord::TurnClaim)?
-            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
+            .map(|bytes| {
+                record::claim(&bytes).map_err(|error| source.locate(CoreRecord::TurnClaim, error))
+            })
+            .transpose()?;
         let launch = present(&mut source, CoreRecord::Launch)?
             .map(|bytes| {
                 record::launch(&bytes).map_err(|error| source.locate(CoreRecord::Launch, error))
@@ -287,7 +289,7 @@ impl Snapshot {
                 hook(record.path());
             }
         });
-        RecordReader::at(record.path()).optional_json_with(super::record::event)
+        record.optional_json_with(super::record::event)
     }
 
     pub(in crate::native) fn active_receipt(&self) -> Option<&requests::Receipt> {

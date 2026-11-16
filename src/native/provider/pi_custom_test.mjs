@@ -15,6 +15,7 @@ for (const kind of ["custom", "missing", "unknown", "invalid", "legacy", "user"]
   const sandbox = vm.createContext({
     process: { env: { AGENT_BRIDGE_NATIVE_SESSION_DIR: directory, AGENT_BRIDGE_EXECUTABLE: "fake" }, pid: 1 },
     join, readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync,
+    lstatSync: fs.lstatSync, TextDecoder,
     renameSync: fs.renameSync, unlinkSync: fs.unlinkSync,
     spawnSync(_command, _args, options) { payloads.push(JSON.parse(options.input)); return { status: 0 }; },
     setInterval() { return 1; }, clearInterval() {},

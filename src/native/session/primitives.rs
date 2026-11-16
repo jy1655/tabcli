@@ -79,15 +79,6 @@ pub(in crate::native) fn is_regular_file(path: &Path) -> Result<bool> {
     }
 }
 
-/// `status.json` or `closed.json` when present: a regular file, decoded strictly.
-pub(in crate::native) fn read_regular_status_if_present(
-    path: &Path,
-) -> Result<Option<SessionStatus>> {
-    read_regular_bytes_if_present(path)?
-        .map(|bytes| record::status(&bytes).map_err(|error| error.in_path(path)))
-        .transpose()
-}
-
 /// The raw bytes of a required regular session file; a missing file is
 /// `failed to read {path}` with its I/O cause.
 pub(in crate::native) fn read_regular_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -105,13 +96,26 @@ pub(in crate::native) fn read_regular_text_if_present(path: &Path) -> Result<Opt
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// The raw bytes of a regular session file: what the core Record decoders in `record.rs`
-/// take, and what a caller that must not alter an event decodes strictly instead of
-/// through the Snapshot's lossy event read.
+/// The raw bytes of a regular session file, `None` when it is missing: the core read
+/// policy's [`read_regular_record`] without a bound.
 pub(in crate::native) fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
+    Ok(read_regular_record(path, None)?.ok())
+}
+
+/// The core read policy's one read. The entry at `path` must be a regular file reached
+/// without a link at its final component: a link, dangling or not, a directory or any other
+/// non-regular entry is refused, never followed. The file is read whole or, with `limit`,
+/// within that many bytes. A missing file is `Ok(Err(absence))`, the platform's own report of
+/// that absence, for a reader that requires the file. The check and the read are two steps,
+/// as in every query that reads this way.
+pub(in crate::native) fn read_regular_record(
+    path: &Path,
+    limit: Option<u64>,
+) -> Result<std::result::Result<Vec<u8>, std::io::Error>> {
+    use std::io::Read as _;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Err(error)),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
         }
@@ -119,8 +123,41 @@ pub(in crate::native) fn read_regular_bytes_if_present(path: &Path) -> Result<Op
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("refusing non-regular session file: {}", path.display());
     }
-    fs::read(path)
-        .map(Some)
+    let Some(limit) = limit else {
+        return fs::read(path)
+            .map(Ok)
+            .with_context(|| format!("failed to read {}", path.display()));
+    };
+    let over_limit = |size: u64| {
+        anyhow::anyhow!(
+            "record is {size} bytes, over the {limit} byte read limit: {}",
+            path.display()
+        )
+    };
+    if metadata.len() > limit {
+        return Err(over_limit(metadata.len()));
+    }
+    let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(over_limit(bytes.len() as u64));
+    }
+    Ok(Ok(bytes))
+}
+
+/// A core record's bytes as strict UTF-8 text. Invalid bytes are reported as the text
+/// readers report them (`fs::read_to_string`), under `failed to read {path}`.
+pub(in crate::native) fn strict_text(path: &Path, bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })
         .with_context(|| format!("failed to read {}", path.display()))
 }
 pub(in crate::native) fn read_manifest(directory: &Path) -> Result<SessionManifest> {

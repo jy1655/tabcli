@@ -8,7 +8,7 @@ use super::close::close_session_surface;
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::schema::{SessionEvent, SessionManifest};
 use crate::native::session::{
-    CoreRecord, Reader, RecordReader, SessionState, Store, record, requests, turn, update_status,
+    CoreRecord, Reader, SessionState, Store, record, requests, turn, update_status,
 };
 use crate::native::turn_report::TurnReport;
 use crate::native::{
@@ -504,11 +504,8 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     // receipt whose event is missing, empty, malformed, or from another provider cannot
     // prove what that request delivered, whatever the latest event says.
     for receipt in &index.receipts {
-        let event_path = Reader::open_unchecked(directory)
-            .event(&receipt.event_file)
-            .path()
-            .to_owned();
-        if !RecordReader::at(&event_path).is_regular_file()? {
+        let event = Reader::open_unchecked(directory).event(&receipt.event_file);
+        if !event.is_regular_file()? {
             return Err(reopen_refusal(
                 ReopenGate::RequestUnresolved,
                 format!(
@@ -517,7 +514,7 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
                 ),
             ));
         }
-        let event = session::RecordReader::at(&event_path).json_with(session::record::event).map_err(|error| {
+        let event = event.json_with(session::record::event).map_err(|error| {
             reopen_refusal(
                 ReopenGate::RequestUnresolved,
                 format!(
@@ -566,7 +563,7 @@ fn latest_provider_event_identity(
 ) -> Result<Option<(String, String)>> {
     let mut newest = None;
     for path in Reader::open_unchecked(directory).events()? {
-        let event: SessionEvent = session::RecordReader::at(&path)
+        let event: SessionEvent = session::CoreRecordReader::at(&path)
             .json_with(session::record::event)
             .map_err(|error| {
                 reopen_refusal(

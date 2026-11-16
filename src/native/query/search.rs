@@ -365,7 +365,9 @@ fn search_session(
                     .map_err(|error| format!("{name}: {error:#}"))?;
                 scan.bytes_read += read.bytes_read;
                 match read.state {
-                    JournaledEventState::Committed => Ok(read.committed_text),
+                    JournaledEventState::Committed => {
+                        Ok(read.committed_text.map(String::into_bytes))
+                    }
                     JournaledEventState::Absent => Ok(None),
                     JournaledEventState::Oversized(size) => Err(Ok(size)),
                     JournaledEventState::Mismatched => {
@@ -383,15 +385,27 @@ fn search_session(
             None => reader
                 .event(name)
                 .event_within_budget(remaining)
-                .inspect(|text| {
-                    if let Some(text) = text {
-                        scan.bytes_read += text.len() as u64;
+                .inspect(|bytes| {
+                    if let Some(bytes) = bytes {
+                        scan.bytes_read += bytes.len() as u64;
                     }
                 }),
         };
         let event: SessionEvent = match read {
-            Ok(Some(text)) => {
+            Ok(Some(bytes)) => {
+                // The event's bytes and its read are charged above and here, before it is
+                // decoded: an event that does not decode still spends the scan's budgets.
                 scan.events_read += 1;
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        scan.incomplete(
+                            Some(id),
+                            format!("{name}: invalid UTF-8: {}", error.utf8_error()),
+                        );
+                        continue;
+                    }
+                };
                 match crate::native::session::record::event(&text) {
                     Ok(event) => event,
                     Err(error) => {
@@ -612,7 +626,7 @@ mod search_tests {
     };
     use crate::native::NativeCommand;
     use crate::native::session::test_support::EVENTS_DIRECTORY;
-    use crate::native::session::{Reader, RecordReader};
+    use crate::native::session::{CoreRecordReader, Reader};
     use serde_json::{Value, json};
     use std::fs;
 
@@ -684,26 +698,26 @@ mod search_tests {
         let path = directory.path().join("event.json");
         fs::write(&path, b"0123456789").unwrap();
         assert_eq!(
-            RecordReader::at(&path)
+            CoreRecordReader::at(&path)
                 .event_within_budget(10)
                 .unwrap()
                 .unwrap(),
-            "0123456789"
+            b"0123456789"
         );
         assert_eq!(
-            RecordReader::at(&path)
+            CoreRecordReader::at(&path)
                 .event_within_budget(9)
                 .unwrap_err()
                 .unwrap(),
             10
         );
         assert!(
-            RecordReader::at(&directory.path().join("missing.json"))
+            CoreRecordReader::at(&directory.path().join("missing.json"))
                 .event_within_budget(10)
                 .unwrap()
                 .is_none()
         );
-        let error = RecordReader::at(directory.path())
+        let error = CoreRecordReader::at(directory.path())
             .event_within_budget(10)
             .unwrap_err()
             .unwrap_err();

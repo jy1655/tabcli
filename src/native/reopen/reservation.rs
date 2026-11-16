@@ -4,9 +4,7 @@ use super::gate::{ReopenGate, reopen_refusal, reopen_refusal_gate};
 use crate::native::session::primitives::{unix_ms, valid_session_id};
 use crate::native::session::schema::{ProviderProcessRecord, RecordedReopenRefusal, ReopenMarker};
 use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
-use crate::native::session::{
-    self, CoreRecord, Reader, RecordReader, RecordStore, SessionState, Store, record,
-};
+use crate::native::session::{self, CoreRecord, Reader, RecordStore, SessionState, Store, record};
 #[cfg(any(windows, test))]
 use crate::native::terminal;
 use agent_bridge::process_is_alive;
@@ -386,12 +384,9 @@ fn refused_launch_cleanup_with(
         }
     };
     let surface_closed = state == SessionState::Closed
-        && RecordReader::at(
-            Reader::open_unchecked(refused_directory)
-                .record(CoreRecord::TerminalClosed)
-                .path(),
-        )
-        .is_regular_file()?
+        && Reader::open_unchecked(refused_directory)
+            .record(CoreRecord::TerminalClosed)
+            .is_regular_file()?
         && Reader::open_unchecked(refused_directory)
             .closed_if_present()?
             .is_some_and(|closed| closed.state == SessionState::Closed);
@@ -541,7 +536,7 @@ fn release_reopen_marker_after_refusal_with(
             .path()
             .to_owned();
         let _lock = Store::open_unchecked(source_directory).lock()?;
-        let Some(text) = session::RecordReader::at(&marker_path).text()? else {
+        let Some(text) = session::CoreRecordReader::at(&marker_path).text()? else {
             return Ok(());
         };
         let marker: ReopenMarker = record::reopen_marker(&text).context("invalid reopen marker")?;
@@ -592,16 +587,21 @@ pub(super) fn verify_reopen_source_is_closed(
             ),
         ));
     }
-    for name in [
-        CoreRecord::TurnClaim.name(),
-        CoreRecord::Completion.name(),
-        CoreRecord::Terminal.name(),
-        CoreRecord::TerminalClosing.name(),
+    // Any entry counts, a link or a directory included: none of them shows the close
+    // converged.
+    for record in [
+        CoreRecord::TurnClaim,
+        CoreRecord::Completion,
+        CoreRecord::Terminal,
+        CoreRecord::TerminalClosing,
     ] {
-        if fs::symlink_metadata(Reader::open_unchecked(directory).private(name).path()).is_ok() {
+        if fs::symlink_metadata(Reader::open_unchecked(directory).record(record).path()).is_ok() {
             return Err(reopen_refusal(
                 ReopenGate::SourceNotConverged,
-                format!("session {id} still carries {name}; its close has not converged"),
+                format!(
+                    "session {id} still carries {}; its close has not converged",
+                    record.name()
+                ),
             ));
         }
     }
@@ -620,7 +620,7 @@ pub(super) struct Reservation {
 impl Reservation {
     pub(super) fn finalize(mut self, new_session_id: &str) -> Result<()> {
         let _lock = Store::open_unchecked((self.path).with_file_name("")).lock()?;
-        let text = session::RecordReader::at(&self.path)
+        let text = session::CoreRecordReader::at(&self.path)
             .text()?
             .context("reopen marker disappeared before the new session was recorded")?;
         let mut marker: ReopenMarker =
@@ -643,7 +643,7 @@ impl Drop for Reservation {
         let Ok(_lock) = Store::open_unchecked((self.path).with_file_name("")).lock() else {
             return;
         };
-        let current = session::RecordReader::at(&self.path)
+        let current = session::CoreRecordReader::at(&self.path)
             .text()
             .ok()
             .flatten()

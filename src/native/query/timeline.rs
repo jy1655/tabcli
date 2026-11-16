@@ -15,30 +15,32 @@ const LOG_READ_LIMIT: u64 = 1024 * 1024;
 fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
     let directory = reader.directory();
     let mut records = Records::new();
-    for name in [
-        CoreRecord::Cancel.name(),
-        CoreRecord::Manifest.name(),
-        CoreRecord::Status.name(),
-        CoreRecord::TurnClaim.name(),
-        CoreRecord::Completion.name(),
-        CoreRecord::Launch.name(),
-        CoreRecord::LaunchHost.name(),
-        launch::LOG,
-        CoreRecord::Closed.name(),
-        CoreRecord::TerminalClosing.name(),
-        CoreRecord::TerminalClosed.name(),
+    // `None` is the launch log, which is not a core Record; it is read the same way within
+    // its own bound.
+    for record in [
+        Some(CoreRecord::Cancel),
+        Some(CoreRecord::Manifest),
+        Some(CoreRecord::Status),
+        Some(CoreRecord::TurnClaim),
+        Some(CoreRecord::Completion),
+        Some(CoreRecord::Launch),
+        Some(CoreRecord::LaunchHost),
+        None,
+        Some(CoreRecord::Closed),
+        Some(CoreRecord::TerminalClosing),
+        Some(CoreRecord::TerminalClosed),
     ] {
-        records.insert(
-            name.to_owned(),
-            reader
-                .private(name)
-                .timeline(if name == launch::LOG {
-                    LOG_READ_LIMIT
-                } else {
-                    EVENT_READ_LIMIT
-                })
-                .map_err(|e| format!("{e:#}")),
-        );
+        let (name, read) = match record {
+            Some(record) => (
+                record.name(),
+                reader.record(record).timeline(EVENT_READ_LIMIT),
+            ),
+            None => (
+                launch::LOG,
+                reader.private(launch::LOG).timeline(LOG_READ_LIMIT),
+            ),
+        };
+        records.insert(name.to_owned(), read.map_err(|e| format!("{e:#}")));
     }
     let root = Reader::open_unchecked(directory)
         .record(CoreRecord::Requests)

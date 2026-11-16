@@ -330,9 +330,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   reopen-marker, reopen-refusal and provider-process shape decoders, and the Owner record's,
   also live here, preserving their historical serde policy; the Snapshot timestamp rule is not
   added to those records.
-  Reopen still judges refusal validity and release authority after decoding. Then `reads.rs`
-  for event reads, read budgets and the bounded regular-file read, `primitives.rs` for
-  filesystem durability and private-record permissions, and `owner.rs` for the Owner record.
+  Reopen still judges refusal validity and release authority after decoding. Then
+  `core_record.rs` for the core read policy every core Record is read through, `reads.rs`
+  for event reads, read budgets and the bounded regular-file read, `primitives.rs` for the
+  policy's one regular-file read, filesystem durability and private-record permissions, and
+  `owner.rs` for the Owner record.
   `owner.rs` owns its one observation, shaped like `launch::host::observe`/`judge`: `read`
   yields the record's bytes under one policy (no link at the final component, a regular file,
   at most 128 KiB, strict UTF-8; any violation is unreadable), `judge` decodes them and judges
@@ -355,7 +357,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   tombstone first, then a recorded `closed`, `failed` or `exited` status, then
   `attest_owner(owner).process` for a bound owner, never the projected liveness bools. The owner
   record is read within the Owner record's own 128 KiB bound inside the observation budget. A missing
-  Origin directory is undecided, not ended. It reads through `RecordReader`'s bounded strict
+  Origin directory is undecided, not ended. It reads through `CoreRecordReader`'s bounded strict
   regular-file reads within a `ReadBudget`, rechecks the tombstone and status after the verdict,
   and opens no Store, takes no lock, repairs, recovers or writes nothing. It renders the public
   `origin` and `origin_observation` fields once for `status`, `sessions`, `inspect` and `doctor`,
@@ -593,7 +595,19 @@ legacy journal bytes. Cancel never changes the publication predicate or Claim-re
 Readers treat it as auxiliary evidence: malformed intent cannot hide a Result, and timeline
 marks its interpretation as derived. Replacement removes the earlier intent from observation.
 
-`RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
+`RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters,
+with their own read policies. Every core Record, and every event and receipt in its core
+directories, is read through `session/core_record.rs` instead: `Reader::record`,
+`Store::record`, `Reader::event` and `requests::receipt_record` return a `CoreRecordReader` (or a
+`CoreRecordStore`, whose reads are the same), the one "read this Record" interface, required or
+optional, bytes or decoded text. Its read policy refuses a link at the record's final
+component, dangling or not, and any entry that is not a regular file, through the same
+lstat-then-read primitive the queries use, and decodes interpreted text as strict UTF-8; its
+presence check refuses what a read refuses. Readers keep their own missing-record semantics,
+error context and existing byte bounds. Two paths compare bytes instead of decoding them: the
+publication predicate's comparison of a journaled event with its journal, and Close's handling
+of a completion journal that does not decode, so invalid UTF-8 never keeps Close or prune from
+converging. The search charges an event's bytes and read before it decodes them.
 Core Record decoding is not an adapter concern: it lives in `session/record.rs`, one decoder per
 Record, and every reader of a core Record calls it. The Owner record's decoder there checks
 only its shape; its one read policy and binding judgment are `session::owner`'s, the rules that
