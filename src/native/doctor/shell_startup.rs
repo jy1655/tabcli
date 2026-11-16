@@ -89,7 +89,7 @@ pub(super) fn launch_stage_check(
                 Reason::LAUNCH_HOST_NOT_RECORDED,
                 "No launch host record is retained. A session from an earlier release, another terminal, or a launch that did not reach surface creation has none; absence is not evidence that the host never started.",
                 format!(
-                    "Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline`."
+                    "Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline`. For an iTerm2 or WezTerm launch from an earlier release that timed out with no `wrapper_started` in its launch log, a shell startup file waiting for terminal input (for example Oh My Zsh's update prompt) is a known cause; this release prepares the environment without a terminal. {probe}"
                 ),
             ),
         },
@@ -215,7 +215,9 @@ pub(super) enum ProbeContext {
 }
 
 /// What a probe that ran returned, reduced to counters and numeric codes.
+// Only macOS runs the probe; other platforms map no outcome.
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) enum ProbeOutcome {
     Ready {
         elapsed: Duration,

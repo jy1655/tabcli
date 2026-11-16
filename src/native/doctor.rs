@@ -347,9 +347,18 @@ fn recorded_terminal(
             launch::host::Terminal::Wezterm => terminal::TerminalKind::WezTerm,
         });
     }
+    surface_kind(evidence)
+}
+
+/// The terminal kind a session's surface records name: the active or closing handle, or
+/// the close tombstone, which keeps the kind after the handle is consumed.
+fn surface_kind(evidence: &SessionEvidence) -> Option<terminal::TerminalKind> {
     match &evidence.surface {
         query::observation::SurfaceRecord::Active(Ok(Some(surface)))
         | query::observation::SurfaceRecord::Closing(Ok(surface)) => Some(surface.kind),
+        query::observation::SurfaceRecord::Closed(Ok(tombstone)) => {
+            serde_json::from_value(tombstone.get("terminal")?.clone()).ok()
+        }
         _ => None,
     }
 }
@@ -440,10 +449,7 @@ pub(super) fn record_checks(
             session_checks(&observation, checks, observations);
             checks.push(shell_startup::launch_stage_check(
                 &observation.launch_host,
-                match &observation.judgments.surface {
-                    Surface::Active { kind, .. } => Some(*kind),
-                    _ => None,
-                },
+                surface_kind(&observation.evidence),
                 shell_startup::LaterEvidence {
                     owner_recorded: matches!(observation.evidence.owner, Ok(Some(_))),
                 },

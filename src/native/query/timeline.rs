@@ -528,6 +528,8 @@ fn request_index_entry(id: &str, snapshot: &Snapshot, state: &str) -> Value {
 
 /// #376: the launch host record, judged by the launcher's own reader against this
 /// Snapshot's launch receipt. Absence adds nothing: it is not evidence about the host.
+/// A present record that is rejected (unreadable, malformed, oversized, of another schema
+/// or another launch) makes the timeline incomplete.
 fn render_launch_host(
     before: &Records,
     snapshot: &Snapshot,
@@ -535,6 +537,7 @@ fn render_launch_host(
     request: Option<&str>,
     entries: &mut Vec<Value>,
     session_entries: &mut Vec<Value>,
+    incomplete: &mut bool,
 ) {
     use launch::host::HostObservation;
     let source = CoreRecord::LaunchHost.name();
@@ -570,6 +573,7 @@ fn render_launch_host(
             .iter()
             .find(|r| r.claim_token == launch.claim_token)
     });
+    *incomplete |= state == "unreadable";
     let e = entry(
         id,
         receipt,
@@ -636,7 +640,6 @@ fn render_lifecycle(
             session_entries.push(e);
         }
     }
-    render_launch_host(before, snapshot, id, request, entries, session_entries);
     if let Some(pending) = &snapshot.pending {
         let receipt = snapshot.receipt_for_event(&pending.event_file);
         let e = entry(
@@ -854,6 +857,15 @@ pub(in crate::native) fn timeline_value(
         request,
         &mut entries,
         &mut session_entries,
+    );
+    render_launch_host(
+        &before,
+        &snapshot,
+        id,
+        request,
+        &mut entries,
+        &mut session_entries,
+        &mut incomplete,
     );
     render_close_and_log(&before, id, &mut session_entries, &mut incomplete)?;
     if before != records(reader, request)? {

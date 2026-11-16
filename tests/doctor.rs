@@ -2137,3 +2137,66 @@ fn a_failed_launch_host_names_its_stage_in_doctor_and_the_timeline() {
 
     assert_eq!(entries(fixture.root.path()), before);
 }
+
+// A present launch host record that the timeline rejects makes it incomplete; a valid one
+// does not change completeness.
+#[test]
+fn a_rejected_launch_host_record_makes_the_timeline_incomplete() {
+    let fixture = Fixture::new("codex");
+    write(
+        &fixture.directory.join("launch.json"),
+        &json!({"schema": 1, "claim_token": "123-456-0", "deadline_unix_ms": 1_000_000u64,
+            "phase": "pending"}),
+    );
+    let timeline = || report(fixture.run(&["inspect", "session-doctor", "--timeline", "--json"]));
+    let baseline = timeline()["incomplete"].clone();
+    let host = json!({
+        "schema": 1, "managed_session_id": "session-doctor", "claim_token": "123-456-0",
+        "terminal": "wezterm", "stage": "launch_shell_starting",
+        "host": {"pid": 4242, "start_seconds": 1_700_000_000u64, "start_microseconds": 5},
+        "updated_unix_ms": 900_000u64, "elapsed_ms": 1_600, "capture_budget_ms": 10_000,
+        "capture_elapsed_ms": 1_540, "variables": 46, "background_children_stopped": 0,
+        "failure": null
+    });
+    let path = fixture.directory.join("launch-host.json");
+    write(&path, &host);
+    assert_eq!(timeline()["incomplete"], baseline);
+    let mut other_schema = host.clone();
+    other_schema["schema"] = json!(2);
+    let mut other_claim = host.clone();
+    other_claim["claim_token"] = json!("999-999-0");
+    for (case, bytes) in [
+        ("malformed", b"{".to_vec()),
+        ("schema 2", serde_json::to_vec(&other_schema).unwrap()),
+        ("another launch", serde_json::to_vec(&other_claim).unwrap()),
+        ("oversized", vec![b' '; 16 * 1024 + 1]),
+    ] {
+        fs::write(&path, bytes).unwrap();
+        let value = timeline();
+        assert_eq!(value["incomplete"], true, "{case}: {value}");
+        assert!(
+            value.to_string().contains(r#""stage":"launch_host""#),
+            "{case}: {value}"
+        );
+    }
+}
+
+// A closed session keeps its terminal kind in the close tombstone; doctor uses it to decide
+// that the host record and the probe do not apply to that terminal.
+#[test]
+fn a_closed_session_s_tombstone_names_its_terminal_for_doctor() {
+    let fixture = Fixture::new("codex");
+    write(
+        &fixture.directory.join("terminal.closed.json"),
+        &json!({"consumed": true, "terminal": "ghostty"}),
+    );
+    let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+    assert_eq!(
+        check(&value, "launch_stage")["reason_code"],
+        "launch_stage_not_applicable"
+    );
+    assert_eq!(
+        check(&value, "shell_environment")["reason_code"],
+        "shell_environment_probe_not_applicable"
+    );
+}
