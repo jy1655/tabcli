@@ -783,12 +783,12 @@ fn windows_close_control_uses_the_claimed_terminal_handle() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join(TERMINAL_HANDLE_FILE), b"active").unwrap();
     assert_eq!(
-        windows_console_handle_path(directory.path(), true),
+        windows_console_handle_path(directory.path(), true).unwrap(),
         directory.path().join(TERMINAL_HANDLE_FILE)
     );
     fs::write(directory.path().join(TERMINAL_CLOSING_FILE), b"closing").unwrap();
     assert_eq!(
-        windows_console_handle_path(directory.path(), true),
+        windows_console_handle_path(directory.path(), true).unwrap(),
         directory.path().join(TERMINAL_CLOSING_FILE)
     );
 }

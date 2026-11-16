@@ -36,6 +36,7 @@ function fixture(name) {
   const context = vm.createContext({
     process: { env: { AGENT_BRIDGE_NATIVE_SESSION_DIR: dir, AGENT_BRIDGE_EXECUTABLE: "fake" }, pid: 1, platform: "test" },
     join, readFileSync: fs.readFileSync, unlinkSync: fs.unlinkSync,
+    lstatSync: fs.lstatSync, TextDecoder,
     writeFileSync: fs.writeFileSync, renameSync: fs.renameSync,
     spawnSync(_executable, _args, options) {
       payloads.push(JSON.parse(options.input));

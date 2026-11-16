@@ -489,8 +489,12 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
         // progress has its own wording. Decided under the lock, on the records as they are.
         return fail_deciding(store, &reason, |record, reason| {
             let reader = Reader::open_unchecked(store.directory());
-            let unbound = reader.record(CoreRecord::Terminal).text()?.is_none()
-                && reader.record(CoreRecord::TerminalClosing).text()?.is_none();
+            // Only the records' presence counts here; their content is not interpreted.
+            let unbound = reader.record(CoreRecord::Terminal).bytes()?.is_none()
+                && reader
+                    .record(CoreRecord::TerminalClosing)
+                    .bytes()?
+                    .is_none();
             Ok(if unbound && record.phase == Phase::Pending {
                 format!("{reason}; no surface handle was recorded and no prompt was sent")
             } else {

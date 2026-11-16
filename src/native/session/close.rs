@@ -319,16 +319,18 @@ pub(in crate::native) fn terminal_close_resumable_with(
 
 impl Reader {
     pub(in crate::native) fn has_active_session_capability(&self) -> bool {
+        // Any entry counts, a link or a directory included: none of them is proof that the
+        // record is gone.
         [
-            CoreRecord::Terminal.name(),
-            CoreRecord::TerminalClosing.name(),
-            CoreRecord::TurnClaim.name(),
-            CoreRecord::Completion.name(),
-            CoreRecord::LegacyResumePending.name(),
-            CoreRecord::LegacyResumeRunning.name(),
+            CoreRecord::Terminal,
+            CoreRecord::TerminalClosing,
+            CoreRecord::TurnClaim,
+            CoreRecord::Completion,
+            CoreRecord::LegacyResumePending,
+            CoreRecord::LegacyResumeRunning,
         ]
         .into_iter()
-        .any(|name| fs::symlink_metadata(self.private(name).path()).is_ok())
+        .any(|record| fs::symlink_metadata(self.record(record).path()).is_ok())
     }
 }
 
@@ -456,13 +458,9 @@ where
     }
 
     let terminal_path = store.record(CoreRecord::Terminal).path().to_owned();
-    let closing_path = store.record(CoreRecord::TerminalClosing).path().to_owned();
-    if store
-        .record(CoreRecord::TerminalClosed)
-        .path()
-        .to_owned()
-        .exists()
-    {
+    let closing = store.record(CoreRecord::TerminalClosing);
+    let closing_path = closing.path().to_owned();
+    if store.record(CoreRecord::TerminalClosed).present()? {
         close_error = merge_close_reason(close_error, terminal_consumption_reason(store)?);
         let consume_result = consume_terminal_handle(store, None, close_error.as_deref());
         let close_result = mark_session_closed_locked(store, &claim_path, close_error);
@@ -472,8 +470,8 @@ where
     // No ownership gate sees a handle-less session. Fence this close while the
     // pending launcher can still return a surface, under the same lifecycle lock.
     if status.state == SessionState::Launching
-        && !terminal_path.exists()
-        && !closing_path.exists()
+        && !store.record(CoreRecord::Terminal).present()?
+        && !closing.present()?
         && store.closed_if_present()?.is_none()
         && let Some(record) = launch::read(store)?
         && record.phase == launch::Phase::Pending
@@ -487,7 +485,7 @@ where
     match store.claim_terminal_handle()? {
         Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if !closing_path.exists() {
+            if !closing.present()? {
                 // No adapter will run for this residual surface. Keep its warning in
                 // the new tombstone; ordinary handle-less failures keep prior behavior.
                 let residual = status.residual_surface().and(status.error);
@@ -514,8 +512,7 @@ where
         }
     }
 
-    let terminal = match session::RecordReader::at(&closing_path).json_with(super::record::terminal)
-    {
+    let terminal = match closing.json_with(super::record::terminal) {
         Ok(terminal) => terminal,
         Err(error) => {
             restore_terminal_handle(&closing_path, &terminal_path)?;
@@ -566,9 +563,12 @@ fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<
 fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
     #[cfg(target_os = "macos")]
     {
+        // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read
+        // is strict, and an undecodable tombstone never keeps a close from finishing.
         Ok(store
             .record(CoreRecord::TerminalClosed)
-            .text()?
+            .bytes()?
+            .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| super::record::terminal_consumption_reason(&text)))
     }
     #[cfg(not(target_os = "macos"))]
@@ -653,23 +653,23 @@ pub(in crate::native) fn converge_interrupted(
         )?;
         changed = true;
     }
-    let completion_path = store.record(CoreRecord::Completion).path().to_owned();
-    if completion_path.exists() {
+    let completion = store.record(CoreRecord::Completion);
+    if completion.present()? {
         set_aside_unverified_completion_event_for_close(store)?;
         changed = true;
     }
-    if claim_path.exists() {
+    if session::CoreRecordReader::at(claim_path).present()? {
         remove_turn_claim_locked(claim_path)?;
         changed = true;
     }
-    RecordStore::at(&completion_path).remove()?;
-    for name in [
-        CoreRecord::LegacyResumePending.name(),
-        CoreRecord::LegacyResumeRunning.name(),
+    completion.remove()?;
+    for record in [
+        CoreRecord::LegacyResumePending,
+        CoreRecord::LegacyResumeRunning,
     ] {
-        let path = store.private(name).path().to_owned();
-        if path.exists() {
-            RecordStore::at(&path).remove()?;
+        let record = store.record(record);
+        if record.present()? {
+            record.remove()?;
             changed = true;
         }
     }
@@ -701,8 +701,7 @@ pub(in crate::native) fn converge_interrupted(
 /// the only proof that the entry is the result, is removed.
 fn set_aside_unverified_completion_event_for_close(store: &Store) -> Result<()> {
     let directory = store.directory();
-    let completion_path = store.record(CoreRecord::Completion).path().to_owned();
-    let Some(bytes) = session::RecordReader::at(&completion_path).bytes()? else {
+    let Some(bytes) = store.record(CoreRecord::Completion).bytes()? else {
         return Ok(());
     };
     if store.events_directory_state()? == EventsDirectory::Missing {
@@ -759,21 +758,17 @@ fn mark_session_closed_with_residual_locked(
     // Repair can reach this after consumption but before the closed tombstone.
     // The consumption marker carries the callback's reason across that boundary.
     let error = merge_close_reason(error, terminal_consumption_reason(store)?);
-    let consume_result = if store
-        .record(CoreRecord::Terminal)
-        .path()
-        .to_owned()
-        .exists()
-        || store
-            .record(CoreRecord::TerminalClosing)
-            .path()
-            .to_owned()
-            .exists()
-    {
-        consume_terminal_handle(store, None, error.as_deref())
-    } else {
-        Ok(())
-    };
+    // A refused presence check fails the consumption step, reported after the status update
+    // as a failed consumption is.
+    let consume_result = (|| {
+        if store.record(CoreRecord::Terminal).present()?
+            || store.record(CoreRecord::TerminalClosing).present()?
+        {
+            consume_terminal_handle(store, None, error.as_deref())
+        } else {
+            Ok(())
+        }
+    })();
     let status_result = update_status_with_residual(
         directory,
         SessionState::Closed,
@@ -943,13 +938,12 @@ where
         // before a first explicit close. This gives no authority to send a close:
         // the normal live-owner/previous-intent checks must still pass.
         #[cfg(target_os = "macos")]
-        for name in [
-            CoreRecord::Terminal.name(),
-            CoreRecord::TerminalClosing.name(),
-        ] {
-            if let Some(bytes) = store.private(name).bytes()? {
+        for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
+            if let Some(bytes) = store.record(record).bytes()? {
                 let surface: terminal::TerminalSession = super::record::terminal_bytes(&bytes)
-                    .with_context(|| format!("invalid retained terminal handle {name}"))?;
+                    .with_context(|| {
+                        format!("invalid retained terminal handle {}", record.name())
+                    })?;
                 if retain_surface(&surface) {
                     return untouched(recovery_damage);
                 }
@@ -962,6 +956,8 @@ where
 
 #[cfg(test)]
 mod owner_read_tests;
+#[cfg(test)]
+mod read_policy_tests;
 #[cfg(test)]
 mod tests;
 

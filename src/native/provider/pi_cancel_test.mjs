@@ -31,6 +31,7 @@ async function fixture(name) {
   const context = vm.createContext({
     process: { env: { AGENT_BRIDGE_NATIVE_SESSION_DIR: dir, AGENT_BRIDGE_EXECUTABLE: "fake" }, pid: 1 },
     join, readFileSync: fs.readFileSync, unlinkSync: fs.unlinkSync,
+    lstatSync: fs.lstatSync, TextDecoder,
     writeFileSync: fs.writeFileSync,
     renameSync(from, to) {
       if (to.endsWith("pi-cancel-accepted.json")) {
@@ -239,6 +240,48 @@ for (const [name, accepted, errorMessage, expected] of [
   const f = await fixture("normal_complete");
   await f.start(f.first);
   await f.end("stop", f.records[0].response);
+}
+// The declared core-record reads refuse a link at turn.claim or cancel.json, as Bridge's
+// core read policy does: no cancel is read, so none is accepted.
+for (const [name, record] of [["linked_claim", "turn.claim"], ["linked_cancel", "cancel.json"]]) {
+  const f = await fixture(name);
+  await f.start(f.first);
+  f.cancel(f.first);
+  if (process.platform === "win32") continue;
+  const path = join(f.dir, record);
+  const target = join(f.dir, `${record}.target`);
+  fs.renameSync(path, target);
+  fs.symlinkSync(target, path);
+  f.tick();
+  assert.deepEqual(f.counts(), [0, 0], name);
+  await f.end();
+  assert.equal(f.payloads[0].agent_bridge_cancel_claim_token, undefined, name);
+}
+{
+  // A Claim that is not UTF-8: the token followed by a 0xff byte.
+  const f = await fixture("invalid_claim");
+  fs.writeFileSync(join(f.dir, "turn.claim"), Buffer.concat([
+    Buffer.from(f.first), Buffer.from([0xff]), Buffer.from("\n"),
+  ]));
+  fs.rmSync(join(f.dir, "pi-startup-ready.json"), { force: true });
+  await f.emit("session_start", { reason: "startup" });
+  // A Claim that is not UTF-8 reads as no Claim: no startup record is written.
+  assert.equal(fs.existsSync(join(f.dir, "pi-startup-ready.json")), false);
+}
+{
+  // A cancel record that is not UTF-8: a 0xff byte inside an extra string field.
+  const f = await fixture("invalid_cancel");
+  await f.start(f.first);
+  const text = f.records[0].cancel;
+  const end = text.lastIndexOf("}");
+  fs.writeFileSync(join(f.dir, "cancel.json"), Buffer.concat([
+    Buffer.from(`${text.slice(0, end)},"extra":"`), Buffer.from([0xff]), Buffer.from(`"${text.slice(end)}`),
+  ]));
+  f.tick();
+  // A cancel record that is not UTF-8 supplies no intent.
+  assert.deepEqual(f.counts(), [0, 0]);
+  await f.end();
+  assert.equal(f.payloads[0].agent_bridge_cancel_claim_token, undefined);
 }
 fs.writeFileSync(join(directory, "payloads.json"), JSON.stringify(fixtures));
 }

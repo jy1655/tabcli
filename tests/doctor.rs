@@ -212,7 +212,8 @@ fn codex_terminal_diagnosis_keeps_state_identity_and_strict_reread_policy() {
         if state != "pending" {
             fs::remove_file(fixture.directory.join("turn.claim")).unwrap();
         }
-        let event_path = fixture.directory.join("events/event-1.json");
+        // Joined as production joins it: the reason below compares this path's text.
+        let event_path = fixture.directory.join("events").join("event-1.json");
         write(
             &event_path,
             &json!({
@@ -227,25 +228,38 @@ fn codex_terminal_diagnosis_keeps_state_identity_and_strict_reread_policy() {
             let at = bytes.windows(6).position(|part| part == b"answer").unwrap();
             bytes[at] = 0xff;
             fs::write(&event_path, bytes).unwrap();
-            let ordinary = report(fixture.run(&[
+            // The ordinary result query reads the event strictly too: it reports the event
+            // unreadable instead of a repaired success.
+            let ordinary = fixture.run(&[
                 "result",
                 "session-doctor",
                 "--request",
                 "request-exact",
                 "--json",
-            ]));
-            assert_eq!(ordinary["request_state"], "completed");
+            ]);
+            assert!(!ordinary.status.success());
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&ordinary.stdout),
+                String::from_utf8_lossy(&ordinary.stderr)
+            );
+            assert!(
+                text.contains("stream did not contain valid UTF-8"),
+                "{text}"
+            );
         }
         let before = entries(fixture.root.path());
         let value = fixture.doctor();
         let terminal = &check(&value, "codex_lifecycle")["evidence"]["terminal_outcome"];
         if state == "invalid_utf8" {
+            // The request's observation reads the event strictly and reports it unreadable
+            // before the diagnosis's own strict re-read; the reason is that read error's
+            // outer context, as for every other unreadable event.
             assert_eq!(terminal["observation"], "unavailable");
-            assert!(
-                terminal["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("not valid UTF-8")
+            assert_eq!(
+                terminal["reason"],
+                format!("failed to read {}", event_path.display()),
+                "{terminal}"
             );
         } else if state == "pending" || provenance.is_none() {
             assert_eq!(terminal, &json!({"observation":"not_observed"}));

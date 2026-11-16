@@ -772,23 +772,37 @@ fn record_reader_characterization_event_text_and_timestamp_policies() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let reader = Reader::open_unchecked(&fixture.directory);
     let path = fixture.directory.join("events").join("orphan.json");
-    for (bytes, message, strict_ok) in [
-        (br#"{"provider":"codex","message":"legacy"}"#.to_vec(), "legacy", true),
-        (b"{\"provider\":\"codex\",\"message\":\"\xff\"}".to_vec(), "\u{fffd}", false),
-        (br#"{"provider":"codex","message":"large time","created_unix_ms":18446744073709551616}"#.to_vec(), "large time", true),
+    // An event that is not UTF-8 is unreadable to every reader that decodes it; the search's
+    // budgeted read returns its bytes, which the search charges before decoding.
+    for (bytes, message) in [
+        (br#"{"provider":"codex","message":"legacy"}"#.to_vec(), Some("legacy")),
+        (b"{\"provider\":\"codex\",\"message\":\"\xff\"}".to_vec(), None),
+        (br#"{"provider":"codex","message":"large time","created_unix_ms":18446744073709551616}"#.to_vec(), Some("large time")),
     ] {
         fs::write(&path, &bytes).unwrap();
         let snapshot = reader.snapshot().unwrap();
-        let event = snapshot.event(&reader, "orphan.json").unwrap().unwrap();
-        assert_eq!(event.message, message);
-        assert_eq!(reader.event_strict("orphan.json").is_ok(), strict_ok);
-        if message == "large time" {
-            // Pin current acceptance only. The latent overflow on JSON rendering is a
-            // separate bugfix, not a timestamp compatibility requirement.
-            assert_eq!(event.created_unix_ms, Some(u64::MAX as u128 + 1));
+        let event = snapshot.event(&reader, "orphan.json");
+        assert_eq!(reader.event_strict("orphan.json").is_ok(), message.is_some());
+        match message {
+            Some(message) => {
+                let event = event.unwrap().unwrap();
+                assert_eq!(event.message, message);
+                if message == "large time" {
+                    // Pin current acceptance only. The latent overflow on JSON rendering is
+                    // a separate bugfix, not a timestamp compatibility requirement.
+                    assert_eq!(event.created_unix_ms, Some(u64::MAX as u128 + 1));
+                }
+            }
+            None => assert_eq!(
+                format!("{:#}", event.unwrap_err()),
+                format!(
+                    "failed to read {}: stream did not contain valid UTF-8",
+                    path.display()
+                )
+            ),
         }
-        let text = reader.event("orphan.json").event_within_budget(1024).unwrap().unwrap();
-        assert_eq!(text, String::from_utf8_lossy(&bytes));
+        let read = reader.event("orphan.json").event_within_budget(1024).unwrap().unwrap();
+        assert_eq!(read, bytes);
     }
     fs::write(&path, "{}").unwrap();
     let error = reader
@@ -827,7 +841,7 @@ fn record_reader_characterization_event_text_and_timestamp_policies() {
 }
 
 #[test]
-fn record_reader_characterization_cancel_validation_and_lossy_unknown_fields() {
+fn record_reader_characterization_cancel_validation_and_strict_text() {
     let root = tempfile::tempdir().unwrap();
     let reader = Reader::open_unchecked(root.path());
     let path = root.path().join("cancel.json");
@@ -837,15 +851,27 @@ fn record_reader_characterization_cancel_validation_and_lossy_unknown_fields() {
             .is_none()
     );
     let valid = br#"{"schema":1,"request_id":"request-1","claim_token":"1-2-3","created_unix_ms":1,"extra":"X"}"#;
-    let mut bytes = valid.to_vec();
-    *bytes.iter_mut().find(|b| **b == b'X').unwrap() = 0xff;
-    fs::write(&path, bytes).unwrap();
+    fs::write(&path, valid).unwrap();
     assert_eq!(
         crate::native::session::cancel::read(&reader)
             .unwrap()
             .unwrap()
             .request_id,
         "request-1"
+    );
+    // An unknown field is ignored, but the record's text must still be UTF-8.
+    let mut bytes = valid.to_vec();
+    *bytes.iter_mut().find(|b| **b == b'X').unwrap() = 0xff;
+    fs::write(&path, bytes).unwrap();
+    assert_eq!(
+        format!(
+            "{:#}",
+            crate::native::session::cancel::read(&reader).unwrap_err()
+        ),
+        format!(
+            "failed to read {}: stream did not contain valid UTF-8",
+            path.display()
+        )
     );
     for text in [
         String::from_utf8(valid.to_vec())

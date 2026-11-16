@@ -188,8 +188,9 @@ impl RequestObservation<'_> {
                 "recorded event filename {event_id} does not match an events/ entry exactly"
             )));
         }
-        // Attachments deliberately re-read strictly; ordinary queries and the timeline
-        // retain their distinct readers. Do not substitute the lossy event above.
+        // Attachments deliberately re-read the event with their own error texts; ordinary
+        // queries and the timeline retain their distinct readers. Do not substitute the
+        // Snapshot's event read above.
         let event = reader.event_strict(event_id).map_err(unreadable)?;
         if event.cancelled || event.error.is_some() {
             return Err(refuse(RequestState::Failed.name(), None));

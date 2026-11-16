@@ -23,7 +23,8 @@ impl Reader {
             .transpose()?;
         let claim = before[0]
             .as_deref()
-            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned());
+            .map(|bytes| record::claim(bytes).map_err(anyhow::Error::from))
+            .transpose()?;
         let claim = claim.as_deref();
         let mut receipts_by_event = std::collections::HashMap::new();
         for receipt in &index.receipts {

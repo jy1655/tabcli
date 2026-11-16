@@ -2184,7 +2184,7 @@ fn provenance_survives_each_completion_publication_fault_boundary() {
         let reader = Reader::open_unchecked(store.directory());
         let journal: Option<PendingTurnCompletion> = reader
             .record(CoreRecord::Completion)
-            .optional_json()
+            .optional_json_with(|text| serde_json::from_str(text))
             .unwrap();
         if let Some(journal) = journal {
             assert_eq!(journal.event.provenance.as_deref(), Some("codex_notify"));

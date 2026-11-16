@@ -323,6 +323,12 @@ that duplicates what a provider's own subagents do for a same-provider child.
   writer output and round-trip its output through Rust readers. Replace these core reads
   when Pi provides an addressed interruption endpoint and Bridge has an adapter claim
   retirement boundary.
+  Both reads take Bridge's core read policy (owner's decision, 2026-11-16): a link at the
+  record's path, dangling or not, or any entry that is not a regular file is refused, and
+  the bytes are decoded as fatal UTF-8; a refusal reads as no Claim or no cancel intent.
+  The extension is copied into the session directory at launch, so a Pi session already
+  running keeps the extension it was launched with, which follows a link and decodes
+  invalid UTF-8 lossily, until it is relaunched.
 
 - Native Windows Pi input has no verified addressed first-party endpoint with per-turn
   acceptance. Bridge requires the installed extension's actual schema 2 startup record

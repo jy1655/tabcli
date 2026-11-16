@@ -39,6 +39,7 @@ use std::{fs, thread};
 mod launch_failure;
 #[cfg(windows)]
 mod launch_recovery;
+mod read_policy;
 
 fn test_launch_refusal(gate: ReopenGate) -> RecordedReopenRefusal {
     RecordedReopenRefusal {

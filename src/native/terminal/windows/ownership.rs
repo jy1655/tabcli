@@ -41,22 +41,20 @@ pub(in crate::native) fn windows_console_root_never_ran(directory: &Path) -> boo
         }
 }
 
+/// The handle a console control request reads: the claimed close handle for a close that
+/// finds one, the active handle otherwise. A link or another non-regular entry at the close
+/// handle's path is refused, not passed over.
 pub(in crate::native) fn windows_console_handle_path(
     directory: &Path,
     close_requested: bool,
-) -> PathBuf {
-    let closing = Reader::open_unchecked(directory)
-        .record(CoreRecord::TerminalClosing)
-        .path()
-        .to_owned();
-    if close_requested && closing.is_file() {
-        closing
+) -> Result<PathBuf> {
+    let reader = Reader::open_unchecked(directory);
+    let closing = reader.record(CoreRecord::TerminalClosing);
+    Ok(if close_requested && closing.present()? {
+        closing.path().to_owned()
     } else {
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .path()
-            .to_owned()
-    }
+        reader.record(CoreRecord::Terminal).path().to_owned()
+    })
 }
 
 #[cfg(test)]
