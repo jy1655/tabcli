@@ -9,6 +9,7 @@ use crate::native::session::{Reader, Store};
 #[cfg(test)]
 use crate::native::terminal::ownership;
 #[cfg(unix)]
+#[cfg(test)]
 use crate::native::terminal::shell_quote;
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
 // Default: discover protected gui-sock-<pid> sockets in the macOS runtime directory,
@@ -807,6 +808,7 @@ fn existing_window(
 
 // Execute the launch as the pane program so typed keys cannot edit it; use login/interactive zsh
 // for PATH and foreground jobs. See docs/verification/2026-10-03-v0.1.0-focus.md.
+#[cfg(test)] // Legacy bootstrap exercised by compatibility fixtures.
 fn pane_program(gate: &str, command: &str) -> [String; 5] {
     [
         "/bin/zsh",
@@ -835,12 +837,17 @@ pub(super) fn create_surface(
 
 fn host_pane_program(command: &str, directory: &Path) -> Result<[String; 5]> {
     let executable = env::current_exe().context("failed to resolve Agent Bridge executable")?;
-    let gate = format!(
-        "{} {HOST_COMMAND} {}",
-        shell_quote(executable.as_os_str()),
-        shell_quote(directory.as_os_str())
-    );
-    Ok(pane_program(&gate, command))
+    Ok(host_program(&executable, directory, command))
+}
+
+pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -> [String; 5] {
+    [
+        executable.to_string_lossy().into_owned(),
+        HOST_COMMAND.into(),
+        directory.to_string_lossy().into_owned(),
+        "--launch-command".into(),
+        command.into(),
+    ]
 }
 
 fn create(

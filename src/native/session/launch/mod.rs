@@ -499,6 +499,73 @@ fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
             }))
 }
 
+/// One lifecycle-locked decision for wait and repair. Current confirmed/ended state
+/// wins over a retained diagnostic; an old claim can never settle its successor.
+#[derive(Debug, PartialEq, Eq)]
+enum HostDecision {
+    Confirmed,
+    Ended,
+    Failed,
+    Pending,
+}
+fn host_decision_locked(store: &Store) -> Result<HostDecision> {
+    let Some(receipt) = read(store)? else {
+        return Ok(HostDecision::Pending);
+    };
+    let status = store.status()?;
+    if status.state.ended() || store.closed_if_present()?.is_some() {
+        return Ok(HostDecision::Ended);
+    }
+    if confirmed(store, &receipt, &status) {
+        return Ok(HostDecision::Confirmed);
+    }
+    let claim = turn::current_claim_token(store)?;
+    if status.state != SessionState::Launching
+        || claim.as_deref() != Some(receipt.claim_token.as_str())
+    {
+        return Ok(HostDecision::Pending);
+    }
+    if let host::HostObservation::Recorded(record) = host::observe(store, Some(&receipt))
+        && let Some(failure) = &record.failure
+    {
+        let stage = enum_word(record.stage);
+        let reason = enum_word(failure.reason);
+        let detail = if failure.reason == host::FailureReason::CaptureTimeout {
+            format!(
+                "startup files did not finish within {} ms",
+                record.capture_budget_ms
+            )
+        } else {
+            format!("launch host failed at {stage}")
+        };
+        fail_locked(
+            store,
+            &receipt,
+            &format!(
+                "terminal shell environment could not be prepared: {detail} ({reason}); last recorded launch stage: {stage}"
+            ),
+        )?;
+        return Ok(HostDecision::Failed);
+    }
+    Ok(HostDecision::Pending)
+}
+fn enum_word(value: impl Serialize) -> String {
+    serde_json::to_value(value)
+        .expect("enum serialization")
+        .as_str()
+        .expect("string enum")
+        .into()
+}
+fn deadline_reason(reader: &Reader, receipt: Option<&Record>) -> String {
+    match host::observe(reader, receipt) {
+        host::HostObservation::Recorded(record) => format!(
+            "{LAUNCH_DEADLINE}; last recorded launch stage: {}",
+            enum_word(record.stage)
+        ),
+        _ => LAUNCH_DEADLINE.into(),
+    }
+}
+
 /// Called before old dead-owner repair. A new launch with an uncertain spawn must not
 /// be silently closed/released by the legacy owner-only repair path.
 pub(in crate::native) fn repair(store: &Store) -> Result<bool> {
@@ -526,12 +593,18 @@ fn repair_with_owner(
     if confirmed(store, &record, &status) {
         return Ok(false);
     }
+    match host_decision_locked(store)? {
+        HostDecision::Confirmed => return Ok(false),
+        HostDecision::Failed => return Ok(true),
+        HostDecision::Ended if store.closed_if_present()?.is_some() => return Ok(false),
+        HostDecision::Ended | HostDecision::Pending => {}
+    }
     if status.state == SessionState::Closed {
         return Ok(false);
     }
     if status.state == SessionState::Launching {
         if unix_ms() >= record.deadline_unix_ms {
-            fail_locked(store, &record, LAUNCH_DEADLINE)?;
+            fail_locked(store, &record, &deadline_reason(store, Some(&record)))?;
         } else if let Some(owner) = observe(store)? {
             use crate::native::process_identity::ProcessObservation;
             match owner.process {
@@ -565,6 +638,33 @@ pub(in crate::native) fn wait(
 ) -> Result<()> {
     let mut next_probe = Instant::now() + Duration::from_secs(1);
     loop {
+        if let Some(_lock) = store.try_lock()? {
+            match host_decision_locked(store)? {
+                HostDecision::Confirmed => return Ok(()),
+                HostDecision::Failed => bail!(
+                    "{}",
+                    store
+                        .status()?
+                        .error
+                        .unwrap_or_else(|| "launch host failed".into())
+                ),
+                HostDecision::Ended => {
+                    let status = store.status()?;
+                    bail!(
+                        "{}",
+                        status.error.unwrap_or_else(|| format!(
+                            "launch entered {}",
+                            if store.closed_if_present().ok().flatten().is_some() {
+                                SessionState::Closed
+                            } else {
+                                status.state
+                            }
+                        ))
+                    );
+                }
+                HostDecision::Pending => {}
+            }
+        }
         let status: SessionStatus = store.status()?;
         if status.state.ended() {
             bail!(
@@ -580,7 +680,7 @@ pub(in crate::native) fn wait(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let deadline_reached = remaining.is_zero();
         let reason = if deadline_reached {
-            Some(LAUNCH_DEADLINE)
+            Some(deadline_reason(store, read(store)?.as_ref()))
         } else if Instant::now() >= next_probe {
             next_probe = Instant::now() + Duration::from_secs(1);
             match terminal::surface_present(
@@ -588,9 +688,9 @@ pub(in crate::native) fn wait(
                 surface,
                 remaining.min(Duration::from_secs(2)),
             ) {
-                Ok(false) => {
-                    Some("terminal surface disappeared before provider launch was confirmed")
-                }
+                Ok(false) => Some(
+                    "terminal surface disappeared before provider launch was confirmed".to_owned(),
+                ),
                 // Inspection errors (including permissions/timeouts) do not prove absence.
                 Ok(true) | Err(_) => None,
             }
@@ -612,9 +712,25 @@ pub(in crate::native) fn wait(
             if confirmed(store, &record, &status) {
                 return Ok(());
             }
-            fail_locked(store, &record, reason)?;
+            match host_decision_locked(store)? {
+                HostDecision::Confirmed => return Ok(()),
+                HostDecision::Failed | HostDecision::Ended => bail!(
+                    "{}",
+                    store
+                        .status()?
+                        .error
+                        .unwrap_or_else(|| "launch has ended".into())
+                ),
+                HostDecision::Pending => {}
+            }
+            let reason = if deadline_reached {
+                deadline_reason(store, Some(&record))
+            } else {
+                reason
+            };
+            fail_locked(store, &record, &reason)?;
             let status: SessionStatus = store.status()?;
-            let message = status.error.as_deref().unwrap_or(reason);
+            let message = status.error.as_deref().unwrap_or(&reason);
             // The hint needs this wait's own deadline and that reason as the recorded text;
             // another writer's status text stays a plain message.
             if deadline_reached && message == reason {
@@ -1512,5 +1628,192 @@ mod tests {
             .unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "SCRIPT_OK\n");
+    }
+}
+
+#[cfg(test)]
+mod host_decision_tests {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, Store, String) {
+        let dir = tempfile::Builder::new()
+            .prefix("session-")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir(dir.path().join("events")).unwrap();
+        update_status(dir.path(), SessionState::Launching, None, None).unwrap();
+        let store = Store::open_unchecked(dir.path());
+        let claim = turn::claim(&store, &[]).unwrap();
+        let token = claim.token().to_owned();
+        claim.retain();
+        begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+        (dir, store, token)
+    }
+    fn failed_host(store: &Store, token: &str) {
+        host::initialize(store, token, host::Terminal::Iterm2).unwrap();
+        let identity = host::HostIdentity {
+            pid: 123,
+            start_seconds: 123,
+            start_microseconds: 1,
+        };
+        host::admit(store, token, identity).unwrap();
+        host::advance(
+            store,
+            token,
+            identity,
+            host::Stage::EnvironmentPreparing,
+            host::Progress {
+                capture_budget_ms: 10000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        host::fail(
+            store,
+            token,
+            Some(identity),
+            host::Failure {
+                reason: host::FailureReason::CaptureTimeout,
+                exit_code: None,
+                signal: None,
+            },
+            10000,
+            Some(10000),
+        )
+        .unwrap();
+    }
+    fn surface() -> terminal::TerminalSession {
+        terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "unused".into(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        }
+    }
+    #[test]
+    fn wait_and_repair_fail_current_host_before_deadline_with_the_same_reason() {
+        let mut errors = Vec::new();
+        for repair in [false, true] {
+            let (_dir, store, token) = fixture();
+            failed_host(&store, &token);
+            let start = Instant::now();
+            if repair {
+                assert!(
+                    repair_with_owner(&store, |_| panic!(
+                        "host failure precedes owner observation"
+                    ))
+                    .unwrap()
+                );
+            } else {
+                let error = wait(&store, &surface(), start + Duration::from_secs(20)).unwrap_err();
+                assert!(error.downcast_ref::<TimedOut>().is_none());
+            }
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert_eq!(store.status().unwrap().state, SessionState::Failed);
+            assert!(turn::current_claim_token(&store).unwrap().is_none());
+            errors.push(store.status().unwrap().error.unwrap());
+        }
+        assert_eq!(errors[0], errors[1]);
+        assert!(errors[0].contains(
+            "10000 ms (capture_timeout); last recorded launch stage: environment_preparing"
+        ));
+    }
+    #[test]
+    fn stale_late_and_confirmed_records_never_override_current_state() {
+        for case in ["claim", "receipt", "ended", "closed", "confirmed"] {
+            let (_dir, store, token) = fixture();
+            failed_host(&store, &token);
+            match case {
+                "claim" => {
+                    std::fs::write(store.record(CoreRecord::TurnClaim).path(), "successor").unwrap()
+                }
+                "receipt" | "confirmed" => {
+                    let mut receipt = read(&store).unwrap().unwrap();
+                    if case == "receipt" {
+                        receipt.claim_token = "successor".into();
+                    } else {
+                        receipt.phase = Phase::Spawned;
+                    }
+                    store
+                        .record(CoreRecord::Launch)
+                        .write_json(&receipt)
+                        .unwrap();
+                }
+                "ended" => update_status(
+                    store.directory(),
+                    SessionState::Failed,
+                    None,
+                    Some("earlier failure".into()),
+                )
+                .unwrap(),
+                "closed" => store.write_closed(&store.status().unwrap()).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = store.status().unwrap();
+            let _lock = store.lock().unwrap();
+            assert_ne!(
+                host_decision_locked(&store).unwrap(),
+                HostDecision::Failed,
+                "{case}"
+            );
+            assert_eq!(store.status().unwrap().error, before.error);
+            assert_eq!(store.status().unwrap().state, before.state);
+        }
+    }
+    #[test]
+    fn uncertain_spawn_keeps_claim_and_deadline_suffix_preserves_legacy_text() {
+        let (_dir, store, token) = fixture();
+        assert_eq!(
+            deadline_reason(&store, read(&store).unwrap().as_ref()),
+            LAUNCH_DEADLINE
+        );
+        failed_host(&store, &token);
+        assert_eq!(
+            deadline_reason(&store, read(&store).unwrap().as_ref()),
+            format!("{LAUNCH_DEADLINE}; last recorded launch stage: environment_preparing")
+        );
+        let mut receipt = read(&store).unwrap().unwrap();
+        receipt.phase = Phase::Spawning;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&receipt)
+            .unwrap();
+        let _lock = store.lock().unwrap();
+        assert_eq!(host_decision_locked(&store).unwrap(), HostDecision::Failed);
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+        assert!(
+            store
+                .status()
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("provider spawn is uncertain")
+        );
+    }
+    #[test]
+    fn deadline_wait_keeps_timeout_hint_only_for_its_own_exact_reason() {
+        for recorded in [false, true] {
+            let (_dir, store, token) = fixture();
+            if recorded {
+                host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+            }
+            let expected = if recorded {
+                format!("{LAUNCH_DEADLINE}; last recorded launch stage: awaiting_host")
+            } else {
+                LAUNCH_DEADLINE.into()
+            };
+            let error = wait(&store, &surface(), Instant::now()).unwrap_err();
+            assert!(error.downcast_ref::<TimedOut>().is_some());
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(
+                store.status().unwrap().error.as_deref(),
+                Some(expected.as_str())
+            );
+        }
     }
 }

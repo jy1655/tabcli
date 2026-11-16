@@ -338,16 +338,24 @@ fn create_tab(
 fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     let executable =
         std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
-    let host = format!(
-        "{} {HOST_COMMAND} {}",
-        crate::native::terminal::shell_quote(executable.as_os_str()),
-        crate::native::terminal::shell_quote(directory.as_os_str())
-    );
-    Ok(shell_command(&host, command))
+    Ok(host_command(&executable, directory, command))
+}
+
+pub(super) fn host_command(executable: &Path, directory: &Path, command: &str) -> String {
+    [
+        executable.to_string_lossy().as_ref(),
+        HOST_COMMAND,
+        directory.to_string_lossy().as_ref(),
+        "--launch-command",
+        command,
+    ]
+    .map(iterm_argument)
+    .join(" ")
 }
 
 // Native command creation prevents launch-line editing; login/interactive zsh retains PATH and
 // foreground jobs. The bootstrap is POSIX regardless of the profile's configured command.
+#[cfg(test)] // Legacy bootstrap exercised by compatibility fixtures.
 fn shell_command(host: &str, command: &str) -> String {
     format!(
         "/bin/zsh -l -i -c {}",
@@ -385,7 +393,14 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
                 .to_owned())
         },
         |directory, id, iterm_id| wait_for_binding(directory, id, iterm_id, &mut SystemClock),
-        |_| {},
+        |outcome| {
+            if let Err(error) = outcome {
+                crate::native::session::launch::log(
+                    &crate::native::session::Store::open_unchecked(directory),
+                    &format!("iterm2_host_refused: {error:#}"),
+                );
+            }
+        },
     )
 }
 
@@ -631,6 +646,11 @@ impl<R: Automation> MacTerminalAdapter for Adapter<R> {
     }
 }
 #[cfg(test)]
+pub(super) fn test_iterm_arguments(command: &str) -> Vec<String> {
+    tests::iterm2_arguments(command)
+}
+
+#[cfg(test)]
 mod tests {
     use super::applescript::testing::{Call, Method, Replay, Reply, ScriptId};
     fn automation_session() -> TerminalSession {
@@ -785,11 +805,15 @@ mod tests {
                 let unbound = Cell::new(false);
                 let bootstrap = launch_bootstrap("echo card10", directory.path()).unwrap();
                 let args = iterm2_arguments(&bootstrap);
-                assert!(args[4].contains(&format!(
-                    "native-iterm2-host {}",
-                    crate::native::terminal::shell_quote(directory.path().as_os_str())
-                )));
-                assert!(args[4].ends_with("echo card10"));
+                assert_eq!(
+                    &args[1..],
+                    [
+                        HOST_COMMAND,
+                        directory.path().to_str().unwrap(),
+                        "--launch-command",
+                        "echo card10"
+                    ]
+                );
                 let create_call = call(
                     Method::RunUntil,
                     ScriptId::ItermOpen,
@@ -974,14 +998,17 @@ mod tests {
         let wrapper = crate::native::process_env::tests::wrapper_for(directory);
         let bootstrap = launch_bootstrap(&wrapper, directory).unwrap();
         let args = iterm2_arguments(&bootstrap);
-        assert_eq!(&args[..4], ["/bin/zsh", "-l", "-i", "-c"]);
-        assert!(args[4].contains("native-iterm2-host '/custom state/session-e1'"));
-        assert!(args[4].ends_with(&wrapper));
-        let invocation = args[4].split_once(" || exit; ").unwrap().0;
-        let host_args = super::super::test_support::host_argv(invocation);
-        assert_eq!(host_args, [HOST_COMMAND, directory.to_str().unwrap()]);
+        assert_eq!(
+            &args[1..],
+            [
+                HOST_COMMAND,
+                directory.to_str().unwrap(),
+                "--launch-command",
+                &wrapper
+            ]
+        );
         assert!(
-            matches!(crate::native::parse_args(host_args).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Iterm2 { directory: actual }) if actual == directory)
+            matches!(crate::native::parse_args(args[1..].iter().cloned()).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Iterm2Launch { directory: actual, command }) if actual == directory && command == wrapper)
         );
     }
 
@@ -2006,7 +2033,7 @@ end run
     // splits with its own parser (PTYSession.m `computeArgvForCommand:`;
     // NSStringITerm.m `doubleDollarVariables`,
     // `componentsBySplittingStringWithQuotesAndBackslashEscaping:`).
-    fn iterm2_arguments(command: &str) -> Vec<String> {
+    pub(in crate::native::terminal::macos) fn iterm2_arguments(command: &str) -> Vec<String> {
         let (mut from, mut open) = (0, None);
         while let Some(found) = command[from..].find("$$").map(|at| at + from) {
             match open.take() {
@@ -2085,10 +2112,30 @@ end run
         arguments
     }
 
+    #[test]
+    fn command_host_arguments_round_trip_through_iterm_parser() {
+        let executable = std::path::PathBuf::from(format!("/bin/{ODD_NAME}"));
+        let directory = std::path::PathBuf::from(format!("/state/{ODD_NAME}/session-a1"));
+        let command = format!(
+            ". {}",
+            crate::native::terminal::shell_quote(directory.join("launch.sh").as_os_str())
+        );
+        assert_eq!(
+            iterm2_arguments(&host_command(&executable, &directory, &command)),
+            [
+                executable.to_str().unwrap(),
+                HOST_COMMAND,
+                directory.to_str().unwrap(),
+                "--launch-command",
+                &command
+            ]
+        );
+    }
+
     // Review finding 6. iTerm2 turns the bootstrap into arguments itself, and
     // not as a shell does: the script must reach zsh as it was written.
     #[test]
-    fn the_bootstrap_reaches_zsh_as_written_through_iterm2_s_own_parser() {
+    fn the_legacy_bootstrap_reaches_zsh_as_written_through_iterm2_s_own_parser() {
         let quote = |value: &str| crate::native::terminal::shell_quote(std::ffi::OsStr::new(value));
         for root in [
             "/Users/tester/.agent-bridge/native-sessions".to_owned(),
@@ -2314,7 +2361,7 @@ end run
     }
 
     #[test]
-    fn iterm_creation_command_waits_for_binding_and_discards_startup_keys() {
+    fn legacy_iterm_creation_command_waits_for_binding_and_discards_startup_keys() {
         for cancel in [false, true] {
             host_pty_fixture(cancel);
         }
@@ -2375,6 +2422,7 @@ end run
         let mut command = Command::new(&arguments[0]);
         command
             .args(&arguments[1..])
+            .env("HOME", directory.path())
             .env("ZDOTDIR", directory.path())
             .env("ITERM_SESSION_ID", "w0t0p0:owned-id")
             .stdin(slave.try_clone().unwrap())
@@ -2446,8 +2494,12 @@ end run
         let log =
             std::fs::read_to_string(directory.path().join(crate::native::session::launch::LOG))
                 .unwrap();
-        assert!(log.lines().all(|line| !line.contains("host_")), "{log}");
-        assert_eq!(log.as_bytes(), log_before);
+        if cancel {
+            assert!(log.contains("iterm2_host_refused: iTerm2 launch was cancelled or timed out before surface binding"));
+            assert!(log.as_bytes().starts_with(&log_before));
+        } else {
+            assert_eq!(log.as_bytes(), log_before);
+        }
         let owner = directory.path().join("owner-probe.json");
         if cancel {
             assert!(!owner.exists(), "cancelled host launched a wrapper");

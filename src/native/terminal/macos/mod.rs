@@ -1,3 +1,4 @@
+pub(in crate::native::terminal) mod launch_host;
 // A1 API, consumed by hosts and doctor in later units.
 mod bound_host;
 mod close_transaction;
