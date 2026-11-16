@@ -86,16 +86,36 @@ pub(in crate::native) enum HostObservation {
 }
 
 pub(in crate::native) fn observe(reader: &Reader, receipt: Option<&Record>) -> HostObservation {
-    let bytes = match reader.record(CoreRecord::LaunchHost).timeline(LIMIT) {
+    judge(
+        reader
+            .record(CoreRecord::LaunchHost)
+            .timeline(LIMIT)
+            .map_err(|error| format!("{error:#}")),
+        receipt,
+        reader
+            .directory()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default(),
+    )
+}
+
+/// The one judgment of retained bytes, shared by `observe` and readers that already hold
+/// the bytes (timeline): the receipt attributes history, never a later live claim.
+pub(in crate::native) fn judge(
+    bytes: std::result::Result<Option<Vec<u8>>, String>,
+    receipt: Option<&Record>,
+    session_id: &str,
+) -> HostObservation {
+    let bytes = match bytes {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return HostObservation::NotRecorded,
-        Err(error) => return HostObservation::Unreadable(format!("{error:#}")),
+        Err(error) => return HostObservation::Unreadable(error),
     };
     match record::launch_host(&bytes) {
         Ok(HostObservation::Recorded(host)) => {
             if receipt.is_none_or(|r| r.claim_token != host.claim_token)
-                || reader.directory().file_name().and_then(|n| n.to_str())
-                    != Some(&host.managed_session_id)
+                || host.managed_session_id != session_id
             {
                 HostObservation::IdentityMismatch
             } else {

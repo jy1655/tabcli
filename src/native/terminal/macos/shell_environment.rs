@@ -9,7 +9,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::{Duration, Instant};
 
 use super::super::shell_environment_wire::CAP;
+/// Time kept after the capture for its cleanup, within the caller's deadline.
 pub(in crate::native) const CLEANUP: Duration = Duration::from_millis(500);
+/// Time a launch keeps after the capture for its handoff to the launch shell. A doctor
+/// probe makes no handoff and adds this back to its deadline.
 pub(in crate::native) const HANDOFF_RESERVE: Duration = Duration::from_secs(2);
 const RESERVE: Duration = HANDOFF_RESERVE.saturating_add(CLEANUP);
 
