@@ -20,11 +20,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Variables, FailureReason> {
             return Err(FailureReason::CaptureInvalid);
         };
         let name = &entry[..eq];
-        if name.is_empty()
-            || !(name[0].is_ascii_alphabetic() || name[0] == b'_')
-            || !name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            || !names.insert(name)
-        {
+        if name.is_empty() || !names.insert(name) {
             return Err(FailureReason::CaptureInvalid);
         }
         if [b"_".as_slice(), b"SHLVL", b"PWD", b"OLDPWD"].contains(&name) {
@@ -39,15 +35,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Variables, FailureReason> {
 mod tests {
     use super::*;
     #[test]
-    fn framing_identifiers_duplicates_and_limits() {
-        for bytes in [
-            b"X=y".as_slice(),
-            b"X=y\0X=z\0",
-            b"=v\0",
-            b"1X=y\0",
-            b"A-B=c\0",
-            b"X=y\0\0",
-        ] {
+    fn framing_names_duplicates_and_limits() {
+        for bytes in [b"X=y".as_slice(), b"X=y\0X=z\0", b"=v\0", b"X=y\0\0"] {
             assert_eq!(decode(bytes).unwrap_err(), FailureReason::CaptureInvalid);
         }
         assert_eq!(decode(&[]).unwrap_err(), FailureReason::CaptureNoOutput);
@@ -58,6 +47,18 @@ mod tests {
         assert_eq!(
             decode(b"X=a=b\0_=x\0SHLVL=1\0PWD=p\0OLDPWD=q\0").unwrap(),
             vec![(b"X".to_vec(), b"a=b".to_vec())]
+        );
+    }
+    #[test]
+    fn non_identifier_names_are_exact_bytes() {
+        let bytes = b"A-B=c\0a.b=d\0BASH_FUNC_x%%=function\x001X=value\0\xff=raw\0";
+        let variables = decode(bytes).unwrap();
+        assert_eq!(variables.len(), 5);
+        assert_eq!(variables[0], (b"A-B".to_vec(), b"c".to_vec()));
+        assert_eq!(variables[4], (vec![0xff], b"raw".to_vec()));
+        assert_eq!(
+            decode(b"A-B=c\0A-B=d\0").unwrap_err(),
+            FailureReason::CaptureInvalid
         );
     }
     #[test]

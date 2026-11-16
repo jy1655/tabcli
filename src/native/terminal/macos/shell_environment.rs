@@ -9,8 +9,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::{Duration, Instant};
 
 use super::super::shell_environment_wire::CAP;
-const CLEANUP: Duration = Duration::from_millis(500);
-const RESERVE: Duration = Duration::from_millis(2500);
+pub(in crate::native) const CLEANUP: Duration = Duration::from_millis(500);
+pub(in crate::native) const HANDOFF_RESERVE: Duration = Duration::from_secs(2);
+const RESERVE: Duration = HANDOFF_RESERVE.saturating_add(CLEANUP);
 
 #[derive(Debug)]
 pub(in crate::native) struct Captured {
@@ -514,6 +515,34 @@ mod tests {
         );
     }
     #[test]
+    fn non_identifier_names_allow_capture_and_survive_direct_exec() {
+        let (_dir, mut base) = fixture(b"");
+        let names = ["A-B", "a.b", "BASH_FUNC_x%%", "1X"];
+        for name in names {
+            base.push((name.into(), "newline\n'\"$".into()));
+        }
+        capture(base, Instant::now() + Duration::from_secs(4)).unwrap();
+        // zsh drops non-identifier names when exporting to children, as the old
+        // launch shell did too. Verify decoded handoff bytes with a direct exec.
+        let variables = decode(b"A-B=newline\n'\"$\0a.b=newline\n'\"$\0BASH_FUNC_x%%=newline\n'\"$\x001X=newline\n'\"$\0").unwrap();
+        let output = std::process::Command::new("/usr/bin/env")
+            .arg("-0")
+            .env_clear()
+            .envs(variables)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let variables = decode(&output.stdout).unwrap();
+        for name in names {
+            assert!(
+                variables
+                    .iter()
+                    .any(|(k, v)| k == name && v == "newline\n'\"$"),
+                "missing {name}"
+            );
+        }
+    }
+    #[test]
     fn timeout_kills_sleep_and_is_bounded() {
         let (dir, base) = fixture(b"sleep 100 &\necho $! > $HOME/child\nwait\n");
         let start = Instant::now();
@@ -575,15 +604,8 @@ mod tests {
         assert!(!dir.path().join("started").exists());
     }
     #[test]
-    fn environment_decoder_rejects_partial_duplicate_and_invalid_names() {
-        for bytes in [
-            b"X=y".as_slice(),
-            b"X=y\0X=z\0",
-            b"=v\0",
-            b"1X=y\0",
-            b"A-B=c\0",
-            b"X=y\0\0",
-        ] {
+    fn environment_decoder_rejects_partial_duplicate_and_empty_names() {
+        for bytes in [b"X=y".as_slice(), b"X=y\0X=z\0", b"=v\0", b"X=y\0\0"] {
             assert_eq!(decode(bytes).unwrap_err(), FailureReason::CaptureInvalid);
         }
         assert_eq!(
