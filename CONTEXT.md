@@ -89,6 +89,13 @@ _Avoid_: session state, delivery outcome, Result
 The record that binds a request to its claim and, once published, to its result event.
 _Avoid_: mapping, index entry
 
+**Pending launch**:
+A launch whose launch receipt is still `pending` for the current Claim of a Session that is
+launching and that no close tombstone ends. Whether its deadline has passed is each caller's
+policy: the spawn fence and the hosts judge it, the wrapper's admission does not, and the
+binding wait adds its own budget.
+_Avoid_: eligible launch, live launch, open launch
+
 **Completion journal**:
 The record of a provider completion that Bridge accepted but has not yet published as an
 event. Recovery publishes or discards it.

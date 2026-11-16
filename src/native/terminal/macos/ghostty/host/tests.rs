@@ -1,6 +1,7 @@
 use super::super::tests::{Pty, bind_fixture, existing, launch_fixture, soon};
 use super::super::{CREATE_SURFACE_SCRIPT, CreatedSurface, create_with_runner, handle};
 use super::*;
+use crate::native::session::SessionState;
 use crate::native::terminal::ownership;
 
 #[test]
@@ -433,4 +434,195 @@ fn host_on_a_private_pty_starts_only_its_bound_launch_and_no_key_reaches_it() {
             pty.shown()
         );
     }
+}
+
+// One session directory per case: which error the host reports for every failing fact of
+// its pending launch, alone and together, for each damaged record, and for the binding.
+#[test]
+fn verification_reports_the_first_failing_fact_then_the_binding() {
+    use crate::native::session::launch::test_support::{Change::*, Expect, apply};
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::session::test_support::TERMINAL_HANDLE_FILE;
+    const CANCELLED: Expect = Expect::Text(
+        "Ghostty launch was cancelled, timed out or is not the one sent to this terminal",
+    );
+    #[derive(Clone, Copy)]
+    enum Binding {
+        Bound,
+        Unbound,
+        Invalid,
+        OtherSession,
+        OtherTerminal,
+    }
+    let surface = handle(&CreatedSurface {
+        tab_id: "t2".into(),
+        window_id: "w1".into(),
+        terminal_id: "u2".into(),
+    });
+    let cases = [
+        ("pending", vec![], Binding::Bound, Expect::Pass),
+        (
+            "receipt missing",
+            vec![ReceiptMissing],
+            Binding::Bound,
+            Expect::Text("missing Ghostty launch receipt"),
+        ),
+        (
+            "receipt damaged",
+            vec![ReceiptDamaged],
+            Binding::Bound,
+            Expect::Receipt,
+        ),
+        (
+            "receipt before status",
+            vec![ReceiptDamaged, StatusDamaged],
+            Binding::Bound,
+            Expect::Receipt,
+        ),
+        (
+            "status closed",
+            vec![StatusClosed],
+            Binding::Bound,
+            CANCELLED,
+        ),
+        (
+            "status failed",
+            vec![StatusFailed],
+            Binding::Bound,
+            CANCELLED,
+        ),
+        (
+            "status damaged",
+            vec![StatusDamaged],
+            Binding::Bound,
+            Expect::Status,
+        ),
+        // Close's window: the tombstone refuses before the status says closed.
+        ("tombstone", vec![Tombstone], Binding::Bound, CANCELLED),
+        (
+            "tombstone damaged",
+            vec![TombstoneDamaged],
+            Binding::Bound,
+            Expect::Tombstone,
+        ),
+        (
+            "receipt token",
+            vec![ReceiptToken],
+            Binding::Bound,
+            CANCELLED,
+        ),
+        ("spawning", vec![ReceiptSpawning], Binding::Bound, CANCELLED),
+        ("expired", vec![ReceiptExpired], Binding::Bound, CANCELLED),
+        ("claim absent", vec![ClaimAbsent], Binding::Bound, CANCELLED),
+        ("claim other", vec![ClaimOther], Binding::Bound, CANCELLED),
+        (
+            "claim unreadable",
+            vec![ClaimUnreadable],
+            Binding::Bound,
+            Expect::Claim,
+        ),
+        (
+            "status before spawning",
+            vec![ReceiptSpawning, StatusDamaged],
+            Binding::Bound,
+            Expect::Status,
+        ),
+        (
+            "phase before unreadable claim",
+            vec![ReceiptSpawning, ClaimUnreadable],
+            Binding::Bound,
+            CANCELLED,
+        ),
+        (
+            "tombstone before unreadable claim",
+            vec![Tombstone, ClaimUnreadable],
+            Binding::Bound,
+            CANCELLED,
+        ),
+        (
+            "unbound",
+            vec![],
+            Binding::Unbound,
+            Expect::Text("Ghostty surface is not bound"),
+        ),
+        (
+            "invalid binding",
+            vec![],
+            Binding::Invalid,
+            Expect::Text(
+                "invalid Ghostty surface binding: EOF while parsing an object at line 1 column 1",
+            ),
+        ),
+        (
+            "bound to another session",
+            vec![],
+            Binding::OtherSession,
+            Expect::Text("terminal handle belongs to managed session session-other, not {id}"),
+        ),
+        (
+            "bound to another terminal",
+            vec![],
+            Binding::OtherTerminal,
+            Expect::Text("the bound surface is not a Ghostty terminal"),
+        ),
+        (
+            "claim before binding",
+            vec![ClaimUnreadable],
+            Binding::Invalid,
+            Expect::Claim,
+        ),
+        (
+            "launch before binding",
+            vec![StatusClosed],
+            Binding::Unbound,
+            CANCELLED,
+        ),
+        (
+            "tombstone before binding",
+            vec![Tombstone],
+            Binding::Unbound,
+            CANCELLED,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, changes, binding, expect) in cases {
+        let directory = launch_fixture();
+        let path = directory.path();
+        let id = path.file_name().unwrap().to_str().unwrap().to_owned();
+        bind_fixture(path, &surface);
+        launch_command(path, ". '/launch.sh'", None).unwrap();
+        let store = crate::native::session::Store::open_unchecked(path);
+        let token = crate::native::session::launch::read(&store)
+            .unwrap()
+            .unwrap()
+            .claim_token;
+        let handle_path = path.join(TERMINAL_HANDLE_FILE);
+        match binding {
+            Binding::Bound => {}
+            Binding::Unbound => std::fs::remove_file(&handle_path).unwrap(),
+            Binding::Invalid => std::fs::write(&handle_path, b"{").unwrap(),
+            Binding::OtherSession => write_json_atomic(
+                &handle_path,
+                &serde_json::json!({ "terminal": "ghostty", "session_id": "u2", "tab_id": "t2", "window_id": "w1", "managed_session_id": "session-other" }),
+            )
+            .unwrap(),
+            Binding::OtherTerminal => write_json_atomic(
+                &handle_path,
+                &serde_json::json!({ "terminal": "iterm2", "session_id": "u2", "managed_session_id": id }),
+            )
+            .unwrap(),
+        }
+        apply(&store, &changes);
+        let expected = match expect {
+            Expect::Text(text) => Some(text.replace("{id}", &id)),
+            other => other.error(&store),
+        };
+        let actual = verify_launch(path, &token)
+            .err()
+            .map(|error| format!("{error:#}"));
+        if actual != expected {
+            failures.push(format!("{case}: {actual:?} != {expected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -1475,11 +1475,12 @@ fn the_gate_of_the_pane_is_a_command_that_the_executable_routes_here() {
 // A session directory as a launch leaves it while it waits for its terminal: private,
 // status `launching`, the claim and the pending receipt.
 fn launch_fixture() -> tempfile::TempDir {
-    super::super::test_support::launch_fixture(
+    crate::native::session::launch::test_support::pending_launch(
         "session-wezterm-",
-        std::time::Duration::from_secs(20),
         &std::env::temp_dir(),
+        std::time::Duration::from_secs(20),
     )
+    .0
 }
 
 // What the launcher's bind does with the created surface.

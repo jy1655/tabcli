@@ -1,5 +1,6 @@
 use super::*;
-use crate::native::terminal::macos::{iterm2, test_support, wezterm};
+use crate::native::session::CoreRecord;
+use crate::native::terminal::macos::{iterm2, wezterm};
 use std::{
     fs,
     io::Write,
@@ -170,7 +171,8 @@ fn executable(root: &Path) -> std::path::PathBuf {
 
 fn pty_regression(kind: TerminalKind) {
     let root = tempfile::tempdir().unwrap();
-    let directory = test_support::launch_fixture("session-", Duration::from_secs(10), root.path());
+    let directory =
+        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(directory.path());
     let receipt = launch::read(&store).unwrap().unwrap();
     host::initialize(
@@ -247,7 +249,8 @@ fn wezterm_production_bootstrap_bypasses_startup_key_read_and_flushes_capture_in
 #[test]
 fn capture_failure_is_recorded_while_binding_is_absent() {
     let root = tempfile::tempdir().unwrap();
-    let dir = test_support::launch_fixture("session-", Duration::from_secs(10), root.path());
+    let dir =
+        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(dir.path());
     let receipt = launch::read(&store).unwrap().unwrap();
     host::initialize(&store, &receipt.claim_token, host::Terminal::Iterm2).unwrap();
@@ -279,7 +282,8 @@ fn capture_failure_is_recorded_while_binding_is_absent() {
 #[test]
 fn binding_failure_is_recorded_while_capture_is_still_running() {
     let root = tempfile::tempdir().unwrap();
-    let dir = test_support::launch_fixture("session-", Duration::from_secs(10), root.path());
+    let dir =
+        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(dir.path());
     let receipt = launch::read(&store).unwrap().unwrap();
     host::initialize(&store, &receipt.claim_token, host::Terminal::Iterm2).unwrap();
@@ -311,7 +315,8 @@ fn binding_failure_is_recorded_while_capture_is_still_running() {
 #[test]
 fn binding_timeout_is_retained_after_receipt_expiry() {
     let root = tempfile::tempdir().unwrap();
-    let dir = test_support::launch_fixture("session-", Duration::from_secs(3), root.path());
+    let dir =
+        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(3)).0;
     let store = Store::open_unchecked(dir.path());
     let receipt = launch::read(&store).unwrap().unwrap();
     host::initialize(&store, &receipt.claim_token, host::Terminal::Iterm2).unwrap();
@@ -337,4 +342,147 @@ fn binding_timeout_is_retained_after_receipt_expiry() {
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("binding timeout was not retained for the expired, still current receipt");
+}
+
+#[test]
+fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
+    use crate::native::session::launch::test_support::{Change::*, Expect, apply};
+    const NOT: Expect = Expect::Text("launch host is no longer eligible");
+    let identity = host::HostIdentity {
+        pid: 123,
+        start_seconds: 1234,
+        start_microseconds: 5,
+    };
+    let other = host::HostIdentity {
+        pid: 124,
+        ..identity
+    };
+    let cases = [
+        ("admitted", vec![], identity, Expect::Pass),
+        (
+            "receipt missing",
+            vec![ReceiptMissing],
+            identity,
+            Expect::Text("missing launch receipt"),
+        ),
+        (
+            "receipt damaged",
+            vec![ReceiptDamaged],
+            identity,
+            Expect::Receipt,
+        ),
+        (
+            "receipt before status",
+            vec![ReceiptDamaged, StatusDamaged],
+            identity,
+            Expect::Receipt,
+        ),
+        ("receipt token", vec![ReceiptToken], identity, NOT),
+        ("spawning", vec![ReceiptSpawning], identity, NOT),
+        ("expired", vec![ReceiptExpired], identity, NOT),
+        ("status closed", vec![StatusClosed], identity, NOT),
+        (
+            "status damaged",
+            vec![StatusDamaged],
+            identity,
+            Expect::Status,
+        ),
+        ("tombstone", vec![Tombstone], identity, NOT),
+        (
+            "tombstone damaged",
+            vec![TombstoneDamaged],
+            identity,
+            Expect::Tombstone,
+        ),
+        ("claim absent", vec![ClaimAbsent], identity, NOT),
+        ("claim other", vec![ClaimOther], identity, NOT),
+        (
+            "claim unreadable",
+            vec![ClaimUnreadable],
+            identity,
+            Expect::Claim,
+        ),
+        ("another incarnation", vec![], other, NOT),
+        (
+            "damaged status with spawning",
+            vec![ReceiptSpawning, StatusDamaged],
+            identity,
+            Expect::Status,
+        ),
+        (
+            "damaged status with expiry",
+            vec![ReceiptExpired, StatusDamaged],
+            identity,
+            Expect::Status,
+        ),
+        (
+            "damaged tombstone with spawning",
+            vec![ReceiptSpawning, TombstoneDamaged],
+            identity,
+            Expect::Tombstone,
+        ),
+        (
+            "unreadable claim before the host record",
+            vec![ClaimUnreadable],
+            other,
+            Expect::Claim,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, changes, caller, expect) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let directory =
+            launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10))
+                .0;
+        let store = Store::open_unchecked(directory.path());
+        let token = launch::read(&store).unwrap().unwrap().claim_token;
+        host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+        host::admit(&store, &token, identity).unwrap();
+        apply(&store, &changes);
+        let expected = expect.error(&store);
+        let actual = host::eligible_incarnation(&store, &token, caller)
+            .err()
+            .map(|error| format!("{error:#}"));
+        if actual != expected {
+            failures.push(format!("{case}: {actual:?} != {expected:?}"));
+        }
+    }
+    // A host record that does not name this admitted, unfailed incarnation.
+    for case in ["unadmitted", "failed", "damaged"] {
+        let root = tempfile::tempdir().unwrap();
+        let directory =
+            launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10))
+                .0;
+        let store = Store::open_unchecked(directory.path());
+        let token = launch::read(&store).unwrap().unwrap().claim_token;
+        host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+        match case {
+            "unadmitted" => {}
+            "failed" => {
+                host::admit(&store, &token, identity).unwrap();
+                host::fail(
+                    &store,
+                    &token,
+                    Some(identity),
+                    host::Failure {
+                        reason: host::FailureReason::CaptureTimeout,
+                        exit_code: None,
+                        signal: None,
+                    },
+                    1,
+                    None,
+                )
+                .unwrap();
+            }
+            "damaged" => fs::write(store.record(CoreRecord::LaunchHost).path(), b"{").unwrap(),
+            _ => unreachable!(),
+        }
+        let actual = host::eligible_incarnation(&store, &token, identity)
+            .err()
+            .map(|error| format!("{error:#}"));
+        if actual.as_deref() != Some("launch host is no longer eligible") {
+            failures.push(format!("{case}: {actual:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

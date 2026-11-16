@@ -1,6 +1,5 @@
 use super::{MacTerminalAdapter, OwnedSurfaceClose};
-use crate::native::session::primitives::set_private_directory_permissions;
-use crate::native::session::{SessionState, Store, launch, turn, update_status};
+use crate::native::session::launch;
 use crate::native::settings::MacosOpenMode;
 use crate::native::terminal::{CloseOutcome, TerminalSendResult, TerminalSession};
 use anyhow::Result;
@@ -63,23 +62,6 @@ impl MacTerminalAdapter for Unused {
     ) -> Result<CloseOutcome> {
         self.reached("close_owned_session")
     }
-}
-
-pub(super) fn launch_fixture(prefix: &str, timeout: Duration, parent: &Path) -> tempfile::TempDir {
-    let directory = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(parent)
-        .unwrap();
-    // On macOS this is exactly set_permissions(Permissions::from_mode(0o700)).
-    set_private_directory_permissions(directory.path()).unwrap();
-    std::fs::create_dir(directory.path().join("events")).unwrap();
-    update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-    let store = Store::open_unchecked(directory.path());
-    let claim = turn::claim(&store, &[]).unwrap();
-    let token = claim.token().to_owned();
-    claim.retain();
-    launch::begin(&store, &token, Instant::now() + timeout).unwrap();
-    directory
 }
 
 // Let zsh decode the actual builder's quoting, without running the host or wrapper.

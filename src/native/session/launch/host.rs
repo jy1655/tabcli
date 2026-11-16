@@ -1,9 +1,9 @@
 //! Launch-owned host diagnostics. Writers take the lifecycle lock themselves; readers
 //! attribute history to the receipt, never to a later live claim.
-use super::{Phase, Record};
+use super::Record;
+use super::pending::{self, Expiry};
 use crate::native::session::primitives::unix_ms;
-use crate::native::session::state::SessionState;
-use crate::native::session::{CoreRecord, Reader, Store, record, turn};
+use crate::native::session::{CoreRecord, Reader, Store, record};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -127,15 +127,15 @@ pub(in crate::native) fn judge(
     }
 }
 
+// The Pending launch of `token`; `require_time` adds the receipt's deadline.
 fn eligible(store: &Store, token: &str, require_time: bool) -> Result<Record> {
     let receipt = super::read(store)?.context("missing launch receipt")?;
-    if receipt.claim_token != token
-        || receipt.phase != Phase::Pending
-        || (require_time && unix_ms() >= receipt.deadline_unix_ms)
-        || store.status()?.state != SessionState::Launching
-        || store.closed_if_present()?.is_some()
-        || turn::current_claim_token(store)?.as_deref() != Some(token)
-    {
+    let expiry = if require_time {
+        Expiry::Receipt
+    } else {
+        Expiry::Unchecked
+    };
+    if pending::judge(store, &receipt, token, expiry)?.is_err() {
         bail!("launch host is no longer eligible");
     }
     Ok(receipt)
@@ -182,6 +182,8 @@ pub(in crate::native) fn initialize(store: &Store, token: &str, terminal: Termin
     )
 }
 
+// `current` and the writers below serve the macOS launch host; no other platform has one.
+#[cfg(any(target_os = "macos", test))]
 fn current(store: &Store, token: &str, require_time: bool) -> Result<HostRecord> {
     let receipt = eligible(store, token, require_time)?;
     match observe(store, Some(&receipt)) {
@@ -190,7 +192,28 @@ fn current(store: &Store, token: &str, require_time: bool) -> Result<HostRecord>
     }
 }
 
+/// The admitted host `identity` may still act for the Pending launch of `token`: the launch
+/// is pending before its deadline, and the host record names that incarnation and no
+/// failure. The terminal host checks this under the lifecycle lock before each act.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn eligible_incarnation(
+    store: &Store,
+    token: &str,
+    identity: HostIdentity,
+) -> Result<()> {
+    let receipt = eligible(store, token, true)?;
+    match observe(store, Some(&receipt)) {
+        HostObservation::Recorded(host)
+            if host.host == Some(identity) && host.failure.is_none() =>
+        {
+            Ok(())
+        }
+        _ => bail!("launch host is no longer eligible"),
+    }
+}
+
 /// Even the same incarnation cannot admit twice. Callers must retain the first result.
+#[cfg(any(target_os = "macos", test))]
 pub(in crate::native) fn admit(store: &Store, token: &str, identity: HostIdentity) -> Result<()> {
     let _lock = store.lock()?;
     let mut host = current(store, token, true)?;
@@ -204,6 +227,7 @@ pub(in crate::native) fn admit(store: &Store, token: &str, identity: HostIdentit
 }
 
 /// Only counters enter this API; neither environment values nor startup output can enter.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 pub(in crate::native) struct Progress {
     pub(in crate::native) elapsed_ms: u64,
@@ -213,6 +237,7 @@ pub(in crate::native) struct Progress {
     pub(in crate::native) background_children_stopped: Option<u32>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(in crate::native) fn advance(
     store: &Store,
     token: &str,
@@ -239,6 +264,7 @@ pub(in crate::native) fn advance(
 /// over an admitted incarnation. Failure is final and preserves the last stage.
 /// Expiry withholds launch authority but does not discard its failure diagnosis;
 /// the current pending claim and unsettled, unclosed session are still required.
+#[cfg(any(target_os = "macos", test))]
 pub(in crate::native) fn fail(
     store: &Store,
     token: &str,
@@ -263,22 +289,16 @@ pub(in crate::native) fn fail(
 
 #[cfg(test)]
 mod tests {
+    use super::super::Phase;
     use super::*;
-    use std::time::{Duration, Instant};
+    use crate::native::session::SessionState;
+    use std::time::Duration;
     fn fixture() -> (tempfile::TempDir, Store, String) {
-        let dir = tempfile::Builder::new()
-            .prefix("session-")
-            .tempdir()
-            .unwrap();
-        std::fs::create_dir(dir.path().join("events")).unwrap();
-        crate::native::session::update_status(dir.path(), SessionState::Launching, None, None)
-            .unwrap();
-        let store = Store::open_unchecked(dir.path());
-        let claim = turn::claim(&store, &[]).unwrap();
-        let token = claim.token().to_owned();
-        claim.retain();
-        super::super::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
-        (dir, store, token)
+        super::super::test_support::pending_launch(
+            "session-",
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+        )
     }
     fn identity() -> HostIdentity {
         HostIdentity {
@@ -528,6 +548,179 @@ mod tests {
             read(&store).failure.unwrap().reason,
             FailureReason::BindingTimeout
         );
+    }
+    #[test]
+    fn eligibility_reports_the_first_failing_fact_in_one_order() {
+        use super::super::test_support::{Change::*, Expect, apply};
+        const NOT: Expect = Expect::Text("launch host is no longer eligible");
+        let cases = [
+            ("pending", vec![], true, Expect::Pass),
+            (
+                "receipt missing",
+                vec![ReceiptMissing],
+                true,
+                Expect::Text("missing launch receipt"),
+            ),
+            (
+                "receipt damaged",
+                vec![ReceiptDamaged],
+                true,
+                Expect::Receipt,
+            ),
+            (
+                "receipt before status",
+                vec![ReceiptDamaged, StatusDamaged],
+                true,
+                Expect::Receipt,
+            ),
+            ("receipt token", vec![ReceiptToken], true, NOT),
+            ("spawning", vec![ReceiptSpawning], true, NOT),
+            ("expired", vec![ReceiptExpired], true, NOT),
+            (
+                "expired without time",
+                vec![ReceiptExpired],
+                false,
+                Expect::Pass,
+            ),
+            ("status closed", vec![StatusClosed], true, NOT),
+            ("status failed", vec![StatusFailed], true, NOT),
+            ("status damaged", vec![StatusDamaged], true, Expect::Status),
+            ("tombstone", vec![Tombstone], true, NOT),
+            (
+                "tombstone damaged",
+                vec![TombstoneDamaged],
+                true,
+                Expect::Tombstone,
+            ),
+            (
+                "tombstone directory",
+                vec![TombstoneDirectory],
+                true,
+                Expect::Tombstone,
+            ),
+            ("claim absent", vec![ClaimAbsent], true, NOT),
+            ("claim other", vec![ClaimOther], true, NOT),
+            (
+                "claim unreadable",
+                vec![ClaimUnreadable],
+                true,
+                Expect::Claim,
+            ),
+            // The status and the tombstone are read before the receipt is judged.
+            (
+                "damaged status with spawning",
+                vec![ReceiptSpawning, StatusDamaged],
+                true,
+                Expect::Status,
+            ),
+            (
+                "damaged status with receipt token",
+                vec![ReceiptToken, StatusDamaged],
+                true,
+                Expect::Status,
+            ),
+            (
+                "damaged status with expiry",
+                vec![ReceiptExpired, StatusDamaged],
+                true,
+                Expect::Status,
+            ),
+            (
+                "damaged status with expiry without time",
+                vec![ReceiptExpired, StatusDamaged],
+                false,
+                Expect::Status,
+            ),
+            (
+                "damaged tombstone with spawning",
+                vec![ReceiptSpawning, TombstoneDamaged],
+                true,
+                Expect::Tombstone,
+            ),
+            (
+                "damaged tombstone with expiry",
+                vec![ReceiptExpired, TombstoneDamaged],
+                true,
+                Expect::Tombstone,
+            ),
+            (
+                "status before damaged tombstone",
+                vec![StatusClosed, TombstoneDamaged],
+                true,
+                NOT,
+            ),
+            (
+                "phase before unreadable claim",
+                vec![ReceiptSpawning, ClaimUnreadable],
+                true,
+                NOT,
+            ),
+            (
+                "status before unreadable claim",
+                vec![StatusClosed, ClaimUnreadable],
+                true,
+                NOT,
+            ),
+            (
+                "tombstone before unreadable claim",
+                vec![Tombstone, ClaimUnreadable],
+                true,
+                NOT,
+            ),
+            (
+                "expiry before unreadable claim",
+                vec![ReceiptExpired, ClaimUnreadable],
+                true,
+                NOT,
+            ),
+            (
+                "unreadable claim without time",
+                vec![ReceiptExpired, ClaimUnreadable],
+                false,
+                Expect::Claim,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, changes, require_time, expect) in cases {
+            let (_dir, store, token) = fixture();
+            apply(&store, &changes);
+            let expected = expect.error(&store);
+            let actual = eligible(&store, &token, require_time)
+                .err()
+                .map(|error| format!("{error:#}"));
+            if actual != expected {
+                failures.push(format!("{case}: {actual:?} != {expected:?}"));
+            }
+        }
+        // The host record is judged only for a pending launch.
+        for (case, initialized, changes, expected) in [
+            (
+                "not recorded",
+                false,
+                vec![],
+                Some("launch host record is unavailable or terminal"),
+            ),
+            ("recorded", true, vec![], None),
+            (
+                "pending before record",
+                false,
+                vec![ReceiptSpawning],
+                Some("launch host is no longer eligible"),
+            ),
+        ] {
+            let (_dir, store, token) = fixture();
+            if initialized {
+                initialize(&store, &token, Terminal::Iterm2).unwrap();
+            }
+            apply(&store, &changes);
+            let actual = current(&store, &token, true)
+                .err()
+                .map(|error| format!("{error:#}"));
+            if actual.as_deref() != expected {
+                failures.push(format!("current {case}: {actual:?} != {expected:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
     #[test]
     fn concurrent_admission_has_exactly_one_winner() {
