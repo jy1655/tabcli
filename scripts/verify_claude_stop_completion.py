@@ -62,14 +62,14 @@ def records(path):
 def read_core_record(path):
     """A Bridge session record under Bridge's core read policy: None when it is missing; a
     link, dangling or not, or any other entry that is not a regular file is refused; the
-    bytes are decoded as strict UTF-8."""
+    text is decoded as strict UTF-8 with read_text()'s universal newlines."""
     try:
         metadata = os.lstat(path)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(metadata.st_mode):
         raise RuntimeError(f"refusing non-regular session file: {path}")
-    return Path(path).read_bytes().decode("utf-8")
+    return Path(path).read_text(encoding="utf-8")
 
 
 def owned_sessions(state):

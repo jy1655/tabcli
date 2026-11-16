@@ -130,6 +130,9 @@ class CoreRecordReadTests(unittest.TestCase):
             self.assertIsNone(probe.read_core_record(record))
             record.write_bytes(b'{"terminal":"iterm2"}')
             self.assertEqual(probe.read_core_record(record), '{"terminal":"iterm2"}')
+            # Universal newlines as read_text() had them, so a JSON diagnostic keeps its offsets.
+            record.write_bytes(b'{\r\n"terminal": }')
+            self.assertEqual(probe.read_core_record(record), '{\n"terminal": }')
             record.write_bytes(b'{"terminal":"iterm2","extra":"\xff"}')
             with self.assertRaises(UnicodeDecodeError):
                 probe.read_core_record(record)
