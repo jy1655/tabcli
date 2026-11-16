@@ -18,6 +18,10 @@ pub(in crate::native) const WEZTERM_HOST_COMMAND: &str =
 pub(in crate::native) const CONSOLE_HOST_COMMAND: &str =
     TerminalKind::WindowsConsole.registration().host_command;
 
+/// The flag that hands a launch host the command it runs on its bound terminal. Only the host
+/// command of a kind that uses the launch host takes it.
+pub(in crate::native) const LAUNCH_COMMAND_FLAG: &str = "--launch-command";
+
 // The kind whose registered host command is the name.
 fn kind_of(command: &str) -> Option<TerminalKind> {
     TerminalKind::ALL
@@ -27,34 +31,42 @@ fn kind_of(command: &str) -> Option<TerminalKind> {
 
 #[derive(Debug)]
 pub(crate) enum HostCommand {
-    Console { directory: PathBuf },
-    Iterm2 { directory: PathBuf },
-    AppleTerminal { directory: PathBuf },
-    WezTerm { directory: PathBuf },
-    Iterm2Launch { directory: PathBuf, command: String },
-    WezTermLaunch { directory: PathBuf, command: String },
+    Console {
+        directory: PathBuf,
+    },
+    Iterm2 {
+        directory: PathBuf,
+    },
+    AppleTerminal {
+        directory: PathBuf,
+    },
+    WezTerm {
+        directory: PathBuf,
+    },
+    /// The launch host of a kind that uses one, with the command it hands its surface to.
+    Launch {
+        kind: TerminalKind,
+        directory: PathBuf,
+        command: String,
+    },
     Ghostty,
-    Warp { directory: PathBuf, attempt: String },
+    Warp {
+        directory: PathBuf,
+        attempt: String,
+    },
 }
 
 pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCommand> {
-    if matches!(
-        kind_of(command),
-        Some(TerminalKind::Iterm2 | TerminalKind::WezTerm)
-    ) && let [_, flag, launch_command] = rest
-        && flag == "--launch-command"
+    if let Some(kind) = kind_of(command)
+        && kind.uses_launch_host()
+        && let [_, flag, launch_command] = rest
+        && flag == LAUNCH_COMMAND_FLAG
     {
-        return match parse_directory_host(command, kind_of(command), &rest[..1])? {
-            HostCommand::Iterm2 { directory } => Ok(HostCommand::Iterm2Launch {
-                directory,
-                command: launch_command.clone(),
-            }),
-            HostCommand::WezTerm { directory } => Ok(HostCommand::WezTermLaunch {
-                directory,
-                command: launch_command.clone(),
-            }),
-            _ => unreachable!(),
-        };
+        return Ok(HostCommand::Launch {
+            kind,
+            directory: session_directory(command, &rest[..1])?,
+            command: launch_command.clone(),
+        });
     }
     match kind_of(command) {
         Some(TerminalKind::Ghostty) => parse_ghostty_host(rest),
@@ -63,13 +75,9 @@ pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCom
     }
 }
 
-fn parse_directory_host(
-    command: &str,
-    kind: Option<TerminalKind>,
-    rest: &[String],
-) -> Result<HostCommand> {
-    // The tab's process does not necessarily inherit the state root, so it is
-    // given the session directory itself.
+// The tab's process does not necessarily inherit the state root, so it is given the session
+// directory itself.
+fn session_directory(command: &str, rest: &[String]) -> Result<PathBuf> {
     let directory = PathBuf::from(one_positional(
         rest,
         &format!("{command} requires one session directory"),
@@ -82,6 +90,15 @@ fn parse_directory_host(
     if !directory.is_absolute() {
         bail!("{command} requires an absolute session directory");
     }
+    Ok(directory)
+}
+
+fn parse_directory_host(
+    command: &str,
+    kind: Option<TerminalKind>,
+    rest: &[String],
+) -> Result<HostCommand> {
+    let directory = session_directory(command, rest)?;
     match kind {
         Some(TerminalKind::Iterm2) => Ok(HostCommand::Iterm2 { directory }),
         Some(TerminalKind::AppleTerminal) => Ok(HostCommand::AppleTerminal { directory }),
@@ -126,12 +143,11 @@ fn parse_warp_host(rest: &[String]) -> Result<HostCommand> {
 
 pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
     match command {
-        HostCommand::Iterm2Launch { directory, command } => {
-            run_launch_host(directory, command, TerminalKind::Iterm2)
-        }
-        HostCommand::WezTermLaunch { directory, command } => {
-            run_launch_host(directory, command, TerminalKind::WezTerm)
-        }
+        HostCommand::Launch {
+            kind,
+            directory,
+            command,
+        } => run_launch_host(directory, command, kind),
         HostCommand::Console { directory } => {
             #[cfg(target_os = "windows")]
             {
@@ -247,8 +263,7 @@ mod tests {
             )
             .unwrap();
             match parsed {
-                HostCommand::Iterm2Launch { command, .. }
-                | HostCommand::WezTermLaunch { command, .. } => {
+                HostCommand::Launch { command, .. } => {
                     assert_eq!(command, ". 'quoted $$ script'")
                 }
                 _ => panic!("lost launch command"),
@@ -275,6 +290,109 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    // Every kind's host command, given the launch form and its malformed shapes: only a
+    // launch host command takes it, and every refusal keeps its command's own text.
+    #[test]
+    fn launch_form_is_taken_only_by_launch_host_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-args");
+        let directory = directory.to_str().unwrap();
+        let invalid = root.path().join("invalid id");
+        let invalid = invalid.to_str().unwrap();
+        let mut actual = Vec::new();
+        for kind in TerminalKind::ALL {
+            let command = kind.registration().host_command;
+            for rest in [
+                vec![directory, "--launch-command", "script"],
+                vec![directory, "--launch-command"],
+                vec![directory, "--other", "script"],
+                vec![directory, "--launch-command", "script", "extra"],
+                vec!["session-relative", "--launch-command", "script"],
+                vec![invalid, "--launch-command", "script"],
+                vec![directory],
+            ] {
+                let shape = rest.len();
+                let rest: Vec<String> = rest.into_iter().map(Into::into).collect();
+                let outcome = match parse(command, &rest) {
+                    Ok(HostCommand::Launch {
+                        kind,
+                        directory,
+                        command,
+                    }) => format!("launch {} {} {command}", kind.as_str(), directory.display()),
+                    Ok(HostCommand::Iterm2 { directory }) => {
+                        format!("host iterm2 {}", directory.display())
+                    }
+                    Ok(HostCommand::AppleTerminal { directory }) => {
+                        format!("host apple-terminal {}", directory.display())
+                    }
+                    Ok(HostCommand::WezTerm { directory }) => {
+                        format!("host wezterm {}", directory.display())
+                    }
+                    Ok(HostCommand::Console { directory }) => {
+                        format!("host windows-console {}", directory.display())
+                    }
+                    Ok(HostCommand::Ghostty) => "host ghostty".into(),
+                    Ok(HostCommand::Warp { directory, attempt }) => {
+                        format!("host warp {} {attempt}", directory.display())
+                    }
+                    Err(error) => format!("refused: {error:#}"),
+                };
+                actual.push(
+                    format!("{command} [{shape}] {outcome}")
+                        .replace(directory, "<dir>")
+                        .replace(invalid, "<invalid>"),
+                );
+            }
+        }
+        let refusals = |command: &str, text: &str| {
+            [3, 2, 3, 4, 3, 3].map(|shape| format!("{command} [{shape}] refused: {text}"))
+        };
+        let launch_host = |command: &str, kind: &str| {
+            [
+                format!("{command} [3] launch {kind} <dir> script"),
+                format!("{command} [2] refused: {command} requires one session directory"),
+                format!("{command} [3] refused: {command} requires one session directory"),
+                format!("{command} [4] refused: {command} requires one session directory"),
+                format!("{command} [3] refused: {command} requires an absolute session directory"),
+                format!("{command} [3] refused: invalid Agent Bridge session id: \"invalid id\""),
+                format!("{command} [1] host {kind} <dir>"),
+            ]
+        };
+        let directory_host = |command: &str, kind: &str| {
+            let mut lines = refusals(
+                command,
+                &format!("{command} requires one session directory"),
+            )
+            .to_vec();
+            lines.push(format!("{command} [1] host {kind} <dir>"));
+            lines
+        };
+        let mut ghostty = refusals(
+            GHOSTTY_HOST_COMMAND,
+            "native-ghostty-host takes no argument",
+        )
+        .to_vec();
+        ghostty.push(format!(
+            "{GHOSTTY_HOST_COMMAND} [1] refused: native-ghostty-host takes no argument"
+        ));
+        let pair = "native-warp-host requires a session directory and attempt token";
+        let mut warp = refusals(WARP_HOST_COMMAND, pair).to_vec();
+        warp[1] = format!(
+            "{WARP_HOST_COMMAND} [2] refused: native-warp-host requires a valid attempt token"
+        );
+        warp.push(format!("{WARP_HOST_COMMAND} [1] refused: {pair}"));
+        let expected: Vec<String> = [
+            launch_host(ITERM2_HOST_COMMAND, "iterm2").to_vec(),
+            directory_host(APPLE_TERMINAL_HOST_COMMAND, "apple-terminal"),
+            ghostty,
+            warp,
+            launch_host(WEZTERM_HOST_COMMAND, "wezterm").to_vec(),
+            directory_host(CONSOLE_HOST_COMMAND, "windows-console"),
+        ]
+        .concat();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -307,6 +425,21 @@ mod tests {
             (
                 vec![GHOSTTY_HOST_COMMAND],
                 "the native Ghostty host is only available on macOS",
+            ),
+            #[cfg(not(target_os = "macos"))]
+            (
+                vec![ITERM2_HOST_COMMAND, directory, "--launch-command", "script"],
+                "native launch hosts are only available on macOS",
+            ),
+            #[cfg(not(target_os = "macos"))]
+            (
+                vec![
+                    WEZTERM_HOST_COMMAND,
+                    directory,
+                    "--launch-command",
+                    "script",
+                ],
+                "native launch hosts are only available on macOS",
             ),
             #[cfg(not(target_os = "macos"))]
             (

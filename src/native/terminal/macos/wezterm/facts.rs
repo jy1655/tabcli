@@ -1,5 +1,5 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, LaunchHostFacts, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 #[cfg(target_os = "macos")]
@@ -13,6 +13,10 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-wezterm-host",
+    launch_host: Some(LaunchHostFacts {
+        #[cfg(target_os = "macos")]
+        binding_names_host: crate::native::terminal::macos::wezterm::binding_names_this_host,
+    }),
     close_evidence: CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext,
     // WezTerm reads its screen through `get-text`; only the one-call dialog answer is missing.
     screen_read_refusal: None,

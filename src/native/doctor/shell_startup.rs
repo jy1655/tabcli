@@ -39,7 +39,7 @@ pub(super) fn launch_stage_check(
                     Reason::LAUNCH_HOST_FAILED,
                     format!(
                         "The {} launch host failed after stage {}: {}.",
-                        terminal_name(host),
+                        host.terminal.display_name(),
                         stage_name(host.stage),
                         failure_text(failure, host)
                     ),
@@ -53,7 +53,7 @@ pub(super) fn launch_stage_check(
                         Reason::LAUNCH_STAGE_OBSERVED,
                         format!(
                             "The {} launch host recorded stage {}; the shell environment was prepared without a terminal.",
-                            terminal_name(host),
+                            host.terminal.display_name(),
                             stage_name(host.stage)
                         ),
                         "No host action is needed; inspect the provider and request records for later stages.",
@@ -66,7 +66,7 @@ pub(super) fn launch_stage_check(
                     Reason::LAUNCH_STAGE_OBSERVED,
                     format!(
                         "The last recorded stage of the {} launch host is {}. A retained earlier stage does not prove that the step is still running.",
-                        terminal_name(host),
+                        host.terminal.display_name(),
                         stage_name(host.stage)
                     ),
                     format!("Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline`. {probe}"),
@@ -75,7 +75,7 @@ pub(super) fn launch_stage_check(
             }
         }
         HostObservation::NotRecorded => match known_terminal {
-            Some(kind) if !host_terminal(kind) => not_applicable(kind),
+            Some(kind) if !kind.uses_launch_host() => not_applicable(kind),
             _ if !cfg!(target_os = "macos") => Check::new(
                 CheckId::LAUNCH_STAGE,
                 Unavailable,
@@ -126,17 +126,6 @@ fn not_applicable(kind: TerminalKind) -> Check {
         "No action is needed.",
     )
     .evidence(json!({"terminal": kind}))
-}
-
-pub(super) fn host_terminal(kind: TerminalKind) -> bool {
-    matches!(kind, TerminalKind::Iterm2 | TerminalKind::WezTerm)
-}
-
-fn terminal_name(host: &HostRecord) -> &'static str {
-    match host.terminal {
-        crate::native::session::launch::host::Terminal::Iterm2 => "iTerm2",
-        crate::native::session::launch::host::Terminal::Wezterm => "WezTerm",
-    }
 }
 
 fn stage_name(stage: Stage) -> &'static str {
@@ -260,7 +249,7 @@ pub(super) fn shell_environment_check(
                 "Run doctor --provider PROVIDER --probe from the terminal you launch with.",
             );
         }
-        ProbeContext::Terminal(kind) if !cfg!(target_os = "macos") || !host_terminal(kind) => {
+        ProbeContext::Terminal(kind) if !cfg!(target_os = "macos") || !kind.uses_launch_host() => {
             return Check::new(
                 CheckId::SHELL_ENVIRONMENT,
                 Unavailable,
@@ -358,14 +347,14 @@ pub(super) fn run_probe(_deadline: Instant) -> (ProbeOutcome, Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::session::launch::host::{HostIdentity, Terminal};
+    use crate::native::session::launch::host::HostIdentity;
 
     fn host(stage: Stage, failure: Option<Failure>) -> HostRecord {
         HostRecord {
             schema: 1,
             managed_session_id: "session-abc".into(),
             claim_token: "token".into(),
-            terminal: Terminal::Iterm2,
+            terminal: TerminalKind::Iterm2,
             stage,
             host: (stage != Stage::AwaitingHost).then_some(HostIdentity {
                 pid: 10,
@@ -498,6 +487,116 @@ mod tests {
             assert_eq!(row["availability"], "unknown");
             assert_eq!(row["reason_code"], reason);
         }
+    }
+
+    // Each launch host terminal is named by its display name in every recorded branch,
+    // and by its wire word in the record evidence.
+    #[test]
+    fn launch_stage_names_each_launch_host_terminal() {
+        let mut actual = Vec::new();
+        for (terminal, name) in [
+            (TerminalKind::Iterm2, "iTerm2"),
+            (TerminalKind::WezTerm, "WezTerm"),
+        ] {
+            let named = |stage, failure| {
+                let mut record = host(stage, failure);
+                record.terminal = terminal;
+                record
+            };
+            for (record, owner) in [
+                (
+                    named(
+                        Stage::EnvironmentPreparing,
+                        Some(Failure {
+                            reason: FailureReason::CaptureExitNonzero,
+                            exit_code: Some(3),
+                            signal: None,
+                        }),
+                    ),
+                    false,
+                ),
+                (named(Stage::LaunchShellStarting, None), false),
+                (named(Stage::HostStarted, None), false),
+            ] {
+                let row = check(HostObservation::Recorded(record), None, owner);
+                actual.push(format!(
+                    "{name}: {} {} | {} | {}",
+                    row["availability"].as_str().unwrap(),
+                    row["reason_code"].as_str().unwrap(),
+                    row["detail"].as_str().unwrap(),
+                    row["evidence"]["record"]["terminal"]
+                ));
+            }
+        }
+        let expected = [
+            "iTerm2: unavailable launch_host_failed | The iTerm2 launch host failed after stage environment_preparing: capture_exit_nonzero, exit status 3. | \"iterm2\"",
+            "iTerm2: available launch_stage_observed | The iTerm2 launch host recorded stage launch_shell_starting; the shell environment was prepared without a terminal. | \"iterm2\"",
+            "iTerm2: unknown launch_stage_observed | The last recorded stage of the iTerm2 launch host is host_started. A retained earlier stage does not prove that the step is still running. | \"iterm2\"",
+            "WezTerm: unavailable launch_host_failed | The WezTerm launch host failed after stage environment_preparing: capture_exit_nonzero, exit status 3. | \"wezterm\"",
+            "WezTerm: available launch_stage_observed | The WezTerm launch host recorded stage launch_shell_starting; the shell environment was prepared without a terminal. | \"wezterm\"",
+            "WezTerm: unknown launch_stage_observed | The last recorded stage of the WezTerm launch host is host_started. A retained earlier stage does not prove that the step is still running. | \"wezterm\"",
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    // Only the launch host terminals are applicable; the others read the same text.
+    #[test]
+    fn launch_host_terminals_are_the_only_applicable_kinds() {
+        let mut actual = Vec::new();
+        for kind in TerminalKind::ALL {
+            let stage = check(HostObservation::NotRecorded, Some(kind), false);
+            let probe = probe(
+                ProbeContext::Terminal(kind),
+                Some((
+                    ProbeOutcome::Ready {
+                        elapsed: Duration::from_millis(1),
+                        variables: 1,
+                        background_children_stopped: 0,
+                    },
+                    Duration::from_secs(1),
+                )),
+            );
+            actual.push(format!(
+                "{kind:?}: {} | {} | {} | {} | probe ran {} {} | {}",
+                kind.uses_launch_host(),
+                stage["reason_code"].as_str().unwrap(),
+                stage["detail"].as_str().unwrap(),
+                stage["evidence"],
+                probe["ran"],
+                probe["reason_code"].as_str().unwrap(),
+                probe["detail"].as_str().unwrap(),
+            ));
+        }
+        const NOT_RECORDED: &str = "No launch host record is retained. A session from an earlier release, another terminal, or a launch that did not reach surface creation has none; absence is not evidence that the host never started.";
+        const NO_RECORDS: &str =
+            "Launch host records exist only for macOS iTerm2 and WezTerm launches.";
+        const NO_PROBE: &str =
+            "Only macOS iTerm2 and WezTerm launches prepare the shell environment this way.";
+        let host = |kind: &str| {
+            if cfg!(target_os = "macos") {
+                format!(
+                    "{kind}: true | launch_host_not_recorded | {NOT_RECORDED} | null | probe ran true shell_environment_ready | Your zsh startup files prepared 1 environment variables without a terminal in 1 ms."
+                )
+            } else {
+                format!(
+                    "{kind}: true | launch_stage_not_applicable | {NO_RECORDS} | null | probe ran false shell_environment_probe_not_applicable | {NO_PROBE}"
+                )
+            }
+        };
+        let other = |kind: &str, word: &str| {
+            format!(
+                "{kind}: false | launch_stage_not_applicable | {NO_RECORDS} | {{\"terminal\":\"{word}\"}} | probe ran false shell_environment_probe_not_applicable | {NO_PROBE}"
+            )
+        };
+        let expected = [
+            host("Iterm2"),
+            other("AppleTerminal", "apple-terminal"),
+            other("Ghostty", "ghostty"),
+            other("Warp", "warp"),
+            host("WezTerm"),
+            other("WindowsConsole", "windows-console"),
+        ];
+        assert_eq!(actual, expected);
     }
 
     fn probe(context: ProbeContext, outcome: Option<(ProbeOutcome, Duration)>) -> Value {

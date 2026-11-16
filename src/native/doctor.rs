@@ -180,7 +180,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     let mut session_terminal = None;
     let manifest = directory.as_ref().and_then(|directory| {
         let mut clock = SystemClock;
-        let (manifest, evidence) = record_checks(
+        let (manifest, evidence, launch_host) = record_checks(
             &Reader::open_unchecked(directory),
             request.session.as_deref().unwrap(),
             deadline,
@@ -201,7 +201,8 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             request.session.as_deref().unwrap(),
             &mut checks,
         );
-        session_terminal = recorded_terminal(&Reader::open_unchecked(directory), &evidence);
+        session_terminal =
+            recorded_terminal(&Reader::open_unchecked(directory), launch_host, &evidence);
         manifest
     });
     let provider = match manifest
@@ -333,19 +334,21 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
 }
 
 /// The terminal a session launched in, as its records name it: the launch host record of
-/// its receipt, then an active surface handle. Read after the snapshot is released.
+/// its receipt, then an active surface handle. `launch_host` is the host record that the
+/// session's Observation judged; a host record's terminal never changes once written. When
+/// no Observation could be read, the host record is read here, after the snapshot attempt,
+/// without its lock.
 fn recorded_terminal(
     reader: &Reader,
+    launch_host: Option<launch::host::HostObservation>,
     evidence: &SessionEvidence,
 ) -> Option<terminal::TerminalKind> {
-    let receipt = launch::read(reader).ok().flatten();
-    if let launch::host::HostObservation::Recorded(host) =
+    let launch_host = launch_host.unwrap_or_else(|| {
+        let receipt = launch::read(reader).ok().flatten();
         launch::host::observe(reader, receipt.as_ref())
-    {
-        return Some(match host.terminal {
-            launch::host::Terminal::Iterm2 => terminal::TerminalKind::Iterm2,
-            launch::host::Terminal::Wezterm => terminal::TerminalKind::WezTerm,
-        });
+    });
+    if let launch::host::HostObservation::Recorded(host) = launch_host {
+        return Some(host.terminal);
     }
     surface_kind(evidence)
 }
@@ -436,6 +439,8 @@ fn render_report(request: &DoctorRequest, started: u128, diagnosis: Diagnosis) -
     Ok(())
 }
 
+/// The session's record checks. Returns the manifest, the evidence, and the launch host
+/// record that the Observation judged (`None` when no Observation could be read).
 pub(super) fn record_checks(
     reader: &Reader,
     id: &str,
@@ -443,8 +448,12 @@ pub(super) fn record_checks(
     checks: &mut Vec<Check>,
     observations: &mut Value,
     environment: &mut OriginEnvironment<'_>,
-) -> (Option<SessionManifest>, SessionEvidence) {
-    let (manifest, evidence, surface, hold) = match Observation::read(reader) {
+) -> (
+    Option<SessionManifest>,
+    SessionEvidence,
+    Option<launch::host::HostObservation>,
+) {
+    let (manifest, evidence, surface, hold, launch_host) = match Observation::read(reader) {
         Ok(observation) => {
             session_checks(&observation, checks, observations);
             checks.push(shell_startup::launch_stage_check(
@@ -471,6 +480,7 @@ pub(super) fn record_checks(
                 records,
                 evidence,
                 judgments,
+                launch_host,
                 ..
             } = observation;
             (
@@ -478,6 +488,7 @@ pub(super) fn record_checks(
                 evidence,
                 judgments.surface,
                 judgments.hold,
+                Some(launch_host),
             )
         }
         Err(error) => {
@@ -500,13 +511,13 @@ pub(super) fn record_checks(
             } = PartialObservation::read(reader, id);
             cancel_check(&cancel, id, checks);
             unobserved_origin_check(id, checks);
-            (manifest, evidence, surface, hold)
+            (manifest, evidence, surface, hold, None)
         }
     };
     owner_check(evidence.judge_owner(), checks);
     terminal_check(&surface, checks);
     hold_check(&hold, id, checks);
-    (manifest, evidence)
+    (manifest, evidence, launch_host)
 }
 
 fn cancel_check(cancel: &Cancel, id: &str, checks: &mut Vec<Check>) {
@@ -1461,5 +1472,145 @@ mod attestation_tests {
         let row = owner_row(owner);
         assert_eq!(row[0], "unavailable");
         assert_eq!(row[1], "owner_identity_mismatch");
+    }
+}
+
+#[cfg(test)]
+mod launch_host_tests {
+    use super::*;
+    use crate::native::session::launch::host;
+    use crate::native::session::launch::test_support::{Change, apply, pending_launch};
+    use crate::native::session::{CoreRecord, Store};
+    use crate::native::terminal::TerminalKind;
+    use std::time::Duration;
+
+    /// The launch_stage check as [availability, reason, detail, evidence], and the terminal
+    /// the probe would run for, as doctor derives both for one session.
+    fn launch_view(reader: &Reader) -> (Value, Option<TerminalKind>) {
+        let mut checks = Vec::new();
+        let mut observations = json!({});
+        let mut clock = SystemClock;
+        let (_, evidence, launch_host) = record_checks(
+            reader,
+            "session-view",
+            Instant::now() + Duration::from_secs(5),
+            &mut checks,
+            &mut observations,
+            &mut OriginEnvironment::production(&mut clock),
+        );
+        let stage = checks
+            .iter()
+            .find(|check| check.id == "launch_stage")
+            .unwrap();
+        let stage = serde_json::to_value(stage).unwrap();
+        let evidence_terminal = match (
+            &stage["evidence"]["record"]["terminal"],
+            &stage["evidence"]["terminal"],
+        ) {
+            (Value::Null, terminal) => terminal.clone(),
+            (terminal, _) => terminal.clone(),
+        };
+        (
+            json!([
+                stage["availability"],
+                stage["reason_code"],
+                stage["detail"],
+                evidence_terminal
+            ]),
+            recorded_terminal(reader, launch_host, &evidence),
+        )
+    }
+
+    fn surface(store: &Store, kind: TerminalKind) {
+        store
+            .write_terminal(&terminal::TerminalSession {
+                kind,
+                id: "1".into(),
+                tab_id: None,
+                window_id: None,
+                managed_session_id: Some(
+                    store
+                        .directory()
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                ),
+                wezterm_mux: None,
+                windows_process_identity: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn launch_stage_and_probe_terminal_come_from_the_host_record_then_the_surface() {
+        let root = tempfile::tempdir().unwrap();
+        let mut actual = Vec::new();
+        for case in [
+            "iterm2",
+            "wezterm",
+            "none",
+            "ghostty surface",
+            "iterm2 with ghostty surface",
+            "identity mismatch",
+            "snapshot unreadable",
+            "snapshot and host unreadable",
+        ] {
+            let (directory, store, token) =
+                pending_launch("session-", root.path(), Duration::from_secs(30));
+            crate::native::session::test_support::write_test_manifest(directory.path(), "codex");
+            match case {
+                "iterm2"
+                | "iterm2 with ghostty surface"
+                | "identity mismatch"
+                | "snapshot unreadable"
+                | "snapshot and host unreadable" => {
+                    host::initialize(&store, &token, TerminalKind::Iterm2).unwrap()
+                }
+                "wezterm" => host::initialize(&store, &token, TerminalKind::WezTerm).unwrap(),
+                _ => {}
+            }
+            match case {
+                "ghostty surface" | "iterm2 with ghostty surface" => {
+                    surface(&store, TerminalKind::Ghostty)
+                }
+                "identity mismatch" => apply(&store, &[Change::ReceiptToken]),
+                "snapshot unreadable" => apply(&store, &[Change::StatusDamaged]),
+                "snapshot and host unreadable" => {
+                    apply(&store, &[Change::StatusDamaged]);
+                    std::fs::write(store.record(CoreRecord::LaunchHost).path(), b"{").unwrap();
+                }
+                _ => {}
+            }
+            let (stage, terminal) = launch_view(&Reader::open_unchecked(directory.path()));
+            actual.push(format!("{case}: {stage} {terminal:?}"));
+        }
+        const EARLIER: &str =
+            "A retained earlier stage does not prove that the step is still running.";
+        const UNJUDGED: &str = r#"["unknown","records_unreadable","No consistent session snapshot was available, so the launch host record was not judged.",null]"#;
+        let none = if cfg!(target_os = "macos") {
+            r#"["unknown","launch_host_not_recorded","No launch host record is retained. A session from an earlier release, another terminal, or a launch that did not reach surface creation has none; absence is not evidence that the host never started.",null]"#
+        } else {
+            r#"["unavailable","launch_stage_not_applicable","Launch host records exist only for macOS iTerm2 and WezTerm launches.",null]"#
+        };
+        let expected = [
+            format!(
+                r#"iterm2: ["unknown","launch_stage_observed","The last recorded stage of the iTerm2 launch host is awaiting_host. {EARLIER}","iterm2"] Some(Iterm2)"#
+            ),
+            format!(
+                r#"wezterm: ["unknown","launch_stage_observed","The last recorded stage of the WezTerm launch host is awaiting_host. {EARLIER}","wezterm"] Some(WezTerm)"#
+            ),
+            format!("none: {none} None"),
+            r#"ghostty surface: ["unavailable","launch_stage_not_applicable","Launch host records exist only for macOS iTerm2 and WezTerm launches.","ghostty"] Some(Ghostty)"#.to_owned(),
+            format!(
+                r#"iterm2 with ghostty surface: ["unknown","launch_stage_observed","The last recorded stage of the iTerm2 launch host is awaiting_host. {EARLIER}","iterm2"] Some(Iterm2)"#
+            ),
+            r#"identity mismatch: ["unknown","launch_host_identity_mismatch","The launch host record does not name this session's launch receipt, so it says nothing about this launch.",null] None"#.to_owned(),
+            // Without a snapshot the probe's terminal still comes from the host record.
+            format!("snapshot unreadable: {UNJUDGED} Some(Iterm2)"),
+            format!("snapshot and host unreadable: {UNJUDGED} None"),
+        ];
+        assert_eq!(actual, expected);
     }
 }

@@ -346,7 +346,7 @@ pub(super) fn host_command(executable: &Path, directory: &Path, command: &str) -
         executable.to_string_lossy().as_ref(),
         HOST_COMMAND,
         directory.to_string_lossy().as_ref(),
-        "--launch-command",
+        crate::native::terminal::host::LAUNCH_COMMAND_FLAG,
         command,
     ]
     .map(iterm_argument)
@@ -375,6 +375,35 @@ fn iterm_argument(value: &str) -> String {
     )
 }
 
+/// The iTerm2 session that a host runs in, as iTerm2 names it in the `ITERM_SESSION_ID` it
+/// gives the processes it starts: the part after the last colon.
+fn host_session(variable: Result<String, std::env::VarError>) -> Result<String> {
+    let iterm_id = variable.context("iTerm2 did not supply its session identity")?;
+    Ok(iterm_id
+        .rsplit(':')
+        .next()
+        .filter(|id| !id.is_empty())
+        .context("empty iTerm2 session identity")?
+        .to_owned())
+}
+
+/// Whether `surface` names the iTerm2 session `host`: the one rule by which both the legacy
+/// host and the launch host recognize their own surface.
+fn binding_names_host(surface: &TerminalSession, host: &str) -> bool {
+    surface.kind == TerminalKind::Iterm2 && surface.id == host
+}
+
+/// The iTerm2 session this process runs in.
+fn this_host_session() -> Result<String> {
+    host_session(std::env::var("ITERM_SESSION_ID"))
+}
+
+/// The launch host's check, registered for iTerm2: the bound surface names the session this
+/// process runs in. An absent or empty identity names no surface.
+pub(in crate::native::terminal) fn binding_names_this_host(surface: &TerminalSession) -> bool {
+    this_host_session().is_ok_and(|host| binding_names_host(surface, &host))
+}
+
 // Wait for restored selection and the exact returned UUID in the receipt and surface binding.
 // Failure or timeout never falls back to typed shell input.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
@@ -382,16 +411,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     run_tty_bound_host(
         directory,
         &BoundHostSpec { name: BINDING.host },
-        || {
-            let iterm_id = std::env::var("ITERM_SESSION_ID")
-                .context("iTerm2 did not supply its session identity")?;
-            Ok(iterm_id
-                .rsplit(':')
-                .next()
-                .filter(|id| !id.is_empty())
-                .context("empty iTerm2 session identity")?
-                .to_owned())
-        },
+        this_host_session,
         |directory, id, iterm_id| wait_for_binding(directory, id, iterm_id, &mut SystemClock),
         |outcome| {
             if let Err(error) = outcome {
@@ -412,12 +432,10 @@ fn wait_for_binding(
 ) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    super::bound_host::binding_names_host(
-        &surface,
-        TerminalKind::Iterm2,
-        |surface| surface.id == iterm_id,
-        "iTerm2 surface binding does not match this launch host",
-    )
+    if !binding_names_host(&surface, iterm_id) {
+        bail!("iTerm2 surface binding does not match this launch host");
+    }
+    Ok(())
 }
 
 fn send_file(
@@ -1008,7 +1026,7 @@ mod tests {
             ]
         );
         assert!(
-            matches!(crate::native::parse_args(args[1..].iter().cloned()).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Iterm2Launch { directory: actual, command }) if actual == directory && command == wrapper)
+            matches!(crate::native::parse_args(args[1..].iter().cloned()).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Launch { kind: TerminalKind::Iterm2, directory: actual, command }) if actual == directory && command == wrapper)
         );
     }
 
@@ -2297,6 +2315,93 @@ end run
             }),
         )
         .unwrap();
+    }
+
+    // The host's identity and the one rule both iTerm2 hosts use to recognize their surface,
+    // decided without a terminal.
+    #[test]
+    fn host_session_and_binding_rule_need_no_terminal() {
+        use std::env::VarError;
+        let session = |value: Result<String, VarError>| {
+            host_session(value).map_err(|error| format!("{error:#}"))
+        };
+        assert_eq!(session(Ok("w0t0p0:owned-id".into())), Ok("owned-id".into()));
+        assert_eq!(session(Ok("owned-id".into())), Ok("owned-id".into()));
+        assert_eq!(session(Ok("a:b:owned-id".into())), Ok("owned-id".into()));
+        for empty in ["w0t0p0:", ""] {
+            assert_eq!(
+                session(Ok(empty.into())),
+                Err("empty iTerm2 session identity".into())
+            );
+        }
+        assert_eq!(
+            session(Err(VarError::NotPresent)),
+            Err(
+                "iTerm2 did not supply its session identity: environment variable not found".into()
+            )
+        );
+        assert!(
+            session(Err(VarError::NotUnicode("x".into())))
+                .unwrap_err()
+                .starts_with("iTerm2 did not supply its session identity: ")
+        );
+        let surface = |kind, id: &str| TerminalSession {
+            kind,
+            id: id.into(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        };
+        assert!(binding_names_host(
+            &surface(TerminalKind::Iterm2, "owned-id"),
+            "owned-id"
+        ));
+        assert!(!binding_names_host(
+            &surface(TerminalKind::Iterm2, "other-id"),
+            "owned-id"
+        ));
+        for kind in TerminalKind::ALL {
+            if kind != TerminalKind::Iterm2 {
+                assert!(
+                    !binding_names_host(&surface(kind, "owned-id"), "owned-id"),
+                    "{kind:?}"
+                );
+            }
+        }
+    }
+
+    // The legacy host accepts only a binding that names its own iTerm2 session, and refuses
+    // any other with one text.
+    #[test]
+    fn iterm_host_binding_names_its_session_or_refuses_with_one_text() {
+        const REFUSAL: &str = "iTerm2 surface binding does not match this launch host";
+        for (mode, expected) in [
+            ("owned", None),
+            ("other id", Some(REFUSAL)),
+            ("other terminal", Some(REFUSAL)),
+        ] {
+            let directory = launch_fixture();
+            let directory = directory.path();
+            let id = directory.file_name().unwrap().to_str().unwrap();
+            match mode {
+                "owned" => bind_fixture(directory, "owned-id"),
+                "other id" => bind_fixture(directory, "other-id"),
+                _ => crate::native::session::primitives::write_json_atomic(
+                    &directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE),
+                    &serde_json::json!({
+                        "terminal": "wezterm", "session_id": "owned-id",
+                        "managed_session_id": id
+                    }),
+                )
+                .unwrap(),
+            }
+            let actual = wait_for_binding(directory, id, "owned-id", &mut SystemClock)
+                .err()
+                .map(|error| format!("{error:#}"));
+            assert_eq!(actual.as_deref(), expected, "{mode}");
+        }
     }
 
     #[test]

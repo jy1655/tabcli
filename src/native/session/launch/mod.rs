@@ -1694,7 +1694,7 @@ mod host_decision_tests {
         test_support::pending_launch("session-", &std::env::temp_dir(), START_TIMEOUT)
     }
     fn failed_host(store: &Store, token: &str) {
-        host::initialize(store, token, host::Terminal::Iterm2).unwrap();
+        host::initialize(store, token, terminal::TerminalKind::Iterm2).unwrap();
         let identity = host::HostIdentity {
             pid: 123,
             start_seconds: 123,
@@ -1768,7 +1768,7 @@ mod host_decision_tests {
     #[test]
     fn non_capture_failure_names_the_host_instead_of_environment_preparation() {
         let (_dir, store, token) = fixture();
-        host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+        host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
         host::fail(
             &store,
             &token,
@@ -1875,7 +1875,7 @@ mod host_decision_tests {
         for recorded in [false, true] {
             let (_dir, store, token) = fixture();
             if recorded {
-                host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+                host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
             }
             let expected = if recorded {
                 format!("{LAUNCH_DEADLINE}; last recorded launch stage: awaiting_host")

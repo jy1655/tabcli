@@ -68,9 +68,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the receipt first, keeps its own locks, deadline policy and error text, and the judgment
   reads in one order (status, close tombstone, the receipt's Claim, phase and deadline, then
   the current Claim). `host.rs` owns the launch-owned host record (`launch-host.json`): its
-  decoder and identity judgment, which the timeline and doctor share, and the forward-only,
-  lock-held writers through which the macOS launch host records its stages and failure, with
-  the check that the admitted host incarnation may still act for the pending launch.
+  decoder (whose `terminal` is a `TerminalKind` that uses the launch host) and identity
+  judgment, which the timeline and doctor share, and the forward-only, lock-held writers
+  through which the macOS launch host records its stages and failure, with the check that the
+  admitted host incarnation may still act for the pending launch. Doctor judges the record
+  once, in its Observation, and takes the probe's terminal from that judgment.
 - `src/native/provider_installation.rs` observes the installed provider CLI: resolving its
   executable from absolute `PATH` entries, the validity test (an absolute path to a regular,
   executable file), the version text of a `--version` probe, and the support verdict against
@@ -235,24 +237,29 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
   Each terminal kind is registered once: its portable `facts.rs` declares its surface facts,
-  host command, close-evidence choice, refusal messages for screen reads and guarded dialog
-  input and, on macOS, its binding facts, and the shared lookups (`facts`, `close_evidence`,
-  `host`, the command table) read that registration. The installed macOS dispatch is a value
-  built from each adapter's injectable dependency (the AppleScript automation, the Ghostty and
-  Warp runners, the WezTerm host); a test builds one with a recording automation or a fake
-  runner. The shared macOS operations refuse an operation the kind declares unsupported from
+  host command, whether its launch runs the launch host, close-evidence choice, refusal
+  messages for screen reads and guarded dialog input and, on macOS, its binding facts, and the
+  shared lookups (`facts`, `close_evidence`, `host`, the command table) read that registration.
+  The launcher, the host command parser, the launch host, the `launch-host.json` decoder and
+  doctor read the launch-host fact (`uses_launch_host`) instead of naming kinds. The installed
+  macOS dispatch is a value built from each adapter's injectable dependency (the AppleScript
+  automation, the Ghostty and Warp runners, the WezTerm host); a test builds one with a
+  recording automation or a fake runner. The shared macOS operations refuse an operation the kind declares unsupported from
   its facts before any adapter is reached, so an adapter implements only what its kind
   supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
   Shared macOS procedures admit every host in one order (absolute path, session-id file
-  name, existing real directory, private to the current user) with one refusal vocabulary,
-  check that a binding names its host, and run close re-probes with adapter-owned actions,
-  budgets and inspection-error policies.
-  iTerm2's and WezTerm's launches run `terminal/macos/launch_host.rs` as the surface program
-  (#376): it admits itself into the launch-owned host record, prepares the shell environment
-  without a terminal while it waits for the binding, and then replaces itself with the
-  non-startup shell on the bound terminal. It reads core records only through
+  name, existing real directory, private to the current user) with one refusal vocabulary
+  and run close re-probes with adapter-owned actions, budgets and inspection-error policies.
+  Each adapter owns the rule by which a binding names its host. Terminal.app passes its rule to
+  the shared check; iTerm2 (its `ITERM_SESSION_ID` session) and WezTerm (its pane and GUI
+  socket) apply theirs in the adapter, where both the legacy host and the launch host use it.
+  The launches of a kind whose registration declares a launch host (iTerm2 and WezTerm) run
+  `terminal/macos/launch_host.rs` as the surface program (#376): it admits itself into the
+  launch-owned host record, prepares the shell environment without a terminal while it waits
+  for the binding, recognizes its surface by the check the kind registers, and then replaces
+  itself with the non-startup shell on the bound terminal. It reads core records only through
   `session::launch` (the receipt, the host record and its writers, and the bound surface).
   `terminal/macos/shell_environment.rs` owns that preparation: the zsh login and interactive
   startup run once without a terminal under a supervisor that owns its cleanup, bounded by the
@@ -643,9 +650,10 @@ repair settles the records without resending a prompt or guessing ownership of a
   owner stop that the teardown and the live-owner closes share. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
   Register the kind once: its `facts.rs` declares one `Registration` with the close facts,
-  paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, the
-  close-evidence choice, the refusal message for each operation the kind does not support and,
-  on macOS, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
+  paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, whether its
+  launch runs the launch host (`LaunchHostFacts`, carrying on macOS the adapter's check that a
+  binding names that host), the close-evidence choice, the refusal message for each operation
+  the kind does not support and, on macOS, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
   exhaustive lookup on every build target; the shared lookups and the shared macOS refusals read
   it, so nothing else needs a per-kind match. For macOS operations, implement the
   `MacTerminalAdapter` methods for the operations the kind supports, behind an injectable

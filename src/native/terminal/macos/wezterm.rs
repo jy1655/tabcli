@@ -846,7 +846,7 @@ pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -
         executable.to_string_lossy().into_owned(),
         HOST_COMMAND.into(),
         directory.to_string_lossy().into_owned(),
-        "--launch-command".into(),
+        crate::native::terminal::host::LAUNCH_COMMAND_FLAG.into(),
         command.into(),
     ]
 }
@@ -995,6 +995,40 @@ fn require_shared_pane(
     Ok(())
 }
 
+/// The pane and GUI socket that WezTerm names, in its pane and socket variables, for the
+/// process it starts in a pane.
+fn host_pane(
+    pane: Result<String, env::VarError>,
+    socket: Option<std::ffi::OsString>,
+) -> Result<(String, std::ffi::OsString)> {
+    let pane = pane.context("WezTerm did not name the pane of this host")?;
+    let socket = socket.context("WezTerm did not name the GUI of this host")?;
+    Ok((pane, socket))
+}
+
+/// Whether `surface` names the pane `pane` of the WezTerm GUI at `socket`: the one rule by
+/// which both the legacy host and the launch host recognize their own surface.
+fn binding_names_host(surface: &TerminalSession, pane: &str, socket: &Path) -> bool {
+    surface.kind == TerminalKind::WezTerm
+        && surface.id == pane
+        && surface
+            .wezterm_mux
+            .as_ref()
+            .is_some_and(|mux| Path::new(&mux.socket) == socket)
+}
+
+/// The pane and GUI socket of the WezTerm pane this process runs in.
+fn this_host_pane() -> Result<(String, std::ffi::OsString)> {
+    host_pane(env::var("WEZTERM_PANE"), env::var_os("WEZTERM_UNIX_SOCKET"))
+}
+
+/// The launch host's check, registered for WezTerm: the bound surface names the pane and GUI
+/// this process runs in. A missing pane or socket names no surface.
+pub(in crate::native::terminal) fn binding_names_this_host(surface: &TerminalSession) -> bool {
+    this_host_pane()
+        .is_ok_and(|(pane, socket)| binding_names_host(surface, &pane, Path::new(&socket)))
+}
+
 // Wait for the receipt/claim/status to bind the pane and socket supplied by the mux itself.
 // Failure or timeout never falls back to typed input; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
@@ -1002,13 +1036,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     run_tty_bound_host(
         directory,
         &BoundHostSpec { name: BINDING.host },
-        || {
-            let pane =
-                env::var("WEZTERM_PANE").context("WezTerm did not name the pane of this host")?;
-            let socket = env::var_os("WEZTERM_UNIX_SOCKET")
-                .context("WezTerm did not name the GUI of this host")?;
-            Ok((pane, socket))
-        },
+        this_host_pane,
         |directory, id, (pane, socket)| {
             wait_for_binding(directory, id, pane, Path::new(socket), &mut SystemClock)
         },
@@ -1033,18 +1061,10 @@ fn wait_for_binding(
 ) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    super::bound_host::binding_names_host(
-        &surface,
-        TerminalKind::WezTerm,
-        |surface| {
-            surface.id == pane
-                && surface
-                    .wezterm_mux
-                    .as_ref()
-                    .is_some_and(|mux| Path::new(&mux.socket) == socket)
-        },
-        "WezTerm surface binding does not name the pane of this launch host",
-    )
+    if !binding_names_host(&surface, pane, socket) {
+        bail!("WezTerm surface binding does not name the pane of this launch host");
+    }
+    Ok(())
 }
 
 // The prompt and its Enter are one write to the pty. Only a call that never started is

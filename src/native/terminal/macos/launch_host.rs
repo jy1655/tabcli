@@ -30,12 +30,10 @@ pub(in crate::native::terminal) fn run(
     let name = kind.display_name();
     run_bound_host(directory, &BoundHostSpec { name }, |session_id| {
         let store = Store::open_unchecked(directory);
-        let terminal = match kind {
-            TerminalKind::Iterm2 => host::Terminal::Iterm2,
-            TerminalKind::WezTerm => host::Terminal::Wezterm,
-            _ => bail!("unsupported launch host"),
-        };
-        let prefix = word(terminal);
+        if !kind.uses_launch_host() {
+            bail!("unsupported launch host");
+        }
+        let prefix = kind.as_str();
         let start = Instant::now();
         let receipt = launch::read(&store)?.context("missing host launch receipt")?;
         let token = &receipt.claim_token;
@@ -89,7 +87,7 @@ pub(in crate::native::terminal) fn run(
         let identity = identity
             .ok_or_else(|| fail(host::FailureReason::IdentityUnavailable, None, None, None))?;
         match host::observe(&store, Some(&receipt)) {
-            host::HostObservation::Recorded(record) if record.terminal == terminal => {}
+            host::HostObservation::Recorded(record) if record.terminal == kind => {}
             _ => return Err(fail(host::FailureReason::BindingMismatch, None, None, None)),
         }
         if host::admit(&store, token, identity).is_err() {
@@ -275,27 +273,15 @@ fn progress(start: Instant, budget: u64, capture: &Captured) -> host::Progress {
     }
 }
 
-// Whether the bound surface of this Session names this host's own terminal surface.
+// Whether the bound surface of this Session names this host's own terminal surface, by the
+// check that the kind registers for its launch host.
 fn matches_surface(surface: &TerminalSession, kind: TerminalKind) -> bool {
-    if surface.kind != kind {
-        return false;
-    }
-    match kind {
-        TerminalKind::Iterm2 => std::env::var("ITERM_SESSION_ID")
-            .ok()
-            .and_then(|s| s.rsplit(':').next().map(str::to_owned))
-            .is_some_and(|s| !s.is_empty() && s == surface.id),
-        TerminalKind::WezTerm => {
-            std::env::var("WEZTERM_PANE").is_ok_and(|s| s == surface.id)
-                && std::env::var_os("WEZTERM_UNIX_SOCKET").is_some_and(|s| {
-                    surface
-                        .wezterm_mux
-                        .as_ref()
-                        .is_some_and(|m| Path::new(&m.socket) == Path::new(&s))
-                })
-        }
-        _ => false,
-    }
+    surface.kind == kind
+        && kind
+            .registration()
+            .launch_host
+            .as_ref()
+            .is_some_and(|host| (host.binding_names_host)(surface))
 }
 
 #[cfg(test)]

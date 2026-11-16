@@ -1,8 +1,10 @@
 //! Adapter declarations are portable: a persisted handle can name another platform.
 //! Each terminal kind is registered once, in its own `facts.rs`, and every shared
-//! lookup (surface facts, host command, close evidence, declared refusals and the
-//! macOS binding facts) reads that registration.
+//! lookup (surface facts, host command, launch host, close evidence, declared refusals
+//! and the macOS binding facts) reads that registration.
 use super::TerminalKind;
+#[cfg(target_os = "macos")]
+use super::TerminalSession;
 #[cfg(target_os = "macos")]
 use crate::native::session::launch::BindingFacts;
 
@@ -24,6 +26,17 @@ pub(in crate::native) enum CloseEvidenceChoice {
     AppleTerminal,
 }
 
+/// A kind whose launch runs the terminal-less launch host (`terminal/macos/launch_host.rs`)
+/// as its surface program. The launcher records `launch-host.json` for it, its host command
+/// takes `--launch-command`, the record names it, and doctor reports its recorded stage.
+pub(in crate::native) struct LaunchHostFacts {
+    /// Whether a bound surface names the terminal surface that the calling host runs in, as
+    /// the terminal names that surface in the host's environment. The adapter owns this
+    /// check; its legacy host decides with the same rule.
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) binding_names_host: fn(&TerminalSession) -> bool,
+}
+
 /// One kind's registration. A refusal of `None` means the kind supports the
 /// operation; `Some` is the exact message the shared macOS dispatch answers with
 /// before any adapter is reached.
@@ -31,6 +44,8 @@ pub(in crate::native) enum CloseEvidenceChoice {
 pub(in crate::native) struct Registration {
     pub(in crate::native) facts: SurfaceFacts,
     pub(in crate::native) host_command: &'static str,
+    /// `Some` when the kind's launch runs the launch host.
+    pub(in crate::native) launch_host: Option<LaunchHostFacts>,
     pub(in crate::native) close_evidence: CloseEvidenceChoice,
     pub(in crate::native) screen_read_refusal: Option<&'static str>,
     pub(in crate::native) guarded_input_refusal: Option<&'static str>,
@@ -61,6 +76,11 @@ impl TerminalKind {
             Self::WezTerm => &wezterm::REGISTRATION,
             Self::WindowsConsole => &windows::REGISTRATION,
         }
+    }
+
+    /// Whether this kind's launch runs the terminal-less launch host.
+    pub(in crate::native) const fn uses_launch_host(self) -> bool {
+        self.registration().launch_host.is_some()
     }
 }
 
@@ -118,5 +138,32 @@ mod tests {
             .map(|kind| kind.registration().host_command)
             .collect();
         assert_eq!(host_commands.len(), KINDS.len());
+    }
+
+    // A kind uses the launch host exactly when its host command takes the launch form, so
+    // the fact and the argv parse cannot drift.
+    #[test]
+    fn launch_host_fact_agrees_with_the_host_command_parse() {
+        use super::super::host::{HostCommand, parse};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-facts");
+        let launch_form = [
+            directory.to_str().unwrap().to_owned(),
+            "--launch-command".to_owned(),
+            "script".to_owned(),
+        ];
+        let mut launch_hosts = Vec::new();
+        for kind in KINDS {
+            match parse(kind.registration().host_command, &launch_form) {
+                Ok(HostCommand::Launch { kind: parsed, .. }) => {
+                    assert_eq!(parsed, kind);
+                    assert!(kind.uses_launch_host(), "{kind:?}");
+                    launch_hosts.push(kind);
+                }
+                Ok(other) => panic!("{kind:?}: {other:?}"),
+                Err(_) => assert!(!kind.uses_launch_host(), "{kind:?}"),
+            }
+        }
+        assert_eq!(launch_hosts, [TerminalKind::Iterm2, TerminalKind::WezTerm]);
     }
 }
