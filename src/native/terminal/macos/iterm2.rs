@@ -2280,11 +2280,12 @@ end run
     }
 
     fn launch_fixture_in(parent: &Path) -> tempfile::TempDir {
-        super::super::test_support::launch_fixture(
+        crate::native::session::launch::test_support::pending_launch(
             "session-iterm-",
-            std::time::Duration::from_secs(5),
             parent,
+            std::time::Duration::from_secs(5),
         )
+        .0
     }
 
     fn bind_fixture(directory: &Path, terminal_id: &str) {

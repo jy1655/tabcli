@@ -2423,11 +2423,12 @@ end run
     // A launch as it stands when the surface is opened: a private session directory,
     // the status `launching`, the retained initial claim and its pending receipt.
     fn launch_fixture() -> tempfile::TempDir {
-        super::super::test_support::launch_fixture(
+        crate::native::session::launch::test_support::pending_launch(
             "session-terminal-",
-            std::time::Duration::from_secs(20),
             &std::env::temp_dir(),
+            std::time::Duration::from_secs(20),
         )
+        .0
     }
 
     fn binding(directory: &std::path::Path, tty: &str) -> serde_json::Value {

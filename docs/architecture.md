@@ -62,6 +62,15 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   native-session wrapper with its admission and provision steps (including its re-check of the
   recorded executable's version) and the fd handoff consumer; `mod.rs` keeps the launch
   records and their rules (receipt, phases, failure handoff, repair, wait, spawn, finalize).
+  `pending.rs` holds the one Pending launch judgment that every launch admission check uses
+  (the macOS binding wait, the launch hosts, the wrapper's admission and the spawn fence),
+  and reads the bound surface of a Session for the hosts. It takes no lock: each caller reads
+  the receipt first, keeps its own locks, deadline policy and error text, and the judgment
+  reads in one order (status, close tombstone, the receipt's Claim, phase and deadline, then
+  the current Claim). `host.rs` owns the launch-owned host record (`launch-host.json`): its
+  decoder and identity judgment, which the timeline and doctor share, and the forward-only,
+  lock-held writers through which the macOS launch host records its stages and failure, with
+  the check that the admitted host incarnation may still act for the pending launch.
 - `src/native/provider_installation.rs` observes the installed provider CLI: resolving its
   executable from absolute `PATH` entries, the validity test (an absolute path to a regular,
   executable file), the version text of a `--version` probe, and the support verdict against
@@ -232,6 +241,14 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   name, existing real directory, private to the current user) with one refusal vocabulary,
   check that a binding names its host, and run close re-probes with adapter-owned actions,
   budgets and inspection-error policies.
+  iTerm2's and WezTerm's launches run `terminal/macos/launch_host.rs` as the surface program
+  (#376): it admits itself into the launch-owned host record, prepares the shell environment
+  without a terminal while it waits for the binding, and then replaces itself with the
+  non-startup shell on the bound terminal. It reads core records only through
+  `session::launch` (the receipt, the host record and its writers, and the bound surface).
+  `terminal/macos/shell_environment.rs` owns that preparation: the zsh login and interactive
+  startup run once without a terminal under a supervisor that owns its cleanup, bounded by the
+  launch receipt, returning counts and the environment, never startup output.
   Ghostty's frame host lives in `terminal/macos/ghostty/host.rs`. It proves the bound PTY, carries
   the session directory only after binding, and discards startup input. Ghostty 1.4.0 adds a
   scripted `tty` property, which this adapter does not yet consume; replacing the frame must
@@ -360,7 +377,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
   optional bounded probes. `assemble_checks` performs its record reads and probes in one fixed
   order; `doctor/installation.rs` computes the provider executable, version and workspace rows
-  from what it observed. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
+  from what it observed; `doctor/shell_startup.rs` reports the launch host's recorded stage
+  and, with `--probe`, an opt-in run of the shell environment preparation, neither of which
+  writes anything or shows startup output or an environment value. The diagnostic vocabulary (`Check`, `Availability`, `Context`,
   `ResultTimeoutDiagnostic`) lives in `src/native/diagnostics.rs`; provider adapters and the
   Reopen marker observation depend on it rather than on the command. `process_env` owns `probe`
   and the shared bounded executor, including optional output limits, process-tree containment,
@@ -456,6 +475,7 @@ before deciding that the operation never happened.
 | `native-session.json` | Recorded owner identity used for attestation |
 | `provider-process.json` | Spawned provider identity, including refused-reopen checks |
 | `launch.json` | Launch claim, deadline, and spawn phase |
+| `launch-host.json` | macOS iTerm2/WezTerm launch host for the launch receipt's Claim: admitted incarnation, forward-only stage, capture counts, and final failure |
 | `turn.claim` | Current exclusive right to deliver a turn |
 | `turn.claim.lock` | Synchronizes claim, completion, exit, and close transitions |
 | `status.lock` | Synchronizes status updates |

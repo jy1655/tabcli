@@ -137,7 +137,6 @@ pub(in crate::native) fn launch(bytes: &[u8]) -> Result<launch::Record, DecodeEr
 }
 
 /// Bounded launch-host decoder shared by live diagnosis and retained timeline bytes.
-#[allow(dead_code)] // A1: readers are integrated in the following unit.
 pub(in crate::native) fn launch_host(
     bytes: &[u8],
 ) -> Result<launch::host::HostObservation, DecodeError> {

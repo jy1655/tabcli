@@ -2095,11 +2095,12 @@ mod tests {
     // A session directory as the launcher leaves it before it opens the surface:
     // launching, claimed, with a pending launch receipt.
     pub(super) fn launch_fixture() -> tempfile::TempDir {
-        super::super::test_support::launch_fixture(
+        crate::native::session::launch::test_support::pending_launch(
             "session-ghostty-",
-            std::time::Duration::from_secs(8),
             &std::env::temp_dir(),
+            std::time::Duration::from_secs(8),
         )
+        .0
     }
     // The launcher's atomic binding of the surface that the creation returned.
     pub(super) fn bind_fixture(directory: &Path, handle: &TerminalSession) {

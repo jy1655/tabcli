@@ -1,5 +1,6 @@
 //! Characterization shared by the three real host entry points. The script runs only
 //! at read boundaries on the calling test thread; no scheduler or wall-clock wait.
+use super::test_support::{Change, apply};
 use super::*;
 use crate::native::session::names::*;
 use crate::native::session::{self, update_status};
@@ -111,7 +112,10 @@ pub(in crate::native) fn characterize(
         "retry-replaced",
         "retry-cancelled",
         "retry-released",
+        "retry-claim-other",
         "retry-spawning",
+        "retry-tombstone",
+        "retry-damaged-tombstone",
         "receipt-before-status",
         "missing-retry",
         "expired-before-bad-status",
@@ -215,6 +219,12 @@ pub(in crate::native) fn characterize(
             "missing-retry" => expected = format!("missing {name} launch receipt"),
             "claim-before-bad-binding" => expected = "failed to inspect native turn claim".into(),
             "invalid-binding" => expected = format!("invalid {name} surface binding"),
+            "retry-damaged-tombstone" => {
+                // Capture the exact existing Reader error, including its path.
+                apply(&store, &[Change::TombstoneDamaged]);
+                expected = store.closed_if_present().unwrap_err().to_string();
+                fs::remove_file(directory.join(CLOSED_STATUS_FILE)).unwrap();
+            }
             "expired-before-bad-status" => {
                 // Capture the exact existing Reader error, including its path.
                 let status = store.status().unwrap();
@@ -284,6 +294,13 @@ pub(in crate::native) fn characterize(
                         update_status(&path, SessionState::Closed, None, None).unwrap()
                     }
                     "retry-released" => fs::remove_file(path.join(TURN_CLAIM_FILE)).unwrap(),
+                    "retry-claim-other" => {
+                        apply(&Store::open_unchecked(&path), &[Change::ClaimOther])
+                    }
+                    "retry-tombstone" => apply(&Store::open_unchecked(&path), &[Change::Tombstone]),
+                    "retry-damaged-tombstone" => {
+                        apply(&Store::open_unchecked(&path), &[Change::TombstoneDamaged])
+                    }
                     "retry-spawning" => receipt(&path, |r| r.phase = Phase::Spawning),
                     "receipt-before-status" => {
                         fs::write(path.join(FILE), b"{").unwrap();

@@ -5,8 +5,7 @@
 use super::{QUEUE_COMMAND_SCRIPT, Runner, ownership_proof};
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use crate::native::session::launch::launcher::validate_shell_command_component;
-use crate::native::session::primitives::unix_ms;
-use crate::native::session::{CoreRecord, Reader, RecordStore, SessionState};
+use crate::native::session::{Reader, RecordStore};
 use crate::native::terminal::{TerminalKind, TerminalSession};
 use anyhow::{Context, Result, bail};
 use std::{
@@ -216,7 +215,7 @@ pub(super) fn parse(typed: &[u8]) -> Result<Option<Frame>> {
 // the launcher's private session directory, its pending receipt and claim, the atomic
 // binding of a Ghostty surface to this session, and the script written for the host.
 fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
-    use crate::native::session::{SessionStatus, launch};
+    use crate::native::session::launch;
     let private = |path: &Path, directory: bool| -> Result<bool> {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(metadata.is_dir() == directory
@@ -227,31 +226,18 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
         directory,
         &super::super::bound_host::BoundHostSpec { name: "Ghostty" },
         |id| {
-            let receipt = launch::read(&Reader::open_unchecked(directory))?
-                .context("missing Ghostty launch receipt")?;
-            let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-            if receipt.phase != launch::Phase::Pending
-                || receipt.claim_token != token
-                || unix_ms() >= receipt.deadline_unix_ms
-                || status.state != SessionState::Launching
-                || crate::native::session::turn::current_claim_token(
-                    &crate::native::session::Reader::open_unchecked(directory),
-                )?
-                .as_deref()
-                    != Some(token)
+            let reader = Reader::open_unchecked(directory);
+            let receipt = launch::read(&reader)?.context("missing Ghostty launch receipt")?;
+            if launch::pending::judge(&reader, &receipt, token, launch::pending::Expiry::Receipt)?
+                .is_err()
             {
                 bail!(
                     "Ghostty launch was cancelled, timed out or is not the one sent to this terminal"
                 );
             }
-            let surface: TerminalSession = crate::native::session::record::terminal(
-                &Reader::open_unchecked(directory)
-                    .record(CoreRecord::Terminal)
-                    .text()?
-                    .context("Ghostty surface is not bound")?,
-            )
-            .context("invalid Ghostty surface binding")?;
-            surface.verify_managed_session(id)?;
+            let surface =
+                launch::pending::bound_surface(&reader, id, || "invalid Ghostty surface binding")?
+                    .context("Ghostty surface is not bound")?;
             if surface.kind != TerminalKind::Ghostty {
                 bail!("the bound surface is not a Ghostty terminal");
             }

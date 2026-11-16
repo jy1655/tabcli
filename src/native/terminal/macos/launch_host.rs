@@ -2,9 +2,9 @@
 //! then replace this process with the non-startup shell on the already bound terminal.
 use super::bound_host::{BoundHostSpec, run_bound_host};
 use super::shell_environment::{self, Captured};
+use crate::native::session::Store;
 use crate::native::session::launch::{self, host};
 use crate::native::session::primitives::unix_ms;
-use crate::native::session::{CoreRecord, Store, turn};
 use crate::native::terminal::{TerminalKind, TerminalSession};
 use anyhow::{Context, Result, bail};
 use std::{
@@ -187,15 +187,13 @@ pub(in crate::native::terminal) fn run(
             }
             let binding = (|| -> Result<Option<bool>> {
                 let _lock = store.lock()?;
-                eligible(&store, token, identity)?;
-                Ok(match store.record(CoreRecord::Terminal).text()? {
-                    None => None,
-                    Some(text) => {
-                        let surface = crate::native::session::record::terminal(&text)
-                            .map_err(|_| anyhow::anyhow!("invalid host surface binding"))?;
-                        Some(matches_surface(&surface, session_id, kind))
-                    }
-                })
+                host::eligible_incarnation(&store, token, identity)?;
+                Ok(launch::pending::bound_surface(
+                    &store,
+                    session_id,
+                    || "invalid host surface binding",
+                )?
+                .map(|surface| matches_surface(&surface, kind)))
             })()
             .map_err(|_| fail(host::FailureReason::BindingMismatch, None, None, None))?;
             // A present, mismatched handle is final; absence is still waiting.
@@ -210,7 +208,7 @@ pub(in crate::native::terminal) fn run(
         let captured = captured.expect("capture completed before handoff");
         let flushed = {
             let _lock = store.lock()?;
-            eligible(&store, token, identity)?;
+            host::eligible_incarnation(&store, token, identity)?;
             unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) == 0 }
         };
         if !flushed {
@@ -231,7 +229,7 @@ pub(in crate::native::terminal) fn run(
         launch::log(&store, &format!("{prefix}_host_launch_shell"));
         let error = {
             let _lock = store.lock()?;
-            eligible(&store, token, identity)?;
+            host::eligible_incarnation(&store, token, identity)?;
             let mut shell = crate::native::process_env::helper_command("/bin/zsh");
             shell
                 .args(["-f", "-i", "-c", command])
@@ -277,23 +275,9 @@ fn progress(start: Instant, budget: u64, capture: &Captured) -> host::Progress {
     }
 }
 
-fn eligible(store: &Store, token: &str, identity: host::HostIdentity) -> Result<()> {
-    let receipt = launch::read(store)?.context("missing launch receipt")?;
-    if receipt.claim_token != token
-        || receipt.phase != launch::Phase::Pending
-        || unix_ms() >= receipt.deadline_unix_ms
-        || store.status()?.state != crate::native::session::SessionState::Launching
-        || store.closed_if_present()?.is_some()
-        || turn::current_claim_token(store)?.as_deref() != Some(token)
-        || !matches!(host::observe(store, Some(&receipt)), host::HostObservation::Recorded(r) if r.host == Some(identity) && r.failure.is_none())
-    {
-        bail!("launch host is no longer eligible");
-    }
-    Ok(())
-}
-
-fn matches_surface(surface: &TerminalSession, id: &str, kind: TerminalKind) -> bool {
-    if surface.verify_managed_session(id).is_err() || surface.kind != kind {
+// Whether the bound surface of this Session names this host's own terminal surface.
+fn matches_surface(surface: &TerminalSession, kind: TerminalKind) -> bool {
+    if surface.kind != kind {
         return false;
     }
     match kind {

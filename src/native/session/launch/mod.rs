@@ -28,10 +28,9 @@ use std::{
 #[cfg(all(test, any(target_os = "macos", windows)))]
 pub(in crate::native) use super::names::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
-pub(in crate::native) mod launcher;
-// A1 primitives; launcher and host integration follows separately.
-#[allow(dead_code)]
 pub(in crate::native) mod host;
+pub(in crate::native) mod launcher;
+pub(in crate::native) mod pending;
 pub(in crate::native) mod wrapper;
 // Written at the end of the launch log by whoever sees the wrapper end: the bootstrap for a
 // wrapper that could not write, the wrapper itself, and the admission refusal.
@@ -39,8 +38,12 @@ pub(in crate::native) const WRAPPER_EXIT_CODE_MARKER: &str = "wrapper_exit_code=
 pub(in crate::native) use super::state::RESIDUAL_SURFACE_MARKER;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+mod admission_tests;
 #[cfg(all(test, target_os = "macos"))]
 pub(in crate::native) mod binding_tests;
+#[cfg(test)]
+pub(in crate::native) mod test_support;
 
 pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
     let directory = store.directory();
@@ -153,25 +156,25 @@ pub(in crate::native) fn wait_for_binding(
     binding_tests::checkpoint(binding_tests::Point::BudgetCaptured);
     loop {
         let record = read(reader)?.with_context(|| format!("missing {name} launch receipt"))?;
-        // Status is read even after expiry. Keep claim and binding reads lazy: these
-        // short circuits also determine which damaged-record error the host reports.
-        let status: SessionStatus = reader.status()?;
-        if clock.now() >= deadline
-            || unix_ms() >= record.deadline_unix_ms
-            || record.phase != Phase::Pending
-            || record.claim_token != initial.claim_token
-            || status.state != SessionState::Launching
-            || turn::current_claim_token(reader)?.as_deref() != Some(initial.claim_token.as_str())
+        // The judgment reads the status even after expiry and the Claim last, and the binding
+        // is read only for a pending launch: this order also determines which damaged-record
+        // error the host reports.
+        let mut budget_spent = || clock.now() >= deadline;
+        if pending::judge(
+            reader,
+            &record,
+            &initial.claim_token,
+            pending::Expiry::BudgetOrReceipt(&mut budget_spent),
+        )?
+        .is_err()
         {
             bail!("{cancelled}");
         }
         #[cfg(test)]
         binding_tests::checkpoint(binding_tests::Point::BeforeBinding);
-        if let Some(text) = reader.record(CoreRecord::Terminal).text()? {
-            let surface: terminal::TerminalSession =
-                crate::native::session::record::terminal(&text)
-                    .with_context(|| format!("invalid {name} surface binding"))?;
-            surface.verify_managed_session(session_id)?;
+        if let Some(surface) = pending::bound_surface(reader, session_id, || {
+            format!("invalid {name} surface binding")
+        })? {
             return Ok(surface);
         }
         // The real wait sleeps a full 10 ms, even with less than 10 ms remaining.
@@ -804,31 +807,33 @@ pub(in crate::native) fn wait(
 }
 
 fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
-    let directory = store.directory();
-    let status: SessionStatus = store.status()?;
-    if status.state != SessionState::Launching
-        || Reader::open_unchecked(directory)
-            .record(CoreRecord::Closed)
-            .path()
-            .to_owned()
-            .exists()
-    {
-        bail!("provider launch cancelled: session is {}", status.state);
+    let judged = match record {
+        Some(record) => {
+            pending::judge(store, record, &record.claim_token, pending::Expiry::Receipt)?
+        }
+        // A launch without a receipt is judged on its status and tombstone alone.
+        None => pending::launching(store)?,
+    };
+    match judged {
+        Ok(()) => Ok(()),
+        Err(pending::NotPending::State(state)) => {
+            bail!("provider launch cancelled: session is {state}")
+        }
+        // The tombstone is judged only for a launching status.
+        Err(pending::NotPending::Closed) => bail!(
+            "provider launch cancelled: session is {}",
+            SessionState::Launching
+        ),
+        Err(pending::NotPending::Phase(_)) => {
+            bail!("provider launch already attempted; refusing a second spawn")
+        }
+        Err(pending::NotPending::Expired) => {
+            bail!("provider launch deadline expired before spawn")
+        }
+        Err(pending::NotPending::ReceiptClaim | pending::NotPending::Claim) => {
+            bail!("provider launch claim no longer belongs to this wrapper")
+        }
     }
-    if let Some(record) = record {
-        if record.phase != Phase::Pending {
-            bail!("provider launch already attempted; refusing a second spawn");
-        }
-        if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
-            != Some(&record.claim_token)
-        {
-            bail!("provider launch claim no longer belongs to this wrapper");
-        }
-        if unix_ms() >= record.deadline_unix_ms {
-            bail!("provider launch deadline expired before spawn");
-        }
-    }
-    Ok(())
 }
 
 pub(in crate::native) fn spawn<F>(
@@ -890,12 +895,16 @@ where
 /// The wrapper's admission: the launch it was started for is still the pending one.
 pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<()> {
     let directory = store.directory();
-    if let Some(record) = read(&Reader::open_unchecked(directory))? {
-        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-        if record.phase != Phase::Pending
-            || status.state != SessionState::Launching
-            || turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
-                != Some(&record.claim_token)
+    let reader = Reader::open_unchecked(directory);
+    if let Some(record) = read(&reader)? {
+        // The wrapper has no deadline: the spawn fence judges it under the lifecycle lock.
+        if pending::judge(
+            &reader,
+            &record,
+            &record.claim_token,
+            pending::Expiry::Unchecked,
+        )?
+        .is_err()
         {
             log(
                 &Store::open_unchecked(directory),
@@ -1005,25 +1014,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate::native::session;
     use crate::native::session::names::*;
-    use crate::native::session::update_status;
     use std::{fs, process::Stdio};
 
     fn fixture() -> (tempfile::TempDir, String) {
-        let directory = tempfile::Builder::new()
-            .prefix("session-")
-            .tempdir()
-            .unwrap();
-        fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
-        let token = claim.token().to_owned();
-        claim.retain();
-        begin(
-            &Store::open_unchecked(directory.path()),
-            &token,
-            Instant::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let (directory, _, token) =
+            test_support::pending_launch("session-", &std::env::temp_dir(), START_TIMEOUT);
         (directory, token)
     }
 
@@ -1696,18 +1691,7 @@ mod tests {
 mod host_decision_tests {
     use super::*;
     fn fixture() -> (tempfile::TempDir, Store, String) {
-        let dir = tempfile::Builder::new()
-            .prefix("session-")
-            .tempdir()
-            .unwrap();
-        std::fs::create_dir(dir.path().join("events")).unwrap();
-        update_status(dir.path(), SessionState::Launching, None, None).unwrap();
-        let store = Store::open_unchecked(dir.path());
-        let claim = turn::claim(&store, &[]).unwrap();
-        let token = claim.token().to_owned();
-        claim.retain();
-        begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
-        (dir, store, token)
+        test_support::pending_launch("session-", &std::env::temp_dir(), START_TIMEOUT)
     }
     fn failed_host(store: &Store, token: &str) {
         host::initialize(store, token, host::Terminal::Iterm2).unwrap();
