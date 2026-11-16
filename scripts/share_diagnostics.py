@@ -47,6 +47,7 @@ CHECK_IDS = enum("""
     codex_hook_trust codex_lifecycle codex_mcp codex_notify_payload_budget
     agy_follow_up agy_workspace_trust agy_input_receipt
     agy_tool_confirmation pi_follow_up pi_provider_credentials
+    launch_stage shell_environment
 """)
 REASONS = enum("""
     platform_supported platform_unsupported session_unavailable records_read records_busy
@@ -78,6 +79,11 @@ REASONS = enum("""
     claude_completion_mode_unrecognized claude_completion_mode_absent claude_completion_legacy_stop
     claude_completion_readiness_recorded claude_completion_readiness_not_observed
     claude_completion_readiness_unrecognized claude_completion_readiness_malformed
+    launch_stage_observed launch_host_failed launch_host_not_recorded
+    launch_host_identity_mismatch launch_host_record_unreadable launch_host_schema_unsupported
+    launch_stage_not_applicable shell_environment_ready shell_environment_failed
+    shell_environment_probe_budget_exhausted shell_environment_probe_not_requested
+    shell_environment_probe_not_applicable shell_environment_probe_context_unavailable
     claude_completion_readiness_unreadable claude_completion_diagnostic_recorded
     claude_completion_diagnostic_not_recorded claude_completion_diagnostic_unrecognized
     claude_completion_diagnostic_malformed claude_completion_diagnostic_unreadable
