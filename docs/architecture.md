@@ -219,8 +219,16 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   rules that judge an owner record (its binding to an expected Session as bound, unbound or
   foreign; the five-field control record of the ownership proof and close authority; and
   attestation's narrower rule, which compares control when any of the TTY device and the two
-  process groups is recorded), control proof and the owner-teardown action, and the platform
+  process groups is recorded), control proof and the owner stop, and the platform
   adapters keep the surface close. Each reader maps the rules' answers itself.
+  The owner stop (`stop_attested_owner`) is one sequence for the owner teardown and for every
+  kind's close with a live owner: the close budget, the ownership proof, the shell check after
+  it, the kind's record of the owner, the budget, the intent and the stop. Terminal.app and
+  Warp observe the shell again after the proof; only the teardown attests the owner again
+  after its intent. A kind supplies the surface TTY its proof compares, what it records about
+  the owner before the intent (Terminal.app: a missing App incarnation) and what it stops
+  (Terminal.app: SIGTERM to the owner's group and SIGKILL to the shell's; Warp: the owner's
+  foreground group; WezTerm: nothing); iTerm2 and Ghostty record no intent.
   The macOS owner wrapper reads the record and calls the same ordered verifier as portable tests;
   live-process and TTY observations are lazy so that an earlier refusal prevents later OS reads.
   `session::owner` owns the one observation of the Owner record and
@@ -632,7 +640,7 @@ repair settles the records without resending a prompt or guessing ownership of a
 - For a new terminal, start with `src/native/terminal/mod.rs` and its surface and delivery types.
   Before implementing close, read `src/native/terminal/close_authority.rs` for the decision and
   the seam, `close_evidence.rs` for selecting the kind's evidence, and `ownership.rs` for the
-  owner-teardown action. Add application-native
+  owner stop that the teardown and the live-owner closes share. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
   Register the kind once: its `facts.rs` declares one `Registration` with the close facts,
   paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, the
@@ -643,8 +651,8 @@ repair settles the records without resending a prompt or guessing ownership of a
   `MacTerminalAdapter` methods for the operations the kind supports, behind an injectable
   dependency, and add the adapter to the `Dispatch` in `macos/mod.rs`; an operation the
   registration declares unsupported is refused before the adapter is called. What an adapter
-  does for a live owner before ending its surface
-  lives in its `close_owned_session`. Reuse `open_with` for binding and cleanup unless the adapter
+  does for a live owner before ending its surface is its part of the shared owner stop,
+  called from its `close_owned_session`. Reuse `open_with` for binding and cleanup unless the adapter
   owns a distinct open protocol, as Warp does. Keep screen and presence scripts in the adapter.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal

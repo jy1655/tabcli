@@ -2993,25 +2993,22 @@ fn g4_r20_creation_configs_carry_quoted_and_unicode_text_exactly() {
 
 use crate::native::session::primitives::read_json;
 use crate::native::session::test_support::{TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE};
+use crate::native::terminal::ownership::NativeProcessIdentity;
 use crate::native::tests::write_attested_apple_terminal_state;
 
+// The records and identities of a Warp live-owner close whose owner and shell both attest:
+// the owner leads the foreground group of its TTY, and its parent shell, recorded with the
+// owner, leads a group of its own on the same TTY.
 #[cfg(target_os = "macos")]
-#[test]
-fn warp_close_records_intent_before_stopping_only_attested_group() {
+fn live_owner_close_fixture() -> (
+    tempfile::TempDir,
+    NativeSessionOwner,
+    terminal::TerminalSession,
+    NativeProcessIdentity,
+    NativeProcessIdentity,
+) {
     let directory = tempfile::tempdir().unwrap();
-    let owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
-    let mut handle: terminal::TerminalSession =
-        read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-    handle.kind = terminal::TerminalKind::Warp;
-    let live = NativeProcessIdentity {
-        pid: 4242,
-        parent_pid: 4000,
-        terminal_tty_device: 7,
-        process_group: 4242,
-        terminal_process_group: 4242,
-        process_start_seconds: 1_790_000_000,
-        process_start_microseconds: 42,
-    };
+    let mut owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
     let shell = NativeProcessIdentity {
         pid: 4000,
         parent_pid: 3000,
@@ -3021,13 +3018,82 @@ fn warp_close_records_intent_before_stopping_only_attested_group() {
         process_start_seconds: 1,
         process_start_microseconds: 0,
     };
-    let result = prepare_warp_close(
+    owner.terminal_shell = Some(
+        crate::native::terminal::ownership::MacTerminalShellIdentity {
+            pid: shell.pid,
+            process_group: shell.process_group,
+            terminal_tty_device: shell.terminal_tty_device,
+            process_start_seconds: shell.process_start_seconds,
+            process_start_microseconds: shell.process_start_microseconds,
+        },
+    );
+    write_owner(directory.path(), &owner);
+    let mut handle: terminal::TerminalSession =
+        read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+    handle.kind = terminal::TerminalKind::Warp;
+    crate::native::session::primitives::write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &handle,
+    )
+    .unwrap();
+    let live = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 1_790_000_000,
+        process_start_microseconds: 42,
+    };
+    (directory, owner, handle, live, shell)
+}
+
+#[cfg(target_os = "macos")]
+fn write_owner(directory: &Path, owner: &NativeSessionOwner) {
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join(crate::native::session::test_support::SESSION_OWNER_FILE),
+        owner,
+    )
+    .unwrap();
+}
+
+// The fixture's processes as the system would report them: the owner answers `live`, and the
+// shell answers its reads in turn, the proof's read first and the stop's second.
+#[cfg(target_os = "macos")]
+fn fixture_processes(
+    live: NativeProcessIdentity,
+    shell_reads: Vec<Result<NativeProcessIdentity>>,
+) -> impl Fn(u32) -> Result<NativeProcessIdentity> {
+    let shell_reads = std::cell::RefCell::new(shell_reads.into_iter());
+    move |pid| match pid {
+        4242 => Ok(live),
+        4000 => shell_reads
+            .borrow_mut()
+            .next()
+            .expect("the shell is read at most twice"),
+        _ => panic!("unexpected process {pid}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fixture_tty_device(path: &Path) -> Result<u64> {
+    assert_eq!(path, Path::new("/dev/ttys999"));
+    Ok(7)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_close_records_intent_before_stopping_only_attested_group() {
+    let (directory, _, handle, live, shell) = live_owner_close_fixture();
+    let processes = fixture_processes(live, vec![Ok(shell), Ok(shell)]);
+    let result = stop_live_owner(
         directory.path(),
         "session-owner123",
         &handle,
-        &owner,
-        &live,
-        &shell,
+        ProcessReads {
+            identity: &processes,
+            tty_device: &fixture_tty_device,
+        },
         |group| {
             assert_eq!(group, 4242);
             assert!(
@@ -3049,14 +3115,16 @@ fn warp_close_records_intent_before_stopping_only_attested_group() {
         process_start_microseconds: 43,
         ..live
     };
+    let processes = fixture_processes(changed, vec![]);
     assert!(
-        prepare_warp_close(
+        stop_live_owner(
             directory.path(),
             "session-owner123",
             &handle,
-            &owner,
-            &changed,
-            &shell,
+            ProcessReads {
+                identity: &processes,
+                tty_device: &fixture_tty_device,
+            },
             |_| panic!("changed owner must not be signalled"),
             crate::native::session::close::budget::close_deadline()
         )
@@ -3066,47 +3134,215 @@ fn warp_close_records_intent_before_stopping_only_attested_group() {
 }
 
 // Warp stops only an owner bound to this session: an unbound legacy record and one bound to
-// another session are refused before any intent is recorded or signal sent.
+// another session are refused by the ownership proof before any intent is recorded or signal
+// sent.
 #[cfg(target_os = "macos")]
 #[test]
 fn warp_close_refuses_an_unbound_or_foreign_owner_before_recording_an_intent() {
     for binding in [None, Some("session-other456")] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
+        let (directory, mut owner, handle, live, shell) = live_owner_close_fixture();
         owner.managed_session_id = binding.map(str::to_owned);
-        let mut handle: terminal::TerminalSession =
-            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-        handle.kind = terminal::TerminalKind::Warp;
-        let live = NativeProcessIdentity {
-            pid: 4242,
-            parent_pid: 4000,
-            terminal_tty_device: 7,
-            process_group: 4242,
-            terminal_process_group: 4242,
-            process_start_seconds: 1_790_000_000,
-            process_start_microseconds: 42,
-        };
-        let shell = NativeProcessIdentity {
-            pid: 4000,
-            parent_pid: 3000,
-            terminal_tty_device: 7,
-            process_group: 4000,
-            terminal_process_group: 4242,
-            process_start_seconds: 1,
-            process_start_microseconds: 0,
-        };
-        let error = prepare_warp_close(
+        write_owner(directory.path(), &owner);
+        let processes = fixture_processes(live, vec![Ok(shell), Ok(shell)]);
+        let error = stop_live_owner(
             directory.path(),
             "session-owner123",
             &handle,
-            &owner,
-            &live,
-            &shell,
+            ProcessReads {
+                identity: &processes,
+                tty_device: &fixture_tty_device,
+            },
             |_| panic!("{binding:?}: an owner not bound to this session is not signalled"),
             crate::native::session::close::budget::close_deadline(),
         )
         .unwrap_err();
-        assert_eq!(error.to_string(), "Warp close owner identity changed");
+        assert_eq!(
+            error.to_string(),
+            "native-session owner is not bound to this managed session"
+        );
         assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
     }
+}
+
+// The shell is read again after the ownership proof: one that no longer holds the owner's
+// foreground job, has ended or cannot be inspected refuses the Warp close before its intent
+// and before any stop, with the shell check's or the read's own words.
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_close_refuses_a_changed_shell_before_intent_and_stop() {
+    for (case, expected) in [
+        (
+            "parent",
+            "Warp shell no longer owns the native-session process",
+        ),
+        ("tty", "Warp shell is attached to a different TTY"),
+        ("job", "Warp shell does not own the expected foreground job"),
+        ("incarnation", "Warp shell identity changed"),
+        ("ended", "failed to inspect native-session process 4000"),
+        (
+            "uninspectable",
+            "macOS returned an incomplete identity for native-session process 4000",
+        ),
+    ] {
+        let (directory, _, handle, live, shell) = live_owner_close_fixture();
+        let second_read = match case {
+            "parent" => Ok(NativeProcessIdentity { pid: 4001, ..shell }),
+            "tty" => Ok(NativeProcessIdentity {
+                terminal_tty_device: 8,
+                ..shell
+            }),
+            "job" => Ok(NativeProcessIdentity {
+                terminal_process_group: 7777,
+                ..shell
+            }),
+            "incarnation" => Ok(NativeProcessIdentity {
+                process_start_microseconds: 1,
+                ..shell
+            }),
+            "ended" => Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                .context("failed to inspect native-session process 4000"),
+            _ => Err(anyhow!(
+                "macOS returned an incomplete identity for native-session process 4000"
+            )),
+        };
+        let processes = fixture_processes(live, vec![Ok(shell), second_read]);
+        let error = stop_live_owner(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            ProcessReads {
+                identity: &processes,
+                tty_device: &fixture_tty_device,
+            },
+            |_| panic!("{case}: a changed shell is not stopped"),
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected, "{case}");
+        assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+    }
+}
+
+// The close budget is checked before the proof, before the intent and again before the stop:
+// an expiry at the first check reads nothing, one at the second records nothing, and one at
+// the third keeps the intent and stops nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_close_deadline_expiry_at_each_check() {
+    for unexpired_reads in 0..=3 {
+        let (directory, _, handle, live, shell) = live_owner_close_fixture();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, unexpired_reads);
+        let reads = clock.reads();
+        let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+        let processes = fixture_processes(live, vec![Ok(shell), Ok(shell)]);
+        let observed = Cell::new(0);
+        let counted = |pid| {
+            observed.set(observed.get() + 1);
+            processes(pid)
+        };
+        let stops = Cell::new(0);
+        let result = stop_live_owner(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            ProcessReads {
+                identity: &counted,
+                tty_device: &fixture_tty_device,
+            },
+            |group| {
+                assert_eq!(group, 4242);
+                stops.set(stops.get() + 1);
+                Ok(())
+            },
+            deadline,
+        );
+        let intent = directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists();
+        // (expired, process reads, intent recorded, stops, budget reads)
+        let expected = match unexpired_reads {
+            0 => (true, 0, false, 0, 1),
+            1 => (true, 3, false, 0, 2),
+            2 => (true, 3, true, 0, 3),
+            _ => (false, 3, true, 1, 3),
+        };
+        let expired = match &result {
+            Ok(()) => false,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("close deadline expired"),
+                    "{error:#}"
+                );
+                true
+            }
+        };
+        assert_eq!(
+            (expired, observed.get(), intent, stops.get(), reads.get()),
+            expected,
+            "{unexpired_reads}"
+        );
+    }
+}
+
+// The live-owner close attests its owner before it records or stops anything: without an
+// owner record the close sends nothing to Warp. The message names the kind.
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_live_owner_close_without_an_owner_record_sends_nothing() {
+    let (directory, _, handle, _, _) = live_owner_close_fixture();
+    fs::remove_file(
+        directory
+            .path()
+            .join(crate::native::session::test_support::SESSION_OWNER_FILE),
+    )
+    .unwrap();
+    let local = Adapter::with_runner(FakeRunner::new(directory.path(), "unused"));
+    let error = local
+        .close_owned_session(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            OwnedSurfaceClose::LiveOwner,
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Warp ownership requires a live native-session owner"
+    );
+    assert!(local.runner().calls.is_empty());
+    assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+}
+
+// The live-owner close checks the budget before it attests: an expired budget reads no
+// owner and sends nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_live_owner_close_checks_the_budget_before_attesting() {
+    let (directory, _, handle, _, _) = live_owner_close_fixture();
+    fs::remove_file(
+        directory
+            .path()
+            .join(crate::native::session::test_support::SESSION_OWNER_FILE),
+    )
+    .unwrap();
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(60);
+    let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, 0);
+    let reads = clock.reads();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+    let local = Adapter::with_runner(FakeRunner::new(directory.path(), "unused"));
+    let error = local
+        .close_owned_session(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            OwnedSurfaceClose::LiveOwner,
+            deadline,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("close deadline expired"));
+    assert_eq!(reads.get(), 1);
+    assert!(local.runner().calls.is_empty());
+    assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
 }

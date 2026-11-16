@@ -219,7 +219,7 @@ pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
     }
     verified_terminal_owner_process_group(&owner, &live)?;
     let live_shell = process(live.parent_pid)?;
-    verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    verified_terminal_shell_process_group(session.kind.display_name(), &owner, &live, &live_shell)?;
     Ok((owner, live))
 }
 
@@ -337,7 +337,9 @@ pub(in crate::native) fn current_native_session_owner(
         windows_process_identity: None,
     };
     verified_terminal_owner_process_group(&owner, &live)?;
-    verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    // The surface record, and with it the kind, is read only after the owner is built
+    // (`current_surface_owner`), so this check names no terminal application.
+    verified_terminal_shell_process_group("terminal", &owner, &live, &live_shell)?;
     Ok(owner)
 }
 
@@ -413,23 +415,27 @@ pub(in crate::native) fn verified_terminal_owner_process_group(
     Ok(process_group)
 }
 
+/// Checks that `live_shell`, the owner's parent, holds the owner's foreground job on the
+/// owner's TTY and is the shell the owner recorded. `terminal` names the terminal
+/// application in the refusal, or is the word "terminal" where the kind is not known.
 #[cfg(any(target_os = "macos", test))]
 pub(in crate::native) fn verified_terminal_shell_process_group(
+    terminal: &str,
     owner: &NativeSessionOwner,
     live_owner: &NativeProcessIdentity,
     live_shell: &NativeProcessIdentity,
 ) -> Result<u32> {
     if owner.pid != live_owner.pid || live_owner.parent_pid != live_shell.pid {
-        bail!("Terminal.app shell no longer owns the native-session process")
+        bail!("{terminal} shell no longer owns the native-session process")
     }
     if live_shell.terminal_tty_device != live_owner.terminal_tty_device {
-        bail!("Terminal.app shell is attached to a different TTY")
+        bail!("{terminal} shell is attached to a different TTY")
     }
     if live_shell.process_group != live_shell.pid
         || live_shell.terminal_process_group != live_owner.process_group
         || live_shell.process_group == live_owner.process_group
     {
-        bail!("Terminal.app shell does not own the expected foreground job")
+        bail!("{terminal} shell does not own the expected foreground job")
     }
     if let Some(recorded) = &owner.terminal_shell
         && (recorded.pid != live_shell.pid
@@ -438,7 +444,7 @@ pub(in crate::native) fn verified_terminal_shell_process_group(
             || recorded.process_start_seconds != live_shell.process_start_seconds
             || recorded.process_start_microseconds != live_shell.process_start_microseconds)
     {
-        bail!("Terminal.app shell identity changed")
+        bail!("{terminal} shell identity changed")
     }
     Ok(live_shell.process_group)
 }
@@ -553,42 +559,188 @@ fn owner_group_gone_with(
     }
 }
 
+// One step stops the attested owner before its surface is ended, for the teardown of an
+// owner whose surface is proven absent and for every kind's close with a live owner:
+// - the close budget, then the ownership proof (`attest`: the owner record and its live
+//   incarnation, compared with the surface TTY where the kind supplies one);
+// - the shell check after the proof: Terminal.app and Warp observe the shell again from the
+//   system, so a shell that ended, changed incarnation or cannot be inspected since the
+//   proof refuses here; the proof's own observation is not reused;
+// - what the kind records about the owner before the intent names it (Terminal.app: a
+//   missing App incarnation);
+// - the close budget, the owner's group, and the intent;
+// - the teardown alone attests the owner again after its intent and refuses a changed one;
+//   a close with a live owner does not;
+// - the caller's stop, which checks the budget itself where it does.
+// The caller ends the surface afterwards.
+
+/// How a stop of the attested owner checks the terminal shell after the ownership proof.
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) trait ShellCheck {
+    /// What the stop learns of the shell.
+    type Group;
+    fn check(
+        self,
+        surface: &TerminalSession,
+        owner: &NativeSessionOwner,
+        live: &NativeProcessIdentity,
+    ) -> Result<Self::Group>;
+}
+
+/// The ownership proof's own shell check is the last one; the stop learns nothing of the
+/// shell.
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) struct ProvenShell;
+
+#[cfg(target_os = "macos")]
+impl ShellCheck for ProvenShell {
+    type Group = ();
+    fn check(
+        self,
+        _: &TerminalSession,
+        _: &NativeSessionOwner,
+        _: &NativeProcessIdentity,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The shell is observed again by the owner's parent PID and checked as the proof checks it;
+/// the stop learns the shell's process group from this observation.
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) struct FreshShell<F>(pub(in crate::native::terminal) F);
+
+#[cfg(target_os = "macos")]
+impl<F: FnOnce(u32) -> Result<NativeProcessIdentity>> ShellCheck for FreshShell<F> {
+    type Group = u32;
+    fn check(
+        self,
+        surface: &TerminalSession,
+        owner: &NativeSessionOwner,
+        live: &NativeProcessIdentity,
+    ) -> Result<u32> {
+        let shell = (self.0)(live.parent_pid)?;
+        verified_terminal_shell_process_group(surface.kind.display_name(), owner, live, &shell)
+    }
+}
+
+/// The process groups a stop acts on: the owner's foreground group, and what the shell
+/// check learned of the shell.
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) struct OwnerGroups<S> {
+    pub(in crate::native::terminal) owner: u32,
+    pub(in crate::native::terminal) shell: S,
+}
+
+/// The intent a stop publishes before it acts.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native::terminal) enum OwnerStopIntent {
+    /// A close with a live attested owner: the close intent names the owner.
+    Close,
+    /// The end of a live attested owner whose surface is proven absent: the intent names the
+    /// owner's group and the teardown reason, and the owner is attested again after it.
+    Teardown,
+}
+
+/// What a caller supplies to [`stop_attested_owner`].
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) struct OwnerStop<A, S, H, P> {
+    /// The ownership proof. The teardown calls it a second time after its intent.
+    pub(in crate::native::terminal) attest: A,
+    pub(in crate::native::terminal) shell: S,
+    /// Completes the owner record before the intent names it.
+    pub(in crate::native::terminal) record_incarnation: H,
+    /// What is stopped once the intent is published, and how.
+    pub(in crate::native::terminal) stop: P,
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) fn stop_attested_owner<A, S, H, P>(
+    store: &Store,
+    id: &str,
+    surface: &TerminalSession,
+    intent: OwnerStopIntent,
+    owner_stop: OwnerStop<A, S, H, P>,
+    deadline: Instant,
+) -> Result<()>
+where
+    A: FnMut() -> Result<(NativeSessionOwner, NativeProcessIdentity)>,
+    S: ShellCheck,
+    H: FnOnce(&mut NativeSessionOwner) -> Result<()>,
+    P: FnOnce(OwnerGroups<S::Group>) -> Result<()>,
+{
+    let OwnerStop {
+        mut attest,
+        shell,
+        record_incarnation,
+        stop,
+    } = owner_stop;
+    close_remaining(deadline)?;
+    let (mut owner, live) = attest()?;
+    let shell = shell.check(surface, &owner, &live)?;
+    record_incarnation(&mut owner)?;
+    close_remaining(deadline)?;
+    let group = verified_terminal_owner_process_group(&owner, &live)?;
+    match intent {
+        OwnerStopIntent::Close => {
+            session::close::record_terminal_close_intent(store, id, surface, &owner)?;
+        }
+        OwnerStopIntent::Teardown => {
+            session::close::record_terminal_teardown_intent(
+                store,
+                id,
+                surface,
+                &owner,
+                group,
+                OWNER_TEARDOWN_REASON,
+            )?;
+            #[cfg(test)]
+            session::close::interruption::at(session::close::interruption::Point::IntentPublished);
+            // The second full attestation reads the owner, tty and parent shell again.
+            // A replacement record, even if it attests successfully, is not this intent.
+            close_remaining(deadline)?;
+            let (again, current) = attest()?;
+            close_remaining(deadline)?;
+            if serde_json::to_value(&owner)? != serde_json::to_value(&again)?
+                || !native_owner_identity_matches(&owner, &current)
+                || verified_terminal_owner_process_group(&again, &current)? != group
+            {
+                bail!("the teardown owner changed after intent publication; no signal was sent");
+            }
+        }
+    }
+    stop(OwnerGroups {
+        owner: group,
+        shell,
+    })
+}
+
 #[cfg(target_os = "macos")]
 pub(in crate::native::terminal) fn teardown_absent_owner_with(
     store: &Store,
     id: &str,
     surface: &TerminalSession,
-    mut attest: impl FnMut() -> Result<(NativeSessionOwner, NativeProcessIdentity)>,
+    attest: impl FnMut() -> Result<(NativeSessionOwner, NativeProcessIdentity)>,
     stop: impl FnOnce(u32) -> Result<()>,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
-    close_remaining(deadline)?;
-    let (owner, live) = attest()?;
-    close_remaining(deadline)?;
-    let group = verified_terminal_owner_process_group(&owner, &live)?;
-    session::close::record_terminal_teardown_intent(
+    stop_attested_owner(
         store,
         id,
         surface,
-        &owner,
-        group,
-        OWNER_TEARDOWN_REASON,
+        OwnerStopIntent::Teardown,
+        OwnerStop {
+            attest,
+            shell: ProvenShell,
+            record_incarnation: |_: &mut NativeSessionOwner| Ok(()),
+            stop: |groups: OwnerGroups<()>| {
+                close_remaining(deadline)?;
+                stop(groups.owner)
+            },
+        },
+        deadline,
     )?;
-    #[cfg(test)]
-    session::close::interruption::at(session::close::interruption::Point::IntentPublished);
-    // The second full attestation reads the owner, tty and parent shell again.
-    // A replacement record, even if it attests successfully, is not this intent.
-    close_remaining(deadline)?;
-    let (again, current) = attest()?;
-    close_remaining(deadline)?;
-    if serde_json::to_value(&owner)? != serde_json::to_value(&again)?
-        || !native_owner_identity_matches(&owner, &current)
-        || verified_terminal_owner_process_group(&again, &current)? != group
-    {
-        bail!("the teardown owner changed after intent publication; no signal was sent");
-    }
-    close_remaining(deadline)?;
-    stop(group)?;
     close_remaining(deadline)?;
     Ok(terminal::CloseResult {
         outcome: CloseOutcome::Missing,
@@ -600,14 +752,14 @@ pub(in crate::native::terminal) fn teardown_absent_owner_with(
 pub(in crate::native::terminal) fn process_group_signal_target(
     process_group: u32,
 ) -> Result<libc::pid_t> {
-    let process_group = libc::pid_t::try_from(process_group)
-        .context("Terminal.app process group is out of range")?;
+    let process_group =
+        libc::pid_t::try_from(process_group).context("terminal process group is out of range")?;
     if process_group <= 0 {
-        bail!("Terminal.app process group must be positive")
+        bail!("terminal process group must be positive")
     }
     process_group
         .checked_neg()
-        .context("Terminal.app process group cannot be represented as a signal target")
+        .context("terminal process group cannot be represented as a signal target")
 }
 
 #[cfg(target_os = "macos")]
@@ -639,7 +791,10 @@ fn terminate_owned_foreground_group_with(
 }
 
 #[cfg(target_os = "macos")]
-fn signal_process_group(target: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
+pub(in crate::native::terminal) fn signal_process_group(
+    target: libc::pid_t,
+    signal: libc::c_int,
+) -> std::io::Result<()> {
     if unsafe { libc::kill(target, signal) } == 0 {
         Ok(())
     } else {

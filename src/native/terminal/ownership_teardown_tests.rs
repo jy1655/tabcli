@@ -634,17 +634,20 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
                         process_start_microseconds: 0,
                         ..live
                     };
-                    terminal::macos::warp::prepare_warp_close(
-                        dir.path(),
+                    stop_attested_owner(
+                        &store,
                         "session-owner123",
                         &surface,
-                        &owner,
-                        &live,
-                        &shell,
-                        |_| {
-                            expire("policy");
-                            close_remaining(deadline)?;
-                            Ok(())
+                        OwnerStopIntent::Close,
+                        OwnerStop {
+                            attest: || Ok((owner.clone(), live)),
+                            shell: FreshShell(|_| Ok(shell)),
+                            record_incarnation: |_: &mut NativeSessionOwner| Ok(()),
+                            stop: |_: OwnerGroups<u32>| {
+                                expire("policy");
+                                close_remaining(deadline)?;
+                                Ok(())
+                            },
                         },
                         deadline,
                     )?;
@@ -868,4 +871,544 @@ fn r1_c8_reused_birth_resumes_only_through_exact_intent_at_authority_seam() {
             assert!(result.is_err());
         }
     }
+}
+
+// The teardown checks the close budget at its start, after the first attestation, after the
+// intent, after the second attestation, before the stop and after it. An expiry at each
+// check leaves exactly the effects before it.
+#[test]
+fn teardown_deadline_expiry_at_each_check() {
+    for unexpired_reads in 0..=6 {
+        let (dir, owner, surface, live) = fixture(terminal::TerminalKind::Warp);
+        let store = Store::open_unchecked(dir.path());
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, unexpired_reads);
+        let reads = clock.reads();
+        let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+        let (attestations, stops) = (Cell::new(0), Cell::new(0));
+        let result = teardown_absent_owner_with(
+            &store,
+            "session-owner123",
+            &surface,
+            || {
+                attestations.set(attestations.get() + 1);
+                Ok((owner.clone(), live))
+            },
+            |group| {
+                assert_eq!(group, 4242);
+                stops.set(stops.get() + 1);
+                Ok(())
+            },
+            deadline,
+        );
+        let intent = session::close::terminal_teardown_intent(&store, &surface)
+            .unwrap()
+            .is_some();
+        // (expired, attestations, intent recorded, stops)
+        let expected = match unexpired_reads {
+            0 => (true, 0, false, 0),
+            1 => (true, 1, false, 0),
+            2 => (true, 1, true, 0),
+            3 | 4 => (true, 2, true, 0),
+            5 => (true, 2, true, 1),
+            _ => (false, 2, true, 1),
+        };
+        let expired = match &result {
+            Ok(_) => false,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("close deadline expired"),
+                    "{unexpired_reads}: {error:#}"
+                );
+                true
+            }
+        };
+        assert_eq!(
+            (expired, attestations.get(), intent, stops.get()),
+            expected,
+            "{unexpired_reads}"
+        );
+        assert_eq!(
+            reads.get(),
+            (unexpired_reads + 1).min(6),
+            "{unexpired_reads}"
+        );
+    }
+}
+
+// A Terminal.app live-owner close checks the budget in the adapter, before its owner stop
+// and before the surface verification of the stop: an expiry at any of the three sends no
+// automation and records nothing. With the budget left, the surface is verified first and
+// the owner is attested after it.
+#[test]
+fn terminal_app_live_owner_close_checks_budget_and_surface_before_the_owner() {
+    use crate::native::terminal::macos::automation_testing::{Method, Replay, Reply};
+    for unexpired_reads in 0..=3 {
+        let (dir, _, surface, _) = fixture(terminal::TerminalKind::AppleTerminal);
+        std::fs::remove_file(
+            Store::open_unchecked(dir.path())
+                .record(CoreRecord::Owner)
+                .path(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, unexpired_reads);
+        let reads = clock.reads();
+        let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+        let automation = Replay::new(if unexpired_reads == 3 {
+            vec![Reply::Normal(Ok(surface.id.clone()))]
+        } else {
+            vec![]
+        });
+        let dispatch = terminal::macos::apple_terminal_dispatch(automation.clone());
+        let error = terminal::macos::close_owned_session(
+            &dispatch,
+            dir.path(),
+            "session-owner123",
+            &surface,
+            terminal::macos::OwnedSurfaceClose::LiveOwner,
+            deadline,
+        )
+        .unwrap_err();
+        if unexpired_reads == 3 {
+            assert_eq!(
+                error.to_string(),
+                "Terminal.app ownership requires a live native-session owner"
+            );
+            let calls = automation.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].method, Method::RunUntil);
+        } else {
+            assert!(
+                error.to_string().contains("close deadline expired"),
+                "{unexpired_reads}: {error:#}"
+            );
+            assert!(automation.calls().is_empty());
+        }
+        assert_eq!(
+            reads.get(),
+            (unexpired_reads + 1).min(3),
+            "{unexpired_reads}"
+        );
+        automation.assert_finished();
+        let store = Store::open_unchecked(dir.path());
+        assert!(store.record(CoreRecord::Terminal).path().exists());
+        assert!(
+            !store
+                .record(CoreRecord::TerminalCloseIntent)
+                .path()
+                .exists()
+        );
+    }
+}
+
+// A surface that does not verify refuses the Terminal.app live-owner close before the owner
+// is read: no intent, no signal.
+#[test]
+fn terminal_app_live_owner_close_refuses_an_unverified_surface_before_the_owner() {
+    use crate::native::terminal::macos::automation_testing::{Replay, Reply};
+    let (dir, _, surface, _) = fixture(terminal::TerminalKind::AppleTerminal);
+    // An owner record that cannot be read: reaching it would fail with its own error.
+    std::fs::write(
+        Store::open_unchecked(dir.path())
+            .record(CoreRecord::Owner)
+            .path(),
+        b"{",
+    )
+    .unwrap();
+    let automation = Replay::new([Reply::Normal(Ok("another-tty".into()))]);
+    let dispatch = terminal::macos::apple_terminal_dispatch(automation.clone());
+    let error = terminal::macos::close_owned_session(
+        &dispatch,
+        dir.path(),
+        "session-owner123",
+        &surface,
+        terminal::macos::OwnedSurfaceClose::LiveOwner,
+        crate::native::session::close::budget::close_deadline(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Agent Bridge Terminal.app owned tab is missing"
+    );
+    automation.assert_finished();
+    assert!(
+        !Store::open_unchecked(dir.path())
+            .record(CoreRecord::TerminalCloseIntent)
+            .path()
+            .exists()
+    );
+}
+
+// The shell of `fixture`: the owner's parent, leading its own group on the owner's TTY.
+fn fixture_shell(live: NativeProcessIdentity) -> NativeProcessIdentity {
+    NativeProcessIdentity {
+        pid: 4000,
+        parent_pid: 3000,
+        process_group: 4000,
+        process_start_seconds: 1,
+        process_start_microseconds: 0,
+        ..live
+    }
+}
+
+// What the intent record says when the stop runs: none, a close intent, or a teardown
+// intent with its group.
+fn recorded_intent(store: &Store, surface: &TerminalSession) -> String {
+    match session::close::terminal_teardown_intent(store, surface).unwrap() {
+        Some(teardown) => format!("teardown intent {}", teardown.process_group),
+        None if store
+            .record(CoreRecord::TerminalCloseIntent)
+            .path()
+            .exists() =>
+        {
+            "close intent".to_owned()
+        }
+        None => "no intent".to_owned(),
+    }
+}
+
+// One step for every caller: the proof, the shell check, the record of the incarnation, the
+// intent and the stop, in this order. Only the teardown attests again after its intent; the
+// intent is published after the incarnation record and before the stop.
+#[test]
+fn owner_stop_runs_proof_shell_incarnation_intent_and_stop_in_order() {
+    for (intent, fresh) in [
+        (OwnerStopIntent::Close, false),
+        (OwnerStopIntent::Close, true),
+        (OwnerStopIntent::Teardown, false),
+    ] {
+        let (dir, owner, surface, live) = fixture(terminal::TerminalKind::Warp);
+        let store = Store::open_unchecked(dir.path());
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+        let attest = || {
+            events.borrow_mut().push("attest".into());
+            Ok((owner.clone(), live))
+        };
+        let record_incarnation = |_: &mut NativeSessionOwner| {
+            events.borrow_mut().push(format!(
+                "incarnation with {}",
+                recorded_intent(&store, &surface)
+            ));
+            Ok(())
+        };
+        let result = if fresh {
+            stop_attested_owner(
+                &store,
+                "session-owner123",
+                &surface,
+                intent,
+                OwnerStop {
+                    attest,
+                    shell: FreshShell(|pid| {
+                        events.borrow_mut().push(format!("shell {pid}"));
+                        Ok(fixture_shell(live))
+                    }),
+                    record_incarnation,
+                    stop: |groups: OwnerGroups<u32>| {
+                        events.borrow_mut().push(format!(
+                            "stop {} {} with {}",
+                            groups.owner,
+                            groups.shell,
+                            recorded_intent(&store, &surface)
+                        ));
+                        Ok(())
+                    },
+                },
+                crate::native::session::close::budget::close_deadline(),
+            )
+        } else {
+            stop_attested_owner(
+                &store,
+                "session-owner123",
+                &surface,
+                intent,
+                OwnerStop {
+                    attest,
+                    shell: ProvenShell,
+                    record_incarnation,
+                    stop: |groups: OwnerGroups<()>| {
+                        events.borrow_mut().push(format!(
+                            "stop {} with {}",
+                            groups.owner,
+                            recorded_intent(&store, &surface)
+                        ));
+                        Ok(())
+                    },
+                },
+                crate::native::session::close::budget::close_deadline(),
+            )
+        };
+        result.unwrap();
+        let expected: &[&str] = match (intent, fresh) {
+            (OwnerStopIntent::Close, false) => &[
+                "attest",
+                "incarnation with no intent",
+                "stop 4242 with close intent",
+            ],
+            (OwnerStopIntent::Close, true) => &[
+                "attest",
+                "shell 4000",
+                "incarnation with no intent",
+                "stop 4242 4000 with close intent",
+            ],
+            _ => &[
+                "attest",
+                "incarnation with no intent",
+                "attest",
+                "stop 4242 with teardown intent 4242",
+            ],
+        };
+        assert_eq!(*events.borrow(), expected, "{intent:?}, fresh {fresh}");
+    }
+}
+
+// The intent names the owner as the incarnation record left it.
+#[test]
+fn owner_stop_intent_names_the_owner_the_incarnation_record_completed() {
+    let (dir, mut owner, surface, live) = fixture(terminal::TerminalKind::AppleTerminal);
+    let app = owner.terminal_app.take().unwrap();
+    let store = Store::open_unchecked(dir.path());
+    stop_attested_owner(
+        &store,
+        "session-owner123",
+        &surface,
+        OwnerStopIntent::Close,
+        OwnerStop {
+            attest: || Ok((owner.clone(), live)),
+            shell: ProvenShell,
+            record_incarnation: |owner: &mut NativeSessionOwner| {
+                owner.terminal_app = Some(app.clone());
+                Ok(())
+            },
+            stop: |_: OwnerGroups<()>| Ok(()),
+        },
+        crate::native::session::close::budget::close_deadline(),
+    )
+    .unwrap();
+    let named = session::close::terminal_close_intent_owner(&store, &surface, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(named.terminal_app, Some(app));
+}
+
+// A shell observed again after the proof that ended, cannot be inspected, changed
+// incarnation, or no longer holds the owner's job refuses before the incarnation record,
+// the intent and the stop. The shell check names the surface's kind.
+#[test]
+fn owner_stop_refuses_a_changed_shell_before_incarnation_intent_and_stop() {
+    for kind in [
+        terminal::TerminalKind::AppleTerminal,
+        terminal::TerminalKind::Warp,
+    ] {
+        let name = kind.display_name();
+        for (case, expected) in [
+            (
+                "ended",
+                "failed to inspect native-session process 4000".to_owned(),
+            ),
+            ("uninspectable", "process inspection failed".to_owned()),
+            ("incarnation", format!("{name} shell identity changed")),
+            (
+                "tty",
+                format!("{name} shell is attached to a different TTY"),
+            ),
+            (
+                "parent",
+                format!("{name} shell no longer owns the native-session process"),
+            ),
+            (
+                "job",
+                format!("{name} shell does not own the expected foreground job"),
+            ),
+        ] {
+            let (dir, owner, surface, live) = fixture(kind);
+            let store = Store::open_unchecked(dir.path());
+            let shell = fixture_shell(live);
+            let error = stop_attested_owner(
+                &store,
+                "session-owner123",
+                &surface,
+                OwnerStopIntent::Close,
+                OwnerStop {
+                    attest: || Ok((owner.clone(), live)),
+                    shell: FreshShell(|pid| {
+                        assert_eq!(pid, 4000);
+                        match case {
+                            "ended" => Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+                                .context("failed to inspect native-session process 4000"),
+                            "uninspectable" => bail!("process inspection failed"),
+                            "incarnation" => Ok(NativeProcessIdentity {
+                                process_start_seconds: 2,
+                                ..shell
+                            }),
+                            "tty" => Ok(NativeProcessIdentity {
+                                terminal_tty_device: 8,
+                                ..shell
+                            }),
+                            "parent" => Ok(NativeProcessIdentity { pid: 4001, ..shell }),
+                            _ => Ok(NativeProcessIdentity {
+                                terminal_process_group: 4000,
+                                ..shell
+                            }),
+                        }
+                    }),
+                    record_incarnation: |_: &mut NativeSessionOwner| -> Result<()> {
+                        panic!("{case}: no incarnation is recorded")
+                    },
+                    stop: |_: OwnerGroups<u32>| -> Result<()> {
+                        panic!("{case}: nothing is stopped")
+                    },
+                },
+                crate::native::session::close::budget::close_deadline(),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected, "{kind:?} {case}");
+            assert_eq!(recorded_intent(&store, &surface), "no intent", "{case}");
+        }
+    }
+}
+
+// A refused proof or incarnation record publishes no intent and stops nothing.
+#[test]
+fn owner_stop_refusals_before_the_intent_record_nothing() {
+    for case in ["proof", "incarnation"] {
+        let (dir, owner, surface, live) = fixture(terminal::TerminalKind::AppleTerminal);
+        let store = Store::open_unchecked(dir.path());
+        let error = stop_attested_owner(
+            &store,
+            "session-owner123",
+            &surface,
+            OwnerStopIntent::Close,
+            OwnerStop {
+                attest: || {
+                    if case == "proof" {
+                        bail!("proof refused")
+                    }
+                    Ok((owner.clone(), live))
+                },
+                shell: FreshShell(|_| Ok(fixture_shell(live))),
+                record_incarnation: |_: &mut NativeSessionOwner| bail!("incarnation refused"),
+                stop: |_: OwnerGroups<u32>| -> Result<()> { panic!("{case}: nothing is stopped") },
+            },
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), format!("{case} refused"));
+        assert_eq!(recorded_intent(&store, &surface), "no intent", "{case}");
+    }
+}
+
+// The step checks the budget before the proof and before the intent; a close's stop checks
+// it again itself. An expiry at each check leaves exactly the effects before it.
+#[test]
+fn owner_stop_deadline_expiry_at_each_check() {
+    for unexpired_reads in 0..=2 {
+        let (dir, owner, surface, live) = fixture(terminal::TerminalKind::Warp);
+        let store = Store::open_unchecked(dir.path());
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, unexpired_reads);
+        let reads = clock.reads();
+        let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+        let (attestations, shells, incarnations, stops) =
+            (Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0));
+        let result = stop_attested_owner(
+            &store,
+            "session-owner123",
+            &surface,
+            OwnerStopIntent::Close,
+            OwnerStop {
+                attest: || {
+                    attestations.set(attestations.get() + 1);
+                    Ok((owner.clone(), live))
+                },
+                shell: FreshShell(|_| {
+                    shells.set(shells.get() + 1);
+                    Ok(fixture_shell(live))
+                }),
+                record_incarnation: |_: &mut NativeSessionOwner| {
+                    incarnations.set(incarnations.get() + 1);
+                    Ok(())
+                },
+                stop: |_: OwnerGroups<u32>| {
+                    stops.set(stops.get() + 1);
+                    Ok(())
+                },
+            },
+            deadline,
+        );
+        let intent = recorded_intent(&store, &surface) == "close intent";
+        // (expired, attestations, shell reads, incarnation records, intent, stops)
+        let expected = match unexpired_reads {
+            0 => (true, 0, 0, 0, false, 0),
+            1 => (true, 1, 1, 1, false, 0),
+            _ => (false, 1, 1, 1, true, 1),
+        };
+        let expired = match &result {
+            Ok(()) => false,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("close deadline expired"),
+                    "{error:#}"
+                );
+                true
+            }
+        };
+        assert_eq!(
+            (
+                expired,
+                attestations.get(),
+                shells.get(),
+                incarnations.get(),
+                intent,
+                stops.get()
+            ),
+            expected,
+            "{unexpired_reads}"
+        );
+        assert_eq!(
+            reads.get(),
+            (unexpired_reads + 1).min(2),
+            "{unexpired_reads}"
+        );
+    }
+}
+
+// A process group that cannot be a signal target is refused before any signal, by every
+// shared stop that signals a group, whatever the kind: the teardown replay's group probe and
+// the foreground-group stop of Warp and the teardown. The negation of a positive `pid_t`
+// cannot overflow, so the third refusal of `process_group_signal_target` is not reachable.
+#[test]
+fn process_group_signal_target_refusals_name_no_terminal_application() {
+    let out_of_range = i32::MAX as u32 + 1;
+    for (group, expected) in [
+        (out_of_range, "terminal process group is out of range"),
+        (0, "terminal process group must be positive"),
+    ] {
+        assert_eq!(
+            process_group_signal_target(group).unwrap_err().to_string(),
+            expected
+        );
+        assert_eq!(
+            owner_group_gone_with(group, |_, _| panic!("{group}: no group is probed"))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            terminate_owned_foreground_group_until_with_io(
+                group,
+                Instant::now() + Duration::from_secs(60),
+                |_, _| panic!("{group}: no signal is sent"),
+                |_| {},
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+    }
+    assert_eq!(process_group_signal_target(4242).unwrap(), -4242);
 }

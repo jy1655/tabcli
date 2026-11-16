@@ -57,3 +57,47 @@ impl Clock for FakeClock {
         self.slept += duration;
     }
 }
+
+// A clock that answers `start` for a given number of reads and `expired` from then on: it
+// places the expiry of a budget at one exact read, so a table of cases can expire it at
+// each check of a sequence in turn. `reads` counts every read, the expired ones included.
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::native) struct ExpiresAtRead {
+    start: Instant,
+    expired: Instant,
+    unexpired_reads: usize,
+    reads: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl ExpiresAtRead {
+    pub(in crate::native) fn new(start: Instant, expired: Instant, unexpired_reads: usize) -> Self {
+        Self {
+            start,
+            expired,
+            unexpired_reads,
+            reads: std::rc::Rc::default(),
+        }
+    }
+
+    pub(in crate::native) fn reads(&self) -> std::rc::Rc<std::cell::Cell<usize>> {
+        std::rc::Rc::clone(&self.reads)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Clock for ExpiresAtRead {
+    fn now(&mut self) -> Instant {
+        let read = self.reads.get();
+        self.reads.set(read + 1);
+        if read < self.unexpired_reads {
+            self.start
+        } else {
+            self.expired
+        }
+    }
+
+    fn sleep(&mut self, _: Duration) {
+        panic!("a sequence placed on read counts does not sleep")
+    }
+}

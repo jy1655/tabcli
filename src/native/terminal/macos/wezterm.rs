@@ -1,13 +1,14 @@
 use super::OwnedSurfaceClose;
-use super::ownership::verified_macos_terminal_owner;
+use super::ownership::{ProcessReads, SYSTEM_READS, verified_macos_terminal_owner_with};
 use super::process;
 use super::{MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
-use crate::native::session;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{Reader, Store};
-#[cfg(test)]
 use crate::native::terminal::ownership;
+use crate::native::terminal::ownership::{
+    NativeSessionOwner, OwnerGroups, OwnerStop, OwnerStopIntent, ProvenShell,
+};
 #[cfg(unix)]
 #[cfg(test)]
 use crate::native::terminal::shell_quote;
@@ -1326,19 +1327,35 @@ impl<H: Host> MacTerminalAdapter for Adapter<H> {
         deadline: Instant,
     ) -> Result<CloseOutcome> {
         if close == OwnedSurfaceClose::LiveOwner {
-            close_remaining(deadline)?;
-            // The adapter close can end the owner even when surface cleanup fails.
-            let (owner, _) = verified_macos_terminal_owner(directory, id, session, None)?;
-            close_remaining(deadline)?;
-            session::close::record_terminal_close_intent(
-                &Store::open_unchecked(directory),
-                id,
-                session,
-                &owner,
-            )?;
+            record_live_owner_intent(directory, id, session, SYSTEM_READS, deadline)?;
         }
         close_session_until(&self.host, session, deadline)
     }
+}
+
+// WezTerm's part of the owner stop: the proof's shell check is the last one, and nothing is
+// stopped before the pane is closed. The intent is still recorded first, because the adapter
+// close can end the owner even when surface cleanup fails.
+fn record_live_owner_intent(
+    directory: &Path,
+    id: &str,
+    session: &TerminalSession,
+    reads: ProcessReads<'_>,
+    deadline: Instant,
+) -> Result<()> {
+    ownership::stop_attested_owner(
+        &Store::open_unchecked(directory),
+        id,
+        session,
+        OwnerStopIntent::Close,
+        OwnerStop {
+            attest: || verified_macos_terminal_owner_with(directory, id, session, None, reads),
+            shell: ProvenShell,
+            record_incarnation: |_: &mut NativeSessionOwner| Ok(()),
+            stop: |_: OwnerGroups<()>| Ok(()),
+        },
+        deadline,
+    )
 }
 #[cfg(test)]
 mod tests;
