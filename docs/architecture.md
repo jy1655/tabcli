@@ -603,7 +603,9 @@ directories, is read through `session/core_record.rs` instead: `Reader::record`,
 optional, bytes or decoded text. Its read policy refuses a link at the record's final
 component, dangling or not, and any entry that is not a regular file, through the same
 lstat-then-read primitive the queries use, and decodes interpreted text as strict UTF-8; its
-presence check refuses what a read refuses. Readers keep their own missing-record semantics,
+presence check refuses what a read refuses. A Record decoded from bytes (the Hold, the macOS
+retained handle, every `record.rs` decoder) is checked whole as UTF-8 first (`record::utf8`):
+serde's byte decoder skips an unknown field's value without checking it. Readers keep their own missing-record semantics,
 error context and existing byte bounds. Two paths compare bytes instead of decoding them: the
 publication predicate's comparison of a journaled event with its journal, and Close's handling
 of a completion journal that does not decode, so invalid UTF-8 never keeps Close or prune from

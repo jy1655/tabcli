@@ -974,7 +974,8 @@ mod tests {
             format!("{error:#}"),
             format!(
                 "failed to read {}: stream did not contain valid UTF-8",
-                directory.join("events/event-1.json").display()
+                // Joined as production joins it, so the separators match on Windows.
+                directory.join("events").join("event-1.json").display()
             )
         );
         drop(snapshot);

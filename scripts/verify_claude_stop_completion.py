@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -56,6 +57,19 @@ def records(path):
     if not path.exists():
         return []
     return [json.loads(line)["payload"] for line in path.read_text().splitlines()]
+
+
+def read_core_record(path):
+    """A Bridge session record under Bridge's core read policy: None when it is missing; a
+    link, dangling or not, or any other entry that is not a regular file is refused; the
+    bytes are decoded as strict UTF-8."""
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"refusing non-regular session file: {path}")
+    return Path(path).read_bytes().decode("utf-8")
 
 
 def owned_sessions(state):
@@ -276,9 +290,11 @@ def main():
                 run_json([str(bridge), "inspect", owned, "--json"],
                          cleanup_output, "inspect", environment)
                 surface = terminal_session if owned == session else None
-                handle = state / owned / "terminal.json"
-                if surface is None and handle.exists():
-                    record = json.loads(handle.read_text())
+                handle = None
+                if surface is None:
+                    handle = read_core_record(state / owned / "terminal.json")
+                if handle is not None:
+                    record = json.loads(handle)
                     if record.get("terminal") == "iterm2":
                         surface = record.get("session_id", record.get("iterm_session_id"))
                 capture_surface(cleanup_output, surface)

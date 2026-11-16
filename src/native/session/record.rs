@@ -63,12 +63,18 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
+/// The whole input as UTF-8, before any shape decoder sees it. Serde's byte decoder skips the
+/// string value of a field the shape does not keep without checking its UTF-8, so a Record
+/// decoded from bytes is checked whole first; bytes that are UTF-8 keep serde's own
+/// diagnostics.
+pub(in crate::native) fn utf8(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).context("invalid UTF-8")
+}
+
 /// Strict UTF-8, the timestamp range rule, then the shape `T`. Shared by every decoder
 /// and by the projections of a core Record that are not the Record itself.
 pub(in crate::native) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DecodeError> {
-    let text = std::str::from_utf8(bytes)
-        .context("invalid UTF-8")
-        .map_err(DecodeError::Malformed)?;
+    let text = utf8(bytes).map_err(DecodeError::Malformed)?;
     let value: Value =
         serde_json::from_str(text).map_err(|error| DecodeError::Malformed(error.into()))?;
     timestamps_in_range(&value).map_err(DecodeError::Malformed)?;
@@ -243,13 +249,14 @@ pub(in crate::native) fn terminal(
     serde_json::from_str(text)
 }
 
-/// Retained-handle repair historically decodes directly from bytes, preserving serde's
-/// UTF-8 diagnostics rather than the text reader's I/O diagnostic.
+/// Retained-handle repair decodes the handle from its bytes: the whole input must be UTF-8
+/// (`invalid UTF-8`, see [`utf8`]), then serde's shape diagnostics, not the text reader's
+/// I/O diagnostic.
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn terminal_bytes(
     bytes: &[u8],
-) -> serde_json::Result<crate::native::terminal::TerminalSession> {
-    serde_json::from_slice(bytes)
+) -> Result<crate::native::terminal::TerminalSession> {
+    Ok(serde_json::from_str(utf8(bytes)?)?)
 }
 
 /// The self-test's typed projection of the handle consumed by close.

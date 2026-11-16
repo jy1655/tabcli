@@ -123,5 +123,79 @@ sys.exit(0 if interrupted and ready.exists() else 1)
             self.assertEqual((output / "launch.stderr").read_text(), "deadline detail\n")
 
 
+class CoreRecordReadTests(unittest.TestCase):
+    def test_a_core_record_is_a_regular_file_of_strict_utf8(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "terminal.json"
+            self.assertIsNone(probe.read_core_record(record))
+            record.write_bytes(b'{"terminal":"iterm2"}')
+            self.assertEqual(probe.read_core_record(record), '{"terminal":"iterm2"}')
+            record.write_bytes(b'{"terminal":"iterm2","extra":"\xff"}')
+            with self.assertRaises(UnicodeDecodeError):
+                probe.read_core_record(record)
+            record.unlink()
+            record.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "refusing non-regular session file"):
+                probe.read_core_record(record)
+
+    @unittest.skipIf(os.name == "nt", "Creating a symlink needs a privilege on Windows")
+    def test_a_link_at_a_core_record_is_refused_dangling_or_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "outside.json"
+            record = root / "terminal.json"
+            record.symlink_to(target)
+            for _ in ("dangling", "linked"):
+                with self.assertRaisesRegex(RuntimeError, "refusing non-regular session file"):
+                    probe.read_core_record(record)
+                target.write_text('{"terminal":"iterm2"}', encoding="utf-8")
+
+    @unittest.skipIf(os.name == "nt", "Creating a symlink needs a privilege on Windows")
+    def test_cleanup_refuses_a_linked_terminal_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            binary = root / "binary"
+            binary.touch()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            foreign = root / "foreign.json"
+            probe.write_json(foreign, {"terminal": "iterm2", "session_id": "foreign-surface"})
+            calls = []
+
+            def prepare(output, _claude):
+                state = output / "state"
+                state.mkdir()
+                return {"AGENT_BRIDGE_NATIVE_STATE_DIR": str(state)}
+
+            def run(command, output, name, environment=None, timeout=110):
+                calls.append(command)
+                state = Path(environment["AGENT_BRIDGE_NATIVE_STATE_DIR"])
+                if command[1] == "ask":
+                    owned = state / "session-owned"
+                    owned.mkdir()
+                    (owned / "terminal.json").symlink_to(foreign)
+                    raise subprocess.TimeoutExpired("ask", 1)
+                if command[1] == "close-session":
+                    return {"ok": True, "closed": True}, 0
+                return {"ok": True}, 0
+
+            argv = ["probe", "--bridge", str(binary), "--workspace", str(workspace),
+                    "--output", str(root / "probe")]
+            stderr = io.StringIO()
+            with (patch.object(probe.sys, "argv", argv),
+                  patch.object(probe.sys, "platform", "darwin"),
+                  patch.object(probe.shutil, "which", return_value=str(binary)),
+                  patch.object(probe, "prepare_probe", side_effect=prepare),
+                  patch.object(probe, "run_json", side_effect=run),
+                  patch.object(probe, "capture_surface") as capture,
+                  contextlib.redirect_stderr(stderr)):
+                self.assertEqual(probe.main(), 1)
+            # The linked handle is refused: no surface is captured through it, and the
+            # owned session is still closed.
+            capture.assert_not_called()
+            self.assertEqual([call[1] for call in calls], ["ask", "inspect", "close-session"])
+            self.assertIn("refusing non-regular session file", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

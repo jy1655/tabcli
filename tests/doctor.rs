@@ -212,7 +212,8 @@ fn codex_terminal_diagnosis_keeps_state_identity_and_strict_reread_policy() {
         if state != "pending" {
             fs::remove_file(fixture.directory.join("turn.claim")).unwrap();
         }
-        let event_path = fixture.directory.join("events/event-1.json");
+        // Joined as production joins it: the reason below compares this path's text.
+        let event_path = fixture.directory.join("events").join("event-1.json");
         write(
             &event_path,
             &json!({

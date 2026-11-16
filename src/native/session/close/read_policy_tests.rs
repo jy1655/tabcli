@@ -290,3 +290,40 @@ fn close_reason_from_a_tombstone_that_is_not_utf8() {
         closed.error
     );
 }
+
+// Repair keeps a dead owner's retained handle for the macOS adapters only after decoding it;
+// a handle whose unknown field's value is not UTF-8 is not a handle, and repair reports it
+// instead of acting on it.
+#[cfg(target_os = "macos")]
+#[test]
+fn repair_refuses_a_retained_handle_whose_unknown_value_is_not_utf8() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-retained");
+    fs::create_dir(&directory).unwrap();
+    crate::native::session::test_support::lifecycle::write_owned_terminal_state(
+        &directory,
+        "working",
+        std::process::id(),
+    );
+    let handle = directory.join(TERMINAL_HANDLE_FILE);
+    let text = fs::read_to_string(&handle).unwrap();
+    let end = text.rfind('}').unwrap();
+    let mut bytes = format!("{},\"extra\":\"x", &text[..end]).into_bytes();
+    bytes.push(0xff);
+    bytes.extend_from_slice(format!("\"{}", &text[end..]).as_bytes());
+    fs::write(&handle, bytes).unwrap();
+    let error = repair_dead_owner_with(
+        &Store::open_unchecked(&directory),
+        |_| Ok(false),
+        |_| true,
+        |_| panic!("a macOS repair closes no surface"),
+        budget::close_deadline(),
+    )
+    .map_err(|error| format!("{error:#}"))
+    .unwrap_err();
+    assert!(
+        error.starts_with("invalid retained terminal handle terminal.json: invalid UTF-8"),
+        "{error}"
+    );
+    assert_eq!(status(&directory).state.as_str(), "working");
+}

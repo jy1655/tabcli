@@ -81,8 +81,9 @@ enum Valid {
 }
 
 /// One reader of one record: the record's file name in the session directory, its valid
-/// bytes, the text after which a `0xff` byte makes them non-UTF-8 (inside a JSON string, so
-/// a lossy reader still decodes them), the reader, and what it makes of each case in
+/// bytes, the text after which a `0xff` byte makes them non-UTF-8 (inside a JSON string
+/// value, never a key, so a lossy reader still decodes them and a decoder that skips an
+/// unknown field's value would accept them), the reader, and what it makes of each case in
 /// [`CASES`] order.
 struct Row {
     reader: &'static str,
@@ -214,13 +215,25 @@ fn fixed(text: &str) -> Valid {
     Valid::Fixed(text.to_owned())
 }
 
+/// The corruption points of the fixed records below: inside a value, after its first byte.
+const ERROR_VALUE: &str = "\"error\":\"e";
+const NOTE_VALUE: &str = "\"note\":\"n";
+
 const STATUS: &str =
     r#"{"state":"working","generation":9,"updated_unix_ms":1,"exit_code":null,"error":"e"}"#;
 
 #[test]
 fn status_read_policy() {
-    let status =
-        |reader, read, expected| row(reader, STATUS_FILE, fixed(STATUS), "\"e", read, expected);
+    let status = |reader, read, expected| {
+        row(
+            reader,
+            STATUS_FILE,
+            fixed(STATUS),
+            ERROR_VALUE,
+            read,
+            expected,
+        )
+    };
     check(
         "status",
         vec![
@@ -251,7 +264,7 @@ fn closed_read_policy() {
             "Reader::closed_if_present",
             CLOSED_STATUS_FILE,
             fixed(&STATUS.replace("working", "closed")),
-            "\"e",
+            ERROR_VALUE,
             Box::new(|d| some(reader(d).closed_if_present())),
             [Refused, Refused, Refused, NotUtf8, Absent],
         )],
@@ -476,10 +489,12 @@ fn hold_read_policy() {
         row(
             reader,
             HOLD_FILE,
+            // An unknown field's value: serde's byte decoder skips it, so only a whole-input
+            // UTF-8 check refuses it.
             fixed(r#"{"held":true,"created_unix_ms":1,"note":"n"}"#),
-            "\"n",
+            NOTE_VALUE,
             read,
-            [Refused, Refused, Refused, Failed, Absent],
+            [Refused, Refused, Refused, NotUtf8, Absent],
         )
     };
     check(
@@ -657,7 +672,7 @@ fn launch_and_receipt_read_policy() {
             fixed(
                 r#"{"schema":1,"claim_token":"1-2-3","deadline_unix_ms":11,"phase":"pending","note":"n"}"#,
             ),
-            "\"n",
+            NOTE_VALUE,
             Box::new(|d| some(launch::read(&reader(d)))),
             [Refused, Refused, Refused, NotUtf8, Absent],
         )],
@@ -766,7 +781,7 @@ fn launch_host_read_policy() {
             "launch::host::observe",
             CoreRecord::LaunchHost.name(),
             fixed(r#"{"schema":2,"note":"n"}"#),
-            "\"n",
+            NOTE_VALUE,
             Box::new(|d| match launch::host::observe(&reader(d), None) {
                 HostObservation::NotRecorded => Ok(None),
                 HostObservation::Unreadable(error) => Err(anyhow::anyhow!(error)),
@@ -775,4 +790,27 @@ fn launch_host_read_policy() {
             [Refused, Refused, Refused, NotUtf8, Absent],
         )],
     );
+}
+
+// A Hold whose unknown field's value is not UTF-8 is malformed to the hold command too: it is
+// replaced and reported, not taken as a valid Hold.
+#[test]
+fn hold_change_over_an_unknown_value_that_is_not_utf8() {
+    let fixture = new_fixture();
+    let path = fixture.directory.join(HOLD_FILE);
+    fs::write(
+        &path,
+        corrupt(
+            r#"{"held":true,"created_unix_ms":1,"note":"n"}"#,
+            NOTE_VALUE,
+        ),
+    )
+    .unwrap();
+    let change = hold::change(&Store::open_unchecked(&fixture.directory), false).unwrap();
+    assert_eq!(
+        serde_json::to_value(&change).unwrap(),
+        serde_json::json!({"held": true, "changed": true, "previous": "malformed"})
+    );
+    assert!(hold::read(&reader(&fixture.directory)).unwrap());
+    assert!(std::str::from_utf8(&fs::read(&path).unwrap()).is_ok());
 }

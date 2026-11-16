@@ -10,7 +10,8 @@ struct Hold {
 }
 
 fn decode(bytes: &[u8]) -> Result<()> {
-    let record: Hold = serde_json::from_slice(bytes)?;
+    // Checked whole first: serde would skip an unknown field's value without checking it.
+    let record: Hold = serde_json::from_str(super::record::utf8(bytes)?)?;
     if !record.held {
         bail!("hold record must have held: true");
     }
