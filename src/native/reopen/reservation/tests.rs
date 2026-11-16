@@ -1,7 +1,6 @@
 use super::*;
 use crate::native::reopen::*;
 use crate::native::session::close as session_close;
-#[cfg(windows)]
 use crate::native::session::launch;
 #[cfg(windows)]
 use crate::native::session::launch::wrapper::provision;
@@ -3612,6 +3611,10 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
 }
 
 fn start_source_fixture(root: &Path) -> ResolvedReopen {
+    start_source_fixture_on(root, terminal::TerminalKind::WindowsConsole)
+}
+
+fn start_source_fixture_on(root: &Path, terminal_kind: terminal::TerminalKind) -> ResolvedReopen {
     let id = "session-start-source";
     let directory =
         write_closed_reopen_source(root, id, "claude", Some(REOPEN_TEST_CONVERSATION), true);
@@ -3631,12 +3634,7 @@ fn start_source_fixture(root: &Path) -> ResolvedReopen {
         source_id: id.into(),
         source_directory: directory,
         source,
-        start: session_start::Resolved::from_parts(
-            spec,
-            terminal::TerminalKind::WindowsConsole,
-            Vec::new(),
-            None,
-        ),
+        start: session_start::Resolved::from_parts(spec, terminal_kind, Vec::new(), None),
     }
 }
 
@@ -3791,6 +3789,77 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
     let admitted = Reservation::claim(&died_source, died_id, REOPEN_TEST_CONVERSATION)
         .expect("the next reopen releases the stale marker and is admitted");
     drop(admitted);
+}
+
+// A reopen launch that fails before the launcher fences its Claim keeps the reopen's own
+// settlement: it fences the Claim itself, records the launch-failed refusal, fences the
+// failed start through the launch receipt and releases the source. The launch host step
+// fails on a recorded host record, before any terminal, on every platform.
+#[test]
+fn a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement() {
+    const CHILD: &str = "TABCLI_REOPEN_LAUNCH_BEFORE_FENCE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::reopen::reservation::tests::a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let adapter = start_source_fixture_on(&root, terminal::TerminalKind::Iterm2)
+        .create()
+        .unwrap();
+    let source_id = adapter.source_id.clone();
+    let source_directory = adapter.source_directory.clone();
+    let directory = adapter.prepared.created.directory.clone();
+    fs::write(directory.join(CoreRecord::LaunchHost.name()), b"{}").unwrap();
+    let mut report = TurnReport::new(false, serde_json::Map::new());
+    let (outcome, gate) = adapter.run(&start_operation(), &mut report);
+    let error = outcome.unwrap_err();
+    const FAILURE: &str = "launch host is already recorded";
+    assert_eq!(gate, Some(ReopenGate::LaunchFailed));
+    assert_eq!(
+        format!("{error:#}"),
+        format!("reopen refused (launch-failed): {FAILURE}")
+    );
+    let reader = Reader::open_unchecked(&directory);
+    let status = reader.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some(FAILURE));
+    assert!(turn::current_claim_token(&reader).unwrap().is_none());
+    let receipt = launch::read(&reader).unwrap().unwrap();
+    assert_eq!(receipt.phase, launch::Phase::Pending);
+    let refusal = read_reopen_launch_refusal(&directory).unwrap();
+    assert_eq!(refusal.gate, ReopenGate::LaunchFailed.as_str());
+    assert_eq!(refusal.detail, FAILURE);
+    assert_eq!(
+        refusal.claim_token.as_deref(),
+        Some(receipt.claim_token.as_str())
+    );
+    assert_eq!(refusal.cleanup, None);
+    let (_, request) = report.address().unwrap();
+    let result = query::request_result(&reader, request).unwrap();
+    assert_eq!(result["request_state"], "failed", "{result}");
+    assert_eq!(result["error"], FAILURE, "{result}");
+    assert!(
+        !Reader::open_unchecked(&source_directory)
+            .record(CoreRecord::ReopenMarker)
+            .path()
+            .exists(),
+        "the settlement releases the source marker"
+    );
+    let second = Reservation::claim(&source_directory, &source_id, REOPEN_TEST_CONVERSATION)
+        .expect("a second reopen of the source is admitted");
+    drop(second);
 }
 
 #[test]

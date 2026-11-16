@@ -592,10 +592,10 @@ fn concurrent_reopens_reserve_safe_generic_failure_once() {
 }
 
 #[test]
-fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop() {
+fn failure_before_durable_launch_receipt_retains_reopen_and_settles_fresh_failed() {
     if isolated(concat!(
         module_path!(),
-        "::failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop"
+        "::failure_before_durable_launch_receipt_retains_reopen_and_settles_fresh_failed"
     )) {
         return;
     }
@@ -611,8 +611,8 @@ fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop
     assert_eq!(child, root.join(&child_id));
     fs::create_dir(child.join(launch::FILE)).unwrap();
 
-    // Fresh keeps the ordinary Claim Drop behavior, even before launch::begin wrote
-    // a receipt. Exercise the complete Initial prompt operation, not its error hook.
+    // Fresh settles a launch failure before the fence as failed, even before launch::begin
+    // wrote a receipt. Exercise the complete Initial prompt operation, not its error hook.
     let mut fresh_report = TurnReport::new(false, serde_json::Map::new());
     let fresh_error = start_operation()
         .run(
@@ -625,9 +625,12 @@ fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop
     assert!(fresh_report.address().is_some());
     assert!(!child.join(TURN_CLAIM_FILE).exists());
     assert!(!child.join(REOPEN_REFUSAL_FILE).exists());
+    let receipt_error = launch::read(&Reader::open_unchecked(&child)).unwrap_err();
+    let status = Reader::open_unchecked(&child).status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
     assert_eq!(
-        Reader::open_unchecked(&child).status().unwrap().state,
-        SessionState::Launching
+        status.error.unwrap(),
+        format!("{original}; {receipt_error:#}")
     );
 
     // Reopen fences that same stage and settles its marker without requiring the caller

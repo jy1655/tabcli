@@ -544,6 +544,12 @@ impl Claim {
         self.retained = true;
     }
 
+    /// Whether the launcher fenced this Claim, so that a launch failure publication owns its
+    /// release. Read only while its launch starts: delivery settlement retains it later.
+    pub(in crate::native) fn launch_fenced(&self) -> bool {
+        self.retained
+    }
+
     // Releases the claim now and publishes `state` with `reason` in the same status write,
     // under the lifecycle lock and only while the claim file still holds this token. Returns
     // whether that write happened; a claim that another request already owns is left alone

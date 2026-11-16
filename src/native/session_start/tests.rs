@@ -1,6 +1,8 @@
 use super::*;
 use crate::native::create_session_within;
-use crate::native::session::CoreRecord;
+use crate::native::query;
+use crate::native::session::test_support::STATUS_LOCK_FILE;
+use crate::native::session::{CoreRecord, close};
 use std::fs;
 
 struct Fixture {
@@ -8,6 +10,16 @@ struct Fixture {
     consent: Option<PathBuf>,
     unwritable_consent: bool,
     unwritable_claim: bool,
+    terminal_kind: terminal::TerminalKind,
+    // A directory at the launch receipt's path: `launch::begin` fails and the receipt stays
+    // unreadable. Without it the launch can reach the terminal, so a test that clears it
+    // must stop the launch another way.
+    receipt_directory: bool,
+    // A regular launch-host record that `launch::host::initialize` refuses to replace.
+    recorded_launch_host: bool,
+    // A directory at the status lock's path: every status write fails, while status reads
+    // and the Claim's removal still succeed.
+    status_lock_directory: bool,
 }
 
 impl Fixture {
@@ -17,7 +29,21 @@ impl Fixture {
             consent: None,
             unwritable_consent: false,
             unwritable_claim: false,
+            terminal_kind: terminal::TerminalKind::WindowsConsole,
+            receipt_directory: true,
+            recorded_launch_host: false,
+            status_lock_directory: false,
         }
+    }
+
+    // A launch whose receipt `begin` writes and whose host step then fails, before the
+    // launcher fences the Claim and before any terminal is touched, on every platform.
+    fn host_failure() -> Self {
+        let mut fixture = Self::new();
+        fixture.receipt_directory = false;
+        fixture.terminal_kind = terminal::TerminalKind::Iterm2;
+        fixture.recorded_launch_host = true;
+        fixture
     }
 
     fn prepare(&self) -> Result<Prepared> {
@@ -33,7 +59,7 @@ impl Fixture {
                 yolo: false,
                 prompt: "fixture".into(),
             },
-            terminal_kind: terminal::TerminalKind::WindowsConsole,
+            terminal_kind: self.terminal_kind,
             context_sources: context_sources(),
             consent: self
                 .consent
@@ -45,13 +71,23 @@ impl Fixture {
             let created =
                 create_session_within(self.root.path(), &[self.root.path().to_owned()], spec)?;
             // Stop before any terminal or provider could be launched.
-            fs::create_dir(created.directory.join(CoreRecord::Launch.name()))?;
+            if self.receipt_directory {
+                fs::create_dir(created.directory.join(CoreRecord::Launch.name()))?;
+            }
+            if self.recorded_launch_host {
+                fs::write(created.directory.join(CoreRecord::LaunchHost.name()), b"{}")?;
+            }
             if self.unwritable_consent {
                 fs::create_dir(created.directory.join("workspace-consent.json"))?;
             }
             record_consent(&created, consent)?;
             if self.unwritable_claim {
                 fs::create_dir(created.directory.join("turn.claim"))?;
+            }
+            if self.status_lock_directory {
+                let lock = created.directory.join(STATUS_LOCK_FILE);
+                fs::remove_file(&lock)?;
+                fs::create_dir(&lock)?;
             }
             Ok((created, ()))
         })?;
@@ -82,9 +118,30 @@ fn start() -> Start {
 }
 
 fn run(prepared: &Prepared, source: &dyn InitialSource) -> (anyhow::Error, TurnReport) {
+    run_with(&start(), prepared, source)
+}
+
+fn run_with(
+    start: &Start,
+    prepared: &Prepared,
+    source: &dyn InitialSource,
+) -> (anyhow::Error, TurnReport) {
     let mut report = TurnReport::new(false, ResultExtra::new());
-    let error = start().run(prepared, source, &mut report).unwrap_err();
+    let error = start.run(prepared, source, &mut report).unwrap_err();
     (error, report)
+}
+
+// Runs `run` with the records' wall clock fixed at `now`.
+fn at_unix_ms<T>(now: u128, run: impl FnOnce() -> T) -> T {
+    use crate::native::session::tests::FIXED_UNIX_MS;
+    struct Reset(Option<u128>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIXED_UNIX_MS.set(self.0);
+        }
+    }
+    let _reset = Reset(FIXED_UNIX_MS.replace(Some(now)));
+    run()
 }
 
 struct FailedExtra;
@@ -179,13 +236,219 @@ fn real_create_stops_at_launch_begin_with_optional_consent() {
         assert!(directory.join(CoreRecord::Launch.name()).is_dir());
         assert!(!directory.join(CoreRecord::Terminal.name()).exists());
         assert!(!directory.join("turn.claim").exists());
-        // A fresh launch that failed before a durable receipt keeps ordinary Drop behavior.
+        // A fresh launch that failed before the launcher fenced its Claim is settled as a
+        // failed start; the unreadable receipt's error follows the launch error.
+        let reader = Reader::open_unchecked(directory);
+        let receipt_error = launch::read(&reader).unwrap_err();
+        let status = reader.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
         assert_eq!(
-            Reader::open_unchecked(directory).status().unwrap().state,
-            SessionState::Launching
+            status.error.unwrap(),
+            format!("{error:#}; {receipt_error:#}")
         );
         assert!(!directory.join(CoreRecord::ReopenRefusal.name()).exists());
     }
+}
+
+// What a settled start failure before the fence leaves for the queries and close: a failed
+// Request with the recorded error, the `launch_failed` attention flag, and a close that does
+// not wait for the launch deadline.
+fn assert_settled_before_fence(fixture: &Fixture, prepared: &Prepared, report: &TurnReport) {
+    let directory = &prepared.created.directory;
+    let store = Store::open_unchecked(directory);
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    let recorded = status.error.unwrap();
+    assert!(!directory.join("turn.claim").exists());
+    assert!(!directory.join(CoreRecord::Terminal.name()).exists());
+    let (session, request) = report.address().unwrap();
+    let result = query::request_result(&store, request).unwrap();
+    assert_eq!(result["request_state"], "failed", "{result}");
+    assert_eq!(result["error"], recorded.as_str(), "{result}");
+    assert!(
+        attention(fixture, session).contains(&"launch_failed".to_owned()),
+        "{:?}",
+        attention(fixture, session)
+    );
+    close::close(&store, None, close::budget::close_deadline(), |_| {
+        panic!("no terminal handle")
+    })
+    .unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+}
+
+fn attention(fixture: &Fixture, session: &str) -> Vec<String> {
+    let status = query::status::test_value_in(fixture.root.path());
+    let row = status["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == session)
+        .unwrap_or_else(|| panic!("{status}"));
+    row["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|flag| flag.as_str().unwrap().to_owned())
+        .collect()
+}
+
+// A valid Pending receipt for the Claim: the launch host step fails after `begin` and before
+// the fence, and the start settles through the launch failure publication.
+#[test]
+fn a_host_failure_before_the_fence_settles_the_pending_receipt() {
+    let fixture = Fixture::host_failure();
+    let prepared = fixture.prepare().unwrap();
+    let (error, report) = run(&prepared, &FreshSource);
+    assert_eq!(format!("{error:#}"), "launch host is already recorded");
+    let store = Store::open_unchecked(&prepared.created.directory);
+    let receipt = launch::read(&store).unwrap().unwrap();
+    assert_eq!(receipt.phase, launch::Phase::Pending);
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("launch host is already recorded")
+    );
+    assert_settled_before_fence(&fixture, &prepared, &report);
+}
+
+// The request deadline is already spent when the launch begins: the host step refuses the
+// receipt whose deadline has passed, before the fence.
+#[test]
+fn an_expired_request_deadline_before_the_fence_settles_the_pending_receipt() {
+    let mut fixture = Fixture::host_failure();
+    fixture.recorded_launch_host = false;
+    let prepared = fixture.prepare().unwrap();
+    let expired = Start {
+        options: StartOptions {
+            timeout: Duration::from_secs(30),
+            detach: false,
+            json: false,
+        },
+        deadline: Instant::now(),
+    };
+    let (error, report) = at_unix_ms(1_000_000, || run_with(&expired, &prepared, &FreshSource));
+    assert_eq!(format!("{error:#}"), "launch host is no longer eligible");
+    let store = Store::open_unchecked(&prepared.created.directory);
+    assert_eq!(
+        launch::read(&store).unwrap().unwrap().deadline_unix_ms,
+        1_000_000
+    );
+    assert!(
+        !prepared
+            .created
+            .directory
+            .join(CoreRecord::LaunchHost.name())
+            .exists()
+    );
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("launch host is no longer eligible")
+    );
+    assert_settled_before_fence(&fixture, &prepared, &report);
+}
+
+// Repair past the receipt's deadline no longer finds a launching Session without its Claim:
+// the start failure stays recorded as it was settled.
+#[test]
+fn repair_past_the_deadline_keeps_a_start_failure_settled_before_the_fence() {
+    let fixture = Fixture::host_failure();
+    let prepared = fixture.prepare().unwrap();
+    let (_, report) = run(&prepared, &FreshSource);
+    let store = Store::open_unchecked(&prepared.created.directory);
+    let receipt = launch::read(&store).unwrap().unwrap();
+    let before = store.status().unwrap();
+    assert!(at_unix_ms(receipt.deadline_unix_ms + 1, || launch::repair(&store)).unwrap());
+    let after = store.status().unwrap();
+    assert_eq!(after.state, SessionState::Failed);
+    assert_eq!(after.error, before.error);
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+    let (_, request) = report.address().unwrap();
+    let result = query::request_result(&store, request).unwrap();
+    assert_eq!(result["request_state"], "failed", "{result}");
+}
+
+// A settlement whose status write fails keeps the fenced Claim, so the Session is never left
+// launching without one; repair past the receipt's deadline settles it.
+#[test]
+fn a_failed_settlement_before_the_fence_keeps_the_claim_for_repair() {
+    let mut fixture = Fixture::host_failure();
+    fixture.status_lock_directory = true;
+    let prepared = fixture.prepare().unwrap();
+    let (error, report) = run(&prepared, &FreshSource);
+    let directory = &prepared.created.directory;
+    let store = Store::open_unchecked(directory);
+    let receipt = launch::read(&store).unwrap().unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Launching);
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some(receipt.claim_token.as_str())
+    );
+    let text = format!("{error:#}");
+    assert!(
+        text.starts_with("the failed launch could not be settled: "),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(": launch host is already recorded"),
+        "{text}"
+    );
+    fs::remove_dir(directory.join(STATUS_LOCK_FILE)).unwrap();
+    assert!(at_unix_ms(receipt.deadline_unix_ms, || launch::repair(&store)).unwrap());
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(
+        status.error.as_deref(),
+        Some("provider launch timed out before startup was confirmed")
+    );
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+    let (_, request) = report.address().unwrap();
+    let result = query::request_result(&store, request).unwrap();
+    assert_eq!(result["request_state"], "failed", "{result}");
+}
+
+// No receipt for the Claim (`launch::begin` failed before writing it): the status alone
+// records the failure. Without a launch record there is no launch diagnostic, so the Request
+// stays unresolved and no `launch_failed` flag appears.
+#[test]
+fn a_start_failure_without_a_receipt_records_only_the_failed_status() {
+    let mut fixture = Fixture::new();
+    fixture.receipt_directory = false;
+    let prepared = fixture.prepare().unwrap();
+    let directory = &prepared.created.directory;
+    let store = Store::open_unchecked(directory);
+    let mut claim = turn::claim(&store, &context_sources()).unwrap();
+    let request = claim.receipt().request_id.clone();
+    let error = FreshSource.failed(
+        &prepared.created,
+        Failure::Launch {
+            claim: &mut claim,
+            error: anyhow::anyhow!("injected receipt failure"),
+        },
+    );
+    drop(claim);
+    assert_eq!(format!("{error:#}"), "injected receipt failure");
+    assert!(launch::read(&store).unwrap().is_none());
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some("injected receipt failure"));
+    assert!(!directory.join("turn.claim").exists());
+    let result = query::request_result(&store, &request).unwrap();
+    assert_eq!(result["request_state"], "unresolved", "{result}");
+    let flags = attention(&fixture, &prepared.created.id);
+    assert!(flags.contains(&"session_failed".to_owned()), "{flags:?}");
+    assert!(
+        !flags.iter().any(|flag| flag.starts_with("launch_")),
+        "{flags:?}"
+    );
+    close::close(&store, None, close::budget::close_deadline(), |_| {
+        panic!("no terminal handle")
+    })
+    .unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
 }
 
 #[test]
@@ -724,4 +987,126 @@ fn the_initial_delivery_failure_carries_the_version_note_beside_the_session() {
         format!("{error:#}"),
         "failed to deliver the initial prompt to claude session session-note: cause"
     );
+}
+
+// An unreadable receipt stays unreadable to the queries, whatever the status records. Close
+// reports it as its pre-close repair failure and, the start being settled as failed, no
+// longer stops at the receipt that a launching Session's deadline check reads.
+#[test]
+fn an_unreadable_launch_receipt_stays_unreadable_to_queries() {
+    let fixture = Fixture::new();
+    let prepared = fixture.prepare().unwrap();
+    let (_, report) = run(&prepared, &FreshSource);
+    let store = Store::open_unchecked(&prepared.created.directory);
+    let receipt_error = format!("{:#}", launch::read(&store).unwrap_err());
+    assert!(
+        receipt_error.starts_with("refusing non-regular session file: "),
+        "{receipt_error}"
+    );
+    let (session, request) = report.address().unwrap();
+    let error = query::request_result(&store, request).unwrap_err();
+    assert_eq!(format!("{error:#}"), receipt_error);
+    let status = query::status::test_value_in(fixture.root.path());
+    assert_eq!(status["incomplete"], true, "{status}");
+    assert_eq!(
+        status["incomplete_reasons"],
+        serde_json::json!([{"session": session, "reason": receipt_error}]),
+        "{status}"
+    );
+    assert_eq!(status["sessions"], serde_json::json!([]), "{status}");
+    close::close(&store, None, close::budget::close_deadline(), |_| {
+        panic!("no terminal handle")
+    })
+    .unwrap();
+    let closed = store.closed_if_present().unwrap().unwrap();
+    assert_eq!(closed.state, SessionState::Closed);
+    assert_eq!(
+        closed.error.unwrap(),
+        format!("pre-close session repair failed: {receipt_error}")
+    );
+}
+
+// A launch failure after the launcher fenced the Claim keeps the terminal failure handoff's
+// settlement: the recorded wording, the released Claim and the failed Request. The surface
+// fails without a terminal on every platform: macOS and Linux refuse Windows Console, and
+// Windows takes the injected failure before it opens one.
+#[test]
+fn a_surface_failure_after_the_fence_keeps_its_terminal_failure_settlement() {
+    let mut fixture = Fixture::new();
+    fixture.receipt_directory = false;
+    let prepared = fixture.prepare().unwrap();
+    #[cfg(windows)]
+    terminal::launch_failure_test_support::inject(|_| anyhow::anyhow!("injected surface failure"));
+    let (error, report) = run(&prepared, &FreshSource);
+    let text = format!("{error:#}");
+    let cause = text
+        .strip_prefix(&format!(
+            "failed to open Windows Console surface for session {}: ",
+            prepared.created.id
+        ))
+        .unwrap_or_else(|| panic!("{text}"));
+    #[cfg(windows)]
+    assert_eq!(cause, "injected surface failure");
+    let store = Store::open_unchecked(&prepared.created.directory);
+    assert_eq!(
+        launch::read(&store).unwrap().unwrap().phase,
+        launch::Phase::Pending
+    );
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    let recorded = format!(
+        "terminal launch failed: {cause}; no surface handle was recorded and no prompt was sent"
+    );
+    assert_eq!(status.error.as_deref(), Some(recorded.as_str()));
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+    let (_, request) = report.address().unwrap();
+    let result = query::request_result(&store, request).unwrap();
+    assert_eq!(result["request_state"], "failed", "{result}");
+    assert_eq!(result["error"], recorded.as_str(), "{result}");
+}
+
+// A launch failure whose Claim the launcher already fenced belongs to the launcher's own
+// settlement (the terminal failure handoff or the startup wait); the fresh source adds none,
+// even while the Session is still launching.
+#[test]
+fn a_fenced_launch_failure_is_left_to_the_launchers_settlement() {
+    let mut fixture = Fixture::new();
+    fixture.receipt_directory = false;
+    let prepared = fixture.prepare().unwrap();
+    let directory = &prepared.created.directory;
+    let store = Store::open_unchecked(directory);
+    let mut claim = turn::claim(&store, &context_sources()).unwrap();
+    let token = claim.token().to_owned();
+    let request = claim.receipt().request_id.clone();
+    launch::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+    claim.fence_launch();
+    let records = || {
+        [
+            CoreRecord::Status,
+            CoreRecord::TurnClaim,
+            CoreRecord::Launch,
+        ]
+        .map(|record| store.record(record).bytes().unwrap())
+    };
+    let before = records();
+    let error = FreshSource.failed(
+        &prepared.created,
+        Failure::Launch {
+            claim: &mut claim,
+            error: anyhow::anyhow!("startup is still holding the lifecycle lock"),
+        },
+    );
+    drop(claim);
+    assert_eq!(
+        format!("{error:#}"),
+        "startup is still holding the lifecycle lock"
+    );
+    assert_eq!(records(), before);
+    assert_eq!(store.status().unwrap().state, SessionState::Launching);
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    let result = query::request_result(&store, &request).unwrap();
+    assert_eq!(result["request_state"], "pending", "{result}");
 }

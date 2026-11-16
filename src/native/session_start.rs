@@ -124,11 +124,20 @@ impl InitialSource for FreshSource {
         Ok(())
     }
 
+    // A launch failure before the launcher fenced the Claim has no launcher settlement; one
+    // after the fence keeps the launcher's own (the terminal failure handoff or the wait).
     fn failed(&self, created: &CreatedSession, failure: Failure<'_>) -> anyhow::Error {
         match failure {
             Failure::Preparing(error) => {
                 mark_start_failed(created, &error);
                 error
+            }
+            Failure::Launch { claim, error } if !claim.launch_fenced() => {
+                launch::settle_unfenced_start(
+                    &Store::open_unchecked(&created.directory),
+                    claim,
+                    error,
+                )
             }
             Failure::Launch { error, .. } | Failure::Delivery { error, .. } => error,
         }
