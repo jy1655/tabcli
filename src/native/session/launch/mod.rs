@@ -5,7 +5,6 @@ use crate::native::session::state::{
     ResidualSurface, SessionState, SessionStatus, update_status, update_status_with_residual,
 };
 
-#[cfg(target_os = "macos")]
 use crate::native::clock::Clock;
 use crate::native::failure_kind::TimedOut;
 use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
@@ -18,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use std::process::Child;
 use std::{
     process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -44,6 +42,8 @@ mod admission_tests;
 pub(in crate::native) mod binding_tests;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
+#[cfg(test)]
+mod wait_tests;
 
 pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
     let directory = store.directory();
@@ -694,67 +694,72 @@ fn repair_with_owner(
 }
 
 const LAUNCH_DEADLINE: &str = "provider launch timed out before startup was confirmed";
+const SURFACE_DISAPPEARED: &str =
+    "terminal surface disappeared before provider launch was confirmed";
+/// The wait inspects the surface this often, first one interval after it starts.
+const SURFACE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// One inspection may take this long, and never past the deadline.
+const SURFACE_PROBE_BOUND: Duration = Duration::from_secs(2);
+/// The longest sleep between two readings of the records.
+const WAIT_POLL: Duration = Duration::from_millis(100);
+
+/// The surface observation port of the launcher's wait: whether the launch's terminal
+/// surface is still present. An inspection error does not prove absence.
+trait SurfacePresence {
+    fn present(&mut self, timeout: Duration) -> Result<bool>;
+}
+
+/// Production: the terminal's read-only presence check of the launch's surface.
+struct TerminalSurface<'a> {
+    directory: &'a std::path::Path,
+    surface: &'a terminal::TerminalSession,
+}
+
+impl SurfacePresence for TerminalSurface<'_> {
+    fn present(&mut self, timeout: Duration) -> Result<bool> {
+        terminal::surface_present(self.directory, self.surface, timeout)
+    }
+}
 
 pub(in crate::native) fn wait(
     store: &Store,
     surface: &terminal::TerminalSession,
     deadline: Instant,
 ) -> Result<()> {
-    let mut next_probe = Instant::now() + Duration::from_secs(1);
+    wait_with(
+        store,
+        deadline,
+        &mut crate::native::clock::SystemClock,
+        &mut TerminalSurface {
+            directory: store.directory(),
+            surface,
+        },
+    )
+}
+
+/// The launcher's wait for a confirmed launch. Each poll reads the records, then decides on
+/// the time and the surface: at the deadline, or when a due probe finds the surface gone,
+/// the wait settles the launch under the lifecycle lock. Every reading of time and every
+/// sleep goes through `clock`.
+fn wait_with(
+    store: &Store,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+    presence: &mut dyn SurfacePresence,
+) -> Result<()> {
+    let mut next_probe = clock.now() + SURFACE_PROBE_INTERVAL;
     loop {
-        if let Some(_lock) = store.try_lock()? {
-            match host_decision_locked(store)? {
-                HostDecision::Confirmed => return Ok(()),
-                HostDecision::Failed => bail!(
-                    "{}",
-                    store
-                        .status()?
-                        .error
-                        .unwrap_or_else(|| "launch host failed".into())
-                ),
-                HostDecision::Ended => {
-                    let status = store.status()?;
-                    bail!(
-                        "{}",
-                        status.error.unwrap_or_else(|| format!(
-                            "launch entered {}",
-                            if store.closed_if_present().ok().flatten().is_some() {
-                                SessionState::Closed
-                            } else {
-                                status.state
-                            }
-                        ))
-                    );
-                }
-                HostDecision::Pending => {}
-            }
-        }
-        let status: SessionStatus = store.status()?;
-        if status.state.ended() {
-            bail!(
-                "{}",
-                status
-                    .error
-                    .unwrap_or_else(|| format!("launch entered {}", status.state))
-            );
-        }
-        if read(store)?.is_some_and(|record| confirmed(store, &record, &status)) {
+        if recorded_confirmation(store)? {
             return Ok(());
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(clock.now());
         let deadline_reached = remaining.is_zero();
         let reason = if deadline_reached {
             Some(deadline_reason(store, read(store)?.as_ref()))
-        } else if Instant::now() >= next_probe {
-            next_probe = Instant::now() + Duration::from_secs(1);
-            match terminal::surface_present(
-                store.directory(),
-                surface,
-                remaining.min(Duration::from_secs(2)),
-            ) {
-                Ok(false) => Some(
-                    "terminal surface disappeared before provider launch was confirmed".to_owned(),
-                ),
+        } else if clock.now() >= next_probe {
+            next_probe = clock.now() + SURFACE_PROBE_INTERVAL;
+            match presence.present(remaining.min(SURFACE_PROBE_BOUND)) {
+                Ok(false) => Some(SURFACE_DISAPPEARED.to_owned()),
                 // Inspection errors (including permissions/timeouts) do not prove absence.
                 Ok(true) | Err(_) => None,
             }
@@ -762,48 +767,99 @@ pub(in crate::native) fn wait(
             None
         };
         if let Some(reason) = reason {
-            let Some(_lock) = store.try_lock()? else {
-                let message = format!(
-                    "{reason}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
-                );
-                if deadline_reached {
-                    bail!(TimedOut::new(message));
-                }
-                bail!("{message}");
-            };
-            let record = read(store)?.context("launch receipt disappeared")?;
-            let status: SessionStatus = store.status()?;
-            if confirmed(store, &record, &status) {
-                return Ok(());
-            }
-            match host_decision_locked(store)? {
-                HostDecision::Confirmed => return Ok(()),
-                HostDecision::Failed | HostDecision::Ended => bail!(
-                    "{}",
-                    store
-                        .status()?
-                        .error
-                        .unwrap_or_else(|| "launch has ended".into())
-                ),
-                HostDecision::Pending => {}
-            }
-            let reason = if deadline_reached {
-                deadline_reason(store, Some(&record))
-            } else {
-                reason
-            };
-            fail_locked(store, &record, &reason)?;
-            let status: SessionStatus = store.status()?;
-            let message = status.error.as_deref().unwrap_or(&reason);
-            // The hint needs this wait's own deadline and that reason as the recorded text;
-            // another writer's status text stays a plain message.
-            if deadline_reached && message == reason {
-                bail!(TimedOut::new(message));
-            }
-            bail!("{message}");
+            return settle(store, reason, deadline_reached);
         }
-        thread::sleep(remaining.min(Duration::from_millis(100)));
+        clock.sleep(remaining.min(WAIT_POLL));
     }
+}
+
+// What the records already decide for the wait: `true` for a confirmed launch, an error
+// naming how an ended or failed launch ended, `false` while it is pending. The locked host
+// decision runs only when the lifecycle lock is free; the status and the receipt are read
+// on every poll.
+fn recorded_confirmation(store: &Store) -> Result<bool> {
+    if let Some(_lock) = store.try_lock()? {
+        match host_decision_locked(store)? {
+            HostDecision::Confirmed => return Ok(true),
+            HostDecision::Failed => bail!(
+                "{}",
+                store
+                    .status()?
+                    .error
+                    .unwrap_or_else(|| "launch host failed".into())
+            ),
+            HostDecision::Ended => {
+                let status = store.status()?;
+                bail!(
+                    "{}",
+                    status.error.unwrap_or_else(|| format!(
+                        "launch entered {}",
+                        if store.closed_if_present().ok().flatten().is_some() {
+                            SessionState::Closed
+                        } else {
+                            status.state
+                        }
+                    ))
+                );
+            }
+            HostDecision::Pending => {}
+        }
+    }
+    let status: SessionStatus = store.status()?;
+    if status.state.ended() {
+        bail!(
+            "{}",
+            status
+                .error
+                .unwrap_or_else(|| format!("launch entered {}", status.state))
+        );
+    }
+    Ok(read(store)?.is_some_and(|record| confirmed(store, &record, &status)))
+}
+
+// Settles the wait for `reason` under the lifecycle lock: a launch confirmed or settled
+// meanwhile keeps its own outcome; otherwise the launch fails with `reason` (the deadline's
+// reason read again under the lock). A held lock leaves the claim and the records alone.
+fn settle(store: &Store, reason: String, deadline_reached: bool) -> Result<()> {
+    let Some(_lock) = store.try_lock()? else {
+        let message = format!(
+            "{reason}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
+        );
+        if deadline_reached {
+            bail!(TimedOut::new(message));
+        }
+        bail!("{message}");
+    };
+    let record = read(store)?.context("launch receipt disappeared")?;
+    let status: SessionStatus = store.status()?;
+    if confirmed(store, &record, &status) {
+        return Ok(());
+    }
+    match host_decision_locked(store)? {
+        HostDecision::Confirmed => return Ok(()),
+        HostDecision::Failed | HostDecision::Ended => bail!(
+            "{}",
+            store
+                .status()?
+                .error
+                .unwrap_or_else(|| "launch has ended".into())
+        ),
+        HostDecision::Pending => {}
+    }
+    let reason = if deadline_reached {
+        deadline_reason(store, Some(&record))
+    } else {
+        reason
+    };
+    fail_locked(store, &record, &reason)?;
+    let status: SessionStatus = store.status()?;
+    let message = status.error.as_deref().unwrap_or(&reason);
+    // The hint needs this wait's own deadline and that reason as the recorded text;
+    // another writer's status text stays a plain message.
+    if deadline_reached && message == reason {
+        bail!(TimedOut::new(message));
+    }
+    bail!("{message}");
 }
 
 fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {

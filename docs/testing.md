@@ -168,7 +168,9 @@ Tests inject it into the workspace trust wait, Agy's readiness gate and receipt 
 messenger, the Codex queue's bounded send, legacy Codex submission polling, Windows console
 input drain, read-only Request polling in `wait` and `result --wait`, the Status scan and its
 Session observation and snapshot retries, the Origin observation environment (which also carries
-the process attester), the macOS launch binding wait, and the
+the process attester), the macOS launch binding wait, the macOS launch host's wait for its
+handoff (with its capture result and binding observation ports), the launcher's wait for a
+confirmed launch (with its surface presence port), and the
 close scope. The close deadline stays an ambient scope by design, because record primitives and
 the AppleScript diagnostics read it without a parameter; the scope's clock is a field of that
 scope, set only by tests, and `close_now` reads it or the system clock. No production path

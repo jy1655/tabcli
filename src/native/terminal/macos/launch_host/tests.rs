@@ -1,7 +1,10 @@
 use super::*;
+use crate::native::clock::FakeClock;
 use crate::native::session::CoreRecord;
 use crate::native::terminal::macos::{iterm2, wezterm};
 use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     fs,
     io::Write,
     os::{
@@ -9,6 +12,7 @@ use std::{
         unix::fs::PermissionsExt,
     },
     process::{Child, Command, Stdio},
+    rc::Rc,
 };
 
 struct PtyChild {
@@ -237,102 +241,710 @@ fn wezterm_production_bootstrap_bypasses_startup_key_read_and_flushes_capture_in
     pty_regression(TerminalKind::WezTerm);
 }
 
+// The host's step decision on a scripted clock: the capture and the binding answer from a
+// script, a sleep only advances the clock (and a fixed wall clock with it), and the trace
+// records every port call at its simulated time in milliseconds from the start. Nothing here
+// waits on the wall clock or needs a terminal.
+#[derive(Debug, Eq, PartialEq)]
+enum Event {
+    Poll(u64),
+    Ready(u64),
+    Observe(u64),
+    Sleep(u64),
+}
+use Event::{Observe, Poll, Ready, Sleep};
+
+#[derive(Clone)]
+struct Trace {
+    origin: Instant,
+    now: Rc<Cell<Instant>>,
+    events: Rc<RefCell<Vec<Event>>>,
+}
+
+impl Trace {
+    fn new(clock: &FakeClock) -> Self {
+        let now = clock.shared();
+        Self {
+            origin: now.get(),
+            now,
+            events: Rc::default(),
+        }
+    }
+
+    fn push(&self, event: fn(u64) -> Event) {
+        let at = self.now.get().duration_since(self.origin).as_millis() as u64;
+        self.events.borrow_mut().push(event(at));
+    }
+}
+
+struct TracedClock {
+    clock: FakeClock,
+    trace: Trace,
+}
+
+impl Clock for TracedClock {
+    fn now(&mut self) -> Instant {
+        self.clock.now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        let ms = duration.as_millis();
+        self.trace.events.borrow_mut().push(Sleep(ms as u64));
+        self.clock.sleep(duration);
+        let wall = &crate::native::session::tests::FIXED_UNIX_MS;
+        if let Some(now) = wall.get() {
+            wall.set(Some(now + ms));
+        }
+    }
+}
+
+struct ScriptedCapture {
+    answers: VecDeque<CapturePoll>,
+    trace: Trace,
+}
+
+impl CaptureResult for ScriptedCapture {
+    fn poll(&mut self) -> CapturePoll {
+        self.trace.push(Poll);
+        // An exhausted script keeps the capture running.
+        self.answers.pop_front().unwrap_or(CapturePoll::Running)
+    }
+}
+
+struct ScriptedBinding {
+    answers: VecDeque<Binding>,
+    trace: Trace,
+}
+
+impl BindingObservation for ScriptedBinding {
+    fn observe(&mut self) -> Binding {
+        self.trace.push(Observe);
+        // An exhausted script keeps the binding absent.
+        self.answers.pop_front().unwrap_or(Binding::Absent)
+    }
+}
+
+// The production observation, traced.
+struct TracedBinding<'a> {
+    binding: LockedBinding<'a>,
+    trace: Trace,
+}
+
+impl BindingObservation for TracedBinding<'_> {
+    fn observe(&mut self) -> Binding {
+        self.trace.push(Observe);
+        self.binding.observe()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Outcome {
+    HandOff { variables: usize },
+    Refused(Refusal),
+    Error(String),
+}
+
+fn captured() -> Captured {
+    Captured {
+        variables: vec![("FIXTURE".into(), "ready".into())],
+        elapsed: Duration::from_millis(7),
+        background_children_stopped: 0,
+    }
+}
+
+fn capture_failure(
+    reason: host::FailureReason,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> CaptureFailure {
+    CaptureFailure {
+        reason,
+        exit_code,
+        signal,
+        elapsed: Duration::from_millis(1500),
+    }
+}
+
+fn refusal(reason: host::FailureReason) -> Outcome {
+    Outcome::Refused(Refusal::host(reason))
+}
+
+/// Drives the wait with scripted ports from its start to its outcome, with the deadline
+/// `deadline_ms` after the start. The ready act records its call and answers `ready`.
+fn drive(
+    deadline_ms: u64,
+    captures: Vec<CapturePoll>,
+    bindings: Vec<Binding>,
+    ready: fn() -> Result<()>,
+) -> (Outcome, Vec<Event>) {
+    let clock = FakeClock::new(Instant::now());
+    let trace = Trace::new(&clock);
+    let start = trace.origin;
+    let mut clock = TracedClock {
+        clock,
+        trace: trace.clone(),
+    };
+    let ready_trace = trace.clone();
+    let outcome = await_handoff(
+        &mut clock,
+        start,
+        start + Duration::from_millis(deadline_ms),
+        &mut ScriptedCapture {
+            answers: captures.into(),
+            trace: trace.clone(),
+        },
+        &mut ScriptedBinding {
+            answers: bindings.into(),
+            trace: trace.clone(),
+        },
+        &mut |_, now| {
+            assert_eq!(now, ready_trace.now.get());
+            ready_trace.push(Ready);
+            ready()
+        },
+    );
+    let outcome = match outcome {
+        Ok(Ok(captured)) => Outcome::HandOff {
+            variables: captured.variables.len(),
+        },
+        Ok(Err(refusal)) => Outcome::Refused(refusal),
+        Err(error) => Outcome::Error(format!("{error:#}")),
+    };
+    (outcome, trace.events.take())
+}
+
+fn recorded() -> Result<()> {
+    Ok(())
+}
+
+#[test]
+fn capture_ready_before_the_binding_hands_off_when_the_binding_names_the_host() {
+    let (outcome, trace) = drive(
+        1000,
+        vec![CapturePoll::Running, CapturePoll::Finished(Ok(captured()))],
+        vec![Binding::Absent, Binding::Absent, Binding::Host],
+        recorded,
+    );
+    assert_eq!(outcome, Outcome::HandOff { variables: 1 });
+    // The capture is no longer polled once it has answered.
+    assert_eq!(
+        trace,
+        [
+            Poll(0),
+            Observe(0),
+            Sleep(10),
+            Poll(10),
+            Ready(10),
+            Observe(10),
+            Sleep(10),
+            Observe(20)
+        ]
+    );
+}
+
+#[test]
+fn capture_ready_after_the_binding_hands_off_in_the_same_step() {
+    let (outcome, trace) = drive(
+        1000,
+        vec![
+            CapturePoll::Running,
+            CapturePoll::Running,
+            CapturePoll::Finished(Ok(captured())),
+        ],
+        vec![Binding::Host, Binding::Host, Binding::Host],
+        recorded,
+    );
+    assert_eq!(outcome, Outcome::HandOff { variables: 1 });
+    assert_eq!(
+        trace,
+        [
+            Poll(0),
+            Observe(0),
+            Sleep(10),
+            Poll(10),
+            Observe(10),
+            Sleep(10),
+            Poll(20),
+            Ready(20),
+            Observe(20)
+        ]
+    );
+}
+
+#[test]
+fn capture_failure_refuses_with_the_captures_own_facts() {
+    for (exit_code, signal) in [(Some(3), None), (None, Some(9))] {
+        let (outcome, trace) = drive(
+            1000,
+            vec![
+                CapturePoll::Running,
+                CapturePoll::Finished(Err(capture_failure(
+                    host::FailureReason::CaptureExitNonzero,
+                    exit_code,
+                    signal,
+                ))),
+            ],
+            vec![],
+            recorded,
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Refused(Refusal {
+                reason: host::FailureReason::CaptureExitNonzero,
+                exit_code,
+                signal,
+                capture_elapsed: Some(Duration::from_millis(1500)),
+            })
+        );
+        // The binding is not observed after the capture failed.
+        assert_eq!(trace, [Poll(0), Observe(0), Sleep(10), Poll(10)]);
+    }
+}
+
+#[test]
+fn a_capture_thread_gone_without_an_answer_refuses_as_a_failed_capture_spawn() {
+    let (outcome, trace) = drive(
+        1000,
+        vec![
+            CapturePoll::Running,
+            CapturePoll::Running,
+            CapturePoll::Gone,
+        ],
+        vec![],
+        recorded,
+    );
+    // The capture's duration is the host's own time since the start.
+    assert_eq!(
+        outcome,
+        Outcome::Refused(Refusal {
+            reason: host::FailureReason::CaptureSpawnFailed,
+            exit_code: None,
+            signal: None,
+            capture_elapsed: Some(Duration::from_millis(20)),
+        })
+    );
+    assert_eq!(
+        trace,
+        [
+            Poll(0),
+            Observe(0),
+            Sleep(10),
+            Poll(10),
+            Observe(10),
+            Sleep(10),
+            Poll(20)
+        ]
+    );
+}
+
+#[test]
+fn a_binding_that_does_not_name_the_host_refuses_at_once_with_or_without_the_capture() {
+    for binding in [Binding::Other, Binding::Unavailable] {
+        // The capture still runs: the host refuses without waiting for it.
+        let (outcome, trace) = drive(1000, vec![], vec![Binding::Absent, binding], recorded);
+        assert_eq!(outcome, refusal(host::FailureReason::BindingMismatch));
+        assert_eq!(
+            trace,
+            [Poll(0), Observe(0), Sleep(10), Poll(10), Observe(10)],
+            "{binding:?}"
+        );
+        let (outcome, trace) = drive(
+            1000,
+            vec![CapturePoll::Finished(Ok(captured()))],
+            vec![binding],
+            recorded,
+        );
+        assert_eq!(outcome, refusal(host::FailureReason::BindingMismatch));
+        assert_eq!(trace, [Poll(0), Ready(0), Observe(0)], "{binding:?}");
+    }
+}
+
+#[test]
+fn the_deadline_refuses_before_the_binding_is_observed_with_and_without_the_capture() {
+    let (outcome, trace) = drive(30, vec![], vec![], recorded);
+    assert_eq!(outcome, refusal(host::FailureReason::BindingTimeout));
+    assert_eq!(
+        trace,
+        [
+            Poll(0),
+            Observe(0),
+            Sleep(10),
+            Poll(10),
+            Observe(10),
+            Sleep(10),
+            Poll(20),
+            Observe(20),
+            Sleep(10),
+            Poll(30)
+        ]
+    );
+    let (outcome, trace) = drive(
+        30,
+        vec![CapturePoll::Finished(Ok(captured()))],
+        vec![],
+        recorded,
+    );
+    assert_eq!(outcome, refusal(host::FailureReason::BindingTimeout));
+    assert_eq!(
+        trace,
+        [
+            Poll(0),
+            Ready(0),
+            Observe(0),
+            Sleep(10),
+            Observe(10),
+            Sleep(10),
+            Observe(20),
+            Sleep(10)
+        ]
+    );
+}
+
+#[test]
+fn a_capture_answer_at_the_deadline_is_taken_before_the_deadline() {
+    let failure = capture_failure(host::FailureReason::CaptureTimeout, None, None);
+    let (outcome, trace) = drive(
+        0,
+        vec![CapturePoll::Finished(Err(failure))],
+        vec![],
+        recorded,
+    );
+    assert_eq!(
+        outcome,
+        Outcome::Refused(Refusal {
+            reason: host::FailureReason::CaptureTimeout,
+            exit_code: None,
+            signal: None,
+            capture_elapsed: Some(Duration::from_millis(1500)),
+        })
+    );
+    assert_eq!(trace, [Poll(0)]);
+    // A ready environment is recorded first; the deadline then refuses unobserved.
+    let (outcome, trace) = drive(
+        0,
+        vec![CapturePoll::Finished(Ok(captured()))],
+        vec![Binding::Host],
+        recorded,
+    );
+    assert_eq!(outcome, refusal(host::FailureReason::BindingTimeout));
+    assert_eq!(trace, [Poll(0), Ready(0)]);
+}
+
+#[test]
+fn a_failed_ready_record_ends_the_wait_without_a_refusal() {
+    let (outcome, trace) = drive(
+        1000,
+        vec![CapturePoll::Finished(Ok(captured()))],
+        vec![Binding::Host],
+        || Err(anyhow::anyhow!("stale launch host transition")),
+    );
+    assert_eq!(
+        outcome,
+        Outcome::Error("stale launch host transition".into())
+    );
+    assert_eq!(trace, [Poll(0), Ready(0)]);
+}
+
+// The capture result port's production adapter: the capture thread's channel.
+#[test]
+fn the_capture_channel_answers_running_then_each_result_then_gone() {
+    let (send, receive) = mpsc::sync_channel(1);
+    let mut capture = ChannelCapture(receive);
+    assert!(matches!(capture.poll(), CapturePoll::Running));
+    send.send(Ok(captured())).unwrap();
+    assert!(matches!(
+        capture.poll(),
+        CapturePoll::Finished(Ok(captured)) if captured.variables.len() == 1
+    ));
+    send.send(Err(capture_failure(
+        host::FailureReason::CaptureTimeout,
+        None,
+        None,
+    )))
+    .unwrap();
+    assert!(matches!(
+        capture.poll(),
+        CapturePoll::Finished(Err(failure)) if failure.reason == host::FailureReason::CaptureTimeout
+    ));
+    drop(send);
+    assert!(matches!(capture.poll(), CapturePoll::Gone));
+}
+
+const IDENTITY: host::HostIdentity = host::HostIdentity {
+    pid: 123,
+    start_seconds: 1234,
+    start_microseconds: 5,
+};
+
+// An iTerm2 host admitted for a pending launch, preparing its environment.
+fn admitted(timeout: Duration) -> (tempfile::TempDir, Store, String) {
+    let (directory, store, token) =
+        launch::test_support::pending_launch("session-", &std::env::temp_dir(), timeout);
+    host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
+    host::admit(&store, &token, IDENTITY).unwrap();
+    host::advance(
+        &store,
+        &token,
+        IDENTITY,
+        host::Stage::EnvironmentPreparing,
+        host::Progress {
+            capture_budget_ms: 10_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (directory, store, token)
+}
+
+fn session_id(store: &Store) -> &str {
+    store.directory().file_name().unwrap().to_str().unwrap()
+}
+
+fn host_record(store: &Store) -> host::HostRecord {
+    match host::observe(store, launch::read(store).unwrap().as_ref()) {
+        host::HostObservation::Recorded(record) => record,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Runs the admitted host's wait on the scripted clock and capture, with the production
+/// binding observation and record acts, until it refuses; the deadline comes from the
+/// receipt as the host computes it. Returns the host's error and the trace.
+fn refuse(store: &Store, token: &str, captures: Vec<CapturePoll>) -> (String, Vec<Event>) {
+    let clock = FakeClock::new(Instant::now());
+    let trace = Trace::new(&clock);
+    let start = trace.origin;
+    let mut clock = TracedClock {
+        clock,
+        trace: trace.clone(),
+    };
+    let receipt = launch::read(store).unwrap().unwrap();
+    let deadline =
+        start + Duration::from_millis(receipt.deadline_unix_ms.saturating_sub(unix_ms()) as u64);
+    let recorder = Recorder {
+        store,
+        token,
+        kind: TerminalKind::Iterm2,
+        identity: Some(IDENTITY),
+        start,
+    };
+    let ready_trace = trace.clone();
+    let refusal = await_handoff(
+        &mut clock,
+        start,
+        deadline,
+        &mut ScriptedCapture {
+            answers: captures.into(),
+            trace: trace.clone(),
+        },
+        &mut TracedBinding {
+            binding: LockedBinding {
+                store,
+                token,
+                identity: IDENTITY,
+                session_id: session_id(store),
+                kind: TerminalKind::Iterm2,
+            },
+            trace: trace.clone(),
+        },
+        &mut |captured, now| {
+            ready_trace.push(Ready);
+            recorder.ready(IDENTITY, 10_000, captured, now)
+        },
+    )
+    .unwrap()
+    .expect_err("the host refuses");
+    let error = recorder.refuse(refusal, clock.now());
+    (format!("{error:#}"), trace.events.take())
+}
+
+fn launch_log(store: &Store) -> String {
+    fs::read_to_string(store.directory().join(launch::LOG)).unwrap()
+}
+
 #[test]
 fn capture_failure_is_recorded_while_binding_is_absent() {
-    let root = tempfile::tempdir().unwrap();
-    let dir =
-        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
-    let store = Store::open_unchecked(dir.path());
-    let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(&store, &receipt.claim_token, TerminalKind::Iterm2).unwrap();
-    fs::write(dir.path().join(".zshrc"), "exit 3\n").unwrap();
-    let program = bootstrap(
-        &executable(root.path()),
-        dir.path(),
-        "exit 99",
-        TerminalKind::Iterm2,
+    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (error, trace) = refuse(
+        &store,
+        &token,
+        vec![
+            CapturePoll::Running,
+            CapturePoll::Finished(Err(capture_failure(
+                host::FailureReason::CaptureExitNonzero,
+                Some(3),
+                None,
+            ))),
+        ],
     );
-    let mut child = spawn(&program, dir.path());
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut recorded = false;
-    while Instant::now() < deadline {
-        if let host::HostObservation::Recorded(r) = host::observe(&store, Some(&receipt))
-            && let Some(f) = r.failure
-        {
-            assert_eq!(f.reason, host::FailureReason::CaptureExitNonzero);
-            assert_eq!(f.exit_code, Some(3));
-            assert_eq!(r.stage, host::Stage::EnvironmentPreparing);
-            recorded = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(recorded);
-    let _ = child.child.wait();
+    assert_eq!(error, "iTerm2 launch host refused: capture_exit_nonzero");
+    assert_eq!(trace, [Poll(0), Observe(0), Sleep(10), Poll(10)]);
+    let record = host_record(&store);
+    assert_eq!(
+        record.failure,
+        Some(host::Failure {
+            reason: host::FailureReason::CaptureExitNonzero,
+            exit_code: Some(3),
+            signal: None,
+        })
+    );
+    assert_eq!(record.stage, host::Stage::EnvironmentPreparing);
+    assert_eq!(record.elapsed_ms, 10);
+    assert_eq!(record.capture_elapsed_ms, Some(1500));
+    let log = launch_log(&store);
+    assert!(
+        log.contains(" shell_environment_failed reason=capture_exit_nonzero elapsed_ms=1500\n"),
+        "{log}"
+    );
+    assert!(
+        log.ends_with(" iterm2_host_refused reason=capture_exit_nonzero\n"),
+        "{log}"
+    );
 }
+
 #[test]
 fn binding_failure_is_recorded_while_capture_is_still_running() {
-    let root = tempfile::tempdir().unwrap();
-    let dir =
-        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
-    let store = Store::open_unchecked(dir.path());
-    let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(&store, &receipt.claim_token, TerminalKind::Iterm2).unwrap();
-    fs::write(dir.path().join(".zshrc"), "sleep 100\n").unwrap();
+    let (_directory, store, token) = admitted(Duration::from_secs(10));
     bind(&store, TerminalKind::WezTerm);
-    let program = bootstrap(
-        &executable(root.path()),
-        dir.path(),
-        "exit 99",
-        TerminalKind::Iterm2,
+    // The capture never answers: the refusal comes at the first observation.
+    let (error, trace) = refuse(&store, &token, vec![]);
+    assert_eq!(error, "iTerm2 launch host refused: binding_mismatch");
+    assert_eq!(trace, [Poll(0), Observe(0)]);
+    let record = host_record(&store);
+    assert_eq!(
+        record.failure,
+        Some(host::Failure {
+            reason: host::FailureReason::BindingMismatch,
+            exit_code: None,
+            signal: None,
+        })
     );
-    let mut child = spawn(&program, dir.path());
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut recorded = false;
-    while Instant::now() < deadline {
-        if let host::HostObservation::Recorded(r) = host::observe(&store, Some(&receipt))
-            && let Some(f) = r.failure
-        {
-            assert_eq!(f.reason, host::FailureReason::BindingMismatch);
-            recorded = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(recorded);
-    let _ = child.child.wait();
+    assert_eq!(record.stage, host::Stage::EnvironmentPreparing);
+    assert_eq!(record.capture_elapsed_ms, None);
+    let log = launch_log(&store);
+    assert!(!log.contains("shell_environment_failed"), "{log}");
+    assert!(
+        log.ends_with(" iterm2_host_refused reason=binding_mismatch\n"),
+        "{log}"
+    );
 }
 
 #[test]
 fn binding_timeout_is_retained_after_receipt_expiry() {
-    let root = tempfile::tempdir().unwrap();
-    let dir =
-        launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(3)).0;
-    let store = Store::open_unchecked(dir.path());
-    let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(&store, &receipt.claim_token, TerminalKind::Iterm2).unwrap();
-    fs::write(dir.path().join(".zshrc"), "export FIXTURE=ready\n").unwrap();
-    let program = bootstrap(
-        &executable(root.path()),
-        dir.path(),
-        "exit 99",
-        TerminalKind::Iterm2,
-    );
-    let _child = spawn(&program, dir.path());
-    let until = Instant::now() + Duration::from_secs(4);
-    while Instant::now() < until {
-        if let host::HostObservation::Recorded(record) = host::observe(&store, Some(&receipt))
-            && let Some(failure) = record.failure
-        {
-            assert_eq!(failure.reason, host::FailureReason::BindingTimeout);
-            assert_eq!(record.stage, host::Stage::EnvironmentReady);
-            assert!(record.capture_elapsed_ms.is_some());
-            assert!(record.variables.is_some());
-            return;
+    struct Wall(Option<u128>);
+    impl Drop for Wall {
+        fn drop(&mut self) {
+            crate::native::session::tests::FIXED_UNIX_MS.set(self.0);
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("binding timeout was not retained for the expired, still current receipt");
+    const WALL: u128 = 1_000_000;
+    let _wall = Wall(crate::native::session::tests::FIXED_UNIX_MS.replace(Some(WALL)));
+    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    // A receipt that expires 50 ms after the host starts, on the fixed wall clock.
+    let mut receipt = launch::read(&store).unwrap().unwrap();
+    receipt.deadline_unix_ms = WALL + 50;
+    store
+        .record(CoreRecord::Launch)
+        .write_json(&receipt)
+        .unwrap();
+    let (error, trace) = refuse(&store, &token, vec![CapturePoll::Finished(Ok(captured()))]);
+    // The binding was last observed while the receipt was current; the failure is
+    // recorded once the receipt has expired.
+    assert_eq!(unix_ms(), WALL + 50);
+    assert_eq!(error, "iTerm2 launch host refused: binding_timeout");
+    assert_eq!(
+        trace,
+        [
+            Poll(0),
+            Ready(0),
+            Observe(0),
+            Sleep(10),
+            Observe(10),
+            Sleep(10),
+            Observe(20),
+            Sleep(10),
+            Observe(30),
+            Sleep(10),
+            Observe(40),
+            Sleep(10)
+        ]
+    );
+    let record = host_record(&store);
+    assert_eq!(
+        record.failure.map(|failure| failure.reason),
+        Some(host::FailureReason::BindingTimeout)
+    );
+    assert_eq!(record.stage, host::Stage::EnvironmentReady);
+    assert_eq!(record.elapsed_ms, 50);
+    assert_eq!(record.capture_elapsed_ms, Some(7));
+    assert_eq!(record.variables, Some(1));
+    assert_eq!(record.background_children_stopped, Some(0));
+    let log = launch_log(&store);
+    assert!(
+        log.contains(
+            " shell_environment_ready elapsed_ms=7 variables=1 background_children_stopped=0\n"
+        ),
+        "{log}"
+    );
+    assert!(!log.contains("shell_environment_failed"), "{log}");
+    assert!(
+        log.ends_with(" iterm2_host_refused reason=binding_timeout\n"),
+        "{log}"
+    );
+}
+
+// The surface observation port's production adapter, on a real Session directory. A binding
+// that names this host's surface depends on the terminal's environment; the PTY regression
+// tests and the surface identity tests cover it.
+#[test]
+fn the_locked_binding_observation_needs_an_eligible_host_and_a_readable_handle() {
+    use launch::test_support::{Change, apply};
+    let other = host::HostIdentity {
+        pid: 124,
+        ..IDENTITY
+    };
+    let mut failures = Vec::new();
+    for (case, observer, expected) in [
+        ("absent", IDENTITY, Binding::Absent),
+        ("another terminal", IDENTITY, Binding::Other),
+        ("damaged handle", IDENTITY, Binding::Unavailable),
+        ("expired receipt", IDENTITY, Binding::Unavailable),
+        ("failed host", IDENTITY, Binding::Unavailable),
+        ("another incarnation", other, Binding::Unavailable),
+    ] {
+        let (_directory, store, token) = admitted(Duration::from_secs(10));
+        match case {
+            "another terminal" => bind(&store, TerminalKind::WezTerm),
+            "damaged handle" => fs::write(store.record(CoreRecord::Terminal).path(), b"{").unwrap(),
+            "expired receipt" => apply(&store, &[Change::ReceiptExpired]),
+            "failed host" => host::fail(
+                &store,
+                &token,
+                Some(IDENTITY),
+                host::Failure {
+                    reason: host::FailureReason::CaptureTimeout,
+                    exit_code: None,
+                    signal: None,
+                },
+                1,
+                None,
+            )
+            .unwrap(),
+            _ => {}
+        }
+        let observed = LockedBinding {
+            store: &store,
+            token: &token,
+            identity: observer,
+            session_id: session_id(&store),
+            kind: TerminalKind::Iterm2,
+        }
+        .observe();
+        if observed != expected {
+            failures.push(format!("{case}: {observed:?} != {expected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]

@@ -1,7 +1,11 @@
 //! Command-created surface host: capture without a TTY, observe binding concurrently,
 //! then replace this process with the non-startup shell on the already bound terminal.
+//! `run` performs the OS acts (identity, the capture thread, the input flush and the exec);
+//! `await_handoff` decides, on the clock and two ports (the capture result and the binding
+//! observation), whether the host keeps waiting, refuses or hands off.
 use super::bound_host::{BoundHostSpec, run_bound_host};
-use super::shell_environment::{self, Captured};
+use super::shell_environment::{self, CaptureFailure, Captured};
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::Store;
 use crate::native::session::launch::{self, host};
 use crate::native::session::primitives::unix_ms;
@@ -13,6 +17,9 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
+
+/// The host's wait between two observations of the capture and the binding.
+const POLL: Duration = Duration::from_millis(10);
 
 pub(super) fn word(value: impl serde::Serialize) -> String {
     serde_json::to_value(value)
@@ -34,7 +41,8 @@ pub(in crate::native::terminal) fn run(
             bail!("unsupported launch host");
         }
         let prefix = kind.as_str();
-        let start = Instant::now();
+        let mut clock = SystemClock;
+        let start = clock.now();
         let receipt = launch::read(&store)?.context("missing host launch receipt")?;
         let token = &receipt.claim_token;
         let remaining = Duration::from_millis(
@@ -53,42 +61,27 @@ pub(in crate::native::terminal) fn run(
                     start_microseconds: i.process_start_microseconds.try_into().ok()?,
                 })
             });
-        let fail =
-            |reason, exit_code, signal, capture_elapsed: Option<Duration>| -> anyhow::Error {
-                let elapsed = start.elapsed().as_millis() as u64;
-                let _ = host::fail(
-                    &store,
-                    token,
-                    identity,
-                    host::Failure {
-                        reason,
-                        exit_code,
-                        signal,
-                    },
-                    elapsed,
-                    capture_elapsed.map(|d| d.as_millis() as u64),
-                );
-                if let Some(elapsed) = capture_elapsed {
-                    launch::log(
-                        &store,
-                        &format!(
-                            "shell_environment_failed reason={} elapsed_ms={}",
-                            word(reason),
-                            elapsed.as_millis()
-                        ),
-                    );
-                }
-                launch::log(
-                    &store,
-                    &format!("{prefix}_host_refused reason={}", word(reason)),
-                );
-                anyhow::anyhow!("{name} launch host refused: {}", word(reason))
-            };
-        let identity = identity
-            .ok_or_else(|| fail(host::FailureReason::IdentityUnavailable, None, None, None))?;
+        let recorder = Recorder {
+            store: &store,
+            token,
+            kind,
+            identity,
+            start,
+        };
+        let identity = identity.ok_or_else(|| {
+            recorder.refuse(
+                Refusal::host(host::FailureReason::IdentityUnavailable),
+                clock.now(),
+            )
+        })?;
         match host::observe(&store, Some(&receipt)) {
             host::HostObservation::Recorded(record) if record.terminal == kind => {}
-            _ => return Err(fail(host::FailureReason::BindingMismatch, None, None, None)),
+            _ => {
+                return Err(recorder.refuse(
+                    Refusal::host(host::FailureReason::BindingMismatch),
+                    clock.now(),
+                ));
+            }
         }
         if host::admit(&store, token, identity).is_err() {
             // A refused duplicate must not publish failure for the admitted incarnation.
@@ -100,7 +93,7 @@ pub(in crate::native::terminal) fn run(
         }
         launch::log(&store, &format!("{prefix}_host_started"));
         let budget = deadline
-            .saturating_duration_since(Instant::now())
+            .saturating_duration_since(clock.now())
             .saturating_sub(
                 shell_environment::HANDOFF_RESERVE.saturating_add(shell_environment::CLEANUP),
             )
@@ -112,7 +105,7 @@ pub(in crate::native::terminal) fn run(
             identity,
             host::Stage::EnvironmentPreparing,
             host::Progress {
-                elapsed_ms: start.elapsed().as_millis() as u64,
+                elapsed_ms: recorder.elapsed(clock.now()).as_millis() as u64,
                 capture_budget_ms: budget_ms,
                 ..Default::default()
             },
@@ -131,90 +124,40 @@ pub(in crate::native::terminal) fn run(
                 let _ = send.send(shell_environment::capture(base, deadline));
             })
             .map_err(|_| {
-                fail(
-                    host::FailureReason::CaptureSpawnFailed,
-                    None,
-                    None,
-                    Some(Duration::ZERO),
+                recorder.refuse(
+                    Refusal {
+                        reason: host::FailureReason::CaptureSpawnFailed,
+                        exit_code: None,
+                        signal: None,
+                        capture_elapsed: Some(Duration::ZERO),
+                    },
+                    clock.now(),
                 )
             })?;
-        let mut captured: Option<Captured> = None;
-        loop {
-            if captured.is_none() {
-                match receive.try_recv() {
-                    Ok(Ok(result)) => {
-                        host::advance(
-                            &store,
-                            token,
-                            identity,
-                            host::Stage::EnvironmentReady,
-                            progress(start, budget_ms, &result),
-                        )?;
-                        launch::log(
-                            &store,
-                            &format!(
-                                "shell_environment_ready elapsed_ms={} variables={} background_children_stopped={}",
-                                result.elapsed.as_millis(),
-                                result.variables.len(),
-                                result.background_children_stopped
-                            ),
-                        );
-                        captured = Some(result);
-                    }
-                    Ok(Err(error)) => {
-                        return Err(fail(
-                            error.reason,
-                            error.exit_code,
-                            error.signal,
-                            Some(error.elapsed),
-                        ));
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(fail(
-                            host::FailureReason::CaptureSpawnFailed,
-                            None,
-                            None,
-                            Some(start.elapsed()),
-                        ));
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(fail(host::FailureReason::BindingTimeout, None, None, None));
-            }
-            let binding = (|| -> Result<Option<bool>> {
-                let _lock = store.lock()?;
-                host::eligible_incarnation(&store, token, identity)?;
-                Ok(launch::pending::bound_surface(
-                    &store,
-                    session_id,
-                    || "invalid host surface binding",
-                )?
-                .map(|surface| matches_surface(&surface, kind)))
-            })()
-            .map_err(|_| fail(host::FailureReason::BindingMismatch, None, None, None))?;
-            // A present, mismatched handle is final; absence is still waiting.
-            if binding == Some(false) {
-                return Err(fail(host::FailureReason::BindingMismatch, None, None, None));
-            }
-            if binding == Some(true) && captured.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let captured = captured.expect("capture completed before handoff");
+        let captured = await_handoff(
+            &mut clock,
+            start,
+            deadline,
+            &mut ChannelCapture(receive),
+            &mut LockedBinding {
+                store: &store,
+                token,
+                identity,
+                session_id,
+                kind,
+            },
+            &mut |captured, now| recorder.ready(identity, budget_ms, captured, now),
+        )?
+        .map_err(|refusal| recorder.refuse(refusal, clock.now()))?;
         let flushed = {
             let _lock = store.lock()?;
             host::eligible_incarnation(&store, token, identity)?;
             unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) == 0 }
         };
         if !flushed {
-            return Err(fail(
-                host::FailureReason::InputFlushFailed,
-                None,
-                None,
-                None,
+            return Err(recorder.refuse(
+                Refusal::host(host::FailureReason::InputFlushFailed),
+                clock.now(),
             ));
         }
         host::advance(
@@ -222,7 +165,7 @@ pub(in crate::native::terminal) fn run(
             token,
             identity,
             host::Stage::LaunchShellStarting,
-            progress(start, budget_ms, &captured),
+            progress(recorder.elapsed(clock.now()), budget_ms, &captured),
         )?;
         launch::log(&store, &format!("{prefix}_host_launch_shell"));
         let error = {
@@ -254,22 +197,287 @@ pub(in crate::native::terminal) fn run(
             shell.exec()
         };
         let _ = error; // Never log free-form child/startup errors.
-        Err(fail(
-            host::FailureReason::LaunchShellExecFailed,
-            None,
-            None,
-            None,
+        Err(recorder.refuse(
+            Refusal::host(host::FailureReason::LaunchShellExecFailed),
+            clock.now(),
         ))
     })
 }
 
-fn progress(start: Instant, budget: u64, capture: &Captured) -> host::Progress {
+fn progress(elapsed: Duration, budget: u64, capture: &Captured) -> host::Progress {
     host::Progress {
-        elapsed_ms: start.elapsed().as_millis() as u64,
+        elapsed_ms: elapsed.as_millis() as u64,
         capture_budget_ms: budget,
         capture_elapsed_ms: Some(capture.elapsed.as_millis() as u64),
         variables: Some(capture.variables.len() as u32),
         background_children_stopped: Some(capture.background_children_stopped),
+    }
+}
+
+/// Why the host refuses, as its failure record keeps it.
+#[derive(Debug, Eq, PartialEq)]
+struct Refusal {
+    reason: host::FailureReason,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    /// How long the capture ran when the capture ends the launch; the launch log names it then.
+    capture_elapsed: Option<Duration>,
+}
+
+impl Refusal {
+    /// A refusal of the host's own step, which carries no capture facts.
+    fn host(reason: host::FailureReason) -> Self {
+        Self {
+            reason,
+            exit_code: None,
+            signal: None,
+            capture_elapsed: None,
+        }
+    }
+}
+
+/// The host's writes for its launch: the host record through `session::launch::host`, then
+/// the launch log. Durations are measured from `start` on the host's clock.
+struct Recorder<'a> {
+    store: &'a Store,
+    token: &'a str,
+    kind: TerminalKind,
+    /// `None` only while the host has not identified itself.
+    identity: Option<host::HostIdentity>,
+    start: Instant,
+}
+
+impl Recorder<'_> {
+    fn elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.start)
+    }
+
+    /// Records `refusal` as the host's failure, best effort, and returns the error the host
+    /// exits with.
+    fn refuse(&self, refusal: Refusal, now: Instant) -> anyhow::Error {
+        let Refusal {
+            reason,
+            exit_code,
+            signal,
+            capture_elapsed,
+        } = refusal;
+        let elapsed = self.elapsed(now).as_millis() as u64;
+        let _ = host::fail(
+            self.store,
+            self.token,
+            self.identity,
+            host::Failure {
+                reason,
+                exit_code,
+                signal,
+            },
+            elapsed,
+            capture_elapsed.map(|d| d.as_millis() as u64),
+        );
+        if let Some(elapsed) = capture_elapsed {
+            launch::log(
+                self.store,
+                &format!(
+                    "shell_environment_failed reason={} elapsed_ms={}",
+                    word(reason),
+                    elapsed.as_millis()
+                ),
+            );
+        }
+        launch::log(
+            self.store,
+            &format!(
+                "{}_host_refused reason={}",
+                self.kind.as_str(),
+                word(reason)
+            ),
+        );
+        anyhow::anyhow!(
+            "{} launch host refused: {}",
+            self.kind.display_name(),
+            word(reason)
+        )
+    }
+
+    /// Records the prepared environment: the next stage, then the launch log line. A failed
+    /// record write ends the host without a failure record.
+    fn ready(
+        &self,
+        identity: host::HostIdentity,
+        budget_ms: u64,
+        captured: &Captured,
+        now: Instant,
+    ) -> Result<()> {
+        host::advance(
+            self.store,
+            self.token,
+            identity,
+            host::Stage::EnvironmentReady,
+            progress(self.elapsed(now), budget_ms, captured),
+        )?;
+        launch::log(
+            self.store,
+            &format!(
+                "shell_environment_ready elapsed_ms={} variables={} background_children_stopped={}",
+                captured.elapsed.as_millis(),
+                captured.variables.len(),
+                captured.background_children_stopped
+            ),
+        );
+        Ok(())
+    }
+}
+
+/// What the capture has answered so far.
+enum CapturePoll {
+    Running,
+    Finished(Result<Captured, CaptureFailure>),
+    /// The capture thread ended without an answer.
+    Gone,
+}
+
+/// The capture result port.
+trait CaptureResult {
+    fn poll(&mut self) -> CapturePoll;
+}
+
+/// Production: the capture thread's channel, read without blocking.
+struct ChannelCapture(mpsc::Receiver<Result<Captured, CaptureFailure>>);
+
+impl CaptureResult for ChannelCapture {
+    fn poll(&mut self) -> CapturePoll {
+        match self.0.try_recv() {
+            Ok(result) => CapturePoll::Finished(result),
+            Err(mpsc::TryRecvError::Empty) => CapturePoll::Running,
+            Err(mpsc::TryRecvError::Disconnected) => CapturePoll::Gone,
+        }
+    }
+}
+
+/// The host's observation of its Session's bound surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Binding {
+    /// No surface is bound yet.
+    Absent,
+    /// The bound surface names this host's own terminal surface.
+    Host,
+    /// The bound surface names another surface.
+    Other,
+    /// This incarnation may no longer act for the launch, or the binding cannot be read.
+    Unavailable,
+}
+
+/// The surface observation port.
+trait BindingObservation {
+    fn observe(&mut self) -> Binding;
+}
+
+/// Production: under the lifecycle lock, whether this incarnation may still act, then the
+/// bound surface and whether it names this host.
+struct LockedBinding<'a> {
+    store: &'a Store,
+    token: &'a str,
+    identity: host::HostIdentity,
+    session_id: &'a str,
+    kind: TerminalKind,
+}
+
+impl BindingObservation for LockedBinding<'_> {
+    fn observe(&mut self) -> Binding {
+        let binding = (|| -> Result<Option<bool>> {
+            let _lock = self.store.lock()?;
+            host::eligible_incarnation(self.store, self.token, self.identity)?;
+            Ok(launch::pending::bound_surface(
+                self.store,
+                self.session_id,
+                || "invalid host surface binding",
+            )?
+            .map(|surface| matches_surface(&surface, self.kind)))
+        })();
+        match binding {
+            Ok(None) => Binding::Absent,
+            Ok(Some(true)) => Binding::Host,
+            Ok(Some(false)) => Binding::Other,
+            Err(_) => Binding::Unavailable,
+        }
+    }
+}
+
+/// The host's decision at one observation, once the capture has not ended the launch.
+#[derive(Debug, Eq, PartialEq)]
+enum Step {
+    Continue,
+    Refuse(Refusal),
+    HandOff,
+}
+
+/// The step decision from the time, whether the environment is ready, and the binding,
+/// which is observed only before the deadline. A present binding that does not name this
+/// host is final, absence is still waiting, and the handoff needs both the binding and the
+/// environment.
+fn decide(now: Instant, deadline: Instant, ready: bool, binding: impl FnOnce() -> Binding) -> Step {
+    if now >= deadline {
+        return Step::Refuse(Refusal::host(host::FailureReason::BindingTimeout));
+    }
+    match binding() {
+        Binding::Other | Binding::Unavailable => {
+            Step::Refuse(Refusal::host(host::FailureReason::BindingMismatch))
+        }
+        Binding::Host if ready => Step::HandOff,
+        Binding::Host | Binding::Absent => Step::Continue,
+    }
+}
+
+/// The host's wait from the capture's start to the handoff. Every 10 ms it polls the capture
+/// until it answers, then decides on the time and the binding: the capture keeps running
+/// while the binding is observed, and a capture failure, the deadline or a binding that does
+/// not name this host refuses at once, without waiting for the capture. `ready` records the
+/// prepared environment as soon as the capture returns it; its error ends the wait without
+/// a refusal.
+fn await_handoff(
+    clock: &mut dyn Clock,
+    start: Instant,
+    deadline: Instant,
+    capture: &mut dyn CaptureResult,
+    binding: &mut dyn BindingObservation,
+    ready: &mut dyn FnMut(&Captured, Instant) -> Result<()>,
+) -> Result<std::result::Result<Captured, Refusal>> {
+    let mut captured: Option<Captured> = None;
+    loop {
+        if captured.is_none() {
+            match capture.poll() {
+                CapturePoll::Running => {}
+                CapturePoll::Finished(Ok(result)) => {
+                    ready(&result, clock.now())?;
+                    captured = Some(result);
+                }
+                CapturePoll::Finished(Err(failure)) => {
+                    return Ok(Err(Refusal {
+                        reason: failure.reason,
+                        exit_code: failure.exit_code,
+                        signal: failure.signal,
+                        capture_elapsed: Some(failure.elapsed),
+                    }));
+                }
+                CapturePoll::Gone => {
+                    return Ok(Err(Refusal {
+                        reason: host::FailureReason::CaptureSpawnFailed,
+                        exit_code: None,
+                        signal: None,
+                        capture_elapsed: Some(clock.now().saturating_duration_since(start)),
+                    }));
+                }
+            }
+        }
+        match decide(clock.now(), deadline, captured.is_some(), || {
+            binding.observe()
+        }) {
+            Step::Continue => clock.sleep(POLL),
+            Step::Refuse(refusal) => return Ok(Err(refusal)),
+            Step::HandOff => {
+                return Ok(Ok(captured.expect("capture completed before handoff")));
+            }
+        }
     }
 }
 
