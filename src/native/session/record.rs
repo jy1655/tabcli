@@ -136,6 +136,43 @@ pub(in crate::native) fn launch(bytes: &[u8]) -> Result<launch::Record, DecodeEr
     Ok(record)
 }
 
+/// Bounded launch-host decoder shared by live diagnosis and retained timeline bytes.
+#[allow(dead_code)] // A1: readers are integrated in the following unit.
+pub(in crate::native) fn launch_host(
+    bytes: &[u8],
+) -> Result<launch::host::HostObservation, DecodeError> {
+    use launch::host::{HostObservation, HostRecord, LIMIT, Stage};
+    if bytes.len() as u64 > LIMIT {
+        return Err(DecodeError::Rule(anyhow::anyhow!(
+            "launch host record exceeds 16 KiB"
+        )));
+    }
+    #[derive(serde::Deserialize)]
+    struct Version {
+        schema: u32,
+    }
+    let version: Version = decode(bytes)?;
+    if version.schema != 1 {
+        return Ok(HostObservation::SchemaUnsupported(version.schema));
+    }
+    let host: HostRecord = decode(bytes)?;
+    if host.claim_token.is_empty()
+        || host.managed_session_id.is_empty()
+        || (host.stage == Stage::AwaitingHost) != host.host.is_none()
+        || host.host.is_some_and(|h| {
+            h.pid == 0
+                || h.pid > i32::MAX as u32
+                || h.start_seconds == 0
+                || h.start_microseconds >= 1_000_000
+        })
+    {
+        return Err(DecodeError::Rule(anyhow::anyhow!(
+            "invalid launch host identity or stage"
+        )));
+    }
+    Ok(HostObservation::Recorded(host))
+}
+
 /// `requests/<claim>.json`: the shape, the receipt's validation, then the token it was
 /// addressed by.
 pub(in crate::native) fn receipt(

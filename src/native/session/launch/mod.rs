@@ -29,6 +29,9 @@ use std::{
 pub(in crate::native) use super::names::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
 pub(in crate::native) mod launcher;
+// A1 primitives; launcher and host integration follows separately.
+#[allow(dead_code)]
+pub(in crate::native) mod host;
 pub(in crate::native) mod wrapper;
 // Written at the end of the launch log by whoever sees the wrapper end: the bootstrap for a
 // wrapper that could not write, the wrapper itself, and the admission refusal.

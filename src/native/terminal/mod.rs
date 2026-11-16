@@ -38,6 +38,10 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
+// Pure wire validation is exercised on every test platform.
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos/shell_environment/wire.rs"]
+mod shell_environment_wire;
 // Compiled into every test build so its refusal is tested on every CI target.
 #[cfg(any(not(any(target_os = "macos", target_os = "windows")), test))]
 #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
