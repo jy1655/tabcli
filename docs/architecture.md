@@ -61,7 +61,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   holds the start-in-surface operation and both bootstrap builders; `wrapper.rs` holds the
   native-session wrapper with its admission and provision steps (including its re-check of the
   recorded executable's version) and the fd handoff consumer; `mod.rs` keeps the launch
-  records and their rules (receipt, phases, failure handoff, repair, wait, spawn, finalize).
+  records and their rules (receipt, phases, failure handoff, repair, wait, spawn, finalize);
+  the launcher's wait reads time through the `Clock` and the surface through a presence port.
   `pending.rs` holds the one Pending launch judgment that every launch admission check uses
   (the macOS binding wait, the launch hosts, the wrapper's admission and the spawn fence),
   and reads the bound surface of a Session for the hosts. It takes no lock: each caller reads
@@ -261,6 +262,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   for the binding, recognizes its surface by the check the kind registers, and then replaces
   itself with the non-startup shell on the bound terminal. It reads core records only through
   `session::launch` (the receipt, the host record and its writers, and the bound surface).
+  `run` performs the OS acts (identity, the capture thread, the input flush and the exec);
+  the wait between them decides on the crate's `Clock` and two ports, the capture result and
+  the binding observation, whether the host keeps waiting, refuses or hands off.
   `terminal/macos/shell_environment.rs` owns that preparation: the zsh login and interactive
   startup run once without a terminal under a supervisor that owns its cleanup, bounded by the
   launch receipt, returning counts and the environment, never startup output.
