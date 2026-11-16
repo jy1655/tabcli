@@ -107,11 +107,11 @@ pub(in crate::native) fn observe(reader: &Reader, receipt: Option<&Record>) -> H
     }
 }
 
-fn eligible(store: &Store, token: &str) -> Result<Record> {
+fn eligible(store: &Store, token: &str, require_time: bool) -> Result<Record> {
     let receipt = super::read(store)?.context("missing launch receipt")?;
     if receipt.claim_token != token
         || receipt.phase != Phase::Pending
-        || unix_ms() >= receipt.deadline_unix_ms
+        || (require_time && unix_ms() >= receipt.deadline_unix_ms)
         || store.status()?.state != SessionState::Launching
         || store.closed_if_present()?.is_some()
         || turn::current_claim_token(store)?.as_deref() != Some(token)
@@ -129,7 +129,7 @@ fn write(store: &Store, host: &HostRecord) -> Result<()> {
 
 pub(in crate::native) fn initialize(store: &Store, token: &str, terminal: Terminal) -> Result<()> {
     let _lock = store.lock()?;
-    eligible(store, token)?;
+    eligible(store, token, true)?;
     if store
         .record(CoreRecord::LaunchHost)
         .timeline(LIMIT)?
@@ -162,8 +162,8 @@ pub(in crate::native) fn initialize(store: &Store, token: &str, terminal: Termin
     )
 }
 
-fn current(store: &Store, token: &str) -> Result<HostRecord> {
-    let receipt = eligible(store, token)?;
+fn current(store: &Store, token: &str, require_time: bool) -> Result<HostRecord> {
+    let receipt = eligible(store, token, require_time)?;
     match observe(store, Some(&receipt)) {
         HostObservation::Recorded(host) if host.failure.is_none() => Ok(host),
         _ => bail!("launch host record is unavailable or terminal"),
@@ -173,7 +173,7 @@ fn current(store: &Store, token: &str) -> Result<HostRecord> {
 /// Even the same incarnation cannot admit twice. Callers must retain the first result.
 pub(in crate::native) fn admit(store: &Store, token: &str, identity: HostIdentity) -> Result<()> {
     let _lock = store.lock()?;
-    let mut host = current(store, token)?;
+    let mut host = current(store, token, true)?;
     if host.host.is_some() || host.stage != Stage::AwaitingHost {
         bail!("duplicate launch host");
     }
@@ -201,7 +201,7 @@ pub(in crate::native) fn advance(
     progress: Progress,
 ) -> Result<()> {
     let _lock = store.lock()?;
-    let mut host = current(store, token)?;
+    let mut host = current(store, token, true)?;
     if host.host != Some(identity) || stage <= host.stage {
         bail!("stale launch host transition");
     }
@@ -217,6 +217,8 @@ pub(in crate::native) fn advance(
 
 /// `None` can record identity acquisition failure before admission, but cannot write
 /// over an admitted incarnation. Failure is final and preserves the last stage.
+/// Expiry withholds launch authority but does not discard its failure diagnosis;
+/// the current pending claim and unsettled, unclosed session are still required.
 pub(in crate::native) fn fail(
     store: &Store,
     token: &str,
@@ -226,7 +228,7 @@ pub(in crate::native) fn fail(
     capture_elapsed_ms: Option<u64>,
 ) -> Result<()> {
     let _lock = store.lock()?;
-    let mut host = current(store, token)?;
+    let mut host = current(store, token, false)?;
     if host.host != identity {
         bail!("stale launch host failure");
     }
@@ -336,7 +338,6 @@ mod tests {
             "claim",
             "receipt",
             "spawned",
-            "expired",
             "incarnation",
         ] {
             let (_dir, store, token) = fixture();
@@ -354,16 +355,13 @@ mod tests {
                 "closed" => store.write_closed(&store.status().unwrap()).unwrap(),
                 "claim" => std::fs::write(store.record(CoreRecord::TurnClaim).path(), b"successor")
                     .unwrap(),
-                "receipt" | "spawned" | "expired" => {
+                "receipt" | "spawned" => {
                     let mut receipt = super::super::read(&store).unwrap().unwrap();
                     if case == "receipt" {
                         receipt.claim_token = "successor".into();
                     }
                     if case == "spawned" {
                         receipt.phase = Phase::Spawned;
-                    }
-                    if case == "expired" {
-                        receipt.deadline_unix_ms = 0;
                     }
                     store
                         .record(CoreRecord::Launch)
@@ -470,6 +468,46 @@ mod tests {
             record::launch_host(br#"{"schema":2}"#).unwrap(),
             HostObservation::SchemaUnsupported(2)
         ));
+    }
+    #[test]
+    fn expired_current_launch_can_record_failure_but_cannot_advance() {
+        let (_dir, store, token) = fixture();
+        initialize(&store, &token, Terminal::Iterm2).unwrap();
+        admit(&store, &token, identity()).unwrap();
+        let mut receipt = super::super::read(&store).unwrap().unwrap();
+        receipt.deadline_unix_ms = 0;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&receipt)
+            .unwrap();
+        assert!(
+            advance(
+                &store,
+                &token,
+                identity(),
+                Stage::EnvironmentPreparing,
+                Progress::default()
+            )
+            .is_err()
+        );
+        fail(
+            &store,
+            &token,
+            Some(identity()),
+            Failure {
+                reason: FailureReason::BindingTimeout,
+                exit_code: None,
+                signal: None,
+            },
+            30000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(&store).stage, Stage::HostStarted);
+        assert_eq!(
+            read(&store).failure.unwrap().reason,
+            FailureReason::BindingTimeout
+        );
     }
     #[test]
     fn concurrent_admission_has_exactly_one_winner() {
