@@ -118,6 +118,55 @@ pub(in crate::native) enum FailureReason {
     LaunchShellExecFailed,
 }
 
+/// Who must act on a launch host failure: the one grouping of `FailureReason`, which
+/// status.error and doctor each map to their own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::native) enum Responsibility {
+    /// The user's zsh startup files did not produce an environment without a terminal.
+    StartupFiles,
+    /// The launch deadline left no time for the step.
+    Deadline,
+    /// The terminal did not identify the surface Bridge created.
+    SurfaceIdentity,
+    /// Bridge's own host step could not complete.
+    HostStep,
+}
+
+impl FailureReason {
+    pub(in crate::native) fn responsibility(self) -> Responsibility {
+        use FailureReason::*;
+        match self {
+            CaptureTimeout | CaptureExitNonzero | CaptureSignaled | CaptureNoOutput
+            | CaptureOversized | CaptureInvalid => Responsibility::StartupFiles,
+            LaunchBudgetExhausted | BindingTimeout => Responsibility::Deadline,
+            IdentityUnavailable | BindingMismatch => Responsibility::SurfaceIdentity,
+            CaptureSpawnFailed | CleanupFailed | InputFlushFailed | LaunchShellExecFailed => {
+                Responsibility::HostStep
+            }
+        }
+    }
+
+    /// The reason's record word, as every renderer and the launch log name it.
+    pub(in crate::native) fn word(self) -> String {
+        word(self)
+    }
+}
+
+impl Stage {
+    /// The stage's record word, as every renderer names it.
+    pub(in crate::native) fn word(self) -> String {
+        word(self)
+    }
+}
+
+fn word(value: impl Serialize) -> String {
+    serde_json::to_value(value)
+        .expect("enum serialization")
+        .as_str()
+        .expect("string enum")
+        .into()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(in crate::native) struct Failure {
     pub(in crate::native) reason: FailureReason,
@@ -151,6 +200,37 @@ pub(in crate::native) struct HostRecord {
     pub(in crate::native) variables: Option<u32>,
     pub(in crate::native) background_children_stopped: Option<u32>,
     pub(in crate::native) failure: Option<Failure>,
+}
+
+impl HostRecord {
+    /// What a failure adds to its reason: only a capture timeout has a detail, the budget
+    /// that the startup files exceeded.
+    pub(in crate::native) fn failure_detail(&self) -> Option<String> {
+        self.failure
+            .as_ref()
+            .filter(|failure| failure.reason == FailureReason::CaptureTimeout)
+            .map(|_| {
+                format!(
+                    "startup files did not finish within {} ms",
+                    self.capture_budget_ms
+                )
+            })
+    }
+
+    /// The record's fields that both the timeline and doctor show. Neither the identities
+    /// nor `updated_unix_ms` are among them: each renderer places the update time itself.
+    pub(in crate::native) fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "terminal": self.terminal,
+            "stage": self.stage,
+            "failure": self.failure,
+            "elapsed_ms": self.elapsed_ms,
+            "capture_budget_ms": self.capture_budget_ms,
+            "capture_elapsed_ms": self.capture_elapsed_ms,
+            "variables": self.variables,
+            "background_children_stopped": self.background_children_stopped,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1066,5 +1146,160 @@ mod tests {
             r#"ghostty: "unreadable" "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23""#,
         ];
         assert_eq!(actual, expected);
+    }
+
+    // Every reason has one responsibility class; status.error and doctor map only the class.
+    #[test]
+    fn every_failure_reason_has_one_responsibility_class() {
+        use FailureReason::*;
+        use Responsibility::*;
+        let table = [
+            (IdentityUnavailable, SurfaceIdentity),
+            (BindingMismatch, SurfaceIdentity),
+            (BindingTimeout, Deadline),
+            (LaunchBudgetExhausted, Deadline),
+            (CaptureSpawnFailed, HostStep),
+            (CaptureTimeout, StartupFiles),
+            (CaptureExitNonzero, StartupFiles),
+            (CaptureSignaled, StartupFiles),
+            (CaptureNoOutput, StartupFiles),
+            (CaptureOversized, StartupFiles),
+            (CaptureInvalid, StartupFiles),
+            (CleanupFailed, HostStep),
+            (InputFlushFailed, HostStep),
+            (LaunchShellExecFailed, HostStep),
+        ];
+        // Adding a reason fails to compile here until the table above names it.
+        for (reason, _) in table {
+            match reason {
+                IdentityUnavailable
+                | BindingMismatch
+                | BindingTimeout
+                | LaunchBudgetExhausted
+                | CaptureSpawnFailed
+                | CaptureTimeout
+                | CaptureExitNonzero
+                | CaptureSignaled
+                | CaptureNoOutput
+                | CaptureOversized
+                | CaptureInvalid
+                | CleanupFailed
+                | InputFlushFailed
+                | LaunchShellExecFailed => {}
+            }
+        }
+        let actual: Vec<_> = table
+            .iter()
+            .map(|(reason, _)| (*reason, reason.responsibility()))
+            .collect();
+        assert_eq!(actual, table);
+    }
+
+    // Only a capture timeout adds a detail to its reason: the budget its record holds.
+    #[test]
+    fn only_a_capture_timeout_has_a_failure_detail() {
+        let (_dir, store, token) = fixture();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
+        let mut host = read(&store);
+        host.capture_budget_ms = 9996;
+        assert_eq!(host.failure_detail(), None);
+        for (reason, expected) in [
+            (
+                FailureReason::CaptureTimeout,
+                Some("startup files did not finish within 9996 ms"),
+            ),
+            (FailureReason::CaptureExitNonzero, None),
+            (FailureReason::LaunchBudgetExhausted, None),
+        ] {
+            host.failure = Some(Failure {
+                reason,
+                exit_code: None,
+                signal: None,
+            });
+            assert_eq!(host.failure_detail().as_deref(), expected, "{reason:?}");
+        }
+    }
+
+    // The timeline's launch host entry of a failed record: the record's update time is the
+    // entry's time, and the detail holds every other field the doctor evidence holds.
+    #[test]
+    fn timeline_entry_of_a_failed_record_carries_its_time_and_fields() {
+        let (dir, store, token) = fixture();
+        crate::native::session::test_support::write_test_manifest(dir.path(), "codex");
+        initialize(&store, &token, TerminalKind::WezTerm).unwrap();
+        admit(&store, &token, identity()).unwrap();
+        advance(
+            &store,
+            &token,
+            identity(),
+            Stage::EnvironmentPreparing,
+            Progress {
+                elapsed_ms: 3,
+                capture_budget_ms: 9996,
+                ..Progress::default()
+            },
+        )
+        .unwrap();
+        fail(
+            &store,
+            &token,
+            Some(identity()),
+            Failure {
+                reason: FailureReason::CaptureExitNonzero,
+                exit_code: Some(3),
+                signal: None,
+            },
+            44,
+            Some(40),
+            None,
+        )
+        .unwrap();
+        let mut host = read(&store);
+        host.updated_unix_ms = 1_700_000_000_123;
+        host.variables = Some(70);
+        host.background_children_stopped = Some(1);
+        store
+            .record(CoreRecord::LaunchHost)
+            .write_json(&host)
+            .unwrap();
+        let id = dir.path().file_name().unwrap().to_str().unwrap();
+        let timeline = crate::native::query::timeline_value(&store, id, None).unwrap();
+        let mut entries = Vec::new();
+        let mut stack = vec![&timeline];
+        while let Some(value) = stack.pop() {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if map.get("stage") == Some(&serde_json::json!("launch_host")) {
+                        entries.push(value.clone());
+                    }
+                    stack.extend(map.values());
+                }
+                serde_json::Value::Array(values) => stack.extend(values),
+                _ => {}
+            }
+        }
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        assert_eq!(
+            entry.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "detail",
+                "event_id",
+                "observed_unix_ms",
+                "record_state",
+                "request_id",
+                "session",
+                "source",
+                "stage"
+            ]
+        );
+        assert_eq!(entry["session"], id);
+        assert_eq!(entry["observed_unix_ms"], 1_700_000_000_123u64);
+        assert_eq!(entry["record_state"], "observed");
+        assert_eq!(entry["source"], "launch-host.json");
+        assert_eq!(
+            entry["detail"].to_string(),
+            r#"{"background_children_stopped":1,"capture_budget_ms":9996,"capture_elapsed_ms":40,"elapsed_ms":44,"failure":{"exit_code":3,"reason":"capture_exit_nonzero","signal":null},"stage":"environment_preparing","terminal":"wezterm","variables":70}"#
+        );
     }
 }

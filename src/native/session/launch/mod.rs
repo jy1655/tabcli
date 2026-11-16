@@ -614,50 +614,33 @@ fn host_decision_locked(store: &Store) -> Result<HostDecision> {
     if let host::HostObservation::Recorded(record) = host::observe(store, Some(&receipt))
         && let Some(failure) = &record.failure
     {
-        let stage = enum_word(record.stage);
-        let reason = enum_word(failure.reason);
-        let detail = if failure.reason == host::FailureReason::CaptureTimeout {
-            format!(
-                "startup files did not finish within {} ms",
-                record.capture_budget_ms
-            )
-        } else {
-            format!("launch host failed at {stage}")
-        };
-        let message = match failure.reason {
-            host::FailureReason::LaunchBudgetExhausted
-            | host::FailureReason::CaptureSpawnFailed
-            | host::FailureReason::CaptureTimeout
-            | host::FailureReason::CaptureExitNonzero
-            | host::FailureReason::CaptureSignaled
-            | host::FailureReason::CaptureNoOutput
-            | host::FailureReason::CaptureOversized
-            | host::FailureReason::CaptureInvalid => {
-                format!("terminal shell environment could not be prepared: {detail}")
-            }
-            _ => format!("terminal launch host failed: {reason} at {stage}"),
-        };
+        use host::Responsibility::*;
+        let mut message = match failure.reason.responsibility() {
+            StartupFiles => "terminal shell environment could not be prepared",
+            Deadline | SurfaceIdentity | HostStep => "terminal launch host failed",
+        }
+        .to_owned();
+        if let Some(detail) = record.failure_detail() {
+            message.push_str(&format!(": {detail}"));
+        }
         fail_locked(
             store,
             &receipt,
-            &format!("{message} ({reason}); last recorded launch stage: {stage}"),
+            &format!(
+                "{message} ({}); last recorded launch stage: {}",
+                failure.reason.word(),
+                record.stage.word()
+            ),
         )?;
         return Ok(HostDecision::Failed);
     }
     Ok(HostDecision::Pending)
 }
-fn enum_word(value: impl Serialize) -> String {
-    serde_json::to_value(value)
-        .expect("enum serialization")
-        .as_str()
-        .expect("string enum")
-        .into()
-}
 fn deadline_reason(reader: &Reader, receipt: Option<&Record>) -> String {
     match host::observe(reader, receipt) {
         host::HostObservation::Recorded(record) => format!(
             "{LAUNCH_DEADLINE}; last recorded launch stage: {}",
-            enum_word(record.stage)
+            record.stage.word()
         ),
         _ => LAUNCH_DEADLINE.into(),
     }
@@ -1973,7 +1956,7 @@ mod host_decision_tests {
         assert_eq!(
             store.status().unwrap().error.as_deref(),
             Some(
-                "terminal launch host failed: identity_unavailable at awaiting_host (identity_unavailable); last recorded launch stage: awaiting_host"
+                "terminal launch host failed (identity_unavailable); last recorded launch stage: awaiting_host"
             )
         );
     }
@@ -2072,5 +2055,123 @@ mod host_decision_tests {
                 Some(expected.as_str())
             );
         }
+    }
+
+    /// Records `failure` for a current host at `stage`, the stage at which the launch host
+    /// refuses for that reason; every capture budget is 9996 ms.
+    fn host_failed_at(store: &Store, token: &str, stage: host::Stage, failure: host::Failure) {
+        host::initialize(store, token, terminal::TerminalKind::Iterm2).unwrap();
+        let identity = host::HostIdentity {
+            pid: 123,
+            start_seconds: 123,
+            start_microseconds: 1,
+        };
+        let identity = (stage != host::Stage::AwaitingHost).then_some(identity);
+        if let Some(identity) = identity {
+            host::admit(store, token, identity).unwrap();
+            for next in [
+                host::Stage::EnvironmentPreparing,
+                host::Stage::EnvironmentReady,
+                host::Stage::LaunchShellStarting,
+            ] {
+                if next > stage {
+                    break;
+                }
+                host::advance(
+                    store,
+                    token,
+                    identity,
+                    next,
+                    host::Progress {
+                        capture_budget_ms: 9996,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        }
+        host::fail(store, token, identity, failure, 10_000, None, None).unwrap();
+    }
+
+    // status.error of a current host failure, for every reason, as the repair and the wait
+    // record it: the exit status and signal never appear in it.
+    #[test]
+    fn host_failure_status_error_for_every_reason() {
+        use host::FailureReason::*;
+        use host::Stage::*;
+        let cases = [
+            (IdentityUnavailable, AwaitingHost, None, None),
+            (BindingMismatch, EnvironmentPreparing, None, None),
+            (BindingTimeout, EnvironmentPreparing, None, None),
+            (LaunchBudgetExhausted, EnvironmentPreparing, None, None),
+            (CaptureSpawnFailed, EnvironmentPreparing, None, None),
+            (CaptureTimeout, EnvironmentPreparing, None, None),
+            (CaptureExitNonzero, EnvironmentPreparing, Some(3), None),
+            (CaptureSignaled, EnvironmentPreparing, None, Some(9)),
+            (CaptureNoOutput, EnvironmentPreparing, None, None),
+            (CaptureOversized, EnvironmentPreparing, None, None),
+            (CaptureInvalid, EnvironmentPreparing, None, None),
+            (CleanupFailed, EnvironmentPreparing, None, None),
+            (InputFlushFailed, EnvironmentReady, None, None),
+            (LaunchShellExecFailed, LaunchShellStarting, None, None),
+        ];
+        // Adding a reason fails to compile here until the table above names it.
+        for (reason, ..) in cases {
+            match reason {
+                IdentityUnavailable
+                | BindingMismatch
+                | BindingTimeout
+                | LaunchBudgetExhausted
+                | CaptureSpawnFailed
+                | CaptureTimeout
+                | CaptureExitNonzero
+                | CaptureSignaled
+                | CaptureNoOutput
+                | CaptureOversized
+                | CaptureInvalid
+                | CleanupFailed
+                | InputFlushFailed
+                | LaunchShellExecFailed => {}
+            }
+        }
+        let mut actual = Vec::new();
+        for (reason, stage, exit_code, signal) in cases {
+            let (_dir, store, token) = fixture();
+            host_failed_at(
+                &store,
+                &token,
+                stage,
+                host::Failure {
+                    reason,
+                    exit_code,
+                    signal,
+                },
+            );
+            assert!(
+                repair_with_owner(&store, |_| panic!(
+                    "host failure precedes owner observation"
+                ))
+                .unwrap()
+            );
+            assert_eq!(store.status().unwrap().state, SessionState::Failed);
+            actual.push(store.status().unwrap().error.unwrap());
+        }
+        let expected = [
+            "terminal launch host failed (identity_unavailable); last recorded launch stage: awaiting_host",
+            "terminal launch host failed (binding_mismatch); last recorded launch stage: environment_preparing",
+            "terminal launch host failed (binding_timeout); last recorded launch stage: environment_preparing",
+            "terminal launch host failed (launch_budget_exhausted); last recorded launch stage: environment_preparing",
+            "terminal launch host failed (capture_spawn_failed); last recorded launch stage: environment_preparing",
+            "terminal shell environment could not be prepared: startup files did not finish within 9996 ms (capture_timeout); last recorded launch stage: environment_preparing",
+            "terminal shell environment could not be prepared (capture_exit_nonzero); last recorded launch stage: environment_preparing",
+            "terminal shell environment could not be prepared (capture_signaled); last recorded launch stage: environment_preparing",
+            "terminal shell environment could not be prepared (capture_no_output); last recorded launch stage: environment_preparing",
+            "terminal shell environment could not be prepared (capture_oversized); last recorded launch stage: environment_preparing",
+            "terminal shell environment could not be prepared (capture_invalid); last recorded launch stage: environment_preparing",
+            "terminal launch host failed (cleanup_failed); last recorded launch stage: environment_preparing",
+            "terminal launch host failed (input_flush_failed); last recorded launch stage: environment_ready",
+            "terminal launch host failed (launch_shell_exec_failed); last recorded launch stage: launch_shell_starting",
+        ];
+        assert_eq!(actual, expected);
     }
 }

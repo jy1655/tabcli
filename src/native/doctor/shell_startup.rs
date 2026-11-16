@@ -4,7 +4,7 @@
 use super::super::diagnostics::{Availability, Check};
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::session::launch::host::{
-    Failure, FailureReason, HostObservation, HostRecord, Stage,
+    Failure, FailureReason, HostObservation, HostRecord, Responsibility, Stage,
 };
 use crate::native::terminal::TerminalKind;
 use crate::native::terminal::shell_environment_budget::LIMIT;
@@ -41,7 +41,7 @@ pub(super) fn launch_stage_check(
                     format!(
                         "The {} launch host failed after stage {}: {}.",
                         host.terminal.display_name(),
-                        stage_name(host.stage),
+                        host.stage.word(),
                         failure_text(failure, host)
                     ),
                     failure_action(failure.reason, &probe),
@@ -55,7 +55,7 @@ pub(super) fn launch_stage_check(
                         format!(
                             "The {} launch host recorded stage {}; the shell environment was prepared without a terminal.",
                             host.terminal.display_name(),
-                            stage_name(host.stage)
+                            host.stage.word()
                         ),
                         "No host action is needed; inspect the provider and request records for later stages.",
                     )
@@ -68,7 +68,7 @@ pub(super) fn launch_stage_check(
                     format!(
                         "The last recorded stage of the {} launch host is {}. A retained earlier stage does not prove that the step is still running.",
                         host.terminal.display_name(),
-                        stage_name(host.stage)
+                        host.stage.word()
                     ),
                     format!("Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline`. {probe}"),
                 )
@@ -129,71 +129,42 @@ fn not_applicable(kind: TerminalKind) -> Check {
     .evidence(json!({"terminal": kind}))
 }
 
-fn stage_name(stage: Stage) -> &'static str {
-    match stage {
-        Stage::AwaitingHost => "awaiting_host",
-        Stage::HostStarted => "host_started",
-        Stage::EnvironmentPreparing => "environment_preparing",
-        Stage::EnvironmentReady => "environment_ready",
-        Stage::LaunchShellStarting => "launch_shell_starting",
-    }
-}
-
-fn reason_name(reason: FailureReason) -> String {
-    serde_json::to_value(reason)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
 fn failure_text(failure: &Failure, host: &HostRecord) -> String {
-    let mut text = reason_name(failure.reason);
+    let mut text = failure.reason.word();
     if let Some(code) = failure.exit_code {
         text.push_str(&format!(", exit status {code}"));
     }
     if let Some(signal) = failure.signal {
         text.push_str(&format!(", signal {signal}"));
     }
-    if failure.reason == FailureReason::CaptureTimeout {
-        text.push_str(&format!(
-            ", the startup files did not finish within {} ms",
-            host.capture_budget_ms
-        ));
+    if let Some(detail) = host.failure_detail() {
+        text.push_str(&format!(", the {detail}"));
     }
     text
 }
 
 fn failure_action(reason: FailureReason, probe: &str) -> String {
-    use FailureReason::*;
-    match reason {
-        CaptureTimeout | CaptureExitNonzero | CaptureSignaled | CaptureNoOutput
-        | CaptureOversized | CaptureInvalid => format!(
+    match reason.responsibility() {
+        Responsibility::StartupFiles => format!(
             "Your zsh startup files (`/bin/zsh -l -i`) did not produce an environment when run without a terminal. Check them for commands that wait, fail or print to the environment without a terminal. {probe}"
         ),
-        LaunchBudgetExhausted | BindingTimeout => format!(
+        Responsibility::Deadline => format!(
             "The launch deadline left no time for this step. Check the terminal application and system load, then start a new session. {probe}"
         ),
-        IdentityUnavailable | BindingMismatch => {
+        Responsibility::SurfaceIdentity => {
             "The terminal did not identify the surface Bridge created. Close this session and start a new one; do not reuse its surface.".to_owned()
         }
-        CaptureSpawnFailed | CleanupFailed | InputFlushFailed | LaunchShellExecFailed => {
+        Responsibility::HostStep => {
             format!("Bridge could not complete this host step. Close this session and start a new one. {probe}")
         }
     }
 }
 
+/// The record's shared fields, with its update time inside.
 fn record_evidence(host: &HostRecord) -> Value {
-    json!({
-        "terminal": host.terminal,
-        "stage": host.stage,
-        "failure": host.failure,
-        "updated_unix_ms": host.updated_unix_ms,
-        "elapsed_ms": host.elapsed_ms,
-        "capture_budget_ms": host.capture_budget_ms,
-        "capture_elapsed_ms": host.capture_elapsed_ms,
-        "variables": host.variables,
-        "background_children_stopped": host.background_children_stopped,
-    })
+    let mut evidence = host.evidence();
+    evidence["updated_unix_ms"] = json!(host.updated_unix_ms);
+    evidence
 }
 
 /// Where the probe would apply, decided before it runs.
@@ -305,7 +276,7 @@ pub(super) fn shell_environment_check(
             CheckId::SHELL_ENVIRONMENT,
             Unavailable,
             Reason::SHELL_ENVIRONMENT_FAILED,
-            format!("Your zsh startup files did not prepare an environment without a terminal: {}.", reason_name(reason)),
+            format!("Your zsh startup files did not prepare an environment without a terminal: {}.", reason.word()),
             "Check `/bin/zsh -l -i` startup files for commands that wait, fail or need a terminal. Their output is not shown here.",
         )
         .evidence(json!({"source": SOURCE, "terminal": kind, "elapsed_ms": elapsed.as_millis(),
@@ -539,6 +510,283 @@ mod tests {
             "WezTerm: available launch_stage_observed | The WezTerm launch host recorded stage launch_shell_starting; the shell environment was prepared without a terminal. | \"wezterm\"",
             "WezTerm: unknown launch_stage_observed | The last recorded stage of the WezTerm launch host is host_started. A retained earlier stage does not prove that the step is still running. | \"wezterm\"",
         ];
+        assert_eq!(actual, expected);
+    }
+
+    // The failed launch stage of every reason: its detail, its action and the whole record
+    // evidence, with `updated_unix_ms` inside the record.
+    #[test]
+    fn launch_stage_reports_every_failure_reason() {
+        use FailureReason::*;
+        let probe = format!(
+            "Run `{PUBLIC_COMMAND} doctor session-abc --probe` to run the same preparation once now."
+        );
+        let startup_files = format!(
+            "Your zsh startup files (`/bin/zsh -l -i`) did not produce an environment when run without a terminal. Check them for commands that wait, fail or print to the environment without a terminal. {probe}"
+        );
+        let deadline = format!(
+            "The launch deadline left no time for this step. Check the terminal application and system load, then start a new session. {probe}"
+        );
+        let surface = "The terminal did not identify the surface Bridge created. Close this session and start a new one; do not reuse its surface.".to_owned();
+        let host_step = format!(
+            "Bridge could not complete this host step. Close this session and start a new one. {probe}"
+        );
+        let cases = [
+            (
+                IdentityUnavailable,
+                Stage::AwaitingHost,
+                None,
+                None,
+                "identity_unavailable",
+                &surface,
+            ),
+            (
+                BindingMismatch,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "binding_mismatch",
+                &surface,
+            ),
+            (
+                BindingTimeout,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "binding_timeout",
+                &deadline,
+            ),
+            (
+                LaunchBudgetExhausted,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "launch_budget_exhausted",
+                &deadline,
+            ),
+            (
+                CaptureSpawnFailed,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "capture_spawn_failed",
+                &host_step,
+            ),
+            (
+                CaptureTimeout,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "capture_timeout, the startup files did not finish within 10000 ms",
+                &startup_files,
+            ),
+            (
+                CaptureExitNonzero,
+                Stage::EnvironmentPreparing,
+                Some(3),
+                None,
+                "capture_exit_nonzero, exit status 3",
+                &startup_files,
+            ),
+            (
+                CaptureSignaled,
+                Stage::EnvironmentPreparing,
+                None,
+                Some(9),
+                "capture_signaled, signal 9",
+                &startup_files,
+            ),
+            (
+                CaptureNoOutput,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "capture_no_output",
+                &startup_files,
+            ),
+            (
+                CaptureOversized,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "capture_oversized",
+                &startup_files,
+            ),
+            (
+                CaptureInvalid,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "capture_invalid",
+                &startup_files,
+            ),
+            (
+                CleanupFailed,
+                Stage::EnvironmentPreparing,
+                None,
+                None,
+                "cleanup_failed",
+                &host_step,
+            ),
+            (
+                InputFlushFailed,
+                Stage::EnvironmentReady,
+                None,
+                None,
+                "input_flush_failed",
+                &host_step,
+            ),
+            (
+                LaunchShellExecFailed,
+                Stage::LaunchShellStarting,
+                None,
+                None,
+                "launch_shell_exec_failed",
+                &host_step,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (reason, stage, exit_code, signal, text, action) in cases {
+            let row = check(
+                HostObservation::Recorded(host(
+                    stage,
+                    Some(Failure {
+                        reason,
+                        exit_code,
+                        signal,
+                    }),
+                )),
+                None,
+                false,
+            );
+            let stage = serde_json::to_value(stage).unwrap();
+            let stage = stage.as_str().unwrap();
+            let word = text.split(',').next().unwrap();
+            let expected = [
+                "unavailable".to_owned(),
+                "launch_host_failed".to_owned(),
+                format!("The iTerm2 launch host failed after stage {stage}: {text}."),
+                action.clone(),
+                format!(
+                    r#"{{"owner_recorded":false,"record":{{"background_children_stopped":null,"capture_budget_ms":10000,"capture_elapsed_ms":10001,"elapsed_ms":7,"failure":{{"exit_code":{},"reason":"{word}","signal":{}}},"stage":"{stage}","terminal":"iterm2","updated_unix_ms":5,"variables":null}}}}"#,
+                    json!(exit_code),
+                    json!(signal),
+                ),
+            ];
+            let actual = [
+                row["availability"].as_str().unwrap().to_owned(),
+                row["reason_code"].as_str().unwrap().to_owned(),
+                row["detail"].as_str().unwrap().to_owned(),
+                row["next_action"].as_str().unwrap().to_owned(),
+                row["evidence"].to_string(),
+            ];
+            if actual != expected {
+                failures.push(format!("{reason:?}: {actual:#?} != {expected:#?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // Each stage is named by its record word in the detail and the evidence.
+    #[test]
+    fn launch_stage_names_every_stage_by_its_record_word() {
+        let mut actual = Vec::new();
+        for stage in [
+            Stage::AwaitingHost,
+            Stage::HostStarted,
+            Stage::EnvironmentPreparing,
+            Stage::EnvironmentReady,
+            Stage::LaunchShellStarting,
+        ] {
+            let row = check(HostObservation::Recorded(host(stage, None)), None, false);
+            let failed = check(
+                HostObservation::Recorded(host(
+                    stage,
+                    Some(Failure {
+                        reason: FailureReason::CleanupFailed,
+                        exit_code: None,
+                        signal: None,
+                    }),
+                )),
+                None,
+                false,
+            );
+            actual.push(format!(
+                "{} | {} | {}",
+                row["detail"].as_str().unwrap(),
+                failed["detail"].as_str().unwrap(),
+                row["evidence"]["record"]["stage"]
+            ));
+        }
+        let expected = [
+            "The last recorded stage of the iTerm2 launch host is awaiting_host. A retained earlier stage does not prove that the step is still running. | The iTerm2 launch host failed after stage awaiting_host: cleanup_failed. | \"awaiting_host\"",
+            "The last recorded stage of the iTerm2 launch host is host_started. A retained earlier stage does not prove that the step is still running. | The iTerm2 launch host failed after stage host_started: cleanup_failed. | \"host_started\"",
+            "The last recorded stage of the iTerm2 launch host is environment_preparing. A retained earlier stage does not prove that the step is still running. | The iTerm2 launch host failed after stage environment_preparing: cleanup_failed. | \"environment_preparing\"",
+            "The last recorded stage of the iTerm2 launch host is environment_ready. A retained earlier stage does not prove that the step is still running. | The iTerm2 launch host failed after stage environment_ready: cleanup_failed. | \"environment_ready\"",
+            "The iTerm2 launch host recorded stage launch_shell_starting; the shell environment was prepared without a terminal. | The iTerm2 launch host failed after stage launch_shell_starting: cleanup_failed. | \"launch_shell_starting\"",
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    // The probe's failed outcome names every reason by its record word.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn shell_environment_failure_names_every_reason_by_its_record_word() {
+        use FailureReason::*;
+        let mut actual = Vec::new();
+        for reason in [
+            IdentityUnavailable,
+            BindingMismatch,
+            BindingTimeout,
+            CaptureSpawnFailed,
+            CaptureTimeout,
+            CaptureExitNonzero,
+            CaptureSignaled,
+            CaptureNoOutput,
+            CaptureOversized,
+            CaptureInvalid,
+            CleanupFailed,
+            InputFlushFailed,
+            LaunchShellExecFailed,
+        ] {
+            let row = probe(
+                ProbeContext::Terminal(TerminalKind::Iterm2),
+                Some((
+                    ProbeOutcome::Failed {
+                        reason,
+                        exit_code: None,
+                        signal: None,
+                        elapsed: Duration::from_millis(20),
+                    },
+                    LIMIT,
+                )),
+            );
+            actual.push(format!(
+                "{} {}",
+                row["detail"].as_str().unwrap(),
+                row["evidence"]["reason"]
+            ));
+        }
+        let expected = [
+            "identity_unavailable",
+            "binding_mismatch",
+            "binding_timeout",
+            "capture_spawn_failed",
+            "capture_timeout",
+            "capture_exit_nonzero",
+            "capture_signaled",
+            "capture_no_output",
+            "capture_oversized",
+            "capture_invalid",
+            "cleanup_failed",
+            "input_flush_failed",
+            "launch_shell_exec_failed",
+        ]
+        .map(|word| {
+            format!(
+                "Your zsh startup files did not prepare an environment without a terminal: {word}. \"{word}\""
+            )
+        });
         assert_eq!(actual, expected);
     }
 
