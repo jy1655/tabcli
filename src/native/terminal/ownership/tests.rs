@@ -579,7 +579,8 @@ fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
     };
 
     assert_eq!(
-        verified_terminal_shell_process_group(&owner, &live_owner, &live_shell).unwrap(),
+        verified_terminal_shell_process_group("Terminal.app", &owner, &live_owner, &live_shell)
+            .unwrap(),
         4000
     );
 
@@ -587,13 +588,19 @@ fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
         terminal_tty_device: 8,
         ..live_shell
     };
-    assert!(verified_terminal_shell_process_group(&owner, &live_owner, &wrong_tty).is_err());
+    assert!(
+        verified_terminal_shell_process_group("Terminal.app", &owner, &live_owner, &wrong_tty)
+            .is_err()
+    );
 
     let changed_shell = NativeProcessIdentity {
         process_start_microseconds: 101,
         ..live_shell
     };
-    assert!(verified_terminal_shell_process_group(&owner, &live_owner, &changed_shell).is_err());
+    assert!(
+        verified_terminal_shell_process_group("Terminal.app", &owner, &live_owner, &changed_shell)
+            .is_err()
+    );
 }
 
 /// What each platform's probe requires of a bound owner, stated over its attestation, on
@@ -951,5 +958,218 @@ fn control_record_and_attestation_rules_classify_every_subset_of_the_control_fie
             present & (1 | 8 | 16) != 0,
             "{present:05b}"
         );
+    }
+}
+
+// The ownership proof's shell check names the surface's kind.
+#[test]
+fn terminal_owner_verifier_shell_refusals_name_the_kind() {
+    use terminal::TerminalKind;
+    for kind in [
+        TerminalKind::AppleTerminal,
+        TerminalKind::Iterm2,
+        TerminalKind::Ghostty,
+        TerminalKind::Warp,
+        TerminalKind::WezTerm,
+    ] {
+        let (mut terminal, owner, live, shell) = owner_fixture();
+        terminal.kind = kind;
+        for (changed, expected) in [
+            (
+                NativeProcessIdentity { pid: 4001, ..shell },
+                "shell no longer owns the native-session process",
+            ),
+            (
+                NativeProcessIdentity {
+                    terminal_tty_device: 8,
+                    ..shell
+                },
+                "shell is attached to a different TTY",
+            ),
+            (
+                NativeProcessIdentity {
+                    process_group: 4999,
+                    ..shell
+                },
+                "shell does not own the expected foreground job",
+            ),
+            (
+                NativeProcessIdentity {
+                    process_start_microseconds: 101,
+                    ..shell
+                },
+                "shell identity changed",
+            ),
+        ] {
+            let error = verify_native_terminal_owner_with(
+                SESSION_ID,
+                &terminal,
+                None,
+                owner.clone(),
+                |pid| match pid {
+                    4242 => Ok(live),
+                    4000 => Ok(changed),
+                    _ => panic!("unexpected process {pid}"),
+                },
+                |_| Ok(7),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{} {expected}", kind.display_name()),
+                "{kind:?}"
+            );
+        }
+    }
+}
+
+// The macOS ownership proof requires an owner record, and says so in the surface's kind's
+// name.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_ownership_proof_without_an_owner_record_names_the_kind() {
+    use crate::native::terminal::macos::ownership::verified_macos_terminal_owner;
+    use terminal::TerminalKind;
+    for kind in [
+        TerminalKind::AppleTerminal,
+        TerminalKind::Iterm2,
+        TerminalKind::Ghostty,
+        TerminalKind::Warp,
+        TerminalKind::WezTerm,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut terminal, _, _, _) = owner_fixture();
+        terminal.kind = kind;
+        let error = verified_macos_terminal_owner(directory.path(), SESSION_ID, &terminal, None)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} ownership requires a live native-session owner",
+                kind.display_name()
+            ),
+            "{kind:?}"
+        );
+    }
+}
+
+// Owner registration runs in the wrapper before the surface record, and with it the kind, is
+// read. Its shell check is driven here through real processes on a private PTY, none of
+// them a terminal application: a session leader `sh` (A) runs a second `sh` (B) in its own
+// process group, and B runs this test binary as the probe (C). In "foreground-job" C makes
+// its own group the PTY's foreground group, so its parent B leads no group; in "other-tty" C
+// starts a session on a second PTY, so B is attached to another TTY.
+#[cfg(target_os = "macos")]
+const REGISTRATION_PROBE: &str = "AB_OWNER_REGISTRATION_PROBE";
+#[cfg(target_os = "macos")]
+const REGISTRATION_PROBE_OUT: &str = "AB_OWNER_REGISTRATION_PROBE_OUT";
+
+#[cfg(target_os = "macos")]
+fn open_private_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(master),
+            std::os::fd::OwnedFd::from_raw_fd(slave),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn registration_probe(mode: &str) -> String {
+    use std::os::fd::AsRawFd;
+    // Kept open until the registration has read its TTY.
+    let mut second_pty = None;
+    let setup = unsafe {
+        match mode {
+            "foreground-job" => {
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                libc::setpgid(0, 0) == 0 && libc::tcsetpgrp(0, libc::getpgrp()) == 0
+            }
+            _ => {
+                let (master, slave) = open_private_pty();
+                let ready = libc::setsid() != -1
+                    && libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0) != -1
+                    && libc::dup2(slave.as_raw_fd(), 0) != -1;
+                second_pty = Some((master, slave));
+                ready
+            }
+        }
+    };
+    if !setup {
+        return format!("probe setup failed: {}", std::io::Error::last_os_error());
+    }
+    let result = crate::native::terminal::ownership::current_native_session_owner(
+        "session-registration-probe",
+    );
+    // Closing the master of its controlling TTY would hang up the probe before it answers;
+    // the PTY ends with the probe.
+    std::mem::forget(second_pty);
+    match result {
+        Ok(_) => "registered".to_owned(),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn owner_registration_shell_refusals_name_no_terminal_application() {
+    use std::os::unix::process::CommandExt;
+    if let Some(mode) = std::env::var_os(REGISTRATION_PROBE) {
+        let answer = registration_probe(mode.to_str().unwrap());
+        std::fs::write(std::env::var_os(REGISTRATION_PROBE_OUT).unwrap(), answer).unwrap();
+        return;
+    }
+    let executable = std::env::current_exe().unwrap();
+    let probe = format!(
+        "{} --exact native::terminal::ownership::tests::owner_registration_shell_refusals_name_no_terminal_application --test-threads=1 >/dev/null 2>&1; true",
+        terminal::shell_quote(executable.as_os_str())
+    );
+    let shell_b = format!(
+        "/bin/sh -c {}; true",
+        terminal::shell_quote(std::ffi::OsStr::new(&probe))
+    );
+    for (mode, expected) in [
+        (
+            "foreground-job",
+            "terminal shell does not own the expected foreground job",
+        ),
+        ("other-tty", "terminal shell is attached to a different TTY"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("answer");
+        let (_master, slave) = open_private_pty();
+        let mut shell_a = std::process::Command::new("/bin/sh");
+        shell_a
+            .args(["-c", &shell_b])
+            .env(REGISTRATION_PROBE, mode)
+            .env(REGISTRATION_PROBE_OUT, &out)
+            .stdin(slave)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            shell_a.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(shell_a.status().unwrap().success(), "{mode}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), expected, "{mode}");
     }
 }

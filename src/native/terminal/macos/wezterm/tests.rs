@@ -2163,3 +2163,176 @@ fn serving_inspection_error_preserves_reason() {
     );
     assert!(commands(&host).is_empty());
 }
+
+// A WezTerm pane of the fake GUI, bound to `session-owner123` in a session directory that
+// records its handle but no owner.
+fn live_owner_close_without_owner(host: &Fake) -> (tempfile::TempDir, TerminalSession) {
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::session::test_support::{SESSION_OWNER_FILE, TERMINAL_HANDLE_FILE};
+    let directory = tempfile::tempdir().unwrap();
+    crate::native::tests::write_attested_apple_terminal_state(directory.path(), "ready", 4242);
+    std::fs::remove_file(directory.path().join(SESSION_OWNER_FILE)).unwrap();
+    let mut pane = session(host);
+    pane.managed_session_id = Some("session-owner123".to_owned());
+    write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &pane).unwrap();
+    (directory, pane)
+}
+
+// The live-owner close attests its owner before it records anything or asks WezTerm to
+// close the pane: without an owner record nothing is sent. The message names the kind.
+#[test]
+fn live_owner_close_without_an_owner_record_sends_nothing() {
+    use crate::native::session::test_support::TERMINAL_CLOSE_INTENT_FILE;
+    let local = Adapter::with_host(fake());
+    let (directory, pane) = live_owner_close_without_owner(&local.host);
+    let error = local
+        .close_owned_session(
+            directory.path(),
+            "session-owner123",
+            &pane,
+            OwnedSurfaceClose::LiveOwner,
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "WezTerm ownership requires a live native-session owner"
+    );
+    assert!(commands(&local.host).is_empty());
+    assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+}
+
+// The live-owner close checks the budget before it attests: an expired budget reads no
+// owner and sends nothing.
+#[test]
+fn live_owner_close_checks_the_budget_before_attesting() {
+    use crate::native::session::test_support::TERMINAL_CLOSE_INTENT_FILE;
+    let local = Adapter::with_host(fake());
+    let (directory, pane) = live_owner_close_without_owner(&local.host);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(60);
+    let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, 0);
+    let reads = clock.reads();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+    let error = local
+        .close_owned_session(
+            directory.path(),
+            "session-owner123",
+            &pane,
+            OwnedSurfaceClose::LiveOwner,
+            deadline,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("close deadline expired"));
+    assert_eq!(reads.get(), 1);
+    assert!(commands(&local.host).is_empty());
+    assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+}
+
+// WezTerm's part of the owner stop: the proof reads the owner and its shell once each, the
+// shell is not read again, the intent is published, and nothing is stopped. The budget is
+// checked before the proof and before the intent.
+#[test]
+fn live_owner_intent_reads_the_shell_once_and_stops_nothing() {
+    use crate::native::session::test_support::{
+        SESSION_OWNER_FILE, TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE,
+    };
+    use crate::native::terminal::ownership::{MacTerminalShellIdentity, NativeProcessIdentity};
+    let live = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 1_790_000_000,
+        process_start_microseconds: 42,
+    };
+    let shell = NativeProcessIdentity {
+        pid: 4000,
+        parent_pid: 3000,
+        process_group: 4000,
+        process_start_seconds: 1,
+        process_start_microseconds: 0,
+        ..live
+    };
+    for unexpired_reads in 0..=2 {
+        let host = fake();
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner = crate::native::tests::write_attested_apple_terminal_state(
+            directory.path(),
+            "ready",
+            4242,
+        );
+        owner.terminal_shell = Some(MacTerminalShellIdentity {
+            pid: 4000,
+            process_group: 4000,
+            terminal_tty_device: 7,
+            process_start_seconds: 1,
+            process_start_microseconds: 0,
+        });
+        crate::native::session::primitives::write_json_atomic(
+            &directory.path().join(SESSION_OWNER_FILE),
+            &owner,
+        )
+        .unwrap();
+        let mut pane = session(&host);
+        pane.managed_session_id = Some("session-owner123".to_owned());
+        crate::native::session::primitives::write_json_atomic(
+            &directory.path().join(TERMINAL_HANDLE_FILE),
+            &pane,
+        )
+        .unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        let clock = crate::native::clock::ExpiresAtRead::new(start, deadline, unexpired_reads);
+        let reads = clock.reads();
+        let _scope = crate::native::session::close::budget::Scope::with_clock(clock);
+        let observed = RefCell::new(Vec::new());
+        let identity = |pid: u32| {
+            observed.borrow_mut().push(pid);
+            match pid {
+                4242 => Ok(live),
+                4000 => Ok(shell),
+                _ => panic!("unexpected process {pid}"),
+            }
+        };
+        let result = record_live_owner_intent(
+            directory.path(),
+            "session-owner123",
+            &pane,
+            ProcessReads {
+                identity: &identity,
+                tty_device: &|_| Ok(7),
+            },
+            deadline,
+        );
+        let intent = directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists();
+        // (expired, process reads, intent recorded)
+        let expected: (bool, &[u32], bool) = match unexpired_reads {
+            0 => (true, &[], false),
+            1 => (true, &[4242, 4000], false),
+            _ => (false, &[4242, 4000], true),
+        };
+        let expired = match &result {
+            Ok(()) => false,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("close deadline expired"),
+                    "{error:#}"
+                );
+                true
+            }
+        };
+        assert_eq!(
+            (expired, observed.borrow().as_slice(), intent),
+            expected,
+            "{unexpired_reads}"
+        );
+        assert_eq!(
+            reads.get(),
+            (unexpired_reads + 1).min(2),
+            "{unexpired_reads}"
+        );
+        assert!(commands(&host).is_empty());
+    }
+}
