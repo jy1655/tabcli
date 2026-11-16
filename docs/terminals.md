@@ -215,6 +215,32 @@ This does not remove all Claude or Codex configuration or plugin context, or ret
 clean an existing terminal application's environment. Restart an already contaminated
 terminal application.
 
+### Shell startup files (iTerm2 and WezTerm)
+
+iTerm2 and WezTerm start Bridge's host as the program of the new surface. Before the launch,
+the host runs your zsh login and interactive startup files once, without a terminal:
+`/bin/zsh -l -i` in a new session with no controlling terminal and standard input from
+`/dev/null`. It keeps only the exported environment that run produces, then starts the launch
+with `/bin/zsh -f -i` in the surface and that environment. A startup file that waits for
+terminal input, such as Oh My Zsh's update prompt, therefore cannot hold the launch (#376).
+
+- The run has a bound of at most ten seconds, shortened by the launch deadline. A run that
+  does not finish, exits with an error, or produces no usable environment fails the launch at
+  once, and the failure names the stage; `tabcli doctor SESSION` shows it as `launch_stage`.
+- Exports that a startup file makes only when it is attached to a terminal (for example under
+  `[[ -t 0 ]]` or after `tty`) are not carried, and neither are shell functions, options or
+  limits. Put what a provider needs in an unconditional export.
+- Processes a startup file leaves running in that run's process group are stopped and counted
+  (`background_children_stopped`); the launch continues. A daemon that detaches itself is not
+  touched.
+- Startup-file output is discarded. It is never stored, logged or shown.
+- `tabcli doctor --probe` runs the same preparation once in the caller's current environment and
+  reports only its outcome, which is not a reconstruction of the terminal's environment.
+
+Terminal.app, Ghostty and Warp are unchanged: Terminal.app and Warp type the launch into the
+terminal's own shell, which runs your startup files in the terminal first, and Ghostty already
+starts a clean shell with the launcher's `PATH`.
+
 ## Ownership and close
 
 Open sessions, including finished sessions that were not closed, load the terminal. For bulk
