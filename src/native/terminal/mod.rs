@@ -42,6 +42,10 @@ pub(super) mod macos;
 #[cfg(any(target_os = "macos", test))]
 #[path = "macos/shell_environment/wire.rs"]
 mod shell_environment_wire;
+// The capture's time budget is a pure rule, and doctor reads its limit on every target.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[path = "macos/shell_environment/budget.rs"]
+pub(in crate::native) mod shell_environment_budget;
 // Compiled into every test build so its refusal is tested on every CI target.
 #[cfg(any(not(any(target_os = "macos", target_os = "windows")), test))]
 #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]

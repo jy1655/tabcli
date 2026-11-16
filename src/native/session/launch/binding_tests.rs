@@ -23,6 +23,8 @@ struct Script {
     hook: Hook,
     retries: usize,
     points: Vec<Point>,
+    /// A pause right after the next monotonic reading: both clocks move on by it once.
+    pause_after_read: Option<Duration>,
 }
 
 // The wait's checkpoints receive no handle, so the checkpoint hook reads the script of
@@ -50,7 +52,17 @@ struct ScriptedClock(Rc<RefCell<Script>>);
 
 impl Clock for ScriptedClock {
     fn now(&mut self) -> Instant {
-        self.0.borrow().now
+        let mut script = self.0.borrow_mut();
+        let now = script.now;
+        if let Some(pause) = script.pause_after_read.take() {
+            script.now += pause;
+            session::tests::FIXED_UNIX_MS.set(
+                session::tests::FIXED_UNIX_MS
+                    .get()
+                    .map(|wall| wall + pause.as_millis()),
+            );
+        }
+        now
     }
 
     fn sleep(&mut self, delay: Duration) {
@@ -132,6 +144,8 @@ pub(in crate::native) fn characterize(
         "short-budget",
         "expired-then-rollback",
         "thirty-second-cap",
+        "far-future-cap",
+        "pause-after-monotonic-read",
     ] {
         let _reset = Reset(session::tests::FIXED_UNIX_MS.replace(Some(1_000)));
         let fixture = tempfile::Builder::new()
@@ -162,8 +176,12 @@ pub(in crate::native) fn characterize(
                 "start_seconds": 1, "start_microseconds": 0, "owns_gui": false },
         });
         let mut expected = cancelled.clone();
-        let success = matches!(case, "bound" | "late-cancellation")
-            || (case == "legacy-owner" && name == "iTerm2")
+        // A pause between the wall and the monotonic readings must not shorten the budget: the
+        // binding arrives 70 ms after the readings, before the receipt's 100 ms run out.
+        let success = matches!(
+            case,
+            "bound" | "late-cancellation" | "pause-after-monotonic-read"
+        ) || (case == "legacy-owner" && name == "iTerm2")
             || (matches!(
                 case,
                 "rollback" | "extended-deadline" | "short-budget" | "expired-then-rollback"
@@ -201,6 +219,8 @@ pub(in crate::native) fn characterize(
             "short-budget" => receipt(directory, |r| r.deadline_unix_ms = 1_005),
             "expired-then-rollback" => receipt(directory, |r| r.deadline_unix_ms = 999),
             "thirty-second-cap" => receipt(directory, |r| r.deadline_unix_ms = 100_000),
+            // The furthest deadline a receipt can be read with: the 30 s cap still applies.
+            "far-future-cap" => receipt(directory, |r| r.deadline_unix_ms = u64::MAX.into()),
             "owner-before-surface" => {
                 let mut binding = binding.clone();
                 binding["managed_session_id"] = "session-foreign".into();
@@ -242,6 +262,8 @@ pub(in crate::native) fn characterize(
             now: Instant::now(),
             retries: 0,
             points: Vec::new(),
+            pause_after_read: (case == "pause-after-monotonic-read")
+                .then_some(Duration::from_millis(60)),
             hook: Box::new(move |point, now| {
                 if point == Point::InitialReceipt {
                     initial_seen = true;
@@ -345,8 +367,8 @@ pub(in crate::native) fn characterize(
                         receipt(&path, |r| r.deadline_unix_ms = 2_000);
                         session::tests::FIXED_UNIX_MS.set(Some(1_110));
                     }
-                    "thirty-second-cap" => *now += Duration::from_secs(30),
-                    "short-budget" => {}
+                    "thirty-second-cap" | "far-future-cap" => *now += Duration::from_secs(30),
+                    "short-budget" | "pause-after-monotonic-read" => {}
                     _ => panic!("unexpected retry for {case}"),
                 }
             }),

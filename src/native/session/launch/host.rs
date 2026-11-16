@@ -143,6 +143,9 @@ pub(in crate::native) struct HostRecord {
     pub(in crate::native) host: Option<HostIdentity>,
     pub(in crate::native) updated_unix_ms: u128,
     pub(in crate::native) elapsed_ms: u64,
+    /// The host's estimate while `EnvironmentPreparing`, made before the capture starts; the
+    /// budget the capture enforced from `EnvironmentReady` on, and in the failure record of a
+    /// capture that ended the launch.
     pub(in crate::native) capture_budget_ms: u64,
     pub(in crate::native) capture_elapsed_ms: Option<u64>,
     pub(in crate::native) variables: Option<u32>,
@@ -305,6 +308,7 @@ pub(in crate::native) fn admit(store: &Store, token: &str, identity: HostIdentit
 }
 
 /// Only counters enter this API; neither environment values nor startup output can enter.
+/// `capture_budget_ms` is what `HostRecord::capture_budget_ms` holds at the stage.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 pub(in crate::native) struct Progress {
@@ -342,6 +346,8 @@ pub(in crate::native) fn advance(
 /// over an admitted incarnation. Failure is final and preserves the last stage.
 /// Expiry withholds launch authority but does not discard its failure diagnosis;
 /// the current pending claim and unsettled, unclosed session are still required.
+/// The capture's elapsed time and budget, when given, replace the recorded ones; otherwise
+/// the record keeps them as the last stage wrote them.
 #[cfg(any(target_os = "macos", test))]
 pub(in crate::native) fn fail(
     store: &Store,
@@ -350,6 +356,7 @@ pub(in crate::native) fn fail(
     failure: Failure,
     elapsed_ms: u64,
     capture_elapsed_ms: Option<u64>,
+    capture_budget_ms: Option<u64>,
 ) -> Result<()> {
     let _lock = store.lock()?;
     let mut host = current(store, token, false)?;
@@ -360,6 +367,9 @@ pub(in crate::native) fn fail(
     host.elapsed_ms = elapsed_ms;
     if capture_elapsed_ms.is_some() {
         host.capture_elapsed_ms = capture_elapsed_ms;
+    }
+    if let Some(budget_ms) = capture_budget_ms {
+        host.capture_budget_ms = budget_ms;
     }
     host.updated_unix_ms = unix_ms();
     write(store, &host)
@@ -440,12 +450,13 @@ mod tests {
             failure.clone(),
             44,
             Some(40),
+            None,
         )
         .unwrap();
         assert_eq!(read(&store).stage, Stage::LaunchShellStarting);
         assert_eq!(read(&store).capture_elapsed_ms, Some(40));
         assert_eq!(read(&store).failure, Some(failure.clone()));
-        assert!(fail(&store, &token, Some(identity()), failure, 55, None).is_err());
+        assert!(fail(&store, &token, Some(identity()), failure, 55, None, None).is_err());
         assert!(admit(&store, &token, identity()).is_err());
     }
     #[test]
@@ -512,6 +523,7 @@ mod tests {
                         signal: None
                     },
                     1,
+                    None,
                     None
                 )
                 .is_err(),
@@ -618,6 +630,7 @@ mod tests {
                 signal: None,
             },
             30000,
+            None,
             None,
         )
         .unwrap();

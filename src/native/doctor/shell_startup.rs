@@ -7,6 +7,7 @@ use crate::native::session::launch::host::{
     Failure, FailureReason, HostObservation, HostRecord, Stage,
 };
 use crate::native::terminal::TerminalKind;
+use crate::native::terminal::shell_environment_budget::LIMIT;
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -221,9 +222,8 @@ pub(super) enum ProbeOutcome {
     },
 }
 
-/// The launch's own capture limit; a shorter budget that ran out is inconclusive.
-const LAUNCH_CAPTURE_LIMIT: Duration = Duration::from_secs(10);
-
+/// `run` returns the probe's outcome and the budget the capture enforced. A timeout within a
+/// budget shorter than a launch's own limit is inconclusive.
 pub(super) fn shell_environment_check(
     context: ProbeContext,
     run: impl FnOnce() -> (ProbeOutcome, Duration),
@@ -284,7 +284,7 @@ pub(super) fn shell_environment_check(
             signal,
             elapsed,
         } if reason == FailureReason::LaunchBudgetExhausted
-            || (reason == FailureReason::CaptureTimeout && budget < LAUNCH_CAPTURE_LIMIT) =>
+            || (reason == FailureReason::CaptureTimeout && budget < LIMIT) =>
         {
             Check::new(
                 CheckId::SHELL_ENVIRONMENT,
@@ -313,30 +313,33 @@ pub(super) fn shell_environment_check(
     }
 }
 
-/// Runs the launch's capture once in the caller's environment. The capture reserves time
-/// for a launch handoff that a probe does not make, so the probe hands it that reserve back;
-/// the capture still ends, cleanup included, by `deadline`.
+/// Runs the launch's capture once in the caller's environment and returns its outcome with
+/// the budget the capture enforced. The capture reserves time for a launch handoff that a
+/// probe does not make, so the probe hands it that reserve back; the capture still ends,
+/// cleanup included, by `deadline`.
 #[cfg(target_os = "macos")]
 pub(super) fn run_probe(deadline: Instant) -> (ProbeOutcome, Duration) {
-    use crate::native::terminal::macos::shell_environment::{CLEANUP, HANDOFF_RESERVE, capture};
-    let budget = deadline
-        .saturating_duration_since(Instant::now())
-        .saturating_sub(CLEANUP)
-        .min(LAUNCH_CAPTURE_LIMIT);
-    let outcome = match capture(std::env::vars_os(), deadline + HANDOFF_RESERVE) {
-        Ok(captured) => ProbeOutcome::Ready {
-            elapsed: captured.elapsed,
-            variables: captured.variables.len(),
-            background_children_stopped: captured.background_children_stopped,
-        },
-        Err(failure) => ProbeOutcome::Failed {
-            reason: failure.reason,
-            exit_code: failure.exit_code,
-            signal: failure.signal,
-            elapsed: failure.elapsed,
-        },
-    };
-    (outcome, budget)
+    use crate::native::terminal::macos::shell_environment::capture;
+    use crate::native::terminal::shell_environment_budget::HANDOFF_RESERVE;
+    match capture(std::env::vars_os(), deadline + HANDOFF_RESERVE) {
+        Ok(captured) => (
+            ProbeOutcome::Ready {
+                elapsed: captured.elapsed,
+                variables: captured.variables.len(),
+                background_children_stopped: captured.background_children_stopped,
+            },
+            captured.budget,
+        ),
+        Err(failure) => (
+            ProbeOutcome::Failed {
+                reason: failure.reason,
+                exit_code: failure.exit_code,
+                signal: failure.signal,
+                elapsed: failure.elapsed,
+            },
+            failure.budget,
+        ),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -681,7 +684,87 @@ mod tests {
             row["reason_code"],
             "shell_environment_probe_budget_exhausted"
         );
-        let row = failed(FailureReason::CaptureTimeout, LAUNCH_CAPTURE_LIMIT);
+        let row = failed(FailureReason::CaptureTimeout, LIMIT);
         assert_eq!(row["reason_code"], "shell_environment_failed");
+    }
+
+    // A timeout is conclusive only when the probe had a launch's full 10 s limit.
+    #[test]
+    fn a_capture_timeout_is_inconclusive_only_below_the_launch_limit() {
+        assert_eq!(LIMIT, Duration::from_secs(10));
+        let mut actual = Vec::new();
+        for (reason, budget) in [
+            (FailureReason::CaptureTimeout, Duration::from_millis(9_999)),
+            (FailureReason::CaptureTimeout, Duration::from_secs(10)),
+            (
+                FailureReason::LaunchBudgetExhausted,
+                Duration::from_secs(10),
+            ),
+            (FailureReason::CaptureExitNonzero, Duration::ZERO),
+        ] {
+            let row = serde_json::to_value(shell_environment_check(
+                ProbeContext::Terminal(TerminalKind::Iterm2),
+                || {
+                    (
+                        ProbeOutcome::Failed {
+                            reason,
+                            exit_code: None,
+                            signal: None,
+                            elapsed: Duration::from_millis(20),
+                        },
+                        budget,
+                    )
+                },
+            ))
+            .unwrap();
+            actual.push(format!(
+                "{} {} {}",
+                row["reason_code"].as_str().unwrap(),
+                row["evidence"]["budget_ms"],
+                row["detail"].as_str().unwrap()
+            ));
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                actual,
+                [
+                    "shell_environment_probe_budget_exhausted 9999 The probe budget (9999 ms) ran out before the startup files finished; the result is inconclusive.",
+                    "shell_environment_failed 10000 Your zsh startup files did not prepare an environment without a terminal: capture_timeout.",
+                    "shell_environment_probe_budget_exhausted 10000 The probe budget (10000 ms) ran out before the startup files finished; the result is inconclusive.",
+                    "shell_environment_failed 0 Your zsh startup files did not prepare an environment without a terminal: capture_exit_nonzero.",
+                ]
+            );
+        } else {
+            assert!(
+                actual
+                    .iter()
+                    .all(|row| row.starts_with("shell_environment_probe_not_applicable null ")),
+                "{actual:?}"
+            );
+        }
+    }
+
+    // A probe whose deadline leaves no budget past the cleanup reserve starts no shell and
+    // reports a zero budget.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_probe_without_budget_reports_exhaustion_without_a_shell() {
+        use crate::native::terminal::shell_environment_budget::CLEANUP;
+        for deadline in [Instant::now(), Instant::now() + CLEANUP] {
+            let (outcome, budget) = run_probe(deadline);
+            assert!(
+                matches!(
+                    outcome,
+                    ProbeOutcome::Failed {
+                        reason: FailureReason::LaunchBudgetExhausted,
+                        exit_code: None,
+                        signal: None,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(budget, Duration::ZERO);
+        }
     }
 }

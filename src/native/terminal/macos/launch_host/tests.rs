@@ -1,6 +1,7 @@
 use super::*;
 use crate::native::clock::FakeClock;
 use crate::native::session::CoreRecord;
+use crate::native::session::primitives::unix_ms;
 use crate::native::terminal::macos::{iterm2, wezterm};
 use std::{
     cell::{Cell, RefCell},
@@ -175,6 +176,7 @@ fn executable(root: &Path) -> std::path::PathBuf {
 
 fn pty_regression(kind: TerminalKind) {
     let root = tempfile::tempdir().unwrap();
+    let receipt_written = Instant::now();
     let directory =
         launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(directory.path());
@@ -203,6 +205,25 @@ fn pty_regression(kind: TerminalKind) {
         &directory.path().join("capturing"),
         Duration::from_secs(2)
     ));
+    // While the capture runs, the preparing record holds the host's budget, which the launch
+    // log names: the 10 s receipt less the 2.5 s of reserves, measured when the host started.
+    let host::HostObservation::Recorded(preparing) = host::observe(&store, Some(&receipt)) else {
+        panic!("missing host record");
+    };
+    let since_receipt = receipt_written.elapsed().as_millis() as u64;
+    assert_eq!(preparing.stage, host::Stage::EnvironmentPreparing);
+    let estimate = preparing.capture_budget_ms;
+    assert!(
+        estimate <= 7_500 && estimate + since_receipt >= 7_500,
+        "{estimate} ms, {since_receipt} ms after the receipt"
+    );
+    let log = fs::read_to_string(directory.path().join(launch::LOG)).unwrap();
+    assert!(
+        log.contains(&format!(
+            " shell_environment_started budget_ms={estimate}\n"
+        )),
+        "{log}"
+    );
     child
         .master
         .as_mut()
@@ -222,6 +243,12 @@ fn pty_regression(kind: TerminalKind) {
     assert_eq!(record.stage, host::Stage::LaunchShellStarting);
     assert!(record.failure.is_none());
     assert!(record.variables.is_some_and(|n| n > 0));
+    // The capture decided its budget when it started, after the host's estimate.
+    assert!(
+        record.capture_budget_ms <= estimate && record.capture_budget_ms > 0,
+        "{} ms enforced, {estimate} ms estimated",
+        record.capture_budget_ms
+    );
     let log = fs::read_to_string(directory.path().join(launch::LOG)).unwrap();
     for marker in [
         "_host_started",
@@ -344,11 +371,16 @@ enum Outcome {
     Error(String),
 }
 
+/// The budget a scripted capture enforced: lower than the 10 s the admitted host's preparing
+/// record holds, as for a capture that starts after the host's estimate.
+const ENFORCED: Duration = Duration::from_millis(9_996);
+
 fn captured() -> Captured {
     Captured {
         variables: vec![("FIXTURE".into(), "ready".into())],
         elapsed: Duration::from_millis(7),
         background_children_stopped: 0,
+        budget: ENFORCED,
     }
 }
 
@@ -362,6 +394,7 @@ fn capture_failure(
         exit_code,
         signal,
         elapsed: Duration::from_millis(1500),
+        budget: ENFORCED,
     }
 }
 
@@ -494,6 +527,7 @@ fn capture_failure_refuses_with_the_captures_own_facts() {
                 exit_code,
                 signal,
                 capture_elapsed: Some(Duration::from_millis(1500)),
+                capture_budget: Some(ENFORCED),
             })
         );
         // The binding is not observed after the capture failed.
@@ -521,6 +555,8 @@ fn a_capture_thread_gone_without_an_answer_refuses_as_a_failed_capture_spawn() {
             exit_code: None,
             signal: None,
             capture_elapsed: Some(Duration::from_millis(20)),
+            // The thread gave no answer, so no enforced budget.
+            capture_budget: None,
         })
     );
     assert_eq!(
@@ -616,6 +652,7 @@ fn a_capture_answer_at_the_deadline_is_taken_before_the_deadline() {
             exit_code: None,
             signal: None,
             capture_elapsed: Some(Duration::from_millis(1500)),
+            capture_budget: Some(ENFORCED),
         })
     );
     assert_eq!(trace, [Poll(0)]);
@@ -719,8 +756,7 @@ fn refuse(store: &Store, token: &str, captures: Vec<CapturePoll>) -> (String, Ve
         trace: trace.clone(),
     };
     let receipt = launch::read(store).unwrap().unwrap();
-    let deadline =
-        start + Duration::from_millis(receipt.deadline_unix_ms.saturating_sub(unix_ms()) as u64);
+    let deadline = launch::saturating_deadline(start, receipt.remaining(Duration::ZERO));
     let recorder = Recorder {
         store,
         token,
@@ -749,7 +785,7 @@ fn refuse(store: &Store, token: &str, captures: Vec<CapturePoll>) -> (String, Ve
         },
         &mut |captured, now| {
             ready_trace.push(Ready);
-            recorder.ready(IDENTITY, 10_000, captured, now)
+            recorder.ready(IDENTITY, captured, now)
         },
     )
     .unwrap()
@@ -802,6 +838,35 @@ fn capture_failure_is_recorded_while_binding_is_absent() {
     );
 }
 
+// A capture that timed out: its failure record's budget is the one `status.error` names.
+#[test]
+fn a_capture_timeout_records_the_budget_that_status_error_names() {
+    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (error, trace) = refuse(
+        &store,
+        &token,
+        vec![CapturePoll::Finished(Err(capture_failure(
+            host::FailureReason::CaptureTimeout,
+            None,
+            None,
+        )))],
+    );
+    assert_eq!(error, "iTerm2 launch host refused: capture_timeout");
+    assert_eq!(trace, [Poll(0)]);
+    let record = host_record(&store);
+    assert_eq!(record.stage, host::Stage::EnvironmentPreparing);
+    // The preparing record's 10 s estimate is replaced by the budget the capture enforced.
+    assert_eq!(record.capture_budget_ms, 9_996);
+    assert_eq!(record.capture_elapsed_ms, Some(1500));
+    assert!(launch::repair(&store).unwrap());
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(
+            "terminal shell environment could not be prepared: startup files did not finish within 9996 ms (capture_timeout); last recorded launch stage: environment_preparing"
+        )
+    );
+}
+
 #[test]
 fn binding_failure_is_recorded_while_capture_is_still_running() {
     let (_directory, store, token) = admitted(Duration::from_secs(10));
@@ -821,6 +886,8 @@ fn binding_failure_is_recorded_while_capture_is_still_running() {
     );
     assert_eq!(record.stage, host::Stage::EnvironmentPreparing);
     assert_eq!(record.capture_elapsed_ms, None);
+    // The capture has not answered: the preparing record's budget stays.
+    assert_eq!(record.capture_budget_ms, 10_000);
     let log = launch_log(&store);
     assert!(!log.contains("shell_environment_failed"), "{log}");
     assert!(
@@ -876,6 +943,9 @@ fn binding_timeout_is_retained_after_receipt_expiry() {
     );
     assert_eq!(record.stage, host::Stage::EnvironmentReady);
     assert_eq!(record.elapsed_ms, 50);
+    // The ready record replaced the preparing estimate with the budget the capture enforced,
+    // and the binding failure keeps it.
+    assert_eq!(record.capture_budget_ms, 9_996);
     assert_eq!(record.capture_elapsed_ms, Some(7));
     assert_eq!(record.variables, Some(1));
     assert_eq!(record.background_children_stopped, Some(0));
@@ -927,6 +997,7 @@ fn the_locked_binding_observation_needs_an_eligible_host_and_a_readable_handle()
                     signal: None,
                 },
                 1,
+                None,
                 None,
             )
             .unwrap(),
@@ -1073,6 +1144,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
                         signal: None,
                     },
                     1,
+                    None,
                     None,
                 )
                 .unwrap();

@@ -89,16 +89,49 @@ pub(in crate::native) struct Record {
 const RECHECK_GRACE: Duration = Duration::from_secs(2);
 
 impl Record {
-    // The wrapper's re-check bound on the monotonic clock: the recorded deadline plus the
-    // grace, converted once. A bound already past is now; one the monotonic clock cannot
-    // represent is none.
-    fn recheck_bound(&self) -> Option<Instant> {
+    /// The time from the wall clock's reading here until `after` past the recorded deadline:
+    /// zero once that time has passed, and `None` when it is more than `u64::MAX` milliseconds
+    /// away. This is the wall-clock half of the receipt's conversion to the monotonic clock;
+    /// each caller reads the monotonic clock itself, in its own order around this reading, and
+    /// keeps its own cap, grace and overflow policy.
+    pub(in crate::native) fn remaining(&self, after: Duration) -> Option<Duration> {
         let remaining = self
             .deadline_unix_ms
-            .saturating_add(RECHECK_GRACE.as_millis())
+            .saturating_add(after.as_millis())
             .saturating_sub(unix_ms());
-        Instant::now().checked_add(Duration::from_millis(u64::try_from(remaining).ok()?))
+        u64::try_from(remaining).ok().map(Duration::from_millis)
     }
+
+    // The wrapper's re-check bound: the recorded deadline plus the grace. The wall clock is
+    // read before `monotonic_now`, so that a pause between the two readings can only lengthen
+    // the bound. A remaining time that does not fit the conversion or the monotonic clock
+    // gives none, and the wrapper keeps its unbounded check.
+    fn recheck_bound(&self, monotonic_now: impl FnOnce() -> Instant) -> Option<Instant> {
+        let remaining = self.remaining(RECHECK_GRACE)?;
+        monotonic_now().checked_add(remaining)
+    }
+}
+
+/// `now` plus a receipt's `remaining` time, saturating: a remaining time too long for the
+/// conversion counts as `u64::MAX` milliseconds, and an instant the monotonic clock cannot
+/// represent is the furthest one short of it that it can. The macOS launch host and binding
+/// wait use it.
+#[cfg(any(target_os = "macos", test))]
+pub(in crate::native) fn saturating_deadline(now: Instant, remaining: Option<Duration>) -> Instant {
+    let remaining = remaining.unwrap_or(Duration::from_millis(u64::MAX));
+    if let Some(deadline) = now.checked_add(remaining) {
+        return deadline;
+    }
+    let (mut reachable, mut beyond) = (Duration::ZERO, remaining);
+    while beyond - reachable > Duration::from_nanos(1) {
+        let middle = reachable + (beyond - reachable) / 2;
+        if now.checked_add(middle).is_some() {
+            reachable = middle;
+        } else {
+            beyond = middle;
+        }
+    }
+    now + reachable
 }
 
 pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
@@ -142,16 +175,16 @@ pub(in crate::native) fn wait_for_binding(
     binding_tests::checkpoint(binding_tests::Point::InitialReceipt);
     // Preserve both budgets: after wall-clock rollback or a receipt extension,
     // The start-timeout budget may continue beyond the initial receipt's remaining duration.
-    let budget = match facts.budget {
-        BindingBudget::StartTimeout => START_TIMEOUT,
-        BindingBudget::RemainingReceiptCapped => Duration::from_millis(
-            initial
-                .deadline_unix_ms
-                .saturating_sub(unix_ms())
-                .min(30_000) as u64,
-        ),
+    let deadline = match facts.budget {
+        BindingBudget::StartTimeout => clock.now() + START_TIMEOUT,
+        BindingBudget::RemainingReceiptCapped => {
+            // The wall clock before the monotonic clock: a pause between the two readings can
+            // only lengthen the budget, and the receipt's own expiry still bounds the wait.
+            let remaining = initial.remaining(Duration::ZERO);
+            let now = clock.now();
+            saturating_deadline(now, remaining).min(now + START_TIMEOUT)
+        }
     };
-    let deadline = clock.now() + budget;
     #[cfg(test)]
     binding_tests::checkpoint(binding_tests::Point::BudgetCaptured);
     loop {
@@ -1281,7 +1314,7 @@ mod tests {
                 phase: Phase::Pending,
             };
             let before = Instant::now();
-            let bound = record.recheck_bound();
+            let bound = record.recheck_bound(Instant::now);
             (before, bound, Instant::now())
         };
         assert_eq!(RECHECK_GRACE, Duration::from_secs(2));
@@ -1316,6 +1349,97 @@ mod tests {
                     .is_some_and(|earliest| earliest <= bound)
             );
         }
+    }
+
+    // The re-check reads the wall clock before the monotonic clock, so that a pause between the
+    // two readings can only lengthen its bound. A pause right after the monotonic reading
+    // leaves the bound at the recorded deadline plus the grace; one right before it lengthens
+    // the bound by the pause.
+    #[test]
+    fn the_wrappers_recheck_bound_reads_the_wall_clock_before_the_monotonic_clock() {
+        use crate::native::session::tests::FIXED_UNIX_MS;
+        struct Reset(Option<u128>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FIXED_UNIX_MS.set(self.0);
+            }
+        }
+        const NOW: u128 = 1_000_000;
+        const PAUSE: Duration = Duration::from_secs(6);
+        let _reset = Reset(FIXED_UNIX_MS.replace(Some(NOW)));
+        let record = Record {
+            schema: 1,
+            claim_token: "claim".to_owned(),
+            deadline_unix_ms: NOW + 10_000,
+            phase: Phase::Pending,
+        };
+        let reading = Instant::now();
+        let pause = || FIXED_UNIX_MS.set(Some(NOW + PAUSE.as_millis()));
+        let after_reading = record.recheck_bound(|| {
+            pause();
+            reading
+        });
+        FIXED_UNIX_MS.set(Some(NOW));
+        let before_reading = record.recheck_bound(|| {
+            pause();
+            reading + PAUSE
+        });
+        assert_eq!(
+            (after_reading, before_reading),
+            (
+                Some(reading + Duration::from_secs(12)),
+                Some(reading + PAUSE + Duration::from_secs(12))
+            )
+        );
+    }
+
+    // The wall-clock half of the receipt's conversion, and the saturating monotonic half that
+    // the launch host and the binding wait use.
+    #[test]
+    fn the_receipt_deadline_converts_to_the_monotonic_clock_saturating() {
+        struct Reset(Option<u128>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::native::session::tests::FIXED_UNIX_MS.set(self.0);
+            }
+        }
+        const NOW: u128 = 1_000_000;
+        let _reset = Reset(crate::native::session::tests::FIXED_UNIX_MS.replace(Some(NOW)));
+        let ms = Duration::from_millis;
+        let remaining = |deadline_unix_ms, after| {
+            Record {
+                schema: 1,
+                claim_token: "claim".to_owned(),
+                deadline_unix_ms,
+                phase: Phase::Pending,
+            }
+            .remaining(after)
+        };
+        assert_eq!(remaining(NOW + 500, Duration::ZERO), Some(ms(500)));
+        assert_eq!(remaining(NOW, Duration::ZERO), Some(Duration::ZERO));
+        assert_eq!(remaining(NOW - 500, Duration::ZERO), Some(Duration::ZERO));
+        assert_eq!(remaining(0, Duration::ZERO), Some(Duration::ZERO));
+        // A time after the deadline counts from the deadline, even once it has passed.
+        assert_eq!(remaining(NOW - 500, ms(2_000)), Some(ms(1_500)));
+        assert_eq!(remaining(NOW - 5_000, ms(2_000)), Some(Duration::ZERO));
+        let largest = u128::from(u64::MAX);
+        assert_eq!(remaining(largest + NOW, Duration::ZERO), Some(ms(u64::MAX)));
+        assert_eq!(remaining(largest + NOW + 1, Duration::ZERO), None);
+        assert_eq!(remaining(u128::MAX, Duration::ZERO), None);
+
+        let now = Instant::now();
+        let furthest = |instant: Instant| instant.checked_add(Duration::from_nanos(1)).is_none();
+        assert_eq!(saturating_deadline(now, Some(ms(500))), now + ms(500));
+        assert_eq!(saturating_deadline(now, Some(Duration::ZERO)), now);
+        // Too long for the conversion: `u64::MAX` milliseconds, or the clock's furthest instant.
+        let saturated = saturating_deadline(now, None);
+        match now.checked_add(ms(u64::MAX)) {
+            Some(expected) => assert_eq!(saturated, expected),
+            None => assert!(furthest(saturated)),
+        }
+        // Past what the monotonic clock represents: its furthest instant, never a panic.
+        let saturated = saturating_deadline(now, Some(Duration::MAX));
+        assert!(saturated > now && furthest(saturated));
     }
 
     #[test]
@@ -1779,6 +1903,7 @@ mod host_decision_tests {
             },
             10000,
             Some(10000),
+            None,
         )
         .unwrap();
     }
@@ -1835,6 +1960,7 @@ mod host_decision_tests {
                 signal: None,
             },
             0,
+            None,
             None,
         )
         .unwrap();
