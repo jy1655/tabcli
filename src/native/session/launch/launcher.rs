@@ -30,6 +30,18 @@ pub(in crate::native) fn start(
         expected_claim_token,
         deadline,
     )?;
+    let host_terminal = match terminal_kind {
+        terminal::TerminalKind::Iterm2 => Some(launch::host::Terminal::Iterm2),
+        terminal::TerminalKind::WezTerm => Some(launch::host::Terminal::Wezterm),
+        _ => None,
+    };
+    if let Some(terminal) = host_terminal {
+        launch::host::initialize(
+            &Store::open_unchecked(&created.directory),
+            expected_claim_token,
+            terminal,
+        )?;
+    }
     let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,

@@ -27,6 +27,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 mod installation;
+mod shell_startup;
 
 #[derive(Debug)]
 pub(crate) struct DoctorRequest {
@@ -133,8 +134,10 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             }
         });
     let mut observations = json!({});
+    let mut selected_terminal = None;
     if request.provider.is_some() {
         let selected = terminal::select(None);
+        selected_terminal = selected.as_ref().ok().copied();
         let (availability, reason, evidence) = match selected {
             Ok(kind) if kind.supported_on_this_platform() => (
                 Available,
@@ -174,6 +177,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             ),
         });
     }
+    let mut session_terminal = None;
     let manifest = directory.as_ref().and_then(|directory| {
         let mut clock = SystemClock;
         let (manifest, evidence) = record_checks(
@@ -197,6 +201,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             request.session.as_deref().unwrap(),
             &mut checks,
         );
+        session_terminal = recorded_terminal(&Reader::open_unchecked(directory), &evidence);
         manifest
     });
     let provider = match manifest
@@ -283,6 +288,23 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         ));
         scope_workspace = Some(workspace);
     }
+    let probe_context = if !request.probe {
+        shell_startup::ProbeContext::NotRequested
+    } else if request.session.is_some() {
+        session_terminal.map_or(
+            shell_startup::ProbeContext::Unknown,
+            shell_startup::ProbeContext::Terminal,
+        )
+    } else {
+        selected_terminal.map_or(
+            shell_startup::ProbeContext::Unknown,
+            shell_startup::ProbeContext::Terminal,
+        )
+    };
+    checks.push(shell_startup::shell_environment_check(
+        probe_context,
+        || shell_startup::run_probe(deadline),
+    ));
     let workspace = scope_workspace
         .or_else(|| manifest.as_ref().map(|m| m.workspace.clone()))
         .or_else(|| std::env::current_dir().ok());
@@ -308,6 +330,37 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         observations,
         checks,
     })
+}
+
+/// The terminal a session launched in, as its records name it: the launch host record of
+/// its receipt, then an active surface handle. Read after the snapshot is released.
+fn recorded_terminal(
+    reader: &Reader,
+    evidence: &SessionEvidence,
+) -> Option<terminal::TerminalKind> {
+    let receipt = launch::read(reader).ok().flatten();
+    if let launch::host::HostObservation::Recorded(host) =
+        launch::host::observe(reader, receipt.as_ref())
+    {
+        return Some(match host.terminal {
+            launch::host::Terminal::Iterm2 => terminal::TerminalKind::Iterm2,
+            launch::host::Terminal::Wezterm => terminal::TerminalKind::WezTerm,
+        });
+    }
+    surface_kind(evidence)
+}
+
+/// The terminal kind a session's surface records name: the active or closing handle, or
+/// the close tombstone, which keeps the kind after the handle is consumed.
+fn surface_kind(evidence: &SessionEvidence) -> Option<terminal::TerminalKind> {
+    match &evidence.surface {
+        query::observation::SurfaceRecord::Active(Ok(Some(surface)))
+        | query::observation::SurfaceRecord::Closing(Ok(surface)) => Some(surface.kind),
+        query::observation::SurfaceRecord::Closed(Ok(tombstone)) => {
+            serde_json::from_value(tombstone.get("terminal")?.clone()).ok()
+        }
+        _ => None,
+    }
 }
 
 fn render_report(request: &DoctorRequest, started: u128, diagnosis: Diagnosis) -> Result<()> {
@@ -394,6 +447,14 @@ pub(super) fn record_checks(
     let (manifest, evidence, surface, hold) = match Observation::read(reader) {
         Ok(observation) => {
             session_checks(&observation, checks, observations);
+            checks.push(shell_startup::launch_stage_check(
+                &observation.launch_host,
+                surface_kind(&observation.evidence),
+                shell_startup::LaterEvidence {
+                    owner_recorded: matches!(observation.evidence.owner, Ok(Some(_))),
+                },
+                id,
+            ));
             cancel_check(&observation.judgments.cancel, id, checks);
             let origin = observation.observe_origin(reader, Some(deadline), environment);
             origin.add_fields(observations);
@@ -424,6 +485,9 @@ pub(super) fn record_checks(
             };
             checks.push(Check::new(CheckId::SESSION_RECORDS, Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
             unknown_session_checks(id, reason, checks);
+            checks.push(Check::new(CheckId::LAUNCH_STAGE, Availability::Unknown, reason,
+                "No consistent session snapshot was available, so the launch host record was not judged.",
+                format!("{PUBLIC_COMMAND} inspect {id} --timeline")));
             let PartialObservation {
                 manifest,
                 evidence,
@@ -904,6 +968,7 @@ mod attestation_tests {
             resumed_from: Ok(None),
             workspace_consent: consent::SessionConsentObservation::default(),
             judgments,
+            launch_host: crate::native::session::launch::host::HostObservation::NotRecorded,
         }
     }
 

@@ -595,6 +595,7 @@ fn assert_core_record_contract(extension: &str) {
             CoreRecord::Events => false,
             CoreRecord::Requests => false,
             CoreRecord::Launch => false,
+            CoreRecord::LaunchHost => false,
         }
     }
     let records = [
@@ -620,6 +621,7 @@ fn assert_core_record_contract(extension: &str) {
         CoreRecord::Events,
         CoreRecord::Requests,
         CoreRecord::Launch,
+        CoreRecord::LaunchHost,
     ];
     for record in records {
         assert_eq!(

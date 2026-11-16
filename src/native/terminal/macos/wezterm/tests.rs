@@ -10,9 +10,15 @@ fn launch_context_does_not_depend_on_terminal_environment() {
     let directory = Path::new("/custom state/session-e1");
     let wrapper = crate::native::process_env::tests::wrapper_for(directory);
     let program = host_pane_program(&wrapper, directory).unwrap();
-    assert_eq!(&program[..4], ["/bin/zsh", "-l", "-i", "-c"]);
-    assert!(program[4].contains("native-wezterm-host '/custom state/session-e1'"));
-    assert!(program[4].ends_with(&wrapper));
+    assert_eq!(
+        &program[1..],
+        [
+            HOST_COMMAND,
+            directory.to_str().unwrap(),
+            "--launch-command",
+            &wrapper
+        ]
+    );
     let command = gui_command(std::iter::empty(), &program);
     crate::native::process_env::tests::assert_helper_environment(&command, &[]);
     assert_eq!(
@@ -1433,16 +1439,7 @@ fn the_launch_command_is_never_typed_into_the_pane() {
         // It is the program of the pane, behind the gate of exactly this session.
         assert_eq!(
             started(&host),
-            [
-                "/bin/zsh",
-                "-l",
-                "-i",
-                "-c",
-                &format!(
-                    "{} || exit; . '/tmp/s/launch.sh'",
-                    gate(Path::new("/tmp/s"))
-                )
-            ]
+            host_pane_program(". '/tmp/s/launch.sh'", Path::new("/tmp/s")).unwrap()
         );
         let mux = host.0.borrow();
         assert_eq!(mux.started, usize::from(force_new_window));
@@ -1458,12 +1455,12 @@ fn the_gate_of_the_pane_is_a_command_that_the_executable_routes_here() {
     let gate = gate(Path::new("/s/session-a1"));
     assert!(gate.ends_with(" native-wezterm-host '/s/session-a1'"));
     let program = host_pane_program("wrapper", Path::new("/s/session-a1")).unwrap();
-    assert_eq!(&program[..4], ["/bin/zsh", "-l", "-i", "-c"]);
-    let invocation = program[4].split_once(" || exit; ").unwrap().0;
-    let args = super::super::test_support::host_argv(invocation);
-    assert_eq!(args, [HOST_COMMAND, "/s/session-a1"]);
+    assert_eq!(
+        &program[1..],
+        [HOST_COMMAND, "/s/session-a1", "--launch-command", "wrapper"]
+    );
     assert!(
-        matches!(parse_args(args).unwrap(), NativeCommand::Host(crate::native::terminal::host::HostCommand::WezTerm { directory }) if directory == Path::new("/s/session-a1"))
+        matches!(parse_args(program[1..].iter().cloned()).unwrap(), NativeCommand::Host(crate::native::terminal::host::HostCommand::WezTermLaunch { directory, command }) if directory == Path::new("/s/session-a1") && command == "wrapper")
     );
 
     assert!(is_command("native-wezterm-host"));
@@ -1539,7 +1536,7 @@ fn pane_probe() {
 // and the provider never started. Replayed on a private pty with what the adapter sent;
 // no terminal application and no key of the machine is involved.
 #[test]
-fn keys_typed_while_the_pane_starts_cannot_change_the_launch_command() {
+fn legacy_keys_typed_while_the_pane_starts_cannot_change_the_launch_command() {
     for cancelled in [false, true] {
         replay_on_a_private_pty(cancelled);
     }
@@ -1560,9 +1557,13 @@ fn replay_on_a_private_pty(cancelled: bool) {
         None,
         "the launch command went through the input of the pane"
     );
-    let mut program = started(&host);
-    assert!(program[4].starts_with(&gate(directory)), "{program:?}");
-    program[4] = program[4].replacen(&gate(directory), &probe("host", directory), 1);
+    assert_eq!(
+        started(&host),
+        host_pane_program(&command, directory).unwrap()
+    );
+    // Retain the directory-only host compatibility fixture. The new production
+    // bootstrap and input flush run through the real binary in launch_host/tests.rs.
+    let program = pane_program(&probe("host", directory), &command);
 
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(
@@ -1590,6 +1591,7 @@ fn replay_on_a_private_pty(cancelled: bool) {
         .env("WEZTERM_PANE", &session.id)
         .env("WEZTERM_UNIX_SOCKET", SOCKET)
         // No startup file of the user.
+        .env("HOME", directory)
         .env("ZDOTDIR", directory)
         .stdin(slave.try_clone().unwrap())
         .stdout(slave.try_clone().unwrap())

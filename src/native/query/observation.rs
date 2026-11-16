@@ -286,6 +286,9 @@ pub(in crate::native) struct Observation {
     pub(in crate::native) judgments: Judgments,
     /// The Origin as this Snapshot's launch record and initial receipt name it.
     pub(in crate::native) origin: origin::OriginReference,
+    /// The launch host record attributed to this Snapshot's launch receipt (#376), read
+    /// under the retained lock.
+    pub(in crate::native) launch_host: launch::host::HostObservation,
 }
 
 /// A Result reference rendered by the same builder as `result`, without its body.
@@ -357,6 +360,7 @@ impl Observation {
             active_state,
             session_id_of(reader),
         );
+        let launch_host = launch::host::observe(reader, records.launch.as_ref());
         Self {
             origin,
             cancel,
@@ -365,6 +369,7 @@ impl Observation {
             resumed_from,
             workspace_consent: consent::observe(reader.directory()),
             judgments,
+            launch_host,
         }
     }
 

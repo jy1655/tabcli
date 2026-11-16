@@ -456,6 +456,7 @@ pub(in crate::native) enum CoreRecord {
     Events,
     Requests,
     Launch,
+    LaunchHost,
 }
 impl CoreRecord {
     pub(in crate::native) fn name(self) -> &'static str {
@@ -482,6 +483,7 @@ impl CoreRecord {
             Self::Events => EVENTS_DIRECTORY,
             Self::Requests => REQUESTS_DIRECTORY,
             Self::Launch => LAUNCH_FILE,
+            Self::LaunchHost => "launch-host.json",
         }
     }
 }

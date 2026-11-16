@@ -22,6 +22,7 @@ fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
         CoreRecord::TurnClaim.name(),
         CoreRecord::Completion.name(),
         CoreRecord::Launch.name(),
+        CoreRecord::LaunchHost.name(),
         launch::LOG,
         CoreRecord::Closed.name(),
         CoreRecord::TerminalClosing.name(),
@@ -525,6 +526,73 @@ fn request_index_entry(id: &str, snapshot: &Snapshot, state: &str) -> Value {
     )
 }
 
+/// #376: the launch host record, judged by the launcher's own reader against this
+/// Snapshot's launch receipt. Absence adds nothing: it is not evidence about the host.
+/// A present record that is rejected (unreadable, malformed, oversized, of another schema
+/// or another launch) makes the timeline incomplete.
+fn render_launch_host(
+    before: &Records,
+    snapshot: &Snapshot,
+    id: &str,
+    request: Option<&str>,
+    entries: &mut Vec<Value>,
+    session_entries: &mut Vec<Value>,
+    incomplete: &mut bool,
+) {
+    use launch::host::HostObservation;
+    let source = CoreRecord::LaunchHost.name();
+    let Some(bytes) = before.get(source) else {
+        return;
+    };
+    let (time, state, detail) =
+        match launch::host::judge(bytes.clone(), snapshot.launch.as_ref(), id) {
+            HostObservation::NotRecorded => return,
+            HostObservation::Recorded(host) => (
+                Some(host.updated_unix_ms),
+                "observed",
+                json!({"terminal": host.terminal, "stage": host.stage, "failure": host.failure,
+                    "elapsed_ms": host.elapsed_ms, "capture_budget_ms": host.capture_budget_ms,
+                    "capture_elapsed_ms": host.capture_elapsed_ms, "variables": host.variables,
+                    "background_children_stopped": host.background_children_stopped}),
+            ),
+            HostObservation::Unreadable(error) => (None, "unreadable", json!(error)),
+            HostObservation::SchemaUnsupported(schema) => (
+                None,
+                "unreadable",
+                json!(format!("unsupported schema {schema}")),
+            ),
+            HostObservation::IdentityMismatch => (
+                None,
+                "unreadable",
+                json!("the record does not name this session's launch receipt"),
+            ),
+        };
+    let receipt = snapshot.launch.as_ref().and_then(|launch| {
+        snapshot
+            .receipts
+            .iter()
+            .find(|r| r.claim_token == launch.claim_token)
+    });
+    *incomplete |= state == "unreadable";
+    let e = entry(
+        id,
+        receipt,
+        receipt.map(|r| r.event_file.as_str()),
+        Entry {
+            stage: "launch_host",
+            time,
+            source,
+            state,
+            detail,
+        },
+    );
+    match receipt {
+        Some(receipt) if request.is_none_or(|id| receipt.request_id == id) => entries.push(e),
+        Some(_) => {}
+        None => session_entries.push(e),
+    }
+}
+
 fn render_lifecycle(
     before: &Records,
     snapshot: &Snapshot,
@@ -789,6 +857,15 @@ pub(in crate::native) fn timeline_value(
         request,
         &mut entries,
         &mut session_entries,
+    );
+    render_launch_host(
+        &before,
+        &snapshot,
+        id,
+        request,
+        &mut entries,
+        &mut session_entries,
+        &mut incomplete,
     );
     render_close_and_log(&before, id, &mut session_entries, &mut incomplete)?;
     if before != records(reader, request)? {

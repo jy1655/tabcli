@@ -217,3 +217,23 @@ pub(super) fn seed_event_written_completion_with(
     write_json_atomic(&event_path, &event).unwrap();
     (request_id, event_path)
 }
+
+/// The package's `tabcli` binary that `cargo test --all-targets` builds. The unit-test
+/// binary sits under `target/<profile>/deps` before Cargo 1.100 and under
+/// `target/<profile>/build/<package>/<hash>/out` from Cargo 1.100's build-dir layout, while
+/// the package binary stays in `target/<profile>`; search upward instead of assuming a depth.
+pub(in crate::native) fn package_binary() -> std::path::PathBuf {
+    let current = std::env::current_exe().unwrap();
+    let name = format!("tabcli{}", std::env::consts::EXE_SUFFIX);
+    current
+        .ancestors()
+        .skip(1)
+        .map(|directory| directory.join(&name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "no {name} above {}: run cargo test --all-targets to build the package binary",
+                current.display()
+            )
+        })
+}

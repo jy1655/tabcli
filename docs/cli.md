@@ -1271,6 +1271,29 @@ Session reports append a `hold` check after the other record checks: `available`
 names `hold SESSION --release` only when it is known not to be closed; a closed session retains
 its hold as a record and cannot release it.
 
+Session reports add a `launch_stage` check for an iTerm2 or WezTerm launch. It reads the
+launch-owned host record (`launch-host.json`) of the session's launch receipt and reports the
+last stage that record holds: `awaiting_host`, `host_started`, `environment_preparing`,
+`environment_ready` or `launch_shell_starting`, and, when the host failed, its reason (for
+example `capture_timeout` when the shell startup files did not finish in time; see
+[terminals](terminals.md#shell-startup-files-iterm2-and-wezterm)). Reasons:
+`launch_stage_observed`, `launch_host_failed`, `launch_host_not_recorded` (no record: a session
+from an earlier release, another terminal, or a launch that did not reach surface creation;
+absence is not evidence that the host never started), `launch_host_identity_mismatch`,
+`launch_host_record_unreadable`, `launch_host_schema_unsupported` and
+`launch_stage_not_applicable`. Owner and provider records can show that the launch went further.
+
+With `--probe`, on macOS for iTerm2 or WezTerm, a `shell_environment` check runs the shell
+environment preparation of a launch once, in the caller's current environment, within the
+remaining shared probe budget. It reports the outcome (`shell_environment_ready`,
+`shell_environment_failed`, `shell_environment_probe_budget_exhausted`), elapsed and budget
+milliseconds, the variable count, stopped background processes and a numeric exit status or
+signal; never the startup files' output or any environment value. It is not a reconstruction
+of the terminal's own environment. Without `--probe` it is `shell_environment_probe_not_requested`;
+on another platform or terminal `shell_environment_probe_not_applicable`; when the terminal
+cannot be determined `shell_environment_probe_context_unavailable`. The probe runs your
+startup files, which can have side effects.
+
 Session reports add an `origin` check, and `observations` gains `origin` and
 `origin_observation` (see [origin observation](#origin-observation)). The check is `available` /
 `origin_external` for an initial request from outside Bridge, `available` / `origin_live` when the

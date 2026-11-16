@@ -31,11 +31,31 @@ pub(crate) enum HostCommand {
     Iterm2 { directory: PathBuf },
     AppleTerminal { directory: PathBuf },
     WezTerm { directory: PathBuf },
+    Iterm2Launch { directory: PathBuf, command: String },
+    WezTermLaunch { directory: PathBuf, command: String },
     Ghostty,
     Warp { directory: PathBuf, attempt: String },
 }
 
 pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCommand> {
+    if matches!(
+        kind_of(command),
+        Some(TerminalKind::Iterm2 | TerminalKind::WezTerm)
+    ) && let [_, flag, launch_command] = rest
+        && flag == "--launch-command"
+    {
+        return match parse_directory_host(command, kind_of(command), &rest[..1])? {
+            HostCommand::Iterm2 { directory } => Ok(HostCommand::Iterm2Launch {
+                directory,
+                command: launch_command.clone(),
+            }),
+            HostCommand::WezTerm { directory } => Ok(HostCommand::WezTermLaunch {
+                directory,
+                command: launch_command.clone(),
+            }),
+            _ => unreachable!(),
+        };
+    }
     match kind_of(command) {
         Some(TerminalKind::Ghostty) => parse_ghostty_host(rest),
         Some(TerminalKind::Warp) => parse_warp_host(rest),
@@ -106,6 +126,12 @@ fn parse_warp_host(rest: &[String]) -> Result<HostCommand> {
 
 pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
     match command {
+        HostCommand::Iterm2Launch { directory, command } => {
+            run_launch_host(directory, command, TerminalKind::Iterm2)
+        }
+        HostCommand::WezTermLaunch { directory, command } => {
+            run_launch_host(directory, command, TerminalKind::WezTerm)
+        }
         HostCommand::Console { directory } => {
             #[cfg(target_os = "windows")]
             {
@@ -183,10 +209,73 @@ pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
     }
 }
 
+fn run_launch_host(directory: PathBuf, command: String, kind: TerminalKind) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::launch_host::run(&directory, &command, kind)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (directory, command, kind);
+        bail!("native launch hosts are only available on macOS")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native::{parse_args, run};
+
+    #[test]
+    fn command_hosts_accept_exact_new_and_legacy_forms() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-args");
+        let directory = directory.to_str().unwrap();
+        for command in [ITERM2_HOST_COMMAND, WEZTERM_HOST_COMMAND] {
+            let legacy = parse(command, &[directory.into()]).unwrap();
+            assert!(matches!(
+                legacy,
+                HostCommand::Iterm2 { .. } | HostCommand::WezTerm { .. }
+            ));
+            let parsed = parse(
+                command,
+                &[
+                    directory.into(),
+                    "--launch-command".into(),
+                    ". 'quoted $$ script'".into(),
+                ],
+            )
+            .unwrap();
+            match parsed {
+                HostCommand::Iterm2Launch { command, .. }
+                | HostCommand::WezTermLaunch { command, .. } => {
+                    assert_eq!(command, ". 'quoted $$ script'")
+                }
+                _ => panic!("lost launch command"),
+            }
+            for rest in [
+                vec![directory.into(), "--launch-command".into()],
+                vec![directory.into(), "--other".into(), "script".into()],
+                vec![
+                    directory.into(),
+                    "--launch-command".into(),
+                    "script".into(),
+                    "extra".into(),
+                ],
+            ] {
+                assert!(parse(command, &rest).is_err());
+            }
+        }
+        for command in [APPLE_TERMINAL_HOST_COMMAND, CONSOLE_HOST_COMMAND] {
+            assert!(
+                parse(
+                    command,
+                    &[directory.into(), "--launch-command".into(), "script".into()]
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn unsupported_hosts_refuse_before_reading_the_directory() {

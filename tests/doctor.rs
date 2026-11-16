@@ -83,6 +83,8 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
+            // A probe that applies runs zsh startup files; never the developer's own.
+            .env("ZDOTDIR", self.root.path())
             .output()
             .unwrap()
     }
@@ -91,7 +93,8 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
         command
             .args(args)
-            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path());
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
+            .env("ZDOTDIR", self.root.path());
         for (key, value) in env {
             match value {
                 Some(value) => command.env(key, value),
@@ -305,7 +308,7 @@ fn partial_record_diagnostics_keep_independent_evidence_and_check_order() {
         assert_eq!(
             rows.iter()
                 .skip(1)
-                .take(9)
+                .take(10)
                 .map(|row| row["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
@@ -313,6 +316,7 @@ fn partial_record_diagnostics_keep_independent_evidence_and_check_order() {
                 "session_state",
                 "turn",
                 "completion",
+                "launch_stage",
                 "cancel",
                 "origin",
                 "owner",
@@ -602,6 +606,7 @@ printf '2.1.302\n'
     let mut child = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["doctor", "session-doctor", "--probe", "--json"])
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
+        .env("ZDOTDIR", fixture.root.path())
         .env("AB_DOCTOR_TEST_DIR", fixture.root.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1241,6 +1246,7 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             "session_state",
             "turn",
             "completion",
+            "launch_stage",
             "cancel",
             "origin",
             "owner",
@@ -1251,7 +1257,8 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             "workspace",
             "workspace_consent",
             "pi_follow_up",
-            "pi_provider_credentials"
+            "pi_provider_credentials",
+            "shell_environment"
         ]
     );
     let human = fixture.run(&["doctor", "session-doctor"]);
@@ -1341,6 +1348,7 @@ fn scope_reports_resolved_path_and_only_successful_current_version() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
         command
             .args(["doctor", "--provider", "pi", "--json"])
+            .env("ZDOTDIR", fixture.root.path())
             .env("PATH", fixture.root.path())
             .env(
                 "AGENT_BRIDGE_NATIVE_STATE_DIR",
@@ -1788,6 +1796,7 @@ fn provider_executable_rows_keep_each_path_resolution_outcome() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
         command
             .args(["doctor", "--provider", "pi", "--probe", "--json"])
+            .env("ZDOTDIR", root.path())
             .env(
                 "AGENT_BRIDGE_NATIVE_STATE_DIR",
                 root.path().join("absent-store"),
@@ -2047,4 +2056,147 @@ fn workspace_rows_keep_each_directory_outcome() {
         assert_eq!(value["scope"]["workspace"], json!(workspace));
         assert_eq!(entries(fixture.root.path()), before);
     }
+}
+
+// #376: a launch whose shell startup files never finished names that stage in doctor and in
+// the timeline, from the launch-owned host record, without writing anything.
+#[test]
+fn a_failed_launch_host_names_its_stage_in_doctor_and_the_timeline() {
+    let fixture = Fixture::new("codex");
+    write(
+        &fixture.directory.join("launch.json"),
+        &json!({"schema": 1, "claim_token": "123-456-0", "deadline_unix_ms": 1_000_000u64,
+            "phase": "pending"}),
+    );
+    write(
+        &fixture.directory.join("status.json"),
+        &status(
+            "failed",
+            3,
+            Some("terminal shell environment could not be prepared"),
+        ),
+    );
+    let host = json!({
+        "schema": 1, "managed_session_id": "session-doctor", "claim_token": "123-456-0",
+        "terminal": "iterm2", "stage": "environment_preparing",
+        "host": {"pid": 4242, "start_seconds": 1_700_000_000u64, "start_microseconds": 5},
+        "updated_unix_ms": 900_000u64, "elapsed_ms": 10_400, "capture_budget_ms": 10_000,
+        "capture_elapsed_ms": 10_010, "variables": null, "background_children_stopped": null,
+        "failure": {"reason": "capture_timeout", "exit_code": null, "signal": null}
+    });
+    write(&fixture.directory.join("launch-host.json"), &host);
+    let before = entries(fixture.root.path());
+
+    let value = fixture.doctor();
+    let row = check(&value, "launch_stage");
+    assert_eq!(row["availability"], "unavailable", "{row}");
+    assert_eq!(row["reason_code"], "launch_host_failed");
+    let detail = row["detail"].as_str().unwrap();
+    assert!(detail.contains("environment_preparing"), "{detail}");
+    assert!(detail.contains("capture_timeout"), "{detail}");
+    assert_eq!(row["evidence"]["record"]["terminal"], "iterm2");
+    assert_eq!(
+        check(&value, "shell_environment")["reason_code"],
+        "shell_environment_probe_not_requested"
+    );
+
+    // With --probe the recorded terminal decides; the fixture ZDOTDIR has no startup files.
+    let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+    let row = check(&value, "shell_environment");
+    if cfg!(target_os = "macos") {
+        assert!(
+            [
+                "shell_environment_ready",
+                "shell_environment_probe_budget_exhausted"
+            ]
+            .contains(&row["reason_code"].as_str().unwrap()),
+            "{row}"
+        );
+        assert_eq!(row["evidence"]["source"], "current_caller");
+        assert_eq!(row["evidence"]["terminal"], "iterm2");
+    } else {
+        assert_eq!(row["reason_code"], "shell_environment_probe_not_applicable");
+    }
+
+    // Another claim's record says nothing about this launch.
+    let mut other = host.clone();
+    other["claim_token"] = json!("999-999-0");
+    write(&fixture.directory.join("launch-host.json"), &other);
+    assert_eq!(
+        check(&fixture.doctor(), "launch_stage")["reason_code"],
+        "launch_host_identity_mismatch"
+    );
+    write(&fixture.directory.join("launch-host.json"), &host);
+
+    let timeline = report(fixture.run(&["inspect", "session-doctor", "--timeline", "--json"]));
+    let entry = timeline.to_string().contains(r#""stage":"launch_host""#);
+    assert!(entry, "{timeline}");
+    let text = timeline.to_string();
+    assert!(text.contains(r#""capture_timeout""#), "{text}");
+    assert!(text.contains(r#""environment_preparing""#), "{text}");
+
+    assert_eq!(entries(fixture.root.path()), before);
+}
+
+// A present launch host record that the timeline rejects makes it incomplete; a valid one
+// does not change completeness.
+#[test]
+fn a_rejected_launch_host_record_makes_the_timeline_incomplete() {
+    let fixture = Fixture::new("codex");
+    write(
+        &fixture.directory.join("launch.json"),
+        &json!({"schema": 1, "claim_token": "123-456-0", "deadline_unix_ms": 1_000_000u64,
+            "phase": "pending"}),
+    );
+    let timeline = || report(fixture.run(&["inspect", "session-doctor", "--timeline", "--json"]));
+    let baseline = timeline()["incomplete"].clone();
+    let host = json!({
+        "schema": 1, "managed_session_id": "session-doctor", "claim_token": "123-456-0",
+        "terminal": "wezterm", "stage": "launch_shell_starting",
+        "host": {"pid": 4242, "start_seconds": 1_700_000_000u64, "start_microseconds": 5},
+        "updated_unix_ms": 900_000u64, "elapsed_ms": 1_600, "capture_budget_ms": 10_000,
+        "capture_elapsed_ms": 1_540, "variables": 46, "background_children_stopped": 0,
+        "failure": null
+    });
+    let path = fixture.directory.join("launch-host.json");
+    write(&path, &host);
+    assert_eq!(timeline()["incomplete"], baseline);
+    let mut other_schema = host.clone();
+    other_schema["schema"] = json!(2);
+    let mut other_claim = host.clone();
+    other_claim["claim_token"] = json!("999-999-0");
+    for (case, bytes) in [
+        ("malformed", b"{".to_vec()),
+        ("schema 2", serde_json::to_vec(&other_schema).unwrap()),
+        ("another launch", serde_json::to_vec(&other_claim).unwrap()),
+        ("oversized", vec![b' '; 16 * 1024 + 1]),
+    ] {
+        fs::write(&path, bytes).unwrap();
+        let value = timeline();
+        assert_eq!(value["incomplete"], true, "{case}: {value}");
+        assert!(
+            value.to_string().contains(r#""stage":"launch_host""#),
+            "{case}: {value}"
+        );
+    }
+}
+
+// A closed session keeps its terminal kind in the close tombstone; doctor uses it to decide
+// that the host record and the probe do not apply to that terminal.
+#[test]
+fn a_closed_session_s_tombstone_names_its_terminal_for_doctor() {
+    let fixture = Fixture::new("codex");
+    write(
+        &fixture.directory.join("terminal.closed.json"),
+        &json!({"consumed": true, "terminal": "ghostty"}),
+    );
+    let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+    assert_eq!(
+        check(&value, "launch_stage")["reason_code"],
+        "launch_stage_not_applicable"
+    );
+    assert_eq!(
+        check(&value, "shell_environment")["reason_code"],
+        "shell_environment_probe_not_applicable"
+    );
 }

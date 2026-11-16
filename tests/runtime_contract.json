@@ -394,7 +394,7 @@
   "src/native/terminal/macos/iterm2.rs": {
     "AB_SCREEN_BEGIN": 1,
     "AB_SCREEN_END": 1,
-    "{HOST_COMMAND}": 1,
+    "HOST_COMMAND,": 1,
     "const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;": 1
   },
   "src/native/terminal/macos/ownership.rs": {
@@ -426,7 +426,7 @@
     "gui-sock-": 3,
     "/dev/ttys": 1,
     "WEZTERM_": 6,
-    "{HOST_COMMAND}": 1,
+    "HOST_COMMAND.into(),": 1,
     "const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;": 1
   },
   "src/native/terminal/windows/budget.rs": {

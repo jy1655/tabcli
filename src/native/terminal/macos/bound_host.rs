@@ -370,24 +370,18 @@ mod tests {
             .find(|(host, _)| *host == name)
             .unwrap()
             .1;
-        let before = fs::read(directory.join(crate::native::session::launch::LOG)).ok();
         let error = format!("{:#}", run(&directory).unwrap_err());
         assert_eq!(error, expected, "{mode}");
-        if is_iterm {
-            assert_eq!(
-                fs::read(directory.join(crate::native::session::launch::LOG)).ok(),
-                before
-            );
+        let prefix = if is_terminal {
+            "terminal_host_"
+        } else if is_iterm {
+            "iterm2_host_"
         } else {
-            let prefix = if is_terminal {
-                "terminal_host_"
-            } else {
-                "wezterm_host_"
-            };
-            assert_eq!(
-                test_support::host_log_messages(&directory, prefix),
-                [format!("{prefix}refused: {expected}\n")]
-            );
-        }
+            "wezterm_host_"
+        };
+        assert_eq!(
+            test_support::host_log_messages(&directory, prefix),
+            [format!("{prefix}refused: {expected}\n")]
+        );
     }
 }

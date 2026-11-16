@@ -57,6 +57,7 @@ fn in_memory(records: Snapshot) -> StatusObservation {
             resumed_from: Ok(None),
             workspace_consent: consent::SessionConsentObservation::default(),
             judgments,
+            launch_host: crate::native::session::launch::host::HostObservation::NotRecorded,
         },
         active: None,
         latest: Ok(None),
