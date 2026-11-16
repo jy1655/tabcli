@@ -267,7 +267,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the binding observation, whether the host keeps waiting, refuses or hands off.
   `terminal/macos/shell_environment.rs` owns that preparation: the zsh login and interactive
   startup run once without a terminal under a supervisor that owns its cleanup, bounded by the
-  launch receipt, returning counts and the environment, never startup output.
+  launch receipt, returning counts and the environment, never startup output. The capture
+  decides its budget when it starts and returns it with either outcome; the host records that
+  enforced budget with the next stage or the capture's failure, and doctor's probe reports it.
+  The launch receipt converts its deadline to the monotonic clock once
+  (`launch::Record::monotonic_deadline`, saturating) for the host, the binding wait and the
+  wrapper's re-check, which keep their own cap and grace.
   Ghostty's frame host lives in `terminal/macos/ghostty/host.rs`. It proves the bound PTY, carries
   the session directory only after binding, and discards startup input. Ghostty 1.4.0 adds a
   scripted `tty` property, which this adapter does not yet consume; replacing the frame must
@@ -280,7 +285,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   authority remain adapter-owned. Tests inject recording or script-executing Automation
   implementations through the dispatch they build. The Windows submit budget and the macOS
   terminal selection live in portable children of their platform modules (`windows/budget.rs`,
-  `macos/selection.rs`), compiled and tested on every target.
+  `macos/selection.rs`), compiled and tested on every target, and so does the capture's budget
+  rule (`macos/shell_environment/budget.rs`: what the deadline leaves after the handoff and
+  cleanup reserves, at most 10 s), whose limit doctor reads on every platform.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, reopen-marker and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, time
@@ -494,7 +501,7 @@ before deciding that the operation never happened.
 | `native-session.json` | Recorded owner identity used for attestation |
 | `provider-process.json` | Spawned provider identity, including refused-reopen checks |
 | `launch.json` | Launch claim, deadline, and spawn phase |
-| `launch-host.json` | macOS iTerm2/WezTerm launch host for the launch receipt's Claim: admitted incarnation, forward-only stage, capture counts, and final failure |
+| `launch-host.json` | macOS iTerm2/WezTerm launch host for the launch receipt's Claim: admitted incarnation, forward-only stage, capture counts, and final failure. `capture_budget_ms` is the host's estimate while `environment_preparing` (made before the capture starts) and the budget the capture enforced from `environment_ready` on and in a capture's failure |
 | `turn.claim` | Current exclusive right to deliver a turn |
 | `turn.claim.lock` | Synchronizes claim, completion, exit, and close transitions |
 | `status.lock` | Synchronizes status updates |

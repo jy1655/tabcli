@@ -103,7 +103,7 @@ pub(in crate::native) fn provision_with(
     let deadline = super::read(&Reader::open_unchecked(directory))
         .ok()
         .flatten()
-        .and_then(|record| record.recheck_bound());
+        .map(|record| record.recheck_bound());
     check(provider, &manifest.provider_path, deadline)?;
     let prompt_path = Reader::open_unchecked(directory)
         .record(CoreRecord::InitialPrompt)

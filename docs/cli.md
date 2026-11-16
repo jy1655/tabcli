@@ -1294,8 +1294,8 @@ absence is not evidence that the host never started), `launch_host_identity_mism
 With `--probe`, on macOS for iTerm2 or WezTerm, a `shell_environment` check runs the shell
 environment preparation of a launch once, in the caller's current environment, within the
 remaining shared probe budget. It reports the outcome (`shell_environment_ready`,
-`shell_environment_failed`, `shell_environment_probe_budget_exhausted`), elapsed and budget
-milliseconds, the variable count, stopped background processes and a numeric exit status or
+`shell_environment_failed`, `shell_environment_probe_budget_exhausted`), elapsed milliseconds,
+the budget in milliseconds that the preparation enforced, the variable count, stopped background processes and a numeric exit status or
 signal; never the startup files' output or any environment value. It is not a reconstruction
 of the terminal's own environment. Without `--probe` it is `shell_environment_probe_not_requested`;
 on another platform or terminal `shell_environment_probe_not_applicable`; when the terminal

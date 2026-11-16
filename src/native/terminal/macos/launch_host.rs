@@ -8,7 +8,7 @@ use super::shell_environment::{self, CaptureFailure, Captured};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::Store;
 use crate::native::session::launch::{self, host};
-use crate::native::session::primitives::unix_ms;
+use crate::native::terminal::shell_environment_budget::capture_budget;
 use crate::native::terminal::{TerminalKind, TerminalSession};
 use anyhow::{Context, Result, bail};
 use std::{
@@ -45,13 +45,7 @@ pub(in crate::native::terminal) fn run(
         let start = clock.now();
         let receipt = launch::read(&store)?.context("missing host launch receipt")?;
         let token = &receipt.claim_token;
-        let remaining = Duration::from_millis(
-            receipt
-                .deadline_unix_ms
-                .saturating_sub(unix_ms())
-                .min(u64::MAX as u128) as u64,
-        );
-        let deadline = start + remaining;
+        let deadline = receipt.monotonic_deadline(start, Duration::ZERO);
         let identity = super::process::live_native_process_identity(std::process::id())
             .ok()
             .and_then(|i| {
@@ -92,13 +86,10 @@ pub(in crate::native::terminal) fn run(
             bail!("{name} launch host admission refused");
         }
         launch::log(&store, &format!("{prefix}_host_started"));
-        let budget = deadline
-            .saturating_duration_since(clock.now())
-            .saturating_sub(
-                shell_environment::HANDOFF_RESERVE.saturating_add(shell_environment::CLEANUP),
-            )
-            .min(Duration::from_secs(10));
-        let budget_ms = budget.as_millis() as u64;
+        // The host's estimate, which the preparing record and the launch log carry. The capture
+        // decides the budget it enforces when it starts, a little later, and the next record
+        // carries that one.
+        let budget_ms = capture_budget(clock.now(), deadline).as_millis() as u64;
         host::advance(
             &store,
             token,
@@ -130,6 +121,7 @@ pub(in crate::native::terminal) fn run(
                         exit_code: None,
                         signal: None,
                         capture_elapsed: Some(Duration::ZERO),
+                        capture_budget: None,
                     },
                     clock.now(),
                 )
@@ -146,7 +138,7 @@ pub(in crate::native::terminal) fn run(
                 session_id,
                 kind,
             },
-            &mut |captured, now| recorder.ready(identity, budget_ms, captured, now),
+            &mut |captured, now| recorder.ready(identity, captured, now),
         )?
         .map_err(|refusal| recorder.refuse(refusal, clock.now()))?;
         let flushed = {
@@ -165,7 +157,7 @@ pub(in crate::native::terminal) fn run(
             token,
             identity,
             host::Stage::LaunchShellStarting,
-            progress(recorder.elapsed(clock.now()), budget_ms, &captured),
+            progress(recorder.elapsed(clock.now()), &captured),
         )?;
         launch::log(&store, &format!("{prefix}_host_launch_shell"));
         let error = {
@@ -204,10 +196,10 @@ pub(in crate::native::terminal) fn run(
     })
 }
 
-fn progress(elapsed: Duration, budget: u64, capture: &Captured) -> host::Progress {
+fn progress(elapsed: Duration, capture: &Captured) -> host::Progress {
     host::Progress {
         elapsed_ms: elapsed.as_millis() as u64,
-        capture_budget_ms: budget,
+        capture_budget_ms: capture.budget.as_millis() as u64,
         capture_elapsed_ms: Some(capture.elapsed.as_millis() as u64),
         variables: Some(capture.variables.len() as u32),
         background_children_stopped: Some(capture.background_children_stopped),
@@ -222,6 +214,8 @@ struct Refusal {
     signal: Option<i32>,
     /// How long the capture ran when the capture ends the launch; the launch log names it then.
     capture_elapsed: Option<Duration>,
+    /// The budget the capture enforced, when it answered with its failure.
+    capture_budget: Option<Duration>,
 }
 
 impl Refusal {
@@ -232,6 +226,7 @@ impl Refusal {
             exit_code: None,
             signal: None,
             capture_elapsed: None,
+            capture_budget: None,
         }
     }
 }
@@ -260,6 +255,7 @@ impl Recorder<'_> {
             exit_code,
             signal,
             capture_elapsed,
+            capture_budget,
         } = refusal;
         let elapsed = self.elapsed(now).as_millis() as u64;
         let _ = host::fail(
@@ -273,6 +269,7 @@ impl Recorder<'_> {
             },
             elapsed,
             capture_elapsed.map(|d| d.as_millis() as u64),
+            capture_budget.map(|d| d.as_millis() as u64),
         );
         if let Some(elapsed) = capture_elapsed {
             launch::log(
@@ -299,21 +296,15 @@ impl Recorder<'_> {
         )
     }
 
-    /// Records the prepared environment: the next stage, then the launch log line. A failed
-    /// record write ends the host without a failure record.
-    fn ready(
-        &self,
-        identity: host::HostIdentity,
-        budget_ms: u64,
-        captured: &Captured,
-        now: Instant,
-    ) -> Result<()> {
+    /// Records the prepared environment, with the budget the capture enforced: the next stage,
+    /// then the launch log line. A failed record write ends the host without a failure record.
+    fn ready(&self, identity: host::HostIdentity, captured: &Captured, now: Instant) -> Result<()> {
         host::advance(
             self.store,
             self.token,
             identity,
             host::Stage::EnvironmentReady,
-            progress(self.elapsed(now), budget_ms, captured),
+            progress(self.elapsed(now), captured),
         )?;
         launch::log(
             self.store,
@@ -457,6 +448,7 @@ fn await_handoff(
                         exit_code: failure.exit_code,
                         signal: failure.signal,
                         capture_elapsed: Some(failure.elapsed),
+                        capture_budget: Some(failure.budget),
                     }));
                 }
                 CapturePoll::Gone => {
@@ -465,6 +457,7 @@ fn await_handoff(
                         exit_code: None,
                         signal: None,
                         capture_elapsed: Some(clock.now().saturating_duration_since(start)),
+                        capture_budget: None,
                     }));
                 }
             }

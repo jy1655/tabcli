@@ -89,16 +89,44 @@ pub(in crate::native) struct Record {
 const RECHECK_GRACE: Duration = Duration::from_secs(2);
 
 impl Record {
-    // The wrapper's re-check bound on the monotonic clock: the recorded deadline plus the
-    // grace, converted once. A bound already past is now; one the monotonic clock cannot
-    // represent is none.
-    fn recheck_bound(&self) -> Option<Instant> {
+    /// The time `after` the recorded deadline, on the monotonic clock that reads `now` when the
+    /// wall clock is read here: as far past `now` as that time is ahead of the wall clock, and
+    /// `now` once it has passed. It saturates: a time more than `u64::MAX` milliseconds ahead
+    /// counts as that many, and one the monotonic clock cannot represent is the furthest
+    /// instant it can. Each caller keeps its own cap and grace.
+    pub(in crate::native) fn monotonic_deadline(&self, now: Instant, after: Duration) -> Instant {
         let remaining = self
             .deadline_unix_ms
-            .saturating_add(RECHECK_GRACE.as_millis())
+            .saturating_add(after.as_millis())
             .saturating_sub(unix_ms());
-        Instant::now().checked_add(Duration::from_millis(u64::try_from(remaining).ok()?))
+        saturating_add(
+            now,
+            Duration::from_millis(u64::try_from(remaining).unwrap_or(u64::MAX)),
+        )
     }
+
+    // The wrapper's re-check bound: the recorded deadline plus the grace.
+    fn recheck_bound(&self) -> Instant {
+        self.monotonic_deadline(Instant::now(), RECHECK_GRACE)
+    }
+}
+
+/// `instant` plus `duration`, or the furthest instant short of it that the monotonic clock
+/// represents.
+fn saturating_add(instant: Instant, duration: Duration) -> Instant {
+    if let Some(sum) = instant.checked_add(duration) {
+        return sum;
+    }
+    let (mut reachable, mut beyond) = (Duration::ZERO, duration);
+    while beyond - reachable > Duration::from_nanos(1) {
+        let middle = reachable + (beyond - reachable) / 2;
+        if instant.checked_add(middle).is_some() {
+            reachable = middle;
+        } else {
+            beyond = middle;
+        }
+    }
+    instant + reachable
 }
 
 pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
@@ -142,16 +170,13 @@ pub(in crate::native) fn wait_for_binding(
     binding_tests::checkpoint(binding_tests::Point::InitialReceipt);
     // Preserve both budgets: after wall-clock rollback or a receipt extension,
     // The start-timeout budget may continue beyond the initial receipt's remaining duration.
-    let budget = match facts.budget {
-        BindingBudget::StartTimeout => START_TIMEOUT,
-        BindingBudget::RemainingReceiptCapped => Duration::from_millis(
-            initial
-                .deadline_unix_ms
-                .saturating_sub(unix_ms())
-                .min(30_000) as u64,
-        ),
+    let now = clock.now();
+    let deadline = match facts.budget {
+        BindingBudget::StartTimeout => now + START_TIMEOUT,
+        BindingBudget::RemainingReceiptCapped => initial
+            .monotonic_deadline(now, Duration::ZERO)
+            .min(now + START_TIMEOUT),
     };
-    let deadline = clock.now() + budget;
     #[cfg(test)]
     binding_tests::checkpoint(binding_tests::Point::BudgetCaptured);
     loop {
@@ -1262,7 +1287,8 @@ mod tests {
     }
 
     // The wall clock is fixed, so the bound is bracketed by the monotonic readings around the
-    // call: the recorded deadline plus the grace, never earlier than now, none past the clock.
+    // call: the recorded deadline plus the grace, never earlier than now, saturating past the
+    // clock.
     #[test]
     fn the_wrappers_recheck_bound_is_the_recorded_deadline_plus_the_grace() {
         struct Reset(Option<u128>);
@@ -1295,7 +1321,6 @@ mod tests {
             (0, 0),
         ] {
             let (before, bound, after) = bound(deadline);
-            let bound = bound.unwrap();
             let remaining = Duration::from_millis(remaining_ms);
             assert!(
                 before + remaining <= bound && bound <= after + remaining,
@@ -1303,19 +1328,66 @@ mod tests {
                 bound.saturating_duration_since(before)
             );
         }
-        assert_eq!(bound(u128::MAX).1, None);
-        // The largest deadline a launch record can be read with: a bound where the monotonic
-        // clock can represent it, none where it cannot, and never a panic.
-        let largest = u128::from(u64::MAX);
-        let (before, bound, _) = bound(largest);
-        if let Some(bound) = bound {
-            let remaining = u64::try_from(largest + RECHECK_GRACE.as_millis() - NOW).unwrap();
-            assert!(
-                before
-                    .checked_add(Duration::from_millis(remaining))
-                    .is_some_and(|earliest| earliest <= bound)
-            );
+        // The largest deadline a launch record can be read with, and one further than a
+        // receipt can hold: a bound at least that far where the monotonic clock can represent
+        // it, the furthest instant it can where it cannot, and never a panic.
+        for (deadline, remaining) in [
+            (
+                u128::from(u64::MAX),
+                u64::try_from(u128::from(u64::MAX) + RECHECK_GRACE.as_millis() - NOW).unwrap(),
+            ),
+            (u128::MAX, u64::MAX),
+        ] {
+            let (before, bound, _) = bound(deadline);
+            match before.checked_add(Duration::from_millis(remaining)) {
+                Some(earliest) => assert!(earliest <= bound, "deadline {deadline}"),
+                None => assert!(bound.checked_add(Duration::from_nanos(1)).is_none()),
+            }
         }
+    }
+
+    // The one conversion of the receipt's wall-clock deadline: exact for a monotonic reading
+    // given with a fixed wall clock, `now` once passed, saturating when too far away.
+    #[test]
+    fn the_receipt_deadline_converts_to_the_monotonic_clock_saturating() {
+        struct Reset(Option<u128>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::native::session::tests::FIXED_UNIX_MS.set(self.0);
+            }
+        }
+        const NOW: u128 = 1_000_000;
+        let _reset = Reset(crate::native::session::tests::FIXED_UNIX_MS.replace(Some(NOW)));
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let at = |deadline_unix_ms, after| {
+            Record {
+                schema: 1,
+                claim_token: "claim".to_owned(),
+                deadline_unix_ms,
+                phase: Phase::Pending,
+            }
+            .monotonic_deadline(now, after)
+        };
+        assert_eq!(at(NOW + 500, Duration::ZERO), now + ms(500));
+        assert_eq!(at(NOW, Duration::ZERO), now);
+        assert_eq!(at(NOW - 500, Duration::ZERO), now);
+        assert_eq!(at(0, Duration::ZERO), now);
+        // A time after the deadline counts from the deadline, even once it has passed.
+        assert_eq!(at(NOW - 500, ms(2_000)), now + ms(1_500));
+        assert_eq!(at(NOW - 5_000, ms(2_000)), now);
+        let furthest = |instant: Instant| instant.checked_add(Duration::from_nanos(1)).is_none();
+        for deadline in [u128::from(u64::MAX) + NOW, u128::MAX] {
+            let converted = at(deadline, Duration::ZERO);
+            match now.checked_add(ms(u64::MAX)) {
+                Some(expected) => assert_eq!(converted, expected, "deadline {deadline}"),
+                None => assert!(furthest(converted), "deadline {deadline}"),
+            }
+        }
+        // Past what the monotonic clock represents: its furthest instant, never a panic.
+        let saturated = saturating_add(now, Duration::MAX);
+        assert!(saturated > now && furthest(saturated));
+        assert_eq!(saturating_add(now, ms(1)), now + ms(1));
     }
 
     #[test]
@@ -1779,6 +1851,7 @@ mod host_decision_tests {
             },
             10000,
             Some(10000),
+            None,
         )
         .unwrap();
     }
@@ -1835,6 +1908,7 @@ mod host_decision_tests {
                 signal: None,
             },
             0,
+            None,
             None,
         )
         .unwrap();

@@ -132,6 +132,7 @@ pub(in crate::native) fn characterize(
         "short-budget",
         "expired-then-rollback",
         "thirty-second-cap",
+        "far-future-cap",
     ] {
         let _reset = Reset(session::tests::FIXED_UNIX_MS.replace(Some(1_000)));
         let fixture = tempfile::Builder::new()
@@ -201,6 +202,8 @@ pub(in crate::native) fn characterize(
             "short-budget" => receipt(directory, |r| r.deadline_unix_ms = 1_005),
             "expired-then-rollback" => receipt(directory, |r| r.deadline_unix_ms = 999),
             "thirty-second-cap" => receipt(directory, |r| r.deadline_unix_ms = 100_000),
+            // The furthest deadline a receipt can be read with: the 30 s cap still applies.
+            "far-future-cap" => receipt(directory, |r| r.deadline_unix_ms = u64::MAX.into()),
             "owner-before-surface" => {
                 let mut binding = binding.clone();
                 binding["managed_session_id"] = "session-foreign".into();
@@ -345,7 +348,7 @@ pub(in crate::native) fn characterize(
                         receipt(&path, |r| r.deadline_unix_ms = 2_000);
                         session::tests::FIXED_UNIX_MS.set(Some(1_110));
                     }
-                    "thirty-second-cap" => *now += Duration::from_secs(30),
+                    "thirty-second-cap" | "far-future-cap" => *now += Duration::from_secs(30),
                     "short-budget" => {}
                     _ => panic!("unexpected retry for {case}"),
                 }

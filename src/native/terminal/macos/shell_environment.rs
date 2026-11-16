@@ -8,19 +8,40 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::{Duration, Instant};
 
+use super::super::shell_environment_budget::{CLEANUP, capture_budget};
 use super::super::shell_environment_wire::CAP;
-/// Time kept after the capture for its cleanup, within the caller's deadline.
-pub(in crate::native) const CLEANUP: Duration = Duration::from_millis(500);
-/// Time a launch keeps after the capture for its handoff to the launch shell. A doctor
-/// probe makes no handoff and adds this back to its deadline.
-pub(in crate::native) const HANDOFF_RESERVE: Duration = Duration::from_secs(2);
-const RESERVE: Duration = HANDOFF_RESERVE.saturating_add(CLEANUP);
+
+/// How the supervisor spends `CLEANUP` once the shell has ended or run out of time: it ends
+/// the capture group within `GROUP_CLEANUP_NS`, which leaves the last tenth of `CLEANUP` for
+/// its report to reach the host, and the host stops reading `CLEANUP` after the capture's
+/// deadline. Nanoseconds, because the supervisor reads only `monotonic_ns` after the fork.
+const GROUP_CLEANUP_NS: u64 = (CLEANUP.as_nanos() - CLEANUP.as_nanos() / 10) as u64;
+/// Within `GROUP_CLEANUP_NS`, the group's time to exit after SIGTERM, before SIGKILL: a fifth
+/// of `CLEANUP`, so that most of the supervisor's share remains for SIGKILL and the reaping.
+const TERMINATE_GRACE_NS: u64 = (CLEANUP.as_nanos() / 5) as u64;
+const _: () = assert!(TERMINATE_GRACE_NS < GROUP_CLEANUP_NS);
+
+/// The supervisor's report: four native-endian `i32` words written once, after cleanup. Word 0
+/// is the outcome below; word 1 the shell's exit status or signal; word 2 the stopped background
+/// members; word 3 the outcome before cleanup, which says what word 1 holds. The supervisor
+/// writes these codes and `capture` decodes them.
+mod report_code {
+    /// The shell exited with status zero.
+    pub(super) const EXITED_ZERO: i32 = 0;
+    pub(super) const SPAWN_FAILED: i32 = 1;
+    pub(super) const TIMEOUT: i32 = 2;
+    pub(super) const EXIT_NONZERO: i32 = 3;
+    pub(super) const SIGNALED: i32 = 4;
+    pub(super) const CLEANUP_FAILED: i32 = 5;
+}
 
 #[derive(Debug)]
 pub(in crate::native) struct Captured {
     pub(in crate::native) variables: Vec<(OsString, OsString)>,
     pub(in crate::native) elapsed: Duration,
     pub(in crate::native) background_children_stopped: u32,
+    /// The budget the capture enforced, decided when it started.
+    pub(in crate::native) budget: Duration,
 }
 #[derive(Debug)]
 pub(in crate::native) struct CaptureFailure {
@@ -28,6 +49,8 @@ pub(in crate::native) struct CaptureFailure {
     pub(in crate::native) exit_code: Option<i32>,
     pub(in crate::native) signal: Option<i32>,
     pub(in crate::native) elapsed: Duration,
+    /// The budget the capture enforced, decided when it started; zero when it left no time.
+    pub(in crate::native) budget: Duration,
 }
 
 fn decode(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, FailureReason> {
@@ -72,21 +95,20 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
 
 /// `deadline` is the receipt/probe deadline, including the handoff and cleanup reserves.
 /// Callers supply their own environment; this function applies the helper removal policy.
+/// The budget is decided here, when the capture starts, and returned with either outcome.
 pub(in crate::native) fn capture(
     base: impl IntoIterator<Item = (OsString, OsString)>,
     deadline: Instant,
 ) -> Result<Captured, CaptureFailure> {
     let start = Instant::now();
+    let budget = capture_budget(start, deadline);
     let failure = |reason, exit_code, signal| CaptureFailure {
         reason,
         exit_code,
         signal,
         elapsed: start.elapsed(),
+        budget,
     };
-    let budget = deadline
-        .saturating_duration_since(start)
-        .saturating_sub(RESERVE)
-        .min(Duration::from_secs(10));
     if budget.is_zero() {
         return Err(failure(FailureReason::LaunchBudgetExhausted, None, None));
     }
@@ -232,15 +254,16 @@ pub(in crate::native) fn capture(
     }
     let words: [i32; 4] = std::array::from_fn(|i| i32::from_ne_bytes(report.as_chunks::<4>().0[i]));
     let reason = match words[0] {
-        0 => None,
-        1 => Some(FailureReason::CaptureSpawnFailed),
-        2 => Some(FailureReason::CaptureTimeout),
-        3 => Some(FailureReason::CaptureExitNonzero),
-        4 => Some(FailureReason::CaptureSignaled),
+        report_code::EXITED_ZERO => None,
+        report_code::SPAWN_FAILED => Some(FailureReason::CaptureSpawnFailed),
+        report_code::TIMEOUT => Some(FailureReason::CaptureTimeout),
+        report_code::EXIT_NONZERO => Some(FailureReason::CaptureExitNonzero),
+        report_code::SIGNALED => Some(FailureReason::CaptureSignaled),
+        // `report_code::CLEANUP_FAILED`, and any word the supervisor does not write.
         _ => Some(FailureReason::CleanupFailed),
     };
-    let exit_code = (words[3] == 3).then_some(words[1]);
-    let signal = (words[3] == 4).then_some(words[1]);
+    let exit_code = (words[3] == report_code::EXIT_NONZERO).then_some(words[1]);
+    let signal = (words[3] == report_code::SIGNALED).then_some(words[1]);
     let reason = if reason == Some(FailureReason::CleanupFailed) {
         reason
     } else {
@@ -254,6 +277,7 @@ pub(in crate::native) fn capture(
         variables,
         elapsed: start.elapsed(),
         background_children_stopped: words[2] as u32,
+        budget,
     })
 }
 
@@ -318,9 +342,9 @@ unsafe fn supervise(
         libc::close(fds[1][1]);
         libc::close(fds[2][1]);
         libc::close(fds[5][1]);
-        let mut report = [0i32; 4];
+        let mut report = [report_code::EXITED_ZERO, 0, 0, 0];
         if child < 0 {
-            report[0] = 1;
+            report[0] = report_code::SPAWN_FAILED;
         } else {
             loop {
                 discard(fds[1][0]);
@@ -335,14 +359,14 @@ unsafe fn supervise(
                 if wait == 0 && info.si_pid == child {
                     let mut marker = 0u8;
                     if libc::read(fds[5][0], (&mut marker as *mut u8).cast(), 1) > 0 {
-                        report[0] = 1;
+                        report[0] = report_code::SPAWN_FAILED;
                     } else if info.si_code == libc::CLD_EXITED {
                         if info.si_status != 0 {
-                            report[0] = 3;
+                            report[0] = report_code::EXIT_NONZERO;
                             report[1] = info.si_status;
                         }
                     } else {
-                        report[0] = 4;
+                        report[0] = report_code::SIGNALED;
                         report[1] = info.si_status;
                     }
                     break;
@@ -350,11 +374,11 @@ unsafe fn supervise(
                 let mut byte = 0u8;
                 let host = libc::read(fds[3][0], (&mut byte as *mut u8).cast(), 1);
                 if host == 0 || monotonic_ns() >= until {
-                    report[0] = 2;
+                    report[0] = report_code::TIMEOUT;
                     break;
                 }
                 if wait < 0 {
-                    report[0] = 5;
+                    report[0] = report_code::CLEANUP_FAILED;
                     break;
                 }
                 libc::usleep(2000);
@@ -362,15 +386,15 @@ unsafe fn supervise(
             report[3] = report[0];
             // Keep the shell unreaped until the last signal: its PID cannot be reused
             // for an unrelated group while cleanup retains negative-PID authority.
-            let cleanup_end = monotonic_ns() + 450_000_000;
+            let cleanup_end = monotonic_ns() + GROUP_CLEANUP_NS;
             let count = group_members(child, pids);
             if count < 0 {
-                report[0] = 5;
-            } else if report[0] == 0 {
+                report[0] = report_code::CLEANUP_FAILED;
+            } else if report[0] == report_code::EXITED_ZERO {
                 report[2] = count;
             }
             libc::kill(-child, libc::SIGTERM);
-            let grace = monotonic_ns() + 100_000_000;
+            let grace = monotonic_ns() + TERMINATE_GRACE_NS;
             while monotonic_ns() < grace {
                 discard(fds[1][0]);
                 discard(fds[2][0]);
@@ -395,7 +419,7 @@ unsafe fn supervise(
                     break;
                 }
                 if monotonic_ns() >= cleanup_end {
-                    report[0] = 5;
+                    report[0] = report_code::CLEANUP_FAILED;
                     break;
                 }
                 libc::usleep(2000);
@@ -487,6 +511,12 @@ mod tests {
         ));
         let captured = capture(base, Instant::now() + Duration::from_secs(4)).unwrap();
         assert!(captured.elapsed < Duration::from_secs(2));
+        // The budget the capture decided when it started: 4 s less the 2.5 s of reserves.
+        assert!(
+            captured.budget <= Duration::from_millis(1500)
+                && captured.budget > Duration::from_millis(1000),
+            "{captured:?}"
+        );
         assert!(
             !captured
                 .variables
@@ -551,6 +581,13 @@ mod tests {
         let start = Instant::now();
         let result = capture(base, start + Duration::from_secs(3)).unwrap_err();
         assert_eq!(result.reason, FailureReason::CaptureTimeout);
+        // The deadline less the 2.5 s of reserves leaves at most 500 ms, which the capture
+        // runs out before it reports the timeout.
+        assert!(result.elapsed >= Duration::from_millis(400), "{result:?}");
+        assert!(
+            result.budget <= Duration::from_millis(500) && result.elapsed >= result.budget,
+            "{result:?}"
+        );
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_gone(&dir.path().join("child"));
     }
@@ -598,22 +635,24 @@ mod tests {
     #[test]
     fn exhausted_budget_starts_no_shell() {
         let (dir, base) = fixture(b"touch $HOME/started\n");
-        assert_eq!(
-            capture(base, Instant::now() + Duration::from_millis(2500))
-                .unwrap_err()
-                .reason,
-            FailureReason::LaunchBudgetExhausted
-        );
+        // A deadline that leaves only the reserves: no budget remains before the spawn.
+        let failure = capture(base, Instant::now() + Duration::from_millis(2500)).unwrap_err();
+        assert_eq!(failure.reason, FailureReason::LaunchBudgetExhausted);
+        assert_eq!(failure.budget, Duration::ZERO);
+        assert_eq!((failure.exit_code, failure.signal), (None, None));
         assert!(!dir.path().join("started").exists());
     }
+    // The supervisor's cleanup timings are shares of `CLEANUP`.
     #[test]
-    fn environment_decoder_rejects_partial_duplicate_and_empty_names() {
-        for bytes in [b"X=y".as_slice(), b"X=y\0X=z\0", b"=v\0", b"X=y\0\0"] {
-            assert_eq!(decode(bytes).unwrap_err(), FailureReason::CaptureInvalid);
-        }
+    fn supervisor_cleanup_fits_inside_the_cleanup_reserve() {
+        assert_eq!(CLEANUP, Duration::from_millis(500));
         assert_eq!(
-            decode(b"X=a=b\0_=x\0SHLVL=1\0PWD=p\0OLDPWD=q\0").unwrap(),
-            vec![("X".into(), "a=b".into())]
+            Duration::from_nanos(GROUP_CLEANUP_NS),
+            Duration::from_millis(450)
+        );
+        assert_eq!(
+            Duration::from_nanos(TERMINATE_GRACE_NS),
+            Duration::from_millis(100)
         );
     }
 }

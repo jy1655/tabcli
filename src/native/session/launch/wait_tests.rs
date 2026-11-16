@@ -214,6 +214,7 @@ fn a_failed_host_ends_the_wait_with_the_failure_it_records() {
         },
         0,
         None,
+        None,
     )
     .unwrap();
     let run = run(&store, 20_000, unprobed);
