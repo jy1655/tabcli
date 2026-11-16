@@ -364,6 +364,44 @@ fn provision_hands_the_check_the_launch_deadline_plus_the_grace() {
     assert_eq!(handed(&session).1, None, "an unreadable launch record");
 }
 
+// The largest deadline a launch record can be read with, against a wall clock rolled back
+// below the grace (a clock before the epoch reads as 0): the remaining time does not fit the
+// millisecond conversion, so the check gets no bound and keeps the unbounded executor. From a
+// wall clock at the grace on, the bound exists wherever the monotonic clock can represent it.
+#[test]
+fn provision_hands_no_bound_when_the_recorded_deadline_does_not_fit_the_conversion() {
+    let session = session(PROMPT);
+    session.begin_unhurried();
+    session.set_deadline(u128::from(u64::MAX));
+    for wall in [0, 1_999, 2_000] {
+        let _clock = PinnedClock::at(wall);
+        assert_eq!(
+            session.record().map(|record| record.deadline_unix_ms),
+            Some(u128::from(u64::MAX)),
+            "the receipt is readable"
+        );
+        let mut captured = None;
+        let before = Instant::now();
+        let result = provision_with(&session.directory, |_, _, bound| {
+            captured = Some(bound);
+            Err(anyhow::anyhow!("captured"))
+        });
+        assert_eq!(format!("{:#}", result.unwrap_err()), "captured");
+        let bound = captured.expect("provision did not reach the check");
+        if wall < 2_000 {
+            assert_eq!(bound, None, "wall clock {wall}");
+        } else {
+            let earliest = before.checked_add(Duration::from_millis(u64::MAX));
+            assert_eq!(bound.is_some(), earliest.is_some(), "wall clock {wall}");
+            assert!(
+                earliest
+                    .zip(bound)
+                    .is_none_or(|(earliest, bound)| earliest <= bound)
+            );
+        }
+    }
+}
+
 // A probe that would hang cannot keep `provision`, and is no longer running when it returns.
 // The wall clock is pinned on the thread that runs `provision`, with the recorded deadline
 // 400 ms after it, so the check is bounded 2.4 s after its conversion however the test was

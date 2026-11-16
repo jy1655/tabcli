@@ -756,7 +756,7 @@ fn refuse(store: &Store, token: &str, captures: Vec<CapturePoll>) -> (String, Ve
         trace: trace.clone(),
     };
     let receipt = launch::read(store).unwrap().unwrap();
-    let deadline = receipt.monotonic_deadline(start, Duration::ZERO);
+    let deadline = launch::saturating_deadline(start, receipt.remaining(Duration::ZERO));
     let recorder = Recorder {
         store,
         token,

@@ -45,7 +45,8 @@ pub(in crate::native::terminal) fn run(
         let start = clock.now();
         let receipt = launch::read(&store)?.context("missing host launch receipt")?;
         let token = &receipt.claim_token;
-        let deadline = receipt.monotonic_deadline(start, Duration::ZERO);
+        // `start` was read before the wall clock, as the host always has.
+        let deadline = launch::saturating_deadline(start, receipt.remaining(Duration::ZERO));
         let identity = super::process::live_native_process_identity(std::process::id())
             .ok()
             .and_then(|i| {

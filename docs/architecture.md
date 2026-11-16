@@ -270,9 +270,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   launch receipt, returning counts and the environment, never startup output. The capture
   decides its budget when it starts and returns it with either outcome; the host records that
   enforced budget with the next stage or the capture's failure, and doctor's probe reports it.
-  The launch receipt converts its deadline to the monotonic clock once
-  (`launch::Record::monotonic_deadline`, saturating) for the host, the binding wait and the
-  wrapper's re-check, which keep their own cap and grace.
+  The launch receipt gives the wall-clock half of its deadline's conversion to the monotonic
+  clock once (`launch::Record::remaining`); the host, the binding wait and the wrapper's
+  re-check each read the monotonic clock in their own order around it (the wait and the
+  re-check after the wall clock, so that a pause between the readings only lengthens their
+  deadline) and keep their own cap and grace. The host and the binding wait saturate
+  (`launch::saturating_deadline`); the re-check has no bound when the time does not fit.
   Ghostty's frame host lives in `terminal/macos/ghostty/host.rs`. It proves the bound PTY, carries
   the session directory only after binding, and discards startup input. Ghostty 1.4.0 adds a
   scripted `tty` property, which this adapter does not yet consume; replacing the frame must
