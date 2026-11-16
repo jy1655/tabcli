@@ -248,7 +248,7 @@ impl Reader {
     // Read by the macOS and Windows ownership paths; Linux has no managed surface yet.
     #[cfg(any(target_os = "macos", windows))]
     pub(in crate::native) fn owner(&self) -> Result<NativeSessionOwner> {
-        self.private(SESSION_OWNER_FILE).json_with(record::owner)
+        owner::required(self).map(|recorded| recorded.owner)
     }
     pub(in crate::native) fn terminal(&self) -> Result<terminal::TerminalSession> {
         self.private(TERMINAL_HANDLE_FILE)

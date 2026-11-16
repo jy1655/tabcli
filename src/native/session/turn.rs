@@ -1085,14 +1085,16 @@ pub(in crate::native) fn running_wait_owner_with(
     directory: &Path,
     observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
 ) -> Result<()> {
-    // The running wait attests the recorded process whatever Session the record names;
-    // whether it should consult the binding first is an open follow-up.
-    if let Some(text) = Reader::open_unchecked(directory)
-        .record(CoreRecord::Owner)
-        .text()?
-    {
-        let owner: NativeSessionOwner =
-            super::record::owner(&text).context("invalid native-session owner record")?;
+    // The running wait attests the recorded process whatever Session the record names.
+    let owner = match super::owner::observe(&Reader::open_unchecked(directory)) {
+        super::owner::OwnerRecord::Absent => None,
+        super::owner::OwnerRecord::Unreadable(error) => return Err(error),
+        super::owner::OwnerRecord::Malformed { error, .. } => {
+            return Err(anyhow::Error::new(error).context("invalid native-session owner record"));
+        }
+        super::owner::OwnerRecord::Recorded(recorded) => Some(recorded.owner),
+    };
+    if let Some(owner) = owner {
         match observe(&owner).process {
             ProcessObservation::Gone(Gone::Exited) => bail!(
                 "native session process {} is no longer running; terminal cleanup remains unverified",

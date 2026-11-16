@@ -451,7 +451,10 @@ pub(super) fn record_checks(
                 &observation.launch_host,
                 surface_kind(&observation.evidence),
                 shell_startup::LaterEvidence {
-                    owner_recorded: matches!(observation.evidence.owner, Ok(Some(_))),
+                    owner_recorded: matches!(
+                        observation.evidence.owner,
+                        crate::native::session::owner::OwnerRecord::Recorded(_)
+                    ),
                 },
                 id,
             ));
@@ -500,7 +503,7 @@ pub(super) fn record_checks(
             (manifest, evidence, surface, hold)
         }
     };
-    owner_check(evidence.judge_owner(id), checks);
+    owner_check(evidence.judge_owner(), checks);
     terminal_check(&surface, checks);
     hold_check(&hold, id, checks);
     (manifest, evidence)
@@ -804,13 +807,13 @@ fn owner_check(owner: &OwnerJudgment, checks: &mut Vec<Check>) {
                 json!(owner.observation()),
             )
         }
-        OwnerJudgment::Foreign => (
+        OwnerJudgment::Foreign(_) => (
             Unavailable,
             Reason::OWNER_SESSION_MISMATCH,
             "Owner record belongs to another managed session.".to_owned(),
             Value::Null,
         ),
-        OwnerJudgment::UnboundLegacy { .. } => (Unknown, Reason::OWNER_UNBOUND_LEGACY, "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(owner.observation())),
+        OwnerJudgment::UnboundLegacy(_) => (Unknown, Reason::OWNER_UNBOUND_LEGACY, "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(owner.observation())),
         OwnerJudgment::Absent => (
             Unknown,
             Reason::OWNER_UNVERIFIED,
@@ -939,6 +942,13 @@ mod attestation_tests {
             ])
         };
         json!([check["availability"], check["reason_code"], facts])
+    }
+
+    /// A session directory named `session-test` holding an owner bound to it.
+    fn bound_store(dir: &tempfile::TempDir) -> crate::native::session::Store {
+        let directory = dir.path().join("session-test");
+        std::fs::create_dir(&directory).unwrap();
+        crate::native::session::Store::open_unchecked(directory)
     }
 
     fn bound_evidence(store: &crate::native::session::Store) -> SessionEvidence {
@@ -1359,12 +1369,49 @@ mod attestation_tests {
                 )),
                 json!(["unknown", "owner_unverified", [false, null, "denied"]]),
             ),
+            // A record not bound to this session reports its liveness only.
             (
-                OwnerJudgment::UnboundLegacy { alive: Some(false) },
+                OwnerJudgment::UnboundLegacy(attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    NotRecorded,
+                    Some(false),
+                )),
                 json!(["unknown", "owner_unbound_legacy", [false, null, null]]),
             ),
             (
-                OwnerJudgment::Foreign,
+                OwnerJudgment::UnboundLegacy(reused_attestation()),
+                json!(["unknown", "owner_unbound_legacy", [true, false, null]]),
+            ),
+            (
+                OwnerJudgment::UnboundLegacy(attestation(
+                    ProcessObservation::Live(Attested::Incarnation),
+                    Verified,
+                    Some(true),
+                )),
+                json!(["unknown", "owner_unbound_legacy", [true, null, null]]),
+            ),
+            (
+                OwnerJudgment::UnboundLegacy(attestation(
+                    ProcessObservation::Unknown("denied".into()),
+                    NotRecorded,
+                    Some(false),
+                )),
+                json!(["unknown", "owner_unbound_legacy", [false, null, "denied"]]),
+            ),
+            (
+                OwnerJudgment::Foreign(attestation(
+                    ProcessObservation::Live(Attested::PidOnly),
+                    NotRecorded,
+                    Some(true),
+                )),
+                json!(["unavailable", "owner_session_mismatch", null]),
+            ),
+            (
+                OwnerJudgment::Foreign(attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    NotRecorded,
+                    Some(false),
+                )),
                 json!(["unavailable", "owner_session_mismatch", null]),
             ),
             (
@@ -1387,20 +1434,16 @@ mod attestation_tests {
     fn correction_a3_intermediate_owner_doctor_distinguishes_changed_unknown_and_verified() {
         use crate::native::session::owner::tests::intermediate_attestation;
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::native::session::Store::open_unchecked(dir.path());
+        let store = bound_store(&dir);
         for (control, availability, reason) in [
             ("changed", "unavailable", "owner_identity_mismatch"),
             ("unknown", "unknown", "owner_unverified"),
             ("verified", "available", "owner_identity_observed"),
         ] {
             let evidence = bound_evidence(&store);
-            let owner = evidence.judge_owner_with(
-                "session-test",
-                &judgment::Observers {
-                    attest: &|_| intermediate_attestation(control),
-                    pid_alive: &|_| panic!("a bound record is attested"),
-                },
-            );
+            let owner = evidence.judge_owner_with(&judgment::Observers {
+                attest: &|_| intermediate_attestation(control),
+            });
             let row = owner_row(owner);
             assert_eq!(row[0], availability, "{control}");
             assert_eq!(row[1], reason, "{control}");
@@ -1410,15 +1453,11 @@ mod attestation_tests {
     #[test]
     fn r1_c6_reused_owner_is_unavailable_with_mismatch_reason() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::native::session::Store::open_unchecked(dir.path());
+        let store = bound_store(&dir);
         let evidence = bound_evidence(&store);
-        let owner = evidence.judge_owner_with(
-            "session-test",
-            &judgment::Observers {
-                attest: &|_| reused_attestation(),
-                pid_alive: &|_| panic!("a bound record is attested"),
-            },
-        );
+        let owner = evidence.judge_owner_with(&judgment::Observers {
+            attest: &|_| reused_attestation(),
+        });
         let row = owner_row(owner);
         assert_eq!(row[0], "unavailable");
         assert_eq!(row[1], "owner_identity_mismatch");

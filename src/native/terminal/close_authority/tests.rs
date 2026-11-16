@@ -6,6 +6,7 @@
 use super::test_support::{Call, RecordValues, TestObservation};
 use super::*;
 use crate::native::process_identity::Attested;
+use crate::native::session::CoreRecord;
 use crate::native::session::owner::ControlAttestation;
 use crate::native::terminal::ownership::{MacTerminalAppIdentity, test_owner_attestation};
 use std::cell::RefCell;

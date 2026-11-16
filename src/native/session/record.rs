@@ -211,16 +211,9 @@ pub(in crate::native) fn provider_process(
 }
 
 /// `native-session.json`, the Owner record: serde's shape decoder, without the snapshot
-/// timestamp-range rule or a schema check. Every reader keeps its own I/O policy (required or
-/// optional, strict or lossy text, byte budget, regular-file check) and error context, and
-/// judges the record with the binding and control rules beside `NativeSessionOwner`.
-pub(in crate::native) fn owner(text: &str) -> serde_json::Result<NativeSessionOwner> {
-    serde_json::from_str(text)
-}
-
-/// The Owner record from bytes, for Origin's budgeted read, preserving serde's UTF-8
-/// diagnostics rather than a text reader's.
-pub(in crate::native) fn owner_bytes(bytes: &[u8]) -> serde_json::Result<NativeSessionOwner> {
+/// timestamp-range rule or a schema check. The record's one read policy and its binding
+/// judgment are `session::owner`'s; every reader keeps its own error context and authority.
+pub(in crate::native) fn owner(bytes: &[u8]) -> serde_json::Result<NativeSessionOwner> {
     serde_json::from_slice(bytes)
 }
 

@@ -7,6 +7,7 @@
 //! the read and is never a close authority.
 use super::enumerate::{CheckOrder, Fault, enumerate};
 use super::launch;
+use super::owner;
 use super::primitives::{EXTERNAL_SOURCE, valid_session_id};
 use super::record::{self, DecodeError};
 use super::requests::{self, Receipt};
@@ -25,7 +26,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Largest record any Origin read accepts.
+/// Largest record any Origin read accepts, except the Owner record, read within its own
+/// bound (`owner::LIMIT`).
 const RECORD_LIMIT: u64 = 64 * 1024;
 /// Cooperative time and byte budget of one Origin observation inside a query.
 const OBSERVATION_TIME: Duration = Duration::from_millis(100);
@@ -135,6 +137,16 @@ impl ReadBudget {
         record: &RecordReader,
         clock: &mut dyn Clock,
     ) -> Result<Option<Vec<u8>>, ReadFault> {
+        self.read_within(record, clock, RECORD_LIMIT)
+    }
+
+    /// `read` with the record's own bound, which the allowance can only lower.
+    fn read_within(
+        &mut self,
+        record: &RecordReader,
+        clock: &mut dyn Clock,
+        record_limit: u64,
+    ) -> Result<Option<Vec<u8>>, ReadFault> {
         if let Some(why) = self.exhausted {
             return Err(ReadFault::Exhausted(why));
         }
@@ -144,7 +156,7 @@ impl ReadBudget {
         if self.remaining == 0 {
             return Err(self.exhaust(Exhaustion::Bytes));
         }
-        let limit = RECORD_LIMIT.min(self.remaining);
+        let limit = record_limit.min(self.remaining);
         let outcome = match record.timeline(limit) {
             Ok(None) => Ok(None),
             Ok(Some(bytes)) => {
@@ -155,11 +167,11 @@ impl ReadBudget {
             Err(error) => {
                 // A record that fits the per-record limit but not what is left of the
                 // allowance exhausts the budget; it is not a damaged record.
-                let over_allowance = limit < RECORD_LIMIT
+                let over_allowance = limit < record_limit
                     && fs::symlink_metadata(record.path()).is_ok_and(|metadata| {
                         metadata.is_file()
                             && metadata.len() > limit
-                            && metadata.len() <= RECORD_LIMIT
+                            && metadata.len() <= record_limit
                     });
                 if over_allowance {
                     Err(self.exhaust(Exhaustion::Bytes))
@@ -650,7 +662,7 @@ fn observe_target(
         Err(fault) => return fault_target(fault, "origin_unreadable"),
     }
     if let Some(owner_bytes) = owner_bytes {
-        match budget.read(&reader.record(CoreRecord::Owner), clock) {
+        match budget.read_within(&reader.record(CoreRecord::Owner), clock, owner::LIMIT) {
             Ok(bytes) if bytes == owner_bytes => (),
             Ok(_) => return target(None, "origin_busy", None),
             Err(fault) => return fault_target(fault, "origin_unreadable"),
@@ -674,7 +686,7 @@ fn owner_verdict(
     attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
 ) -> (Target, Option<Option<Vec<u8>>>) {
     let record = reader.record(CoreRecord::Owner);
-    let bytes = match budget.read(&record, clock) {
+    let bytes = match budget.read_within(&record, clock, owner::LIMIT) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             return (
@@ -684,8 +696,8 @@ fn owner_verdict(
         }
         Err(fault) => return (fault_target(fault, "owner_unverified"), None),
     };
-    let verdict = match super::record::owner_bytes(&bytes) {
-        Ok(owner) => owner_attested(&owner, id, attest),
+    let verdict = match owner::decode(&bytes, id) {
+        Ok(recorded) => owner_attested(&recorded.owner, recorded.binding, attest),
         Err(error) => target(
             None,
             "owner_unverified",
@@ -700,10 +712,11 @@ fn owner_verdict(
 
 fn owner_attested(
     owner: &NativeSessionOwner,
-    id: &str,
+    binding: OwnerBinding,
     attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
 ) -> Target {
-    match owner.binding(id) {
+    // Origin ended is never derived from a record not bound to the Origin.
+    match binding {
         OwnerBinding::Bound => (),
         OwnerBinding::Unbound => {
             return target(

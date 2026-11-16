@@ -369,13 +369,11 @@ fn attested_owner(
         control,
         Some(true),
     )));
-    observed.evidence.judge_owner_with(
-        SESSION,
-        &observation::judgment::Observers {
+    observed
+        .evidence
+        .judge_owner_with(&observation::judgment::Observers {
             attest: &|_| attested.borrow_mut().take().expect("one attestation"),
-            pid_alive: &|_| panic!("a bound record is attested"),
-        },
-    );
+        });
 }
 
 /// The fixture's owner record is PID-only, which macOS's probe cannot verify, so rows past
@@ -580,8 +578,10 @@ fn the_owner_gate_is_what_dead_owner_repair_finds_without_repairing() {
     let live = std::process::id();
     for (pid, session, expected) in [
         (dead, Some(SESSION), &ended),
-        // An unbound legacy record observed gone is the death repair finds too.
+        // An unbound legacy record observed gone is the death repair finds too, and so is a
+        // record naming another session: Repair attests it whatever Session it names.
         (dead, None, &ended),
+        (dead, Some("session-other"), &ended),
         (live, None, &unattested),
         (live, Some("session-other"), &unattested),
     ] {
@@ -1008,4 +1008,161 @@ fn a_snapshot_without_the_lifecycle_lock_leaves_every_capability_unknown() {
         json!({"emission_observation": unknown, "response": unknown})
     );
     assert!(!fixture.directory.join(TURN_CLAIM_LOCK_FILE).exists());
+}
+
+/// inspect's owner facts and tell's owner gate, past the surface gate.
+fn owner_row(directory: &Path, adjust: impl FnOnce(&mut observation::Observation)) -> Value {
+    let before = snapshot_directory(directory);
+    let reader = Reader::open_unchecked(directory);
+    let mut observed = observation::Observation::read_locked(&reader).unwrap();
+    bound_surface(&mut observed);
+    adjust(&mut observed);
+    let mut clock = SystemClock;
+    let value = super::inspect::value(
+        observed,
+        &reader,
+        SESSION,
+        &mut crate::native::session::origin::OriginEnvironment::production(&mut clock),
+    )
+    .unwrap();
+    assert_eq!(snapshot_directory(directory), before);
+    assert_eq!(
+        value["owner_process_alive"],
+        value["owner"]["process_alive"]
+    );
+    json!({"owner": value["owner"], "tell": value["capabilities"]["tell"]})
+}
+
+fn owner_facts(alive: Value, matches: Value, error: Value) -> Value {
+    json!({"process_alive": alive, "identity_matches": matches, "error": error})
+}
+
+// Records Repair attests whatever Session they name, and records no writer produces, as the
+// production observers judge them: inspect reports the liveness Repair acts on, and a record
+// it cannot read is unreadable here as it is to Repair.
+#[test]
+fn inspect_owner_rows_for_foreign_and_damaged_records() {
+    use crate::native::session::owner::damaged_tests::{Damaged, owner_path, write_damaged_owner};
+    let fixture = ready("codex");
+    let directory = &fixture.directory;
+    let ended = refused(
+        "owner_ended",
+        "the recorded session owner is no longer running",
+    );
+    let unattested = json!({"state": "unknown", "reason": "owner_unattested"});
+    let foreign = json!("owner record belongs to another session");
+    let dead = reaped_child_pid();
+    for (pid, expected) in [
+        (
+            dead,
+            json!({"owner": owner_facts(json!(false), json!(null), foreign.clone()),
+                "tell": ended}),
+        ),
+        (
+            std::process::id(),
+            json!({"owner": owner_facts(json!(true), json!(null), foreign.clone()),
+                "tell": unattested}),
+        ),
+    ] {
+        write_owner(directory, pid, Some("session-other"));
+        assert_eq!(owner_row(directory, |_| ()), expected, "foreign {pid}");
+    }
+    let bound_dead = NativeSessionOwner {
+        pid: dead,
+        managed_session_id: Some(SESSION.to_owned()),
+        ..NativeSessionOwner::default()
+    };
+    let path = owner_path(directory);
+    for (damaged, error) in [
+        (
+            Damaged::NonUtf8,
+            format!(
+                "failed to read {}: stream did not contain valid UTF-8",
+                path.display()
+            ),
+        ),
+        (
+            Damaged::Oversized,
+            format!(
+                "record is 131073 bytes, over the 131072 byte read limit: {}",
+                path.display()
+            ),
+        ),
+    ] {
+        write_damaged_owner(directory, &bound_dead, damaged);
+        assert_eq!(
+            owner_row(directory, |_| ()),
+            json!({"owner": owner_facts(json!(null), json!(null), json!(error)),
+                "tell": {"state": "unknown", "reason": "evidence_unreadable", "detail": error}}),
+            "{damaged:?}"
+        );
+    }
+}
+
+// An unbound legacy record that records a birth: a PID now held by another incarnation.
+#[cfg(target_os = "macos")]
+#[test]
+fn inspect_owner_row_for_an_unbound_record_whose_pid_was_reused() {
+    let fixture = ready("codex");
+    let directory = &fixture.directory;
+    Store::open_unchecked(directory)
+        .write_owner(&NativeSessionOwner {
+            pid: std::process::id(),
+            process_start_seconds: Some(1),
+            process_start_microseconds: Some(1),
+            ..NativeSessionOwner::default()
+        })
+        .unwrap();
+    assert_eq!(
+        owner_row(directory, |_| ()),
+        json!({"owner": owner_facts(json!(true), json!(false), json!(null)),
+            "tell": refused("owner_ended", "the recorded session owner is no longer running")})
+    );
+}
+
+// An unbound legacy record whose recorded birth could not be inspected.
+#[test]
+fn inspect_owner_rows_for_an_unbound_record_whose_birth_cannot_be_inspected() {
+    let fixture = ready("codex");
+    let directory = &fixture.directory;
+    Store::open_unchecked(directory)
+        .write_owner(&NativeSessionOwner {
+            pid: 4242,
+            process_start_seconds: Some(1),
+            process_start_microseconds: Some(1),
+            ..NativeSessionOwner::default()
+        })
+        .unwrap();
+    let unverified = json!({"state": "unknown", "reason": "owner_unverified",
+        "detail": "birth denied"});
+    for (pid_alive, expected) in [
+        (
+            false,
+            json!({"owner": owner_facts(json!(false), json!(null), json!("birth denied")),
+                "tell": unverified}),
+        ),
+        (
+            true,
+            json!({"owner": owner_facts(json!(true), json!(null), json!("birth denied")),
+                "tell": unverified}),
+        ),
+    ] {
+        let observed = owner_row(directory, |observed| {
+            observed
+                .evidence
+                .judge_owner_with(&observation::judgment::Observers {
+                    attest: &|owner| {
+                        assert_eq!(owner.process_start_seconds, Some(1));
+                        crate::native::session::owner::OwnerAttestation {
+                            process: crate::native::process_identity::ProcessObservation::Unknown(
+                                "birth denied".into(),
+                            ),
+                            control: crate::native::session::owner::ControlAttestation::NotRecorded,
+                            pid_alive: Some(pid_alive),
+                        }
+                    },
+                });
+        });
+        assert_eq!(observed, expected, "{pid_alive}");
+    }
 }

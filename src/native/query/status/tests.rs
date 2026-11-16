@@ -247,14 +247,59 @@ fn status_maps_each_judgment_to_its_documented_output() {
             vec!["owner_unverified"],
             json!([false, null, "denied"]),
         ),
+        // A record not bound to this session is flagged by the death Repair acts on.
         (
-            OwnerJudgment::UnboundLegacy { alive: Some(false) },
+            OwnerJudgment::UnboundLegacy(attestation(
+                ProcessObservation::Gone(Gone::Exited),
+                NotRecorded,
+                Some(false),
+            )),
+            vec!["owner_exited"],
+            json!([null, null, "owner record is unbound"]),
+        ),
+        (
+            OwnerJudgment::UnboundLegacy(attestation(
+                ProcessObservation::Gone(Gone::Reused("birth".into())),
+                NotRecorded,
+                Some(true),
+            )),
+            vec!["owner_identity_mismatch"],
+            json!([null, null, "owner record is unbound"]),
+        ),
+        (
+            OwnerJudgment::UnboundLegacy(attestation(
+                ProcessObservation::Live(Attested::PidOnly),
+                NotRecorded,
+                Some(true),
+            )),
             vec!["owner_unverified"],
             json!([null, null, "owner record is unbound"]),
         ),
         (
-            OwnerJudgment::Foreign,
+            OwnerJudgment::UnboundLegacy(attestation(
+                ProcessObservation::Unknown("birth denied".into()),
+                NotRecorded,
+                Some(false),
+            )),
             vec!["owner_unverified"],
+            json!([null, null, "owner record is unbound"]),
+        ),
+        (
+            OwnerJudgment::Foreign(attestation(
+                ProcessObservation::Live(Attested::Incarnation),
+                Verified,
+                Some(true),
+            )),
+            vec!["owner_unverified"],
+            json!([null, null, FOREIGN_OWNER]),
+        ),
+        (
+            OwnerJudgment::Foreign(attestation(
+                ProcessObservation::Gone(Gone::Exited),
+                NotRecorded,
+                Some(false),
+            )),
+            vec!["owner_exited"],
             json!([null, null, FOREIGN_OWNER]),
         ),
         (

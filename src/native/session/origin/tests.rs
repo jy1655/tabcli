@@ -1503,3 +1503,43 @@ fn origin_owner_verdict_names_each_binding_answer() {
         (Some(true), "owner_exited")
     );
 }
+
+// The owner record's own read bound inside the observation budget.
+#[test]
+fn an_owner_record_is_read_within_the_owner_bound() {
+    let _hooks = Hooks::new();
+    let mut environment = Environment::new();
+    let root = tempfile::tempdir().unwrap();
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let origin = Session::new(root.path(), "session-origin", "ready");
+    environment.attest(|_| {
+        attestation(
+            ProcessObservation::Gone(crate::native::process_identity::Gone::Exited),
+            ControlAttestation::NotRecorded,
+        )
+    });
+    for (size, ended, reason, detail) in [
+        (100 * 1024, Some(true), "owner_exited", None),
+        (
+            128 * 1024 + 1,
+            None,
+            "owner_unverified",
+            Some("record is 131073 bytes, over the 131072 byte read limit"),
+        ),
+    ] {
+        let mut bytes =
+            serde_json::to_vec(&json!({"pid": 7, "managed_session_id": "session-origin"})).unwrap();
+        bytes.resize(size, b' ');
+        fs::write(origin.record(CoreRecord::Owner), bytes).unwrap();
+        let observation = observed(&mut environment, root.path(), &child);
+        assert_eq!(
+            (
+                observation.ended,
+                observation.reason.as_str(),
+                observation.detail.as_deref()
+            ),
+            (ended, reason, detail),
+            "{size}"
+        );
+    }
+}

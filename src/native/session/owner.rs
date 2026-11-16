@@ -1,12 +1,130 @@
 //! Observation of a session's recorded owner process. Read-only: no record changes.
-use super::{CoreRecord, Reader, RecordReader};
+//!
+//! One observation of the Owner record (`native-session.json`) serves every reader: `read`
+//! yields its bytes under the one read policy, `judge` decodes them and judges their binding
+//! to the Session, and `attest_owner` attests the recorded process on request. Each reader
+//! maps the answer to its own vocabulary, messages and authority.
+use super::{CoreRecord, Reader};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation, classify};
 #[cfg(target_os = "macos")]
 use crate::native::terminal::ownership::NativeProcessIdentity;
-use crate::native::terminal::ownership::NativeSessionOwner;
+use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
 use agent_bridge::process_is_alive;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+
+/// The largest Owner record any reader accepts. The writers' largest is about 1.8 KiB on
+/// macOS (a 1,023-byte TTY path) and about 98.5 KiB on Windows (an executable path of
+/// 32,767 three-byte characters).
+pub(super) const LIMIT: u64 = 128 * 1024;
+
+/// The Owner record as one read observed it, judged against the Session it was read for.
+#[derive(Debug)]
+pub(in crate::native) enum OwnerRecord {
+    Absent,
+    /// The read policy refused the record (a link at its final component, not a regular
+    /// file, over `LIMIT`, not UTF-8) or its I/O failed.
+    Unreadable(anyhow::Error),
+    /// The bytes are not an Owner record.
+    Malformed {
+        path: PathBuf,
+        error: serde_json::Error,
+    },
+    Recorded(RecordedOwner),
+}
+
+#[derive(Debug)]
+pub(in crate::native) struct RecordedOwner {
+    pub(in crate::native) owner: NativeSessionOwner,
+    /// The binding to the Session the record was read for. Lifecycle readers attest the
+    /// recorded process whatever it is; only a Bound record grants control authority.
+    pub(in crate::native) binding: OwnerBinding,
+}
+
+/// The read step: the Owner record's bytes under its read policy, `None` when it is absent.
+fn read(reader: &Reader) -> Result<Option<Vec<u8>>> {
+    Ok(read_policy(reader.record(CoreRecord::Owner).path())?.ok())
+}
+
+fn read_policy(path: &Path) -> Result<std::result::Result<Vec<u8>, std::io::Error>> {
+    super::reads::read_bounded_regular_bytes(path, LIMIT)
+}
+
+/// The judge step over the read step's answer for `session`. A reader that holds its own
+/// bytes (Origin's budgeted read) judges them with `decode`.
+fn judge(bytes: Result<Option<Vec<u8>>>, path: &Path, session: &str) -> OwnerRecord {
+    match bytes {
+        Ok(None) => OwnerRecord::Absent,
+        Err(error) => OwnerRecord::Unreadable(error),
+        Ok(Some(bytes)) => match decode(&bytes, session) {
+            Ok(recorded) => OwnerRecord::Recorded(recorded),
+            Err(error) => OwnerRecord::Malformed {
+                path: path.to_owned(),
+                error,
+            },
+        },
+    }
+}
+
+/// Decodes Owner record bytes and judges their binding to `session`.
+pub(super) fn decode(bytes: &[u8], session: &str) -> serde_json::Result<RecordedOwner> {
+    let owner = super::record::owner(bytes)?;
+    let binding = owner.binding(session);
+    Ok(RecordedOwner { owner, binding })
+}
+
+/// One observation of the Owner record of the Session whose directory `reader` opens.
+pub(in crate::native) fn observe(reader: &Reader) -> OwnerRecord {
+    let path = reader.record(CoreRecord::Owner).path().to_owned();
+    judge(read(reader), &path, session_of(reader))
+}
+
+/// Whether the read found no Owner record. Only a missing record is absent: a linked,
+/// dangling, non-regular or otherwise unreadable one is present.
+#[cfg(any(windows, test))]
+pub(in crate::native) fn absent(reader: &Reader) -> bool {
+    matches!(read(reader), Ok(None))
+}
+
+fn session_of(reader: &Reader) -> &str {
+    reader
+        .directory()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+}
+
+/// The required Owner record: a missing one is `failed to read {path}` with the platform's
+/// report of the absence, a malformed one `invalid JSON in {path}`. Read by the macOS and
+/// Windows close paths; Linux has no managed surface yet.
+#[cfg(any(target_os = "macos", windows))]
+pub(super) fn required(reader: &Reader) -> Result<RecordedOwner> {
+    let path = reader.record(CoreRecord::Owner).path().to_owned();
+    let bytes =
+        read_policy(&path)?.with_context(|| format!("failed to read {}", path.display()))?;
+    decode(&bytes, session_of(reader))
+        .with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+impl OwnerRecord {
+    /// The recorded owner, `None` when absent. An unreadable record is the read's own error
+    /// and a malformed one `invalid JSON in {path}`: the readers' shared messages.
+    pub(in crate::native) fn decoded(self) -> Result<Option<RecordedOwner>> {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Unreadable(error) => Err(error),
+            Self::Malformed { path, error } => Err(anyhow::Error::new(error))
+                .with_context(|| format!("invalid JSON in {}", path.display())),
+            Self::Recorded(recorded) => Ok(Some(recorded)),
+        }
+    }
+
+    /// The record could not be read or decoded.
+    pub(in crate::native) fn unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_) | Self::Malformed { .. })
+    }
+}
 
 #[derive(Clone, Default, Serialize)]
 pub(in crate::native) struct OwnerObservation {
@@ -30,12 +148,11 @@ pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
 }
 
 /// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
+/// Launch repair attests the recorded process whatever Session the record names.
 pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
-    // Launch repair reads the owner here and attests the recorded process whatever Session
-    // the record names; whether it should consult the binding first is an open follow-up.
-    Ok(RecordReader::at(reader.record(CoreRecord::Owner).path())
-        .optional_json_with(super::record::owner)?
-        .map(|owner| attest_owner(&owner)))
+    Ok(observe(reader)
+        .decoded()?
+        .map(|recorded| attest_owner(&recorded.owner)))
 }
 
 #[derive(Debug)]
@@ -199,6 +316,25 @@ pub(in crate::native) fn attest_owner_with(
     }
 }
 
+impl OwnerObservation {
+    /// The liveness facts of an attestation without its control identity: what a record
+    /// that grants no control authority reports. A reused PID is the recorded incarnation's
+    /// death, projected as the PID's process alive with a mismatched identity.
+    pub(in crate::native) fn liveness(a: &OwnerAttestation) -> Self {
+        let (process_alive, identity_matches, error) = match &a.process {
+            ProcessObservation::Live(_) => (Some(true), None, None),
+            ProcessObservation::Gone(Gone::Exited) => (Some(false), None, None),
+            ProcessObservation::Gone(Gone::Reused(_)) => (Some(true), Some(false), None),
+            ProcessObservation::Unknown(reason) => (a.pid_alive, None, Some(reason.clone())),
+        };
+        Self {
+            process_alive,
+            identity_matches,
+            error,
+        }
+    }
+}
+
 impl From<&OwnerAttestation> for OwnerObservation {
     fn from(a: &OwnerAttestation) -> Self {
         let (process_alive, identity_matches, error) = match &a.process {
@@ -228,5 +364,7 @@ impl From<&OwnerAttestation> for OwnerObservation {
     }
 }
 
+#[cfg(test)]
+pub(in crate::native) mod damaged_tests;
 #[cfg(test)]
 pub(in crate::native) mod tests;
