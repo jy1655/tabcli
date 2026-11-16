@@ -641,19 +641,8 @@ fn assert_real_shell_preserves_large_stdin(is_cmd: bool) {
     // pwsh.exe through an absolute entry in this PATH snapshot, then the standard
     // Program Files\PowerShell\7 location. Every spawn uses the selected full path.
     let recorded_path = std::env::var_os("PATH").unwrap_or_default();
-    let test_executable = std::env::current_exe().unwrap();
-    let executable = test_executable
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tabcli.exe");
-    // No ambient binary override: all-targets builds this profile's sibling binary.
-    assert!(
-        executable.is_file(),
-        "missing {}: run cargo test --all-targets to build the required sibling tabcli.exe",
-        executable.display()
-    );
+    // No ambient binary override: all-targets builds this profile's package binary.
+    let executable = crate::native::tests::package_binary();
     let path = executable.to_string_lossy();
     if path.contains(' ') || !path.is_ascii() {
         eprintln!(
@@ -794,14 +783,7 @@ fn windows_pwsh_hook_preserves_large_unicode_results_and_nonblocking_errors() {
 fn windows_lifecycle_hook_binary_never_blocks_or_writes_stdout() {
     use crate::native::provider::codex;
     use crate::native::session::{SessionState, turn, update_status};
-    let exe = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tabcli.exe");
-    assert!(exe.is_file(), "all-targets must build tabcli.exe");
+    let exe = crate::native::tests::package_binary();
     let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
         .join("System32")
         .join("cmd.exe");
