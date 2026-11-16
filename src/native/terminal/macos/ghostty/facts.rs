@@ -11,6 +11,7 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-ghostty-host",
+    launch_host: None,
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     screen_read_refusal: Some("Ghostty's scripting dictionary exposes no screen text"),
     guarded_input_refusal: Some("managed dialog input unsupported for this terminal"),

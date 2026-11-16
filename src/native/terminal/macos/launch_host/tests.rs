@@ -175,16 +175,7 @@ fn pty_regression(kind: TerminalKind) {
         launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(directory.path());
     let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(
-        &store,
-        &receipt.claim_token,
-        if kind == TerminalKind::Iterm2 {
-            host::Terminal::Iterm2
-        } else {
-            host::Terminal::Wezterm
-        },
-    )
-    .unwrap();
+    host::initialize(&store, &receipt.claim_token, kind).unwrap();
     // This exact fixture blocks the old controlling-terminal bootstrap before the host.
     // Non-TTY capture gets EOF at the key read and then waits for the controlled release.
     fs::write(directory.path().join(".zshrc"), b"read -r -k 1 ignored\nprintf started > $HOME/capturing\nwhile [[ ! -e $HOME/release ]]; do sleep 0.01; done\nexport FIXTURE_VALUE='captured value'\nexport CODEX_THREAD_ID=removed_at_handoff\n").unwrap();
@@ -253,7 +244,7 @@ fn capture_failure_is_recorded_while_binding_is_absent() {
         launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(dir.path());
     let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(&store, &receipt.claim_token, host::Terminal::Iterm2).unwrap();
+    host::initialize(&store, &receipt.claim_token, TerminalKind::Iterm2).unwrap();
     fs::write(dir.path().join(".zshrc"), "exit 3\n").unwrap();
     let program = bootstrap(
         &executable(root.path()),
@@ -286,7 +277,7 @@ fn binding_failure_is_recorded_while_capture_is_still_running() {
         launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10)).0;
     let store = Store::open_unchecked(dir.path());
     let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(&store, &receipt.claim_token, host::Terminal::Iterm2).unwrap();
+    host::initialize(&store, &receipt.claim_token, TerminalKind::Iterm2).unwrap();
     fs::write(dir.path().join(".zshrc"), "sleep 100\n").unwrap();
     bind(&store, TerminalKind::WezTerm);
     let program = bootstrap(
@@ -319,7 +310,7 @@ fn binding_timeout_is_retained_after_receipt_expiry() {
         launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(3)).0;
     let store = Store::open_unchecked(dir.path());
     let receipt = launch::read(&store).unwrap().unwrap();
-    host::initialize(&store, &receipt.claim_token, host::Terminal::Iterm2).unwrap();
+    host::initialize(&store, &receipt.claim_token, TerminalKind::Iterm2).unwrap();
     fs::write(dir.path().join(".zshrc"), "export FIXTURE=ready\n").unwrap();
     let program = bootstrap(
         &executable(root.path()),
@@ -436,7 +427,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
                 .0;
         let store = Store::open_unchecked(directory.path());
         let token = launch::read(&store).unwrap().unwrap().claim_token;
-        host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+        host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         host::admit(&store, &token, identity).unwrap();
         apply(&store, &changes);
         let expected = expect.error(&store);
@@ -455,7 +446,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
                 .0;
         let store = Store::open_unchecked(directory.path());
         let token = launch::read(&store).unwrap().unwrap().claim_token;
-        host::initialize(&store, &token, host::Terminal::Iterm2).unwrap();
+        host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         match case {
             "unadmitted" => {}
             "failed" => {
@@ -485,4 +476,146 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// Runs only as a child of the test below, which gives it the terminal environment.
+#[test]
+fn surface_identity_probe() {
+    let Ok(mode) = std::env::var("AB_LAUNCH_HOST_IDENTITY_PROBE") else {
+        return;
+    };
+    let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
+        kind,
+        id: id.into(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: None,
+        wezterm_mux: socket.map(|socket| crate::native::terminal::WezTermMux {
+            socket: socket.into(),
+            pid: 1,
+            start_seconds: 1,
+            start_microseconds: 1,
+            owns_gui: true,
+        }),
+        windows_process_identity: None,
+    };
+    let surfaces = [
+        (
+            "iterm2 owned",
+            surface(TerminalKind::Iterm2, "owned-id", None),
+        ),
+        (
+            "iterm2 other",
+            surface(TerminalKind::Iterm2, "other-id", None),
+        ),
+        (
+            "wezterm owned",
+            surface(TerminalKind::WezTerm, "owned-id", Some("/fixture/socket")),
+        ),
+        (
+            "wezterm owned without mux",
+            surface(TerminalKind::WezTerm, "owned-id", None),
+        ),
+        (
+            "wezterm owned other gui",
+            surface(TerminalKind::WezTerm, "owned-id", Some("/fixture/other")),
+        ),
+        (
+            "wezterm other pane",
+            surface(TerminalKind::WezTerm, "other-id", Some("/fixture/socket")),
+        ),
+        (
+            "ghostty owned",
+            surface(TerminalKind::Ghostty, "owned-id", Some("/fixture/socket")),
+        ),
+    ];
+    let mut matched = Vec::new();
+    for (name, surface) in &surfaces {
+        for kind in TerminalKind::ALL {
+            if matches_surface(surface, kind) {
+                matched.push(format!("{name} as {kind:?}"));
+            }
+        }
+    }
+    println!("MATCHED {mode}: {}", matched.join(", "));
+}
+
+// Whether a bound surface names this host is read from the environment the terminal gives
+// the host: iTerm2's session id after its last colon, WezTerm's pane and GUI socket.
+#[test]
+fn launch_host_names_its_surface_from_its_terminal_environment() {
+    const OWNED_ITERM: (&str, &str) = ("ITERM_SESSION_ID", "w0t0p0:owned-id");
+    const OWNED_PANE: (&str, &str) = ("WEZTERM_PANE", "owned-id");
+    const OWNED_SOCKET: (&str, &str) = ("WEZTERM_UNIX_SOCKET", "/fixture/socket");
+    let cases = [
+        (
+            "all",
+            vec![OWNED_ITERM, OWNED_PANE, OWNED_SOCKET],
+            "iterm2 owned as Iterm2, wezterm owned as WezTerm",
+        ),
+        ("none", vec![], ""),
+        (
+            "iterm bare",
+            vec![("ITERM_SESSION_ID", "owned-id")],
+            "iterm2 owned as Iterm2",
+        ),
+        ("iterm empty", vec![("ITERM_SESSION_ID", "w0t0p0:")], ""),
+        (
+            "iterm other",
+            vec![("ITERM_SESSION_ID", "w0t0p0:other-id")],
+            "iterm2 other as Iterm2",
+        ),
+        ("wezterm pane only", vec![OWNED_PANE], ""),
+        ("wezterm socket only", vec![OWNED_SOCKET], ""),
+        (
+            "wezterm socket spelling",
+            vec![OWNED_PANE, ("WEZTERM_UNIX_SOCKET", "/fixture//socket")],
+            "wezterm owned as WezTerm",
+        ),
+        (
+            "wezterm other pane",
+            vec![("WEZTERM_PANE", "other-id"), OWNED_SOCKET],
+            "wezterm other pane as WezTerm",
+        ),
+        (
+            "wezterm other gui",
+            vec![OWNED_PANE, ("WEZTERM_UNIX_SOCKET", "/fixture/other")],
+            "wezterm owned other gui as WezTerm",
+        ),
+        (
+            "wezterm empty pane",
+            vec![("WEZTERM_PANE", ""), OWNED_SOCKET],
+            "",
+        ),
+        (
+            "iterm environment only names iterm",
+            vec![OWNED_ITERM],
+            "iterm2 owned as Iterm2",
+        ),
+    ];
+    for (mode, environment, expected) in cases {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::terminal::macos::launch_host::tests::surface_identity_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove("ITERM_SESSION_ID")
+            .env_remove("WEZTERM_PANE")
+            .env_remove("WEZTERM_UNIX_SOCKET")
+            .envs(environment)
+            .env("AB_LAUNCH_HOST_IDENTITY_PROBE", mode)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{mode}: {stdout}");
+        let prefix = format!("MATCHED {mode}: ");
+        let line = stdout
+            .lines()
+            .find_map(|line| line.split_once(&prefix).map(|(_, matched)| matched))
+            .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        assert_eq!(line, expected, "{mode}");
+    }
 }

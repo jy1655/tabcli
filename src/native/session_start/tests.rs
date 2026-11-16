@@ -313,6 +313,18 @@ fn a_host_failure_before_the_fence_settles_the_pending_receipt() {
     assert_settled_before_fence(&fixture, &prepared, &report);
 }
 
+// Each launch host terminal records its launch host before the fence: a WezTerm start
+// reaches the same host step as an iTerm2 start.
+#[test]
+fn a_wezterm_start_reaches_the_launch_host_step_before_the_fence() {
+    let mut fixture = Fixture::host_failure();
+    fixture.terminal_kind = terminal::TerminalKind::WezTerm;
+    let prepared = fixture.prepare().unwrap();
+    let (error, report) = run(&prepared, &FreshSource);
+    assert_eq!(format!("{error:#}"), "launch host is already recorded");
+    assert_settled_before_fence(&fixture, &prepared, &report);
+}
+
 // The request deadline is already spent when the launch begins: the host step refuses the
 // receipt whose deadline has passed, before the fence.
 #[test]

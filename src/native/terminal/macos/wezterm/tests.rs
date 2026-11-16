@@ -1460,7 +1460,7 @@ fn the_gate_of_the_pane_is_a_command_that_the_executable_routes_here() {
         [HOST_COMMAND, "/s/session-a1", "--launch-command", "wrapper"]
     );
     assert!(
-        matches!(parse_args(program[1..].iter().cloned()).unwrap(), NativeCommand::Host(crate::native::terminal::host::HostCommand::WezTermLaunch { directory, command }) if directory == Path::new("/s/session-a1") && command == "wrapper")
+        matches!(parse_args(program[1..].iter().cloned()).unwrap(), NativeCommand::Host(crate::native::terminal::host::HostCommand::Launch { kind: TerminalKind::WezTerm, directory, command }) if directory == Path::new("/s/session-a1") && command == "wrapper")
     );
 
     assert!(is_command("native-wezterm-host"));
@@ -1764,6 +1764,123 @@ fn the_launch_host_starts_only_for_the_bound_pane_of_a_pending_launch() {
     fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let error = run_host(fixture.path()).unwrap_err();
     assert!(format!("{error:#}").contains("not private"), "{error:#}");
+}
+
+// The host's identity and the one rule both WezTerm hosts use to recognize their surface,
+// decided without a terminal.
+#[test]
+fn host_pane_and_binding_rule_need_no_terminal() {
+    use std::env::VarError;
+    use std::ffi::OsString;
+    let pane = |pane: Result<String, VarError>, socket: Option<&str>| {
+        host_pane(pane, socket.map(OsString::from)).map_err(|error| format!("{error:#}"))
+    };
+    assert_eq!(
+        pane(Ok("8".into()), Some(SOCKET)),
+        Ok(("8".into(), SOCKET.into()))
+    );
+    assert_eq!(
+        pane(Err(VarError::NotPresent), Some(SOCKET)),
+        Err("WezTerm did not name the pane of this host: environment variable not found".into())
+    );
+    // The pane is read first.
+    assert_eq!(
+        pane(Err(VarError::NotPresent), None),
+        Err("WezTerm did not name the pane of this host: environment variable not found".into())
+    );
+    assert_eq!(
+        pane(Ok("8".into()), None),
+        Err("WezTerm did not name the GUI of this host".into())
+    );
+    let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
+        kind,
+        id: id.into(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: None,
+        wezterm_mux: socket.map(|socket| WezTermMux {
+            socket: socket.into(),
+            pid: PID,
+            start_seconds: BIRTH.0,
+            start_microseconds: BIRTH.1,
+            owns_gui: false,
+        }),
+        windows_process_identity: None,
+    };
+    let names = |surface: &TerminalSession, socket: &str| {
+        binding_names_host(surface, "8", Path::new(socket))
+    };
+    assert!(names(
+        &surface(TerminalKind::WezTerm, "8", Some(SOCKET)),
+        SOCKET
+    ));
+    // The same socket in another spelling is the same socket.
+    assert!(names(
+        &surface(TerminalKind::WezTerm, "8", Some(SOCKET)),
+        "/Users/tester//.local/share/wezterm/gui-sock-4242"
+    ));
+    assert!(!names(
+        &surface(TerminalKind::WezTerm, "9", Some(SOCKET)),
+        SOCKET
+    ));
+    assert!(!names(
+        &surface(TerminalKind::WezTerm, "8", Some(SOCKET)),
+        "/Users/tester/.local/share/wezterm/gui-sock-4243"
+    ));
+    assert!(!names(&surface(TerminalKind::WezTerm, "8", None), SOCKET));
+    for kind in TerminalKind::ALL {
+        if kind != TerminalKind::WezTerm {
+            assert!(
+                !names(&surface(kind, "8", Some(SOCKET)), SOCKET),
+                "{kind:?}"
+            );
+        }
+    }
+}
+
+// The legacy host accepts only a binding that names its own pane and GUI, and refuses any
+// other with one text.
+#[test]
+fn wezterm_host_binding_names_its_pane_or_refuses_with_one_text() {
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::session::test_support::TERMINAL_HANDLE_FILE;
+    const REFUSAL: &str = "WezTerm surface binding does not name the pane of this launch host";
+    for (case, expected) in [
+        ("owned", None),
+        ("another pane", Some(REFUSAL)),
+        ("another GUI", Some(REFUSAL)),
+        ("no GUI", Some(REFUSAL)),
+        ("another terminal", Some(REFUSAL)),
+    ] {
+        let fixture = launch_fixture();
+        let directory = fixture.path();
+        let id = directory.file_name().unwrap().to_str().unwrap();
+        let mut bound = serde_json::json!({
+            "terminal": "wezterm", "session_id": "8", "tab_id": "8", "window_id": "7",
+            "managed_session_id": id,
+            "wezterm_mux": {
+                "socket": SOCKET, "pid": PID, "start_seconds": BIRTH.0,
+                "start_microseconds": BIRTH.1, "owns_gui": false
+            },
+        });
+        match case {
+            "another pane" => bound["session_id"] = "9".into(),
+            "another GUI" => {
+                bound["wezterm_mux"]["socket"] =
+                    "/Users/tester/.local/share/wezterm/gui-sock-4243".into()
+            }
+            "no GUI" => {
+                bound.as_object_mut().unwrap().remove("wezterm_mux");
+            }
+            "another terminal" => bound["terminal"] = "iterm2".into(),
+            _ => {}
+        }
+        write_json_atomic(&directory.join(TERMINAL_HANDLE_FILE), &bound).unwrap();
+        let actual = wait_for_binding(directory, id, "8", Path::new(SOCKET), &mut SystemClock)
+            .err()
+            .map(|error| format!("{error:#}"));
+        assert_eq!(actual.as_deref(), expected, "{case}");
+    }
 }
 
 #[test]

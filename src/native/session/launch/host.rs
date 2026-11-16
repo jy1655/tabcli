@@ -4,16 +4,89 @@ use super::Record;
 use super::pending::{self, Expiry};
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, Store, record};
+use crate::native::terminal::TerminalKind;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub(in crate::native) const LIMIT: u64 = 16 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(in crate::native) enum Terminal {
-    Iterm2,
-    Wezterm,
+const LAUNCH_HOST_COUNT: usize = {
+    let mut count = 0;
+    let mut index = 0;
+    while index < TerminalKind::ALL.len() {
+        if TerminalKind::ALL[index].uses_launch_host() {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+};
+
+/// The wire names of the kinds that use the launch host, in declaration order: the only
+/// terminals a host record can name.
+const LAUNCH_HOST_NAMES: [&str; LAUNCH_HOST_COUNT] = {
+    let mut names = [""; LAUNCH_HOST_COUNT];
+    let mut index = 0;
+    let mut next = 0;
+    while index < TerminalKind::ALL.len() {
+        let kind = TerminalKind::ALL[index];
+        if kind.uses_launch_host() {
+            names[next] = kind.as_str();
+            next += 1;
+        }
+        index += 1;
+    }
+    names
+};
+
+/// The record's `terminal`: a kind that uses the launch host, read as an externally tagged
+/// unit variant through the same deserializer calls that a derived enum makes, so that a
+/// refused value gets serde's own message (`unknown variant ..., expected ...`) naming the
+/// accepted kinds, at the same position.
+fn launch_host_kind<'de, D>(deserializer: D) -> std::result::Result<TerminalKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{DeserializeSeed, EnumAccess, Error, VariantAccess, Visitor};
+    use std::fmt;
+    struct Name;
+    impl<'de> Visitor<'de> for Name {
+        type Value = TerminalKind;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("variant identifier")
+        }
+        fn visit_str<E: Error>(self, value: &str) -> std::result::Result<TerminalKind, E> {
+            TerminalKind::ALL
+                .into_iter()
+                .find(|kind| kind.uses_launch_host() && kind.as_str() == value)
+                .ok_or_else(|| E::unknown_variant(value, &LAUNCH_HOST_NAMES))
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Name {
+        type Value = TerminalKind;
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<TerminalKind, D::Error> {
+            deserializer.deserialize_identifier(self)
+        }
+    }
+    struct Kind;
+    impl<'de> Visitor<'de> for Kind {
+        type Value = TerminalKind;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a terminal kind that uses the launch host")
+        }
+        fn visit_enum<A: EnumAccess<'de>>(
+            self,
+            data: A,
+        ) -> std::result::Result<TerminalKind, A::Error> {
+            let (kind, variant) = data.variant_seed(Name)?;
+            variant.unit_variant()?;
+            Ok(kind)
+        }
+    }
+    deserializer.deserialize_enum("TerminalKind", &LAUNCH_HOST_NAMES, Kind)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -64,7 +137,8 @@ pub(in crate::native) struct HostRecord {
     pub(in crate::native) schema: u32,
     pub(in crate::native) managed_session_id: String,
     pub(in crate::native) claim_token: String,
-    pub(in crate::native) terminal: Terminal,
+    #[serde(deserialize_with = "launch_host_kind")]
+    pub(in crate::native) terminal: TerminalKind,
     pub(in crate::native) stage: Stage,
     pub(in crate::native) host: Option<HostIdentity>,
     pub(in crate::native) updated_unix_ms: u128,
@@ -147,7 +221,11 @@ fn write(store: &Store, host: &HostRecord) -> Result<()> {
     store.record(CoreRecord::LaunchHost).write_json(host)
 }
 
-pub(in crate::native) fn initialize(store: &Store, token: &str, terminal: Terminal) -> Result<()> {
+pub(in crate::native) fn initialize(
+    store: &Store,
+    token: &str,
+    terminal: TerminalKind,
+) -> Result<()> {
     let _lock = store.lock()?;
     eligible(store, token, true)?;
     if store
@@ -320,8 +398,8 @@ mod tests {
             observe(&store, None),
             HostObservation::NotRecorded
         ));
-        initialize(&store, &token, Terminal::Iterm2).unwrap();
-        assert!(initialize(&store, &token, Terminal::Iterm2).is_err());
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
+        assert!(initialize(&store, &token, TerminalKind::Iterm2).is_err());
         assert_eq!(read(&store).stage, Stage::AwaitingHost);
         admit(&store, &token, identity()).unwrap();
         let before = store.record(CoreRecord::LaunchHost).bytes().unwrap();
@@ -381,7 +459,7 @@ mod tests {
             "incarnation",
         ] {
             let (_dir, store, token) = fixture();
-            initialize(&store, &token, Terminal::Wezterm).unwrap();
+            initialize(&store, &token, TerminalKind::WezTerm).unwrap();
             admit(&store, &token, identity()).unwrap();
             let mut id = identity();
             match case {
@@ -446,7 +524,7 @@ mod tests {
     #[test]
     fn historical_observation_uses_receipt_and_session_identity() {
         let (_dir, store, token) = fixture();
-        initialize(&store, &token, Terminal::Iterm2).unwrap();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         std::fs::write(store.record(CoreRecord::TurnClaim).path(), b"later").unwrap();
         assert_eq!(read(&store).claim_token, token);
         assert!(matches!(
@@ -473,7 +551,7 @@ mod tests {
     #[test]
     fn decoder_is_bounded_typed_and_reports_future_schema() {
         let (_dir, store, token) = fixture();
-        initialize(&store, &token, Terminal::Iterm2).unwrap();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         let host = read(&store);
         for (key, value) in [
             ("terminal", serde_json::json!("ghostty")),
@@ -512,7 +590,7 @@ mod tests {
     #[test]
     fn expired_current_launch_can_record_failure_but_cannot_advance() {
         let (_dir, store, token) = fixture();
-        initialize(&store, &token, Terminal::Iterm2).unwrap();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         admit(&store, &token, identity()).unwrap();
         let mut receipt = super::super::read(&store).unwrap().unwrap();
         receipt.deadline_unix_ms = 0;
@@ -710,7 +788,7 @@ mod tests {
         ] {
             let (_dir, store, token) = fixture();
             if initialized {
-                initialize(&store, &token, Terminal::Iterm2).unwrap();
+                initialize(&store, &token, TerminalKind::Iterm2).unwrap();
             }
             apply(&store, &changes);
             let actual = current(&store, &token, true)
@@ -725,7 +803,7 @@ mod tests {
     #[test]
     fn concurrent_admission_has_exactly_one_winner() {
         let (_dir, store, token) = fixture();
-        initialize(&store, &token, Terminal::Iterm2).unwrap();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         let barrier = std::sync::Barrier::new(2);
         let wins = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..2)
@@ -748,5 +826,232 @@ mod tests {
                 .sum::<usize>()
         });
         assert_eq!(wins, 1);
+    }
+
+    // The record names exactly the kinds whose registration declares a launch host, by
+    // their wire names; the writer refuses any other kind.
+    #[test]
+    fn record_accepts_exactly_the_registered_launch_host_kinds() {
+        assert_eq!(LAUNCH_HOST_NAMES, ["iterm2", "wezterm"]);
+        let (_dir, store, token) = fixture();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
+        let mut host = serde_json::to_value(read(&store)).unwrap();
+        for kind in TerminalKind::ALL {
+            let wire = serde_json::to_value(kind).unwrap();
+            assert_eq!(wire, kind.as_str());
+            host["terminal"] = wire;
+            match record::launch_host(&serde_json::to_vec(&host).unwrap()) {
+                Ok(HostObservation::Recorded(record)) => {
+                    assert!(kind.uses_launch_host(), "{kind:?}");
+                    assert_eq!(record.terminal, kind);
+                }
+                Ok(other) => panic!("{kind:?}: {other:?}"),
+                Err(error) => {
+                    assert!(!kind.uses_launch_host(), "{kind:?}");
+                    let expected = format!(
+                        "unknown variant `{}`, expected `iterm2` or `wezterm` at line 1 column ",
+                        kind.as_str()
+                    );
+                    assert!(error.to_string().starts_with(&expected), "{error}");
+                }
+            }
+        }
+        let (_dir, store, token) = fixture();
+        let error = initialize(&store, &token, TerminalKind::Ghostty).unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with(
+                "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 1 column "
+            ),
+            "{error:#}"
+        );
+        assert!(
+            store
+                .record(CoreRecord::LaunchHost)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // The writer's bytes name each launch host terminal by its wire word.
+    #[test]
+    fn host_record_bytes_name_each_launch_host_terminal() {
+        for (terminal, word) in [
+            (TerminalKind::Iterm2, "iterm2"),
+            (TerminalKind::WezTerm, "wezterm"),
+        ] {
+            let (_dir, store, token) = fixture();
+            initialize(&store, &token, terminal).unwrap();
+            let bytes = store
+                .record(CoreRecord::LaunchHost)
+                .bytes()
+                .unwrap()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let expected = format!(
+                "{{\n  \"schema\": 1,\n  \"managed_session_id\": \"{}\",\n  \"claim_token\": \"{token}\",\n  \"terminal\": \"{word}\",\n  \"stage\": \"awaiting_host\",\n  \"host\": null,\n  \"updated_unix_ms\": {},\n  \"elapsed_ms\": 0,\n  \"capture_budget_ms\": 0,\n  \"capture_elapsed_ms\": null,\n  \"variables\": null,\n  \"background_children_stopped\": null,\n  \"failure\": null\n}}",
+                store.directory().file_name().unwrap().to_str().unwrap(),
+                value["updated_unix_ms"],
+            );
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+            assert_eq!(read(&store).terminal, terminal);
+        }
+    }
+
+    // A terminal without a launch host, or no terminal at all, is refused with serde's
+    // own wording, which `observe` and doctor report unchanged.
+    #[test]
+    fn decoder_refuses_a_terminal_without_a_launch_host_in_serde_wording() {
+        let (_dir, store, token) = fixture();
+        initialize(&store, &token, TerminalKind::Iterm2).unwrap();
+        let text = String::from_utf8(
+            store
+                .record(CoreRecord::LaunchHost)
+                .bytes()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let line = "\"terminal\": \"iterm2\"";
+        assert_eq!(text.matches(line).count(), 1);
+        let outcome = |value: &str| {
+            let bytes = text.replace(line, &format!("\"terminal\": {value}"));
+            let outcome = match record::launch_host(bytes.as_bytes()) {
+                Ok(HostObservation::Recorded(host)) => {
+                    format!(
+                        "recorded {}",
+                        serde_json::to_string(&host.terminal).unwrap()
+                    )
+                }
+                Ok(other) => format!("{other:?}"),
+                Err(error) => error.to_string(),
+            };
+            format!("{value} => {outcome}")
+        };
+        let actual: Vec<_> = [
+            r#""iterm2""#,
+            r#""wezterm""#,
+            r#""ghostty""#,
+            r#""kitty""#,
+            r#""ITERM2""#,
+            r#""WezTerm""#,
+            r#""apple-terminal""#,
+            r#""warp""#,
+            r#""windows-console""#,
+            r#""""#,
+            "1",
+            "null",
+            "true",
+            r#"["iterm2"]"#,
+            r#"{"iterm2": null}"#,
+            r#"{"wezterm": null}"#,
+            r#"{"ghostty": null}"#,
+            r#"{"iterm2": 1}"#,
+            "{}",
+            r#"{"iterm2": null, "wezterm": null}"#,
+            r#""ghostty"  "#,
+        ]
+        .into_iter()
+        .map(outcome)
+        .collect();
+        let expected = [
+            r#""iterm2" => recorded "iterm2""#,
+            r#""wezterm" => recorded "wezterm""#,
+            r#""ghostty" => unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23"#,
+            r#""kitty" => unknown variant `kitty`, expected `iterm2` or `wezterm` at line 5 column 21"#,
+            r#""ITERM2" => unknown variant `ITERM2`, expected `iterm2` or `wezterm` at line 5 column 22"#,
+            r#""WezTerm" => unknown variant `WezTerm`, expected `iterm2` or `wezterm` at line 5 column 23"#,
+            r#""apple-terminal" => unknown variant `apple-terminal`, expected `iterm2` or `wezterm` at line 5 column 30"#,
+            r#""warp" => unknown variant `warp`, expected `iterm2` or `wezterm` at line 5 column 20"#,
+            r#""windows-console" => unknown variant `windows-console`, expected `iterm2` or `wezterm` at line 5 column 31"#,
+            r#""" => unknown variant ``, expected `iterm2` or `wezterm` at line 5 column 16"#,
+            "1 => expected value at line 5 column 15",
+            "null => expected value at line 5 column 15",
+            "true => expected value at line 5 column 15",
+            r#"["iterm2"] => expected value at line 5 column 15"#,
+            r#"{"iterm2": null} => recorded "iterm2""#,
+            r#"{"wezterm": null} => recorded "wezterm""#,
+            r#"{"ghostty": null} => unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 24"#,
+            r#"{"iterm2": 1} => invalid type: integer `1`, expected unit at line 5 column 26"#,
+            "{} => expected value at line 5 column 16",
+            r#"{"iterm2": null, "wezterm": null} => expected value at line 5 column 29"#,
+            r#""ghostty"   => unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23"#,
+        ];
+        assert_eq!(actual, expected);
+        std::fs::write(
+            store.record(CoreRecord::LaunchHost).path(),
+            text.replace(line, "\"terminal\": \"ghostty\""),
+        )
+        .unwrap();
+        match observe(&store, super::super::read(&store).unwrap().as_ref()) {
+            HostObservation::Unreadable(reason) => assert_eq!(
+                reason,
+                "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // The timeline's launch host entry names the terminal by the record's wire word, and
+    // reports a terminal without a launch host as the decoder's text.
+    #[test]
+    fn timeline_names_each_launch_host_terminal_and_reports_others_unreadable() {
+        let mut actual = Vec::new();
+        for case in ["iterm2", "wezterm", "ghostty"] {
+            let (dir, store, token) = fixture();
+            crate::native::session::test_support::write_test_manifest(dir.path(), "codex");
+            initialize(
+                &store,
+                &token,
+                if case == "wezterm" {
+                    TerminalKind::WezTerm
+                } else {
+                    TerminalKind::Iterm2
+                },
+            )
+            .unwrap();
+            if case == "ghostty" {
+                let path = store.record(CoreRecord::LaunchHost).path().to_owned();
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(
+                    &path,
+                    text.replace("\"terminal\": \"iterm2\"", "\"terminal\": \"ghostty\""),
+                )
+                .unwrap();
+            }
+            let id = dir.path().file_name().unwrap().to_str().unwrap();
+            let timeline = crate::native::query::timeline_value(&store, id, None).unwrap();
+            let mut entry = None;
+            let mut stack = vec![&timeline];
+            while let Some(value) = stack.pop() {
+                match value {
+                    serde_json::Value::Object(map) => {
+                        if map.get("stage") == Some(&serde_json::json!("launch_host")) {
+                            entry = Some(value.clone());
+                        }
+                        stack.extend(map.values());
+                    }
+                    serde_json::Value::Array(values) => stack.extend(values),
+                    _ => {}
+                }
+            }
+            let entry = entry.unwrap();
+            let detail = &entry["detail"];
+            actual.push(format!(
+                "{case}: {} {}",
+                entry["record_state"],
+                if detail.is_object() {
+                    detail["terminal"].clone()
+                } else {
+                    detail.clone()
+                }
+            ));
+        }
+        let expected = [
+            r#"iterm2: "observed" "iterm2""#,
+            r#"wezterm: "observed" "wezterm""#,
+            r#"ghostty: "unreadable" "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23""#,
+        ];
+        assert_eq!(actual, expected);
     }
 }

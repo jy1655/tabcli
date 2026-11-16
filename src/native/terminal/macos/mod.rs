@@ -1,10 +1,8 @@
-pub(in crate::native::terminal) mod launch_host;
-// A1 API, consumed by hosts and doctor in later units.
 mod bound_host;
 mod close_transaction;
+pub(in crate::native::terminal) mod launch_host;
 pub(in crate::native) mod ownership;
 pub(in crate::native) mod process;
-#[allow(dead_code)]
 pub(in crate::native) mod shell_environment;
 
 use std::{

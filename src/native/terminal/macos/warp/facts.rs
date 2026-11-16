@@ -10,6 +10,7 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-warp-host",
+    launch_host: None,
     close_evidence: CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext,
     screen_read_refusal: Some(
         "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",

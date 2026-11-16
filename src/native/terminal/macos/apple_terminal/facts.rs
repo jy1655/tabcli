@@ -13,6 +13,7 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: true,
     },
     host_command: "native-terminal-host",
+    launch_host: None,
     close_evidence: CloseEvidenceChoice::AppleTerminal,
     screen_read_refusal: None,
     guarded_input_refusal: None,

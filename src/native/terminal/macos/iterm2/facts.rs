@@ -1,5 +1,5 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, LaunchHostFacts, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 #[cfg(target_os = "macos")]
@@ -13,6 +13,10 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: true,
     },
     host_command: "native-iterm2-host",
+    launch_host: Some(LaunchHostFacts {
+        #[cfg(target_os = "macos")]
+        binding_names_host: crate::native::terminal::macos::iterm2::binding_names_this_host,
+    }),
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     screen_read_refusal: None,
     guarded_input_refusal: None,
