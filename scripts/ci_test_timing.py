@@ -16,6 +16,10 @@ import time
 
 
 COMMAND = ["cargo", "test", "--all-targets", "--all-features", "--", "--test-threads=1"]
+# An absolute directory for the tests' TEMP and TMP, used only on an NTFS volume (see
+# docs/testing.md#windows-ci-performance-observations). Not passed on to the tests.
+FIXTURE_TEMP_ENV = "CI_TEST_FIXTURE_TEMP"
+FIXTURE_FILESYSTEM = "NTFS"
 ENVIRONMENT = (
     "RUNNER_OS", "RUNNER_ARCH", "RUNNER_ENVIRONMENT", "ImageOS", "ImageVersion",
     "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "GITHUB_EVENT_NAME",
@@ -185,6 +189,53 @@ def metadata(cwd):
     }
 
 
+def volume_filesystem(path):
+    """Name the file system of the volume that holds an existing path; None if unknown."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.GetVolumePathNameW.restype = wintypes.BOOL
+    kernel32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, wintypes.LPDWORD,
+        wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+    root = ctypes.create_unicode_buffer(32768)
+    if not kernel32.GetVolumePathNameW(str(path), root, len(root)):
+        return None
+    name = ctypes.create_unicode_buffer(261)
+    if not kernel32.GetVolumeInformationW(root.value, None, 0, None, None, None, name, len(name)):
+        return None
+    return name.value
+
+
+def fixture_temp(requested, filesystem=None):
+    """Return the TEMP/TMP overrides for the tests and the record of that decision."""
+    filesystem = volume_filesystem if filesystem is None else filesystem
+    requested = Path(requested)
+    if not requested.is_absolute():
+        raise ValueError(f"{FIXTURE_TEMP_ENV} is not an absolute path: {requested}")
+    existing = requested
+    while not existing.exists() and existing.parent != existing:
+        existing = existing.parent
+    name = filesystem(existing)
+    record = {"requested": str(requested), "filesystem": name, "applied": False, "temp": None}
+    if name != FIXTURE_FILESYSTEM:
+        return {}, record
+    requested.mkdir(parents=True, exist_ok=True)
+    record.update(applied=True, temp=str(requested))
+    return {"TEMP": str(requested), "TMP": str(requested)}, record
+
+
+def fixture_condition(data):
+    value = data["metadata"].get("fixture_temp")
+    if isinstance(value, dict) and value.get("applied") is True:
+        return value.get("filesystem")
+    return None
+
+
 def suite_complete(suite):
     return (suite.get("target") is not None and suite.get("reported_seconds") is not None
             and suite.get("parsed_tests") == sum(suite.get(key, 0) for key in ["passed", "failed", "ignored"]))
@@ -207,6 +258,15 @@ def cell(value):
     return html.escape(str(value)).replace("|", "&#124;").replace("\n", "<br>")
 
 
+def fixture_text(value):
+    if not isinstance(value, dict):
+        return "default"
+    if value.get("applied") is True:
+        return f"{cell(value.get('temp'))} ({cell(value.get('filesystem'))})"
+    return (f"default; {cell(value.get('requested'))} is on "
+            f"{cell(value.get('filesystem') or 'an unknown file system')}, not {FIXTURE_FILESYSTEM}")
+
+
 def markdown(data):
     meta, observation = data["metadata"], data["observation"]
     env = meta["environment"]
@@ -214,6 +274,7 @@ def markdown(data):
              f"Source: {cell(meta['source_sha'])}", "",
              f"Runner: {cell(env.get('RUNNER_OS'))} / {cell(env.get('RUNNER_ARCH'))}; "
              f"image: {cell(env.get('ImageOS'))} {cell(env.get('ImageVersion'))}", "",
+             f"Test fixture TEMP: {fixture_text(meta.get('fixture_temp'))}", "",
              f"Cargo exit: {data['returncode']}; observed command: {data['elapsed_seconds']:.3f}s.",
              "", "| Suite | Passed | Failed | Ignored | libtest seconds |",
              "| --- | ---: | ---: | ---: | ---: |"]
@@ -233,7 +294,7 @@ def markdown(data):
     return "\n".join(lines)
 
 
-def run(output, cwd, command=None, stream=None, details=None):
+def run(output, cwd, command=None, stream=None, details=None, environment=None):
     command = list(COMMAND if command is None else command)
     stream = sys.stdout.buffer if stream is None else stream
     details = metadata(cwd) if details is None else details
@@ -254,7 +315,7 @@ def run(output, cwd, command=None, stream=None, details=None):
     try:
         try:
             child = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT, env=environment)
         except OSError as error:
             errors.append(str(error))
         else:
@@ -331,6 +392,15 @@ def read_record(path):
     for key in ["source_sha", "rustc", "cargo"]:
         if key not in meta or meta[key] is not None and not isinstance(meta[key], str):
             raise ValueError(f"{path}: invalid {key}")
+    # Records from before the fixture volume have no fixture_temp: the default TEMP.
+    fixture = meta.get("fixture_temp")
+    if fixture is not None and (
+        not isinstance(fixture, dict) or type(fixture.get("applied")) is not bool
+        or not isinstance(fixture.get("requested"), str)
+        or any(fixture.get(key) is not None and not isinstance(fixture[key], str)
+               for key in ["filesystem", "temp"])
+    ):
+        raise ValueError(f"{path}: invalid fixture_temp")
     obs = data.get("observation")
     if not isinstance(obs, dict) or not isinstance(obs.get("suites"), list):
         raise ValueError(f"{path}: missing suite observations")
@@ -368,6 +438,8 @@ def compare(before, after):
             mismatches.append(key)
     if before["command"] != after["command"]:
         mismatches.append("command")
+    if fixture_condition(before) != fixture_condition(after):
+        mismatches.append("test fixture TEMP volume")
     if any(data["metadata"].get("source_dirty") is not False for data in [before, after]):
         mismatches.append("dirty or unknown source checkout")
     def suite_counts(data):
@@ -423,6 +495,21 @@ def compare(before, after):
     return "\n".join(lines) + "\n"
 
 
+def record_run(output, cwd, command=None, stream=None):
+    details = metadata(cwd)
+    requested = os.environ.get(FIXTURE_TEMP_ENV)
+    if not requested:
+        return run(output, cwd, command, stream, details)
+    overrides, details["fixture_temp"] = fixture_temp(requested)
+    if not details["fixture_temp"]["applied"]:
+        name = details["fixture_temp"]["filesystem"] or "an unknown file system"
+        print(f"::warning::Test fixtures stay on the default TEMP: {requested} is on {name}, "
+              f"not {FIXTURE_FILESYSTEM}", flush=True)
+    environment = {key: value for key, value in os.environ.items() if key != FIXTURE_TEMP_ENV}
+    environment.update(overrides)
+    return run(output, cwd, command, stream, details, environment)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -434,7 +521,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.action == "run":
-            return run(args.output_dir, Path.cwd())
+            return record_run(args.output_dir, Path.cwd())
         print(compare(read_record(args.before), read_record(args.after)), end="")
         return 0
     except (OSError, ValueError, KeyError, TypeError) as error:
