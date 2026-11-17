@@ -50,9 +50,12 @@ impl std::str::FromStr for BootId {
             hex.iter().all(u8::is_ascii_hexdigit),
             "invalid Linux boot_id"
         );
+        let (pairs, []) = hex.as_chunks::<2>() else {
+            anyhow::bail!("invalid Linux boot_id");
+        };
         let mut bytes = [0; 16];
-        for (i, pair) in hex.chunks_exact(2).enumerate() {
-            bytes[i] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+        for (byte, pair) in bytes.iter_mut().zip(pairs) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
         }
         Ok(Self(bytes))
     }
