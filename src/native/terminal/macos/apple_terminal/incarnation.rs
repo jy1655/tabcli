@@ -8,7 +8,7 @@ use crate::native::terminal::macos::process::{
     macos_process_path, macos_process_records, macos_processes_named,
 };
 use crate::native::terminal::ownership::{
-    MacTerminalAppIdentity, MacTerminalShellIdentity, NativeSessionOwner,
+    MacTerminalAppIdentity, NativeSessionOwner, TerminalShellIdentity,
 };
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -146,7 +146,7 @@ pub(super) fn terminal_app_process(owner: &NativeSessionOwner) -> Result<MacTerm
 }
 
 fn terminal_app_process_with(
-    shell: &MacTerminalShellIdentity,
+    shell: &TerminalShellIdentity,
     mut observe: impl FnMut(u32) -> Result<(MacTerminalAppIdentity, u32, String)>,
 ) -> Result<MacTerminalAppIdentity> {
     let mut pid = shell.pid;

@@ -586,7 +586,7 @@ fn assert_core_record_contract(extension: &str) {
             CoreRecord::Terminal => false,
             CoreRecord::TerminalClosing => false,
             CoreRecord::TerminalClosed => false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             CoreRecord::TerminalCloseIntent => false,
             CoreRecord::LegacyResumePending => false,
             CoreRecord::LegacyResumeRunning => false,
@@ -612,7 +612,7 @@ fn assert_core_record_contract(extension: &str) {
         CoreRecord::Terminal,
         CoreRecord::TerminalClosing,
         CoreRecord::TerminalClosed,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         CoreRecord::TerminalCloseIntent,
         CoreRecord::LegacyResumePending,
         CoreRecord::LegacyResumeRunning,

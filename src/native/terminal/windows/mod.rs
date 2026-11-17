@@ -172,6 +172,7 @@ where
         }
     };
     let mut session = TerminalSession {
+        linux_host: None,
         kind,
         id: surface.pid().to_string(),
         tab_id: None,

@@ -6,7 +6,7 @@
 //! maps the answer to its own vocabulary, messages and authority.
 use super::{CoreRecord, Reader};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation, classify};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::NativeProcessIdentity;
 use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
 use agent_bridge::process_is_alive;
@@ -21,6 +21,7 @@ pub(super) const LIMIT: u64 = 128 * 1024;
 
 /// The Owner record as one read observed it, judged against the Session it was read for.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Keep the decoded observation by value; births add fixed-size evidence.
 pub(in crate::native) enum OwnerRecord {
     Absent,
     /// The read policy refused the record (a link at its final component, not a regular
@@ -98,7 +99,7 @@ fn session_of(reader: &Reader) -> &str {
 /// The required Owner record: a missing one is `failed to read {path}` with the platform's
 /// report of the absence, a malformed one `invalid JSON in {path}`. Read by the macOS and
 /// Windows close paths; Linux has no managed surface yet.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(super) fn required(reader: &Reader) -> Result<RecordedOwner> {
     let path = reader.record(CoreRecord::Owner).path().to_owned();
     let bytes =
@@ -165,11 +166,11 @@ pub(in crate::native) struct OwnerAttestation {
 #[derive(Debug)]
 pub(in crate::native) enum ControlAttestation {
     NotRecorded,
-    #[cfg(any(target_os = "macos", windows, test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     Verified,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     Changed(String),
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     Unknown(String),
 }
 
@@ -177,11 +178,51 @@ pub(in crate::native) struct OwnerObservers<'a> {
     pub pid_alive: &'a dyn Fn(u32) -> bool,
     #[cfg(target_os = "macos")]
     pub birth: &'a dyn Fn(u32) -> Result<Option<(u64, u64)>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "linux")]
+    pub birth: &'a dyn Fn(u32) -> Result<Option<ProcessBirth>>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub control: &'a dyn Fn(u32) -> Result<Option<NativeProcessIdentity>>,
     #[cfg(windows)]
     pub identity:
         &'a dyn Fn(u32) -> Result<Option<crate::native::terminal::WindowsProcessIdentity>>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::native) use crate::native::terminal::ownership::ProcessBirth;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recorded_birth(owner: &NativeSessionOwner) -> std::result::Result<Option<ProcessBirth>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if owner.process_start_seconds.is_some()
+            || owner.process_start_microseconds.is_some()
+            || owner.windows_process_identity.is_some()
+        {
+            return Err("foreign or mixed platform owner birth on Linux".into());
+        }
+        Ok(owner.linux_birth.map(ProcessBirth::Linux))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if owner.linux_birth.is_some() {
+            return Err("foreign Linux owner birth on macOS".into());
+        }
+        Ok(owner
+            .process_start_seconds
+            .zip(owner.process_start_microseconds)
+            .map(|(s, us)| ProcessBirth::Macos(s, us)))
+    }
+}
+#[cfg(target_os = "linux")]
+fn process_birth(pid: u32) -> Result<Option<ProcessBirth>> {
+    crate::native::terminal::linux::process::process_birth(pid)
+        .map(|birth| birth.map(ProcessBirth::Linux))
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_control(pid: u32) -> Result<Option<NativeProcessIdentity>> {
+    #[cfg(target_os = "macos")]
+    return crate::native::terminal::macos::process::live_native_process_identity_if_present(pid);
+    #[cfg(target_os = "linux")]
+    return crate::native::terminal::linux::process::live_native_process_identity_if_present(pid);
 }
 
 /// Reads only the supplied owner and OS evidence. Never acquires a session lock or reads records.
@@ -190,11 +231,12 @@ pub(in crate::native) fn attest_owner(owner: &NativeSessionOwner) -> OwnerAttest
         owner,
         OwnerObservers {
             pid_alive: &process_is_alive,
+            #[cfg(target_os = "linux")]
+            birth: &process_birth,
             #[cfg(target_os = "macos")]
             birth: &crate::native::terminal::macos::process::macos_process_start,
-            #[cfg(target_os = "macos")]
-            control:
-                &crate::native::terminal::macos::process::live_native_process_identity_if_present,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            control: &process_control,
             #[cfg(windows)]
             identity: &crate::native::terminal::observe_windows_process_identity,
         },
@@ -207,17 +249,26 @@ pub(in crate::native) fn attest_owner_with(
 ) -> OwnerAttestation {
     // One actual PID observation, including for projection of failed identity inspection.
     let pid_alive = (observers.pid_alive)(owner.pid);
-    #[cfg(target_os = "macos")]
-    let recorded_birth = owner
-        .process_start_seconds
-        .zip(owner.process_start_microseconds);
-    #[cfg(target_os = "macos")]
-    let process = classify(
-        owner.pid,
-        recorded_birth.as_ref(),
-        || pid_alive,
-        || (observers.birth)(owner.pid),
-    );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let recorded_birth = recorded_birth(owner);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let process = match recorded_birth {
+        Err(ref error) => ProcessObservation::Unknown(error.clone()),
+        Ok(recorded_birth) => classify(
+            owner.pid,
+            recorded_birth.as_ref(),
+            || pid_alive,
+            || {
+                #[cfg(target_os = "macos")]
+                return (observers.birth)(owner.pid)
+                    .map(|b| b.map(|(s, us)| ProcessBirth::Macos(s, us)));
+                #[cfg(target_os = "linux")]
+                return (observers.birth)(owner.pid);
+            },
+        ),
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let recorded_birth = recorded_birth.ok().flatten();
     #[cfg(windows)]
     let process = {
         use crate::native::terminal::WindowsIncarnation;
@@ -232,9 +283,9 @@ pub(in crate::native) fn attest_owner_with(
             || (observers.identity)(owner.pid).map(|i| i.map(WindowsIncarnation)),
         )
     };
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let process = classify::<()>(owner.pid, None, || pid_alive, || unreachable!());
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let control = if matches!(process, ProcessObservation::Live(Attested::Incarnation))
         && owner.attestation_compares_control()
     {
@@ -252,7 +303,7 @@ pub(in crate::native) fn attest_owner_with(
                         pid_alive: Some(pid_alive),
                     };
                 }
-                let live_birth = (live.process_start_seconds, live.process_start_microseconds);
+                let live_birth = live.birth;
                 if Some(live_birth) != recorded_birth {
                     return OwnerAttestation {
                         process: classify(
@@ -307,7 +358,7 @@ pub(in crate::native) fn attest_owner_with(
     } else {
         ControlAttestation::NotRecorded
     };
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let control = ControlAttestation::NotRecorded;
     OwnerAttestation {
         process,
@@ -339,15 +390,15 @@ impl From<&OwnerAttestation> for OwnerObservation {
     fn from(a: &OwnerAttestation) -> Self {
         let (process_alive, identity_matches, error) = match &a.process {
             ProcessObservation::Live(Attested::Incarnation) => match &a.control {
-                #[cfg(any(target_os = "macos", windows, test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
                 ControlAttestation::Verified => (Some(true), Some(true), None),
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Changed(reason) => {
                     // The reason belongs to control evidence, not an inspection error.
                     let _ = reason;
                     (Some(true), Some(false), None)
                 }
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Unknown(reason) => (a.pid_alive, None, Some(reason.clone())),
                 ControlAttestation::NotRecorded => (Some(true), None, None),
             },

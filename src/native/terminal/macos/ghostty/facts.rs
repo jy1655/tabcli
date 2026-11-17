@@ -15,6 +15,8 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     screen_read_refusal: Some("Ghostty's scripting dictionary exposes no screen text"),
     guarded_input_refusal: Some("managed dialog input unsupported for this terminal"),
+    #[cfg(target_os = "linux")]
+    binding: None,
     #[cfg(target_os = "macos")]
     binding: None,
 };

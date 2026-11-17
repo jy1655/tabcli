@@ -11,7 +11,8 @@ pub(in crate::native) fn owned_and_not_writable_by_others(
 
 /// Unix owner/mode evidence: owned by the supplied effective UID, with no
 /// group/other read, write, or execute/search bits.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 pub(in crate::native) fn owned_and_not_accessible_by_others(
     metadata: &Metadata,
     current_uid: u32,

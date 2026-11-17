@@ -1,9 +1,11 @@
 pub(super) mod close_evidence;
 pub(in crate::native) mod host;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) use close_evidence::for_kind as close_evidence;
 use std::time::Duration;
 pub(super) mod facts;
+mod linux_birth;
+pub(in crate::native) use linux_birth::LinuxBirth;
 
 /// Provider-selected encoding of LF in a native Windows console text batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,21 +19,38 @@ pub(super) const fn facts(kind: TerminalKind) -> facts::SurfaceFacts {
 }
 
 pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     return facts(session.kind).outlives_owner;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = session;
         false
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::native::terminal) mod bound_host;
 pub(in crate::native) mod close_authority;
+#[cfg(target_os = "linux")]
+pub(in crate::native) mod linux;
 pub(in crate::native) mod ownership;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::native) mod posix;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::native) mod posix_ownership;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::native) mod process;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn posix_installed() -> &'static dyn posix::Adapters {
+    #[cfg(target_os = "macos")]
+    return macos::INSTALLED;
+    #[cfg(target_os = "linux")]
+    return &linux::INSTALLED;
+}
 
 use std::{path::Path, str::FromStr, time::Instant};
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -48,14 +67,17 @@ mod shell_environment_wire;
 pub(in crate::native) mod shell_environment_budget;
 // Compiled into every test build so its refusal is tested on every CI target.
 #[cfg(any(not(any(target_os = "macos", target_os = "windows")), test))]
-#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+#[cfg_attr(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    allow(dead_code)
+)]
 mod refusing;
 #[cfg(target_os = "windows")]
 pub(in crate::native) mod windows;
 
 // Platform-only pure decisions live beside their platform module and compile on every
 // target, so that their tests run on every target; the platform modules remain gated.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[path = "macos/dialog.rs"]
 mod macos_dialog;
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
@@ -77,9 +99,11 @@ impl std::fmt::Display for StaleDialogClaim {
 
 impl std::error::Error for StaleDialogClaim {}
 
+#[cfg(target_os = "linux")]
+use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 use refusing as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
@@ -179,6 +203,17 @@ pub(super) struct TerminalSession {
     pub(super) windows_process_identity: Option<WindowsProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) wezterm_mux: Option<WezTermMux>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) linux_host: Option<LinuxHostIdentity>,
+}
+
+/// Only a creation-proven adapter may publish this incarnation. Registration's
+/// BridgeCreatedHost evidence grants authority over this whole host, independent of
+/// owner/close intent. Endpoint reachability is deliberately not part of birth.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct LinuxHostIdentity {
+    pub(super) pid: u32,
+    pub(super) linux_birth: LinuxBirth,
 }
 
 // Only an adapter that has proven its exact surface may return this error. The
@@ -190,8 +225,9 @@ pub(super) struct RetainedLaunchSurface {
     message: String,
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 impl RetainedLaunchSurface {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn new(surface: TerminalSession, message: String) -> Self {
         Self {
             surface,
@@ -200,7 +236,7 @@ impl RetainedLaunchSurface {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn with_unverified_cleanup(mut self) -> Self {
         self.unverified_cleanup = true;
         self
@@ -341,10 +377,10 @@ where
     {
         windows::open_bound_tab(kind, command, directory, deadline, bind, unbind)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        macos::open_bound_tab(
-            macos::INSTALLED,
+        posix::open_bound_tab(
+            posix_installed(),
             kind,
             command,
             directory,
@@ -353,7 +389,7 @@ where
             unbind,
         )
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (directory, deadline);
         let mut session = platform::open_tab(kind, command)?;
@@ -378,7 +414,7 @@ where
 #[cfg(all(test, windows))]
 pub(in crate::native) mod launch_failure_test_support;
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn bind_surface_before_start<T, Bind, Start, Cleanup, Unbind>(
     surface: &mut T,
     bind: Bind,
@@ -430,11 +466,11 @@ pub(super) fn send_file(
     {
         crate::native::console_control::installed().send_file(session, prompt_path, deadline)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        macos::send_file(macos::INSTALLED, session, prompt_path, deadline)
+        posix::send_file(posix_installed(), session, prompt_path, deadline)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         // Unsupported-platform stubs never send, so not_sent is accurate.
         platform::send_file(session, prompt_path, deadline).map_err(TerminalSendFailure::not_sent)
@@ -460,11 +496,11 @@ pub(super) struct GuardedDialogInput {
 }
 
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
-    #[cfg(target_os = "macos")]
-    return macos::read_screen(macos::INSTALLED, session, deadline);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return posix::read_screen(posix_installed(), session, deadline);
     #[cfg(windows)]
     return crate::native::console_control::installed().read_screen(session, deadline);
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (session, deadline);
         bail!("managed screen reads unsupported on this platform");
@@ -481,29 +517,29 @@ pub(super) fn guarded_dialog_input(
     input: &GuardedDialogInput,
     deadline: Instant,
 ) -> Result<bool> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         macos_dialog::dispatch(directory, input, deadline, || {
-            macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
+            posix::guarded_dialog_input(posix_installed(), session, input, deadline)
         })
     }
     #[cfg(windows)]
     return crate::native::console_control::installed()
         .guarded_dialog_input(directory, session, input, deadline);
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (directory, session, input, deadline);
         bail!("managed dialog input unsupported on this platform");
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(super) fn verify_macos_surface(
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn verify_posix_surface(
     directory: &Path,
     session: &TerminalSession,
     timeout: Option<std::time::Duration>,
 ) -> Result<Option<String>> {
-    macos::verify_surface(macos::INSTALLED, directory, session, timeout)
+    posix::verify_surface(posix_installed(), directory, session, timeout)
 }
 
 pub(super) fn close_session_until(
@@ -512,16 +548,16 @@ pub(super) fn close_session_until(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     crate::native::session::close::budget::close_remaining(deadline)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        macos::close_session_until(macos::INSTALLED, directory, session, deadline)
+        posix::close_session_until(posix_installed(), directory, session, deadline)
     }
     #[cfg(windows)]
     {
         crate::native::console_control::installed()
             .close_session_until(directory, session, deadline)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         platform::close_session_until(directory, session, deadline)
     }
@@ -534,15 +570,15 @@ pub(super) fn surface_present(
     session: &TerminalSession,
     timeout: std::time::Duration,
 ) -> Result<bool> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        macos::surface_present(macos::INSTALLED, directory, session, timeout)
+        posix::surface_present(posix_installed(), directory, session, timeout)
     }
     #[cfg(windows)]
     {
         windows::surface_present(directory, session, timeout)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (directory, session, timeout);
         bail!("terminal surface probes are unsupported on this platform")
@@ -666,6 +702,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn macos_test_iterm_session() -> TerminalSession {
         TerminalSession {
+            linux_host: None,
             kind: TerminalKind::Iterm2,
             id: "test-session".to_owned(),
             tab_id: None,
@@ -728,6 +765,7 @@ mod tests {
         assert_eq!(legacy.managed_session_id, None);
 
         let ghostty = TerminalSession {
+            linux_host: None,
             kind: TerminalKind::Ghostty,
             id: "terminal-id".to_owned(),
             tab_id: Some("tab-id".to_owned()),

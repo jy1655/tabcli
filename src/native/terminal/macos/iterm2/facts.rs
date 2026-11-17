@@ -14,12 +14,16 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     },
     host_command: "native-iterm2-host",
     launch_host: Some(LaunchHostFacts {
+        #[cfg(target_os = "linux")]
+        binding_names_host: |_| false,
         #[cfg(target_os = "macos")]
         binding_names_host: crate::native::terminal::macos::iterm2::binding_names_this_host,
     }),
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     screen_read_refusal: None,
     guarded_input_refusal: None,
+    #[cfg(target_os = "linux")]
+    binding: None,
     #[cfg(target_os = "macos")]
     binding: Some(BindingFacts {
         host: "iTerm2",

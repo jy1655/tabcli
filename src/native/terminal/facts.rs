@@ -1,15 +1,16 @@
+#![cfg_attr(target_os = "linux", allow(dead_code))] // Phase 1 has no installed Linux surface.
 //! Adapter declarations are portable: a persisted handle can name another platform.
 //! Each terminal kind is registered once, in its own `facts.rs`, and every shared
 //! lookup (surface facts, host command, launch host, close evidence, declared refusals
 //! and the macOS binding facts) reads that registration.
 use super::TerminalKind;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::TerminalSession;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::launch::BindingFacts;
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) struct SurfaceFacts {
     pub(in crate::native) outlives_owner: bool,
     pub(in crate::native) failed_start_identity: bool,
@@ -19,11 +20,14 @@ pub(in crate::native) struct SurfaceFacts {
 
 /// The close evidence a kind selects; resolved to an implementation only on macOS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) enum CloseEvidenceChoice {
     PresenceOnly,
     PresenceOnlyWithOwnerlessContext,
     AppleTerminal,
+    /// Whole host created exclusively by Bridge and recorded by incarnation.
+    #[allow(dead_code)] // No Phase 1 kind selects this evidence.
+    BridgeCreatedHost,
 }
 
 /// A kind whose launch runs the terminal-less launch host (`terminal/macos/launch_host.rs`)
@@ -33,14 +37,14 @@ pub(in crate::native) struct LaunchHostFacts {
     /// Whether a bound surface names the terminal surface that the calling host runs in, as
     /// the terminal names that surface in the host's environment. The adapter owns this
     /// check; its legacy host decides with the same rule.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) binding_names_host: fn(&TerminalSession) -> bool,
 }
 
 /// One kind's registration. A refusal of `None` means the kind supports the
 /// operation; `Some` is the exact message the shared macOS dispatch answers with
 /// before any adapter is reached.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) struct Registration {
     pub(in crate::native) facts: SurfaceFacts,
     pub(in crate::native) host_command: &'static str,
@@ -49,14 +53,14 @@ pub(in crate::native) struct Registration {
     pub(in crate::native) close_evidence: CloseEvidenceChoice,
     pub(in crate::native) screen_read_refusal: Option<&'static str>,
     pub(in crate::native) guarded_input_refusal: Option<&'static str>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) binding: Option<BindingFacts>,
 }
 
 impl Registration {
     /// The binding facts of a kind whose launch host waits for a surface binding.
     /// Evaluated at compile time by the adapters that have one.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) const fn binding(&'static self) -> &'static BindingFacts {
         match &self.binding {
             Some(binding) => binding,

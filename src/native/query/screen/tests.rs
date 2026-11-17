@@ -177,6 +177,7 @@ fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
 
 fn handle(kind: terminal::TerminalKind, bound_to: Option<&str>) -> terminal::TerminalSession {
     terminal::TerminalSession {
+        linux_host: None,
         kind,
         id: "surface-1".into(),
         tab_id: None,

@@ -44,8 +44,8 @@ pub(in crate::native::terminal) fn run(
             .and_then(|i| {
                 Some(host::HostIdentity {
                     pid: i.pid,
-                    start_seconds: i.process_start_seconds,
-                    start_microseconds: i.process_start_microseconds.try_into().ok()?,
+                    start_seconds: i.birth.macos().unwrap().0,
+                    start_microseconds: i.birth.macos().unwrap().1.try_into().ok()?,
                 })
             });
         let recorder = Recorder {

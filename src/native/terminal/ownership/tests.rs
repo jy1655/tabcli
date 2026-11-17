@@ -3,10 +3,9 @@
 
 use crate::native::terminal;
 use crate::native::terminal::ownership::{
-    ControlRecord, MacTerminalShellIdentity, NativeProcessIdentity, NativeSessionOwner,
-    OwnerBinding, RecordedControl, native_owner_identity_matches,
-    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
-    verify_native_terminal_owner_with,
+    ControlRecord, NativeProcessIdentity, NativeSessionOwner, OwnerBinding, RecordedControl,
+    TerminalShellIdentity, native_owner_identity_matches, verified_terminal_owner_process_group,
+    verified_terminal_shell_process_group, verify_native_terminal_owner_with,
 };
 use anyhow::{Context, bail};
 use std::{cell::RefCell, path::Path};
@@ -28,15 +27,15 @@ fn owner_fixture() -> (
     }))
     .unwrap();
     let live_shell = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(90, 100),
         pid: 4000,
         parent_pid: 3999,
         terminal_tty_device: 7,
         process_group: 4000,
         terminal_process_group: 4242,
-        process_start_seconds: 90,
-        process_start_microseconds: 100,
     };
     let owner = NativeSessionOwner {
+        linux_birth: None,
         pid: 4242,
         managed_session_id: Some(SESSION_ID.to_owned()),
         terminal_tty: Some(OWNER_TTY.to_owned()),
@@ -45,24 +44,24 @@ fn owner_fixture() -> (
         process_start_microseconds: Some(200),
         process_group: Some(4242),
         terminal_process_group: Some(4242),
-        terminal_shell: Some(MacTerminalShellIdentity {
+        terminal_shell: Some(TerminalShellIdentity {
+            linux_birth: None,
             pid: live_shell.pid,
             process_group: live_shell.process_group,
             terminal_tty_device: live_shell.terminal_tty_device,
-            process_start_seconds: live_shell.process_start_seconds,
-            process_start_microseconds: live_shell.process_start_microseconds,
+            process_start_seconds: live_shell.birth.macos().unwrap().0,
+            process_start_microseconds: live_shell.birth.macos().unwrap().1,
         }),
         terminal_app: None,
         windows_process_identity: None,
     };
     let live = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(100, 200),
         pid: 4242,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 100,
-        process_start_microseconds: 200,
     };
     (terminal, owner, live, live_shell)
 }
@@ -235,11 +234,17 @@ fn terminal_owner_verifier_rejects_reused_pid_and_changed_control_identity() {
     for changed in [
         NativeProcessIdentity { pid: 4243, ..live },
         NativeProcessIdentity {
-            process_start_seconds: 101,
+            birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                101,
+                live.birth.macos().unwrap().1,
+            ),
             ..live
         },
         NativeProcessIdentity {
-            process_start_microseconds: 201,
+            birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                live.birth.macos().unwrap().0,
+                201,
+            ),
             ..live
         },
         NativeProcessIdentity {
@@ -464,7 +469,10 @@ fn terminal_owner_verifier_checks_shell_parent_tty_group_and_incarnation() {
         ),
         (
             NativeProcessIdentity {
-                process_start_microseconds: 101,
+                birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                    shell.birth.macos().unwrap().0,
+                    101,
+                ),
                 ..shell
             },
             "Terminal.app shell identity changed",
@@ -507,13 +515,12 @@ fn terminal_owner_process_group_must_match_the_attested_foreground_group() {
         ..NativeSessionOwner::default()
     };
     let live = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(100, 200),
         pid: 4242,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 100,
-        process_start_microseconds: 200,
     };
 
     assert_eq!(
@@ -547,7 +554,8 @@ fn terminal_owner_process_group_must_match_the_attested_foreground_group() {
 
 #[test]
 fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
-    let shell = MacTerminalShellIdentity {
+    let shell = TerminalShellIdentity {
+        linux_birth: None,
         pid: 4000,
         process_group: 4000,
         terminal_tty_device: 7,
@@ -560,22 +568,20 @@ fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
         ..NativeSessionOwner::default()
     };
     let live_owner = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(100, 200),
         pid: 4242,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 100,
-        process_start_microseconds: 200,
     };
     let live_shell = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(90, 100),
         pid: 4000,
         parent_pid: 3999,
         terminal_tty_device: 7,
         process_group: 4000,
         terminal_process_group: 4242,
-        process_start_seconds: 90,
-        process_start_microseconds: 100,
     };
 
     assert_eq!(
@@ -594,7 +600,10 @@ fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
     );
 
     let changed_shell = NativeProcessIdentity {
-        process_start_microseconds: 101,
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+            live_shell.birth.macos().unwrap().0,
+            101,
+        ),
         ..live_shell
     };
     assert!(
@@ -615,7 +624,7 @@ fn each_surface_probe_states_what_it_requires_of_a_bound_owner() {
     let gone = OwnerRequirement::Gone;
     let uninspected = OwnerRequirement::Uninspected;
     let live = || ProcessObservation::Live(Attested::Incarnation);
-    // The answers of [MacosControl, WindowsProcess, Unprobed].
+    // The answers of [PosixControl, WindowsProcess, Unprobed].
     let rows = [
         (live(), ControlAttestation::Verified, [met, met, met]),
         // Only macOS records a control identity that can change.
@@ -664,7 +673,7 @@ fn each_surface_probe_states_what_it_requires_of_a_bound_owner() {
             pid_alive: Some(true),
         };
         for (probe, expected) in [
-            SurfaceProbe::MacosControl,
+            SurfaceProbe::PosixControl,
             SurfaceProbe::WindowsProcess,
             SurfaceProbe::Unprobed,
         ]
@@ -680,8 +689,8 @@ fn each_surface_probe_states_what_it_requires_of_a_bound_owner() {
     }
     assert_eq!(
         SurfaceProbe::HOST,
-        if cfg!(target_os = "macos") {
-            SurfaceProbe::MacosControl
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            SurfaceProbe::PosixControl
         } else if cfg!(windows) {
             SurfaceProbe::WindowsProcess
         } else {
@@ -786,7 +795,10 @@ fn the_macos_owner_requirement_agrees_with_the_probe() {
             "reused PID",
             &full,
             changed(NativeProcessIdentity {
-                process_start_seconds: 101,
+                birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                    101,
+                    live.birth.macos().unwrap().1,
+                ),
                 ..live
             }),
             OwnerRequirement::Gone,
@@ -822,17 +834,17 @@ fn the_macos_owner_requirement_agrees_with_the_probe() {
                 pid_alive: &|_| !matches!(owner, Owner::Exited),
                 birth: &|pid| match owner {
                     Owner::Running(identity) | Owner::ControlUnreadable(identity) => Ok(Some((
-                        identity.process_start_seconds,
-                        identity.process_start_microseconds,
+                        identity.birth.macos().unwrap().0,
+                        identity.birth.macos().unwrap().1,
                     ))),
                     Owner::Exited | Owner::Uninspectable => snapshot(pid).map(|identity| {
-                        identity.map(|i| (i.process_start_seconds, i.process_start_microseconds))
+                        identity.map(|i| (i.birth.macos().unwrap().0, i.birth.macos().unwrap().1))
                     }),
                 },
                 control: &snapshot,
             },
         );
-        let requirement = SurfaceProbe::MacosControl.owner_requirement(&attestation);
+        let requirement = SurfaceProbe::PosixControl.owner_requirement(&attestation);
         assert_eq!(requirement, expected, "{label}: {attestation:?}");
         let probed = verify_native_terminal_owner_with(
             SESSION_ID,
@@ -995,7 +1007,10 @@ fn terminal_owner_verifier_shell_refusals_name_the_kind() {
             ),
             (
                 NativeProcessIdentity {
-                    process_start_microseconds: 101,
+                    birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                        shell.birth.macos().unwrap().0,
+                        101,
+                    ),
                     ..shell
                 },
                 "shell identity changed",
@@ -1028,7 +1043,7 @@ fn terminal_owner_verifier_shell_refusals_name_the_kind() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_ownership_proof_without_an_owner_record_names_the_kind() {
-    use crate::native::terminal::macos::ownership::verified_macos_terminal_owner;
+    use crate::native::terminal::posix_ownership::verified_posix_terminal_owner;
     use terminal::TerminalKind;
     for kind in [
         TerminalKind::AppleTerminal,
@@ -1040,7 +1055,7 @@ fn macos_ownership_proof_without_an_owner_record_names_the_kind() {
         let directory = tempfile::tempdir().unwrap();
         let (mut terminal, _, _, _) = owner_fixture();
         terminal.kind = kind;
-        let error = verified_macos_terminal_owner(directory.path(), SESSION_ID, &terminal, None)
+        let error = verified_posix_terminal_owner(directory.path(), SESSION_ID, &terminal, None)
             .unwrap_err();
         assert_eq!(
             error.to_string(),

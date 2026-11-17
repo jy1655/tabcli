@@ -127,6 +127,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             .unwrap();
             store
                 .write_terminal(&terminal::TerminalSession {
+                    linux_host: None,
                     kind: terminal::TerminalKind::Iterm2,
                     id: "exact-retained-surface".to_owned(),
                     tab_id: None,
@@ -271,6 +272,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "missing-iterm-session".to_owned(),
             tab_id: None,
@@ -337,6 +339,7 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "missing-iterm-session".to_owned(),
             tab_id: None,
@@ -370,7 +373,8 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
         TerminalTombstone {
             consumed: true,
             terminal: Some(terminal::TerminalKind::Iterm2),
-            reason: cfg!(target_os = "macos").then(|| "the tab was already gone".to_owned()),
+            reason: cfg!(any(target_os = "macos", target_os = "linux"))
+                .then(|| "the tab was already gone".to_owned()),
         }
     );
 
@@ -405,6 +409,7 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     write_json_atomic(
         &directory.path().join(TERMINAL_CLOSING_FILE),
         &terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "interrupted-close".to_owned(),
             tab_id: None,
@@ -465,6 +470,7 @@ fn interrupted_close_without_tombstone_converges_after_owner_exit() {
     store
         .record(CoreRecord::TerminalClosing)
         .write_json(&terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "interrupted-close".to_owned(),
             tab_id: None,
@@ -619,6 +625,7 @@ fn deadline_fixture() -> (tempfile::TempDir, Store) {
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
     store
         .write_terminal(&terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "deadline-fixture".into(),
             tab_id: None,
@@ -1196,6 +1203,7 @@ fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::WindowsConsole,
             id: "windows-console-process".to_owned(),
             tab_id: None,
@@ -1242,6 +1250,7 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "concurrent-close".to_owned(),
             tab_id: None,
@@ -1307,6 +1316,7 @@ fn tell_cannot_claim_while_explicit_close_owns_the_terminal_lifecycle() {
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
+            linux_host: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "closing-before-tell".to_owned(),
             tab_id: None,
@@ -1376,11 +1386,11 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
             )
             .unwrap()
         );
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         assert!(
             session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap()
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             assert!(
                 !session_close::repair_dead_owner(&Store::open_unchecked(directory.path()))
@@ -1391,7 +1401,7 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
             let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
             assert_eq!(status.state.as_str(), state);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
             let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -1449,7 +1459,7 @@ fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
         }
         let listing = cli_sessions(fixture.root.path());
         assert_eq!(listing.len(), 1, "{label}: {listing:?}");
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             // A dead owner and unreadable journal prove nothing about its window.
             assert_eq!(listing[0]["state"], state, "{label}: {listing:?}");
             assert!(directory.join(TERMINAL_HANDLE_FILE).exists());
@@ -1524,7 +1534,7 @@ fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[test]
 fn unsupported_platform_refuses_bound_close_and_restores_claimed_handle() {
     let root = tempfile::tempdir().unwrap();

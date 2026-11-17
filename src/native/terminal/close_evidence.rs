@@ -1,5 +1,6 @@
+#![cfg_attr(target_os = "linux", allow(dead_code))] // Phase 1 has no installed Linux surface.
 //! Read-only close evidence supplied by each terminal adapter.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 
 use super::ownership::{MacTerminalAppIdentity, NativeSessionOwner};
 use anyhow::Result;
@@ -34,24 +35,24 @@ pub(in crate::native) trait CloseEvidence {
 // or the presence, and no incarnation is derived. Every kind but Terminal.app selects
 // it; the one declared variation is the context that Warp and WezTerm add when the
 // owner record is absent and the surface is not proven absent.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PresenceOnly {
     ownerless_context: Option<&'static str>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static PRESENCE_ONLY: PresenceOnly = PresenceOnly {
     ownerless_context: None,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT: PresenceOnly = PresenceOnly {
     ownerless_context: Some(
         "could not prove absence of the ownerless startup surface; no close was sent",
     ),
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CloseEvidence for PresenceOnly {
     fn surface_absent(
         &self,
@@ -90,11 +91,17 @@ impl CloseEvidence for PresenceOnly {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn for_kind(kind: super::TerminalKind) -> &'static dyn CloseEvidence {
-    use super::{facts::CloseEvidenceChoice, macos::apple_terminal};
+    use super::facts::CloseEvidenceChoice;
+    #[cfg(target_os = "macos")]
+    use super::macos::apple_terminal;
     match kind.registration().close_evidence {
+        #[cfg(target_os = "macos")]
         CloseEvidenceChoice::AppleTerminal => &apple_terminal::close_evidence::EVIDENCE,
+        #[cfg(target_os = "linux")]
+        CloseEvidenceChoice::AppleTerminal => &PRESENCE_ONLY,
+        CloseEvidenceChoice::BridgeCreatedHost => &PRESENCE_ONLY,
         CloseEvidenceChoice::PresenceOnly => &PRESENCE_ONLY,
         CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext => {
             &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT

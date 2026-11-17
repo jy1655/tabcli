@@ -325,6 +325,7 @@ fn create_tab(
         bail!("iTerm2 did not return a session id");
     }
     Ok(TerminalSession {
+        linux_host: None,
         kind: TerminalKind::Iterm2,
         id,
         tab_id: None,
@@ -2346,6 +2347,7 @@ end run
                 .starts_with("iTerm2 did not supply its session identity: ")
         );
         let surface = |kind, id: &str| TerminalSession {
+            linux_host: None,
             kind,
             id: id.into(),
             tab_id: None,

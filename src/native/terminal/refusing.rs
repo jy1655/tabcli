@@ -53,6 +53,7 @@ mod tests {
     #[test]
     fn every_refusal_keeps_its_text_and_is_unsupported() {
         let session = TerminalSession {
+            linux_host: None,
             kind: TerminalKind::Iterm2,
             id: String::new(),
             tab_id: None,

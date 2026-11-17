@@ -516,6 +516,7 @@ fn metadata_keeps_the_terminal_kind_after_close_consumes_the_handle() {
     write_json_atomic(
         &directory.join("terminal.json"),
         &crate::native::terminal::TerminalSession {
+            linux_host: None,
             kind: crate::native::terminal::TerminalKind::Iterm2,
             id: "missing-iterm-session".to_owned(),
             tab_id: None,

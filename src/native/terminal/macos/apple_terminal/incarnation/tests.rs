@@ -13,7 +13,7 @@ use crate::native::session::{Reader, Store};
 use crate::native::terminal;
 use crate::native::terminal::macos::process::macos_process_start;
 use crate::native::terminal::ownership::{
-    MacTerminalAppIdentity, MacTerminalShellIdentity, NativeSessionOwner,
+    MacTerminalAppIdentity, NativeSessionOwner, TerminalShellIdentity,
 };
 use crate::native::tests::write_attested_apple_terminal_state;
 use anyhow::bail;
@@ -30,7 +30,8 @@ fn terminal_instance(pid: u32, start_seconds: u64) -> MacTerminalAppIdentity {
 #[cfg(target_os = "macos")]
 #[test]
 fn apple_terminal_app_capture_requires_stable_verified_shell_ancestry() {
-    let shell = MacTerminalShellIdentity {
+    let shell = TerminalShellIdentity {
+        linux_birth: None,
         pid: 4,
         process_group: 4,
         terminal_tty_device: 7,
@@ -94,7 +95,8 @@ fn terminal_app_capture_reads_the_ancestors_of_any_user() {
     let (seconds, microseconds) = macos_process_start(pid).unwrap().unwrap();
     let owner = NativeSessionOwner {
         pid,
-        terminal_shell: Some(MacTerminalShellIdentity {
+        terminal_shell: Some(TerminalShellIdentity {
+            linux_birth: None,
             pid,
             process_group: 0,
             terminal_tty_device: 0,
@@ -128,7 +130,8 @@ fn terminal_app_capture_reads_the_ancestors_of_any_user() {
 fn terminal_app_capture_walks_this_tests_real_ancestors_to_the_app() {
     let pid = std::process::id();
     let (seconds, microseconds) = macos_process_start(pid).unwrap().unwrap();
-    let shell = MacTerminalShellIdentity {
+    let shell = TerminalShellIdentity {
+        linux_birth: None,
         pid,
         process_group: 0,
         terminal_tty_device: 0,

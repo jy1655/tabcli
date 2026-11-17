@@ -1,38 +1,42 @@
 use super as terminal;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::CloseOutcome;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::TerminalSession;
-#[cfg(target_os = "macos")]
-use super::macos::ownership::verified_macos_terminal_owner;
-#[cfg(target_os = "macos")]
-use super::macos::process::{
-    current_terminal_tty, live_native_process_identity, terminal_tty_device,
-};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::posix_ownership::verified_posix_terminal_owner;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::process::{current_terminal_tty, live_native_process_identity, terminal_tty_device};
 #[cfg(windows)]
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
 #[cfg(all(test, target_os = "macos"))]
 use crate::native::process_identity::Gone;
 use crate::native::process_identity::{Attested, ProcessObservation};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::Reader;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::{self, Store};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Instant;
 use std::{path::Path, time::Duration};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(in crate::native) struct NativeSessionOwner {
     pub(in crate::native) pid: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "terminal::linux_birth::present"
+    )]
+    pub(in crate::native) linux_birth: Option<terminal::LinuxBirth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) managed_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +52,7 @@ pub(in crate::native) struct NativeSessionOwner {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) terminal_process_group: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(in crate::native) terminal_shell: Option<MacTerminalShellIdentity>,
+    pub(in crate::native) terminal_shell: Option<TerminalShellIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) terminal_app: Option<MacTerminalAppIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,9 +71,9 @@ pub(in crate::native) enum OwnerBinding {
     Foreign,
 }
 
-/// Which of the five macOS control fields an owner record holds: the controlling TTY
-/// device, the birth (seconds and microseconds) and both process groups.
-#[cfg(any(target_os = "macos", test))]
+/// The owner proof requires a controlling TTY device, both process groups and a
+/// complete platform birth: macOS seconds/microseconds or Linux boot/ticks.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum ControlRecord {
     /// None of them: a legacy record, or one written on another platform.
@@ -78,9 +82,16 @@ pub(in crate::native) enum ControlRecord {
     Complete(RecordedControl),
     /// Some but not all of them.
     Partial,
+    /// Complete Linux control; mixed macOS birth fields are Partial.
+    Linux {
+        terminal_tty_device: u64,
+        birth: terminal::LinuxBirth,
+        process_group: u32,
+        terminal_process_group: u32,
+    },
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) struct RecordedControl {
     pub(in crate::native) terminal_tty_device: u64,
@@ -90,10 +101,10 @@ pub(in crate::native) struct RecordedControl {
     pub(in crate::native) terminal_process_group: u32,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl ControlRecord {
     pub(in crate::native) fn is_complete(self) -> bool {
-        matches!(self, Self::Complete(_))
+        matches!(self, Self::Complete(_) | Self::Linux { .. })
     }
 }
 
@@ -120,8 +131,31 @@ impl NativeSessionOwner {
     //   the ownership proof refuses it (`SurfaceProbe::owner_requirement`).
 
     /// The five control fields, classified for the ownership proof and close authority.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(in crate::native) fn control_record(&self) -> ControlRecord {
+        if let Some(birth) = self.linux_birth {
+            return match (
+                self.terminal_tty_device,
+                self.process_group,
+                self.terminal_process_group,
+                self.process_start_seconds,
+                self.process_start_microseconds,
+            ) {
+                (
+                    Some(terminal_tty_device),
+                    Some(process_group),
+                    Some(terminal_process_group),
+                    None,
+                    None,
+                ) => ControlRecord::Linux {
+                    terminal_tty_device,
+                    birth,
+                    process_group,
+                    terminal_process_group,
+                },
+                _ => ControlRecord::Partial,
+            };
+        }
         match (
             self.terminal_tty_device,
             self.process_start_seconds,
@@ -149,7 +183,7 @@ impl NativeSessionOwner {
 
     /// Attestation's rule: a live incarnation's control identity is compared when any of
     /// the TTY device and the two process groups is recorded; the birth does not count.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(in crate::native) fn attestation_compares_control(&self) -> bool {
         self.terminal_tty_device.is_some()
             || self.process_group.is_some()
@@ -157,13 +191,78 @@ impl NativeSessionOwner {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(in crate::native) struct MacTerminalShellIdentity {
+// Shell records preserve the old macOS wall-clock fields, including zero
+// microseconds. Linux writes only linux_birth. Missing, mixed or partial birth
+// payloads refuse decoding instead of becoming a PID-only shell identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(try_from = "TerminalShellWire")]
+pub(in crate::native) struct TerminalShellIdentity {
     pub(in crate::native) pid: u32,
     pub(in crate::native) process_group: u32,
     pub(in crate::native) terminal_tty_device: u64,
     pub(in crate::native) process_start_seconds: u64,
     pub(in crate::native) process_start_microseconds: u64,
+    pub(in crate::native) linux_birth: Option<terminal::LinuxBirth>,
+}
+#[derive(Deserialize)]
+struct TerminalShellWire {
+    pid: u32,
+    process_group: u32,
+    terminal_tty_device: u64,
+    process_start_seconds: Option<u64>,
+    process_start_microseconds: Option<u64>,
+    #[serde(default, deserialize_with = "terminal::linux_birth::present")]
+    linux_birth: Option<terminal::LinuxBirth>,
+}
+impl TryFrom<TerminalShellWire> for TerminalShellIdentity {
+    type Error = &'static str;
+    fn try_from(wire: TerminalShellWire) -> std::result::Result<Self, Self::Error> {
+        let (seconds, microseconds) = match (
+            wire.linux_birth,
+            wire.process_start_seconds,
+            wire.process_start_microseconds,
+        ) {
+            (Some(_), None, None) => (0, 0),
+            (None, Some(s), Some(us)) => (s, us),
+            _ => return Err("terminal shell has missing, partial or mixed platform birth"),
+        };
+        Ok(Self {
+            pid: wire.pid,
+            process_group: wire.process_group,
+            terminal_tty_device: wire.terminal_tty_device,
+            process_start_seconds: seconds,
+            process_start_microseconds: microseconds,
+            linux_birth: wire.linux_birth,
+        })
+    }
+}
+impl Serialize for TerminalShellIdentity {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut wire = serializer.serialize_struct(
+            "TerminalShellIdentity",
+            if self.linux_birth.is_some() { 4 } else { 5 },
+        )?;
+        wire.serialize_field("pid", &self.pid)?;
+        wire.serialize_field("process_group", &self.process_group)?;
+        wire.serialize_field("terminal_tty_device", &self.terminal_tty_device)?;
+        if let Some(birth) = self.linux_birth {
+            if self.process_start_seconds != 0 || self.process_start_microseconds != 0 {
+                return Err(serde::ser::Error::custom("mixed terminal shell birth"));
+            }
+            wire.serialize_field("linux_birth", &birth)?;
+        } else {
+            wire.serialize_field("process_start_seconds", &self.process_start_seconds)?;
+            wire.serialize_field(
+                "process_start_microseconds",
+                &self.process_start_microseconds,
+            )?;
+        }
+        wire.end()
+    }
 }
 
 // Captured from the verified native owner's ancestor chain before provider start.
@@ -175,7 +274,31 @@ pub(in crate::native) struct MacTerminalAppIdentity {
     pub(in crate::native) start_microseconds: u64,
 }
 
-#[cfg(any(target_os = "macos", test))]
+/// A native control snapshot carries exactly one platform's birth. Records keep
+/// their original macOS fields and optional Linux object; only readers translate them.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum ProcessBirth {
+    Macos(u64, u64),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Linux(terminal::LinuxBirth),
+}
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl ProcessBirth {
+    pub(in crate::native) fn macos(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Macos(s, us) => Some((s, us)),
+            Self::Linux(_) => None,
+        }
+    }
+    pub(in crate::native) fn linux(self) -> Option<terminal::LinuxBirth> {
+        match self {
+            Self::Linux(birth) => Some(birth),
+            Self::Macos(_, _) => None,
+        }
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) struct NativeProcessIdentity {
     pub(in crate::native) pid: u32,
@@ -183,14 +306,14 @@ pub(in crate::native) struct NativeProcessIdentity {
     pub(in crate::native) terminal_tty_device: u64,
     pub(in crate::native) process_group: u32,
     pub(in crate::native) terminal_process_group: u32,
-    pub(in crate::native) process_start_seconds: u64,
-    pub(in crate::native) process_start_microseconds: u64,
+
+    pub(in crate::native) birth: ProcessBirth,
 }
 
 // What this probe requires of the owner record is stated over its attestation by
 // `SurfaceProbe::owner_requirement` below; the parity tests in `ownership/tests.rs` hold
 // the two together.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
@@ -228,9 +351,9 @@ pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
 /// value so that each platform's requirement is tested on every host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum SurfaceProbe {
-    /// macOS (`verify_native_terminal_owner_with`): the recorded birth, controlling TTY
+    /// macOS and Linux (`verify_native_terminal_owner_with`): the recorded birth, controlling TTY
     /// device and both process groups must be present and match the live owner.
-    MacosControl,
+    PosixControl,
     /// Native Windows (`verified_windows_native_owner`): the recorded process identity must
     /// be present and match the live owner.
     WindowsProcess,
@@ -255,8 +378,9 @@ pub(in crate::native) enum OwnerRequirement {
 }
 
 impl SurfaceProbe {
-    pub(in crate::native) const HOST: Self = if cfg!(target_os = "macos") {
-        Self::MacosControl
+    pub(in crate::native) const HOST: Self = if cfg!(any(target_os = "macos", target_os = "linux"))
+    {
+        Self::PosixControl
     } else if cfg!(windows) {
         Self::WindowsProcess
     } else {
@@ -274,16 +398,16 @@ impl SurfaceProbe {
     ) -> OwnerRequirement {
         match &attestation.process {
             ProcessObservation::Live(Attested::Incarnation) => match &attestation.control {
-                #[cfg(any(target_os = "macos", windows, test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
                 ControlAttestation::Verified => OwnerRequirement::Met,
-                // Only macOS records a control identity that can change; the Windows probe
+                // POSIX records a control identity that can change; the Windows probe
                 // compares the process identity the incarnation already matched.
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Changed(_) => match self {
-                    Self::MacosControl => OwnerRequirement::ControlUnverified,
+                    Self::PosixControl => OwnerRequirement::ControlUnverified,
                     Self::WindowsProcess | Self::Unprobed => OwnerRequirement::Met,
                 },
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Unknown(_) => OwnerRequirement::Uninspected,
                 ControlAttestation::NotRecorded => self.uncompared(),
             },
@@ -298,13 +422,13 @@ impl SurfaceProbe {
     /// without TTY and process groups.
     fn uncompared(self) -> OwnerRequirement {
         match self {
-            Self::MacosControl | Self::WindowsProcess => OwnerRequirement::ControlUnverified,
+            Self::PosixControl | Self::WindowsProcess => OwnerRequirement::ControlUnverified,
             Self::Unprobed => OwnerRequirement::Met,
         }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn current_native_session_owner(
     session_id: &str,
 ) -> Result<NativeSessionOwner> {
@@ -316,20 +440,30 @@ pub(in crate::native) fn current_native_session_owner(
         bail!("native-session process is not attached to its reported terminal TTY")
     }
     let live_shell = live_native_process_identity(live.parent_pid)?;
-    let terminal_shell = MacTerminalShellIdentity {
+    let terminal_shell = TerminalShellIdentity {
         pid: live_shell.pid,
         process_group: live_shell.process_group,
         terminal_tty_device: live_shell.terminal_tty_device,
-        process_start_seconds: live_shell.process_start_seconds,
-        process_start_microseconds: live_shell.process_start_microseconds,
+        process_start_seconds: live_shell.birth.macos().map_or(0, |b| b.0),
+        process_start_microseconds: live_shell.birth.macos().map_or(0, |b| b.1),
+        linux_birth: live_shell.birth.linux(),
     };
     let owner = NativeSessionOwner {
         pid,
+        linux_birth: live.birth.linux(),
         managed_session_id: Some(session_id.to_owned()),
         terminal_tty: Some(terminal_tty),
         terminal_tty_device: Some(terminal_tty_device),
-        process_start_seconds: Some(live.process_start_seconds),
-        process_start_microseconds: Some(live.process_start_microseconds),
+        process_start_seconds: live
+            .birth
+            .linux()
+            .is_none()
+            .then_some(live.birth.macos().map_or(0, |b| b.0)),
+        process_start_microseconds: live
+            .birth
+            .linux()
+            .is_none()
+            .then_some(live.birth.macos().map_or(0, |b| b.1)),
         process_group: Some(live.process_group),
         terminal_process_group: Some(live.terminal_process_group),
         terminal_shell: Some(terminal_shell),
@@ -356,7 +490,7 @@ pub(in crate::native) fn current_native_session_owner(
     })
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) fn current_native_session_owner(
     session_id: &str,
 ) -> Result<NativeSessionOwner> {
@@ -367,7 +501,7 @@ pub(in crate::native) fn current_native_session_owner(
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(in crate::native) fn native_owner_identity_matches(
     owner: &NativeSessionOwner,
     live: &NativeProcessIdentity,
@@ -379,16 +513,30 @@ pub(in crate::native) fn native_owner_identity_matches(
         ControlRecord::NotRecorded => true,
         ControlRecord::Complete(recorded) => {
             recorded.terminal_tty_device == live.terminal_tty_device
-                && recorded.process_start_seconds == live.process_start_seconds
-                && recorded.process_start_microseconds == live.process_start_microseconds
+                && live.birth
+                    == ProcessBirth::Macos(
+                        recorded.process_start_seconds,
+                        recorded.process_start_microseconds,
+                    )
                 && recorded.process_group == live.process_group
                 && recorded.terminal_process_group == live.terminal_process_group
+        }
+        ControlRecord::Linux {
+            terminal_tty_device,
+            birth,
+            process_group,
+            terminal_process_group,
+        } => {
+            live.birth.linux() == Some(birth)
+                && terminal_tty_device == live.terminal_tty_device
+                && process_group == live.process_group
+                && terminal_process_group == live.terminal_process_group
         }
         ControlRecord::Partial => false,
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(in crate::native) fn verified_terminal_owner_process_group(
     owner: &NativeSessionOwner,
     live: &NativeProcessIdentity,
@@ -418,7 +566,7 @@ pub(in crate::native) fn verified_terminal_owner_process_group(
 /// Checks that `live_shell`, the owner's parent, holds the owner's foreground job on the
 /// owner's TTY and is the shell the owner recorded. `terminal` names the terminal
 /// application in the refusal, or is the word "terminal" where the kind is not known.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(in crate::native) fn verified_terminal_shell_process_group(
     terminal: &str,
     owner: &NativeSessionOwner,
@@ -441,8 +589,9 @@ pub(in crate::native) fn verified_terminal_shell_process_group(
         && (recorded.pid != live_shell.pid
             || recorded.process_group != live_shell.process_group
             || recorded.terminal_tty_device != live_shell.terminal_tty_device
-            || recorded.process_start_seconds != live_shell.process_start_seconds
-            || recorded.process_start_microseconds != live_shell.process_start_microseconds)
+            || recorded.linux_birth != live_shell.birth.linux()
+            || recorded.process_start_seconds != live_shell.birth.macos().map_or(0, |b| b.0)
+            || recorded.process_start_microseconds != live_shell.birth.macos().map_or(0, |b| b.1))
     {
         bail!("{terminal} shell identity changed")
     }
@@ -484,10 +633,10 @@ pub(in crate::native) fn verified_terminal_surface_owner(
             expected_session_id,
         )?)
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let owner = {
-        let surface_tty = terminal::verify_macos_surface(directory, session, timeout)?;
-        let (owner, _) = verified_macos_terminal_owner(
+        let surface_tty = terminal::verify_posix_surface(directory, session, timeout)?;
+        let (owner, _) = verified_posix_terminal_owner(
             directory,
             expected_session_id,
             session,
@@ -495,7 +644,7 @@ pub(in crate::native) fn verified_terminal_surface_owner(
         )?;
         Some(owner)
     };
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let owner = {
         let _ = (directory, timeout);
         None
@@ -534,16 +683,16 @@ pub(in crate::native) fn close_dead_owner_surface_with(
 // keeps its path here for `native.rs`.
 pub(in crate::native) use super::close_authority::close_owned_surface;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const OWNER_TEARDOWN_REASON: &str =
     "the surface was proven absent while its owner was live; the owner was ended";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn owner_group_gone(group: u32) -> Result<bool> {
     owner_group_gone_with(group, signal_process_group)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn owner_group_gone_with(
     group: u32,
     mut signal: impl FnMut(libc::pid_t, libc::c_int) -> std::io::Result<()>,
@@ -575,7 +724,7 @@ fn owner_group_gone_with(
 // The caller ends the surface afterwards.
 
 /// How a stop of the attested owner checks the terminal shell after the ownership proof.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) trait ShellCheck {
     /// What the stop learns of the shell.
     type Group;
@@ -589,10 +738,10 @@ pub(in crate::native::terminal) trait ShellCheck {
 
 /// The ownership proof's own shell check is the last one; the stop learns nothing of the
 /// shell.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) struct ProvenShell;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ShellCheck for ProvenShell {
     type Group = ();
     fn check(
@@ -607,10 +756,11 @@ impl ShellCheck for ProvenShell {
 
 /// The shell is observed again by the owner's parent PID and checked as the proof checks it;
 /// the stop learns the shell's process group from this observation.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(target_os = "linux", allow(dead_code))] // No Phase 1 adapter selects a fresh-shell stop.
 pub(in crate::native::terminal) struct FreshShell<F>(pub(in crate::native::terminal) F);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl<F: FnOnce(u32) -> Result<NativeProcessIdentity>> ShellCheck for FreshShell<F> {
     type Group = u32;
     fn check(
@@ -626,17 +776,19 @@ impl<F: FnOnce(u32) -> Result<NativeProcessIdentity>> ShellCheck for FreshShell<
 
 /// The process groups a stop acts on: the owner's foreground group, and what the shell
 /// check learned of the shell.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) struct OwnerGroups<S> {
     pub(in crate::native::terminal) owner: u32,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(in crate::native::terminal) shell: S,
 }
 
 /// The intent a stop publishes before it acts.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native::terminal) enum OwnerStopIntent {
     /// A close with a live attested owner: the close intent names the owner.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Close,
     /// The end of a live attested owner whose surface is proven absent: the intent names the
     /// owner's group and the teardown reason, and the owner is attested again after it.
@@ -644,10 +796,11 @@ pub(in crate::native::terminal) enum OwnerStopIntent {
 }
 
 /// What a caller supplies to [`stop_attested_owner`].
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) struct OwnerStop<A, S, H, P> {
     /// The ownership proof. The teardown calls it a second time after its intent.
     pub(in crate::native::terminal) attest: A,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(in crate::native::terminal) shell: S,
     /// Completes the owner record before the intent names it.
     pub(in crate::native::terminal) record_incarnation: H,
@@ -655,7 +808,7 @@ pub(in crate::native::terminal) struct OwnerStop<A, S, H, P> {
     pub(in crate::native::terminal) stop: P,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn stop_attested_owner<A, S, H, P>(
     store: &Store,
     id: &str,
@@ -716,7 +869,7 @@ where
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn teardown_absent_owner_with(
     store: &Store,
     id: &str,
@@ -748,7 +901,7 @@ pub(in crate::native::terminal) fn teardown_absent_owner_with(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn process_group_signal_target(
     process_group: u32,
 ) -> Result<libc::pid_t> {
@@ -762,7 +915,7 @@ pub(in crate::native::terminal) fn process_group_signal_target(
         .context("terminal process group cannot be represented as a signal target")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn terminate_owned_foreground_group_until(
     group: u32,
     deadline: Instant,
@@ -790,7 +943,9 @@ fn terminate_owned_foreground_group_with(
     terminate_owned_foreground_group_with_io(group, timeout, signal_process_group, observe)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+// POSIX owner-group stop retains the numeric PGID check/use race on both platforms.
+// pidfds are exclusively for an individually attested host, not a group-exit proof.
 pub(in crate::native::terminal) fn signal_process_group(
     target: libc::pid_t,
     signal: libc::c_int,
@@ -812,7 +967,7 @@ fn terminate_owned_foreground_group_with_io(
     terminate_owned_foreground_group_until_with_io(group, Instant::now() + timeout, signal, observe)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn terminate_owned_foreground_group_until_with_io(
     group: u32,
     deadline: Instant,
@@ -857,10 +1012,10 @@ pub(in crate::native) fn current_surface_owner(
     directory: &Path,
     id: &str,
 ) -> Result<NativeSessionOwner> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = directory;
     let owner = current_native_session_owner(id)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let owner = {
         let mut owner = owner;
         let surface: terminal::TerminalSession = Reader::open_unchecked(directory).terminal()?;
@@ -889,10 +1044,10 @@ mod process_close_tests {
         assert!(owner_group_gone(group).unwrap());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct ForegroundGroupChild(std::process::Child);
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl ForegroundGroupChild {
         fn spawn() -> Self {
             Self(
@@ -919,7 +1074,7 @@ mod process_close_tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl Drop for ForegroundGroupChild {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -927,7 +1082,7 @@ mod process_close_tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn owned_foreground_group_termination_waits_for_zombie_reaping() {
         let child = ForegroundGroupChild::spawn();
@@ -968,7 +1123,7 @@ mod process_close_tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn owned_foreground_group_termination_times_out_before_zombie_reaping() {
         let child = ForegroundGroupChild::spawn();
@@ -990,7 +1145,7 @@ mod process_close_tests {
         assert!(elapsed >= timeout);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn owned_foreground_group_termination_refuses_failed_signal_to_zombie() {
         let child = ForegroundGroupChild::spawn();
@@ -1013,7 +1168,7 @@ mod process_close_tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn owned_foreground_group_termination_waits_for_real_private_process_exit() {
         use std::os::unix::process::CommandExt;

@@ -633,6 +633,7 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     crate::native::session::RecordStore::at(&directory.path().join("console-host-process.json"))
         .write_json(&serde_json::json!({ "schema": 1, "pid": host.id(), "identity": query_process_identity(host.id()).unwrap() })).unwrap();
     let session = super::TerminalSession {
+        linux_host: None,
         kind: super::TerminalKind::WindowsConsole,
         id: root.id().to_string(),
         tab_id: None,

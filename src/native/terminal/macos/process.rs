@@ -136,13 +136,15 @@ pub(in crate::native) fn live_native_process_identity(pid: u32) -> Result<Native
         bail!("native-session process has no controlling TTY")
     }
     Ok(NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+            info.process_start_seconds,
+            info.process_start_microseconds,
+        ),
         pid,
         parent_pid: info.parent_pid,
         terminal_tty_device: u64::from(info.terminal_tty_device),
         process_group: info.process_group,
         terminal_process_group: info.terminal_process_group,
-        process_start_seconds: info.process_start_seconds,
-        process_start_microseconds: info.process_start_microseconds,
     })
 }
 

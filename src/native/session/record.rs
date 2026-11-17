@@ -252,7 +252,7 @@ pub(in crate::native) fn terminal(
 /// Retained-handle repair decodes the handle from its bytes: the whole input must be UTF-8
 /// (`invalid UTF-8`, see [`utf8`]), then serde's shape diagnostics, not the text reader's
 /// I/O diagnostic.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_bytes(
     bytes: &[u8],
 ) -> Result<crate::native::terminal::TerminalSession> {
@@ -272,7 +272,7 @@ pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Res
 
 /// Close only asks for a reason. Malformed JSON or a non-string reason means none;
 /// neither a typed terminal kind nor a consumed fact is required by this projection.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_consumption_reason(text: &str) -> Option<String> {
     terminal_tombstone_value(text)
         .ok()?

@@ -597,6 +597,7 @@ fn fixture() -> (tempfile::TempDir, ControlClient, String) {
 
 fn session() -> TerminalSession {
     TerminalSession {
+        linux_host: None,
         kind: TerminalKind::Warp,
         id: "instance-1".into(),
         tab_id: Some("new-tab".into()),
@@ -722,7 +723,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
         let before = (snapshot(temp.path()), snapshot(global.parent().unwrap()));
         let present = terminal::surface_present(&directory, &session(), Duration::from_secs(2));
         let verified =
-            terminal::verify_macos_surface(&directory, &session(), Some(Duration::from_secs(2)));
+            terminal::verify_posix_surface(&directory, &session(), Some(Duration::from_secs(2)));
         match state {
             "present" => {
                 assert!(present.unwrap());
@@ -841,7 +842,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
         .write_json(&wrong_offer)
         .unwrap();
     assert!(
-        terminal::verify_macos_surface(&directory, &session(), None)
+        terminal::verify_posix_surface(&directory, &session(), None)
             .unwrap_err()
             .to_string()
             .contains("host offer")
@@ -3010,23 +3011,21 @@ fn live_owner_close_fixture() -> (
     let directory = tempfile::tempdir().unwrap();
     let mut owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
     let shell = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1, 0),
         pid: 4000,
         parent_pid: 3000,
         terminal_tty_device: 7,
         process_group: 4000,
         terminal_process_group: 4242,
-        process_start_seconds: 1,
-        process_start_microseconds: 0,
     };
-    owner.terminal_shell = Some(
-        crate::native::terminal::ownership::MacTerminalShellIdentity {
-            pid: shell.pid,
-            process_group: shell.process_group,
-            terminal_tty_device: shell.terminal_tty_device,
-            process_start_seconds: shell.process_start_seconds,
-            process_start_microseconds: shell.process_start_microseconds,
-        },
-    );
+    owner.terminal_shell = Some(crate::native::terminal::ownership::TerminalShellIdentity {
+        linux_birth: None,
+        pid: shell.pid,
+        process_group: shell.process_group,
+        terminal_tty_device: shell.terminal_tty_device,
+        process_start_seconds: shell.birth.macos().unwrap().0,
+        process_start_microseconds: shell.birth.macos().unwrap().1,
+    });
     write_owner(directory.path(), &owner);
     let mut handle: terminal::TerminalSession =
         read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
@@ -3037,13 +3036,12 @@ fn live_owner_close_fixture() -> (
     )
     .unwrap();
     let live = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1_790_000_000, 42),
         pid: 4242,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 1_790_000_000,
-        process_start_microseconds: 42,
     };
     (directory, owner, handle, live, shell)
 }
@@ -3112,7 +3110,10 @@ fn warp_close_records_intent_before_stopping_only_attested_group() {
     assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
     fs::remove_file(directory.path().join(TERMINAL_CLOSE_INTENT_FILE)).unwrap();
     let changed = NativeProcessIdentity {
-        process_start_microseconds: 43,
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+            live.birth.macos().unwrap().0,
+            43,
+        ),
         ..live
     };
     let processes = fixture_processes(changed, vec![]);
@@ -3196,7 +3197,10 @@ fn warp_close_refuses_a_changed_shell_before_intent_and_stop() {
                 ..shell
             }),
             "incarnation" => Ok(NativeProcessIdentity {
-                process_start_microseconds: 1,
+                birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                    shell.birth.macos().unwrap().0,
+                    1,
+                ),
                 ..shell
             }),
             "ended" => Err(std::io::Error::from_raw_os_error(libc::ESRCH))

@@ -446,6 +446,13 @@ mod tests {
             FirstPartyCli::Pi => trust_pi(fixture, workspace),
         }
     }
+    // Fixtures replace their own store, using the same private creation policy each time.
+    fn replace_store(path: &Path, bytes: &[u8]) -> Result<()> {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        write_private(path, bytes)
+    }
     fn store_of(fixture: &Fixture, provider: FirstPartyCli) -> &Path {
         match provider {
             FirstPartyCli::Codex => &fixture.codex,
@@ -509,7 +516,7 @@ mod tests {
             );
 
             // Unreadable, declined or absent in the original store: source-reset.
-            fs::write(store_of(&fixture, provider), b"= =\n").unwrap();
+            replace_store(store_of(&fixture, provider), b"= =\n").unwrap();
             assert_eq!(
                 assess_with(temp.path(), &workspace, &fixture.env)
                     .unwrap()
@@ -523,7 +530,7 @@ mod tests {
                 FirstPartyCli::Agy => b"{\"trustedWorkspaces\":[]}",
                 FirstPartyCli::Pi => b"{}",
             };
-            fs::write(store_of(&fixture, provider), declined).unwrap();
+            replace_store(store_of(&fixture, provider), declined).unwrap();
             assert_eq!(
                 assess_with(temp.path(), &workspace, &fixture.env)
                     .unwrap()
@@ -560,7 +567,7 @@ mod tests {
                 trust(&fixture, *later, &workspace);
             }
             for earlier in &PROVIDERS[..index] {
-                fs::write(store_of(&fixture, *earlier), b"= =\n").unwrap();
+                replace_store(store_of(&fixture, *earlier), b"= =\n").unwrap();
                 assert!(
                     provider::workspace_trust(*earlier, &workspace, &fixture.env, None).is_err()
                 );

@@ -16,11 +16,11 @@ use crate::native::session::turn::{
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::OwnerBinding;
 
 use anyhow::{Context, Result, bail};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self},
@@ -145,7 +145,7 @@ pub(in crate::native) mod budget {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Deserialize, Serialize)]
 struct TerminalCloseIntent {
     managed_session_id: String,
@@ -161,7 +161,7 @@ struct TerminalCloseIntent {
 
 // Absence is the legacy format. A present field must deserialize as a complete
 // payload: Option's usual null -> None behavior would grant legacy replay authority.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn deserialize_teardown_intent<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<TerminalTeardownIntent>, D::Error>
@@ -171,14 +171,14 @@ where
     TerminalTeardownIntent::deserialize(deserializer).map(Some)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Deserialize, Serialize)]
 pub(in crate::native) struct TerminalTeardownIntent {
     pub process_group: u32,
     pub reason: String,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn record_terminal_close_intent(
     store: &Store,
     expected_session_id: &str,
@@ -195,7 +195,7 @@ pub(in crate::native) fn record_terminal_close_intent(
         })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn record_terminal_teardown_intent(
     store: &Store,
     id: &str,
@@ -220,7 +220,7 @@ pub(in crate::native) fn record_terminal_teardown_intent(
 // Teardown is independent of surface retention policy, including iTerm2. A record
 // claiming this intent kind must validate; it may never fall through to dead-owner
 // absence based on the surface alone.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_teardown_intent(
     reader: &Reader,
     surface: &terminal::TerminalSession,
@@ -264,7 +264,7 @@ pub(in crate::native) fn terminal_teardown_intent(
 // that close finish: it names this managed session, this exact handle and this exact
 // owner record, with the owner's whole identity. Anything else, unreadable or not,
 // grants nothing.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_close_intent_owner(
     reader: &Reader,
     session: &terminal::TerminalSession,
@@ -295,7 +295,7 @@ pub(in crate::native) fn terminal_close_intent_owner(
     Ok((attested && bound && exact && intent.teardown.is_none()).then_some(owner))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_close_resumable(
     reader: &Reader,
     session: &terminal::TerminalSession,
@@ -304,7 +304,7 @@ pub(in crate::native) fn terminal_close_resumable(
     terminal_close_resumable_with(reader, session, surface_outlives_owner, attest_owner)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_close_resumable_with(
     reader: &Reader,
     session: &terminal::TerminalSession,
@@ -561,7 +561,7 @@ fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<
 }
 
 fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read
         // is strict, and an undecodable tombstone never keeps a close from finishing.
@@ -571,7 +571,7 @@ fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|text| super::record::terminal_consumption_reason(&text)))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = store;
         Ok(None)
@@ -594,13 +594,13 @@ fn consume_terminal_handle(
         "consumed": true,
         "terminal": terminal_kind,
     });
-    if cfg!(target_os = "macos")
+    if cfg!(any(target_os = "macos", target_os = "linux"))
         && let Some(reason) = reason
     {
         marker["reason"] = reason.into();
     }
     let tombstone_result = store.write_terminal_closed(&marker);
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     if tombstone_result.is_ok() {
         interruption::at(interruption::Point::ConsumptionMarkerWritten);
     }
@@ -609,14 +609,14 @@ fn consume_terminal_handle(
     budget::check()?;
     let active_result = RecordStore::at(store.record(CoreRecord::Terminal).path()).remove();
     let closing_result = RecordStore::at(store.record(CoreRecord::TerminalClosing).path()).remove();
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     if active_result.is_ok() && closing_result.is_ok() {
         interruption::at(interruption::Point::HandleRemoved);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let intent_result =
         RecordStore::at(store.record(CoreRecord::TerminalCloseIntent).path()).remove();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let intent_result = Ok(());
     tombstone_result?;
     active_result?;
@@ -858,7 +858,7 @@ where
     let directory = store.directory();
     #[cfg(not(windows))]
     let _ = (&mut close_terminal, deadline);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = &retain_surface;
     // Completion recovery runs first so a live owner's finished turn is published before
     // anything else is decided. Its failure is damage (a missing `events/`, a journal
@@ -925,7 +925,7 @@ where
         // prove it absent. Even a damaged/mismatched intent must preserve that pending
         // cleanup: it grants no authority, but is not evidence of a vanished surface.
         // The explicit close validates the full intent before using it as authority.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if store
             .record(CoreRecord::TerminalCloseIntent)
             .bytes()?
@@ -937,7 +937,7 @@ where
         // disappeared. Keep the exact handle for the affected macOS adapters even
         // before a first explicit close. This gives no authority to send a close:
         // the normal live-owner/previous-intent checks must still pass.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
             if let Some(bytes) = store.record(record).bytes()? {
                 let surface: terminal::TerminalSession = super::record::terminal_bytes(&bytes)
@@ -963,7 +963,8 @@ mod tests;
 
 // A panic models interruption, not an operation error: no caller's restore/settle
 // handler runs. File locks unwind; only the selected thread's one checkpoint fires.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Additional macOS interruption scenarios stay application-local.
 pub(in crate::native) mod interruption {
     use std::{
         cell::{Cell, RefCell},

@@ -256,6 +256,7 @@ fn create_tab(
         bail!("Terminal.app did not return one tty and one window id");
     }
     Ok(TerminalSession {
+        linux_host: None,
         kind: TerminalKind::AppleTerminal,
         id: id.unwrap().to_owned(),
         tab_id: None,
@@ -1626,6 +1627,7 @@ end mockClose
     #[test]
     fn terminal_disappearing_after_send_ownership_proof_is_delivery_uncertain() {
         let session = TerminalSession {
+            linux_host: None,
             kind: TerminalKind::AppleTerminal,
             id: TTY.into(),
             window_id: Some(WINDOW.into()),

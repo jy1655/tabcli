@@ -11,7 +11,7 @@ pub(in crate::native) const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.jso
 // An explicit close of a surface whose owner must be verified first writes it after
 // verifying the live owner and surface, before teardown/close; see
 // `terminal_close_intent_owner`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) const TERMINAL_CLOSE_INTENT_FILE: &str = "terminal.close-intent.json";
 // v0.0.2 native-Windows Claude sessions may still carry these files. New sessions never
 // create them; explicit close and prune consume them so an upgrade cannot strand state.

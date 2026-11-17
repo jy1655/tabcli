@@ -21,7 +21,8 @@ pub(super) fn fixture(
     let dir = tempfile::tempdir().unwrap();
     let mut owner = write_attested_apple_terminal_state(dir.path(), "ready", 4242);
     let store = Store::open_unchecked(dir.path());
-    owner.terminal_shell = Some(MacTerminalShellIdentity {
+    owner.terminal_shell = Some(TerminalShellIdentity {
+        linux_birth: None,
         pid: 4000,
         process_group: 4000,
         terminal_tty_device: 7,
@@ -36,13 +37,15 @@ pub(super) fn fixture(
         .write_json(&surface)
         .unwrap();
     let live = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+            owner.process_start_seconds.unwrap(),
+            owner.process_start_microseconds.unwrap(),
+        ),
         pid: owner.pid,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: owner.process_start_seconds.unwrap(),
-        process_start_microseconds: owner.process_start_microseconds.unwrap(),
     };
     (dir, owner, surface, live)
 }
@@ -130,7 +133,10 @@ fn r3_attestation_changes_and_timeout_keep_handle_and_intent() {
                         let mut process = live;
                         if failure == "reused" && calls.get() == 2 {
                             observed.process_start_microseconds = Some(43);
-                            process.process_start_microseconds = 43;
+                            process.birth = crate::native::terminal::ownership::ProcessBirth::Macos(
+                                process.birth.macos().unwrap().0,
+                                43,
+                            );
                         }
                         Ok((observed, process))
                     },
@@ -218,7 +224,7 @@ fn decision(
         })
         .with_owner_record(|_| panic!("spawn recovery must not run"))
         .with_pid_alive(move |_| pid_alive)
-        .with_mac_owner_live(move |_| test_owner_attestation(live))
+        .with_posix_owner_live(move |_| test_owner_attestation(live))
         .with_proof(|| bail!("restored iTerm2: did not match exactly one session"))
         .with_attest(|| Ok(()))
         .with_group_gone(group_gone)
@@ -300,7 +306,7 @@ fn r3_terminal_incarnation_changes_or_old_window_in_new_app_refuse() {
                 .with_evidence(&apple)
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
-                .with_mac_owner_live(|_| test_owner_attestation(true))
+                .with_posix_owner_live(|_| test_owner_attestation(true))
                 .with_resumable(|| Ok(false))
                 .with_proof(|| bail!("original proof mismatch"))
                 .with_attest(|| panic!("unproven absence must not attest or signal"))
@@ -347,7 +353,7 @@ fn r3_owner_dying_during_live_intent_retry_cannot_bypass_group_check() {
         .with_evidence(terminal::close_evidence(surface.kind))
         .with_owner_record(|_| panic!("not startup"))
         .with_pid_alive(|_| false)
-        .with_mac_owner_live(|_| {
+        .with_posix_owner_live(|_| {
             live_reads.set(live_reads.get() + 1);
             test_owner_attestation(live_reads.get() == 1)
         })
@@ -437,7 +443,7 @@ fn damaged_teardown_refuses(path: &str) {
                 .with_evidence(terminal::close_evidence(surface.kind))
                 .with_owner_record(|_| test_owner_attestation(false))
                 .with_pid_alive(|_| false)
-                .with_mac_owner_live(|_| test_owner_attestation(false))
+                .with_posix_owner_live(|_| test_owner_attestation(false))
                 .with_resumable(|| {
                     Ok(session::close::terminal_close_intent_owner(
                         &store,
@@ -608,7 +614,7 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
                 .with_evidence(terminal::close_evidence(surface.kind))
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
-                .with_mac_owner_live(|_| test_owner_attestation(true))
+                .with_posix_owner_live(|_| test_owner_attestation(true))
                 .with_resumable(|| Ok(false))
                 .with_proof(|| {
                     proof_calls.set(proof_calls.get() + 1);
@@ -628,10 +634,9 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
                 || panic!("expired observation grants no teardown"),
                 |_| {
                     let shell = NativeProcessIdentity {
+                        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1, 0),
                         pid: 4000,
                         process_group: 4000,
-                        process_start_seconds: 1,
-                        process_start_microseconds: 0,
                         ..live
                     };
                     stop_attested_owner(
@@ -786,7 +791,7 @@ fn owner_control_failure_or_reuse_grants_no_ordinary_surface_authority() {
                 .with_presence(|| panic!("control failure must not probe surface"))
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
-                .with_mac_owner_live(|_| OwnerAttestation {
+                .with_posix_owner_live(|_| OwnerAttestation {
                     process: ProcessObservation::Live(Attested::Incarnation),
                     control: match &control {
                         ControlAttestation::Changed(r) => ControlAttestation::Changed(r.clone()),
@@ -808,7 +813,7 @@ fn owner_control_failure_or_reuse_grants_no_ordinary_surface_authority() {
         .with_presence(|| panic!("reuse grants no absence"))
         .with_owner_record(|_| panic!("not startup"))
         .with_pid_alive(|_| false)
-        .with_mac_owner_live(|_| OwnerAttestation {
+        .with_posix_owner_live(|_| OwnerAttestation {
             process: ProcessObservation::Gone(Gone::Reused("birth".into())),
             control: ControlAttestation::NotRecorded,
             pid_alive: Some(false),
@@ -857,7 +862,7 @@ fn r1_c8_reused_birth_resumes_only_through_exact_intent_at_authority_seam() {
                 .with_presence(|| panic!("no surface observation granted"))
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
-                .with_mac_owner_live(observe)
+                .with_posix_owner_live(observe)
                 .with_resumable(|| {
                     session::close::terminal_close_resumable_with(&store, &surface, true, observe)
                 })
@@ -1045,11 +1050,10 @@ fn terminal_app_live_owner_close_refuses_an_unverified_surface_before_the_owner(
 // The shell of `fixture`: the owner's parent, leading its own group on the owner's TTY.
 fn fixture_shell(live: NativeProcessIdentity) -> NativeProcessIdentity {
     NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1, 0),
         pid: 4000,
         parent_pid: 3000,
         process_group: 4000,
-        process_start_seconds: 1,
-        process_start_microseconds: 0,
         ..live
     }
 }
@@ -1241,7 +1245,10 @@ fn owner_stop_refuses_a_changed_shell_before_incarnation_intent_and_stop() {
                                 .context("failed to inspect native-session process 4000"),
                             "uninspectable" => bail!("process inspection failed"),
                             "incarnation" => Ok(NativeProcessIdentity {
-                                process_start_seconds: 2,
+                                birth: crate::native::terminal::ownership::ProcessBirth::Macos(
+                                    2,
+                                    shell.birth.macos().unwrap().1,
+                                ),
                                 ..shell
                             }),
                             "tty" => Ok(NativeProcessIdentity {

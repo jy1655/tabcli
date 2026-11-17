@@ -92,12 +92,12 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     use Availability::*;
     let mut checks = vec![Check::new(
         CheckId::PLATFORM,
-        if cfg!(any(target_os = "macos", windows)) {
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             Available
         } else {
             Unavailable
         },
-        if cfg!(any(target_os = "macos", windows)) {
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             Reason::PLATFORM_SUPPORTED
         } else {
             Reason::PLATFORM_UNSUPPORTED
@@ -1524,6 +1524,7 @@ mod launch_host_tests {
     fn surface(store: &Store, kind: TerminalKind) {
         store
             .write_terminal(&terminal::TerminalSession {
+                linux_host: None,
                 kind,
                 id: "1".into(),
                 tab_id: None,
