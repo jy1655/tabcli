@@ -270,6 +270,20 @@ predates the script keep the ordinary serial command.
 Capture setup failures stop the step before Cargo starts. A capture failure after a successful
 Cargo run fails the step; if Cargo itself fails, its failure status takes precedence.
 
+When `CI_TEST_FIXTURE_TEMP` names an absolute directory, the recorder points the tests'
+`TEMP` and `TMP` there, but only if that directory's volume reports NTFS; the variable itself
+is not passed to the tests. CI and Release set it to `RUNNER_TEMP/test-fixtures` on the
+runner's temporary-storage volume. The default `TEMP` is on the OS disk, where a file flush
+took 4–7 ms instead of 0.1–0.3 ms and the main unit tests ran 3.1–5.5 times longer
+([2026-11-17 measurement](verification/2026-11-17-windows-test-fixture-volume.md)). The same
+tests, permissions, flushes and serial harness run; only the fixtures' volume changes.
+GitHub formats that volume as ReFS from 2026-11-30
+([actions/runner-images#15315](https://github.com/actions/runner-images/issues/15315)). The
+recorder then keeps the default `TEMP` and writes a `::warning::`, so Windows tests stay on
+the file system that users have, at the earlier speed, until ReFS is evaluated. The record
+and summary name the fixture `TEMP`, its volume root and file system, and `compare` treats a
+different fixture volume as a different condition. Earlier tags' recorders ignore the variable.
+
 Completed captures contain `output.log`, `timings.json`, and `summary.md`. Before starting Cargo,
 the recorder saves a `running` record with no result; it atomically replaces it after exit.
 An interrupted capture can retain that initial record and the flushed partial log. Neither

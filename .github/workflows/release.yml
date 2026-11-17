@@ -141,10 +141,13 @@ jobs:
         run: cargo test --all-targets --all-features -- --test-threads=1
       - name: Run Windows serial tests with timing
         if: runner.os == 'Windows' && hashFiles('scripts/ci_test_timing.py') != ''
-        # Normally 7-11 minutes, and up to 22 before the in-process SID lookup.
+        # Fixtures use the runner's temporary-storage volume while it is NTFS; see
+        # docs/testing.md#windows-ci-performance-observations. On the OS disk this step took
+        # 7-19 minutes, and up to 22 before the in-process SID lookup.
         timeout-minutes: 60
         env:
           TEST_TIMING_DIR: ${{ runner.temp }}/ci-test-timing
+          CI_TEST_FIXTURE_TEMP: ${{ runner.temp }}/test-fixtures
         run: python -I scripts/ci_test_timing.py run --output-dir "$env:TEST_TIMING_DIR"
       - name: Preserve Windows test timing
         if: always() && runner.os == 'Windows' && hashFiles('scripts/ci_test_timing.py') != ''

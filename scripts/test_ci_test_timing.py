@@ -265,6 +265,109 @@ class TimingTests(unittest.TestCase):
             self.assertIn("Conditions differ or are unknown", report)
             self.assertNotIn("Recorded conditions match", report)
 
+    def test_fixture_temp_moves_only_to_an_ntfs_volume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requested = root / "missing" / "fixtures"
+            probed = []
+            def ntfs(path):
+                probed.append(path)
+                return "D:\\", "NTFS"
+            overrides, record = timing.fixture_temp(requested, ntfs)
+            self.assertEqual(probed, [root])
+            self.assertTrue(requested.is_dir())
+            self.assertEqual(overrides, {"TEMP": str(requested), "TMP": str(requested)})
+            self.assertEqual(record, {"requested": str(requested), "volume": "D:\\",
+                                      "filesystem": "NTFS", "applied": True,
+                                      "temp": str(requested)})
+            for name in ["ReFS", None]:
+                other = root / f"other-{name}"
+                volume = None if name is None else "D:\\"
+                overrides, record = timing.fixture_temp(other, lambda path, v=volume, n=name: (v, n))
+                self.assertEqual(overrides, {})
+                self.assertFalse(other.exists())
+                self.assertEqual(record, {"requested": str(other), "volume": volume,
+                                          "filesystem": name, "applied": False, "temp": None})
+            with self.assertRaises(ValueError):
+                timing.fixture_temp(Path("relative"), ntfs)
+
+    def test_volume_filesystem_names_the_native_volume_only_on_windows(self):
+        volume, name = timing.volume_filesystem(Path(tempfile.gettempdir()))
+        if os.name == "nt":
+            for value in [volume, name]:
+                self.assertIsInstance(value, str)
+                self.assertTrue(value)
+            self.assertTrue(tempfile.gettempdir().lower().startswith(volume.lower().rstrip("\\")))
+        else:
+            self.assertEqual((volume, name), (None, None))
+
+    def test_recorded_run_passes_fixture_temp_to_the_tests_only(self):
+        script = ("import os; print('TEMP=' + os.environ.get('TEMP', '')); "
+                  "print('TMP=' + os.environ.get('TMP', '')); "
+                  f"print('LEAK=' + str({timing.FIXTURE_TEMP_ENV!r} in os.environ))")
+        for name in ["NTFS", "ReFS"]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                requested = root / "fixtures"
+                output = root / "timing"
+                environment = {"GITHUB_STEP_SUMMARY": "", timing.FIXTURE_TEMP_ENV: str(requested),
+                               "TEMP": "default-temp", "TMP": "default-tmp"}
+                console = io.StringIO()
+                with mock.patch.dict(os.environ, environment), \
+                     mock.patch.object(timing, "metadata", return_value=details()), \
+                     mock.patch.object(timing, "volume_filesystem", return_value=("D:\\", name)), \
+                     mock.patch("sys.stdout", console):
+                    code = timing.record_run(output, root, [sys.executable, "-c", script], io.BytesIO())
+                self.assertEqual(code, 0)
+                log = (output / "output.log").read_text()
+                data = json.loads((output / "timings.json").read_text())
+                summary = (output / "summary.md").read_text()
+                self.assertIn("LEAK=False", log)
+                if name == "NTFS":
+                    self.assertIn(f"TEMP={requested}", log)
+                    self.assertIn(f"TMP={requested}", log)
+                    self.assertTrue(data["metadata"]["fixture_temp"]["applied"])
+                    self.assertIn(f"Test fixture TEMP: {requested} (NTFS volume D:\\)", summary)
+                    self.assertEqual(console.getvalue(), "")
+                else:
+                    self.assertIn("TEMP=default-temp", log)
+                    self.assertIn("TMP=default-tmp", log)
+                    self.assertFalse(requested.exists())
+                    self.assertFalse(data["metadata"]["fixture_temp"]["applied"])
+                    self.assertIn("is on ReFS, not NTFS", summary)
+                    self.assertTrue(console.getvalue().startswith("::warning::Test fixtures stay"))
+                timing.read_record(output / "timings.json")
+
+    def test_comparison_names_a_different_fixture_temp_volume(self):
+        before = self.sample()
+        moved = copy.deepcopy(before)
+        moved["metadata"]["fixture_temp"] = {"requested": "D:\\t", "volume": "D:\\",
+                                             "filesystem": "NTFS", "applied": True, "temp": "D:\\t"}
+        report = timing.compare(before, moved)
+        self.assertIn("test fixture TEMP volume", report)
+        self.assertIn("Recorded conditions match", timing.compare(moved, copy.deepcopy(moved)))
+        other_volume = copy.deepcopy(moved)
+        other_volume["metadata"]["fixture_temp"].update(requested="C:\\t", volume="C:\\", temp="C:\\t")
+        self.assertIn("test fixture TEMP volume", timing.compare(moved, other_volume))
+        same_volume = copy.deepcopy(moved)
+        same_volume["metadata"]["fixture_temp"].update(volume="d:\\", temp="D:\\other")
+        self.assertIn("Recorded conditions match", timing.compare(moved, same_volume))
+        kept = copy.deepcopy(before)
+        kept["metadata"]["fixture_temp"] = {"requested": "D:\\t", "volume": "D:\\",
+                                            "filesystem": "ReFS", "applied": False, "temp": None}
+        self.assertIn("Recorded conditions match", timing.compare(before, kept))
+        for invalid in [[], {"requested": "x", "filesystem": None, "applied": "yes", "temp": None},
+                        {"requested": "x", "filesystem": 1, "applied": False, "temp": None},
+                        {"requested": "x", "volume": 2, "filesystem": "NTFS", "applied": True,
+                         "temp": "x"}]:
+            with tempfile.TemporaryDirectory() as directory:
+                record = copy.deepcopy(before)
+                record["metadata"]["fixture_temp"] = invalid
+                path = Path(directory) / "timings.json"
+                path.write_text(json.dumps(record))
+                with self.assertRaises(ValueError):
+                    timing.read_record(path)
+
     def test_suite_comparison_survives_a_new_target_and_reordered_ordinals(self):
         before = self.sample()
         after = copy.deepcopy(before)
