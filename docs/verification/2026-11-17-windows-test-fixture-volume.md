@@ -33,24 +33,24 @@ an Intel Xeon Platinum 8573C with SAS virtual disks.
 | both | 83.6 / 118.1 | 114.5 / 155.7 | 0 / 0 |
 
 A file flush cost 4.3–7.0 ms on the OS disk and 0.14–0.29 ms on `D:`. Directory flushes
-(29,504 calls) took 8–11 s on the OS disk and under 1.5 s on `D:`; DACL applications
-(46,116 calls) took 2–6 s. Skipping flushes on the OS disk still left the suite slower
+took 8–11 s on the OS disk (29,504 calls) and under 1.5 s on `D:` (29,466 calls); DACL
+applications (46,116 calls) took 2–6 s. Skipping flushes on the OS disk still left the suite slower
 than real flushes on `D:`: other writes to the OS disk are slow too. On `D:`, skipping
 flushes saved only another 8–11 s, so the change keeps every flush.
 
-Every arm had two failures from the measurement itself: its import in
-`terminal/windows/security.rs` broke `tests/windows_security_policy.rs`, which guards that
-module's dependencies. Job 1's `skip-flush` arm also failed
-`the_self_test_runner_classifies_its_own_deadlines_from_typed_evidence` once (a 50 ms
-spawn deadline expired before the child started), and Cargo stopped before the
-integration binaries, so that arm has no all-suites total. Counts were identical in all
-other arms (1,661 passed, 5 ignored). Two jobs are a small sample; hosted load still varies.
+The seven captures that reached the integration tests each had two failures from the
+measurement itself: its import in `terminal/windows/security.rs` broke
+`tests/windows_security_policy.rs`, which guards that module's dependencies. Their counts
+were identical (1,661 passed, 2 failed, 5 ignored). The eighth, job 1's `skip-flush` arm,
+instead failed `the_self_test_runner_classifies_its_own_deadlines_from_typed_evidence`
+in the unit tests (a 50 ms spawn deadline expired before the child started), and Cargo
+stopped before the integration binaries, so that arm has no all-suites total. Two jobs are a small sample; hosted load still varies.
 
 ## Change
 
 `scripts/ci_test_timing.py` points the tests' `TEMP` and `TMP` at `CI_TEST_FIXTURE_TEMP`
-when that directory's volume reports NTFS, records the decision in `timings.json` and the
-summary, and does not pass the variable to the tests. CI and Release set it to
+when that directory's volume reports NTFS, records the decision with the volume root and
+file system in `timings.json` and the summary, and does not pass the variable to the tests. CI and Release set it to
 `RUNNER_TEMP/test-fixtures`. Tests, permissions, flushes, retries and the serial harness are
 unchanged. GitHub formats `D:` as ReFS from 2026-11-30
 ([actions/runner-images#15315](https://github.com/actions/runner-images/issues/15315)); the

@@ -190,9 +190,9 @@ def metadata(cwd):
 
 
 def volume_filesystem(path):
-    """Name the file system of the volume that holds an existing path; None if unknown."""
+    """Return (volume root, file system name) for an existing path; (None, None) if unknown."""
     if os.name != "nt":
-        return None
+        return None, None
     import ctypes
     from ctypes import wintypes
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -204,11 +204,11 @@ def volume_filesystem(path):
     kernel32.GetVolumeInformationW.restype = wintypes.BOOL
     root = ctypes.create_unicode_buffer(32768)
     if not kernel32.GetVolumePathNameW(str(path), root, len(root)):
-        return None
+        return None, None
     name = ctypes.create_unicode_buffer(261)
     if not kernel32.GetVolumeInformationW(root.value, None, 0, None, None, None, name, len(name)):
-        return None
-    return name.value
+        return root.value, None
+    return root.value, name.value
 
 
 def fixture_temp(requested, filesystem=None):
@@ -220,8 +220,9 @@ def fixture_temp(requested, filesystem=None):
     existing = requested
     while not existing.exists() and existing.parent != existing:
         existing = existing.parent
-    name = filesystem(existing)
-    record = {"requested": str(requested), "filesystem": name, "applied": False, "temp": None}
+    volume, name = filesystem(existing)
+    record = {"requested": str(requested), "volume": volume, "filesystem": name,
+              "applied": False, "temp": None}
     if name != FIXTURE_FILESYSTEM:
         return {}, record
     requested.mkdir(parents=True, exist_ok=True)
@@ -230,9 +231,11 @@ def fixture_temp(requested, filesystem=None):
 
 
 def fixture_condition(data):
+    """The fixture volume a record ran on; None for the default TEMP."""
     value = data["metadata"].get("fixture_temp")
     if isinstance(value, dict) and value.get("applied") is True:
-        return value.get("filesystem")
+        volume = value.get("volume")
+        return (volume.casefold() if isinstance(volume, str) else None, value.get("filesystem"))
     return None
 
 
@@ -262,7 +265,8 @@ def fixture_text(value):
     if not isinstance(value, dict):
         return "default"
     if value.get("applied") is True:
-        return f"{cell(value.get('temp'))} ({cell(value.get('filesystem'))})"
+        return (f"{cell(value.get('temp'))} ({cell(value.get('filesystem'))} volume "
+                f"{cell(value.get('volume'))})")
     return (f"default; {cell(value.get('requested'))} is on "
             f"{cell(value.get('filesystem') or 'an unknown file system')}, not {FIXTURE_FILESYSTEM}")
 
@@ -398,7 +402,7 @@ def read_record(path):
         not isinstance(fixture, dict) or type(fixture.get("applied")) is not bool
         or not isinstance(fixture.get("requested"), str)
         or any(fixture.get(key) is not None and not isinstance(fixture[key], str)
-               for key in ["filesystem", "temp"])
+               for key in ["volume", "filesystem", "temp"])
     ):
         raise ValueError(f"{path}: invalid fixture_temp")
     obs = data.get("observation")

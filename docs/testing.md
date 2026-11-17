@@ -281,8 +281,8 @@ GitHub formats that volume as ReFS from 2026-11-30
 ([actions/runner-images#15315](https://github.com/actions/runner-images/issues/15315)). The
 recorder then keeps the default `TEMP` and writes a `::warning::`, so Windows tests stay on
 the file system that users have, at the earlier speed, until ReFS is evaluated. The record
-and summary name the fixture `TEMP`, and `compare` treats a different fixture volume as a
-different condition. Earlier tags' recorders ignore the variable.
+and summary name the fixture `TEMP`, its volume root and file system, and `compare` treats a
+different fixture volume as a different condition. Earlier tags' recorders ignore the variable.
 
 Completed captures contain `output.log`, `timings.json`, and `summary.md`. Before starting Cargo,
 the recorder saves a `running` record with no result; it atomically replaces it after exit.
