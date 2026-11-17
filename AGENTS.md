@@ -97,7 +97,7 @@ Paths mentioned inside the boundary files are relative to the repository root.
 | [Current Pi Boundary](docs/agents/pi.md) | Pi extension, input, pending turn, cancellation or usage; `src/native/provider/pi/` and `src/native/provider/pi_*` extension/fixture files. |
 | [Current Codex Boundary](docs/agents/codex.md) | Codex hooks, input, completion, questions, memory admission or caller markers; `src/native/provider/codex/`. |
 | [Current Linux Surface Boundary](docs/agents/linux.md) | Linux/tmux launch, input, observation, close, process identity or exec budgets; `src/native/terminal/linux/`. |
-| [Current Windows Surface Boundary](docs/agents/windows.md) | Windows console/tab launch, focus, host, control or record publication; `src/native/terminal/windows/` and `src/native/console_control/`. |
+| [Current Windows Surface Boundary](docs/agents/windows.md) | Windows console/tab launch, focus, host, control or record publication; `src/native/terminal/windows/`, `src/native/console_control.rs` and `src/native/console_control/`. |
 | [Current macOS Shell Startup Boundary](docs/agents/macos-shell.md) | macOS shell capture or launch host; `src/native/terminal/macos/` (especially iTerm2/WezTerm). |
 | [Trust Store Boundary](docs/agents/trust.md) | Workspace consent, provider trust readers, launch dialogs or reopen admission; `src/native/consent/` and provider trust code. |
 | [Observation and Self-Test Boundary](docs/agents/observation.md) | Queries, screen, timelines, delivery refusal, version notes or self-test; `src/native/query/`, `src/native/self_test/` and diagnostics. |
