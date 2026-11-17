@@ -106,40 +106,47 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 
 ## 설치
 
-[GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`을 사용합니다.
+[GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`, glibc 2.39 이상(Ubuntu 24.04 이상)의 x86_64 Linux는 `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz`를 사용합니다.
 
-0.4.42 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
+0.4.43 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
 ```sh
-shasum -a 256 -c tabcli-0.4.42-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.42-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.43-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.43-aarch64-apple-darwin.tar.gz
+```
+
+Linux에서도 같은 방식으로 진행합니다.
+
+```sh
+sha256sum -c tabcli-0.4.43-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.43-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Windows에서는 PowerShell에서 실행합니다.
 
 ```powershell
-$archive = "tabcli-0.4.42-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.43-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
 Expand-Archive $archive -DestinationPath .\tabcli
 ```
 
-체크섬이 다르면 설치를 멈추고 같은 릴리스에서 압축 파일과 체크섬을 다시 받습니다. 압축을 푼 `tabcli`(macOS) 또는 `tabcli.exe`(Windows)를 `PATH`에 있는 디렉터리에 둡니다.
+체크섬이 다르면 설치를 멈추고 같은 릴리스에서 압축 파일과 체크섬을 다시 받습니다. 압축을 푼 `tabcli`(macOS, Linux) 또는 `tabcli.exe`(Windows)를 `PATH`에 있는 디렉터리에 둡니다.
 
 소스에서 설치하려면 Rust 1.97.1 이상과 Cargo가 필요합니다.
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.42 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.43 --locked
 ```
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.
 
-첫 실행 전에 사용할 에이전트 CLI를 설치하고 로그인한 뒤, 해당 프로젝트의 작업 디렉터리 신뢰 질문을 처리합니다. iTerm2, Terminal.app, Ghostty 연동은 macOS Automation을 사용합니다. 실행 중 Apple Events 권한 오류가 나면 [macOS 승인 확인 절차](docs/macos-permissions.md)를 따릅니다. Windows에서 직접 실행할 때는 cmd에서 호출하더라도 `PATH`에 PowerShell 7(`pwsh.exe`)이 있어야 합니다.
+첫 실행 전에 사용할 에이전트 CLI를 설치하고 로그인한 뒤, 해당 프로젝트의 작업 디렉터리 신뢰 질문을 처리합니다. iTerm2, Terminal.app, Ghostty 연동은 macOS Automation을 사용합니다. 실행 중 Apple Events 권한 오류가 나면 [macOS 승인 확인 절차](docs/macos-permissions.md)를 따릅니다. Windows에서 직접 실행할 때는 cmd에서 호출하더라도 `PATH`에 PowerShell 7(`pwsh.exe`)이 있어야 합니다. Linux에서는 `PATH`에 tmux 3.2 이상이 있어야 합니다. [Linux / tmux](docs/terminals.md#linux--tmux)를 참고하세요.
 
 ## 에이전트 플러그인 설치
 
-먼저 [`tabcli`를 설치](#설치)한 뒤, 저장소 버전의 플러그인을 설치합니다. macOS 터미널 또는 Windows PowerShell에서 실행하세요.
+먼저 [`tabcli`를 설치](#설치)한 뒤, 저장소 버전의 플러그인을 설치합니다. macOS나 Linux 셸, 또는 Windows PowerShell에서 실행하세요.
 
 ```sh
 git clone --depth 1 https://github.com/jy1655/tabcli.git tabcli-integrations
