@@ -16,6 +16,28 @@ fn birth(boot: &str, ticks: u64) -> LinuxBirth {
 const BOOT: &str = "00112233-4455-6677-8899-aabbccddeeff";
 const OTHER_BOOT: &str = "ffeeddcc-bbaa-9988-7766-554433221100";
 
+#[test]
+fn close_observation_keeps_procfs_birth_separate_from_pidfd_exit() {
+    let host = Fake::new();
+    // An unreaped process still has a procfs birth even though its pidfd reports exit.
+    host.server.exited.set(true);
+    assert_eq!(
+        observe_created_host(&host, &handle()).unwrap(),
+        ProcessObservation::Live(Attested::Incarnation)
+    );
+    assert_eq!(
+        end_server(&host, &handle(), deadline()).unwrap(),
+        CloseOutcome::Missing
+    );
+    assert!(host.server.log.borrow().is_empty());
+    assert!(host.commands().is_empty());
+    host.births.borrow_mut().insert(SERVER, None);
+    assert_eq!(
+        observe_created_host(&host, &handle()).unwrap(),
+        ProcessObservation::Gone(Gone::Exited)
+    );
+}
+
 enum Reply {
     Out(&'static str),
     Failed(&'static str),
@@ -155,20 +177,16 @@ fn socket() -> PathBuf {
 }
 
 fn handle() -> TerminalSession {
-    TerminalSession {
-        kind: TerminalKind::Tmux,
-        id: "%0".into(),
-        tab_id: Some("@0".into()),
-        window_id: Some("$0".into()),
-        managed_session_id: Some("session-tmuxtest".into()),
-        windows_process_identity: None,
-        wezterm_mux: None,
-        linux_host: Some(LinuxHostIdentity {
-            pid: SERVER,
-            linux_birth: birth(BOOT, 100),
-        }),
-        tmux_socket: Some(socket().to_str().unwrap().into()),
-    }
+    TerminalSession::new(TerminalKind::Tmux, "%0".into())
+        .with_location(Some("@0".into()), Some("$0".into()))
+        .with_binding(Some("session-tmuxtest".into()))
+        .with_tmux_server(
+            socket().to_str().unwrap().into(),
+            LinuxHostIdentity {
+                pid: SERVER,
+                linux_birth: birth(BOOT, 100),
+            },
+        )
 }
 
 const VERSION: &str = "tmux 3.6\n";
@@ -225,13 +243,11 @@ fn creation_starts_one_detached_server_with_a_direct_host_program_and_proves_it(
         .reply("list-sessions", Reply::Out(ONE_SESSION))
         .reply("list-panes", Reply::Out(ONE_PANE));
     let session = created(&host).unwrap();
-    assert_eq!(
-        session,
-        TerminalSession {
-            managed_session_id: None,
-            ..handle()
-        }
-    );
+    assert_eq!(session, {
+        let mut surface = handle();
+        surface.managed_session_id = None;
+        surface
+    });
     let socket = socket().display().to_string();
     assert_eq!(
         host.commands(),
@@ -320,7 +336,7 @@ fn a_proven_server_that_fails_its_shape_is_ended_or_retained() {
             );
         } else {
             let retained = retained.expect("an unconfirmed end retains the proven handle");
-            assert_eq!(retained.surface.linux_host, handle().linux_host);
+            assert_eq!(retained.surface.tmux_server(), handle().tmux_server());
         }
     }
 }
@@ -479,25 +495,30 @@ fn verification_returns_the_tty_of_exactly_its_pane() {
     let host = Fake::new().reply("list-panes", Reply::Out("4242\t$0\t@0\t%0\t\n"));
     assert!(verify_session(&host, &handle(), Some(Duration::from_secs(1))).is_err());
     for broken in [
-        TerminalSession {
-            linux_host: None,
-            ..handle()
+        {
+            let mut wire = serde_json::to_value(handle()).unwrap();
+            wire["linux_host"] = serde_json::Value::Null;
+            serde_json::from_value::<TerminalSession>(wire).unwrap()
         },
-        TerminalSession {
-            tmux_socket: Some("relative/tmux.sock".into()),
-            ..handle()
+        {
+            let mut wire = serde_json::to_value(handle()).unwrap();
+            wire["tmux_socket"] = serde_json::json!("relative/tmux.sock");
+            serde_json::from_value::<TerminalSession>(wire).unwrap()
         },
-        TerminalSession {
-            tmux_socket: Some("/state/other.sock".into()),
-            ..handle()
+        {
+            let mut wire = serde_json::to_value(handle()).unwrap();
+            wire["tmux_socket"] = serde_json::json!("/state/other.sock");
+            serde_json::from_value::<TerminalSession>(wire).unwrap()
         },
-        TerminalSession {
-            tab_id: None,
-            ..handle()
+        {
+            let mut surface = handle();
+            surface.tab_id = None;
+            surface
         },
-        TerminalSession {
-            kind: TerminalKind::WezTerm,
-            ..handle()
+        {
+            let mut surface = handle();
+            surface.kind = TerminalKind::WezTerm;
+            surface
         },
     ] {
         let host = Fake::new();
@@ -562,9 +583,10 @@ fn ending_the_server_signals_its_incarnation_once_then_forgets_the_socket() {
 fn a_binding_names_this_host_only_through_its_server_and_pane() {
     let socket = "/state/a,b/session-tmuxtest/tmux.sock";
     let directory = Path::new("/state/a,b/session-tmuxtest");
-    let surface = TerminalSession {
-        tmux_socket: Some(socket.into()),
-        ..handle()
+    let surface = {
+        let mut wire = serde_json::to_value(handle()).unwrap();
+        wire["tmux_socket"] = serde_json::json!(socket);
+        serde_json::from_value::<TerminalSession>(wire).unwrap()
     };
     let names = |surface: &TerminalSession, tmux: &str, pane: &str| {
         binding_names_host(
@@ -594,18 +616,20 @@ fn a_binding_names_this_host_only_through_its_server_and_pane() {
 
 #[test]
 fn the_attach_command_quotes_its_socket() {
-    let surface = TerminalSession {
-        tmux_socket: Some("/state/it's/session-x/tmux.sock".into()),
-        ..handle()
+    let surface = {
+        let mut wire = serde_json::to_value(handle()).unwrap();
+        wire["tmux_socket"] = serde_json::json!("/state/it's/session-x/tmux.sock");
+        serde_json::from_value::<TerminalSession>(wire).unwrap()
     };
     assert_eq!(
         attach_command(&surface).unwrap(),
         "tmux -S '/state/it'\"'\"'s/session-x/tmux.sock' attach"
     );
     assert_eq!(
-        attach_command(&TerminalSession {
-            kind: TerminalKind::WezTerm,
-            ..surface
+        attach_command(&{
+            let mut surface = surface;
+            surface.kind = TerminalKind::WezTerm;
+            surface
         }),
         None
     );
@@ -648,9 +672,10 @@ fn production_close_evidence_classifies_the_recorded_server_incarnation() {
         .spawn()
         .unwrap();
     let live = process_birth(child.id()).unwrap().unwrap();
-    let with = |pid: u32, linux_birth: LinuxBirth| TerminalSession {
-        linux_host: Some(LinuxHostIdentity { pid, linux_birth }),
-        ..handle()
+    let with = |pid: u32, linux_birth: LinuxBirth| {
+        let mut wire = serde_json::to_value(handle()).unwrap();
+        wire["linux_host"] = serde_json::json!(Some(LinuxHostIdentity { pid, linux_birth }));
+        serde_json::from_value::<TerminalSession>(wire).unwrap()
     };
     let observe = |surface: &TerminalSession| {
         Production::new(root.path(), "session-tmuxtest", surface, deadline())
@@ -675,23 +700,26 @@ fn production_close_evidence_classifies_the_recorded_server_incarnation() {
         Some(ProcessObservation::Gone(Gone::Reused(_)))
     ));
     assert!(
-        observe(&TerminalSession {
-            linux_host: None,
-            ..handle()
+        observe(&{
+            let mut wire = serde_json::to_value(handle()).unwrap();
+            wire["linux_host"] = serde_json::Value::Null;
+            serde_json::from_value::<TerminalSession>(wire).unwrap()
         })
         .is_err()
     );
     assert!(
-        observe(&TerminalSession {
-            managed_session_id: Some("session-other".into()),
-            ..with(child.id(), live)
+        observe(&{
+            let mut surface = with(child.id(), live);
+            surface.managed_session_id = Some("session-other".into());
+            surface
         })
         .is_err()
     );
     assert_eq!(
-        observe(&TerminalSession {
-            kind: TerminalKind::Iterm2,
-            ..handle()
+        observe(&{
+            let mut surface = handle();
+            surface.kind = TerminalKind::Iterm2;
+            surface
         })
         .unwrap(),
         None
@@ -903,8 +931,8 @@ fn a_failed_bind_whose_server_does_not_end_retains_the_proven_server() {
     let retained = error
         .downcast_ref::<RetainedLaunchSurface>()
         .expect("the proven server is handed back");
-    assert_eq!(retained.surface.linux_host, handle().linux_host);
-    assert_eq!(retained.surface.tmux_socket, handle().tmux_socket);
+    assert_eq!(retained.surface.tmux_server(), handle().tmux_server());
+    assert_eq!(retained.surface.tmux_socket(), handle().tmux_socket());
     assert!(
         format!("{error:#}").starts_with("bind failed; exact surface cleanup also failed: "),
         "{error:#}"

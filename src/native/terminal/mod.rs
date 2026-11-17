@@ -52,7 +52,9 @@ use std::{path::Path, str::FromStr, time::Instant};
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
@@ -189,41 +191,10 @@ impl FromStr for TerminalKind {
     }
 }
 
-const fn legacy_iterm2_kind() -> TerminalKind {
-    TerminalKind::Iterm2
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(super) struct TerminalSession {
-    #[serde(default = "legacy_iterm2_kind", rename = "terminal")]
-    pub(super) kind: TerminalKind,
-    #[serde(alias = "iterm_session_id", rename = "session_id")]
-    pub(super) id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) tab_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) window_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) managed_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) windows_process_identity: Option<WindowsProcessIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) wezterm_mux: Option<WezTermMux>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) linux_host: Option<LinuxHostIdentity>,
-    /// The socket of a tmux surface's own server, in its session directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) tmux_socket: Option<String>,
-}
-
-/// Only a creation-proven adapter may publish this incarnation. Registration's
-/// BridgeCreatedHost evidence grants authority over this whole host, independent of
-/// owner/close intent. Endpoint reachability is deliberately not part of birth.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(super) struct LinuxHostIdentity {
-    pub(super) pid: u32,
-    pub(super) linux_birth: LinuxBirth,
-}
+mod record;
+#[cfg(target_os = "linux")]
+pub(in crate::native) use record::LinuxHostIdentity;
+pub(in crate::native) use record::TerminalSession;
 
 // Only an adapter that has proven its exact surface may return this error. The
 // shared launcher persists the handle; it grants no new adapter close authority.
@@ -283,19 +254,6 @@ const fn legacy_wezterm_owns_gui() -> bool {
 pub(super) struct WindowsProcessIdentity {
     pub(super) creation_time: u64,
     pub(super) executable_path: String,
-}
-
-impl TerminalSession {
-    pub(super) fn verify_managed_session(&self, expected: &str) -> Result<()> {
-        match self.managed_session_id.as_deref() {
-            Some(actual) if actual == expected => Ok(()),
-            Some(actual) => {
-                bail!("terminal handle belongs to managed session {actual}, not {expected}")
-            }
-            None if self.kind == TerminalKind::Iterm2 => Ok(()),
-            None => bail!("terminal handle is missing its managed session binding"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -719,17 +677,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn macos_test_iterm_session() -> TerminalSession {
-        TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: TerminalKind::Iterm2,
-            id: "test-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        }
+        TerminalSession::new(TerminalKind::Iterm2, "test-session".to_owned())
     }
 
     #[test]
@@ -783,17 +731,8 @@ mod tests {
         assert_eq!(legacy.window_id, None);
         assert_eq!(legacy.managed_session_id, None);
 
-        let ghostty = TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: TerminalKind::Ghostty,
-            id: "terminal-id".to_owned(),
-            tab_id: Some("tab-id".to_owned()),
-            window_id: Some("window-id".to_owned()),
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        };
+        let ghostty = TerminalSession::new(TerminalKind::Ghostty, "terminal-id".to_owned())
+            .with_location(Some("tab-id".to_owned()), Some("window-id".to_owned()));
         assert_eq!(
             serde_json::to_value(&ghostty).unwrap(),
             serde_json::json!({
@@ -833,7 +772,7 @@ mod tests {
         });
         let session: TerminalSession = serde_json::from_value(record.clone()).unwrap();
         assert_eq!(session.kind, TerminalKind::WezTerm);
-        assert!(session.wezterm_mux.as_ref().unwrap().owns_gui);
+        assert!(session.wezterm_mux().unwrap().owns_gui);
         let mut explicit = record;
         explicit["wezterm_mux"]["owns_gui"] = serde_json::json!(true);
         assert_eq!(serde_json::to_value(&session).unwrap(), explicit);
@@ -841,7 +780,7 @@ mod tests {
         explicit["tab_id"] = serde_json::json!("8");
         explicit["window_id"] = serde_json::json!("3");
         let shared: TerminalSession = serde_json::from_value(explicit.clone()).unwrap();
-        assert!(!shared.wezterm_mux.as_ref().unwrap().owns_gui);
+        assert!(!shared.wezterm_mux().unwrap().owns_gui);
         assert_eq!(serde_json::to_value(shared).unwrap(), explicit);
     }
 

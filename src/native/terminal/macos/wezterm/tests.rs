@@ -608,7 +608,7 @@ fn a_user_closing_an_unrelated_pane_during_spawn_does_not_disown_the_new_tab() {
     assert_eq!(mux.started, 0);
     assert!(mux.terminated.is_empty());
     assert!(mux.removed.is_empty());
-    assert!(!handle.wezterm_mux.unwrap().owns_gui);
+    assert!(!handle.wezterm_mux().unwrap().owns_gui);
 }
 
 #[test]
@@ -618,8 +618,8 @@ fn shared_gui_is_not_ended_or_unlinked_even_after_its_last_pane_is_gone() {
     assert_eq!(handle.id, "8");
     assert_eq!(handle.tab_id.as_deref(), Some("8"));
     assert_eq!(handle.window_id.as_deref(), Some("7"));
-    assert!(!handle.wezterm_mux.as_ref().unwrap().owns_gui);
-    assert_eq!(handle.wezterm_mux.as_ref().unwrap().start_seconds, BIRTH.0);
+    assert!(!handle.wezterm_mux().unwrap().owns_gui);
+    assert_eq!(handle.wezterm_mux().unwrap().start_seconds, BIRTH.0);
     {
         let mut mux = host.0.borrow_mut();
         mux.panes = vec![8]; // user closed their own sibling
@@ -821,7 +821,7 @@ fn capability_failure_falls_back_only_with_budget_remaining() {
         } else {
             host.0.borrow_mut().refused.push("spawn");
             let handle = create_tab(&host, soon()).unwrap();
-            assert!(handle.wezterm_mux.unwrap().owns_gui);
+            assert!(handle.wezterm_mux().unwrap().owns_gui);
             assert_eq!(host.0.borrow().started, 1);
         }
     }
@@ -842,7 +842,7 @@ fn unusable_listings_keep_private_gui_fallback() {
         let host = existing();
         arrange(&mut host.0.borrow_mut());
         let handle = create_tab(&host, soon()).unwrap();
-        assert!(handle.wezterm_mux.unwrap().owns_gui);
+        assert!(handle.wezterm_mux().unwrap().owns_gui);
         assert_eq!(host.0.borrow().started, 1);
         assert_eq!(host.0.borrow().spawn_count, 0);
     }
@@ -853,7 +853,7 @@ fn explicit_new_window_does_not_probe_existing_guis() {
     let host = existing();
     host.0.borrow_mut().discovery_error = true;
     let handle = create(&host, true, &program(), soon()).unwrap();
-    assert!(handle.wezterm_mux.unwrap().owns_gui);
+    assert!(handle.wezterm_mux().unwrap().owns_gui);
     assert_eq!(host.0.borrow().started, 1);
     assert_eq!(commands(&host), ["list"]); // Only the new GUI's startup listing.
 }
@@ -872,7 +872,7 @@ fn unavailable_unsupported_or_ambiguous_target_falls_back_before_any_spawn() {
         let host = existing();
         arrange(&mut host.0.borrow_mut());
         let handle = create_tab(&host, soon()).unwrap();
-        assert!(handle.wezterm_mux.unwrap().owns_gui);
+        assert!(handle.wezterm_mux().unwrap().owns_gui);
         assert_eq!(host.0.borrow().started, 1);
         assert_eq!(host.0.borrow().spawn_count, 0);
     }
@@ -885,14 +885,14 @@ fn explicit_opening_mode_records_scope_without_a_later_policy_read() {
     let persisted = serde_json::to_string(&shared).unwrap();
     let shared: TerminalSession = serde_json::from_str(&persisted).unwrap();
     // No current settings field is passed to close: the saved creation scope wins.
-    assert!(!shared.wezterm_mux.as_ref().unwrap().owns_gui);
+    assert!(!shared.wezterm_mux().unwrap().owns_gui);
     close_session_until(&host, &shared, soon()).unwrap();
     assert_eq!(host.0.borrow().panes, [7]);
     assert_eq!(host.0.borrow().birth, Some(BIRTH));
     assert!(host.0.borrow().terminated.is_empty());
     let host = existing();
     let private = create(&host, true, &program(), soon()).unwrap();
-    assert!(private.wezterm_mux.as_ref().unwrap().owns_gui);
+    assert!(private.wezterm_mux().unwrap().owns_gui);
     assert_eq!(host.0.borrow().started, 1);
     assert_eq!(host.0.borrow().spawn_count, 0);
     close_session_until(&host, &private, soon()).unwrap();
@@ -940,7 +940,7 @@ fn persisted_scope_survives_settings_changes_after_launch() {
         let handle: TerminalSession =
             crate::native::session::primitives::read_json(&saved_handle).unwrap();
         assert_eq!(
-            handle.wezterm_mux.as_ref().unwrap().owns_gui,
+            handle.wezterm_mux().unwrap().owns_gui,
             initial == MacosOpenMode::NewWindow
         );
         close_session_until(&host, &handle, soon()).unwrap();
@@ -1046,7 +1046,7 @@ fn a_session_gets_a_process_of_its_own_and_the_pane_that_process_opened() {
     assert_eq!(session.kind, TerminalKind::WezTerm);
     assert_eq!(session.id, "0");
     assert_eq!(
-        session.wezterm_mux,
+        session.wezterm_mux().cloned(),
         Some(WezTermMux {
             socket: SOCKET.to_owned(),
             pid: PID,
@@ -1187,7 +1187,7 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
                 .any(|(name, value)| name == key && value.is_none())
         );
     }
-    let mux = handle.wezterm_mux.as_ref().unwrap();
+    let mux = handle.wezterm_mux().unwrap();
     assert_eq!(mux.socket, SOCKET);
     assert_eq!(mux.pid, PID);
     assert_eq!(
@@ -1199,7 +1199,7 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
     // The very same host hints must not suppress the existing-GUI tab path.
     let host = existing();
     let handle = create_tab(&host, soon()).unwrap();
-    assert!(!handle.wezterm_mux.as_ref().unwrap().owns_gui);
+    assert!(!handle.wezterm_mux().unwrap().owns_gui);
     close_session_until(&host, &handle, soon()).unwrap();
     assert_eq!(host.0.borrow().panes, [7]);
     assert_eq!(host.0.borrow().birth, Some(BIRTH));
@@ -1357,7 +1357,7 @@ fn the_keyboard_is_given_back_on_the_gui_s_own_evidence_only() {
             arrange(&mut mux);
         }
         let handle = create_tab(&host, soon()).expect(name);
-        assert!(!handle.wezterm_mux.unwrap().owns_gui, "{name}");
+        assert!(!handle.wezterm_mux().unwrap().owns_gui, "{name}");
         let calls = commands(&host);
         assert!(!calls.contains(&"activate-pane".to_owned()), "{name}");
         let mux = host.0.borrow();
@@ -1792,22 +1792,14 @@ fn host_pane_and_binding_rule_need_no_terminal() {
         pane(Ok("8".into()), None),
         Err("WezTerm did not name the GUI of this host".into())
     );
-    let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind,
-        id: id.into(),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: None,
-        wezterm_mux: socket.map(|socket| WezTermMux {
+    let surface = |kind, id: &str, socket: Option<&str>| {
+        TerminalSession::new(kind, id.into()).with_wezterm_mux(socket.map(|socket| WezTermMux {
             socket: socket.into(),
             pid: PID,
             start_seconds: BIRTH.0,
             start_microseconds: BIRTH.1,
             owns_gui: false,
-        }),
-        windows_process_identity: None,
+        }))
     };
     let names = |surface: &TerminalSession, socket: &str| {
         binding_names_host(surface, "8", Path::new(socket))
@@ -2183,7 +2175,7 @@ fn the_ownership_proof_is_the_tty_of_exactly_this_pane() {
 fn a_handle_without_its_process_is_refused() {
     let host = fake();
     let mut session = session(&host);
-    session.wezterm_mux = None;
+    session = session.with_wezterm_mux(None);
 
     assert!(close_session_until(&host, &session, soon()).is_err());
     assert!(surface_present(&host, &session, Duration::from_secs(1)).is_err());
@@ -2215,7 +2207,7 @@ fn live_a_session_process_is_started_bound_and_ended() {
         Instant::now() + Duration::from_secs(20),
     )
     .unwrap();
-    let mux = session.wezterm_mux.clone().unwrap();
+    let mux = session.wezterm_mux().cloned().unwrap();
     eprintln!(
         "LIVE created: pid={} birth={}.{:06} socket={} pane={}",
         mux.pid, mux.start_seconds, mux.start_microseconds, mux.socket, session.id
@@ -2274,7 +2266,7 @@ fn live_a_session_process_is_started_bound_and_ended() {
 fn serving_inspection_error_preserves_reason() {
     let host = fake();
     let session = session(&host);
-    let mux = session.wezterm_mux.as_ref().unwrap();
+    let mux = session.wezterm_mux().unwrap();
     host.0.borrow_mut().unreadable_process = true;
     assert_eq!(
         serving(&host, mux).unwrap_err().to_string(),

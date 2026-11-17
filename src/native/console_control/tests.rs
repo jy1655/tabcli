@@ -1176,17 +1176,9 @@ fn console_helpers_explicitly_forward_only_the_selected_state_root() {
         }
         return;
     }
-    let session = terminal::TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        managed_session_id: Some("session-environment".into()),
-        kind: terminal::TerminalKind::WindowsConsole,
-        id: "1".into(),
-        tab_id: None,
-        window_id: None,
-        windows_process_identity: None,
-        wezterm_mux: None,
-    };
+    let session =
+        terminal::TerminalSession::new(terminal::TerminalKind::WindowsConsole, "1".into())
+            .with_binding(Some("session-environment".into()));
     let root = std::env::var_os(STATE_DIR_ENV);
     for operation in [
         Operation::Window {

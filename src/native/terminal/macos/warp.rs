@@ -609,17 +609,8 @@ where
     let process_birth = runner.process_birth(instance.pid)?
         .context("Warp instance process ended before its launch binding; unproven residual surface preserved")?;
 
-    let mut session = TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: TerminalKind::Warp,
-        id: instance_id.clone(),
-        tab_id: Some(tab_id),
-        window_id: Some(window_id),
-        managed_session_id: None,
-        windows_process_identity: None,
-        wezterm_mux: None,
-    };
+    let mut session = TerminalSession::new(TerminalKind::Warp, instance_id.clone())
+        .with_location(Some(tab_id), Some(window_id));
 
     let control = ControlBinding {
         schema: RECORD_SCHEMA,

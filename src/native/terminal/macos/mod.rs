@@ -368,17 +368,7 @@ mod adapter_tests {
     use super::*;
 
     fn handle(kind: TerminalKind) -> TerminalSession {
-        TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: "surface".into(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        }
+        TerminalSession::new(kind, "surface".into())
     }
 
     // Capability against behaviour: an operation a kind declares unsupported is

@@ -515,17 +515,10 @@ fn metadata_keeps_the_terminal_kind_after_close_consumes_the_handle() {
     write_json_atomic(&directory.join("status.json"), &json!({"schema":1,"state":"working","pid":std::process::id(),"updated_unix_ms":1,"error":null})).unwrap();
     write_json_atomic(
         &directory.join("terminal.json"),
-        &crate::native::terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: crate::native::terminal::TerminalKind::Iterm2,
-            id: "missing-iterm-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &crate::native::terminal::TerminalSession::new(
+            crate::native::terminal::TerminalKind::Iterm2,
+            "missing-iterm-session".to_owned(),
+        ),
     )
     .unwrap();
     let expected = ("2.1.281".to_owned(), Some("iterm2".to_owned()));

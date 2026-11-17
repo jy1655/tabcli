@@ -134,29 +134,7 @@ impl CloseObservation for Production<'_> {
     fn created_host_incarnation(
         &self,
     ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
-        if self.session.kind.registration().close_evidence
-            != terminal::facts::CloseEvidenceChoice::BridgeCreatedHost
-        {
-            return Ok(None);
-        }
-        self.session
-            .verify_managed_session(self.expected_session_id)?;
-        #[cfg(target_os = "linux")]
-        {
-            let host = self
-                .session
-                .linux_host
-                .as_ref()
-                .context("creation-proven Linux host identity is missing")?;
-            Ok(Some(crate::native::process_identity::classify(
-                host.pid,
-                Some(&host.linux_birth),
-                || unreachable!("host birth required"),
-                || terminal::linux::process::process_birth(host.pid),
-            )))
-        }
-        #[cfg(not(target_os = "linux"))]
-        bail!("Bridge-created host evidence is unsupported on this platform")
+        terminal::close_evidence::created_host_incarnation(self.expected_session_id, self.session)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn teardown_intent(&self) -> Result<Option<session::close::TerminalTeardownIntent>> {
@@ -573,17 +551,8 @@ mod projected_authority_tests {
             terminal::TerminalKind::WindowsConsole,
         ] {
             for proof_succeeds in [false, true] {
-                let surface = TerminalSession {
-                    linux_host: None,
-                    tmux_socket: None,
-                    kind,
-                    id: "4242".into(),
-                    tab_id: None,
-                    window_id: None,
-                    managed_session_id: Some("session-test".into()),
-                    windows_process_identity: None,
-                    wezterm_mux: None,
-                };
+                let surface = TerminalSession::new(kind, "4242".into())
+                    .with_binding(Some("session-test".into()));
                 let observation = TestObservation::from_values(RecordValues {
                     owner: Some(NativeSessionOwner {
                         pid: 4242,

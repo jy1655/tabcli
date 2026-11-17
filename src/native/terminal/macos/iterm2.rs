@@ -324,17 +324,7 @@ fn create_tab(
     if id.is_empty() {
         bail!("iTerm2 did not return a session id");
     }
-    Ok(TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: TerminalKind::Iterm2,
-        id,
-        tab_id: None,
-        window_id: None,
-        managed_session_id: None,
-        wezterm_mux: None,
-        windows_process_identity: None,
-    })
+    Ok(TerminalSession::new(TerminalKind::Iterm2, id))
 }
 
 fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
@@ -2347,17 +2337,7 @@ end run
                 .unwrap_err()
                 .starts_with("iTerm2 did not supply its session identity: ")
         );
-        let surface = |kind, id: &str| TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: id.into(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        };
+        let surface = |kind, id: &str| TerminalSession::new(kind, id.into());
         assert!(binding_names_host(
             &surface(TerminalKind::Iterm2, "owned-id"),
             "owned-id"

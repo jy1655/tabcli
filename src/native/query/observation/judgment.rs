@@ -665,17 +665,7 @@ pub(in crate::native) mod tests {
     }
 
     pub(in crate::native) fn handle(kind: TerminalKind, binding: Option<&str>) -> TerminalSession {
-        TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: "surface-1".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: binding.map(str::to_owned),
-            windows_process_identity: None,
-            wezterm_mux: None,
-        }
+        TerminalSession::new(kind, "surface-1".to_owned()).with_binding(binding.map(str::to_owned))
     }
 
     fn error(text: &str) -> anyhow::Error {

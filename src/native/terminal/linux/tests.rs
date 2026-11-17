@@ -498,7 +498,7 @@ fn shell_and_host_birth_wires_round_trip_without_reinterpreting_legacy_birth() {
     let handle =
         serde_json::json!({"session_id":"fixture","linux_host":{"pid":41,"linux_birth":birth(10)}});
     let surface: TerminalSession = serde_json::from_value(handle).unwrap();
-    assert_eq!(surface.linux_host.unwrap().linux_birth, birth(10));
+    assert_eq!(surface.tmux_server().unwrap().linux_birth, birth(10));
     let mut reboot = birth(10);
     reboot.boot_id = "ffffffff-ffff-ffff-ffff-ffffffffffff".parse().unwrap();
     let a = attest_owner_with(

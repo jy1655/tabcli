@@ -61,25 +61,21 @@ pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &st
     });
     write_json_atomic(
         &directory.join(TERMINAL_HANDLE_FILE),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: if cfg!(windows) {
+        &terminal::TerminalSession::new(
+            if cfg!(windows) {
                 terminal::TerminalKind::WindowsConsole
             } else {
                 terminal::TerminalKind::AppleTerminal
             },
-            id: if cfg!(windows) {
+            if cfg!(windows) {
                 owner_pid.to_string()
             } else {
                 "/dev/ttys999".to_owned()
             },
-            tab_id: None,
-            window_id: (!cfg!(windows)).then(|| "1001".to_owned()),
-            managed_session_id: Some(session_id.clone()),
-            wezterm_mux: None,
-            windows_process_identity: windows_process_identity.clone(),
-        },
+        )
+        .with_location(None, (!cfg!(windows)).then(|| "1001".to_owned()))
+        .with_binding(Some(session_id.clone()))
+        .with_windows_identity(windows_process_identity.clone()),
     )
     .unwrap();
     write_json_atomic(
@@ -126,21 +122,15 @@ pub(in crate::native) fn assert_journal_settled(directory: &Path) {
 }
 
 pub(in crate::native) fn close_test_terminal() -> terminal::TerminalSession {
-    terminal::TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: if cfg!(windows) {
+    terminal::TerminalSession::new(
+        if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
         } else {
             terminal::TerminalKind::AppleTerminal
         },
-        id: "4242".to_owned(),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: Some("session-close123".to_owned()),
-        wezterm_mux: None,
-        windows_process_identity: None,
-    }
+        "4242".to_owned(),
+    )
+    .with_binding(Some("session-close123".to_owned()))
 }
 
 pub(in crate::native) fn write_test_manifest(directory: &Path) {

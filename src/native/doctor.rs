@@ -1588,14 +1588,8 @@ mod launch_host_tests {
 
     fn surface(store: &Store, kind: TerminalKind) {
         store
-            .write_terminal(&terminal::TerminalSession {
-                linux_host: None,
-                tmux_socket: None,
-                kind,
-                id: "1".into(),
-                tab_id: None,
-                window_id: None,
-                managed_session_id: Some(
+            .write_terminal(
+                &terminal::TerminalSession::new(kind, "1".into()).with_binding(Some(
                     store
                         .directory()
                         .file_name()
@@ -1603,10 +1597,8 @@ mod launch_host_tests {
                         .to_str()
                         .unwrap()
                         .into(),
-                ),
-                wezterm_mux: None,
-                windows_process_identity: None,
-            })
+                )),
+            )
             .unwrap();
     }
 

@@ -687,11 +687,16 @@ repair settles the records without resending a prompt or guessing ownership of a
   reopen decisions in the latter. Keep the provider's payloads and tests beside its adapter;
   unrelated adapters should not need changes. Document what upstream feature would let you
   remove each fallback.
-- For a new terminal, start with `src/native/terminal/mod.rs` and its surface and delivery types.
+- For a new terminal, start with `src/native/terminal/mod.rs` and its kind and delivery types.
+  `terminal/record.rs` owns the Surface record's flat wire format and kind-specific identity
+  construction/access. Keep its legacy aliases, optional fields and equality intact; decoding
+  does not grant control authority. Other adapters should not initialize the new kind's fields.
   Before implementing close, read `src/native/terminal/close_authority.rs` for the decision and
   the seam, `close_evidence.rs` for selecting the kind's evidence, and `ownership.rs` for the
   owner stop that the teardown and the live-owner closes share. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
+  Creation-proven host birth observation belongs to that adapter (currently tmux); the shared
+  Close decision consumes its process observation before reading owner or intent records.
   Register the kind once: its `facts.rs` declares one `Registration` with the close facts,
   paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, whether its
   launch runs the launch host (`LaunchHostFacts`, carrying on macOS the adapter's check that a

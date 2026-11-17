@@ -166,17 +166,8 @@ fn write_reopen_test_manifest(
 }
 
 fn reopen_test_terminal(id: &str) -> terminal::TerminalSession {
-    terminal::TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: terminal::TerminalKind::Iterm2,
-        id: format!("{id}-terminal"),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: Some(id.to_owned()),
-        wezterm_mux: None,
-        windows_process_identity: None,
-    }
+    terminal::TerminalSession::new(terminal::TerminalKind::Iterm2, format!("{id}-terminal"))
+        .with_binding(Some(id.to_owned()))
 }
 
 // A closed session with one resolved request: its turn completed (or failed, when

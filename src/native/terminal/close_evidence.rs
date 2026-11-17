@@ -4,6 +4,25 @@
 use super::ownership::{MacTerminalAppIdentity, NativeSessionOwner};
 use anyhow::Result;
 
+/// Creation-proven host evidence is supplied by its owning adapter, before the Close
+/// decision reads owner/intent records. Other kinds have no such evidence. This is a
+/// read-only observation, not a held process or permission to signal it.
+pub(in crate::native::terminal) fn created_host_incarnation(
+    expected_session_id: &str,
+    session: &super::TerminalSession,
+) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
+    if session.kind.registration().close_evidence
+        != super::facts::CloseEvidenceChoice::BridgeCreatedHost
+    {
+        return Ok(None);
+    }
+    session.verify_managed_session(expected_session_id)?;
+    #[cfg(target_os = "linux")]
+    return super::linux::tmux::created_host_incarnation(session).map(Some);
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("Bridge-created host evidence is unsupported on this platform")
+}
+
 pub(in crate::native) enum ResumableAuthority {
     // Only Terminal.app evidence proves a resumable surface absent.
     #[cfg_attr(target_os = "linux", allow(dead_code))]

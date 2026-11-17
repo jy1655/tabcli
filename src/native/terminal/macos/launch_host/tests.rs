@@ -94,33 +94,27 @@ fn wait_file(path: &Path, timeout: Duration) -> bool {
 }
 fn bind(store: &Store, kind: TerminalKind) {
     store
-        .write_terminal(&TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: "owned-id".into(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: Some(
-                store
-                    .directory()
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .into(),
-            ),
-            wezterm_mux: (kind == TerminalKind::WezTerm).then(|| {
-                crate::native::terminal::WezTermMux {
-                    socket: "/fixture/socket".into(),
-                    pid: 1,
-                    start_seconds: 1,
-                    start_microseconds: 1,
-                    owns_gui: true,
-                }
-            }),
-            windows_process_identity: None,
-        })
+        .write_terminal(
+            &TerminalSession::new(kind, "owned-id".into())
+                .with_binding(Some(
+                    store
+                        .directory()
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                ))
+                .with_wezterm_mux((kind == TerminalKind::WezTerm).then(|| {
+                    crate::native::terminal::WezTermMux {
+                        socket: "/fixture/socket".into(),
+                        pid: 1,
+                        start_seconds: 1,
+                        start_microseconds: 1,
+                        owns_gui: true,
+                    }
+                })),
+        )
         .unwrap();
 }
 fn bootstrap(executable: &Path, dir: &Path, command: &str, kind: TerminalKind) -> Vec<String> {
@@ -1170,22 +1164,16 @@ fn surface_identity_probe() {
     let Ok(mode) = std::env::var("AB_LAUNCH_HOST_IDENTITY_PROBE") else {
         return;
     };
-    let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind,
-        id: id.into(),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: None,
-        wezterm_mux: socket.map(|socket| crate::native::terminal::WezTermMux {
-            socket: socket.into(),
-            pid: 1,
-            start_seconds: 1,
-            start_microseconds: 1,
-            owns_gui: true,
-        }),
-        windows_process_identity: None,
+    let surface = |kind, id: &str, socket: Option<&str>| {
+        TerminalSession::new(kind, id.into()).with_wezterm_mux(socket.map(|socket| {
+            crate::native::terminal::WezTermMux {
+                socket: socket.into(),
+                pid: 1,
+                start_seconds: 1,
+                start_microseconds: 1,
+                owns_gui: true,
+            }
+        }))
     };
     let surfaces = [
         (

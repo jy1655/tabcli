@@ -1,0 +1,273 @@
+//! Surface records retain their historical flat wire format. Kind-specific fields are
+//! private here: adapters construct and read their own identity without spelling another
+//! adapter's absent fields. Parsing remains structural, not proof of control authority;
+//! even mixed-kind and incomplete legacy records retain every recognized field for equality.
+use super::{LinuxBirth, TerminalKind, WezTermMux, WindowsProcessIdentity};
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+const fn legacy_iterm2_kind() -> TerminalKind {
+    TerminalKind::Iterm2
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(in crate::native) struct TerminalSession {
+    #[serde(default = "legacy_iterm2_kind", rename = "terminal")]
+    pub(in crate::native) kind: TerminalKind,
+    #[serde(alias = "iterm_session_id", rename = "session_id")]
+    pub(in crate::native) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) managed_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_process_identity: Option<WindowsProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wezterm_mux: Option<WezTermMux>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linux_host: Option<LinuxHostIdentity>,
+    /// The socket of a tmux surface's own server, in its session directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tmux_socket: Option<String>,
+}
+
+/// Only a creation-proven adapter may publish this incarnation. Registration's
+/// BridgeCreatedHost evidence grants authority over this whole host, independent of
+/// owner/close intent. Endpoint reachability is deliberately not part of birth.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(in crate::native) struct LinuxHostIdentity {
+    pub(in crate::native) pid: u32,
+    pub(in crate::native) linux_birth: LinuxBirth,
+}
+
+impl TerminalSession {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+    pub(in crate::native) fn new(kind: TerminalKind, id: String) -> Self {
+        Self {
+            kind,
+            id,
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+            wezterm_mux: None,
+            linux_host: None,
+            tmux_socket: None,
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(in crate::native) fn with_location(
+        mut self,
+        tab: Option<String>,
+        window: Option<String>,
+    ) -> Self {
+        self.tab_id = tab;
+        self.window_id = window;
+        self
+    }
+
+    #[cfg(test)]
+    pub(in crate::native) fn with_binding(mut self, id: Option<String>) -> Self {
+        self.managed_session_id = id;
+        self
+    }
+
+    #[cfg(any(windows, test))]
+    pub(in crate::native) fn with_windows_identity(
+        mut self,
+        identity: Option<WindowsProcessIdentity>,
+    ) -> Self {
+        self.windows_process_identity = identity;
+        self
+    }
+
+    #[cfg(windows)]
+    pub(in crate::native) fn windows_identity(&self) -> Option<&WindowsProcessIdentity> {
+        self.windows_process_identity.as_ref()
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(in crate::native) fn with_wezterm_mux(mut self, mux: Option<WezTermMux>) -> Self {
+        self.wezterm_mux = mux;
+        self
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(in crate::native) fn wezterm_mux(&self) -> Option<&WezTermMux> {
+        self.wezterm_mux.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::native::terminal) fn with_tmux_server(
+        mut self,
+        socket: String,
+        host: LinuxHostIdentity,
+    ) -> Self {
+        self.tmux_socket = Some(socket);
+        self.linux_host = Some(host);
+        self
+    }
+
+    // Close must also work for a retained server that never reported its pane/location.
+    #[cfg(target_os = "linux")]
+    pub(in crate::native::terminal) fn tmux_server(&self) -> Option<&LinuxHostIdentity> {
+        self.linux_host.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::native::terminal) fn tmux_socket(&self) -> Option<&str> {
+        self.tmux_socket.as_deref()
+    }
+
+    pub(in crate::native) fn verify_managed_session(&self, expected: &str) -> Result<()> {
+        match self.managed_session_id.as_deref() {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => {
+                bail!("terminal handle belongs to managed session {actual}, not {expected}")
+            }
+            None if self.kind == TerminalKind::Iterm2 => Ok(()),
+            None => bail!("terminal handle is missing its managed session binding"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn mixed_record() -> Value {
+        json!({
+            "terminal": "tmux", "session_id": "%0", "tab_id": "@0", "window_id": "$0",
+            "managed_session_id": "session-record",
+            "windows_process_identity": {"creation_time": 7, "executable_path": "provider.exe"},
+            "wezterm_mux": {"socket": "/mux", "pid": 8, "start_seconds": 9,
+                            "start_microseconds": 10, "owns_gui": false},
+            "linux_host": {"pid": 11, "linux_birth": {
+                "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 12}},
+            "tmux_socket": "/session-record/tmux.sock"
+        })
+    }
+
+    #[test]
+    fn recognized_fields_round_trip_even_on_a_different_kind_and_affect_equality() {
+        for kind in TerminalKind::ALL {
+            let mut wire = mixed_record();
+            wire["terminal"] = serde_json::to_value(kind).unwrap();
+            let record: TerminalSession = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&record).unwrap(), wire);
+            // A decoder must not discard unrelated kind fields: equality is used by
+            // close intents and screen's before/after binding comparison.
+            for field in [
+                "tab_id",
+                "window_id",
+                "managed_session_id",
+                "windows_process_identity",
+                "wezterm_mux",
+                "linux_host",
+                "tmux_socket",
+            ] {
+                let mut changed = wire.clone();
+                changed.as_object_mut().unwrap().remove(field);
+                let other: TerminalSession = serde_json::from_value(changed).unwrap();
+                assert_ne!(record, other, "{kind:?}: {field}");
+            }
+            record.verify_managed_session("session-record").unwrap();
+            assert!(record.verify_managed_session("session-other").is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_alias_nulls_and_incomplete_server_keep_their_wire_and_binding_rules() {
+        let legacy: TerminalSession = serde_json::from_value(json!({
+            "iterm_session_id": "legacy", "tab_id": null, "linux_host": null
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            json!({
+                "terminal": "iterm2", "session_id": "legacy"
+            })
+        );
+        legacy.verify_managed_session("session-record").unwrap();
+        assert!(
+            serde_json::from_value::<TerminalSession>(json!({
+                "session_id": "one", "iterm_session_id": "two"
+            }))
+            .is_err()
+        );
+        let mut wire = mixed_record();
+        wire["session_id"] = json!("");
+        for field in [
+            "tab_id",
+            "window_id",
+            "windows_process_identity",
+            "wezterm_mux",
+        ] {
+            wire.as_object_mut().unwrap().remove(field);
+        }
+        let retained: TerminalSession = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&retained).unwrap(), wire);
+        retained.verify_managed_session("session-record").unwrap();
+        wire.as_object_mut().unwrap().remove("managed_session_id");
+        let unbound: TerminalSession = serde_json::from_value(wire).unwrap();
+        assert!(unbound.verify_managed_session("session-record").is_err());
+        for field in [
+            "windows_process_identity",
+            "wezterm_mux",
+            "linux_host",
+            "tmux_socket",
+        ] {
+            let mut malformed = mixed_record();
+            malformed[field] = json!(42);
+            assert!(
+                serde_json::from_value::<TerminalSession>(malformed).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn construction_writes_only_the_selected_adapter_identity() {
+        let win = WindowsProcessIdentity {
+            creation_time: 7,
+            executable_path: "provider.exe".into(),
+        };
+        let mux = WezTermMux {
+            socket: "/mux".into(),
+            pid: 8,
+            start_seconds: 9,
+            start_microseconds: 10,
+            owns_gui: false,
+        };
+        let cases = [
+            (
+                TerminalSession::new(TerminalKind::Ghostty, "pane".into()),
+                json!({
+                "terminal": "ghostty", "session_id": "pane"}),
+            ),
+            (
+                TerminalSession::new(TerminalKind::WindowsConsole, "7".into())
+                    .with_windows_identity(Some(win.clone())),
+                json!({
+                "terminal": "windows-console", "session_id": "7", "windows_process_identity": win}),
+            ),
+            (
+                TerminalSession::new(TerminalKind::WezTerm, "0".into())
+                    .with_wezterm_mux(Some(mux.clone())),
+                json!({
+                "terminal": "wezterm", "session_id": "0", "wezterm_mux": mux}),
+            ),
+        ];
+        for (surface, wire) in cases {
+            assert_eq!(serde_json::to_value(&surface).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<TerminalSession>(wire).unwrap(),
+                surface
+            );
+        }
+    }
+}

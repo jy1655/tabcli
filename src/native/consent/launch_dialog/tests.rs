@@ -233,17 +233,7 @@ fn unsupported_dialog_response_preserves_consent_without_pending_input() {
         terminal::TerminalKind::Warp,
         terminal::TerminalKind::Ghostty,
     ] {
-        let session = terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: "unused".into(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            windows_process_identity: None,
-            wezterm_mux: None,
-        };
+        let session = terminal::TerminalSession::new(kind, "unused".into());
         let error = respond_to_workspace_dialog(
             temp.path(),
             TerminalDialogSurface {

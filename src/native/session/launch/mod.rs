@@ -1901,17 +1901,7 @@ mod host_decision_tests {
         .unwrap();
     }
     fn surface() -> terminal::TerminalSession {
-        terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "unused".into(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        }
+        terminal::TerminalSession::new(terminal::TerminalKind::Iterm2, "unused".into())
     }
     #[test]
     fn wait_and_repair_fail_current_host_before_deadline_with_the_same_reason() {

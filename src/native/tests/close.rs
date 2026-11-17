@@ -99,17 +99,10 @@ fn already_closed_session_never_reuses_a_stale_terminal_handle() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join("terminal.json"),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "stale-iterm-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "stale-iterm-session".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Closed, None, None).unwrap();
@@ -142,17 +135,14 @@ fn explicit_close_routes_using_the_recorded_terminal_kind() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join("terminal.json"),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Ghostty,
-            id: "ghostty-terminal".to_owned(),
-            tab_id: Some("ghostty-tab".to_owned()),
-            window_id: Some("ghostty-window".to_owned()),
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Ghostty,
+            "ghostty-terminal".to_owned(),
+        )
+        .with_location(
+            Some("ghostty-tab".to_owned()),
+            Some("ghostty-window".to_owned()),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
@@ -178,17 +168,10 @@ fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join("terminal.json"),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "closing-iterm-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "closing-iterm-session".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Running, None, None).unwrap();
@@ -368,21 +351,15 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
 #[cfg(any(target_os = "macos", windows))]
 #[test]
 fn explicit_close_allows_only_bound_ownerless_launch_failures() {
-    let session = terminal::TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: if cfg!(windows) {
+    let session = terminal::TerminalSession::new(
+        if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
         } else {
             terminal::TerminalKind::Iterm2
         },
-        id: "launch-surface".to_owned(),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: Some("session-owner123".to_owned()),
-        wezterm_mux: None,
-        windows_process_identity: None,
-    };
+        "launch-surface".to_owned(),
+    )
+    .with_binding(Some("session-owner123".to_owned()));
 
     let directory = tempfile::tempdir().unwrap();
     update_status(
@@ -630,17 +607,8 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
     .unwrap();
     let authority = |kind, managed_session_id: &str| {
         let deadline = crate::native::session::close::budget::close_deadline();
-        let surface = terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: "missing-owned-surface".to_owned(),
-            managed_session_id: Some(managed_session_id.to_owned()),
-            tab_id: None,
-            window_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        };
+        let surface = terminal::TerminalSession::new(kind, "missing-owned-surface".to_owned())
+            .with_binding(Some(managed_session_id.to_owned()));
         #[cfg(target_os = "macos")]
         let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
             |_| panic!("no app incarnation is recorded"),

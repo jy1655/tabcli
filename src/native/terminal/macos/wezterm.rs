@@ -403,8 +403,7 @@ struct Pane {
 
 fn target(session: &TerminalSession) -> Result<(&WezTermMux, u64)> {
     let mux = session
-        .wezterm_mux
-        .as_ref()
+        .wezterm_mux()
         .context("WezTerm handle does not name the process that owns its pane")?;
     if !mux.owns_gui && (session.tab_id.is_none() || session.window_id.is_none()) {
         bail!("shared WezTerm GUI handle is missing its created tab/window identity");
@@ -726,17 +725,14 @@ fn create_private_gui(
     }
     let mux = host.start_gui(program)?;
     match startup_pane(host, &mux, deadline) {
-        Ok(pane) => Ok(TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: TerminalKind::WezTerm,
-            id: pane.pane_id.to_string(),
-            tab_id: Some(pane.tab_id.to_string()),
-            window_id: Some(pane.window_id.to_string()),
-            managed_session_id: None,
-            windows_process_identity: None,
-            wezterm_mux: Some(mux),
-        }),
+        Ok(pane) => Ok(
+            TerminalSession::new(TerminalKind::WezTerm, pane.pane_id.to_string())
+                .with_location(
+                    Some(pane.tab_id.to_string()),
+                    Some(pane.window_id.to_string()),
+                )
+                .with_wezterm_mux(Some(mux)),
+        ),
         // The process exists for this session alone, and without a handle nothing would
         // end it later.
         Err(error) => match end_unbound_process(host, &mux) {
@@ -951,17 +947,14 @@ fn create(
         "WezTerm tab creation is uncertain; spawn reply={reply:?}; creation evidence={}; no retry, fallback or pane cleanup was attempted", evidence()
     ))?;
     give_keyboard_back(host, &mux, keyboard.as_ref(), &pane, &after, deadline);
-    Ok(TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: TerminalKind::WezTerm,
-        id: pane.pane_id.to_string(),
-        tab_id: Some(pane.tab_id.to_string()),
-        window_id: Some(pane.window_id.to_string()),
-        managed_session_id: None,
-        windows_process_identity: None,
-        wezterm_mux: Some(mux),
-    })
+    Ok(
+        TerminalSession::new(TerminalKind::WezTerm, pane.pane_id.to_string())
+            .with_location(
+                Some(pane.tab_id.to_string()),
+                Some(pane.window_id.to_string()),
+            )
+            .with_wezterm_mux(Some(mux)),
+    )
 }
 
 fn local_tty(tty: Option<&str>) -> bool {
@@ -1016,8 +1009,7 @@ fn binding_names_host(surface: &TerminalSession, pane: &str, socket: &Path) -> b
     surface.kind == TerminalKind::WezTerm
         && surface.id == pane
         && surface
-            .wezterm_mux
-            .as_ref()
+            .wezterm_mux()
             .is_some_and(|mux| Path::new(&mux.socket) == socket)
 }
 

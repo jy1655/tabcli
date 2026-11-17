@@ -52,17 +52,7 @@ mod tests {
     // Linux its own; no CI target selects this module for another operating system.
     #[test]
     fn every_refusal_keeps_its_text_and_is_unsupported() {
-        let session = TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: TerminalKind::Iterm2,
-            id: String::new(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            windows_process_identity: None,
-            wezterm_mux: None,
-        };
+        let session = TerminalSession::new(TerminalKind::Iterm2, String::new());
         let errors = [
             select(None).unwrap_err(),
             open_tab(TerminalKind::Iterm2, "command").unwrap_err(),
