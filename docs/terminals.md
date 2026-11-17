@@ -170,7 +170,8 @@ pane. Each later operation checks that incarnation through a pidfd. Only its ver
 means the surface is gone; a live recorded server whose socket refuses is an error.
 
 `close-session --explicit` sends SIGTERM through a pidfd verified against the server birth,
-ending the whole session server, including any windows you added, then removes the socket.
+ending the whole session server, including any windows you added. The socket file stays in
+the session directory, inert, until the session is pruned.
 Repeated close, including after the server already ended, sends no further signal. Pane hangup
 ends the owner and provider processes; they can take a few seconds to end after close returns.
 

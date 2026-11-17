@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::{
     ffi::{OsStr, OsString},
     io::{Seek, SeekFrom, Write},
-    os::unix::{fs::FileTypeExt, process::CommandExt},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -78,9 +78,6 @@ pub(super) trait Host {
     fn server(&self, pid: u32, birth: LinuxBirth) -> Result<Option<Box<dyn Server>>>;
     /// Whether anything exists at this path (a symlink is not followed).
     fn path_exists(&self, path: &Path) -> Result<bool>;
-    /// Removes the socket file of a server proven gone, when nothing listens on it: a server
-    /// that has taken the path since keeps its socket. Anything else stays.
-    fn forget_socket(&self, socket: &Path);
     /// This Bridge executable, which the pane runs as its host.
     fn bridge_executable(&self) -> Result<PathBuf>;
 }
@@ -142,16 +139,6 @@ impl Host for Installed {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
-        }
-    }
-    fn forget_socket(&self, socket: &Path) {
-        // A stale socket left behind is inert: every operation proves the recorded server
-        // first, and the session directory is removed with the session.
-        if std::fs::symlink_metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
-            && std::os::unix::net::UnixStream::connect(socket)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
-        {
-            let _ = std::fs::remove_file(socket);
         }
     }
     fn bridge_executable(&self) -> Result<PathBuf> {
@@ -634,30 +621,25 @@ fn end_created(
     }
 }
 
-/// Ends the recorded server through its held incarnation, then removes its socket. A server
-/// already gone is not signalled again.
+/// Ends the recorded server through its held incarnation. A server already gone is not
+/// signalled again. Its socket file is left in place: once the incarnation is gone it grants
+/// nothing (every operation proves the incarnation first, and a launch never reuses a session
+/// directory), no later check could prove that the path still belongs to it, and the session
+/// directory is removed with the session.
 fn end_server(
     host: &dyn Host,
     handle: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    let socket = Path::new(
-        handle
-            .tmux_socket
-            .as_deref()
-            .context("tmux surface has no recorded socket")?,
-    );
     let recorded = handle
         .linux_host
         .as_ref()
         .context("tmux surface has no recorded server incarnation")?;
     let Some(server) = host.server(recorded.pid, recorded.linux_birth)? else {
-        host.forget_socket(socket);
         return Ok(CloseOutcome::Missing);
     };
     // Ended before this close (not yet reaped): it is not signalled again.
     if server.exited_by(Instant::now())? {
-        host.forget_socket(socket);
         return Ok(CloseOutcome::Missing);
     }
     crate::native::session::close::budget::close_remaining(deadline)?;
@@ -668,7 +650,6 @@ fn end_server(
             recorded.pid
         );
     }
-    host.forget_socket(socket);
     Ok(CloseOutcome::Closed)
 }
 

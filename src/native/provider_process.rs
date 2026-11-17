@@ -332,7 +332,10 @@ pub(in crate::native) fn linux_exec_budget(command: &Command) -> anyhow::Result<
 /// program) and environment string, each with its NUL, plus one pointer per argument (at
 /// least one) and per environment string. The limit is a quarter of the stack limit, which
 /// glibc reports as ARG_MAX, capped at three quarters of the 8 MiB default stack and never
-/// below 32 pages.
+/// below the kernel's ARG_MAX of 128 KiB (32 pages bound each string, not the total).
+/// A `#!` entrypoint (the npm launchers of Codex and Pi) needs more: the kernel adds the
+/// interpreter line and the script path, and an `env` interpreter execs the program again
+/// with its own path; a fixed margin covers both.
 #[cfg(target_os = "linux")]
 fn linux_exec_budget_with(
     command: &Command,
@@ -347,8 +350,8 @@ fn linux_exec_budget_with(
     );
     let string_limit = usize::try_from(page_size)? * 32;
     let limit = usize::try_from(arg_max)?
-        .min(8 * 1024 * 1024 / 4 * 3)
-        .max(string_limit);
+        .min(LINUX_STACK_ARGUMENT_CAP)
+        .max(LINUX_ARG_MAX);
     let mut environment: std::collections::BTreeMap<OsString, OsString> = inherited.collect();
     for (name, value) in command.get_envs() {
         match value {
@@ -358,6 +361,9 @@ fn linux_exec_budget_with(
     }
     let program = command.get_program();
     let mut total = program.len() + 1;
+    if script_entrypoint(program) {
+        total += LINUX_SCRIPT_MARGIN;
+    }
     let mut arguments = 0;
     for argument in std::iter::once(program).chain(command.get_args()) {
         let bytes = argument.len() + 1;
@@ -388,6 +394,26 @@ fn linux_exec_budget_with(
     Ok(())
 }
 
+/// The kernel's ARG_MAX (include/uapi/linux/limits.h): the least total it allows.
+#[cfg(target_os = "linux")]
+const LINUX_ARG_MAX: usize = 128 * 1024;
+/// Three quarters of `_STK_LIM` (8 MiB): the most total the kernel allows.
+#[cfg(target_os = "linux")]
+const LINUX_STACK_ARGUMENT_CAP: usize = 8 * 1024 * 1024 / 4 * 3;
+/// Two paths of PATH_MAX (the script for the kernel, the program for an `env` interpreter)
+/// and one interpreter line of BINPRM_BUF_SIZE, with their pointers.
+#[cfg(target_os = "linux")]
+const LINUX_SCRIPT_MARGIN: usize = 2 * 4096 + 256 + 4 * std::mem::size_of::<usize>();
+
+#[cfg(target_os = "linux")]
+fn script_entrypoint(program: &std::ffi::OsStr) -> bool {
+    use std::io::Read;
+    let mut start = [0; 2];
+    std::fs::File::open(program)
+        .and_then(|mut file| file.read_exact(&mut start))
+        .is_ok_and(|()| start == *b"#!")
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod linux_exec_budget_tests {
     use super::*;
@@ -414,17 +440,36 @@ mod linux_exec_budget_tests {
     }
 
     // The arguments fill the total exactly, then by one byte more; the kernel decides both.
+    // A script entrypoint is refused there too, and accepted a margin below.
     #[test]
     fn the_total_is_refused_exactly_where_the_kernel_refuses_it() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("script");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let script = script.to_str().unwrap();
+        // (entrypoint, bytes below the exact total, refused by the budget and by the kernel,
+        // each at the boundary and one byte over it)
+        for (program, under, budget, kernel) in [
+            ("/bin/./true", 0, [false, true], [false, true]),
+            (script, 0, [true, true], [true, true]),
+            (script, LINUX_SCRIPT_MARGIN, [false, true], [false, false]),
+        ] {
+            total_boundary(program, under, budget, kernel);
+        }
+    }
+
+    fn total_boundary(program: &str, under: usize, budget: [bool; 2], kernel: [bool; 2]) {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let string_limit = page * 32;
         let limit = (unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize)
-            .min(8 * 1024 * 1024 / 4 * 3)
-            .max(string_limit);
+            .min(LINUX_STACK_ARGUMENT_CAP)
+            .max(LINUX_ARG_MAX);
         let pointer = std::mem::size_of::<usize>();
         let environment: Vec<_> = std::env::vars_os().collect();
-        let program = "/bin/./true";
         let fixed = (program.len() + 1) * 2
+            + under
             + environment
                 .iter()
                 .map(|(name, value)| name.len() + value.len() + 2)
@@ -447,9 +492,42 @@ mod linux_exec_budget_tests {
             for (index, bytes) in arguments.iter().enumerate() {
                 command.arg("x".repeat(bytes + if index == last { extra } else { 0 }));
             }
-            assert_eq!(linux_exec_budget(&command).is_err(), extra == 1, "{extra}");
-            assert_eq!(kernel_refuses(&mut command), extra == 1, "{extra}");
+            assert_eq!(
+                linux_exec_budget(&command).is_err(),
+                budget[extra],
+                "{program} {extra}"
+            );
+            assert_eq!(
+                kernel_refuses(&mut command),
+                kernel[extra],
+                "{program} {extra}"
+            );
         }
+    }
+
+    // On 64 KiB pages one string may take 2 MiB, but the total keeps glibc's ARG_MAX.
+    #[test]
+    fn the_total_is_not_raised_to_the_string_limit_of_large_pages() {
+        let mut command = Command::new("/bin/true");
+        command.arg("x".repeat(300 * 1024));
+        let error = linux_exec_budget_with(&command, std::iter::empty(), 64 * 1024, 256 * 1024)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Linux refuses more than 262144 bytes"),
+            "{error}"
+        );
+        let error = linux_exec_budget_with(&command, std::iter::empty(), 4096, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Linux refuses one longer than 131072"),
+            "{error}"
+        );
+        command = Command::new("/bin/true");
+        command.arg("x".repeat(100 * 1024));
+        linux_exec_budget_with(&command, std::iter::empty(), 4096, 1).unwrap();
     }
 
     #[test]

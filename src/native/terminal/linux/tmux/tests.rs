@@ -54,7 +54,6 @@ struct Fake {
     exists_from: Cell<Option<usize>>,
     exists_calls: Cell<usize>,
     server: Rc<ServerState>,
-    forgotten: RefCell<Vec<PathBuf>>,
 }
 
 impl Fake {
@@ -71,7 +70,6 @@ impl Fake {
             exists_from: Cell::new(None),
             exists_calls: Cell::new(0),
             server,
-            forgotten: RefCell::default(),
         }
     }
     fn reply(self, command: &'static str, reply: Reply) -> Self {
@@ -142,9 +140,6 @@ impl Host for Fake {
         let call = self.exists_calls.get();
         self.exists_calls.set(call + 1);
         Ok(self.exists.get() || self.exists_from.get().is_some_and(|from| call >= from))
-    }
-    fn forget_socket(&self, socket: &Path) {
-        self.forgotten.borrow_mut().push(socket.to_owned());
     }
     fn bridge_executable(&self) -> Result<PathBuf> {
         Ok(PathBuf::from("/opt/bridge/tabcli"))
@@ -300,7 +295,6 @@ fn a_server_not_born_after_the_floor_on_this_boot_gets_no_authority() {
             "the tmux server 4242 answering at /state/session-tmuxtest/tmux.sock was not started by this launch"
         );
         assert!(host.server.log.borrow().is_empty());
-        assert!(host.forgotten.borrow().is_empty());
     }
 }
 
@@ -324,11 +318,9 @@ fn a_proven_server_that_fails_its_shape_is_ended_or_retained() {
                 error.to_string(),
                 "the new tmux server does not hold exactly its one session"
             );
-            assert_eq!(*host.forgotten.borrow(), [socket()]);
         } else {
             let retained = retained.expect("an unconfirmed end retains the proven handle");
             assert_eq!(retained.surface.linux_host, handle().linux_host);
-            assert!(host.forgotten.borrow().is_empty());
         }
     }
 }
@@ -355,7 +347,6 @@ fn a_failed_creating_call_ends_only_a_proven_residual_server() {
     let error = created(&host).unwrap_err();
     assert_eq!(error.to_string(), "tmux new-session failed: lost");
     assert_eq!(*host.server.log.borrow(), ["terminate"]);
-    assert_eq!(*host.forgotten.borrow(), [socket()]);
 
     // An unproven residual stays, without authority.
     let host = Fake::new()
@@ -371,7 +362,6 @@ fn a_failed_creating_call_ends_only_a_proven_residual_server() {
         "{error}"
     );
     assert!(host.server.log.borrow().is_empty());
-    assert!(host.forgotten.borrow().is_empty());
 }
 
 fn prompt() -> (tempfile::TempDir, PathBuf) {
@@ -536,14 +526,11 @@ fn ending_the_server_signals_its_incarnation_once_then_forgets_the_socket() {
         CloseOutcome::Closed
     );
     assert_eq!(*host.server.log.borrow(), ["terminate"]);
-    assert_eq!(*host.forgotten.borrow(), [socket()]);
     // Repeated close, or a server that already ended: never signalled again.
-    host.forgotten.borrow_mut().clear();
     assert_eq!(
         end_server(&host, &handle(), deadline()).unwrap(),
         CloseOutcome::Missing
     );
-    assert_eq!(*host.forgotten.borrow(), [socket()]);
     assert_eq!(*host.server.log.borrow(), ["terminate"]);
     host.births.borrow_mut().insert(SERVER, None);
     assert_eq!(
@@ -569,7 +556,6 @@ fn ending_the_server_signals_its_incarnation_once_then_forgets_the_socket() {
         error.to_string(),
         "tmux server 4242 of this session did not exit before the close deadline"
     );
-    assert!(host.forgotten.borrow().is_empty());
 }
 
 #[test]
@@ -745,7 +731,6 @@ fn the_adapter_creates_through_the_shared_bind_and_cleans_up_a_failed_bind() {
     assert_eq!(error.to_string(), "bind failed");
     assert!(unbound.get());
     assert_eq!(*adapter.host.server.log.borrow(), ["terminate"]);
-    assert_eq!(*adapter.host.forgotten.borrow(), [socket()]);
 }
 
 // The installed tmux, with a pane program that echoes its input instead of this Bridge's
@@ -773,9 +758,6 @@ impl Host for RealTmux {
     fn path_exists(&self, path: &Path) -> Result<bool> {
         Installed.path_exists(path)
     }
-    fn forget_socket(&self, socket: &Path) {
-        Installed.forget_socket(socket)
-    }
     fn bridge_executable(&self) -> Result<PathBuf> {
         Ok(self.0.clone())
     }
@@ -802,7 +784,6 @@ fn a_real_tmux_server_is_created_proven_written_read_and_ended() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut session = create(&host, "unused", &directory, deadline).unwrap();
     session.managed_session_id = Some("session-realtmux".into());
-    let socket = directory.join(SOCKET_FILE);
     let ended = || end_server(&host, &session, deadline);
     let checks = (|| -> Result<()> {
         let tty = verify_session(&host, &session, Some(Duration::from_secs(5)))?;
@@ -824,7 +805,6 @@ fn a_real_tmux_server_is_created_proven_written_read_and_ended() {
     })();
     assert_eq!(ended().unwrap(), CloseOutcome::Closed);
     checks.unwrap();
-    assert!(!socket.exists());
     assert!(!surface_present(&host, &session, Duration::from_secs(5)).unwrap());
     assert_eq!(ended().unwrap(), CloseOutcome::Missing);
 }
@@ -900,7 +880,6 @@ fn a_server_is_not_signalled_once_the_close_deadline_has_passed() {
         "{error:#}"
     );
     assert!(host.server.log.borrow().is_empty());
-    assert!(host.forgotten.borrow().is_empty());
 }
 
 #[test]
@@ -930,22 +909,4 @@ fn a_failed_bind_whose_server_does_not_end_retains_the_proven_server() {
         format!("{error:#}").starts_with("bind failed; exact surface cleanup also failed: "),
         "{error:#}"
     );
-}
-
-#[test]
-fn only_a_socket_nothing_listens_on_is_forgotten() {
-    let root = tempfile::Builder::new()
-        .prefix("tmx")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let path = root.path().join(SOCKET_FILE);
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    Installed.forget_socket(&path);
-    assert!(path.exists(), "a listening socket belongs to a live server");
-    drop(listener);
-    Installed.forget_socket(&path);
-    assert!(!path.exists());
-    std::fs::write(&path, "not a socket").unwrap();
-    Installed.forget_socket(&path);
-    assert!(path.exists());
 }

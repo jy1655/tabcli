@@ -1711,8 +1711,8 @@ process teardown, and terminal automation. It does not guarantee that the close 
 A timeout means the close was not confirmed and may have partly happened. A rerun observes
 the session and establishes authority again; it may still refuse the close.
 
-On Linux, explicit close ends the session's entire tmux server, including windows you added,
-and removes its socket. It verifies the recorded server birth through a pidfd before SIGTERM;
+On Linux, explicit close ends the session's entire tmux server, including windows you added.
+The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;
 a repeated close or a server already ended sends no further signal. Pane processes can take
 a few seconds to end after close returns. See [Linux / tmux](terminals.md#linux--tmux).
 

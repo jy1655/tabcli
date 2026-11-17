@@ -673,7 +673,8 @@ that duplicates what a provider's own subagents do for a same-provider child.
   Claude/Agy trust-dialog refusal keeps the pane for the user to attach and answer; the
   stopped session still needs explicit close. Neither consent nor bypass permits a key here.
 - Explicit close sends SIGTERM through the pidfd verified against recorded birth, ends the
-  whole session server (including user-added windows), then removes the socket. Repeated
+  whole session server (including user-added windows). Never unlink the socket: no check can
+  prove the path still belongs to the ended server, and the stale file grants nothing. Repeated
   close and already-ended servers send no further signal. Pane hangup can take a few seconds
   to end owner/provider processes after close returns.
 - Read owner identity from procfs: boot id plus start ticks, process group, session,

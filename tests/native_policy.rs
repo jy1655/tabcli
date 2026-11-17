@@ -491,19 +491,23 @@ fn release_downloads_only_named_release_artifacts() {
             .split("\n      - ")
             .filter(|step| step.contains("uses: actions/download-artifact@"))
             .collect::<Vec<_>>();
-        downloads.len() == 3
+        // The Linux archive is kept apart until the integration verifier has run.
+        downloads.len() == 4
             && [
-                "aarch64-apple-darwin",
-                "x86_64-pc-windows-msvc",
-                "integrations",
+                ("aarch64-apple-darwin", "dist"),
+                ("x86_64-pc-windows-msvc", "dist"),
+                ("integrations", "dist"),
+                ("x86_64-unknown-linux-gnu", "dist-linux"),
             ]
             .iter()
-            .all(|name| {
+            .all(|(name, path)| {
                 downloads
                     .iter()
                     .filter(|step| {
                         step.contains(&format!("\n          name: {name}\n"))
-                            && step.lines().any(|line| line == "          path: dist")
+                            && step
+                                .lines()
+                                .any(|line| line == format!("          path: {path}"))
                             && !step.contains("pattern:")
                             && !step.contains("merge-multiple:")
                             && (*name != "integrations"
@@ -941,9 +945,14 @@ esac
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    fn package_macos(workflow: &str, marker: &str, package: &str, version_line: &str) -> Output {
+    fn package_unix(
+        workflow: &str,
+        marker: &str,
+        package: &str,
+        version_line: &str,
+        target: &str,
+    ) -> Output {
         let fixture = package_fixture(package, package == "tabcli");
-        let target = "aarch64-apple-darwin";
         let release = fixture.repository.join(format!("target/{target}/release"));
         fs::create_dir_all(&release).unwrap();
         executable(&release.join(package), version_line);
@@ -961,58 +970,72 @@ esac
     }
 
     #[test]
-    fn macos_packaging_runs_both_release_identities_and_the_ci_candidate() {
+    fn unix_packaging_runs_both_release_identities_and_the_ci_candidate() {
         for (workflow, marker, package) in [
             (
                 WORKFLOW,
-                "      - name: Package macOS archive and checksum",
+                "      - name: Package macOS or Linux archive and checksum",
                 "tabcli",
             ),
             (
                 WORKFLOW,
-                "      - name: Package macOS archive and checksum",
+                "      - name: Package macOS or Linux archive and checksum",
                 "agent-bridge",
             ),
             (
                 include_str!("../.github/workflows/ci.yml"),
-                "      - name: Package and verify macOS candidate",
+                "      - name: Package and verify macOS or Linux candidate",
                 "tabcli",
             ),
         ] {
-            let output = package_macos(workflow, marker, package, &format!("{package} 1.2.3"));
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                stdout(&output),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+                let output = package_unix(
+                    workflow,
+                    marker,
+                    package,
+                    &format!("{package} 1.2.3"),
+                    target,
+                );
+                assert!(
+                    output.status.success(),
+                    "{target}\n{}\n{}",
+                    stdout(&output),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
     }
 
     #[test]
-    fn macos_packaging_rejects_a_version_line_naming_the_wrong_executable() {
+    fn unix_packaging_rejects_a_version_line_naming_the_wrong_executable() {
         for (workflow, marker, package, wrong) in [
             (
                 WORKFLOW,
-                "      - name: Package macOS archive and checksum",
+                "      - name: Package macOS or Linux archive and checksum",
                 "tabcli",
                 "agent-bridge",
             ),
             (
                 WORKFLOW,
-                "      - name: Package macOS archive and checksum",
+                "      - name: Package macOS or Linux archive and checksum",
                 "agent-bridge",
                 "tabcli",
             ),
             (
                 include_str!("../.github/workflows/ci.yml"),
-                "      - name: Package and verify macOS candidate",
+                "      - name: Package and verify macOS or Linux candidate",
                 "tabcli",
                 "agent-bridge",
             ),
         ] {
-            let output = package_macos(workflow, marker, package, &format!("{wrong} 1.2.3"));
-            assert!(!output.status.success(), "accepted {wrong} as {package}");
+            for target in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+                let output =
+                    package_unix(workflow, marker, package, &format!("{wrong} 1.2.3"), target);
+                assert!(
+                    !output.status.success(),
+                    "accepted {wrong} as {package} ({target})"
+                );
+            }
         }
     }
 
@@ -1024,14 +1047,24 @@ esac
         extra: bool,
     ) {
         let dist = fixture.repository.join("dist");
-        let _ = fs::remove_dir_all(&dist);
-        fs::create_dir(&dist).unwrap();
+        // The Linux archive is downloaded apart and joins dist after the verifier.
+        let dist_linux = fixture.repository.join("dist-linux");
+        for directory in [&dist, &dist_linux] {
+            let _ = fs::remove_dir_all(directory);
+            fs::create_dir(directory).unwrap();
+        }
         let stage = fixture.repository.join("archive-stage");
         fs::create_dir_all(&stage).unwrap();
         for (platform, extension, suffix) in [
             ("aarch64-apple-darwin", "tar.gz", ""),
             ("x86_64-pc-windows-msvc", "zip", ".exe"),
+            ("x86_64-unknown-linux-gnu", "tar.gz", ""),
         ] {
+            let dist = if platform == "x86_64-unknown-linux-gnu" {
+                &dist_linux
+            } else {
+                &dist
+            };
             let binary = format!("{package}{suffix}");
             let mut members = vec![binary.as_str(), "LICENSE"];
             if package == "tabcli" {
@@ -1092,6 +1125,7 @@ esac
             for (platform, suffix) in [
                 ("aarch64-apple-darwin", ""),
                 ("x86_64-pc-windows-msvc", ".exe"),
+                ("x86_64-unknown-linux-gnu", ""),
             ] {
                 let binary = format!("{package}{suffix}");
                 let mut members = vec![binary.as_str(), "LICENSE"];
@@ -1113,7 +1147,19 @@ esac
             }
             release_assets(&fixture, package, "", None, false);
             fs::write(fixture.repository.join("dist/extra-asset"), "extra").unwrap();
-            assert!(!run().status.success(), "accepted a fifth asset");
+            assert!(!run().status.success(), "accepted a seventh asset");
+            release_assets(&fixture, package, "", None, false);
+            fs::write(fixture.repository.join("dist-linux/extra-asset"), "extra").unwrap();
+            assert!(!run().status.success(), "accepted an extra Linux download");
+            release_assets(&fixture, package, "", None, false);
+            fs::remove_file(fixture.repository.join(format!(
+                "dist-linux/{package}-1.2.3-x86_64-unknown-linux-gnu.tar.gz.sha256"
+            )))
+            .unwrap();
+            assert!(
+                !run().status.success(),
+                "accepted a Linux archive without its checksum"
+            );
         }
     }
 
