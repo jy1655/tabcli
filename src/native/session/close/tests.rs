@@ -126,17 +126,10 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             )
             .unwrap();
             store
-                .write_terminal(&terminal::TerminalSession {
-                    linux_host: None,
-                    tmux_socket: None,
-                    kind: terminal::TerminalKind::Iterm2,
-                    id: "exact-retained-surface".to_owned(),
-                    tab_id: None,
-                    window_id: None,
-                    managed_session_id: None,
-                    wezterm_mux: None,
-                    windows_process_identity: None,
-                })
+                .write_terminal(&terminal::TerminalSession::new(
+                    terminal::TerminalKind::Iterm2,
+                    "exact-retained-surface".to_owned(),
+                ))
                 .unwrap();
             let refusal = close(
                 &store,
@@ -272,17 +265,10 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join("terminal.json"),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "missing-iterm-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "missing-iterm-session".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
@@ -340,17 +326,10 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join("terminal.json"),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "missing-iterm-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "missing-iterm-session".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
@@ -411,17 +390,10 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join(TERMINAL_CLOSING_FILE),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "interrupted-close".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "interrupted-close".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
@@ -473,17 +445,10 @@ fn interrupted_close_without_tombstone_converges_after_owner_exit() {
         .unwrap();
     store
         .record(CoreRecord::TerminalClosing)
-        .write_json(&terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "interrupted-close".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        })
+        .write_json(&terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "interrupted-close".to_owned(),
+        ))
         .unwrap();
     for record in [
         CoreRecord::TurnClaim,
@@ -629,17 +594,10 @@ fn deadline_fixture() -> (tempfile::TempDir, Store) {
     let store = Store::open_unchecked(directory.path());
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
     store
-        .write_terminal(&terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "deadline-fixture".into(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        })
+        .write_terminal(&terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "deadline-fixture".into(),
+        ))
         .unwrap();
     (directory, store)
 }
@@ -1208,17 +1166,11 @@ fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::WindowsConsole,
-            id: "windows-console-process".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: Some("session-windows-close".to_owned()),
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::WindowsConsole,
+            "windows-console-process".to_owned(),
+        )
+        .with_binding(Some("session-windows-close".to_owned())),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
@@ -1256,17 +1208,10 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "concurrent-close".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "concurrent-close".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Running, None, None).unwrap();
@@ -1323,17 +1268,10 @@ fn tell_cannot_claim_while_explicit_close_owns_the_terminal_lifecycle() {
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: terminal::TerminalKind::Iterm2,
-            id: "closing-before-tell".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
+        &terminal::TerminalSession::new(
+            terminal::TerminalKind::Iterm2,
+            "closing-before-tell".to_owned(),
+        ),
     )
     .unwrap();
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
@@ -2302,7 +2240,7 @@ fn wezterm_close_retry_preserves_authority_after_partial_surface_cleanup() {
     handle.kind = terminal::TerminalKind::WezTerm;
     handle.id = "0".into();
     // As a handle is stored, so that the record keeps whatever scope it was created with.
-    handle.wezterm_mux = Some(
+    handle = handle.with_wezterm_mux(Some(
         serde_json::from_value(serde_json::json!({
             "socket": "/tmp/owned-wezterm/gui-sock-123",
             "pid": 123,
@@ -2310,7 +2248,7 @@ fn wezterm_close_retry_preserves_authority_after_partial_surface_cleanup() {
             "start_microseconds": 1,
         }))
         .unwrap(),
-    );
+    ));
     handle.tab_id = None;
     handle.window_id = None;
     write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
@@ -2655,7 +2593,7 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
         handle.id = "7".into();
         handle.tab_id = Some("3".into());
         handle.window_id = Some("1".into());
-        handle.wezterm_mux = Some(
+        handle = handle.with_wezterm_mux(Some(
             serde_json::from_value(serde_json::json!({
                 "socket": "/tmp/owned-wezterm/gui-sock-123",
                 "pid": 123,
@@ -2664,7 +2602,7 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
                 "owns_gui": owns_gui,
             }))
             .unwrap(),
-        );
+        ));
         write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
         close_session_state_with_error(
             &Store::open_unchecked(directory.path()),
@@ -2684,7 +2622,9 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
         .unwrap_err();
 
         let mut other_scope = handle.clone();
-        other_scope.wezterm_mux.as_mut().unwrap().owns_gui = !owns_gui;
+        let mut mux = other_scope.wezterm_mux().unwrap().clone();
+        mux.owns_gui = !owns_gui;
+        other_scope = other_scope.with_wezterm_mux(Some(mux));
         assert!(
             session_close::terminal_close_intent_owner(
                 &Reader::open_unchecked(directory.path()),

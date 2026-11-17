@@ -596,17 +596,9 @@ fn fixture() -> (tempfile::TempDir, ControlClient, String) {
 }
 
 fn session() -> TerminalSession {
-    TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: TerminalKind::Warp,
-        id: "instance-1".into(),
-        tab_id: Some("new-tab".into()),
-        window_id: Some("new-window".into()),
-        managed_session_id: Some("session-test".into()),
-        windows_process_identity: None,
-        wezterm_mux: None,
-    }
+    TerminalSession::new(TerminalKind::Warp, "instance-1".into())
+        .with_location(Some("new-tab".into()), Some("new-window".into()))
+        .with_binding(Some("session-test".into()))
 }
 
 #[test]
@@ -1280,10 +1272,7 @@ fn failed_binding_cleanup_retains_only_unconfirmed_warp_surface() {
 }
 
 fn session_with_managed_id(id: &str) -> TerminalSession {
-    TerminalSession {
-        managed_session_id: Some(id.to_owned()),
-        ..session()
-    }
+    session().with_binding(Some(id.to_owned()))
 }
 
 #[test]

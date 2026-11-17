@@ -64,8 +64,7 @@ pub(super) fn surface_present(
         return Ok(false);
     }
     let identity = session
-        .windows_process_identity
-        .as_ref()
+        .windows_identity()
         .context("console identity is missing")?;
     Ok(query_process_identity(pid)? == *identity)
 }
@@ -171,17 +170,8 @@ where
             Surface::Window(ConsoleWindow::create(&powershell, &command_line, deadline)?)
         }
     };
-    let mut session = TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind,
-        id: surface.pid().to_string(),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: None,
-        wezterm_mux: None,
-        windows_process_identity: Some(surface.identity().clone()),
-    };
+    let mut session = TerminalSession::new(kind, surface.pid().to_string())
+        .with_windows_identity(Some(surface.identity().clone()));
     let launch = super::bind_surface_before_start(
         &mut session,
         bind,
@@ -586,8 +576,7 @@ pub(in crate::native) fn console_control(
         .parse::<u32>()
         .context("Windows console session id is not a process id")?;
     let identity = session
-        .windows_process_identity
-        .as_ref()
+        .windows_identity()
         .context("Windows console handle is missing its process identity")?;
     let close_requested = matches!(action, ResolvedAction::Close);
     // Read before anything is ended: a close that cannot tell the host of a tab from the

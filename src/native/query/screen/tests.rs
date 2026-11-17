@@ -176,17 +176,9 @@ fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
 }
 
 fn handle(kind: terminal::TerminalKind, bound_to: Option<&str>) -> terminal::TerminalSession {
-    terminal::TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind,
-        id: "surface-1".into(),
-        tab_id: None,
-        window_id: Some("1001".into()),
-        managed_session_id: bound_to.map(str::to_owned),
-        windows_process_identity: None,
-        wezterm_mux: None,
-    }
+    terminal::TerminalSession::new(kind, "surface-1".into())
+        .with_location(None, Some("1001".into()))
+        .with_binding(bound_to.map(str::to_owned))
 }
 
 /// The kind whose screen this platform reads, when it reads any.

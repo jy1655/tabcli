@@ -49,6 +49,7 @@ Run the language lint for every change (Python 3.9 or newer):
 
 ```sh
 python3 scripts/check_language.py
+python3 scripts/check_agent_instructions.py
 ```
 
 Public text uses English; translations, third-party notices and Unicode fixtures have reviewed

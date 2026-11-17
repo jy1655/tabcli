@@ -130,6 +130,16 @@ outputs, malformed JSON, duplicate keys, non-finite numbers, Unicode/control/bid
 unchanged input objects/bytes, and the stdin/stdout CLI. These are formatter checks and supply
 no authenticated provider or terminal-runtime evidence.
 
+## Agent instruction lint
+
+Run `python3 scripts/check_agent_instructions.py` after changing project instructions.
+`AGENTS.md` stays within 32,768 UTF-8 bytes and routes work to the files in `docs/agents/`
+with explicit read conditions. The check rejects missing, empty or unrouted boundary files
+and a `CLAUDE.md` entry that no longer imports `AGENTS.md`. The repository test runs this
+same check in the existing Python suite on CI. It does not run either agent's instruction
+loader or prove that a reader followed a condition. Keep substantial headroom for ancestor
+instructions; a machine-local budget increase does not change this ceiling.
+
 ## Language lint
 
 Public documentation, source comments and default plugin metadata use English. Run from the

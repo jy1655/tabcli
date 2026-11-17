@@ -59,6 +59,30 @@ const CREATED_FORMAT: &str = "#{pid}\t#{session_id}\t#{window_id}\t#{pane_id}\t#
 const PANE_FORMAT: &str = "#{pid}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_tty}";
 const SESSION_FORMAT: &str = "#{pid}\t#{session_id}";
 
+pub(in crate::native::terminal) fn created_host_incarnation(
+    session: &TerminalSession,
+) -> Result<crate::native::process_identity::ProcessObservation> {
+    observe_created_host(&Installed, session)
+}
+
+fn observe_created_host(
+    host: &dyn Host,
+    session: &TerminalSession,
+) -> Result<crate::native::process_identity::ProcessObservation> {
+    let recorded = session
+        .tmux_server()
+        .context("creation-proven Linux host identity is missing")?;
+    // Close's preliminary observation uses procfs birth, including an unreaped zombie.
+    // The eventual action opens a verified pidfd and checks exit again before signalling.
+    // Do not substitute endpoint/pane presence or the pidfd's exit semantics here.
+    Ok(crate::native::process_identity::classify(
+        recorded.pid,
+        Some(&recorded.linux_birth),
+        || unreachable!("host birth required"),
+        || host.birth(recorded.pid),
+    ))
+}
+
 /// What the adapter reads and runs on this machine. Production reads the system; a test
 /// substitutes every observation and every tmux call.
 pub(super) trait Host {
@@ -266,8 +290,7 @@ impl<'a> Target<'a> {
         }
         let socket = Path::new(
             handle
-                .tmux_socket
-                .as_deref()
+                .tmux_socket()
                 .context("tmux surface has no recorded socket")?,
         );
         if !socket.is_absolute() || socket.file_name() != Some(OsStr::new(SOCKET_FILE)) {
@@ -279,8 +302,7 @@ impl<'a> Target<'a> {
         Ok(Self {
             socket,
             server: handle
-                .linux_host
-                .as_ref()
+                .tmux_server()
                 .context("tmux surface has no recorded server incarnation")?,
             session: handle
                 .window_id
@@ -481,17 +503,9 @@ fn create(
                 .parse()
                 .with_context(|| format!("tmux answered an invalid server PID: {pid:?}"))?;
             let server = prove_server(host, &socket, pid, floor)?;
-            let handle = TerminalSession {
-                kind: TerminalKind::Tmux,
-                id: pane.to_owned(),
-                tab_id: Some(window.to_owned()),
-                window_id: Some(session.to_owned()),
-                managed_session_id: None,
-                windows_process_identity: None,
-                wezterm_mux: None,
-                linux_host: Some(server),
-                tmux_socket: Some(socket_text.to_owned()),
-            };
+            let handle = TerminalSession::new(TerminalKind::Tmux, pane.to_owned())
+                .with_location(Some(window.to_owned()), Some(session.to_owned()))
+                .with_tmux_server(socket_text.to_owned(), server);
             let proven = (|| {
                 if answered_socket != socket_text {
                     bail!("tmux answered from socket {answered_socket}, not {socket_text}");
@@ -511,17 +525,8 @@ fn create(
             match residual_server(host, &socket, floor, deadline) {
                 Ok(None) => Err(error),
                 Ok(Some(server)) => {
-                    let handle = TerminalSession {
-                        kind: TerminalKind::Tmux,
-                        id: String::new(),
-                        tab_id: None,
-                        window_id: None,
-                        managed_session_id: None,
-                        windows_process_identity: None,
-                        wezterm_mux: None,
-                        linux_host: Some(server),
-                        tmux_socket: Some(socket_text.to_owned()),
-                    };
+                    let handle = TerminalSession::new(TerminalKind::Tmux, String::new())
+                        .with_tmux_server(socket_text.to_owned(), server);
                     Err(end_created(host, handle, error, deadline))
                 }
                 Err(residual) => Err(error.context(format!(
@@ -632,8 +637,7 @@ fn end_server(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     let recorded = handle
-        .linux_host
-        .as_ref()
+        .tmux_server()
         .context("tmux surface has no recorded server incarnation")?;
     let Some(server) = host.server(recorded.pid, recorded.linux_birth)? else {
         return Ok(CloseOutcome::Missing);
@@ -786,7 +790,7 @@ pub(super) fn read_screen(
 
 /// The command a user runs to watch or type in this session's pane.
 pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<String> {
-    let socket = session.tmux_socket.as_deref()?;
+    let socket = session.tmux_socket()?;
     (session.kind == TerminalKind::Tmux).then(|| {
         format!(
             "tmux -S {} attach",

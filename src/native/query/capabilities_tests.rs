@@ -263,17 +263,8 @@ fn supported_kind() -> terminal::TerminalKind {
 fn write_handle(directory: &Path, kind: terminal::TerminalKind, session: Option<&str>) {
     crate::native::session::primitives::write_json_atomic(
         &directory.join(TERMINAL_HANDLE_FILE),
-        &terminal::TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind,
-            id: "4242".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: session.map(str::to_owned),
-            windows_process_identity: None,
-            wezterm_mux: None,
-        },
+        &terminal::TerminalSession::new(kind, "4242".to_owned())
+            .with_binding(session.map(str::to_owned)),
     )
     .unwrap();
 }

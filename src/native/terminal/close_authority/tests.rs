@@ -46,17 +46,9 @@ fn app() -> MacTerminalAppIdentity {
 }
 
 fn handle(kind: terminal::TerminalKind, surface_binding: Option<String>) -> TerminalSession {
-    TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind,
-        id: "surface-id".into(),
-        tab_id: None,
-        window_id: Some("1001".into()),
-        managed_session_id: surface_binding,
-        windows_process_identity: None,
-        wezterm_mux: None,
-    }
+    TerminalSession::new(kind, "surface-id".into())
+        .with_location(None, Some("1001".into()))
+        .with_binding(surface_binding)
 }
 
 fn snapshot(directory: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {

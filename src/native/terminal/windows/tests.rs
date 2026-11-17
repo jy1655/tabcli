@@ -632,17 +632,9 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     let identity = query_process_identity(root.id()).unwrap();
     crate::native::session::RecordStore::at(&directory.path().join("console-host-process.json"))
         .write_json(&serde_json::json!({ "schema": 1, "pid": host.id(), "identity": query_process_identity(host.id()).unwrap() })).unwrap();
-    let session = super::TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: super::TerminalKind::WindowsConsole,
-        id: root.id().to_string(),
-        tab_id: None,
-        window_id: None,
-        managed_session_id: None,
-        wezterm_mux: None,
-        windows_process_identity: Some(identity),
-    };
+    let session =
+        super::TerminalSession::new(super::TerminalKind::WindowsConsole, root.id().to_string())
+            .with_windows_identity(Some(identity));
     super::terminate_console_processes(&[root_process], root.id(), Some(host.id())).unwrap();
     root.wait().unwrap();
     assert!(host.try_wait().unwrap().is_none());

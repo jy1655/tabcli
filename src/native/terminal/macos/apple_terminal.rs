@@ -255,17 +255,10 @@ fn create_tab(
     if id.is_none() || window_id.is_none() || ids.next().is_some() {
         bail!("Terminal.app did not return one tty and one window id");
     }
-    Ok(TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: TerminalKind::AppleTerminal,
-        id: id.unwrap().to_owned(),
-        tab_id: None,
-        window_id: Some(window_id.unwrap().to_owned()),
-        managed_session_id: None,
-        wezterm_mux: None,
-        windows_process_identity: None,
-    })
+    Ok(
+        TerminalSession::new(TerminalKind::AppleTerminal, id.unwrap().to_owned())
+            .with_location(None, Some(window_id.unwrap().to_owned())),
+    )
 }
 
 fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
@@ -1627,17 +1620,8 @@ end mockClose
 
     #[test]
     fn terminal_disappearing_after_send_ownership_proof_is_delivery_uncertain() {
-        let session = TerminalSession {
-            linux_host: None,
-            tmux_socket: None,
-            kind: TerminalKind::AppleTerminal,
-            id: TTY.into(),
-            window_id: Some(WINDOW.into()),
-            tab_id: None,
-            managed_session_id: None,
-            windows_process_identity: None,
-            wezterm_mux: None,
-        };
+        let session = TerminalSession::new(TerminalKind::AppleTerminal, TTY.into())
+            .with_location(None, Some(WINDOW.into()));
         let window = ownership_proof(&session).unwrap();
         let prompt = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(prompt.path(), "hello").unwrap();

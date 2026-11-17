@@ -465,17 +465,10 @@ fn validate_composite(surface: &CreatedSurface, state: &Snapshot, before: &Snaps
     Ok(())
 }
 fn handle(surface: &CreatedSurface) -> TerminalSession {
-    TerminalSession {
-        linux_host: None,
-        tmux_socket: None,
-        kind: TerminalKind::Ghostty,
-        id: surface.terminal_id.clone(),
-        tab_id: Some(surface.tab_id.clone()),
-        window_id: Some(surface.window_id.clone()),
-        managed_session_id: None,
-        wezterm_mux: None,
-        windows_process_identity: None,
-    }
+    TerminalSession::new(TerminalKind::Ghostty, surface.terminal_id.clone()).with_location(
+        Some(surface.tab_id.clone()),
+        Some(surface.window_id.clone()),
+    )
 }
 // The application in front before the creation. `None` when it is Ghostty or nothing
 // identifies it: then nothing gets the foreground back.
