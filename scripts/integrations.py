@@ -173,7 +173,7 @@ def packages(root):
             "integration.json": json_bytes({
                 "schema": 1, "host": host, "version": release,
                 "tabcli_min_version": MIN_TABCLI,
-                "platforms": ["macos", "windows"],
+                "platforms": ["linux", "macos", "windows"],
             }),
         }
     return result

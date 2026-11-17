@@ -49,7 +49,9 @@ through Bridge whatever its provider.
   or use a separate Git worktree when concurrent edits would collide. Do not switch another
   session's branch or overwrite its work.
 - Only the selected target CLI needs to be installed and authenticated. Bridge supports
-  macOS and native Windows; Windows needs PowerShell 7 and defaults to `windows-console`.
+  macOS, native Windows, and Linux through tmux 3.2 or later; Windows needs PowerShell 7 and
+  defaults to `windows-console`. Linux defaults to tmux, opens no GUI, and prints an attach
+  command for the user. A Linux process inside WSL is not verified.
   On macOS, allow terminal detection or use the user's supported `--terminal` choice.
 - Keep the provider's permission and trust controls. Do not add `--yolo`, answer a trust
   dialog, edit consent stores, or relax the host's shell restrictions as setup defaults.

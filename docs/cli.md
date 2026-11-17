@@ -173,8 +173,8 @@ defaults to `<provider> · <workspace-basename>` (or `workspace` when the basena
 Titles keep at most 80 characters, replace controls with spaces, collapse whitespace, and must
 remain nonempty. They are record labels; a terminal can also use its own ownership title.
 
-`--terminal` defaults to platform detection. Documented values are `ghostty`, `iterm2`, `terminal`,
-`warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
+`--terminal` defaults to platform detection (tmux on Linux). Documented values are `ghostty`, `iterm2`, `terminal`,
+`tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
 
 `--model` and `--effort` default to no Bridge override and must be nonempty when provided. Provider
@@ -251,6 +251,10 @@ refusal is interrupted, the error says so, and `result` reports what was recorde
 
 For timeout or delivery errors, follow the
 [shared recovery instructions](#shared-prompt-and-output-options).
+
+Linux argument-delivered prompts and Codex queue follow-ups must fit the OS command budgets,
+even with `--prompt-file`. See [Linux command limits](providers.md#linux-command-limits);
+pass long workspace material by path.
 
 ## tell
 
@@ -856,6 +860,9 @@ text, not when the terminal drew it. At most 512 KiB of UTF-8 is returned: the l
 after the capture, so it bounds what is returned, not what the read holds in memory, and a larger
 screen fails instead of being cut.
 
+On Linux, `screen` uses tmux `capture-pane -p`: the 50 visible application rows, even while
+an attached viewer scrolls in copy mode. See [Linux / tmux](terminals.md#linux--tmux).
+
 The text is what the terminal showed at one moment. Bridge does not interpret it, and it is not
 evidence of a request's state: read the request with `result`, `wait` or `inspect`. Do not type
 into the managed terminal to change what it shows. The text can contain secrets that the provider
@@ -1269,6 +1276,11 @@ The report starts human output with `scope`, describing the inputs used by these
   is null when that state was not observed, including provider-only mode.
 
 Scope is not proof of an effective runtime configuration or of delivery.
+
+On Linux, the `platform` check reports a supported platform. The `tmux` check reports
+`tmux_found`, `tmux_too_old`, or `tmux_unavailable`. tmux must be executable on an absolute
+`PATH` entry and at least version 3.2. As with provider versions, `tmux -V` runs only with
+`--probe`; without it no tmux version is read.
 
 The session `owner` check is `unavailable` / `owner_exited` or `owner_identity_mismatch` only for a
 bound owner attested gone or changed; a bound owner whose attestation could not decide is
@@ -1699,6 +1711,11 @@ process teardown, and terminal automation. It does not guarantee that the close 
 A timeout means the close was not confirmed and may have partly happened. A rerun observes
 the session and establishes authority again; it may still refuse the close.
 
+On Linux, explicit close ends the session's entire tmux server, including windows you added,
+and removes its socket. It verifies the recorded server birth through a pidfd before SIGTERM;
+a repeated close or a server already ended sends no further signal. Pane processes can take
+a few seconds to end after close returns. See [Linux / tmux](terminals.md#linux--tmux).
+
 Every open session loads its terminal, including finished sessions that were never closed. When
 you delegate many tasks, cap the number of open sessions, count finished but unclosed ones, and
 close a session before you open its replacement. If the terminal answers slowly, give the close a
@@ -1960,12 +1977,16 @@ shorter, as described under [shared output rules](#shared-prompt-and-output-opti
 
 Fields: `ok`, `schema_version`, `session`, `request_id`, `context_sources`, `request_state`,
 `provider`, `terminal`, `terminal_session_id`, `terminal_tab_id`, `terminal_window_id`,
-compatibility field `iterm_session_id`, `result`, `provider_session_id`, `turn_id`,
+compatibility field `iterm_session_id`, optional `attach_command`, `result`, `provider_session_id`, `turn_id`,
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`. A detached success has
 `request_state: "accepted"` and a null `result`; a waited success has `request_state: "completed"`.
 For Codex and Claude, a waited success can add `question_emitted`, `question_emission_count`,
 and `question_observation`, and for Claude `question_deflected` and `question_deflection_count`,
 as described in [result](#result); it never adds question content.
+
+`attach_command` is present when the active terminal handle is tmux: the shell-quoted
+`tmux -S '<socket>' attach` command for watching or typing in the pane. The same turn output
+used by `reopen` carries it when applicable. Text `ask`/`tell` output prints `attach: ...`.
 
 A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `session`, and `error`, without
 `request_id`; a claim-stage race can leave an unresolved receipt visible through `result --list`.
@@ -2149,7 +2170,9 @@ Fields: `schema_version`, `ok`, `session`, `provider`, `workspace`, `title`, `st
 `generation`, `created_unix_ms`, `updated_unix_ms`, `error`, `exit_code`, `configured`,
 `resumed_from`, `workspace_consent`, `owner_process_alive`, `owner_identity_verified`, `owner`,
 `recovery_required`, `turn_claimed`, `unreadable_requests`, `request_index_error`,
-`recorded_events`, `latest_result`, `requests`, `capabilities`, `origin`, and `origin_observation`. `configured` contains `model`, `effort`, `yolo`,
+`recorded_events`, `latest_result`, `requests`, `capabilities`, `origin`, and `origin_observation`.
+An active tmux handle adds `attach_command`, the shell-quoted `tmux -S '<socket>' attach` command.
+`configured` contains `model`, `effort`, `yolo`,
 and `provider_version_at_launch`. `capabilities` contains `schema_version`, `observed_unix_ms`,
 `cancel`, `tell` and `questions`, as described under [inspect](#inspect). Request references include `request_id`, `created_unix_ms`,
 `source`, `event_id`, `context_sources`, `active`, and the two elapsed-time fields described under

@@ -1,8 +1,8 @@
 # Providers
 
-Run an installed, signed-in `codex`, `claude`, `agy`, or `pi` through Bridge on macOS or native
-Windows. Each session runs in a visible terminal surface; choose one from
-[terminal support](terminals.md). Linux is unsupported.
+Run an installed, signed-in `codex`, `claude`, `agy`, or `pi` through Bridge on macOS, native
+Windows, or Linux through tmux. Each session runs in a terminal surface you can watch; choose
+one from [terminal support](terminals.md). Linux opens no GUI; attach to its tmux pane.
 
 “First-party CLI” means the provider's own command runs the conversation and tools under your
 existing login. Bridge has no credential store, cannot attach an independently launched CLI,
@@ -56,7 +56,7 @@ below explain its workspace-trust requirements and delivery limits.
 Install and sign in to `codex`. You need 0.147.0 or newer to launch, and 0.149.0 or newer for
 follow-ups. Open the project in Codex first and resolve its workspace-trust prompt.
 
-On macOS, Bridge passes the initial prompt as a launch argument. On native Windows, it waits for
+On macOS and Linux, Bridge passes the initial prompt as a launch argument. On native Windows, it waits for
 Codex's startup delay and either verified workspace trust or the empty composer before typing
 when lifecycle hooks were not injected. For a session recorded as `injected`, Bridge always
 requires the visible empty `› Ask Codex to do anything` composer with no workspace dialog or
@@ -356,7 +356,7 @@ interruption completion, and verified follow-up resumption.
 
 Install and sign in to stable `claude` 2.1.302 or newer. Resolve workspace trust in Claude before launch,
 or use [existing workspace consent](security-and-data.md#workspace-trust-and-consent).
-New macOS and native Windows launches, plus Windows reopens, require a recorded stable Claude
+New macOS, Linux, and native Windows launches, plus Windows reopens, require a recorded stable Claude
 Code 2.1.302 or newer and load a session-local Bridge completion module through Claude's official
 `--plugin-dir` flag. Bridge
 waits for that module to report readiness before sending the initial prompt. Disabled hooks
@@ -367,7 +367,7 @@ The version floor establishes launch eligibility, not proof that the module ran.
 `claude_completion` and the module's latest rejection as `claude_completion_diagnostic`;
 see [doctor](cli.md#doctor). Those rows read the session's records and nothing else.
 
-On both platforms, Bridge delivers the initial prompt after launch through Claude's official
+On all supported platforms, Bridge delivers the initial prompt after launch through Claude's official
 cross-session messaging. The prompt is absent from argv. Every follow-up uses that messaging path too:
 a separate, nonpersistent Claude messenger model turn calls `ListAgents` to find your session
 and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session markers so a
@@ -540,7 +540,7 @@ Agy's submission evidence is its receipt; it does not use Codex's composer proto
 Install and sign in to `agy` (Antigravity CLI) 1.1.12 or newer. Trust the exact project directory
 in Agy before launching it through Bridge.
 
-On macOS, Bridge passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
+On macOS and Linux, Bridge passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
 behind its workspace-trust dialog, so receiving the first result does not prove it is ready for
 a follow-up. Windows initial input and all follow-ups use terminal input because Agy has no
 integrated first-party input API or accepted-turn signal.
@@ -598,7 +598,7 @@ observed quota-failure log is not evidence of cancellation.
 Install and sign in to `pi` 0.84.1 or newer. If Pi asks you to resolve project trust, answer that
 prompt before launching through Bridge.
 
-On macOS, the initial prompt is a launch argument. On native Windows, Bridge waits for Pi's
+On macOS and Linux, the initial prompt is a launch argument. On native Windows, Bridge waits for Pi's
 `session_start` event with reason `startup` for the current claim before typing. That event
 follows the trust procedure, including a possible decline; it does not grant shared consent.
 If the wait expires, the error says no initial console input was sent. Resolve the prompt in
@@ -729,9 +729,20 @@ record a failed request, release its claim, or resend input.
 `reopen` refuses Pi sessions because Bridge cannot verify whether a live process still holds
 the conversation. Start a new session instead.
 
+## Linux command limits
+
+Linux limits each argument or environment string, including its NUL, to `MAX_ARG_STRLEN`
+(32 pages: 128 KiB / 131072 bytes on 4 KiB pages), and argv plus environment to `ARG_MAX`.
+Bridge measures the provider command before spawn and refuses an oversized command with
+nothing sent. This covers Codex initial prompts and `codex queue --message` follow-ups, Agy
+`--prompt-interactive`, and Pi positional prompts. Context attachments can reach 256 KiB;
+pass long material by path in the workspace instead. A prompt file does not remove these
+command limits. Codex starts its legacy notify program itself, so Bridge cannot measure that
+command beforehand.
+
 ## Verification boundary
 
-The delivery paths above are implemented for macOS and native Windows. Automated adapter and
+The delivery paths above are implemented for macOS, native Windows, and Linux through tmux. Automated adapter and
 terminal tests cover transport choices, correlation, and refusals; they do not authenticate to
 model services. This table lists authenticated live evidence and its limits. Unlisted
 provider/terminal combinations are not verified.
@@ -747,7 +758,8 @@ provider/terminal combinations are not verified.
 | Claude/Windows | [2026-10-12 candidate 0.4.9][win49], [0.4.8 checks][win48], [reopen][old7] | 0.4.9 record does not give a Claude version; 0.4.8 used 2.1.296; reopen evidence dates to 2026-09-24 |
 | Agy/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
 | Pi/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
-| All/Linux | Not verified | Refusal tests only; no visible-session transport |
+| Four providers/Linux/tmux | [2026-11-17 debug build][linux6] | Ubuntu 26.04, Linux 7.0, x86_64, tmux 3.6 over SSH; Codex 0.169.0, Claude 2.1.326 (`--model opus`), Pi 1.5.2, Agy 1.5.9 (`--model gemini-3.8-flash-medium`); ask/tell/close; Claude/Agy trust refusals; default Agy model quota exhausted |
+| Linux process in WSL | Not verified | Would use tmux; no live evidence |
 
 The 2026-10-15 Mac record covers all four providers on iTerm2 with the downloaded, published 0.4.9
 binary, after publication; it did not gate the release. Codex and Claude used defaults, Pi selected
@@ -766,7 +778,11 @@ Warp requires a reachable official Control endpoint and provable surface ownersh
 submit terminal input, so Agy and Pi follow-ups are unsupported there; choose another terminal
 for those providers. Warp has automated tests. The [0.1.1 check][mac11] returned an empty Warp
 instance list; Warp was not exercised for [0.1.2][mac12] or the 0.4.9 and Ghostty 1.4.0 Mac runs (#63, #87).
-Linux is unsupported even where shared code compiles. See [terminal support](terminals.md) for surface-specific constraints.
+Linux requires tmux 3.2 or later. It never answers workspace-trust dialogs; trust the workspace
+through the provider beforehand. See [terminal support](terminals.md#linux--tmux) for attachment,
+paste delivery, shell environment, and close behavior.
+
+[linux6]: verification/2026-11-17-linux-6-tmux-3.6.md
 
 [mac12]: verification/2026-10-06-macos-0.1.2.md
 [mac11]: verification/2026-10-04-macos-0.1.1.md

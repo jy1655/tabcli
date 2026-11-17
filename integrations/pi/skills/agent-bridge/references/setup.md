@@ -19,11 +19,18 @@ the documentation's `v<installed-version>` Git tag when checking a release-speci
 The probe checks local capabilities; success does not establish authentication, trust,
 successful delivery, or completed work.
 
-Agent Bridge supports macOS and native Windows, not Linux or a Linux headless container.
+Agent Bridge supports macOS, native Windows, and Linux through tmux 3.2 or later on an
+absolute `PATH` entry. Linux opens no GUI. Use the returned `attach_command`
+(`tmux -S '<socket>' attach`) to let the user watch or type in that session's pane; do not
+type into it on the user's behalf. A Linux process inside WSL is not verified.
 Windows needs `pwsh` (PowerShell 7) and a desktop session; `windows-console` is its default terminal.
 macOS needs a supported terminal and its automation permissions; see
 [terminals](https://github.com/jy1655/tabcli/blob/main/docs/terminals.md).
-The assistant must be able to launch a real terminal on that machine.
+The assistant must be able to launch the supported terminal surface on that machine. On Linux,
+the pane reads no shell startup files; provider CLIs and any required `node` must be available
+in the calling process's PATH. tmux cannot answer trust dialogs with a guarded key: have the
+user trust the workspace through the provider first, then explicitly close a stopped session
+before launching again. See the terminal guide for socket-path and close limits.
 
 ## Missing or incompatible installation
 
@@ -64,8 +71,8 @@ new launch after the actual setup problem is fixed.
 
 When the host refuses a shell command, surface the exact restriction and the narrow action
 needed through its normal approval flow. If that environment cannot launch local terminals,
-explain that the integration needs a supported desktop environment. Do not substitute a
-remote daemon or an unrelated execution environment.
+explain that it needs a supported terminal surface (tmux on Linux, a desktop on macOS/Windows).
+Do not substitute a remote daemon or an unrelated execution environment.
 
 ### Agy native Windows shell lifetime
 

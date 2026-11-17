@@ -2,7 +2,7 @@
 
 [English](README.md) · 한국어 README는 영어 README를 따르며, 내용이 다르면 영어 README를 기준으로 합니다.
 
-`tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 눈에 보이는 터미널 탭이나 창에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS와 Windows에서 직접 실행하는 환경을 지원합니다. WSL 안의 Linux 프로세스를 포함해 Linux는 지원하지 않으며 Warp 지원은 제한적입니다.
+`tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 지켜볼 수 있는 터미널 탭, 창 또는 tmux pane에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS, Windows에서 직접 실행하는 환경과 tmux를 통한 Linux 실행을 지원합니다. WSL 안의 Linux 프로세스는 미검증이며 Warp 지원은 제한적입니다.
 
 전역 에이전트 지침을 직접 작성하지 않고 위임하려면 Claude Code, Codex, Agy, Pi용
 [에이전트 브리지 플러그인](#에이전트-플러그인-설치)을 설치하세요. 네 패키지는 동일한
@@ -66,9 +66,14 @@ closed session-K7m2Qx
 | Windows에서 직접 실행 | 구현됨 | 네 CLI 모두, 2026-10-02 |
 | Windows Terminal 탭 | 우선 사용 | 탭 생성/후속 요청/종료, 2026-10-01 |
 | Windows 콘솔 창 | 대체 경로 | 초기 요청/종료, 2026-10-01 |
-| Linux 및 WSL 안의 Linux 프로세스 | 미지원 | 세션 전송 경로 없음 |
+| Linux / tmux | 구현됨 | [네 CLI, 2026-11-17](docs/verification/2026-11-17-linux-6-tmux-3.6.md) |
+| WSL 안의 Linux 프로세스 | 미검증 | 실제 실행 기록 없음 |
 
 macOS에서는 호출한 터미널을 감지하며, 호스트를 식별하지 못하면 Terminal.app을 사용합니다. Terminal.app은 항상 새 창을 엽니다. Windows에서는 전용 Windows Terminal 창의 탭을 우선 사용하고, 탭을 만들지 못하면 별도 콘솔 창을 엽니다. `settings macos-open-mode`와 `settings windows-tab-window`를 포함한 [터미널 선택과 설정](docs/terminals.md#selection-and-settings)을 참고합니다.
+
+Linux는 기본적으로 tmux 3.2 이상을 사용하며 GUI 창을 열지 않습니다. 출력된
+`tmux -S '<socket>' attach` 명령(JSON의 `attach_command`)으로 접속합니다.
+[Linux / tmux](docs/terminals.md#linux--tmux)를 참고합니다.
 
 Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 있어야 사용할 수 있습니다. 터미널 입력을 제출하지 못하므로 Agy와 Pi의 후속 요청은 지원하지 않습니다. 로그인한 CLI로 요청·결과·후속 요청·종료를 거치는 경로도 미검증입니다. 이 두 CLI에는 다른 터미널을 사용합니다.
 
@@ -79,7 +84,7 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 | Agy (`agy`) | 1.1.12 |
 | Pi (`pi`) | 0.84.1 |
 
-Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. macOS와 Windows의 새 Claude 실행 및 Windows 재열기에는 안정 버전 2.1.302 이상과 실제 준비 신호를 보낸 Bridge 완료 모듈이 필요합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
+Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. macOS, Linux, Windows의 새 Claude 실행 및 Windows 재열기에는 안정 버전 2.1.302 이상과 실제 준비 신호를 보낸 Bridge 완료 모듈이 필요합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
 - [2026-10-28 Ghostty 1.4.0, 배포된 0.4.29](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md):
   잠금 해제 상태의 Codex cold/warm 시작, 네 CLI의 요청·후속 요청·종료와 다른 탭·분할 화면 보존을 확인했습니다.
@@ -102,6 +107,7 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 ## 설치
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`을 사용합니다.
+릴리스에는 Linux x86_64 압축 파일도 포함됩니다.
 
 0.4.42 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
