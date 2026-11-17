@@ -182,16 +182,32 @@ mod tests {
             .path()
             .join("a\u{ac00}\u{b098}\u{b2e4}\u{b77c}\u{b9c8}");
         std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
-        let mut child = std::process::Command::new(&program)
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let comm = fs::read(format!("/proc/{}/comm", child.id())).unwrap();
-        assert!(std::str::from_utf8(&comm).is_err(), "{comm:?}");
-        let birth = process_birth(child.id());
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(birth.unwrap().is_some());
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Reaped(
+            std::process::Command::new(&program)
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        // The parent can run before exec renames the child, so wait for the new name.
+        let expected = &program.file_name().unwrap().as_encoded_bytes()[..15];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let comm = fs::read(format!("/proc/{}/comm", child.0.id())).unwrap();
+            if comm.strip_suffix(b"\n") == Some(expected) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{comm:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(std::str::from_utf8(expected).is_err());
+        assert!(process_birth(child.0.id()).unwrap().is_some());
     }
     #[test]
     fn real_procfs_birth_does_not_require_a_tty() {
