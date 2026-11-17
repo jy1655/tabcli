@@ -3,8 +3,9 @@
 //!
 //! Test builds count and time file flushes, directory opens, directory flushes and Windows
 //! DACL applications, attributed to the libtest thread that runs each test. A record is
-//! written only while `AGENT_BRIDGE_TEST_IO_STATS` names a file; one JSON line is appended
-//! when a test thread exits. `AGENT_BRIDGE_TEST_SKIP_FLUSH=1` skips the real flush (the
+//! written only while `AGENT_BRIDGE_TEST_IO_STATS` names a path prefix; each process
+//! appends to `<prefix>.<pid>.jsonl` (tests relaunch this executable), one JSON line when a
+//! test thread exits, carrying the pid, executable and Rust temp directory. `AGENT_BRIDGE_TEST_SKIP_FLUSH=1` skips the real flush (the
 //! call is still counted, logged by `record_sync` and subject to injected failures).
 //! Outside test builds every helper only runs its closure.
 
@@ -88,7 +89,9 @@ mod measured {
         static STATE: OnceLock<Option<Mutex<State>>> = OnceLock::new();
         STATE
             .get_or_init(|| {
-                let path = std::env::var_os("AGENT_BRIDGE_TEST_IO_STATS")?;
+                let prefix = std::env::var_os("AGENT_BRIDGE_TEST_IO_STATS")?;
+                let mut path = prefix;
+                path.push(format!(".{}.jsonl", std::process::id()));
                 let output = OpenOptions::new().create(true).append(true).open(path).ok();
                 Some(Mutex::new(State {
                     output,
@@ -119,6 +122,9 @@ mod measured {
                 "cumulative": self.cumulative.json(),
                 "unattributed": self.unattributed.json(),
                 "skip_flush": skip_flush(),
+                "pid": std::process::id(),
+                "executable": std::env::current_exe().ok(),
+                "temp_dir": std::env::temp_dir(),
             });
             self.test = Totals::default();
             if let Some(output) = self.output.as_mut() {

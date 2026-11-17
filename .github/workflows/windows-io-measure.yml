@@ -86,7 +86,7 @@ jobs:
             }
             if ($arm -like '*skip-flush') { $env:AGENT_BRIDGE_TEST_SKIP_FLUSH = '1' }
             else { Remove-Item Env:AGENT_BRIDGE_TEST_SKIP_FLUSH -ErrorAction SilentlyContinue }
-            $env:AGENT_BRIDGE_TEST_IO_STATS = Join-Path $armDir 'io-stats.jsonl'
+            $env:AGENT_BRIDGE_TEST_IO_STATS = Join-Path $armDir 'io-stats'
             Write-Host "::group::$arm (TEMP=$env:TEMP, skip flush=$env:AGENT_BRIDGE_TEST_SKIP_FLUSH)"
             $started = Get-Date
             python -I scripts/ci_test_timing.py run --output-dir (Join-Path $armDir 'timing')
@@ -99,6 +99,12 @@ jobs:
           $env:TMP = $defaultTmp
           $results | Format-Table -AutoSize | Out-String -Width 200 | Tee-Object -FilePath (Join-Path $root 'arms.txt')
           $results | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $root 'arms.json')
+          $failed = @($results | Where-Object { $_.exit -ne 0 })
+          if ($failed.Count -gt 0) {
+            Write-Host "::error::arms failed: $(($failed | ForEach-Object { $_.arm }) -join ', ')"
+            exit 1
+          }
+          exit 0
       - name: Preserve measurement
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
