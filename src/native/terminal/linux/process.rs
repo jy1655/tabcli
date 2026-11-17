@@ -14,13 +14,22 @@ struct Stat {
     foreground: i64,
     ticks: u64,
 }
-fn parse_stat(text: &str, pid: u32) -> Result<Stat> {
-    let (head, tail) = text
-        .rsplit_once(')')
+// The comm field is raw bytes cut at 15 bytes, so it can hold ')', newlines, and a split
+// UTF-8 sequence; only the PID before it and the fields after its last ')' are text.
+fn parse_stat(bytes: &[u8], pid: u32) -> Result<Stat> {
+    let close = bytes
+        .iter()
+        .rposition(|byte| *byte == b')')
         .context("procfs stat has no closing comm delimiter")?;
-    let (number, _) = head.split_once(" (").context("procfs stat has no comm")?;
+    let open = bytes[..close]
+        .windows(2)
+        .position(|pair| pair == b" (")
+        .context("procfs stat has no comm")?;
+    let number = std::str::from_utf8(&bytes[..open]).context("procfs stat PID is not text")?;
     anyhow::ensure!(number.parse::<u32>()? == pid, "procfs returned another PID");
-    // tail starts at field 3 (state); comm can itself contain ')' and newlines.
+    // tail starts at field 3 (state).
+    let tail =
+        std::str::from_utf8(&bytes[close + 1..]).context("procfs stat fields are not text")?;
     let fields = tail.split_whitespace().collect::<Vec<_>>();
     anyhow::ensure!(
         fields.len() >= 20 && fields[0].len() == 1,
@@ -41,11 +50,11 @@ fn parse_stat(text: &str, pid: u32) -> Result<Stat> {
     })
 }
 fn read_stat(pid: u32) -> Result<Option<Stat>> {
-    read_stat_with(pid, || fs::read_to_string(format!("/proc/{pid}/stat")))
+    read_stat_with(pid, || fs::read(format!("/proc/{pid}/stat")))
 }
 fn read_stat_with(
     pid: u32,
-    read_pid_entry: impl FnOnce() -> std::io::Result<String>,
+    read_pid_entry: impl FnOnce() -> std::io::Result<Vec<u8>>,
 ) -> Result<Option<Stat>> {
     anyhow::ensure!(
         pid > 0 && pid <= i32::MAX as u32,
@@ -135,15 +144,20 @@ mod tests {
         fields[4] = "34817";
         fields[5] = "8";
         fields[19] = "123";
-        let stat = parse_stat(&format!("42 (a )\n b)) {}", fields.join(" ")), 42).unwrap();
+        let stat =
+            parse_stat(format!("42 (a )\n b)) {}", fields.join(" ")).as_bytes(), 42).unwrap();
         assert_eq!(
             (stat.parent, stat.group, stat.session, stat.foreground),
             (7, 8, 9, 8)
         );
         assert_eq!((libc::major(stat.tty), libc::minor(stat.tty)), (136, 1));
         assert_eq!(stat.ticks, 123);
-        assert!(parse_stat("42 (bad) S 1", 42).is_err());
-        assert!(parse_stat("43 (bad) S 1", 42).is_err());
+        assert!(parse_stat(b"42 (bad) S 1", 42).is_err());
+        assert!(parse_stat(b"43 (bad) S 1", 42).is_err());
+        // A comm cut inside a multibyte character is still this process's entry.
+        let mut cut = b"42 (a\xea\xb0\x80\xeb) ".to_vec();
+        cut.extend_from_slice(fields.join(" ").as_bytes());
+        assert_eq!(parse_stat(&cut, 42).unwrap().ticks, 123);
     }
     #[test]
     fn only_pid_entry_enoent_or_esrch_is_absence() {
@@ -157,7 +171,27 @@ mod tests {
         for errno in [libc::EACCES, libc::EPERM, libc::EIO] {
             assert!(read_stat_with(42, || Err(std::io::Error::from_raw_os_error(errno))).is_err());
         }
-        assert!(read_stat_with(42, || Ok("malformed".into())).is_err());
+        assert!(read_stat_with(42, || Ok(b"malformed".to_vec())).is_err());
+    }
+    #[test]
+    fn real_procfs_birth_reads_a_comm_cut_inside_a_character() {
+        // comm is the executed file name cut to 15 bytes: "a" + five 3-byte characters
+        // ends with a split character, which is not UTF-8.
+        let root = tempfile::tempdir().unwrap();
+        let program = root
+            .path()
+            .join("a\u{ac00}\u{b098}\u{b2e4}\u{b77c}\u{b9c8}");
+        std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
+        let mut child = std::process::Command::new(&program)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let comm = fs::read(format!("/proc/{}/comm", child.id())).unwrap();
+        assert!(std::str::from_utf8(&comm).is_err(), "{comm:?}");
+        let birth = process_birth(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(birth.unwrap().is_some());
     }
     #[test]
     fn real_procfs_birth_does_not_require_a_tty() {

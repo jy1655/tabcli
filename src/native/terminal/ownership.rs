@@ -277,11 +277,21 @@ pub(in crate::native) struct MacTerminalAppIdentity {
 /// A native control snapshot carries exactly one platform's birth. Records keep
 /// their original macOS fields and optional Linux object; only readers translate them.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(in crate::native) enum ProcessBirth {
     Macos(u64, u64),
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Linux(terminal::LinuxBirth),
+}
+// Reuse diagnostics print this: macOS keeps its earlier `(seconds, microseconds)` text.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl std::fmt::Debug for ProcessBirth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Macos(seconds, microseconds) => (seconds, microseconds).fmt(f),
+            Self::Linux(birth) => birth.fmt(f),
+        }
+    }
 }
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl ProcessBirth {
@@ -929,12 +939,12 @@ pub(in crate::native::terminal) fn terminate_owned_foreground_group_until(
     )
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<()> {
     terminate_owned_foreground_group_with(group, Duration::from_secs(3), |_| {})
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn terminate_owned_foreground_group_with(
     group: u32,
     timeout: Duration,
@@ -957,7 +967,7 @@ pub(in crate::native::terminal) fn signal_process_group(
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn terminate_owned_foreground_group_with_io(
     group: u32,
     timeout: Duration,
@@ -1027,7 +1037,7 @@ pub(in crate::native) fn current_surface_owner(
     Ok(owner)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod process_close_tests {
     use super::*;
     use std::{os::unix::process::CommandExt, process::Command};
@@ -1060,18 +1070,38 @@ mod process_close_tests {
         }
 
         fn wait_for_zombie(&self) {
-            let target = -(self.0.id() as i32);
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                if unsafe { libc::kill(target, 0) } != 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                {
+                let probe = match unsafe { libc::kill(-(self.0.id() as i32), 0) } {
+                    0 => None,
+                    _ => std::io::Error::last_os_error().raw_os_error(),
+                };
+                if zombie_probe(self.0.id(), probe) {
                     return;
                 }
                 assert!(Instant::now() < deadline, "child did not become a zombie");
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    // What a group probe reports while the group holds only an unreaped zombie. Neither
+    // answer establishes absence; only ESRCH does.
+    // - macOS: EPERM (measured on macOS 26.6.2, 2026-10-07, issue #85).
+    // - Linux: success, so the zombie is read from procfs (measured on Linux 7.0,
+    //   2026-11-17).
+    #[cfg(target_os = "macos")]
+    fn zombie_probe(_pid: u32, probe: Option<i32>) -> bool {
+        probe == Some(libc::EPERM)
+    }
+    #[cfg(target_os = "linux")]
+    fn zombie_probe(pid: u32, probe: Option<i32>) -> bool {
+        probe.is_none()
+            && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, tail)| tail.split_whitespace().next())
+                    == Some("Z")
+            })
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1094,13 +1124,14 @@ mod process_close_tests {
             received
         });
         let mut probes = Vec::new();
-        let mut eperm_probes = 0;
+        let mut zombie_probes = 0;
         let result =
             terminate_owned_foreground_group_with(group, Duration::from_secs(3), |errno| {
-                probes.push(errno);
-                if errno == Some(libc::EPERM) {
-                    eperm_probes += 1;
-                    if eperm_probes == 2 {
+                let zombie = zombie_probe(group, errno);
+                probes.push((errno, zombie));
+                if zombie {
+                    zombie_probes += 1;
+                    if zombie_probes == 2 {
                         reap.send(()).unwrap();
                     }
                 }
@@ -1111,14 +1142,10 @@ mod process_close_tests {
         reaped.unwrap().unwrap();
         let gone = probes
             .iter()
-            .position(|errno| *errno == Some(libc::ESRCH))
+            .position(|(errno, _)| *errno == Some(libc::ESRCH))
             .unwrap();
         assert!(
-            probes[..gone]
-                .iter()
-                .filter(|errno| **errno == Some(libc::EPERM))
-                .count()
-                >= 2,
+            probes[..gone].iter().filter(|(_, zombie)| *zombie).count() >= 2,
             "{probes:?}"
         );
     }
@@ -1127,12 +1154,13 @@ mod process_close_tests {
     #[test]
     fn owned_foreground_group_termination_times_out_before_zombie_reaping() {
         let child = ForegroundGroupChild::spawn();
+        let group = child.0.id();
         let timeout = Duration::from_secs(1);
-        let mut eperm_probes = 0;
+        let mut zombie_probes = 0;
         let started = Instant::now();
-        let result = terminate_owned_foreground_group_with(child.0.id(), timeout, |errno| {
-            if errno == Some(libc::EPERM) {
-                eperm_probes += 1;
+        let result = terminate_owned_foreground_group_with(group, timeout, |errno| {
+            if zombie_probe(group, errno) {
+                zombie_probes += 1;
             }
         });
         let elapsed = started.elapsed();
@@ -1141,7 +1169,7 @@ mod process_close_tests {
             "the attested process group was not confirmed gone before the deadline",
             "{result:?}"
         );
-        assert!(eperm_probes > 0, "no EPERM probe was observed");
+        assert!(zombie_probes > 0, "no zombie-only probe was observed");
         assert!(elapsed >= timeout);
     }
 
@@ -1155,16 +1183,26 @@ mod process_close_tests {
         );
         child.wait_for_zombie();
         let error = terminate_owned_foreground_group(child.0.id()).unwrap_err();
+        // macOS refuses the signal itself; Linux delivers it to the zombie and then never
+        // observes the group gone. Both refuse.
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                error.to_string(),
+                "could not send SIGTERM to the attested process group"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        #[cfg(target_os = "linux")]
         assert_eq!(
             error.to_string(),
-            "could not send SIGTERM to the attested process group"
-        );
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(libc::EPERM)
+            "the attested process group was not confirmed gone before the deadline"
         );
     }
 

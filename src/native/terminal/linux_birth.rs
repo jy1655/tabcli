@@ -2,23 +2,27 @@
 //! optional `linux_birth` object is used by owner, terminal_shell and linux_host.
 //! A present incomplete/malformed object fails decoding; it never becomes PID-only.
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(in crate::native) struct BootId([u8; 16]);
+impl std::fmt::Display for BootId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                f.write_str("-")?;
+            }
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for BootId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 impl Serialize for BootId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let hex = self
-            .0
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        serializer.serialize_str(&format!(
-            "{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        ))
+        serializer.collect_str(self)
     }
 }
 impl<'de> Deserialize<'de> for BootId {
@@ -53,10 +57,15 @@ impl std::str::FromStr for BootId {
         Ok(Self(bytes))
     }
 }
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub(in crate::native) struct LinuxBirth {
     pub(in crate::native) boot_id: BootId,
     pub(in crate::native) starttime_ticks: u64,
+}
+impl std::fmt::Debug for LinuxBirth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(boot {}, tick {})", self.boot_id, self.starttime_ticks)
+    }
 }
 
 // A present null is malformed evidence, not an absent legacy identity.
@@ -64,4 +73,22 @@ pub(in crate::native) fn present<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Option<LinuxBirth>, D::Error> {
     LinuxBirth::deserialize(d).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn birth_text_and_wire_keep_the_canonical_boot_id() {
+        let text = "01234567-89ab-cdef-0123-456789abcdef";
+        let birth = LinuxBirth {
+            boot_id: text.parse().unwrap(),
+            starttime_ticks: 7,
+        };
+        assert_eq!(format!("{birth:?}"), format!("(boot {text}, tick 7)"));
+        assert_eq!(
+            serde_json::to_value(birth).unwrap(),
+            serde_json::json!({"boot_id": text, "starttime_ticks": 7})
+        );
+    }
 }

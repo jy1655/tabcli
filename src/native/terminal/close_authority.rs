@@ -63,6 +63,10 @@ pub(in crate::native) trait CloseObservation {
     /// Some only for a kind declaring BridgeCreatedHost: this observation proves the
     /// whole recorded host incarnation, independent of owner or intent. Unknown refuses.
     /// It never treats a missing endpoint or pane as an absent host.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
     fn created_host_incarnation(
         &self,
     ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
@@ -447,12 +451,19 @@ pub(in crate::native) fn decide(
         Ok(TerminalCloseAuthority::SurfaceOnly)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        ownership_proof()?;
-        bail!(
-            "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
-        )
-    }
+    refuse_without_transport(ownership_proof)
+}
+
+// Other Unix targets have no visible terminal transport. The ownership proof still runs
+// first, so its own refusal wins. Compiled into every test build so that CI runs it.
+#[cfg(any(not(any(target_os = "macos", target_os = "linux", windows)), test))]
+fn refuse_without_transport<T>(
+    ownership_proof: impl FnOnce() -> Result<T>,
+) -> Result<TerminalCloseAuthority> {
+    ownership_proof()?;
+    bail!(
+        "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
+    )
 }
 
 pub(in crate::native) fn close_owned_surface(
@@ -530,6 +541,7 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
     }
 }
 
+// Apple Terminal close-evidence fixtures; the shared rows run on Linux through the tmux kind.
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
@@ -541,6 +553,18 @@ mod projected_authority_tests {
     use crate::native::session::CoreRecord;
     use crate::native::session::launch;
     use crate::native::session::owner::ControlAttestation;
+
+    #[test]
+    fn other_unix_refusal_runs_the_proof_first_and_sends_no_close() {
+        let error =
+            refuse_without_transport(|| -> Result<()> { bail!("proof refused") }).unwrap_err();
+        assert_eq!(error.to_string(), "proof refused");
+        let error = refuse_without_transport(|| Ok(())).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
+        );
+    }
 
     fn assert_failed_start_route(attestation: impl Fn() -> OwnerAttestation, surface_only: bool) {
         for kind in [

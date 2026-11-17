@@ -1188,3 +1188,14 @@ fn owner_registration_shell_refusals_name_no_terminal_application() {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), expected, "{mode}");
     }
 }
+
+#[test]
+fn reuse_diagnostics_keep_the_macos_birth_text() {
+    assert_eq!(
+        format!(
+            "{:?}",
+            crate::native::terminal::ownership::ProcessBirth::Macos(100, 12)
+        ),
+        "(100, 12)"
+    );
+}

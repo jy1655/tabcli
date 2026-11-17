@@ -121,6 +121,32 @@ fn r1_c6_reused_projects_mismatch_without_inspection_error() {
 
 #[cfg(windows)]
 #[test]
+fn windows_refuses_a_linux_owner_birth_as_pid_only_evidence() {
+    let owner: NativeSessionOwner = serde_json::from_value(serde_json::json!({
+        "pid": 4242,
+        "linux_birth": {
+            "boot_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "starttime_ticks": 7
+        }
+    }))
+    .unwrap();
+    for alive in [false, true] {
+        let a = attest_owner_with(
+            &owner,
+            OwnerObservers {
+                pid_alive: &|_| alive,
+                identity: &|_| panic!("a foreign birth must not be compared"),
+            },
+        );
+        assert_eq!(
+            a.process,
+            ProcessObservation::Unknown("foreign Linux owner birth on Windows".into())
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn r1_c1_windows_legacy_dead_does_not_block_prune() {
     let a = attest_owner_with(
         &NativeSessionOwner::default(),

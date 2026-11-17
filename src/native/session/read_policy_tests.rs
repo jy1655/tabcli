@@ -466,7 +466,7 @@ fn terminal_closed_read_policy() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn terminal_close_intent_read_policy() {
     // Both close-intent readers take the record's text through the same read.

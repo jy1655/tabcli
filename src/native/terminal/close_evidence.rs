@@ -109,7 +109,7 @@ pub(in crate::native) fn for_kind(kind: super::TerminalKind) -> &'static dyn Clo
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
     use crate::native::terminal::TerminalKind;

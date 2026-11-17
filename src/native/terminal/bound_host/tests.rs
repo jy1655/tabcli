@@ -8,8 +8,11 @@ fn admission_refuses_relative_link_shared_and_invalid_before_callback() {
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
     let link = temp.path().join("session-link");
     std::os::unix::fs::symlink(&private, &link).unwrap();
+    let invalid = temp.path().join("invalid id");
+    fs::create_dir(&invalid).unwrap();
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).unwrap();
     let spec = BoundHostSpec { name: "test host" };
-    for path in [Path::new("session-relative"), &link] {
+    for path in [Path::new("session-relative"), &link, &invalid] {
         assert!(run_bound_host(path, &spec, |_| -> Result<()> { panic!("refused path") }).is_err());
     }
     let called = Cell::new(false);

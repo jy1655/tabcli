@@ -99,7 +99,7 @@ pub(in crate::native::terminal) fn prepare_bound_launch(
     prepare_bound_launch_with(directory, spec, facts, clock, validate_binding, || {
         if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
             return Err(std::io::Error::last_os_error())
-                .context("cannot discard launch host startup input");
+                .with_context(|| format!("cannot discard {} startup input", spec.name));
         }
         Ok(())
     })
@@ -115,11 +115,14 @@ fn prepare_bound_launch_with(
     use crate::native::session::{Store, launch};
     run_bound_host(directory, spec, |id| {
         let store = Store::open_unchecked(directory);
-        let initial = launch::read(&store)?.context("missing host launch receipt")?;
+        let name = spec.name;
+        let initial =
+            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
         let surface = launch::wait_for_binding(&store, id, facts, clock)?;
         validate_binding(&surface)?;
         let _lock = store.lock()?;
-        let current = launch::read(&store)?.context("missing host launch receipt")?;
+        let current =
+            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
         anyhow::ensure!(
             launch::pending::judge(
                 &store,
@@ -128,12 +131,12 @@ fn prepare_bound_launch_with(
                 launch::pending::Expiry::Receipt
             )?
             .is_ok(),
-            "launch host is no longer pending"
+            "{name} launch is no longer pending"
         );
         anyhow::ensure!(
             launch::pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
                 == Some(&surface),
-            "launch host binding changed"
+            "{name} binding changed"
         );
         flush()?;
         Ok(surface)

@@ -269,8 +269,12 @@ pub(in crate::native) fn attest_owner_with(
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let recorded_birth = recorded_birth.ok().flatten();
+    // A Linux birth names an incarnation this platform cannot observe; it is never
+    // compared as PID-only evidence.
     #[cfg(windows)]
-    let process = {
+    let process = if owner.linux_birth.is_some() {
+        ProcessObservation::Unknown("foreign Linux owner birth on Windows".into())
+    } else {
         use crate::native::terminal::WindowsIncarnation;
         classify(
             owner.pid,

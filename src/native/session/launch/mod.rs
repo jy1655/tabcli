@@ -1091,7 +1091,7 @@ pub(in crate::native) fn diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::native::session;
     use crate::native::session::names::*;
     use std::{fs, process::Stdio};
@@ -1578,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn retained_handoff_marks_stored_and_returned_diagnostics_once() {
         for case in ["normal", "lost", "closed", "write", "read"] {
             let (directory, _) = fixture();
@@ -1671,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn retained_surface_record_failure_is_durable() {
         let (directory, _) = fixture();
         let store = Store::open_unchecked(directory.path());
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn unbound_residual_survives_changed_diagnostics_and_repeated_close() {
         for closed_first in [false, true] {
             let (directory, _) = fixture();
