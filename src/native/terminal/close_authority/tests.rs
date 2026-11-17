@@ -47,6 +47,8 @@ fn app() -> MacTerminalAppIdentity {
 
 fn handle(kind: terminal::TerminalKind, surface_binding: Option<String>) -> TerminalSession {
     TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind,
         id: "surface-id".into(),
         tab_id: None,
@@ -246,7 +248,7 @@ impl Row {
                 assert_eq!(pid, 123);
                 self.pid_alive
             })
-            .with_mac_owner_live(|owner| {
+            .with_posix_owner_live(|owner| {
                 assert_eq!(owner.pid, 123);
                 match fault("mac-live") {
                     Ok(()) => test_owner_attestation(self.live),
@@ -438,7 +440,7 @@ fn failed_start_authorities(
                 }),
             })
             .with_owner_record(|_| attestation())
-            .with_mac_owner_live(|_| attestation())
+            .with_posix_owner_live(|_| attestation())
             .with_presence(|| Ok(true))
             .with_proof(|| bail!("injected full ownership proof failure"))
             .with_evidence(terminal::close_evidence(kind));
@@ -920,7 +922,7 @@ fn resumability_error_stops_before_owner_liveness() {
 }
 
 #[test]
-fn mac_owner_liveness_error_stops_before_pid_surface_and_proof() {
+fn posix_owner_liveness_error_stops_before_pid_surface_and_proof() {
     let mut row = Row::new(AppleTerminal);
     row.observation_error = Some(("mac-live", 1));
     row.check_error_chain(
@@ -1441,7 +1443,7 @@ fn second_owner_read_is_fresh_and_its_answer_decides() {
         .with_presence(|| panic!("no surface observation after a refused owner"))
         .with_evidence(terminal::close_evidence(Ghostty))
         .with_pid_alive(|_| false)
-        .with_mac_owner_live(|_| test_owner_attestation(false))
+        .with_posix_owner_live(|_| test_owner_attestation(false))
         .with_attest(|| panic!("dead owner"))
         .with_group_gone(|_| panic!("no teardown intent"))
         .with_proof(|| panic!("dead owner"));
@@ -1505,7 +1507,7 @@ fn teardown_intent_is_read_first_and_decides_the_dead_owner_route() {
         let observation = TestObservation::on_records(directory.path(), ID, &handle, deadline)
             .with_presence(|| panic!("a teardown intent needs no surface observation"))
             .with_pid_alive(|_| false)
-            .with_mac_owner_live(|_| test_owner_attestation(false))
+            .with_posix_owner_live(|_| test_owner_attestation(false))
             .with_resumable(|| panic!("a teardown intent is never resumable"))
             .with_attest(|| panic!("dead owner"))
             .with_group_gone(|group| {

@@ -1793,6 +1793,8 @@ fn host_pane_and_binding_rule_need_no_terminal() {
         Err("WezTerm did not name the GUI of this host".into())
     );
     let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind,
         id: id.into(),
         tab_id: None,
@@ -2354,22 +2356,20 @@ fn live_owner_intent_reads_the_shell_once_and_stops_nothing() {
     use crate::native::session::test_support::{
         SESSION_OWNER_FILE, TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE,
     };
-    use crate::native::terminal::ownership::{MacTerminalShellIdentity, NativeProcessIdentity};
+    use crate::native::terminal::ownership::{NativeProcessIdentity, TerminalShellIdentity};
     let live = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1_790_000_000, 42),
         pid: 4242,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 1_790_000_000,
-        process_start_microseconds: 42,
     };
     let shell = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1, 0),
         pid: 4000,
         parent_pid: 3000,
         process_group: 4000,
-        process_start_seconds: 1,
-        process_start_microseconds: 0,
         ..live
     };
     for unexpired_reads in 0..=2 {
@@ -2380,7 +2380,8 @@ fn live_owner_intent_reads_the_shell_once_and_stops_nothing() {
             "ready",
             4242,
         );
-        owner.terminal_shell = Some(MacTerminalShellIdentity {
+        owner.terminal_shell = Some(TerminalShellIdentity {
+            linux_birth: None,
             pid: 4000,
             process_group: 4000,
             terminal_tty_device: 7,

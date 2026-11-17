@@ -62,6 +62,8 @@ pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &st
     write_json_atomic(
         &directory.join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind: if cfg!(windows) {
                 terminal::TerminalKind::WindowsConsole
             } else {
@@ -125,6 +127,8 @@ pub(in crate::native) fn assert_journal_settled(directory: &Path) {
 
 pub(in crate::native) fn close_test_terminal() -> terminal::TerminalSession {
     terminal::TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind: if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
         } else {

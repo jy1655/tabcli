@@ -9,12 +9,12 @@
 // The builders and the trace serve the macOS table; other targets use a subset.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use super::{CloseObservation, Production, TerminalCloseAuthority, decide};
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::owner::OwnerAttestation;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::{OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalSession;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::Result;
 use std::cell::RefCell;
@@ -71,28 +71,28 @@ impl<T: Show> Show for Result<T> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Show for crate::native::session::close::TerminalTeardownIntent {
     fn show(&self) -> String {
         format!("teardown(group {}, {:?})", self.process_group, self.reason)
     }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl Show for launch::Record {
     fn show(&self) -> String {
         format!("launch({:?})", self.phase)
     }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl Show for SessionStatus {
     fn show(&self) -> String {
         format!("status({})", self.state)
     }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl Show for NativeSessionOwner {
     fn show(&self) -> String {
         format!(
@@ -103,7 +103,7 @@ impl Show for NativeSessionOwner {
     }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl Show for OwnerObservation {
     fn show(&self) -> String {
         format!(
@@ -113,7 +113,7 @@ impl Show for OwnerObservation {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Show for crate::native::session::owner::OwnerAttestation {
     fn show(&self) -> String {
         format!("{:?}", self.process)
@@ -123,7 +123,7 @@ impl Show for crate::native::session::owner::OwnerAttestation {
 type Member<'a, F> = RefCell<Option<Box<F>>>;
 
 // What `from_values` answers for the Records.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) struct RecordValues {
     pub(in crate::native) owner: Option<NativeSessionOwner>,
     pub(in crate::native) state: SessionState,
@@ -148,37 +148,41 @@ impl Trace<'_> {
 pub(in crate::native) struct TestObservation<'a> {
     trace: Trace<'a>,
     production: Option<Production<'a>>,
-    #[cfg(target_os = "macos")]
+    created_host: Member<
+        'a,
+        dyn FnMut() -> Result<Option<crate::native::process_identity::ProcessObservation>> + 'a,
+    >,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     teardown_intent: Member<
         'a,
         dyn FnMut() -> Result<Option<crate::native::session::close::TerminalTeardownIntent>> + 'a,
     >,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     owner_present: Member<'a, dyn FnMut() -> Result<bool> + 'a>,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     launch: Member<'a, dyn FnMut() -> Result<Option<launch::Record>> + 'a>,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     status: Member<'a, dyn FnMut() -> Result<SessionStatus> + 'a>,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     owner: Member<'a, dyn FnMut() -> Result<NativeSessionOwner> + 'a>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     resumable: Member<'a, dyn FnMut() -> Result<bool> + 'a>,
     surface_present: Member<'a, dyn FnMut() -> Result<bool> + 'a>,
     ownership_proof: Member<'a, dyn FnMut() -> Result<()> + 'a>,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     owner_record: Member<'a, dyn FnMut(&NativeSessionOwner) -> OwnerAttestation + 'a>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pid_alive: Member<'a, dyn FnMut(u32) -> bool + 'a>,
-    #[cfg(target_os = "macos")]
-    mac_owner_live: Member<
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    posix_owner_live: Member<
         'a,
         dyn FnMut(&NativeSessionOwner) -> crate::native::session::owner::OwnerAttestation + 'a,
     >,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     attest_owner: Member<'a, dyn FnMut() -> Result<()> + 'a>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     group_gone: Member<'a, dyn FnMut(u32) -> Result<bool> + 'a>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     evidence: Option<&'a dyn crate::native::terminal::close_evidence::CloseEvidence>,
 }
 
@@ -187,31 +191,32 @@ impl<'a> TestObservation<'a> {
         Self {
             trace: Trace::Owned(RefCell::new(Vec::new())),
             production,
-            #[cfg(target_os = "macos")]
+            created_host: RefCell::new(None),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             teardown_intent: RefCell::new(None),
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             owner_present: RefCell::new(None),
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             launch: RefCell::new(None),
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             status: RefCell::new(None),
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             owner: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             resumable: RefCell::new(None),
             surface_present: RefCell::new(None),
             ownership_proof: RefCell::new(None),
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             owner_record: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             pid_alive: RefCell::new(None),
-            #[cfg(target_os = "macos")]
-            mac_owner_live: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            posix_owner_live: RefCell::new(None),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             attest_owner: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             group_gone: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             evidence: None,
         }
     }
@@ -234,7 +239,7 @@ impl<'a> TestObservation<'a> {
 
     /// In memory: the Records answer from values, no teardown intent exists, and
     /// resumability is false unless injected. Every observation must be injected.
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn from_values(values: RecordValues) -> Self {
         let RecordValues {
             owner,
@@ -260,13 +265,21 @@ impl<'a> TestObservation<'a> {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("the in-memory observation has no owner record"))
             });
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let observation = observation
             .with_teardown_intent(|| Ok(None))
             .with_resumable(|| Ok(false));
         observation
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(in crate::native) fn with_created_host(
+        self,
+        f: impl FnMut() -> Result<Option<crate::native::process_identity::ProcessObservation>> + 'a,
+    ) -> Self {
+        *self.created_host.borrow_mut() = Some(Box::new(f));
+        self
+    }
     fn production(&self, name: &str) -> &Production<'a> {
         self.production
             .as_ref()
@@ -316,7 +329,7 @@ impl<'a> TestObservation<'a> {
         decide(self, expected_session_id, session, deadline)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_teardown_intent(
         self,
         f: impl FnMut() -> Result<Option<crate::native::session::close::TerminalTeardownIntent>> + 'a,
@@ -325,7 +338,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn with_owner_present(
         self,
         f: impl FnMut() -> Result<bool> + 'a,
@@ -334,7 +347,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn with_launch(
         self,
         f: impl FnMut() -> Result<Option<launch::Record>> + 'a,
@@ -343,7 +356,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn with_status(
         self,
         f: impl FnMut() -> Result<SessionStatus> + 'a,
@@ -352,7 +365,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn with_owner(
         self,
         f: impl FnMut() -> Result<NativeSessionOwner> + 'a,
@@ -361,7 +374,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_resumable(self, f: impl FnMut() -> Result<bool> + 'a) -> Self {
         *self.resumable.borrow_mut() = Some(Box::new(f));
         self
@@ -377,7 +390,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn with_owner_record(
         self,
         f: impl FnMut(&NativeSessionOwner) -> OwnerAttestation + 'a,
@@ -386,28 +399,28 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_pid_alive(self, f: impl FnMut(u32) -> bool + 'a) -> Self {
         *self.pid_alive.borrow_mut() = Some(Box::new(f));
         self
     }
 
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) fn with_mac_owner_live(
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(in crate::native) fn with_posix_owner_live(
         self,
         f: impl FnMut(&NativeSessionOwner) -> crate::native::session::owner::OwnerAttestation + 'a,
     ) -> Self {
-        *self.mac_owner_live.borrow_mut() = Some(Box::new(f));
+        *self.posix_owner_live.borrow_mut() = Some(Box::new(f));
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_attest(self, f: impl FnMut() -> Result<()> + 'a) -> Self {
         *self.attest_owner.borrow_mut() = Some(Box::new(f));
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_group_gone(
         self,
         f: impl FnMut(u32) -> Result<bool> + 'a,
@@ -416,7 +429,7 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_evidence(
         mut self,
         evidence: &'a dyn crate::native::terminal::close_evidence::CloseEvidence,
@@ -427,7 +440,19 @@ impl<'a> TestObservation<'a> {
 }
 
 impl CloseObservation for TestObservation<'_> {
-    #[cfg(target_os = "macos")]
+    fn created_host_incarnation(
+        &self,
+    ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
+        match self.created_host.borrow_mut().as_mut() {
+            Some(f) => f(),
+            None => match &self.production {
+                Some(p) => p.created_host_incarnation(),
+                None => Ok(None),
+            },
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn teardown_intent(
         &self,
     ) -> Result<Option<crate::native::session::close::TerminalTeardownIntent>> {
@@ -440,7 +465,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner_present(&self) -> Result<bool> {
         let call = self.begin("owner-present");
         let result = match self.owner_present.borrow_mut().as_mut() {
@@ -451,7 +476,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn launch(&self) -> Result<Option<launch::Record>> {
         let call = self.begin("launch");
         let result = match self.launch.borrow_mut().as_mut() {
@@ -462,7 +487,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn status(&self) -> Result<SessionStatus> {
         let call = self.begin("status");
         let result = match self.status.borrow_mut().as_mut() {
@@ -473,7 +498,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner(&self) -> Result<NativeSessionOwner> {
         let call = self.begin("owner");
         let result = match self.owner.borrow_mut().as_mut() {
@@ -484,7 +509,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn resumable(&self) -> Result<bool> {
         let call = self.begin("resumable");
         let result = match self.resumable.borrow_mut().as_mut() {
@@ -515,7 +540,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
         let call = self.begin("owner-record");
         let result = match self.owner_record.borrow_mut().as_mut() {
@@ -526,7 +551,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool {
         let call = self.begin("pid-alive");
         let result = match self.pid_alive.borrow_mut().as_mut() {
@@ -537,21 +562,21 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(target_os = "macos")]
-    fn mac_owner_live(
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn posix_owner_live(
         &self,
         owner: &NativeSessionOwner,
     ) -> crate::native::session::owner::OwnerAttestation {
         let call = self.begin("mac-live");
-        let result = match self.mac_owner_live.borrow_mut().as_mut() {
+        let result = match self.posix_owner_live.borrow_mut().as_mut() {
             Some(f) => f(owner),
-            None => self.production("mac-live").mac_owner_live(owner),
+            None => self.production("mac-live").posix_owner_live(owner),
         };
         self.finish(call, &result);
         result
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn attest_owner(&self) -> Result<()> {
         let call = self.begin("attest");
         let result = match self.attest_owner.borrow_mut().as_mut() {
@@ -562,7 +587,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn group_gone(&self, group: u32) -> Result<bool> {
         let call = self.begin("group-gone");
         let result = match self.group_gone.borrow_mut().as_mut() {
@@ -573,7 +598,7 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn evidence(&self) -> &dyn crate::native::terminal::close_evidence::CloseEvidence {
         match self.evidence {
             Some(evidence) => evidence,

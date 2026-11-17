@@ -116,6 +116,10 @@ pub(super) fn send_native_queue_message<C: Clock>(
             )));
         }
     }
+    #[cfg(target_os = "linux")]
+    crate::native::provider_process::linux_exec_budget(&command).map_err(|error| {
+        queue_unavailable(error.context("the Codex queue command was refused before it ran"))
+    })?;
     write_pending_turn(context.directory, &pending).map_err(Outcome::NotSent)?;
     let result =
         match run_bounded_command_until(&mut command, context.deadline, "Codex queue", clock) {

@@ -846,6 +846,7 @@ mod tests {
             other("Warp", "warp"),
             host("WezTerm"),
             other("WindowsConsole", "windows-console"),
+            other("Tmux", "tmux"),
         ];
         assert_eq!(actual, expected);
     }

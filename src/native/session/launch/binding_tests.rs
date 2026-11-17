@@ -420,3 +420,16 @@ pub(in crate::native) fn characterize(
         println!("{name}: {case} characterized");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_binding_wait_uses_the_same_ordered_pending_launch_judgment() {
+    let facts = BindingFacts {
+        host: "WezTerm", // Diagnostics are injected; this test runs no application.
+        cancelled: "WezTerm launch was cancelled or timed out before surface binding",
+        budget: BindingBudget::RemainingReceiptCapped,
+    };
+    characterize("WezTerm", |directory, id, clock| {
+        wait_for_binding(&Reader::open_unchecked(directory), id, &facts, clock).map(|_| ())
+    });
+}

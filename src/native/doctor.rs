@@ -86,18 +86,81 @@ struct Diagnosis {
     checks: Vec<Check>,
 }
 
+// The tmux that every managed session on Linux starts its own server with. Its version is
+// read only with --probe, like a provider's.
+#[cfg(target_os = "linux")]
+fn tmux_check(probe: bool, deadline: Instant) -> Check {
+    use crate::native::terminal::linux::tmux::{
+        InstalledVersion, MINIMUM_VERSION, installed_version, resolve_tmux,
+    };
+    use Availability::*;
+    let install = format!(
+        "Install tmux {}.{} or later and check absolute PATH entries.",
+        MINIMUM_VERSION.0, MINIMUM_VERSION.1
+    );
+    let path = match resolve_tmux() {
+        Ok(path) => path,
+        Err(error) => {
+            return Check::new(
+                CheckId::TMUX,
+                Unavailable,
+                Reason::TMUX_UNAVAILABLE,
+                format!("{error:#}"),
+                install,
+            );
+        }
+    };
+    let attach = "Each managed session starts its own tmux server; ask and inspect print the command that attaches to it.";
+    if !probe {
+        return Check::new(
+            CheckId::TMUX,
+            Available,
+            Reason::TMUX_FOUND,
+            "tmux executable was resolved; its version was not read without --probe.",
+            attach,
+        )
+        .evidence(json!({"path": path}));
+    }
+    match installed_version(&path, deadline) {
+        Ok(InstalledVersion::Supported(version)) => Check::new(
+            CheckId::TMUX,
+            Available,
+            Reason::TMUX_FOUND,
+            format!("{version} was resolved."),
+            attach,
+        )
+        .evidence(json!({"path": path, "version": version})),
+        Ok(InstalledVersion::TooOld(version)) => Check::new(
+            CheckId::TMUX,
+            Unavailable,
+            Reason::TMUX_TOO_OLD,
+            format!("{version} is older than managed sessions require."),
+            install,
+        )
+        .evidence(json!({"path": path, "version": version})),
+        Err(error) => Check::new(
+            CheckId::TMUX,
+            Unavailable,
+            Reason::TMUX_UNAVAILABLE,
+            format!("{error:#}"),
+            install,
+        )
+        .evidence(json!({"path": path})),
+    }
+}
+
 // Keep record reads and probes interleaved in their original order. record_checks
 // releases its snapshot before any surface or provider probe uses the shared deadline.
 fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnosis> {
     use Availability::*;
     let mut checks = vec![Check::new(
         CheckId::PLATFORM,
-        if cfg!(any(target_os = "macos", windows)) {
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             Available
         } else {
             Unavailable
         },
-        if cfg!(any(target_os = "macos", windows)) {
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             Reason::PLATFORM_SUPPORTED
         } else {
             Reason::PLATFORM_UNSUPPORTED
@@ -176,6 +239,8 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                 "Install PowerShell 7 and check absolute PATH entries.",
             ),
         });
+        #[cfg(target_os = "linux")]
+        checks.push(tmux_check(request.probe, deadline));
     }
     let mut session_terminal = None;
     let manifest = directory.as_ref().and_then(|directory| {
@@ -1524,6 +1589,8 @@ mod launch_host_tests {
     fn surface(store: &Store, kind: TerminalKind) {
         store
             .write_terminal(&terminal::TerminalSession {
+                linux_host: None,
+                tmux_socket: None,
                 kind,
                 id: "1".into(),
                 tab_id: None,

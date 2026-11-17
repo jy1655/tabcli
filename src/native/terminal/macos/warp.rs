@@ -610,6 +610,8 @@ where
         .context("Warp instance process ended before its launch binding; unproven residual surface preserved")?;
 
     let mut session = TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind: TerminalKind::Warp,
         id: instance_id.clone(),
         tab_id: Some(tab_id),

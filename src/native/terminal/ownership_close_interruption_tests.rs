@@ -99,7 +99,7 @@ impl Processes {
                         })
                         .with_owner_record(|_| panic!("not a failed startup"))
                         .with_pid_alive(|_| self.owner_live.get())
-                        .with_mac_owner_live(|_| test_owner_attestation(self.owner_live.get()))
+                        .with_posix_owner_live(|_| test_owner_attestation(self.owner_live.get()))
                         .with_proof(|| bail!("surface proof failed"))
                         .with_attest(|| self.attest(store, live).map(|_| ()))
                         .with_group_gone(|group| {

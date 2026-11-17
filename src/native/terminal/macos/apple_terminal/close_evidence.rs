@@ -219,22 +219,20 @@ mod tests {
     use crate::native::tests::write_attested_apple_terminal_state;
 
     const LIVE: NativeProcessIdentity = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1_790_000_000, 42),
         pid: 4242,
         parent_pid: 4000,
         terminal_tty_device: 7,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 1_790_000_000,
-        process_start_microseconds: 42,
     };
     const SHELL: NativeProcessIdentity = NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(1, 0),
         pid: 4000,
         parent_pid: 3000,
         terminal_tty_device: 7,
         process_group: 4000,
         terminal_process_group: 4242,
-        process_start_seconds: 1,
-        process_start_microseconds: 0,
     };
 
     // A Terminal.app session whose owner record attests against `LIVE` and `SHELL`.

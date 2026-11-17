@@ -1,26 +1,28 @@
-mod bound_host;
+pub(super) use super::bound_host;
+#[cfg(test)]
+#[path = "bound_host.rs"]
+mod bound_host_app_tests;
 mod close_transaction;
 pub(in crate::native::terminal) mod launch_host;
-pub(in crate::native) mod ownership;
+pub(in crate::native) use super::posix_ownership as ownership;
 pub(in crate::native) mod process;
 pub(in crate::native) mod shell_environment;
 
-use std::{
-    env,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{env, time::Instant};
+#[cfg(test)]
+use std::{path::Path, time::Duration};
 
 use crate::native::failure_kind::Unsupported;
 use crate::native::settings::MacosOpenMode;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use super::{
     CloseOutcome, DialogKey, GuardedDialogInput, TerminalKind, TerminalSendFailure,
     TerminalSendResult, TerminalSession, macos_selection::select_macos_terminal,
 };
 
-const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
+pub(super) use super::posix::PosixTerminalAdapter as MacTerminalAdapter;
+pub(super) use super::posix::*;
 
 pub(in crate::native) mod apple_terminal;
 mod applescript;
@@ -47,89 +49,6 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
         env::var_os("ITERM_SESSION_ID").is_some(),
         env::var_os("TERM_SESSION_ID").is_some(),
     ))
-}
-
-pub(super) type BindSurface<'a> = Box<dyn FnOnce(&mut TerminalSession) -> Result<()> + 'a>;
-
-/// Which authority the owned close runs under: the attested owner is live, or only the
-/// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
-/// work for a live owner only.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::native) enum OwnedSurfaceClose {
-    LiveOwner,
-    SurfaceOnly,
-}
-
-pub(super) trait MacTerminalAdapter {
-    fn open_bound_tab(
-        &self,
-        mode: MacosOpenMode,
-        command: &str,
-        directory: &Path,
-        deadline: Instant,
-        bind: BindSurface<'_>,
-        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
-    ) -> Result<TerminalSession>;
-    fn send_file(
-        &self,
-        session: &TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> TerminalSendResult;
-    fn verify_surface(
-        &self,
-        directory: &Path,
-        session: &TerminalSession,
-        timeout: Option<Duration>,
-    ) -> Result<Option<String>>;
-    fn surface_present(
-        &self,
-        directory: &Path,
-        session: &TerminalSession,
-        timeout: Duration,
-    ) -> Result<bool>;
-    // A kind that declares a refusal for one of these in its registration is refused
-    // by the shared dispatch before its adapter is reached, so the defaults are an
-    // invariant failure and never an ordinary answer.
-    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
-        let _ = deadline;
-        bail!(
-            "{} declares managed screen reads unsupported; the shared dispatch must refuse before its adapter",
-            session.kind.display_name()
-        )
-    }
-    fn guarded_dialog_input(
-        &self,
-        session: &TerminalSession,
-        input: &GuardedDialogInput,
-        deadline: Instant,
-    ) -> Result<bool> {
-        let _ = (input, deadline);
-        bail!(
-            "{} declares managed dialog input unsupported; the shared dispatch must refuse before its adapter",
-            session.kind.display_name()
-        )
-    }
-    fn close_session_until(
-        &self,
-        directory: &Path,
-        session: &TerminalSession,
-        deadline: Instant,
-    ) -> Result<CloseOutcome>;
-    fn close_owned_session(
-        &self,
-        directory: &Path,
-        id: &str,
-        session: &TerminalSession,
-        close: OwnedSurfaceClose,
-        deadline: Instant,
-    ) -> Result<CloseOutcome>;
-}
-
-/// The adapter of a kind. Every shared operation resolves its adapter here and nowhere
-/// else; production passes `&INSTALLED`, a test a `Dispatch` over its own adapters.
-pub(super) trait Adapters {
-    fn adapter(&self, kind: TerminalKind) -> Result<&dyn MacTerminalAdapter>;
 }
 
 /// The five macOS adapters, each over the dependency its own constructor took.
@@ -174,6 +93,7 @@ where
             TerminalKind::WindowsConsole => bail!(Unsupported::new(
                 "Windows Console is only available on Windows"
             )),
+            TerminalKind::Tmux => bail!(Unsupported::new("tmux is only available on Linux")),
         }
     }
 }
@@ -210,153 +130,6 @@ pub(super) fn apple_terminal_dispatch(automation: automation_testing::Replay) ->
         UnusedAdapter("WezTerm"),
         UnusedAdapter("Warp"),
     )
-}
-
-pub(super) fn open_bound_tab<F, U>(
-    adapters: &dyn Adapters,
-    kind: TerminalKind,
-    command: &str,
-    directory: &Path,
-    deadline: Instant,
-    bind: F,
-    unbind: U,
-) -> Result<TerminalSession>
-where
-    F: FnOnce(&mut TerminalSession) -> Result<()>,
-    U: FnOnce() -> Result<()>,
-{
-    // Read once for creation. Close uses only the persisted target/ownership record,
-    // never a setting that the user may have changed since this launch.
-    let mode = crate::native::settings::macos_open_mode(
-        directory
-            .parent()
-            .context("session directory has no state root")?,
-    )?;
-    adapters.adapter(kind)?.open_bound_tab(
-        mode,
-        command,
-        directory,
-        deadline,
-        Box::new(bind),
-        Box::new(unbind),
-    )
-}
-
-pub(super) fn open_with(
-    deadline: Instant,
-    create: impl FnOnce(Instant) -> Result<TerminalSession>,
-    start: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
-    cleanup: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
-    bind: impl FnOnce(&mut TerminalSession) -> Result<()>,
-    unbind: impl FnOnce() -> Result<()>,
-) -> Result<TerminalSession> {
-    let startup_deadline = deadline
-        .checked_sub(STARTUP_CLEANUP_RESERVE)
-        .filter(|candidate| *candidate > Instant::now())
-        .context("terminal startup timeout leaves no room for exact surface cleanup")?;
-    let mut session = create(startup_deadline)?;
-    let start_session = session.clone();
-    let cleanup_session = session.clone();
-    super::bind_surface_before_start(
-        &mut session,
-        bind,
-        || start(&start_session, startup_deadline),
-        || cleanup(&cleanup_session, deadline),
-        unbind,
-    )?;
-    Ok(session)
-}
-
-pub(super) fn send_file(
-    adapters: &dyn Adapters,
-    session: &TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> TerminalSendResult {
-    adapters
-        .adapter(session.kind)
-        .map_err(TerminalSendFailure::not_sent)?
-        .send_file(session, prompt_path, deadline)
-}
-
-pub(super) fn verify_surface(
-    adapters: &dyn Adapters,
-    directory: &Path,
-    session: &TerminalSession,
-    timeout: Option<Duration>,
-) -> Result<Option<String>> {
-    adapters
-        .adapter(session.kind)?
-        .verify_surface(directory, session, timeout)
-}
-
-pub(super) fn surface_present(
-    adapters: &dyn Adapters,
-    directory: &Path,
-    session: &TerminalSession,
-    timeout: Duration,
-) -> Result<bool> {
-    adapters
-        .adapter(session.kind)?
-        .surface_present(directory, session, timeout)
-}
-
-// The declared refusals answer before any adapter is reached.
-pub(super) fn read_screen(
-    adapters: &dyn Adapters,
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<String> {
-    if let Some(refusal) = session.kind.registration().screen_read_refusal {
-        return Err(anyhow::anyhow!(refusal));
-    }
-    adapters
-        .adapter(session.kind)?
-        .read_screen(session, deadline)
-}
-
-pub(super) fn guarded_dialog_input(
-    adapters: &dyn Adapters,
-    session: &TerminalSession,
-    input: &GuardedDialogInput,
-    deadline: Instant,
-) -> Result<bool> {
-    if let Some(refusal) = session.kind.registration().guarded_input_refusal {
-        return Err(anyhow::anyhow!(refusal));
-    }
-    adapters
-        .adapter(session.kind)?
-        .guarded_dialog_input(session, input, deadline)
-}
-
-pub(super) fn close_session_until(
-    adapters: &dyn Adapters,
-    directory: &Path,
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<CloseOutcome> {
-    adapters
-        .adapter(session.kind)?
-        .close_session_until(directory, session, deadline)
-}
-
-pub(super) fn close_owned_session(
-    adapters: &dyn Adapters,
-    directory: &Path,
-    id: &str,
-    session: &TerminalSession,
-    close: OwnedSurfaceClose,
-    deadline: Instant,
-) -> Result<CloseOutcome> {
-    adapters
-        .adapter(session.kind)?
-        .close_owned_session(directory, id, session, close, deadline)
-}
-
-pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
-    Instant::now()
-        .checked_add(timeout)
-        .context("terminal automation timeout is too large")
 }
 
 // Whether the screen of the login session is locked, read from IOKit's console-user
@@ -596,6 +369,8 @@ mod adapter_tests {
 
     fn handle(kind: TerminalKind) -> TerminalSession {
         TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind,
             id: "surface".into(),
             tab_id: None,
@@ -902,120 +677,5 @@ mod adapter_tests {
             );
         }
         apple_terminal.assert_finished();
-    }
-
-    #[test]
-    fn open_with_preserves_prebind_handles_deadlines_and_failure_order() {
-        use std::cell::RefCell;
-        for (failure, cleanup_fails, unbind_fails, expected) in [
-            ("none", false, false, vec!["create", "bind", "start"]),
-            ("create", false, false, vec!["create"]),
-            (
-                "bind",
-                false,
-                false,
-                vec!["create", "bind", "cleanup", "unbind"],
-            ),
-            (
-                "start",
-                false,
-                false,
-                vec!["create", "bind", "start", "cleanup", "unbind"],
-            ),
-            ("bind", true, false, vec!["create", "bind", "cleanup"]),
-            (
-                "start",
-                true,
-                false,
-                vec!["create", "bind", "start", "cleanup"],
-            ),
-            (
-                "bind",
-                false,
-                true,
-                vec!["create", "bind", "cleanup", "unbind"],
-            ),
-            (
-                "start",
-                false,
-                true,
-                vec!["create", "bind", "start", "cleanup", "unbind"],
-            ),
-        ] {
-            let trace = RefCell::new(Vec::new());
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let startup = deadline - Duration::from_secs(2);
-            let result = open_with(
-                deadline,
-                |received| {
-                    trace.borrow_mut().push("create");
-                    assert_eq!(received, startup);
-                    if failure == "create" {
-                        bail!("create failed");
-                    }
-                    Ok(handle(TerminalKind::Iterm2))
-                },
-                |session, received| {
-                    trace.borrow_mut().push("start");
-                    assert_eq!(received, startup);
-                    assert!(session.managed_session_id.is_none());
-                    if failure == "start" {
-                        bail!("start failed");
-                    }
-                    Ok(())
-                },
-                |session, received| {
-                    trace.borrow_mut().push("cleanup");
-                    assert_eq!(received, deadline);
-                    assert!(session.managed_session_id.is_none());
-                    if cleanup_fails {
-                        bail!("cleanup failed");
-                    }
-                    Ok(())
-                },
-                |session| {
-                    trace.borrow_mut().push("bind");
-                    session.managed_session_id = Some("bound".into());
-                    if failure == "bind" {
-                        bail!("bind failed");
-                    }
-                    Ok(())
-                },
-                || {
-                    trace.borrow_mut().push("unbind");
-                    if unbind_fails {
-                        bail!("unbind failed");
-                    }
-                    Ok(())
-                },
-            );
-            assert_eq!(*trace.borrow(), expected);
-            if failure == "none" {
-                assert_eq!(result.unwrap().managed_session_id.as_deref(), Some("bound"));
-            } else {
-                let error = result.unwrap_err().to_string();
-                let mut expected = format!("{failure} failed");
-                if cleanup_fails {
-                    expected.push_str("; exact surface cleanup also failed: cleanup failed");
-                }
-                if unbind_fails {
-                    expected.push_str("; exact surface cleanup succeeded but its durable binding could not be removed: unbind failed");
-                }
-                assert_eq!(error, expected);
-            }
-        }
-        let error = open_with(
-            Instant::now(),
-            |_| panic!("no creation without reserve"),
-            |_, _| panic!(),
-            |_, _| panic!(),
-            |_| panic!(),
-            || panic!(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "terminal startup timeout leaves no room for exact surface cleanup"
-        );
     }
 }

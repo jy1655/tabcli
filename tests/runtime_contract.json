@@ -397,7 +397,7 @@
     "HOST_COMMAND,": 1,
     "const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;": 1
   },
-  "src/native/terminal/macos/ownership.rs": {
+  "src/native/terminal/posix_ownership.rs": {
     "native-session": 1
   },
   "src/native/terminal/macos/process.rs": {

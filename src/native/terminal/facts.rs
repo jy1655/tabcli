@@ -5,11 +5,11 @@
 use super::TerminalKind;
 #[cfg(target_os = "macos")]
 use super::TerminalSession;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::launch::BindingFacts;
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) struct SurfaceFacts {
     pub(in crate::native) outlives_owner: bool,
     pub(in crate::native) failed_start_identity: bool,
@@ -19,11 +19,13 @@ pub(in crate::native) struct SurfaceFacts {
 
 /// The close evidence a kind selects; resolved to an implementation only on macOS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) enum CloseEvidenceChoice {
     PresenceOnly,
     PresenceOnlyWithOwnerlessContext,
     AppleTerminal,
+    /// Whole host created exclusively by Bridge and recorded by incarnation.
+    BridgeCreatedHost,
 }
 
 /// A kind whose launch runs the terminal-less launch host (`terminal/macos/launch_host.rs`)
@@ -40,7 +42,7 @@ pub(in crate::native) struct LaunchHostFacts {
 /// One kind's registration. A refusal of `None` means the kind supports the
 /// operation; `Some` is the exact message the shared macOS dispatch answers with
 /// before any adapter is reached.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) struct Registration {
     pub(in crate::native) facts: SurfaceFacts,
     pub(in crate::native) host_command: &'static str,
@@ -49,14 +51,14 @@ pub(in crate::native) struct Registration {
     pub(in crate::native) close_evidence: CloseEvidenceChoice,
     pub(in crate::native) screen_read_refusal: Option<&'static str>,
     pub(in crate::native) guarded_input_refusal: Option<&'static str>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) binding: Option<BindingFacts>,
 }
 
 impl Registration {
     /// The binding facts of a kind whose launch host waits for a surface binding.
     /// Evaluated at compile time by the adapters that have one.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) const fn binding(&'static self) -> &'static BindingFacts {
         match &self.binding {
             Some(binding) => binding,
@@ -75,6 +77,7 @@ impl TerminalKind {
             Self::Warp => &warp::REGISTRATION,
             Self::WezTerm => &wezterm::REGISTRATION,
             Self::WindowsConsole => &windows::REGISTRATION,
+            Self::Tmux => &tmux::REGISTRATION,
         }
     }
 
@@ -90,6 +93,8 @@ pub(super) mod apple_terminal;
 pub(super) mod ghostty;
 #[path = "macos/iterm2/facts.rs"]
 pub(super) mod iterm2;
+#[path = "linux/tmux/facts.rs"]
+pub(super) mod tmux;
 #[path = "macos/warp/facts.rs"]
 pub(super) mod warp;
 #[path = "macos/wezterm/facts.rs"]
@@ -107,13 +112,14 @@ pub(in crate::native) enum PasteEnvelope {
 mod tests {
     use super::*;
 
-    const KINDS: [TerminalKind; 6] = [
+    const KINDS: [TerminalKind; 7] = [
         TerminalKind::Iterm2,
         TerminalKind::AppleTerminal,
         TerminalKind::Ghostty,
         TerminalKind::Warp,
         TerminalKind::WezTerm,
         TerminalKind::WindowsConsole,
+        TerminalKind::Tmux,
     ];
 
     // A kind that guards dialog input declares no refusal; a kind that refuses screen
@@ -159,6 +165,11 @@ mod tests {
                     assert_eq!(parsed, kind);
                     assert!(kind.uses_launch_host(), "{kind:?}");
                     launch_hosts.push(kind);
+                }
+                // tmux runs its own pane host, which takes the same flag.
+                Ok(HostCommand::Tmux { .. }) => {
+                    assert_eq!(kind, TerminalKind::Tmux);
+                    assert!(!kind.uses_launch_host());
                 }
                 Ok(other) => panic!("{kind:?}: {other:?}"),
                 Err(_) => assert!(!kind.uses_launch_host(), "{kind:?}"),

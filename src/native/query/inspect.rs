@@ -23,6 +23,9 @@ pub(super) fn inspect_inner(id: &str, json: bool) -> Result<()> {
             value["owner_process_alive"], value["recovery_required"]
         );
         println!("held: {}", value["held"]);
+        if let Some(attach) = value["attach_command"].as_str() {
+            println!("attach: {}", terminal_safe_text(attach, false));
+        }
         if let Some(error) = value["hold_error"].as_str() {
             println!("hold error: {}", terminal_safe_text(error, true));
         }
@@ -134,6 +137,14 @@ pub(super) fn value(
     }
     if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = serde_json::to_value(residual)?;
+    }
+    // A tmux session has no window of its own: this is how the user watches or types in it.
+    #[cfg(target_os = "linux")]
+    if let super::observation::SurfaceRecord::Active(Ok(Some(handle))) =
+        &observation.evidence.surface
+        && let Some(attach) = crate::native::terminal::linux::tmux::attach_command(handle)
+    {
+        value["attach_command"] = json!(attach);
     }
     origin.add_fields(&mut value);
     Ok(value)

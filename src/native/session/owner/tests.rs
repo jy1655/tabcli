@@ -8,13 +8,12 @@ fn fixture() -> (
     crate::native::terminal::ownership::NativeProcessIdentity,
 ) {
     let live = crate::native::terminal::ownership::NativeProcessIdentity {
+        birth: crate::native::terminal::ownership::ProcessBirth::Macos(10, 20),
         pid: 4242,
         parent_pid: 42,
         terminal_tty_device: 9,
         process_group: 4242,
         terminal_process_group: 4242,
-        process_start_seconds: 10,
-        process_start_microseconds: 20,
     };
     (
         NativeSessionOwner {
@@ -118,6 +117,32 @@ fn r1_c6_reused_projects_mismatch_without_inspection_error() {
         serde_json::to_value(OwnerObservation::from(&a)).unwrap(),
         serde_json::json!({"process_alive":true,"identity_matches":false,"error":null})
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_refuses_a_linux_owner_birth_as_pid_only_evidence() {
+    let owner: NativeSessionOwner = serde_json::from_value(serde_json::json!({
+        "pid": 4242,
+        "linux_birth": {
+            "boot_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "starttime_ticks": 7
+        }
+    }))
+    .unwrap();
+    for alive in [false, true] {
+        let a = attest_owner_with(
+            &owner,
+            OwnerObservers {
+                pid_alive: &|_| alive,
+                identity: &|_| panic!("a foreign birth must not be compared"),
+            },
+        );
+        assert_eq!(
+            a.process,
+            ProcessObservation::Unknown("foreign Linux owner birth on Windows".into())
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -462,7 +487,8 @@ fn full_incarnation_control_match_and_failed_control_preserve_process_evidence()
 #[test]
 fn independent_review_control_snapshot_must_belong_to_attested_incarnation() {
     let (owner, mut next_incarnation) = fixture();
-    next_incarnation.process_start_seconds += 1;
+    let (s, us) = next_incarnation.birth.macos().unwrap();
+    next_incarnation.birth = crate::native::terminal::ownership::ProcessBirth::Macos(s + 1, us);
     // PID and recorded control fields are unchanged, but the second OS snapshot
     // now positively identifies a different incarnation.
     assert!(
@@ -495,7 +521,8 @@ fn independent_review_control_snapshot_must_belong_to_attested_incarnation() {
 fn independent_review_control_birth_reuse_must_end_running_wait() {
     let root = tempfile::tempdir().unwrap();
     let (owner, mut next_incarnation) = fixture();
-    next_incarnation.process_start_seconds += 1;
+    let (s, us) = next_incarnation.birth.macos().unwrap();
+    next_incarnation.birth = crate::native::terminal::ownership::ProcessBirth::Macos(s + 1, us);
     next_incarnation.process_group += 1;
     crate::native::session::Store::open_unchecked(root.path())
         .write_owner(&owner)

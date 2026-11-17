@@ -4,7 +4,7 @@ use crate::native::session::close as session_close;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::session::launch;
 use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::native::session::test_support::TERMINAL_CLOSING_FILE;
 use crate::native::session::test_support::{
     CLOSED_STATUS_FILE, SESSION_OWNER_FILE, TERMINAL_HANDLE_FILE, TERMINAL_TOMBSTONE_FILE,
@@ -100,6 +100,8 @@ fn already_closed_session_never_reuses_a_stale_terminal_handle() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "stale-iterm-session".to_owned(),
             tab_id: None,
@@ -141,6 +143,8 @@ fn explicit_close_routes_using_the_recorded_terminal_kind() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Ghostty,
             id: "ghostty-terminal".to_owned(),
             tab_id: Some("ghostty-tab".to_owned()),
@@ -175,6 +179,8 @@ fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "closing-iterm-session".to_owned(),
             tab_id: None,
@@ -216,7 +222,7 @@ fn internal_session_ids_cannot_escape_the_state_root() {
     assert!(!valid_session_id("session/child"));
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn assert_dead_terminal_owner_close_converges(state: &str) {
     let directory = tempfile::tempdir().unwrap();
     write_owned_terminal_state(directory.path(), state, reaped_child_pid());
@@ -255,13 +261,13 @@ fn assert_dead_terminal_owner_close_converges(state: &str) {
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn exited_dead_native_owner_consumes_terminal_without_adapter_calls() {
     assert_dead_terminal_owner_close_converges("exited");
 }
 
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn failed_dead_native_owner_consumes_terminal_without_adapter_calls() {
     assert_dead_terminal_owner_close_converges("failed");
 }
@@ -363,6 +369,8 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
 #[test]
 fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     let session = terminal::TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind: if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
         } else {
@@ -623,6 +631,8 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
     let authority = |kind, managed_session_id: &str| {
         let deadline = crate::native::session::close::budget::close_deadline();
         let surface = terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind,
             id: "missing-owned-surface".to_owned(),
             managed_session_id: Some(managed_session_id.to_owned()),

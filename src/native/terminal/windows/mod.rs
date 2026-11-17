@@ -172,6 +172,8 @@ where
         }
     };
     let mut session = TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind,
         id: surface.pid().to_string(),
         tab_id: None,

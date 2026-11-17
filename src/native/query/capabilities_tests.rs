@@ -264,6 +264,8 @@ fn write_handle(directory: &Path, kind: terminal::TerminalKind, session: Option<
     crate::native::session::primitives::write_json_atomic(
         &directory.join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind,
             id: "4242".to_owned(),
             tab_id: None,
@@ -552,7 +554,7 @@ fn a_ready_session_passes_every_record_gate_through_the_production_judgments() {
     // PID-only owner record lacks, so the owner gate is unknown there.
     assert_eq!(
         observe_all(&fixture.directory)["tell"],
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             json!({"state": "unknown", "reason": "owner_control_unverified"})
         } else {
             admissible(&[
@@ -687,8 +689,8 @@ fn a_live_owner_whose_control_identity_is_unverified_is_not_admissible() {
             past_owner.clone()
         }
     };
-    let macos = cfg!(target_os = "macos");
-    let probing = cfg!(any(target_os = "macos", windows));
+    let macos = cfg!(any(target_os = "macos", target_os = "linux"));
+    let probing = cfg!(any(target_os = "macos", target_os = "linux", windows));
     let rows = [
         (
             ProcessObservation::Live(Attested::Incarnation),

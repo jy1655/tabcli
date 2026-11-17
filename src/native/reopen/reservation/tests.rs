@@ -167,6 +167,8 @@ fn write_reopen_test_manifest(
 
 fn reopen_test_terminal(id: &str) -> terminal::TerminalSession {
     terminal::TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind: terminal::TerminalKind::Iterm2,
         id: format!("{id}-terminal"),
         tab_id: None,

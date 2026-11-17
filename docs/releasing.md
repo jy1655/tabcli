@@ -29,7 +29,9 @@ cannot read the setting either.
    The rehearsal builds the existing tag's source; it does not replace verification of the
    new candidate binary. Its separate `integration-rehearsal` job also validates and builds
    the candidate branch's integration packages, without uploading them into the old tag's
-   asset set. Tags predating integrations retain four assets. The workflow reads the Cargo
+   asset set. Tags predating integrations retain four assets. A rehearsal of a tag from before
+   the Linux archive still builds and verifies a Linux archive from that tag's source; the tag's
+   own integration verifier runs before that archive joins the asset set. The workflow reads the Cargo
    package name from the validated commit
    and allows only `tabcli` or `agent-bridge`. For tags before 0.2.0, it puts only the executable
    and `LICENSE` in an `agent-bridge-<version>-<target>` archive and checks
@@ -65,6 +67,8 @@ gh run download "$release_run" -R "$release_repo" \
 gh run download "$release_run" -R "$release_repo" \
   -n release-candidate-x86_64-pc-windows-msvc -D "$release_dir/windows"
 gh run download "$release_run" -R "$release_repo" \
+  -n release-candidate-x86_64-unknown-linux-gnu -D "$release_dir/linux"
+gh run download "$release_run" -R "$release_repo" \
   -n release-candidate-integrations -D "$release_dir/integrations"
 ```
 
@@ -75,16 +79,18 @@ commit as both binaries. From that exact source checkout run
 four `agent-bridge-<host>-<version>.zip` files (`claude`, `codex`, `agy`, `pi`) and their
 four checksums, including every bundled file against source. Do not substitute locally
 regenerated files for the recorded CI artifact. These are platform-independent instruction
-packages and contain no `tabcli` binary. The twelve-asset set is the two CLI archives and
-their two checksums plus these eight files; older source commits have only the four CLI files.
+packages and contain no `tabcli` binary. The fourteen-asset set is the three CLI archives and
+their three checksums plus these eight files. Source commits from before the Linux archive
+(0.4.42 and earlier) have twelve, without the Linux pair; older ones have only the four CLI files.
 
 The immutable query must return `true`. Artifacts must not be expired. Each must contain only
-its archive and the corresponding `.sha256`. Verify checksums in both directories with
+its archive and the corresponding `.sha256`. Verify checksums in every directory with
 `shasum -a 256 -c <archive>.sha256` (or `Get-FileHash -Algorithm SHA256` on Windows).
 From 0.2.0 onward, archive names are `tabcli-<version>-aarch64-apple-darwin.tar.gz` and
-`tabcli-<version>-x86_64-pc-windows-msvc.zip`.
+`tabcli-<version>-x86_64-pc-windows-msvc.zip`; from 0.4.43 also
+`tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz`, built on Ubuntu 24.04.
 Check the contents with `tar -tzf <archive>` and `unzip -Z1 <archive>`.
-The tar contents must be exactly `tabcli`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`; the zip
+The contents of each tar (macOS and Linux) must be exactly `tabcli`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`; the zip
 contents must be exactly `tabcli.exe`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`.
 Check archive paths and file types before extracting into a new directory.
 Compare LICENSE and THIRD_PARTY_NOTICES.md with the commit. Each platform's binary
@@ -104,7 +110,8 @@ Authenticated runtime results are separate; state explicitly if they were omitte
    the commit. Do not rely only on a local tag ref or the Release's `target_commitish`.
 3. Recheck that the immutable setting is still `enabled=true` and the remote tag object is
    unchanged. Read the version and release notes from the validated commit. Upload exactly
-   twelve files (four for source commits predating integrations) to a new draft. If a draft
+   fourteen files (twelve for source commits predating the Linux archive, four for those
+   predating integrations) to a new draft. If a draft
    exists, first check its creator, commit, and files;
    do not overwrite it automatically.
 
@@ -116,16 +123,18 @@ gh release create "$release_tag" -R "$release_repo" --verify-tag --draft \
   "$release_dir/macos/tabcli-<version>-aarch64-apple-darwin.tar.gz" \
   "$release_dir/macos/tabcli-<version>-aarch64-apple-darwin.tar.gz.sha256" \
   "$release_dir/windows/tabcli-<version>-x86_64-pc-windows-msvc.zip" \
-  "$release_dir/windows/tabcli-<version>-x86_64-pc-windows-msvc.zip.sha256"
+  "$release_dir/windows/tabcli-<version>-x86_64-pc-windows-msvc.zip.sha256" \
+  "$release_dir/linux/tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz" \
+  "$release_dir/linux/tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256"
 ```
 
 For a source commit with integrations, include the eight previously verified files from
 `"$release_dir"/integrations/*` in that same `gh release create` command. The command above
-shows the historical four-asset CLI set. Never publish an integration-capable source with
-only that subset.
+shows the six CLI files; a source commit from before the Linux archive has only the macOS and
+Windows pairs. Never publish an integration-capable source with only the CLI subset.
 
-The draft's REST API asset list must match the complete twelve-file set (or historical
-four-file set) exactly by name. Compare each
+The draft's REST API asset list must match the complete fourteen-file set (or the historical
+twelve- or four-file set) exactly by name. Compare each
 `digest=sha256:<local-hash>` and `size` with the local file. Download every draft asset into
 **a new directory** and also check that its bytes match the original CI artifact.
 You can use `gh release download "$release_tag" -R "$release_repo" -D <draft-readback-dir>`.
@@ -147,10 +156,12 @@ gh release verify-asset "$release_tag" <downloaded-macos-archive> -R "$release_r
 gh release verify-asset "$release_tag" <downloaded-macos-checksum> -R "$release_repo"
 gh release verify-asset "$release_tag" <downloaded-windows-archive> -R "$release_repo"
 gh release verify-asset "$release_tag" <downloaded-windows-checksum> -R "$release_repo"
+gh release verify-asset "$release_tag" <downloaded-linux-archive> -R "$release_repo"
+gh release verify-asset "$release_tag" <downloaded-linux-checksum> -R "$release_repo"
 ```
 
 Also run `gh release verify-asset` on each of the eight downloaded integration files when
-present, and rerun the integration verifier on their readback directory. Record all twelve
+present, and rerun the integration verifier on their readback directory. Record all fourteen
 digests. Installing/updating a host integration is a separate operation from publishing these
 assets; it must not update the engine, change consent, or remove a binary used by an open session.
 

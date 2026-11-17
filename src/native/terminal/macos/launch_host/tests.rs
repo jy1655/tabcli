@@ -95,6 +95,8 @@ fn wait_file(path: &Path, timeout: Duration) -> bool {
 fn bind(store: &Store, kind: TerminalKind) {
     store
         .write_terminal(&TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind,
             id: "owned-id".into(),
             tab_id: None,
@@ -1169,6 +1171,8 @@ fn surface_identity_probe() {
         return;
     };
     let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind,
         id: id.into(),
         tab_id: None,

@@ -215,8 +215,19 @@ fn emit_session_result(
     for (key, field) in questions.iter().chain(extra) {
         value[key.as_str()] = field.clone();
     }
+    // A tmux session has no window of its own: this is how the user watches or types in it.
+    #[cfg(target_os = "linux")]
+    let attach = terminal::linux::tmux::attach_command(terminal_session);
+    #[cfg(not(target_os = "linux"))]
+    let attach: Option<String> = None;
+    if let Some(attach) = &attach {
+        value["attach_command"] = serde_json::json!(attach);
+    }
     envelope::emit(json, &value, || {
         println!("session: {id}\nrequest: {request_id}");
+        if let Some(attach) = &attach {
+            println!("attach: {}", terminal_safe_text(attach, false));
+        }
         for (key, field) in extra {
             if let Some(field) = field.as_str() {
                 println!("{}: {}", key, terminal_safe_text(field, false));

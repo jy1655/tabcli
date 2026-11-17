@@ -23,6 +23,8 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     guarded_input_refusal: Some(
         "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane",
     ),
+    #[cfg(target_os = "linux")]
+    binding: None,
     #[cfg(target_os = "macos")]
     binding: Some(BindingFacts {
         host: "WezTerm",

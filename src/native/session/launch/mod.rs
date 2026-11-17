@@ -23,7 +23,7 @@ use std::{
 #[cfg(test)]
 // macOS and Windows tests address the launch record by this name; production code uses
 // the store.
-#[cfg(all(test, any(target_os = "macos", windows)))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) use super::names::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
 pub(in crate::native) mod host;
@@ -38,7 +38,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod admission_tests;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(in crate::native) mod binding_tests;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
@@ -116,7 +116,7 @@ impl Record {
 /// conversion counts as `u64::MAX` milliseconds, and an instant the monotonic clock cannot
 /// represent is the furthest one short of it that it can. The macOS launch host and binding
 /// wait use it.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(in crate::native) fn saturating_deadline(now: Instant, remaining: Option<Duration>) -> Instant {
     let remaining = remaining.unwrap_or(Duration::from_millis(u64::MAX));
     if let Some(deadline) = now.checked_add(remaining) {
@@ -145,15 +145,17 @@ pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
 }
 
 /// Adapters declare binding diagnostics and budget; the shared wait owns observation order.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) struct BindingFacts {
     pub(in crate::native) host: &'static str,
     pub(in crate::native) cancelled: &'static str,
     pub(in crate::native) budget: BindingBudget,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) enum BindingBudget {
+    // Only macOS kinds measure their binding from the start timeout.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     StartTimeout,
     RemainingReceiptCapped,
 }
@@ -161,7 +163,7 @@ pub(in crate::native) enum BindingBudget {
 /// Observe a pending launch until its managed surface is bound. This is an ordered,
 /// unlocked observation, not authorization to spawn; `spawn` owns that final fence. The
 /// budget and every retry read `clock`; the host passes the system clock.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn wait_for_binding(
     reader: &Reader,
     session_id: &str,
@@ -921,6 +923,10 @@ where
     F: FnOnce(&mut Child) -> Result<()>,
 {
     let directory = store.directory();
+    // An exec Linux would refuse is refused here, before the launch phase moves.
+    #[cfg(target_os = "linux")]
+    crate::native::provider_process::linux_exec_budget(command)
+        .context("provider launch was refused before spawn")?;
     let _lock = Store::open_unchecked(directory).lock()?;
     let mut record = read(store)?;
     check_spawn_locked(store, record.as_ref())?;
@@ -1087,7 +1093,7 @@ pub(in crate::native) fn diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::native::session;
     use crate::native::session::names::*;
     use std::{fs, process::Stdio};
@@ -1574,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn retained_handoff_marks_stored_and_returned_diagnostics_once() {
         for case in ["normal", "lost", "closed", "write", "read"] {
             let (directory, _) = fixture();
@@ -1667,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn retained_surface_record_failure_is_durable() {
         let (directory, _) = fixture();
         let store = Store::open_unchecked(directory.path());
@@ -1700,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn unbound_residual_survives_changed_diagnostics_and_repeated_close() {
         for closed_first in [false, true] {
             let (directory, _) = fixture();
@@ -1896,6 +1902,8 @@ mod host_decision_tests {
     }
     fn surface() -> terminal::TerminalSession {
         terminal::TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "unused".into(),
             tab_id: None,

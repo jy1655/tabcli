@@ -1595,11 +1595,7 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     assert_eq!(row["evidence"], evidence);
 
     // The store lists the workspace, but this session's log does not show the load.
-    fs::write(
-        &store,
-        json!({"trustedWorkspaces": [workspace]}).to_string(),
-    )
-    .unwrap();
+    write(&store, &json!({"trustedWorkspaces": [workspace]}));
     let row = doctor(&with_home);
     assert_eq!(row["availability"], "unknown");
     assert_eq!(row["reason_code"], "agy_session_trust_unverified");
@@ -1629,7 +1625,7 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     assert_eq!(row["evidence"], evidence);
 
     // A store that is not Agy's shape is reported as unreadable, with the same evidence.
-    fs::write(&store, "{\"trustedWorkspaces\":true}").unwrap();
+    write(&store, &json!({"trustedWorkspaces":true}));
     let row = doctor(&with_home);
     assert_eq!(row["availability"], "unknown");
     assert_eq!(row["reason_code"], "agy_trust_evidence_unreadable");

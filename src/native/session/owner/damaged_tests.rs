@@ -132,7 +132,7 @@ fn launch_repair_owner_read_answers_for_each_damaged_shape() {
 }
 
 // The macOS running wait attests the recorded owner on every poll; an attested death ends it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn running_wait_owner_read_answers_for_each_damaged_shape() {
     for &damaged in DAMAGED {
@@ -157,7 +157,7 @@ fn running_wait_owner_read_answers_for_each_damaged_shape() {
 
 // The required owner read of the macOS close paths (teardown intent, close authority and the
 // Terminal.app close).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn required_owner_read_answers_for_each_damaged_shape_and_a_missing_record() {
     let root = tempfile::tempdir().unwrap();
@@ -184,10 +184,10 @@ fn required_owner_read_answers_for_each_damaged_shape_and_a_missing_record() {
 
 // The macOS surface-ownership probe `tell` runs: it reads the owner, then verifies its
 // binding and control identity against the live process.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn surface_ownership_probe_owner_read_answers_for_each_damaged_shape() {
-    use crate::native::terminal::macos::ownership::verified_macos_terminal_owner;
+    use crate::native::terminal::posix_ownership::verified_posix_terminal_owner;
     let session: crate::native::terminal::TerminalSession = serde_json::from_value(
         serde_json::json!({"terminal": "apple-terminal", "session_id": "/dev/ttys999",
             "window_id": "1001", "managed_session_id": "session-a"}),
@@ -202,7 +202,7 @@ fn surface_ownership_probe_owner_read_answers_for_each_damaged_shape() {
             damaged,
         );
         let observed = outcome(
-            verified_macos_terminal_owner(root.path(), "session-a", &session, None)
+            verified_posix_terminal_owner(root.path(), "session-a", &session, None)
                 .map(|(owner, _)| owner.pid),
         );
         assert_eq!(
@@ -248,7 +248,7 @@ fn the_observation_reads_under_one_policy_and_judges_the_binding() {
             .unwrap();
         assert_eq!(observed(&observe(&reader)), expected, "{binding:?}");
         assert!(!absent(&reader));
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         assert_eq!(required(&reader).unwrap().owner.pid, 4242);
     }
     // A record padded to exactly the bound is read.
@@ -307,9 +307,9 @@ fn a_recorded_owner_is_attested_on_request_whatever_session_it_names() {
                     calls.set(calls.get() + 1);
                     false
                 },
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 birth: &|_| panic!("no birth is recorded"),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 control: &|_| panic!("no control identity is recorded"),
                 #[cfg(windows)]
                 identity: &|_| panic!("no process identity is recorded"),

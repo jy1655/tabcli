@@ -130,7 +130,7 @@ fn common_error_precedence_matrix() {
         error(
             command,
             &["--terminal", "iterm2", "--terminal", "bad"],
-            "unsupported terminal \"bad\"; expected ghostty, iterm2, terminal, warp, wezterm, or windows-console",
+            "unsupported terminal \"bad\"; expected ghostty, iterm2, terminal, tmux, warp, wezterm, or windows-console",
         );
         for options in [
             vec!["--timeout-secs", "0"],

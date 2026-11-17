@@ -166,7 +166,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   order, the adapter's own arguments, the Initial prompt's place), the environment removals, the
   initial-prompt disposition the wrapper applies after the spawn, and an unstarted completion
   watcher the wrapper starts and stops; `provider/mod.rs` holds only provider-neutral contracts.
-  Claude's cross-session messenger (the initial and follow-up Transport on both platforms, and
+  Claude's cross-session messenger (the initial and follow-up Transport on all supported platforms, and
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   messenger keeps its per-request protocol, executed-input proof and retry evidence. Claude's
@@ -175,7 +175,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Git scope check live in `claude/trust.rs`; the adapter keeps launch, resume, the hook router,
   Reopen and doctor.
   Claude's native completion adapter owns the immutable exact-frame binding, the unmarked
-  bound-answer candidate and the selected marked continuation. New macOS and Windows launches
+  bound-answer candidate and the selected marked continuation. New macOS, Linux, and Windows launches
   select native completion from the recorded stable version, load the session-local module,
   and await its actual readiness before messaging. No initial prompt travels in argv.
   The two official turn ids stay private; core publication retains the Bridge correlation id.
@@ -296,6 +296,14 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `macos/selection.rs`), compiled and tested on every target, and so does the capture's budget
   rule (`macos/shell_environment/budget.rs`: what the deadline leaves after the handoff and
   cleanup reserves, at most 10 s), whose limit doctor reads on every platform.
+- `src/native/terminal/linux/mod.rs` owns Linux surface dispatch. `linux/process.rs` reads
+  procfs owner identity (boot id and start ticks, process group, session, controlling TTY,
+  and foreground group); a zombie retains its incarnation until reaped. `linux/pidfd.rs`
+  verifies process incarnations for observation and signalling. `linux/tmux.rs` owns the
+  per-session server, socket, pane binding, input, screen capture, and close;
+  `linux/tmux/facts.rs` registers its capabilities and guarded-dialog refusal. The shared
+  POSIX seam is `terminal/posix.rs`, `terminal/posix_ownership.rs`, `terminal/bound_host.rs`,
+  and `terminal/process.rs`; Linux transport remains in its adapter.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, reopen-marker and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, time
@@ -702,8 +710,9 @@ repair settles the records without resending a prompt or guessing ownership of a
   paths in `src/native/terminal/refusing.rs`. Then read the process-identity code under the
   existing platform directories, private-record permissions in
   `src/native/session/primitives.rs`, and trust-store checks in `src/native/consent.rs`. Implement
-  those checks along with terminal operations before claiming support. Linux currently refuses
-  visible-session operations; compilation and fixtures do not establish a live round trip.
+  those checks along with terminal operations before claiming support. Linux implements its
+  surface through tmux; compilation and fixtures alone do not establish a live round trip.
+  See the [Linux verification record](verification/2026-11-17-linux-6-tmux-3.6.md) for runtime evidence.
 
 For a lifecycle race or partial transition, first add a deterministic test that reproduces it,
 then change the implementation. Keep observation read-only and prefer the provider's own

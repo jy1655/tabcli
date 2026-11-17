@@ -3,9 +3,10 @@
 [한국어](README.ko.md) follows this README; this one is the reference when they differ.
 
 Use `tabcli` to launch the Codex, Claude Code, Agy, and Pi CLIs you already have installed and
-signed in to, in terminal tabs or windows you can watch. Read the result, send follow-up work to the
-same conversation, and explicitly close the session when you finish. TAB runs on macOS and native
-Windows; Linux, including Linux processes in WSL, is unsupported, and Warp support is limited.
+signed in to, in terminal tabs, windows, or tmux panes you can watch. Read the result, send
+follow-up work to the same conversation, and explicitly close the session when you finish.
+TAB runs on macOS, native Windows, and Linux through tmux. Linux processes in WSL are not
+verified, and Warp support is limited.
 
 To delegate from your assistant without writing global instructions, install the
 [Agent Bridge plugin](#install-an-assistant-plugin) for Claude Code, Codex, Agy, or Pi.
@@ -81,13 +82,18 @@ settings, and limitations. These are not checks of every combination on the curr
 | Native Windows | Implemented | All four providers, 2026-10-02 |
 | Windows Terminal tab | Preferred surface | Tab creation/follow-up/close, 2026-10-01 |
 | Windows console window | Fallback | Initial prompt/close, 2026-10-01 |
-| Linux, including a Linux process in WSL | Unsupported | No session transport |
+| Linux / tmux | Implemented | [Four providers, 2026-11-17](docs/verification/2026-11-17-linux-6-tmux-3.6.md) |
+| Linux process in WSL | Not verified | No live evidence |
 
 macOS detects the invoking terminal and uses Terminal.app when it cannot identify the host.
 Terminal.app always opens a new window. Windows prefers a tab in a dedicated Windows Terminal
 window and uses a console window when a tab cannot be created. See
 [terminal selection and settings](docs/terminals.md#selection-and-settings), including
 `settings macos-open-mode` and `settings windows-tab-window`.
+
+Linux defaults to tmux 3.2 or later and opens no GUI window. Attach with the printed
+`tmux -S '<socket>' attach` command (`attach_command` in JSON); see
+[Linux / tmux](docs/terminals.md#linux--tmux).
 
 By default, `ask`, `reopen`, and `self-test` refuse to launch any provider in the Codex memory
 workspace (`$CODEX_HOME/memories`, default `~/.codex/memories`) or a directory inside it, before
@@ -108,7 +114,7 @@ round trip and close are not verified. Choose another terminal for those provide
 
 Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude needs working
 cross-session messaging in its installed backend and configuration, not only a recent version.
-New macOS and Windows Claude launches, plus Windows reopens, require stable 2.1.302 or newer
+New macOS, Linux, and Windows Claude launches, plus Windows reopens, require stable 2.1.302 or newer
 and a Bridge completion module that Claude loads and that reports readiness.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 

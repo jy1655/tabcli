@@ -7,12 +7,12 @@ use crate::native::session::schema::{
 };
 use crate::native::session::state::{SessionState, SessionStatus, update_status};
 use crate::native::session::{CoreRecord, CoreRecordReader, Reader, RecordStore, Store, requests};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::NativeSessionOwner;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::process_identity::{Gone, ProcessObservation};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::owner::{OwnerAttestation, attest_owner};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Context, Result, bail};
@@ -31,7 +31,10 @@ pub(in crate::native) static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native) enum ClaimState {
     Any,
-    #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows, test)),
+        allow(dead_code)
+    )]
     NotEnded,
     Turn,
 }
@@ -61,7 +64,7 @@ pub(in crate::native) enum StaleClaim {
     Tombstone,
     State(SessionState),
     Expired,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     Busy,
 }
 
@@ -114,7 +117,7 @@ impl ClaimCurrency<'_> {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(in crate::native) fn try_run<T>(
         &self,
         store: &Store,
@@ -1074,12 +1077,12 @@ fn write_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> 
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn running_wait_owner(directory: &Path) -> Result<()> {
     running_wait_owner_with(directory, attest_owner)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn running_wait_owner_with(
     directory: &Path,
     observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
@@ -1123,7 +1126,7 @@ pub(in crate::native) fn wait_for_status(
                     .unwrap_or_else(|| format!("session entered state {}", status.state));
                 bail!("{reason}");
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             running_wait_owner(directory)?;
             if status.state == expected_state {
                 return Ok(status);
@@ -1189,7 +1192,7 @@ fn wait_for_event_for_turn_until(
                 .unwrap_or_else(|| format!("session entered state {}", status.state));
             bail!("{reason}");
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         running_wait_owner(directory)?;
         let remaining = deadline
             .checked_duration_since(Instant::now())

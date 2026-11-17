@@ -37,10 +37,16 @@ pub(in crate::native) enum OwnerJudgment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum BoundOwner {
     /// A live incarnation whose recorded control identity matched.
-    #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows, test)),
+        allow(dead_code)
+    )]
     Verified,
     /// A live incarnation whose control identity changed; not a death.
-    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", test)),
+        allow(dead_code)
+    )]
     ControlChanged,
     /// Alive, with no control identity to compare: a PID-only record, or a recorded
     /// birth without TTY and process groups.
@@ -88,11 +94,11 @@ impl BoundOwner {
     pub(in crate::native) fn of(attestation: &OwnerAttestation) -> Self {
         match &attestation.process {
             ProcessObservation::Live(Attested::Incarnation) => match &attestation.control {
-                #[cfg(any(target_os = "macos", windows, test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
                 ControlAttestation::Verified => Self::Verified,
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Changed(_) => Self::ControlChanged,
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Unknown(_) => Self::Unknown,
                 ControlAttestation::NotRecorded => Self::Uncompared,
             },
@@ -660,6 +666,8 @@ pub(in crate::native) mod tests {
 
     pub(in crate::native) fn handle(kind: TerminalKind, binding: Option<&str>) -> TerminalSession {
         TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind,
             id: "surface-1".to_owned(),
             tab_id: None,

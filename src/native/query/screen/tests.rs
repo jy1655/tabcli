@@ -177,6 +177,8 @@ fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
 
 fn handle(kind: terminal::TerminalKind, bound_to: Option<&str>) -> terminal::TerminalSession {
     terminal::TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind,
         id: "surface-1".into(),
         tab_id: None,
@@ -636,6 +638,7 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
             terminal::TerminalKind::Ghostty,
             terminal::TerminalKind::Warp,
             terminal::TerminalKind::WindowsConsole,
+            terminal::TerminalKind::Tmux,
         ]
     } else if cfg!(windows) {
         &[
@@ -644,6 +647,16 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
             terminal::TerminalKind::Ghostty,
             terminal::TerminalKind::Warp,
             terminal::TerminalKind::WezTerm,
+            terminal::TerminalKind::Tmux,
+        ]
+    } else if cfg!(target_os = "linux") {
+        &[
+            terminal::TerminalKind::Iterm2,
+            terminal::TerminalKind::AppleTerminal,
+            terminal::TerminalKind::Ghostty,
+            terminal::TerminalKind::Warp,
+            terminal::TerminalKind::WezTerm,
+            terminal::TerminalKind::WindowsConsole,
         ]
     } else {
         &terminal::TerminalKind::ALL

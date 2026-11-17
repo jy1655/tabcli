@@ -243,7 +243,10 @@ test steps, one of which also runs Windows tests for historical tags.
 The macOS stable job installs Ghostty and iTerm2 for the AppleScript compile test.
 The release-candidate job packages the executable and license, checks the archive checksum,
 extracts it, and checks the extracted binary's version. This is not an authenticated live test.
-Linux CI checks portable code; Linux managed sessions remain unsupported.
+Linux CI runs portable and Linux surface tests, including a real-tmux test that is skipped
+when tmux is absent. These checks do not authenticate provider CLIs. The separate
+[2026-11-17 Linux record](verification/2026-11-17-linux-6-tmux-3.6.md) covers four providers
+over SSH with tmux 3.6; WSL and other distributions were not verified.
 
 ### Windows CI performance observations
 

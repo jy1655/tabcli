@@ -6,36 +6,36 @@
 //! tests use the in-memory adapter in `test_support`. The actions stay in `ownership`
 //! (Terminal.app owner teardown) and the platform adapters (surface close).
 use super as terminal;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::CloseOutcome;
 use super::TerminalSession;
-#[cfg(target_os = "macos")]
-use super::macos::OwnedSurfaceClose;
-#[cfg(target_os = "macos")]
-use super::macos::ownership::verified_macos_terminal_owner;
 use super::ownership::verify_terminal_surface_ownership_with_timeout;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use super::ownership::{NativeSessionOwner, OwnerBinding};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::ownership::{
     owner_group_gone, teardown_absent_owner_with, terminate_owned_foreground_group_until,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::posix::OwnedSurfaceClose;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use super::posix_ownership::verified_posix_terminal_owner;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::process_identity::Gone;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::process_identity::ProcessObservation;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::SessionStatus;
 use crate::native::session::close::budget::close_remaining;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::owner::{OwnerAttestation, OwnerRecord, attest_owner};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::{self, Store};
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::{Reader, SessionState, launch};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use agent_bridge::process_is_alive;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use anyhow::Context;
 use anyhow::{Result, bail};
 use std::{path::Path, time::Instant};
@@ -45,13 +45,13 @@ pub(in crate::native) mod test_support;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::native) enum TerminalCloseAuthority {
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     LiveOwner,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     OwnerTeardown,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     TeardownComplete(String),
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     SurfaceOnly,
     Absent,
 }
@@ -60,31 +60,43 @@ pub(in crate::native) enum TerminalCloseAuthority {
 // the decision's call order is the Record-read order; the observations are the distinct
 // OS and surface proofs that the production adapter keeps apart.
 pub(in crate::native) trait CloseObservation {
-    #[cfg(target_os = "macos")]
+    /// Some only for a kind declaring BridgeCreatedHost: this observation proves the
+    /// whole recorded host incarnation, independent of owner or intent. Unknown refuses.
+    /// It never treats a missing endpoint or pane as an absent host.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
+    fn created_host_incarnation(
+        &self,
+    ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
+        Ok(None)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn teardown_intent(&self) -> Result<Option<session::close::TerminalTeardownIntent>>;
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner_present(&self) -> Result<bool>;
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn launch(&self) -> Result<Option<launch::Record>>;
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn status(&self) -> Result<SessionStatus>;
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner(&self) -> Result<NativeSessionOwner>;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn resumable(&self) -> Result<bool>;
     fn surface_present(&self) -> Result<bool>;
     fn ownership_proof(&self) -> Result<()>;
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool;
-    #[cfg(target_os = "macos")]
-    fn mac_owner_live(&self, owner: &NativeSessionOwner) -> OwnerAttestation;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn posix_owner_live(&self, owner: &NativeSessionOwner) -> OwnerAttestation;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn attest_owner(&self) -> Result<()>;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn group_gone(&self, group: u32) -> Result<bool>;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn evidence(&self) -> &dyn terminal::close_evidence::CloseEvidence;
 }
 
@@ -112,19 +124,46 @@ impl<'a> Production<'a> {
         }
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn reader(&self) -> Reader {
         Reader::open_unchecked(self.directory)
     }
 }
 
 impl CloseObservation for Production<'_> {
-    #[cfg(target_os = "macos")]
+    fn created_host_incarnation(
+        &self,
+    ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
+        if self.session.kind.registration().close_evidence
+            != terminal::facts::CloseEvidenceChoice::BridgeCreatedHost
+        {
+            return Ok(None);
+        }
+        self.session
+            .verify_managed_session(self.expected_session_id)?;
+        #[cfg(target_os = "linux")]
+        {
+            let host = self
+                .session
+                .linux_host
+                .as_ref()
+                .context("creation-proven Linux host identity is missing")?;
+            Ok(Some(crate::native::process_identity::classify(
+                host.pid,
+                Some(&host.linux_birth),
+                || unreachable!("host birth required"),
+                || terminal::linux::process::process_birth(host.pid),
+            )))
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("Bridge-created host evidence is unsupported on this platform")
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn teardown_intent(&self) -> Result<Option<session::close::TerminalTeardownIntent>> {
         session::close::terminal_teardown_intent(&self.reader(), self.session)
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner_present(&self) -> Result<bool> {
         // A record that cannot be read is refused here, before anything else is read; a
         // malformed one is present and the owner read reports it.
@@ -137,22 +176,22 @@ impl CloseObservation for Production<'_> {
         )
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn launch(&self) -> Result<Option<launch::Record>> {
         launch::read(&self.reader())
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn status(&self) -> Result<SessionStatus> {
         self.reader().status()
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner(&self) -> Result<NativeSessionOwner> {
         self.reader().owner()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn resumable(&self) -> Result<bool> {
         session::close::terminal_close_resumable(
             &self.reader(),
@@ -178,33 +217,33 @@ impl CloseObservation for Production<'_> {
         )
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
         attest_owner(owner)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool {
         process_is_alive(pid)
     }
 
-    #[cfg(target_os = "macos")]
-    fn mac_owner_live(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn posix_owner_live(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
         attest_owner(owner)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn attest_owner(&self) -> Result<()> {
-        verified_macos_terminal_owner(self.directory, self.expected_session_id, self.session, None)
+        verified_posix_terminal_owner(self.directory, self.expected_session_id, self.session, None)
             .map(|_| ())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn group_gone(&self, group: u32) -> Result<bool> {
         owner_group_gone(group)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn evidence(&self) -> &dyn terminal::close_evidence::CloseEvidence {
         terminal::close_evidence(self.session.kind)
     }
@@ -234,11 +273,32 @@ pub(in crate::native) fn decide(
         result
     };
     let _ = (expected_session_id, session, &surface_present);
-    #[cfg(any(target_os = "macos", windows))]
+    // This is independent close authority, not resumability: missing/mismatched
+    // owner intents cannot weaken the creation-proven whole-host identity. A foreign
+    // handle is still refused before observing any host. No current macOS kind selects it.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    if let Some(host) = observation.created_host_incarnation()? {
+        close_remaining(deadline)?;
+        session.verify_managed_session(expected_session_id)?;
+        return match host {
+            ProcessObservation::Live(crate::native::process_identity::Attested::Incarnation) => {
+                Ok(TerminalCloseAuthority::SurfaceOnly)
+            }
+            ProcessObservation::Gone(_) => Ok(TerminalCloseAuthority::Absent),
+            ProcessObservation::Unknown(reason) => {
+                bail!("cannot verify Bridge-created host: {reason}")
+            }
+            ProcessObservation::Live(crate::native::process_identity::Attested::PidOnly) => {
+                bail!("Bridge-created host requires an incarnation")
+            }
+        };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let teardown_intent = observation.teardown_intent()?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let has_teardown_intent = teardown_intent.is_some();
         #[cfg(windows)]
         let has_teardown_intent = false;
@@ -268,7 +328,7 @@ pub(in crate::native) fn decide(
             // again, and only once the incarnation it verified no longer exists. A live
             // or uninspectable incarnation keeps the rules below; a reused PID alone
             // grants nothing outside this exact-intent route.
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             if !has_teardown_intent && observation.resumable()? {
                 session.verify_managed_session(expected_session_id)?;
                 return Ok(
@@ -285,10 +345,10 @@ pub(in crate::native) fn decide(
                     },
                 );
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 let owner: NativeSessionOwner = observation.owner()?;
-                let attestation = observation.mac_owner_live(&owner);
+                let attestation = observation.posix_owner_live(&owner);
                 if let ProcessObservation::Unknown(reason) = &attestation.process {
                     bail!("{reason}");
                 }
@@ -375,7 +435,7 @@ pub(in crate::native) fn decide(
         // A Terminal.app window and tty are identities only inside the app incarnation
         // that no wrapper recorded here, so nothing is closed: the handle is consumed
         // once the window is proven gone.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if !terminal::facts(session.kind).failed_start_identity {
             if observation
                 .evidence()
@@ -390,13 +450,20 @@ pub(in crate::native) fn decide(
         }
         Ok(TerminalCloseAuthority::SurfaceOnly)
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        ownership_proof()?;
-        bail!(
-            "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
-        )
-    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    refuse_without_transport(ownership_proof)
+}
+
+// Other Unix targets have no visible terminal transport. The ownership proof still runs
+// first, so its own refusal wins. Compiled into every test build so that CI runs it.
+#[cfg(any(not(any(target_os = "macos", target_os = "linux", windows)), test))]
+fn refuse_without_transport<T>(
+    ownership_proof: impl FnOnce() -> Result<T>,
+) -> Result<TerminalCloseAuthority> {
+    ownership_proof()?;
+    bail!(
+        "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
+    )
 }
 
 pub(in crate::native) fn close_owned_surface(
@@ -406,7 +473,7 @@ pub(in crate::native) fn close_owned_surface(
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
     let observation = Production::new(directory, id, session, deadline);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         close_owned_surface_with(
             || decide(&observation, id, session, deadline),
@@ -415,7 +482,7 @@ pub(in crate::native) fn close_owned_surface(
                     &Store::open_unchecked(directory),
                     id,
                     session,
-                    || verified_macos_terminal_owner(directory, id, session, None),
+                    || verified_posix_terminal_owner(directory, id, session, None),
                     |group| {
                         terminate_owned_foreground_group_until(group, deadline).context(
                             "could not confirm disappearance of the absent surface owner's group",
@@ -425,8 +492,8 @@ pub(in crate::native) fn close_owned_surface(
                 )
             },
             |has_native_owner| {
-                terminal::macos::close_owned_session(
-                    terminal::macos::INSTALLED,
+                terminal::posix::close_owned_session(
+                    terminal::posix_installed(),
                     directory,
                     id,
                     session,
@@ -441,7 +508,7 @@ pub(in crate::native) fn close_owned_surface(
             deadline,
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let authority = decide(&observation, id, session, deadline)?;
         if authority == TerminalCloseAuthority::Absent {
@@ -453,7 +520,7 @@ pub(in crate::native) fn close_owned_surface(
 
 // Production and interruption tests share the authority-to-action dispatch.
 // Only observations and external actions are replaceable; result mapping is not.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn close_owned_surface_with(
     authority: impl FnOnce() -> Result<TerminalCloseAuthority>,
     teardown: impl FnOnce() -> Result<terminal::CloseResult>,
@@ -474,10 +541,11 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
     }
 }
 
+// Apple Terminal close-evidence fixtures; the shared rows run on Linux through the tmux kind.
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
-#[cfg(all(test, any(windows, target_os = "macos")))]
+#[cfg(all(test, any(windows, target_os = "macos", target_os = "linux")))]
 mod projected_authority_tests {
     use super::test_support::{RecordValues, TestObservation};
     use super::*;
@@ -485,6 +553,18 @@ mod projected_authority_tests {
     use crate::native::session::CoreRecord;
     use crate::native::session::launch;
     use crate::native::session::owner::ControlAttestation;
+
+    #[test]
+    fn other_unix_refusal_runs_the_proof_first_and_sends_no_close() {
+        let error =
+            refuse_without_transport(|| -> Result<()> { bail!("proof refused") }).unwrap_err();
+        assert_eq!(error.to_string(), "proof refused");
+        let error = refuse_without_transport(|| Ok(())).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
+        );
+    }
 
     fn assert_failed_start_route(attestation: impl Fn() -> OwnerAttestation, surface_only: bool) {
         for kind in [
@@ -494,6 +574,8 @@ mod projected_authority_tests {
         ] {
             for proof_succeeds in [false, true] {
                 let surface = TerminalSession {
+                    linux_host: None,
+                    tmux_socket: None,
                     kind,
                     id: "4242".into(),
                     tab_id: None,
@@ -525,10 +607,10 @@ mod projected_authority_tests {
                         bail!("injected full ownership proof failure")
                     }
                 });
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 let observation = observation
                     .with_evidence(terminal::close_evidence(kind))
-                    .with_mac_owner_live(|_| OwnerAttestation {
+                    .with_posix_owner_live(|_| OwnerAttestation {
                         process: ProcessObservation::Live(Attested::Incarnation),
                         control: ControlAttestation::Verified,
                         pid_alive: Some(true),
@@ -539,14 +621,14 @@ mod projected_authority_tests {
                     crate::native::session::close::budget::close_deadline(),
                 );
                 let mut calls = vec![];
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 calls.push("teardown-intent");
                 calls.extend(["owner-present", "launch", "status", "owner", "owner-record"]);
                 if !surface_only {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     calls.extend(["resumable", "owner", "mac-live"]);
                     calls.push("proof");
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     if !proof_succeeds {
                         calls.push("presence");
                     }
@@ -652,10 +734,10 @@ mod projected_authority_tests {
                 .with_presence(|| panic!("projection does not inspect surface"))
                 .with_owner_record(|_| crate::native::session::owner::tests::reused_attestation())
                 .with_proof(|| panic!("failed-start route"));
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let observation = observation
             .with_pid_alive(|_| panic!("failed-start route"))
-            .with_mac_owner_live(|_| panic!("failed-start route"))
+            .with_posix_owner_live(|_| panic!("failed-start route"))
             .with_resumable(|| panic!("failed-start route"))
             .with_attest(|| panic!("failed-start route"))
             .with_group_gone(|_| panic!("failed-start route"));
@@ -666,7 +748,7 @@ mod projected_authority_tests {
         // The failed-start projection reads the launch record, the status and the owner
         // in that order, from the real Records, and observes the owner once.
         let mut reads = vec![];
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         reads.push("teardown-intent");
         reads.extend(["owner-present", "launch", "status", "owner", "owner-record"]);
         assert_eq!(observation.calls(), reads);

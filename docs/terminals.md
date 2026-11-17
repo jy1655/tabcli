@@ -2,20 +2,23 @@
 
 Choose the terminal where Bridge opens your sessions, and check what it will close when you finish.
 On macOS, Bridge detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
-Windows Terminal tab, then a separate console window. Use `--terminal` to override the selection.
+Windows Terminal tab, then a separate console window. Linux uses tmux.
+Use `--terminal` to override the selection.
 
 Bridge creates a new surface for each session: a tab, window, pane, or console. It does not adopt
-one of your existing tabs or attach to an independently running provider CLI. Linux is not supported
-(#6), including a Linux Bridge process inside WSL. A provider's own WSL support does not provide
-Bridge's missing surface implementation. See [CLI commands](cli.md) for a worked session.
+one of your existing tabs or attach to an independently running provider CLI. A Linux Bridge
+process inside WSL would use tmux, but has not been verified. See [CLI commands](cli.md) for a worked session.
 
 ## Selection and settings
 
 `ask` and `self-test` accept `--terminal`; `reopen` currently supports native Windows Claude only.
-The documented terminal names are `iterm2`, `terminal`, `ghostty`, `wezterm`, `warp`, and
+The documented terminal names are `ghostty`, `iterm2`, `terminal`, `tmux`, `warp`, `wezterm`, and
 `windows-console`. Parsing is case-insensitive. Accepted aliases are `iterm`, `iterm.app`,
 `apple-terminal`, `apple_terminal`, `default`, `terminal.app`, `warpterminal`, `windows`, and
 `console`. Structured output names Terminal.app `apple-terminal`.
+
+On Linux, tmux is the default; `--terminal tmux` selects it explicitly. Every other kind is
+refused with `<Name> is not available on Linux; use tmux`. tmux is refused on macOS and Windows.
 
 On macOS an explicit option wins. Otherwise Bridge first examines `TERM_PROGRAM`, recognizing those
 terminal families. An unrecognized value falls back to Terminal.app. Only when `TERM_PROGRAM` is
@@ -77,6 +80,7 @@ adapters above them are macOS-only.
 | macOS | Ghostty | Tab or window | Terminal scripting | Owned surface; proven failed-launch handle retained | Unsupported |
 | macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI | Exact-pane CLI text |
 | macOS | Warp | Tab/window URI | Unsupported | Bound tab/window | Unsupported |
+| Linux | tmux | Detached server and pane | Exact-pane raw paste | Whole session server | Visible pane text |
 | Windows | Terminal tab | Tab | Console input | Console and tab | Console window text |
 | Windows | Console window | Window fallback | Console input | Console | Console window text |
 
@@ -115,6 +119,65 @@ running when it checks; an application that quits between that check and the rea
 again by the scripting call. On native Windows a caller without a console can get a console
 window from the console helper; this is not verified. `screen` is refused for Ghostty and Warp,
 whose scripting exposes no screen text. See [screen](cli.md#screen).
+
+## Linux / tmux
+
+Linux requires tmux 3.2 or later, resolved as an executable `tmux` on an absolute `PATH` entry;
+Bridge uses its canonical path. No GUI window is opened. Use the shell-quoted command printed
+by `ask`/`tell` as `attach: ...`, or the JSON `attach_command` from turn output and `inspect`:
+
+```sh
+tmux -S '<socket>' attach
+```
+
+Each managed session owns one tmux server. Its socket is `<session directory>/tmux.sock`, under
+`~/.agent-bridge/native-sessions` by default, or `AGENT_BRIDGE_NATIVE_STATE_DIR`. The Unix socket
+path must be shorter than 108 bytes; Bridge refuses a longer path before running tmux and
+suggests a shorter state directory. An existing socket path is also refused.
+
+The server starts detached with `-f /dev/null`, one session named `agent-bridge`, and a 200x50
+window. Your tmux configuration, key bindings, and options are not loaded. Client commands drop
+`TMUX`, `TMUX_PANE`, and `TMUX_TMPDIR`, so invoking Bridge inside tmux never addresses that
+outer server. The pane host waits for binding to the exact pane and server, discards startup
+input, then runs the launch command with `bash --noprofile --norc -m -c`. Job control puts the
+provider wrapper in the pane's foreground process group.
+
+No shell startup files are read. The pane inherits the calling process's environment after
+Bridge's usual provider-private variable removal. Profile/rc exports, shell functions, and
+PATH additions absent from that process are unavailable. Node-based Codex and Pi launchers
+use `#!/usr/bin/env node`, so `node` must be on that PATH.
+
+Codex follow-ups use `codex queue`; Claude keeps its official cross-session messaging path.
+Agy and Pi follow-ups load the bracketed-paste prompt plus Enter from stdin into one uniquely
+named tmux buffer (`load-buffer -b <name> -`), then paste it raw into the exact pane
+(`paste-buffer -d -r -b <name> -t <pane>`). Failure before paste starts is `not_sent`; failure
+after it starts is delivery-uncertain and nothing is replayed. An attached viewer's copy mode
+does not stop delivery. `screen` uses `capture-pane -p` to read the application's visible
+50 rows, including while a viewer scrolls in copy mode.
+
+Bridge never answers dialogs in tmux: `tmux cannot compare the screen and send a key in one
+call; answer the dialog in its pane`. A Claude or Agy workspace-trust dialog stops launch with
+`the workspace trust dialog cannot be answered with a guarded key in tmux; no key was sent;
+use the provider's own workspace trust prompt, then launch again`. The pane is kept so you can
+attach and answer. Trust the workspace through the provider beforehand to avoid this stop;
+explicitly close the stopped session before launching again.
+
+The handle records the pane (`terminal_session_id`, such as `%0`), window (`terminal_tab_id`,
+such as `@0`), tmux session (`terminal_window_id`, such as `$0`), socket, and server incarnation
+(pid, boot id, and procfs start ticks). Creation proves the server was born on this boot no
+earlier than the clock reading just before `new-session`, with exactly its one session and
+pane. Each later operation checks that incarnation through a pidfd. Only its verified absence
+means the surface is gone; a live recorded server whose socket refuses is an error.
+
+`close-session --explicit` sends SIGTERM through a pidfd verified against the server birth,
+ending the whole session server, including any windows you added. The socket file stays in
+the session directory, inert, until the session is pruned.
+Repeated close, including after the server already ended, sends no further signal. Pane hangup
+ends the owner and provider processes; they can take a few seconds to end after close returns.
+
+The [2026-11-17 record](verification/2026-11-17-linux-6-tmux-3.6.md) covers all four providers
+over SSH on Ubuntu with tmux 3.6. WSL, desktop GUI attachment, other distributions, other tmux
+versions, and Linux aarch64 were not verified.
 
 ## Requirements and first-run prompts
 
@@ -251,12 +314,14 @@ WezTerm GUI does not answer its pane listing in time, Bridge reports it as busy 
 opening another window.
 
 `close-session` targets the surface Bridge created for that session, not whichever tab you have
-selected. It preserves your other tabs. If Bridge cannot prove ownership or absence of the recorded
+selected. It preserves surfaces outside that session; tmux close includes every window added to
+the session's server. If Bridge cannot prove ownership or absence of the recorded
 surface, it refuses the close and keeps the handle.
 
 The owner is the Bridge process that launched the session. Before signalling it, Bridge checks that
 the recorded owner is still the same process. On macOS it compares the PID, process birth,
-controlling TTY, and process groups; Windows uses process identity. This check is called owner
+controlling TTY, and process groups; Linux uses procfs birth and control identity; Windows uses
+process identity. This check is called owner
 attestation. The surface handle also names its Bridge session. Reusing a PID or TTY does not
 transfer ownership to a new process.
 
@@ -403,6 +468,8 @@ for the tested binary, CLI versions, settings, and date.
 | macOS | Ghostty | Implemented | Readiness/input/close/focus | Four providers [G14]; Codex [M12], [M11] |
 | macOS | WezTerm | Implemented | GUI identity/input/close | Codex/Claude [M12]; Agy [M11] |
 | macOS | Warp | Limited | Control/URI/partial launch/close | Not verified |
+| Linux | tmux | Implemented | Linux surface tests; real tmux when installed | Four providers [L6] |
+| Linux process in WSL | tmux | Not verified | No live evidence | Not verified |
 | Windows | Terminal tab | Implemented | Host/console/identity/input/focus | Four providers [W02] |
 | Windows | Console window | Fallback | Launch/identity/input/close/focus | Initial/close [W01] |
 
@@ -425,6 +492,7 @@ Codex now selects the queue backend itself. The
 [queue record](verification/2026-10-04-codex-queue.md) distinguishes mock-model protocol probes
 from authenticated model runs.
 
+[L6]: verification/2026-11-17-linux-6-tmux-3.6.md
 [M12]: verification/2026-10-06-macos-0.1.2.md
 [M11]: verification/2026-10-04-macos-0.1.1.md
 [W02]: verification/2026-10-02-windows.md

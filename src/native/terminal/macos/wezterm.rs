@@ -727,6 +727,8 @@ fn create_private_gui(
     let mux = host.start_gui(program)?;
     match startup_pane(host, &mux, deadline) {
         Ok(pane) => Ok(TerminalSession {
+            linux_host: None,
+            tmux_socket: None,
             kind: TerminalKind::WezTerm,
             id: pane.pane_id.to_string(),
             tab_id: Some(pane.tab_id.to_string()),
@@ -950,6 +952,8 @@ fn create(
     ))?;
     give_keyboard_back(host, &mux, keyboard.as_ref(), &pane, &after, deadline);
     Ok(TerminalSession {
+        linux_host: None,
+        tmux_socket: None,
         kind: TerminalKind::WezTerm,
         id: pane.pane_id.to_string(),
         tab_id: Some(pane.tab_id.to_string()),

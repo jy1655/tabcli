@@ -235,8 +235,8 @@ impl Reader {
         let path = self.directory.join(STATUS_FILE);
         record::status(&read_regular_bytes(&path)?).map_err(|error| error.in_path(&path))
     }
-    // Read by the macOS and Windows ownership paths; Linux has no managed surface yet.
-    #[cfg(any(target_os = "macos", windows))]
+    // Read by the POSIX and Windows ownership paths.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn owner(&self) -> Result<NativeSessionOwner> {
         owner::required(self).map(|recorded| recorded.owner)
     }
@@ -418,7 +418,7 @@ pub(in crate::native) enum CoreRecord {
     Terminal,
     TerminalClosing,
     TerminalClosed,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     TerminalCloseIntent,
     LegacyResumePending,
     LegacyResumeRunning,
@@ -445,7 +445,7 @@ impl CoreRecord {
             Self::Terminal => TERMINAL_HANDLE_FILE,
             Self::TerminalClosing => TERMINAL_CLOSING_FILE,
             Self::TerminalClosed => TERMINAL_TOMBSTONE_FILE,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Self::TerminalCloseIntent => TERMINAL_CLOSE_INTENT_FILE,
             Self::LegacyResumePending => LEGACY_RESUME_PENDING_FILE,
             Self::LegacyResumeRunning => LEGACY_RESUME_RUNNING_FILE,
@@ -621,8 +621,8 @@ impl RecordReader {
     pub(in crate::native) fn open(&self) -> std::io::Result<File> {
         OpenOptions::new().read(true).open(&self.path)
     }
-    // Read by the WezTerm and Windows paths; Linux has no managed surface that needs it.
-    #[cfg(any(target_os = "macos", windows))]
+    // Read by the WezTerm, tmux and Windows paths.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn raw_bytes(&self) -> std::io::Result<Vec<u8>> {
         fs::read(&self.path)
     }
