@@ -182,21 +182,30 @@ See [provider requirements](docs/providers.md) for delivery paths and failure ha
 
 Download the archive for your platform and its matching `.sha256` file from
 [GitHub Releases](https://github.com/jy1655/tabcli/releases). Prebuilt archives need no Rust:
-`tabcli-<version>-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS, or
-`tabcli-<version>-x86_64-pc-windows-msvc.zip` for x64 Windows.
+`tabcli-<version>-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS,
+`tabcli-<version>-x86_64-pc-windows-msvc.zip` for x64 Windows, or
+`tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz` for x86_64 Linux with glibc 2.39 or newer
+(Ubuntu 24.04 or later).
 
-For version 0.4.42, verify the checksum in the download directory before extracting.
+For version 0.4.43, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.4.42-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.42-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.43-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.43-aarch64-apple-darwin.tar.gz
+```
+
+On Linux, likewise:
+
+```sh
+sha256sum -c tabcli-0.4.43-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.43-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.4.42-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.43-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -204,12 +213,12 @@ Expand-Archive $archive -DestinationPath .\tabcli
 ```
 
 If verification fails, stop and download the archive and checksum again from the same release.
-Put the extracted `tabcli` (macOS) or `tabcli.exe` (Windows) in a directory on your `PATH`.
+Put the extracted `tabcli` (macOS, Linux) or `tabcli.exe` (Windows) in a directory on your `PATH`.
 
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.42 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.43 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated
@@ -219,11 +228,12 @@ Before the first launch, install and sign in to the provider CLI, and resolve it
 prompt for your project. The iTerm2, Terminal.app, and Ghostty integrations use macOS Automation.
 If launch reports an Apple Events permission error, follow the
 [macOS permission checks](docs/macos-permissions.md). Native Windows requires PowerShell 7
-(`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd.
+(`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd. Linux requires tmux 3.2 or later
+on `PATH`; see [Linux / tmux](docs/terminals.md#linux--tmux).
 
 ## Install an assistant plugin
 
-First [install `tabcli`](#install), then install the plugins from this repository. Use a macOS terminal or Windows PowerShell:
+First [install `tabcli`](#install), then install the plugins from this repository. Use a macOS or Linux shell, or Windows PowerShell:
 
 ```sh
 git clone --depth 1 https://github.com/jy1655/tabcli.git tabcli-integrations
