@@ -135,6 +135,14 @@ pub(super) fn value(
     if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = serde_json::to_value(residual)?;
     }
+    // A tmux session has no window of its own: this is how the user watches or types in it.
+    #[cfg(target_os = "linux")]
+    if let super::observation::SurfaceRecord::Active(Ok(Some(handle))) =
+        &observation.evidence.surface
+        && let Some(attach) = crate::native::terminal::linux::tmux::attach_command(handle)
+    {
+        value["attach_command"] = json!(attach);
+    }
     origin.add_fields(&mut value);
     Ok(value)
 }

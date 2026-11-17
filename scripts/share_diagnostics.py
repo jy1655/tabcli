@@ -39,7 +39,7 @@ ATTENTION = enum("""
 """)
 CHECK_IDS = enum("""
     platform session_records session_state active_request turn completion request_index
-    terminal_selection terminal_surface terminal_record powershell provider provider_executable
+    terminal_selection terminal_surface terminal_record powershell tmux provider provider_executable
     provider_version workspace workspace_consent owner hold cancel origin reopen_marker
     claude_inbound_setting claude_caller_markers claude_messaging claude_resumed_conversation_holders
     claude_completion claude_completion_diagnostic
@@ -58,7 +58,8 @@ REASONS = enum("""
     terminal_surface_unverified terminal_consumed terminal_close_in_progress
     terminal_binding_unverified terminal_record_found terminal_record_missing
     terminal_record_unreadable terminal_tombstone_unreadable powershell_found
-    powershell_unavailable provider_unrecognized executable_found executable_path_unverified
+    powershell_unavailable tmux_found tmux_too_old tmux_unavailable
+    provider_unrecognized executable_found executable_path_unverified
     executable_unavailable version_supported version_unsupported version_unrecognized
     version_probe_failed probe_not_requested workspace_present workspace_missing
     workspace_not_directory workspace_unreadable recorded_workspace_consent owner_exited owner_identity_mismatch

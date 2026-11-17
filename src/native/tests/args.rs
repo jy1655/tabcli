@@ -573,6 +573,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         ("native-wezterm-host", terminal::host::WEZTERM_HOST_COMMAND),
         ("native-ghostty-host", terminal::host::GHOSTTY_HOST_COMMAND),
         ("native-warp-host", terminal::host::WARP_HOST_COMMAND),
+        ("native-tmux-host", terminal::host::TMUX_HOST_COMMAND),
     ] {
         assert_eq!(actual, expected);
         let row = COMMANDS.iter().find(|row| row.name == actual).unwrap();
@@ -594,6 +595,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
             "native-wezterm-host",
             "native-ghostty-host",
             "native-warp-host",
+            "native-tmux-host",
         ]
     );
     assert_eq!(
@@ -634,6 +636,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["native-wezterm-host", directory_text], format!("Host(WezTerm {{ directory: {directory:?} }})")),
         (vec!["native-ghostty-host"], "Host(Ghostty)".into()),
         (vec!["native-warp-host", directory_text, token], format!("Host(Warp {{ directory: {directory:?}, attempt: {token:?} }})")),
+        (vec!["native-tmux-host", directory_text, "--launch-command", "script"], format!("Host(Tmux {{ directory: {directory:?}, command: \"script\" }})")),
     ];
     let covered = cases
         .iter()

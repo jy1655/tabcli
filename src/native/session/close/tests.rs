@@ -128,6 +128,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             store
                 .write_terminal(&terminal::TerminalSession {
                     linux_host: None,
+                    tmux_socket: None,
                     kind: terminal::TerminalKind::Iterm2,
                     id: "exact-retained-surface".to_owned(),
                     tab_id: None,
@@ -273,6 +274,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "missing-iterm-session".to_owned(),
             tab_id: None,
@@ -340,6 +342,7 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "missing-iterm-session".to_owned(),
             tab_id: None,
@@ -410,6 +413,7 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
         &directory.path().join(TERMINAL_CLOSING_FILE),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "interrupted-close".to_owned(),
             tab_id: None,
@@ -471,6 +475,7 @@ fn interrupted_close_without_tombstone_converges_after_owner_exit() {
         .record(CoreRecord::TerminalClosing)
         .write_json(&terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "interrupted-close".to_owned(),
             tab_id: None,
@@ -626,6 +631,7 @@ fn deadline_fixture() -> (tempfile::TempDir, Store) {
     store
         .write_terminal(&terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "deadline-fixture".into(),
             tab_id: None,
@@ -1204,6 +1210,7 @@ fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::WindowsConsole,
             id: "windows-console-process".to_owned(),
             tab_id: None,
@@ -1251,6 +1258,7 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "concurrent-close".to_owned(),
             tab_id: None,
@@ -1317,6 +1325,7 @@ fn tell_cannot_claim_while_explicit_close_owns_the_terminal_lifecycle() {
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "closing-before-tell".to_owned(),
             tab_id: None,

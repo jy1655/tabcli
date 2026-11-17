@@ -467,6 +467,7 @@ fn validate_composite(surface: &CreatedSurface, state: &Snapshot, before: &Snaps
 fn handle(surface: &CreatedSurface) -> TerminalSession {
     TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind: TerminalKind::Ghostty,
         id: surface.terminal_id.clone(),
         tab_id: Some(surface.tab_id.clone()),

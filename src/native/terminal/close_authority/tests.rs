@@ -48,6 +48,7 @@ fn app() -> MacTerminalAppIdentity {
 fn handle(kind: terminal::TerminalKind, surface_binding: Option<String>) -> TerminalSession {
     TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind,
         id: "surface-id".into(),
         tab_id: None,

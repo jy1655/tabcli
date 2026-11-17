@@ -517,6 +517,7 @@ fn metadata_keeps_the_terminal_kind_after_close_consumes_the_handle() {
         &directory.join("terminal.json"),
         &crate::native::terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: crate::native::terminal::TerminalKind::Iterm2,
             id: "missing-iterm-session".to_owned(),
             tab_id: None,

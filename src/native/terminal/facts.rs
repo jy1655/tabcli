@@ -1,10 +1,9 @@
-#![cfg_attr(target_os = "linux", allow(dead_code))] // Phase 1 has no installed Linux surface.
 //! Adapter declarations are portable: a persisted handle can name another platform.
 //! Each terminal kind is registered once, in its own `facts.rs`, and every shared
 //! lookup (surface facts, host command, launch host, close evidence, declared refusals
 //! and the macOS binding facts) reads that registration.
 use super::TerminalKind;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use super::TerminalSession;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::launch::BindingFacts;
@@ -26,7 +25,6 @@ pub(in crate::native) enum CloseEvidenceChoice {
     PresenceOnlyWithOwnerlessContext,
     AppleTerminal,
     /// Whole host created exclusively by Bridge and recorded by incarnation.
-    #[allow(dead_code)] // No Phase 1 kind selects this evidence.
     BridgeCreatedHost,
 }
 
@@ -37,7 +35,7 @@ pub(in crate::native) struct LaunchHostFacts {
     /// Whether a bound surface names the terminal surface that the calling host runs in, as
     /// the terminal names that surface in the host's environment. The adapter owns this
     /// check; its legacy host decides with the same rule.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     pub(in crate::native) binding_names_host: fn(&TerminalSession) -> bool,
 }
 
@@ -79,6 +77,7 @@ impl TerminalKind {
             Self::Warp => &warp::REGISTRATION,
             Self::WezTerm => &wezterm::REGISTRATION,
             Self::WindowsConsole => &windows::REGISTRATION,
+            Self::Tmux => &tmux::REGISTRATION,
         }
     }
 
@@ -94,6 +93,8 @@ pub(super) mod apple_terminal;
 pub(super) mod ghostty;
 #[path = "macos/iterm2/facts.rs"]
 pub(super) mod iterm2;
+#[path = "linux/tmux/facts.rs"]
+pub(super) mod tmux;
 #[path = "macos/warp/facts.rs"]
 pub(super) mod warp;
 #[path = "macos/wezterm/facts.rs"]
@@ -111,13 +112,14 @@ pub(in crate::native) enum PasteEnvelope {
 mod tests {
     use super::*;
 
-    const KINDS: [TerminalKind; 6] = [
+    const KINDS: [TerminalKind; 7] = [
         TerminalKind::Iterm2,
         TerminalKind::AppleTerminal,
         TerminalKind::Ghostty,
         TerminalKind::Warp,
         TerminalKind::WezTerm,
         TerminalKind::WindowsConsole,
+        TerminalKind::Tmux,
     ];
 
     // A kind that guards dialog input declares no refusal; a kind that refuses screen
@@ -163,6 +165,11 @@ mod tests {
                     assert_eq!(parsed, kind);
                     assert!(kind.uses_launch_host(), "{kind:?}");
                     launch_hosts.push(kind);
+                }
+                // tmux runs its own pane host, which takes the same flag.
+                Ok(HostCommand::Tmux { .. }) => {
+                    assert_eq!(kind, TerminalKind::Tmux);
+                    assert!(!kind.uses_launch_host());
                 }
                 Ok(other) => panic!("{kind:?}: {other:?}"),
                 Err(_) => assert!(!kind.uses_launch_host(), "{kind:?}"),

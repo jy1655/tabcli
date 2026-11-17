@@ -260,7 +260,7 @@ class IntegrationsTest(unittest.TestCase):
             subject.verify(self.root, self.output, allow_cli_assets=True)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "executes the Ubuntu release job's GNU Bash verifier")
-    def test_actual_release_verifier_accepts_twelve_assets_and_rejects_changed_package(self):
+    def test_actual_release_verifier_accepts_fourteen_assets_and_rejects_changed_package(self):
         subject.build(self.root, self.root / "dist")
         scripts = self.root / "scripts"
         scripts.mkdir()
@@ -272,22 +272,30 @@ class IntegrationsTest(unittest.TestCase):
         for filename in ("tabcli", "tabcli.exe", "LICENSE", "THIRD_PARTY_NOTICES.md"):
             (stage / filename).write_text("fixture")
         macos = dist / f"tabcli-{release}-aarch64-apple-darwin.tar.gz"
-        with tarfile.open(macos, "w:gz") as archive:
-            for filename in ("tabcli", "LICENSE", "THIRD_PARTY_NOTICES.md"):
-                archive.add(stage / filename, arcname=filename)
+        # The Linux archive arrives apart and joins the assets after the integration verifier.
+        linux_dist = self.root / "dist-linux"
+        linux_dist.mkdir()
+        linux = linux_dist / f"tabcli-{release}-x86_64-unknown-linux-gnu.tar.gz"
+        for unix in (macos, linux):
+            with tarfile.open(unix, "w:gz") as archive:
+                for filename in ("tabcli", "LICENSE", "THIRD_PARTY_NOTICES.md"):
+                    archive.add(stage / filename, arcname=filename)
         windows = dist / f"tabcli-{release}-x86_64-pc-windows-msvc.zip"
         with zipfile.ZipFile(windows, "w") as archive:
             for filename in ("tabcli.exe", "LICENSE", "THIRD_PARTY_NOTICES.md"):
                 archive.write(stage / filename, filename)
-        for archive in (macos, windows):
+        for archive in (macos, windows, linux):
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            (dist / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n")
+            (archive.parent / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n")
         workflow = (subject.ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
         step = workflow.split("      - name: Verify downloaded release assets\n", 1)[1].split("      - name:", 1)[0]
         script = "\n".join(line[10:] for line in step.split("        run: |\n", 1)[1].splitlines() if line.startswith("          "))
         environment = {**os.environ, "PACKAGE": "tabcli", "RELEASE_VERSION": release}
         completed = subprocess.run(["bash", "-c", script], cwd=self.root, env=environment, capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(len(list(dist.iterdir())), 14)
+        for name in (linux.name, f"{linux.name}.sha256"):
+            shutil.move(dist / name, linux_dist / name)
         changed = dist / subject.archive_name(self.root, "agy")
         changed.write_bytes(b"bad archive")
         completed = subprocess.run(["bash", "-c", script], cwd=self.root, env=environment, capture_output=True, text=True)

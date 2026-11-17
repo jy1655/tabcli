@@ -235,6 +235,7 @@ fn unsupported_dialog_response_preserves_consent_without_pending_input() {
     ] {
         let session = terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind,
             id: "unused".into(),
             tab_id: None,

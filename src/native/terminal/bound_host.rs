@@ -1,4 +1,3 @@
-#![cfg_attr(target_os = "linux", allow(dead_code))] // Phase 1 has no installed Linux surface.
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use std::path::Path;
 
@@ -8,6 +7,7 @@ pub(in crate::native::terminal) struct BoundHostSpec {
     pub(in crate::native::terminal) name: &'static str,
 }
 
+#[cfg(target_os = "macos")]
 pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     directory: &Path,
     spec: &BoundHostSpec,
@@ -67,6 +67,7 @@ fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
     Ok(id)
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn binding_names_host(
     surface: &super::TerminalSession,
     kind: super::TerminalKind,
@@ -82,13 +83,13 @@ pub(super) fn binding_names_host(
 #[cfg(test)]
 mod tests;
 
-/// Phase 2 host handoff (no exec here): admit the private directory, wait for the
+/// The tmux host's handoff (no exec here): admit the private directory, wait for the
 /// pending launch's binding, validate this host's adapter-owned environment against
 /// it, then recheck the SAME pending Claim and exact binding under the lifecycle
-/// lock before flushing startup input. The Linux command passes --launch-command
-/// separately and execs bash --noprofile --norc -i -c only after this returns.
+/// lock before flushing startup input. The host is given its launch command through
+/// --launch-command and execs bash only after this returns.
 /// The wrapper's spawn fence still owns final launch admission; this is no reservation.
-#[allow(dead_code)] // Phase 2 Linux host entry point.
+#[cfg(target_os = "linux")]
 pub(in crate::native::terminal) fn prepare_bound_launch(
     directory: &Path,
     spec: &BoundHostSpec,
@@ -104,6 +105,8 @@ pub(in crate::native::terminal) fn prepare_bound_launch(
         Ok(())
     })
 }
+// Compiled into every test build, so that macOS runs the handoff tests too.
+#[cfg(any(target_os = "linux", test))]
 fn prepare_bound_launch_with(
     directory: &Path,
     spec: &BoundHostSpec,

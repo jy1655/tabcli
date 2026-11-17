@@ -1,4 +1,3 @@
-#![cfg_attr(target_os = "linux", allow(dead_code))] // Phase 1 has no installed Linux surface.
 //! Read-only close evidence supplied by each terminal adapter.
 #![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 
@@ -6,6 +5,8 @@ use super::ownership::{MacTerminalAppIdentity, NativeSessionOwner};
 use anyhow::Result;
 
 pub(in crate::native) enum ResumableAuthority {
+    // Only Terminal.app evidence proves a resumable surface absent.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Absent,
     SurfaceOnly,
 }

@@ -575,6 +575,7 @@ mod projected_authority_tests {
             for proof_succeeds in [false, true] {
                 let surface = TerminalSession {
                     linux_host: None,
+                    tmux_socket: None,
                     kind,
                     id: "4242".into(),
                     tab_id: None,

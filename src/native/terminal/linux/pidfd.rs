@@ -1,6 +1,5 @@
 //! A pidfd is opened BEFORE birth verification. Only this verified type can signal;
 //! a reused PID can never redirect a later signal. No numeric-PID signalling fallback.
-#![allow(dead_code)] // Phase 2 will use this for its creation-proven server, never a group.
 use super::super::LinuxBirth;
 use super::process::process_birth;
 use anyhow::{Context, Result};

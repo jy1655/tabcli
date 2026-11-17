@@ -118,17 +118,19 @@ pub(crate) enum TerminalKind {
     #[serde(rename = "wezterm")]
     WezTerm,
     WindowsConsole,
+    Tmux,
 }
 
 impl TerminalKind {
     /// Every kind, in declaration order.
-    pub(in crate::native) const ALL: [Self; 6] = [
+    pub(in crate::native) const ALL: [Self; 7] = [
         Self::Iterm2,
         Self::AppleTerminal,
         Self::Ghostty,
         Self::Warp,
         Self::WezTerm,
         Self::WindowsConsole,
+        Self::Tmux,
     ];
 
     pub(super) const fn supported_on_this_platform(self) -> bool {
@@ -137,6 +139,7 @@ impl TerminalKind {
                 cfg!(target_os = "macos")
             }
             Self::WindowsConsole => cfg!(windows),
+            Self::Tmux => cfg!(target_os = "linux"),
         }
     }
 
@@ -148,6 +151,7 @@ impl TerminalKind {
             Self::Warp => "warp",
             Self::WezTerm => "wezterm",
             Self::WindowsConsole => "windows-console",
+            Self::Tmux => "tmux",
         }
     }
 
@@ -159,6 +163,7 @@ impl TerminalKind {
             Self::Warp => "Warp",
             Self::WezTerm => "WezTerm",
             Self::WindowsConsole => "Windows Console",
+            Self::Tmux => "tmux",
         }
     }
 }
@@ -172,12 +177,13 @@ impl FromStr for TerminalKind {
             "warp" | "warpterminal" => Ok(Self::Warp),
             "wezterm" => Ok(Self::WezTerm),
             "windows-console" | "windows" | "console" => Ok(Self::WindowsConsole),
+            "tmux" => Ok(Self::Tmux),
             "iterm" | "iterm.app" | "iterm2" => Ok(Self::Iterm2),
             "apple-terminal" | "apple_terminal" | "default" | "terminal" | "terminal.app" => {
                 Ok(Self::AppleTerminal)
             }
             _ => Err(format!(
-                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, warp, wezterm, or windows-console"
+                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, tmux, warp, wezterm, or windows-console"
             )),
         }
     }
@@ -205,6 +211,9 @@ pub(super) struct TerminalSession {
     pub(super) wezterm_mux: Option<WezTermMux>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) linux_host: Option<LinuxHostIdentity>,
+    /// The socket of a tmux surface's own server, in its session directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tmux_socket: Option<String>,
 }
 
 /// Only a creation-proven adapter may publish this incarnation. Registration's
@@ -225,7 +234,6 @@ pub(super) struct RetainedLaunchSurface {
     message: String,
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 impl RetainedLaunchSurface {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn new(surface: TerminalSession, message: String) -> Self {
@@ -236,7 +244,8 @@ impl RetainedLaunchSurface {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    // Only the macOS adapters retain a surface whose cleanup is unverified.
+    #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
     pub(super) fn with_unverified_cleanup(mut self) -> Self {
         self.unverified_cleanup = true;
         self
@@ -703,6 +712,7 @@ mod tests {
     fn macos_test_iterm_session() -> TerminalSession {
         TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: TerminalKind::Iterm2,
             id: "test-session".to_owned(),
             tab_id: None,
@@ -766,6 +776,7 @@ mod tests {
 
         let ghostty = TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: TerminalKind::Ghostty,
             id: "terminal-id".to_owned(),
             tab_id: Some("tab-id".to_owned()),

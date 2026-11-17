@@ -1178,6 +1178,7 @@ fn console_helpers_explicitly_forward_only_the_selected_state_root() {
     }
     let session = terminal::TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         managed_session_id: Some("session-environment".into()),
         kind: terminal::TerminalKind::WindowsConsole,
         id: "1".into(),

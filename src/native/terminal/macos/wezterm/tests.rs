@@ -1794,6 +1794,7 @@ fn host_pane_and_binding_rule_need_no_terminal() {
     );
     let surface = |kind, id: &str, socket: Option<&str>| TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind,
         id: id.into(),
         tab_id: None,

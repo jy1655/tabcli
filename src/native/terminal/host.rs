@@ -17,6 +17,8 @@ pub(in crate::native) const WEZTERM_HOST_COMMAND: &str =
     TerminalKind::WezTerm.registration().host_command;
 pub(in crate::native) const CONSOLE_HOST_COMMAND: &str =
     TerminalKind::WindowsConsole.registration().host_command;
+pub(in crate::native) const TMUX_HOST_COMMAND: &str =
+    TerminalKind::Tmux.registration().host_command;
 
 /// The flag that hands a launch host the command it runs on its bound terminal. Only the host
 /// command of a kind that uses the launch host takes it.
@@ -54,6 +56,11 @@ pub(crate) enum HostCommand {
         directory: PathBuf,
         attempt: String,
     },
+    /// The program of a tmux pane: it waits for its binding, then runs the command.
+    Tmux {
+        directory: PathBuf,
+        command: String,
+    },
 }
 
 pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCommand> {
@@ -71,6 +78,7 @@ pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCom
     match kind_of(command) {
         Some(TerminalKind::Ghostty) => parse_ghostty_host(rest),
         Some(TerminalKind::Warp) => parse_warp_host(rest),
+        Some(TerminalKind::Tmux) => parse_tmux_host(rest),
         kind => parse_directory_host(command, kind, rest),
     }
 }
@@ -104,7 +112,7 @@ fn parse_directory_host(
         Some(TerminalKind::AppleTerminal) => Ok(HostCommand::AppleTerminal { directory }),
         Some(TerminalKind::WezTerm) => Ok(HostCommand::WezTerm { directory }),
         Some(TerminalKind::WindowsConsole) => Ok(HostCommand::Console { directory }),
-        Some(TerminalKind::Ghostty | TerminalKind::Warp) | None => {
+        Some(TerminalKind::Ghostty | TerminalKind::Warp | TerminalKind::Tmux) | None => {
             bail!("unknown native host command: {command}")
         }
     }
@@ -117,6 +125,24 @@ fn parse_ghostty_host(rest: &[String]) -> Result<HostCommand> {
         bail!("{GHOSTTY_HOST_COMMAND} takes no argument");
     }
     Ok(HostCommand::Ghostty)
+}
+
+// The pane host is only ever given the launch form: a tmux pane has no legacy host.
+fn parse_tmux_host(rest: &[String]) -> Result<HostCommand> {
+    let [_, flag, command] = rest else {
+        bail!(
+            "{TMUX_HOST_COMMAND} requires a session directory and {LAUNCH_COMMAND_FLAG} <command>"
+        );
+    };
+    if flag != LAUNCH_COMMAND_FLAG {
+        bail!(
+            "{TMUX_HOST_COMMAND} requires a session directory and {LAUNCH_COMMAND_FLAG} <command>"
+        );
+    }
+    Ok(HostCommand::Tmux {
+        directory: session_directory(TMUX_HOST_COMMAND, &rest[..1])?,
+        command: command.clone(),
+    })
 }
 
 fn parse_warp_host(rest: &[String]) -> Result<HostCommand> {
@@ -220,6 +246,17 @@ pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
             {
                 let _ = (directory, attempt);
                 bail!("the native Warp host is only available on macOS")
+            }
+        }
+        HostCommand::Tmux { directory, command } => {
+            #[cfg(target_os = "linux")]
+            {
+                super::linux::tmux::run_host(&directory, &command)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (directory, command);
+                bail!("the native tmux host is only available on Linux")
             }
         }
     }
@@ -337,6 +374,9 @@ mod tests {
                     Ok(HostCommand::Warp { directory, attempt }) => {
                         format!("host warp {} {attempt}", directory.display())
                     }
+                    Ok(HostCommand::Tmux { directory, command }) => {
+                        format!("host tmux {} {command}", directory.display())
+                    }
                     Err(error) => format!("refused: {error:#}"),
                 };
                 actual.push(
@@ -383,6 +423,20 @@ mod tests {
             "{WARP_HOST_COMMAND} [2] refused: native-warp-host requires a valid attempt token"
         );
         warp.push(format!("{WARP_HOST_COMMAND} [1] refused: {pair}"));
+        let form = "native-tmux-host requires a session directory and --launch-command <command>";
+        let tmux = vec![
+            format!("{TMUX_HOST_COMMAND} [3] host tmux <dir> script"),
+            format!("{TMUX_HOST_COMMAND} [2] refused: {form}"),
+            format!("{TMUX_HOST_COMMAND} [3] refused: {form}"),
+            format!("{TMUX_HOST_COMMAND} [4] refused: {form}"),
+            format!(
+                "{TMUX_HOST_COMMAND} [3] refused: {TMUX_HOST_COMMAND} requires an absolute session directory"
+            ),
+            format!(
+                "{TMUX_HOST_COMMAND} [3] refused: invalid Agent Bridge session id: \"invalid id\""
+            ),
+            format!("{TMUX_HOST_COMMAND} [1] refused: {form}"),
+        ];
         let expected: Vec<String> = [
             launch_host(ITERM2_HOST_COMMAND, "iterm2").to_vec(),
             directory_host(APPLE_TERMINAL_HOST_COMMAND, "apple-terminal"),
@@ -390,6 +444,7 @@ mod tests {
             warp,
             launch_host(WEZTERM_HOST_COMMAND, "wezterm").to_vec(),
             directory_host(CONSOLE_HOST_COMMAND, "windows-console"),
+            tmux,
         ]
         .concat();
         assert_eq!(actual, expected);
@@ -449,6 +504,11 @@ mod tests {
                     "0123456789abcdef0123456789abcdef",
                 ],
                 "the native Warp host is only available on macOS",
+            ),
+            #[cfg(not(target_os = "linux"))]
+            (
+                vec![TMUX_HOST_COMMAND, directory, "--launch-command", "script"],
+                "the native tmux host is only available on Linux",
             ),
         ];
         for (args, expected) in cases {

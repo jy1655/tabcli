@@ -78,6 +78,31 @@ pub(in crate::native) fn process_birth(pid: u32) -> Result<Option<LinuxBirth>> {
         starttime_ticks: stat.ticks,
     }))
 }
+/// No process created after this call has an earlier birth: this boot, and the current
+/// CLOCK_BOOTTIME in the clock ticks of procfs starttime, which the kernel floors from the
+/// same boot-based clock.
+pub(in crate::native) fn creation_floor() -> Result<LinuxBirth> {
+    let boot_id = boot_id()?;
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("could not read CLOCK_BOOTTIME");
+    }
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    anyhow::ensure!(
+        ticks_per_second > 0,
+        "could not read the procfs clock tick rate"
+    );
+    let nanoseconds = u128::try_from(now.tv_sec)? * 1_000_000_000 + u128::try_from(now.tv_nsec)?;
+    Ok(LinuxBirth {
+        boot_id,
+        starttime_ticks: u64::try_from(
+            nanoseconds * u128::try_from(ticks_per_second)? / 1_000_000_000,
+        )?,
+    })
+}
 pub(in crate::native) fn live_native_process_identity(pid: u32) -> Result<NativeProcessIdentity> {
     live_native_process_identity_if_present(pid)?.context("native-session process is absent")
 }
@@ -208,6 +233,23 @@ mod tests {
         }
         assert!(std::str::from_utf8(expected).is_err());
         assert!(process_birth(child.0.id()).unwrap().is_some());
+    }
+    #[test]
+    fn creation_floor_bounds_the_birth_of_later_processes_only() {
+        let own = process_birth(std::process::id()).unwrap().unwrap();
+        let floor = creation_floor().unwrap();
+        assert_eq!(floor.boot_id, own.boot_id);
+        assert!(floor.starttime_ticks >= own.starttime_ticks);
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let birth = process_birth(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let birth = birth.unwrap().unwrap();
+        assert_eq!(birth.boot_id, floor.boot_id);
+        assert!(birth.starttime_ticks >= floor.starttime_ticks);
     }
     #[test]
     fn real_procfs_birth_does_not_require_a_tty() {

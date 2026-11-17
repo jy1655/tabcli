@@ -2,7 +2,6 @@
 //! Linux adds an adapter by implementing `PosixTerminalAdapter` and returning it from
 //! `linux::Installed::adapter`. Kind registration remains in that kind's facts.rs.
 //! Creation policy is macOS-local: Linux neither accepts it nor reads its setting.
-#![cfg_attr(target_os = "linux", allow(dead_code))] // Phase 1 installs no Linux adapter.
 use super::{
     CloseOutcome, GuardedDialogInput, TerminalKind, TerminalSendFailure, TerminalSendResult,
     TerminalSession,

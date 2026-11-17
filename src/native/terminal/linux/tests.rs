@@ -182,17 +182,31 @@ fn creation_proven_host_close_is_independent_of_owner_and_intents() {
     );
 }
 #[test]
-fn no_adapter_creation_is_explicitly_unsupported() {
+fn linux_selects_tmux_and_refuses_every_other_kind() {
+    use super::super::TerminalKind;
     use crate::native::failure_kind::{FailureKind, classify};
+    assert_eq!(select(None).unwrap(), TerminalKind::Tmux);
     assert_eq!(
-        classify(&select(None).unwrap_err()),
-        Some(FailureKind::Unsupported)
+        select(Some(TerminalKind::Tmux)).unwrap(),
+        TerminalKind::Tmux
     );
-    assert!(
-        INSTALLED
-            .adapter(super::super::TerminalKind::Iterm2)
-            .is_err()
-    );
+    assert!(INSTALLED.adapter(TerminalKind::Tmux).is_ok());
+    for kind in TerminalKind::ALL {
+        if kind == TerminalKind::Tmux {
+            continue;
+        }
+        let error = select(Some(kind)).unwrap_err();
+        assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} is not available on Linux; use tmux",
+                kind.display_name()
+            )
+        );
+        let error = INSTALLED.adapter(kind).err().unwrap();
+        assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+    }
 }
 #[test]
 fn real_private_pty_owner_and_shell_are_attested() {

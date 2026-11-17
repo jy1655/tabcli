@@ -61,6 +61,7 @@
     "terminal_record",
     "terminal_selection",
     "terminal_surface",
+    "tmux",
     "turn",
     "workspace",
     "workspace_consent"
@@ -213,6 +214,9 @@
     "terminal_surface_unverified",
     "terminal_tombstone_unreadable",
     "terminal_unsupported",
+    "tmux_found",
+    "tmux_too_old",
+    "tmux_unavailable",
     "turn_in_progress",
     "version_probe_failed",
     "version_supported",

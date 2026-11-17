@@ -380,6 +380,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         contract: None,
         failure: None,
     },
+    CommandSpec {
+        name: terminal::host::TMUX_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
+        contract: None,
+        failure: None,
+    },
 ];
 
 pub(crate) fn is_command(value: &str) -> bool {

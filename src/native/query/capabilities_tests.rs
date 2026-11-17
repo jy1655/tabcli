@@ -265,6 +265,7 @@ fn write_handle(directory: &Path, kind: terminal::TerminalKind, session: Option<
         &directory.join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind,
             id: "4242".to_owned(),
             tab_id: None,

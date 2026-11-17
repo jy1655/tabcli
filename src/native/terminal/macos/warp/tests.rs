@@ -598,6 +598,7 @@ fn fixture() -> (tempfile::TempDir, ControlClient, String) {
 fn session() -> TerminalSession {
     TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind: TerminalKind::Warp,
         id: "instance-1".into(),
         tab_id: Some("new-tab".into()),

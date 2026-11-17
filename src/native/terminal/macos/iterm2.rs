@@ -326,6 +326,7 @@ fn create_tab(
     }
     Ok(TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind: TerminalKind::Iterm2,
         id,
         tab_id: None,
@@ -2348,6 +2349,7 @@ end run
         );
         let surface = |kind, id: &str| TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind,
             id: id.into(),
             tab_id: None,

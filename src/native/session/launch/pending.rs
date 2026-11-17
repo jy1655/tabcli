@@ -102,7 +102,6 @@ pub(in crate::native) fn judge(
 /// context; a handle of another Session fails with the binding's own error. The caller
 /// judges the kind and whether the surface names its host.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 pub(in crate::native) fn bound_surface<C>(
     reader: &Reader,
     session_id: &str,

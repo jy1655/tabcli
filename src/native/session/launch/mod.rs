@@ -117,7 +117,6 @@ impl Record {
 /// represent is the furthest one short of it that it can. The macOS launch host and binding
 /// wait use it.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 pub(in crate::native) fn saturating_deadline(now: Instant, remaining: Option<Duration>) -> Instant {
     let remaining = remaining.unwrap_or(Duration::from_millis(u64::MAX));
     if let Some(deadline) = now.checked_add(remaining) {
@@ -147,7 +146,6 @@ pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
 
 /// Adapters declare binding diagnostics and budget; the shared wait owns observation order.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 pub(in crate::native) struct BindingFacts {
     pub(in crate::native) host: &'static str,
     pub(in crate::native) cancelled: &'static str,
@@ -155,8 +153,9 @@ pub(in crate::native) struct BindingFacts {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 pub(in crate::native) enum BindingBudget {
+    // Only macOS kinds measure their binding from the start timeout.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     StartTimeout,
     RemainingReceiptCapped,
 }
@@ -165,7 +164,6 @@ pub(in crate::native) enum BindingBudget {
 /// unlocked observation, not authorization to spawn; `spawn` owns that final fence. The
 /// budget and every retry read `clock`; the host passes the system clock.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Used by the Phase 2 host.
 pub(in crate::native) fn wait_for_binding(
     reader: &Reader,
     session_id: &str,
@@ -925,6 +923,10 @@ where
     F: FnOnce(&mut Child) -> Result<()>,
 {
     let directory = store.directory();
+    // An exec Linux would refuse is refused here, before the launch phase moves.
+    #[cfg(target_os = "linux")]
+    crate::native::provider_process::linux_exec_budget(command)
+        .context("provider launch was refused before spawn")?;
     let _lock = Store::open_unchecked(directory).lock()?;
     let mut record = read(store)?;
     check_spawn_locked(store, record.as_ref())?;
@@ -1901,6 +1903,7 @@ mod host_decision_tests {
     fn surface() -> terminal::TerminalSession {
         terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "unused".into(),
             tab_id: None,

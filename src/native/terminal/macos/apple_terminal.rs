@@ -257,6 +257,7 @@ fn create_tab(
     }
     Ok(TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind: TerminalKind::AppleTerminal,
         id: id.unwrap().to_owned(),
         tab_id: None,
@@ -1628,6 +1629,7 @@ end mockClose
     fn terminal_disappearing_after_send_ownership_proof_is_delivery_uncertain() {
         let session = TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: TerminalKind::AppleTerminal,
             id: TTY.into(),
             window_id: Some(WINDOW.into()),

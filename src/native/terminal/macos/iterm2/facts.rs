@@ -14,8 +14,6 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     },
     host_command: "native-iterm2-host",
     launch_host: Some(LaunchHostFacts {
-        #[cfg(target_os = "linux")]
-        binding_names_host: |_| false,
         #[cfg(target_os = "macos")]
         binding_names_host: crate::native::terminal::macos::iterm2::binding_names_this_host,
     }),

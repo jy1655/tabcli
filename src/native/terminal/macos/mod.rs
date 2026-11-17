@@ -93,6 +93,7 @@ where
             TerminalKind::WindowsConsole => bail!(Unsupported::new(
                 "Windows Console is only available on Windows"
             )),
+            TerminalKind::Tmux => bail!(Unsupported::new("tmux is only available on Linux")),
         }
     }
 }
@@ -369,6 +370,7 @@ mod adapter_tests {
     fn handle(kind: TerminalKind) -> TerminalSession {
         TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind,
             id: "surface".into(),
             tab_id: None,

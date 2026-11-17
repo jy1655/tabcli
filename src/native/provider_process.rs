@@ -314,6 +314,127 @@ pub(in crate::native) fn windows_command_path(path: &Path) -> OsString {
         .map_or_else(|| path.as_os_str().to_owned(), OsString::from)
 }
 
+/// Linux refuses an exec when one argument or environment string, with its NUL, is longer
+/// than MAX_ARG_STRLEN (32 pages), or when all of them with their pointers exceed ARG_MAX.
+/// Measured in bytes before the spawn, so that a refusal is known to have run nothing.
+#[cfg(target_os = "linux")]
+pub(in crate::native) fn linux_exec_budget(command: &Command) -> anyhow::Result<()> {
+    linux_exec_budget_with(
+        command,
+        std::env::vars_os(),
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
+        unsafe { libc::sysconf(libc::_SC_ARG_MAX) },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_exec_budget_with(
+    command: &Command,
+    inherited: impl Iterator<Item = (OsString, OsString)>,
+    page_size: libc::c_long,
+    arg_max: libc::c_long,
+) -> anyhow::Result<()> {
+    use anyhow::{bail, ensure};
+    ensure!(
+        page_size > 0 && arg_max > 0,
+        "could not read the Linux exec limits"
+    );
+    let string_limit = usize::try_from(page_size)? * 32;
+    let arg_max = usize::try_from(arg_max)?;
+    let mut environment: std::collections::BTreeMap<OsString, OsString> = inherited.collect();
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => environment.insert(name.to_owned(), value.to_owned()),
+            None => environment.remove(name),
+        };
+    }
+    let mut total = 0;
+    let mut strings = 0;
+    for argument in std::iter::once(command.get_program()).chain(command.get_args()) {
+        let bytes = argument.len() + 1;
+        if bytes > string_limit {
+            bail!(
+                "the provider command has an argument of {bytes} bytes; Linux refuses one longer than {string_limit} bytes. Shorten the prompt and pass long material by path in the workspace; nothing was sent"
+            );
+        }
+        total += bytes;
+        strings += 1;
+    }
+    for (name, value) in &environment {
+        let bytes = name.len() + value.len() + 2;
+        if bytes > string_limit {
+            bail!(
+                "the provider environment variable {} is {bytes} bytes; Linux refuses one longer than {string_limit} bytes; nothing was sent",
+                name.to_string_lossy()
+            );
+        }
+        total += bytes;
+        strings += 1;
+    }
+    total += (strings + 2) * std::mem::size_of::<usize>();
+    if total > arg_max {
+        bail!(
+            "the provider command and environment take {total} bytes; Linux refuses more than {arg_max} bytes. Shorten the prompt and pass long material by path in the workspace; nothing was sent"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_exec_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_budget_refuses_exactly_what_the_kernel_refuses() {
+        let limit = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize * 32;
+        for (length, refused) in [(limit - 1, false), (limit, true)] {
+            let mut command = Command::new("/bin/true");
+            command.arg("x".repeat(length));
+            let budget = linux_exec_budget(&command);
+            assert_eq!(budget.is_err(), refused, "{length}");
+            // The kernel agrees: an over-long argument is E2BIG before anything runs.
+            let spawned = command.status();
+            assert_eq!(
+                spawned
+                    .as_ref()
+                    .err()
+                    .and_then(std::io::Error::raw_os_error),
+                refused.then_some(libc::E2BIG),
+                "{length}: {spawned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_budget_counts_the_effective_environment_and_the_total() {
+        let inherited = || {
+            vec![
+                (OsString::from("KEEP"), OsString::from("v")),
+                (OsString::from("BIG"), OsString::from("y".repeat(200))),
+            ]
+            .into_iter()
+        };
+        let mut command = Command::new("/bin/true");
+        command.env("SET", "z".repeat(150));
+        let error = linux_exec_budget_with(&command, inherited(), 4, 1 << 20).unwrap_err();
+        assert!(error.to_string().contains("BIG is 205 bytes"), "{error}");
+        command.env_remove("BIG");
+        let error = linux_exec_budget_with(&command, inherited(), 4, 1 << 20).unwrap_err();
+        assert!(error.to_string().contains("SET is 155 bytes"), "{error}");
+        command.env_remove("SET");
+        linux_exec_budget_with(&command, inherited(), 4, 1 << 20).unwrap();
+        // "/bin/true" + "KEEP=v", with three pointers more than its strings.
+        let needed = 10 + 7 + 4 * std::mem::size_of::<usize>();
+        linux_exec_budget_with(&command, inherited(), 4, needed as libc::c_long).unwrap();
+        let error = linux_exec_budget_with(&command, inherited(), 4, needed as libc::c_long - 1)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Linux refuses more than"),
+            "{error}"
+        );
+    }
+}
+
 /// First refused length, excluding the terminating NUL (CreateProcessW needs room for it).
 #[cfg(windows)]
 pub(super) const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;

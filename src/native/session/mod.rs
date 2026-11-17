@@ -621,8 +621,8 @@ impl RecordReader {
     pub(in crate::native) fn open(&self) -> std::io::Result<File> {
         OpenOptions::new().read(true).open(&self.path)
     }
-    // Read by the WezTerm and Windows paths; Linux has no managed surface that needs it.
-    #[cfg(any(target_os = "macos", windows))]
+    // Read by the WezTerm, tmux and Windows paths.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn raw_bytes(&self) -> std::io::Result<Vec<u8>> {
         fs::read(&self.path)
     }

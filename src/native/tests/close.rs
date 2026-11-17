@@ -101,6 +101,7 @@ fn already_closed_session_never_reuses_a_stale_terminal_handle() {
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "stale-iterm-session".to_owned(),
             tab_id: None,
@@ -143,6 +144,7 @@ fn explicit_close_routes_using_the_recorded_terminal_kind() {
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Ghostty,
             id: "ghostty-terminal".to_owned(),
             tab_id: Some("ghostty-tab".to_owned()),
@@ -178,6 +180,7 @@ fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind: terminal::TerminalKind::Iterm2,
             id: "closing-iterm-session".to_owned(),
             tab_id: None,
@@ -367,6 +370,7 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
 fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     let session = terminal::TerminalSession {
         linux_host: None,
+        tmux_socket: None,
         kind: if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
         } else {
@@ -628,6 +632,7 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
         let deadline = crate::native::session::close::budget::close_deadline();
         let surface = terminal::TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind,
             id: "missing-owned-surface".to_owned(),
             managed_session_id: Some(managed_session_id.to_owned()),

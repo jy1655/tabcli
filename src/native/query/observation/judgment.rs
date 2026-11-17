@@ -667,6 +667,7 @@ pub(in crate::native) mod tests {
     pub(in crate::native) fn handle(kind: TerminalKind, binding: Option<&str>) -> TerminalSession {
         TerminalSession {
             linux_host: None,
+            tmux_socket: None,
             kind,
             id: "surface-1".to_owned(),
             tab_id: None,

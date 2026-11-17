@@ -411,7 +411,7 @@ mod tests {
         let (public, hidden): (Vec<_>, Vec<_>) =
             native::COMMANDS.iter().partition(|entry| entry.is_public());
         assert_eq!(public.len(), 19);
-        assert_eq!(hidden.len(), 10);
+        assert_eq!(hidden.len(), 11);
         for entry in hidden {
             assert!(!advertised.contains(entry.name), "{}", entry.name);
         }
