@@ -445,9 +445,7 @@ where
                     "{error:#}; exact surface cleanup succeeded but its durable binding could not be removed: {unbind_error:#}"
                 )),
             },
-            Err(cleanup_error) => Err(anyhow::anyhow!(
-                "{error:#}; exact surface cleanup also failed: {cleanup_error:#}"
-            )),
+            Err(cleanup_error) => Err(cleanup_failure(error, cleanup_error)),
         };
     }
     if let Err(error) = start() {
@@ -458,12 +456,23 @@ where
                     "{error:#}; exact surface cleanup succeeded but its durable binding could not be removed: {unbind_error:#}"
                 )),
             },
-            Err(cleanup_error) => Err(anyhow::anyhow!(
-                "{error:#}; exact surface cleanup also failed: {cleanup_error:#}"
-            )),
+            Err(cleanup_error) => Err(cleanup_failure(error, cleanup_error)),
         };
     }
     Ok(())
+}
+
+// A cleanup that hands back its proven surface keeps that type, so that the launch failure
+// records the handle for a later close; any other cleanup failure is one line of text.
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+fn cleanup_failure(error: anyhow::Error, cleanup_error: anyhow::Error) -> anyhow::Error {
+    if cleanup_error
+        .downcast_ref::<RetainedLaunchSurface>()
+        .is_some()
+    {
+        return cleanup_error.context(format!("{error:#}; exact surface cleanup also failed"));
+    }
+    anyhow::anyhow!("{error:#}; exact surface cleanup also failed: {cleanup_error:#}")
 }
 
 pub(super) fn send_file(

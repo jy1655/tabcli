@@ -315,8 +315,9 @@ pub(in crate::native) fn windows_command_path(path: &Path) -> OsString {
 }
 
 /// Linux refuses an exec when one argument or environment string, with its NUL, is longer
-/// than MAX_ARG_STRLEN (32 pages), or when all of them with their pointers exceed ARG_MAX.
-/// Measured in bytes before the spawn, so that a refusal is known to have run nothing.
+/// than MAX_ARG_STRLEN (32 pages), or when all of its strings and pointers exceed the stack
+/// limit's share (fs/exec.c, `bprm_stack_limits`). Measured in bytes before the spawn, so
+/// that a refusal is known to have run nothing.
 #[cfg(target_os = "linux")]
 pub(in crate::native) fn linux_exec_budget(command: &Command) -> anyhow::Result<()> {
     linux_exec_budget_with(
@@ -327,6 +328,11 @@ pub(in crate::native) fn linux_exec_budget(command: &Command) -> anyhow::Result<
     )
 }
 
+/// The kernel's total: its copy of the file name, then every argument (argv[0] is the
+/// program) and environment string, each with its NUL, plus one pointer per argument (at
+/// least one) and per environment string. The limit is a quarter of the stack limit, which
+/// glibc reports as ARG_MAX, capped at three quarters of the 8 MiB default stack and never
+/// below 32 pages.
 #[cfg(target_os = "linux")]
 fn linux_exec_budget_with(
     command: &Command,
@@ -340,7 +346,9 @@ fn linux_exec_budget_with(
         "could not read the Linux exec limits"
     );
     let string_limit = usize::try_from(page_size)? * 32;
-    let arg_max = usize::try_from(arg_max)?;
+    let limit = usize::try_from(arg_max)?
+        .min(8 * 1024 * 1024 / 4 * 3)
+        .max(string_limit);
     let mut environment: std::collections::BTreeMap<OsString, OsString> = inherited.collect();
     for (name, value) in command.get_envs() {
         match value {
@@ -348,9 +356,10 @@ fn linux_exec_budget_with(
             None => environment.remove(name),
         };
     }
-    let mut total = 0;
-    let mut strings = 0;
-    for argument in std::iter::once(command.get_program()).chain(command.get_args()) {
+    let program = command.get_program();
+    let mut total = program.len() + 1;
+    let mut arguments = 0;
+    for argument in std::iter::once(program).chain(command.get_args()) {
         let bytes = argument.len() + 1;
         if bytes > string_limit {
             bail!(
@@ -358,7 +367,7 @@ fn linux_exec_budget_with(
             );
         }
         total += bytes;
-        strings += 1;
+        arguments += 1;
     }
     for (name, value) in &environment {
         let bytes = name.len() + value.len() + 2;
@@ -369,12 +378,11 @@ fn linux_exec_budget_with(
             );
         }
         total += bytes;
-        strings += 1;
     }
-    total += (strings + 2) * std::mem::size_of::<usize>();
-    if total > arg_max {
+    total += (arguments.max(1) + environment.len()) * std::mem::size_of::<usize>();
+    if total > limit {
         bail!(
-            "the provider command and environment take {total} bytes; Linux refuses more than {arg_max} bytes. Shorten the prompt and pass long material by path in the workspace; nothing was sent"
+            "the provider command and environment take {total} bytes; Linux refuses more than {limit} bytes. Shorten the prompt and pass long material by path in the workspace; nothing was sent"
         );
     }
     Ok(())
@@ -384,29 +392,68 @@ fn linux_exec_budget_with(
 mod linux_exec_budget_tests {
     use super::*;
 
-    #[test]
-    fn the_budget_refuses_exactly_what_the_kernel_refuses() {
-        let limit = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize * 32;
-        for (length, refused) in [(limit - 1, false), (limit, true)] {
-            let mut command = Command::new("/bin/true");
-            command.arg("x".repeat(length));
-            let budget = linux_exec_budget(&command);
-            assert_eq!(budget.is_err(), refused, "{length}");
-            // The kernel agrees: an over-long argument is E2BIG before anything runs.
-            let spawned = command.status();
-            assert_eq!(
-                spawned
-                    .as_ref()
-                    .err()
-                    .and_then(std::io::Error::raw_os_error),
-                refused.then_some(libc::E2BIG),
-                "{length}: {spawned:?}"
-            );
+    fn kernel_refuses(command: &mut Command) -> bool {
+        match command.status() {
+            Ok(_) => false,
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::E2BIG), "{error}");
+                true
+            }
         }
     }
 
     #[test]
-    fn the_budget_counts_the_effective_environment_and_the_total() {
+    fn one_string_is_refused_exactly_where_the_kernel_refuses_it() {
+        let limit = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize * 32;
+        for (length, refused) in [(limit - 1, false), (limit, true)] {
+            let mut command = Command::new("/bin/true");
+            command.arg("x".repeat(length));
+            assert_eq!(linux_exec_budget(&command).is_err(), refused, "{length}");
+            assert_eq!(kernel_refuses(&mut command), refused, "{length}");
+        }
+    }
+
+    // The arguments fill the total exactly, then by one byte more; the kernel decides both.
+    #[test]
+    fn the_total_is_refused_exactly_where_the_kernel_refuses_it() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let string_limit = page * 32;
+        let limit = (unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize)
+            .min(8 * 1024 * 1024 / 4 * 3)
+            .max(string_limit);
+        let pointer = std::mem::size_of::<usize>();
+        let environment: Vec<_> = std::env::vars_os().collect();
+        let program = "/bin/./true";
+        let fixed = (program.len() + 1) * 2
+            + environment
+                .iter()
+                .map(|(name, value)| name.len() + value.len() + 2)
+                .sum::<usize>();
+        let mut arguments: Vec<usize> = Vec::new();
+        loop {
+            let pointers = (arguments.len() + 2 + environment.len()) * pointer;
+            let room =
+                limit - fixed - arguments.iter().map(|bytes| bytes + 1).sum::<usize>() - pointers;
+            if room > string_limit {
+                arguments.push(string_limit - 1);
+            } else {
+                arguments.push(room - 1);
+                break;
+            }
+        }
+        for extra in [0, 1] {
+            let mut command = Command::new(program);
+            let last = arguments.len() - 1;
+            for (index, bytes) in arguments.iter().enumerate() {
+                command.arg("x".repeat(bytes + if index == last { extra } else { 0 }));
+            }
+            assert_eq!(linux_exec_budget(&command).is_err(), extra == 1, "{extra}");
+            assert_eq!(kernel_refuses(&mut command), extra == 1, "{extra}");
+        }
+    }
+
+    #[test]
+    fn the_budget_counts_the_effective_environment() {
         let inherited = || {
             vec![
                 (OsString::from("KEEP"), OsString::from("v")),
@@ -423,15 +470,6 @@ mod linux_exec_budget_tests {
         assert!(error.to_string().contains("SET is 155 bytes"), "{error}");
         command.env_remove("SET");
         linux_exec_budget_with(&command, inherited(), 4, 1 << 20).unwrap();
-        // "/bin/true" + "KEEP=v", with three pointers more than its strings.
-        let needed = 10 + 7 + 4 * std::mem::size_of::<usize>();
-        linux_exec_budget_with(&command, inherited(), 4, needed as libc::c_long).unwrap();
-        let error = linux_exec_budget_with(&command, inherited(), 4, needed as libc::c_long - 1)
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("Linux refuses more than"),
-            "{error}"
-        );
     }
 }
 

@@ -23,6 +23,9 @@ pub(super) fn inspect_inner(id: &str, json: bool) -> Result<()> {
             value["owner_process_alive"], value["recovery_required"]
         );
         println!("held: {}", value["held"]);
+        if let Some(attach) = value["attach_command"].as_str() {
+            println!("attach: {}", terminal_safe_text(attach, false));
+        }
         if let Some(error) = value["hold_error"].as_str() {
             println!("hold error: {}", terminal_safe_text(error, true));
         }

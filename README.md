@@ -184,7 +184,8 @@ Download the archive for your platform and its matching `.sha256` file from
 [GitHub Releases](https://github.com/jy1655/tabcli/releases). Prebuilt archives need no Rust:
 `tabcli-<version>-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS, or
 `tabcli-<version>-x86_64-pc-windows-msvc.zip` for x64 Windows.
-The release includes a Linux x86_64 archive.
+From 0.4.43, releases also include `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz` for
+x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04 or later).
 
 For version 0.4.42, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:

@@ -440,14 +440,16 @@ fn only_a_failure_before_the_paste_started_is_not_sent() {
     let failure = send_file(&host, &handle(), &path, deadline()).unwrap_err();
     assert!(!failure.delivery_may_have_occurred());
 
-    // The paste started and failed: the pane may have the input; nothing is replayed.
+    // The paste started and failed: the pane may have the input; nothing is replayed, and
+    // only the buffer is deleted.
     let host = Fake::new()
         .reply("list-panes", Reply::Out(ONE_PANE))
         .reply("load-buffer", Reply::Out(""))
-        .reply("paste-buffer", Reply::Failed("can't find pane: %0"));
+        .reply("paste-buffer", Reply::Failed("can't find pane: %0"))
+        .reply("delete-buffer", Reply::Out(""));
     let failure = send_file(&host, &handle(), &path, deadline()).unwrap_err();
     assert!(failure.delivery_may_have_occurred());
-    assert_eq!(host.commands().len(), 3);
+    assert_eq!(host.commands().len(), 4);
 }
 
 #[test]
@@ -825,4 +827,125 @@ fn a_real_tmux_server_is_created_proven_written_read_and_ended() {
     assert!(!socket.exists());
     assert!(!surface_present(&host, &session, Duration::from_secs(5)).unwrap());
     assert_eq!(ended().unwrap(), CloseOutcome::Missing);
+}
+
+#[test]
+fn the_launch_bash_runs_no_startup_file_but_keeps_bash_env_for_the_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let startup = root.path().join("startup.sh");
+    let ran = root.path().join("ran");
+    let seen = root.path().join("seen");
+    std::fs::write(&startup, format!("touch '{}'\n", ran.display())).unwrap();
+    let command = format!("printf '%s' \"$BASH_ENV\" > '{}'", seen.display());
+    let script = bash_script(&command, Some(startup.as_os_str()));
+    let BashScript::WithoutStartupFile(script) = script else {
+        panic!("{script:?}")
+    };
+    let status = Command::new("/bin/bash")
+        .env("BASH_ENV", &startup)
+        .env_remove("BASH_ENV")
+        .args(["--noprofile", "--norc", "-m", "-c", &script])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!ran.exists(), "BASH_ENV ran before the launch command");
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap(),
+        startup.to_str().unwrap()
+    );
+    assert_eq!(bash_script("cmd", None), BashScript::Plain("cmd".into()));
+    use std::os::unix::ffi::OsStrExt;
+    assert_eq!(
+        bash_script("cmd", Some(OsStr::from_bytes(b"/x\xff"))),
+        BashScript::WithoutStartupFile("cmd".into())
+    );
+}
+
+#[test]
+fn a_delivery_keeps_time_to_delete_its_buffer_after_any_failed_paste() {
+    let (_root, path) = prompt();
+    // Too short to keep the reserve: nothing is loaded.
+    let host = Fake::new();
+    let failure = send_file(
+        &host,
+        &handle(),
+        &path,
+        Instant::now() + Duration::from_millis(500),
+    )
+    .unwrap_err();
+    assert!(!failure.delivery_may_have_occurred());
+    assert!(host.commands().is_empty());
+    // A started paste that failed (the pane went away) still deletes the request's buffer.
+    let host = Fake::new()
+        .reply("list-panes", Reply::Out(ONE_PANE))
+        .reply("load-buffer", Reply::Out(""))
+        .reply("paste-buffer", Reply::Failed("can't find pane: %0"))
+        .reply("delete-buffer", Reply::Out(""));
+    let failure = send_file(&host, &handle(), &path, deadline()).unwrap_err();
+    assert!(failure.delivery_may_have_occurred());
+    let commands = host.commands();
+    let buffer = commands[1].split(' ').nth(3).unwrap();
+    assert_eq!(
+        commands[3],
+        format!("{} delete-buffer -b {buffer}", socket().display())
+    );
+}
+
+#[test]
+fn a_server_is_not_signalled_once_the_close_deadline_has_passed() {
+    let host = Fake::new();
+    let error = end_server(&host, &handle(), Instant::now()).unwrap_err();
+    assert!(
+        error.to_string().contains("close deadline expired"),
+        "{error:#}"
+    );
+    assert!(host.server.log.borrow().is_empty());
+    assert!(host.forgotten.borrow().is_empty());
+}
+
+#[test]
+fn a_failed_bind_whose_server_does_not_end_retains_the_proven_server() {
+    let host = Fake::new()
+        .reply("-V", Reply::Out(VERSION))
+        .reply("new-session", Reply::Out(CREATED))
+        .reply("list-sessions", Reply::Out(ONE_SESSION))
+        .reply("list-panes", Reply::Out(ONE_PANE));
+    host.server.exits_on_term.set(false);
+    let adapter = Adapter::with_host(host);
+    let error = adapter
+        .open_bound_tab(
+            "cmd",
+            &directory(),
+            deadline(),
+            Box::new(|_: &mut TerminalSession| bail!("bind failed")),
+            Box::new(|| panic!("an unconfirmed cleanup keeps its binding")),
+        )
+        .unwrap_err();
+    let retained = error
+        .downcast_ref::<RetainedLaunchSurface>()
+        .expect("the proven server is handed back");
+    assert_eq!(retained.surface.linux_host, handle().linux_host);
+    assert_eq!(retained.surface.tmux_socket, handle().tmux_socket);
+    assert!(
+        format!("{error:#}").starts_with("bind failed; exact surface cleanup also failed: "),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn only_a_socket_nothing_listens_on_is_forgotten() {
+    let root = tempfile::Builder::new()
+        .prefix("tmx")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let path = root.path().join(SOCKET_FILE);
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    Installed.forget_socket(&path);
+    assert!(path.exists(), "a listening socket belongs to a live server");
+    drop(listener);
+    Installed.forget_socket(&path);
+    assert!(!path.exists());
+    std::fs::write(&path, "not a socket").unwrap();
+    Installed.forget_socket(&path);
+    assert!(path.exists());
 }

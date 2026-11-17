@@ -107,7 +107,8 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 ## 설치
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`을 사용합니다.
-릴리스에는 Linux x86_64 압축 파일도 포함됩니다.
+0.4.43부터는 glibc 2.39 이상(Ubuntu 24.04 이상)의 x86_64 Linux용
+`tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz`도 릴리스에 포함됩니다.
 
 0.4.42 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 

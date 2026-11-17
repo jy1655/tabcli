@@ -53,6 +53,8 @@ pub(in crate::native) const MINIMUM_VERSION: (u32, u32) = (3, 2);
 /// `sizeof(sockaddr_un.sun_path)` on Linux, the terminating NUL included.
 const SUN_PATH: usize = 108;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Kept back from a delivery's timeout, so that a failed delivery can still delete its buffer.
+const BUFFER_CLEANUP_RESERVE: Duration = Duration::from_secs(1);
 const CREATED_FORMAT: &str = "#{pid}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{socket_path}";
 const PANE_FORMAT: &str = "#{pid}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{pane_tty}";
 const SESSION_FORMAT: &str = "#{pid}\t#{session_id}";
@@ -76,7 +78,8 @@ pub(super) trait Host {
     fn server(&self, pid: u32, birth: LinuxBirth) -> Result<Option<Box<dyn Server>>>;
     /// Whether anything exists at this path (a symlink is not followed).
     fn path_exists(&self, path: &Path) -> Result<bool>;
-    /// Removes the socket file of a server proven gone; anything else stays.
+    /// Removes the socket file of a server proven gone, when nothing listens on it: a server
+    /// that has taken the path since keeps its socket. Anything else stays.
     fn forget_socket(&self, socket: &Path);
     /// This Bridge executable, which the pane runs as its host.
     fn bridge_executable(&self) -> Result<PathBuf>;
@@ -142,7 +145,11 @@ impl Host for Installed {
         }
     }
     fn forget_socket(&self, socket: &Path) {
+        // A stale socket left behind is inert: every operation proves the recorded server
+        // first, and the session directory is removed with the session.
         if std::fs::symlink_metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
+            && std::os::unix::net::UnixStream::connect(socket)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
         {
             let _ = std::fs::remove_file(socket);
         }
@@ -653,6 +660,7 @@ fn end_server(
         host.forget_socket(socket);
         return Ok(CloseOutcome::Missing);
     }
+    crate::native::session::close::budget::close_remaining(deadline)?;
     server.terminate()?;
     if !server.exited_by(deadline)? {
         bail!(
@@ -666,21 +674,26 @@ fn end_server(
 
 // The prompt and its submit are one buffer, pasted raw into exactly this pane. Only a
 // failure before the paste started is known not to have reached the pane; nothing is
-// replayed after that.
+// replayed after that. The buffer holds prompt text, so every failed path deletes it in
+// time kept back for that.
 pub(super) fn send_file(
     host: &dyn Host,
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
 ) -> TerminalSendResult {
-    let (target, input) = (|| -> Result<_> {
+    let (target, input, send_deadline) = (|| -> Result<_> {
+        let send_deadline = deadline
+            .checked_sub(BUFFER_CLEANUP_RESERVE)
+            .filter(|candidate| *candidate > Instant::now())
+            .context("the delivery timeout leaves no room to remove its tmux buffer")?;
         let target = Target::of(session)?;
         let mut input = RecordReader::at(prompt_path)
             .raw_bytes()
             .context("failed to read the prompt")?;
         input.push(b'\r');
-        require_pane(host, &target, deadline)?;
-        Ok((target, input))
+        require_pane(host, &target, send_deadline)?;
+        Ok((target, input, send_deadline))
     })()
     .map_err(TerminalSendFailure::not_sent)?;
     let buffer = buffer_name();
@@ -706,7 +719,7 @@ pub(super) fn send_file(
             OsStr::new("-"),
         ],
         Some(&input),
-        deadline,
+        send_deadline,
     ) {
         delete();
         return Err(TerminalSendFailure::not_sent(failure.into_error()));
@@ -724,14 +737,15 @@ pub(super) fn send_file(
             OsStr::new(target.pane),
         ],
         None,
-        deadline,
+        send_deadline,
     )
     .map(|_| ())
     .map_err(|failure| {
+        // A failed paste can return before tmux deletes the buffer (`-d`).
+        delete();
         if failure.process_started() {
             TerminalSendFailure::delivery_uncertain(failure.into_error())
         } else {
-            delete();
             TerminalSendFailure::not_sent(failure.into_error())
         }
     })
@@ -764,16 +778,12 @@ pub(super) fn surface_present(
     session: &TerminalSession,
     timeout: Duration,
 ) -> Result<bool> {
+    let deadline = super::super::posix::timeout_deadline(timeout)?;
     let target = Target::of(session)?;
     if !target.server_live(host)? {
         return Ok(false);
     }
-    Ok(listed_pane(
-        host,
-        &target,
-        super::super::posix::timeout_deadline(timeout)?,
-    )?
-    .is_some())
+    Ok(listed_pane(host, &target, deadline)?.is_some())
 }
 
 /// The visible rows of the pane: what the application drew, also while a viewer scrolls in
@@ -835,7 +845,20 @@ impl<H: Host> PosixTerminalAdapter for Adapter<H> {
             |startup_deadline| create(&self.host, command, directory, startup_deadline),
             // The pane's host waits for the binding above; nothing is typed.
             |_, _| Ok(()),
-            |session, deadline| end_server(&self.host, session, deadline).map(|_| ()),
+            // A server whose end is not confirmed is handed back with its proven identity.
+            |session, deadline| {
+                end_server(&self.host, session, deadline)
+                    .map(|_| ())
+                    .map_err(|cleanup| {
+                        RetainedLaunchSurface::new(
+                            session.clone(),
+                            format!(
+                                "the tmux server this launch started was not confirmed ended: {cleanup:#}"
+                            ),
+                        )
+                        .into()
+                    })
+            },
             bind,
             unbind,
         )
@@ -941,6 +964,29 @@ fn binding_names_host(
         && pane == Some(OsStr::new(target.pane))
 }
 
+/// What bash runs. A non-interactive bash runs the file named by `BASH_ENV` before its
+/// command, which `--noprofile --norc` does not stop; the launch must not run it, but the
+/// provider keeps the variable, so the script exports it again. A value that is not UTF-8
+/// cannot be quoted exactly and is dropped.
+#[derive(Debug, Eq, PartialEq)]
+enum BashScript {
+    Plain(String),
+    WithoutStartupFile(String),
+}
+
+fn bash_script(command: &str, bash_env: Option<&OsStr>) -> BashScript {
+    match bash_env {
+        None => BashScript::Plain(command.to_owned()),
+        Some(value) => BashScript::WithoutStartupFile(match value.to_str() {
+            Some(_) => format!(
+                "export BASH_ENV={}\n{command}",
+                crate::native::terminal::shell_quote(value)
+            ),
+            None => command.to_owned(),
+        }),
+    }
+}
+
 /// The pane program: admitted, bound to exactly this pane and server, its startup input
 /// discarded, it becomes bash running the launch command with job control, so that the
 /// command leads its own foreground process group on the pane's terminal. bash reads no
@@ -973,9 +1019,17 @@ pub(in crate::native) fn run_host(directory: &Path, command: &str) -> Result<()>
         );
         return Err(error);
     }
-    let error = Command::new("/bin/bash")
-        .arg0("bash")
-        .args(["--noprofile", "--norc", "-m", "-c", command])
+    let mut bash = Command::new("/bin/bash");
+    bash.arg0("bash");
+    let script = match bash_script(command, std::env::var_os("BASH_ENV").as_deref()) {
+        BashScript::Plain(script) => script,
+        BashScript::WithoutStartupFile(script) => {
+            bash.env_remove("BASH_ENV");
+            script
+        }
+    };
+    let error = bash
+        .args(["--noprofile", "--norc", "-m", "-c", &script])
         .exec();
     let error = anyhow::Error::new(error).context("could not start bash for the tmux launch");
     crate::native::session::launch::log(
