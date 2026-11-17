@@ -22,8 +22,11 @@ use windows_sys::Win32::{
 };
 
 pub(in crate::native) fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
-    let sid = process_user_sid()?;
-    apply_private_dacl(path, &private_sddl(&sid, directory))
+    use crate::native::session::primitives::io_stats::{Op, timed};
+    timed(Op::Dacl, || {
+        let sid = process_user_sid()?;
+        apply_private_dacl(path, &private_sddl(&sid, directory))
+    })
 }
 
 // CreateProcess (and thus the former whoami subprocess) uses the process's primary

@@ -181,7 +181,7 @@ pub(in crate::native) fn record_sync(kind: SyncKind, path: &Path) {
 
 pub(in crate::native) fn sync_file(file: &File, path: &Path) -> Result<()> {
     record_sync(SyncKind::File, path);
-    file.sync_all()
+    super::io_stats::flush(super::io_stats::Op::FileFlush, || file.sync_all())
         .with_context(|| format!("failed to sync {}", path.display()))
 }
 
@@ -316,7 +316,9 @@ pub(in crate::native) fn sync_directory(directory: &Path) -> Result<()> {
 
 #[cfg(unix)]
 pub(in crate::native) fn sync_directory_entries(directory: &Path) -> Result<()> {
-    File::open(directory)?.sync_all()?;
+    use super::io_stats::{Op, flush, timed};
+    let handle = timed(Op::DirectoryOpen, || File::open(directory))?;
+    flush(Op::DirectoryFlush, || handle.sync_all())?;
     Ok(())
 }
 
@@ -328,11 +330,14 @@ pub(in crate::native) fn sync_directory_entries(directory: &Path) -> Result<()> 
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(directory)?
-        .sync_all()?;
+    use super::io_stats::{Op, flush, timed};
+    let handle = timed(Op::DirectoryOpen, || {
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+    })?;
+    flush(Op::DirectoryFlush, || handle.sync_all())?;
     Ok(())
 }
 

@@ -2,6 +2,7 @@
 use super::*;
 
 mod durable;
+pub(in crate::native) mod io_stats;
 mod locks;
 mod state_root;
 

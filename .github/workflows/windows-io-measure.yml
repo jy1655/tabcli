@@ -1,0 +1,109 @@
+# Temporary measurement for the Windows CI duration investigation; not for merge.
+# Each job builds the tests once and runs the unchanged serial suite four times on one
+# runner: fixture temp on the default TEMP or on the workspace drive, each with real
+# flushes or with flushes skipped in the test build. The two jobs use opposite orders.
+name: Windows test I/O measurement
+
+on:
+  push:
+    branches: [measure/windows-test-io]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [forward, reverse]
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      ORDER: ${{ matrix.order }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install stable Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Record runner environment
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'io-measure'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $report = Join-Path $root 'environment.txt'
+          & {
+            "ORDER=$env:ORDER"
+            "TEMP=$env:TEMP"
+            "TMP=$env:TMP"
+            "RUNNER_TEMP=$env:RUNNER_TEMP"
+            "GITHUB_WORKSPACE=$env:GITHUB_WORKSPACE"
+            "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+            "rust temp_dir drive: $((Get-Item $env:TEMP).PSDrive.Name)"
+            "runner temp drive: $((Get-Item $env:RUNNER_TEMP).PSDrive.Name)"
+            Get-CimInstance Win32_Processor | Format-List Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Out-String
+            Get-Volume | Format-Table DriveLetter, FileSystem, FileSystemLabel, DriveType, Size, SizeRemaining -AutoSize | Out-String -Width 200
+            Get-PhysicalDisk | Format-Table DeviceId, FriendlyName, MediaType, BusType, Size -AutoSize | Out-String -Width 200
+            Get-Partition | Format-Table DiskNumber, PartitionNumber, DriveLetter, Size -AutoSize | Out-String -Width 200
+            try {
+              Get-MpComputerStatus | Format-List AMRunningMode, AntivirusEnabled, RealTimeProtectionEnabled, OnAccessProtectionEnabled, BehaviorMonitorEnabled | Out-String
+              Get-MpPreference | Format-List DisableRealtimeMonitoring, ExclusionPath | Out-String
+            } catch { "Defender query failed: $_" }
+            fsutil fsinfo volumeinfo C: | Out-String
+            fsutil fsinfo volumeinfo D: | Out-String
+            fsutil behavior query disablelastaccess | Out-String
+            fsutil behavior query disable8dot3 | Out-String
+          } *>&1 | Tee-Object -FilePath $report
+      - name: Build tests once
+        shell: pwsh
+        run: cargo test --all-targets --all-features --no-run
+      - name: Run the serial suite in four arms
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'io-measure'
+          $defaultTemp = $env:TEMP
+          $defaultTmp = $env:TMP
+          $arms = @('baseline', 'temp-workspace-drive', 'skip-flush', 'temp-workspace-drive-skip-flush')
+          if ($env:ORDER -eq 'reverse') { [array]::Reverse($arms) }
+          $results = @()
+          foreach ($arm in $arms) {
+            $armDir = Join-Path $root $arm
+            New-Item -ItemType Directory -Force -Path $armDir | Out-Null
+            if ($arm -like 'temp-workspace-drive*') {
+              $temp = Join-Path $env:RUNNER_TEMP "fixture-temp-$arm"
+              New-Item -ItemType Directory -Force -Path $temp | Out-Null
+              $env:TEMP = $temp
+              $env:TMP = $temp
+            } else {
+              $env:TEMP = $defaultTemp
+              $env:TMP = $defaultTmp
+            }
+            if ($arm -like '*skip-flush') { $env:AGENT_BRIDGE_TEST_SKIP_FLUSH = '1' }
+            else { Remove-Item Env:AGENT_BRIDGE_TEST_SKIP_FLUSH -ErrorAction SilentlyContinue }
+            $env:AGENT_BRIDGE_TEST_IO_STATS = Join-Path $armDir 'io-stats.jsonl'
+            Write-Host "::group::$arm (TEMP=$env:TEMP, skip flush=$env:AGENT_BRIDGE_TEST_SKIP_FLUSH)"
+            $started = Get-Date
+            python -I scripts/ci_test_timing.py run --output-dir (Join-Path $armDir 'timing')
+            $code = $LASTEXITCODE
+            $seconds = ((Get-Date) - $started).TotalSeconds
+            Write-Host '::endgroup::'
+            $results += [pscustomobject]@{ arm = $arm; exit = $code; seconds = [math]::Round($seconds, 1); temp = $env:TEMP }
+          }
+          $env:TEMP = $defaultTemp
+          $env:TMP = $defaultTmp
+          $results | Format-Table -AutoSize | Out-String -Width 200 | Tee-Object -FilePath (Join-Path $root 'arms.txt')
+          $results | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $root 'arms.json')
+      - name: Preserve measurement
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-io-measure-${{ matrix.order }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/io-measure/
+          if-no-files-found: warn
+          retention-days: 30
