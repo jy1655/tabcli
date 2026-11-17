@@ -1000,7 +1000,8 @@ pub(in crate::native) fn run_host(directory: &Path, command: &str) -> Result<()>
         );
         return Err(error);
     }
-    let mut bash = Command::new("/bin/bash");
+    // The pane already has the helper environment; the same removals keep it.
+    let mut bash = crate::native::process_env::helper_command("/bin/bash");
     bash.arg0("bash");
     let script = match bash_script(command, std::env::var_os("BASH_ENV").as_deref()) {
         BashScript::Plain(script) => script,

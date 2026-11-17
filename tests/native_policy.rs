@@ -1094,7 +1094,7 @@ esac
             let checksum = Command::new("shasum")
                 .args(["-a", "256"])
                 .arg(archive.file_name().unwrap())
-                .current_dir(&dist)
+                .current_dir(dist)
                 .output()
                 .unwrap();
             assert!(checksum.status.success());

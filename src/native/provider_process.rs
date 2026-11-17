@@ -349,9 +349,7 @@ fn linux_exec_budget_with(
         "could not read the Linux exec limits"
     );
     let string_limit = usize::try_from(page_size)? * 32;
-    let limit = usize::try_from(arg_max)?
-        .min(LINUX_STACK_ARGUMENT_CAP)
-        .max(LINUX_ARG_MAX);
+    let limit = usize::try_from(arg_max)?.clamp(LINUX_ARG_MAX, LINUX_STACK_ARGUMENT_CAP);
     let mut environment: std::collections::BTreeMap<OsString, OsString> = inherited.collect();
     for (name, value) in command.get_envs() {
         match value {
@@ -405,22 +403,29 @@ const LINUX_STACK_ARGUMENT_CAP: usize = 8 * 1024 * 1024 / 4 * 3;
 #[cfg(target_os = "linux")]
 const LINUX_SCRIPT_MARGIN: usize = 2 * 4096 + 256 + 4 * std::mem::size_of::<usize>();
 
+// Only an entrypoint whose first bytes were read and are not `#!` goes without the margin:
+// the kernel can run an execute-only script that this process cannot read.
 #[cfg(target_os = "linux")]
 fn script_entrypoint(program: &std::ffi::OsStr) -> bool {
     use std::io::Read;
     let mut start = [0; 2];
     std::fs::File::open(program)
         .and_then(|mut file| file.read_exact(&mut start))
-        .is_ok_and(|()| start == *b"#!")
+        .map_or(true, |()| start == *b"#!")
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod linux_exec_budget_tests {
     use super::*;
 
+    // Refused: the exec failed with E2BIG. A child that ran must also have succeeded, so
+    // that an interpreter's own failed exec is not taken for acceptance.
     fn kernel_refuses(command: &mut Command) -> bool {
         match command.status() {
-            Ok(_) => false,
+            Ok(status) => {
+                assert!(status.success(), "{status}");
+                false
+            }
             Err(error) => {
                 assert_eq!(error.raw_os_error(), Some(libc::E2BIG), "{error}");
                 true
@@ -443,29 +448,49 @@ mod linux_exec_budget_tests {
     // A script entrypoint is refused there too, and accepted a margin below.
     #[test]
     fn the_total_is_refused_exactly_where_the_kernel_refuses_it() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        let script = root.path().join("script");
-        std::fs::write(&script, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
-        let script = script.to_str().unwrap();
+        let script = |name: &str, line: &str, mode: u32| {
+            let path = root.path().join(name);
+            std::fs::write(&path, line).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let shell = script("shell", "#!/bin/sh\n", 0o700);
+        // An `env` interpreter execs the program again; its own exit status counts.
+        let env = script("env", "#!/usr/bin/env sh\n", 0o700);
         // (entrypoint, bytes below the exact total, refused by the budget and by the kernel,
         // each at the boundary and one byte over it)
         for (program, under, budget, kernel) in [
             ("/bin/./true", 0, [false, true], [false, true]),
-            (script, 0, [true, true], [true, true]),
-            (script, LINUX_SCRIPT_MARGIN, [false, true], [false, false]),
+            (shell.as_str(), 0, [true, true], [true, true]),
+            (
+                shell.as_str(),
+                LINUX_SCRIPT_MARGIN,
+                [false, true],
+                [false, false],
+            ),
+            (env.as_str(), 0, [true, true], [true, true]),
+            (
+                env.as_str(),
+                LINUX_SCRIPT_MARGIN,
+                [false, true],
+                [false, false],
+            ),
         ] {
             total_boundary(program, under, budget, kernel);
         }
+        // An entrypoint this process cannot read keeps the margin.
+        let unreadable = script("unreadable", "#!/bin/sh\n", 0o100);
+        assert!(script_entrypoint(std::ffi::OsStr::new(&unreadable)));
+        assert!(!script_entrypoint(std::ffi::OsStr::new("/bin/true")));
     }
 
     fn total_boundary(program: &str, under: usize, budget: [bool; 2], kernel: [bool; 2]) {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let string_limit = page * 32;
         let limit = (unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize)
-            .min(LINUX_STACK_ARGUMENT_CAP)
-            .max(LINUX_ARG_MAX);
+            .clamp(LINUX_ARG_MAX, LINUX_STACK_ARGUMENT_CAP);
         let pointer = std::mem::size_of::<usize>();
         let environment: Vec<_> = std::env::vars_os().collect();
         let fixed = (program.len() + 1) * 2
