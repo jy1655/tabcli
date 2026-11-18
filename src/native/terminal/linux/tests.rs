@@ -428,8 +428,8 @@ fn interrupted_created_host_close_consumes_records_without_a_second_signal() {
                 close_authority::close_owned_surface_with(
                     || observation.decide("session-hostclose", handle, deadline),
                     || panic!("no owner teardown"),
-                    |live_owner| {
-                        assert!(!live_owner);
+                    |close| {
+                        assert_eq!(close, super::super::posix::OwnedSurfaceClose::SurfaceOnly);
                         signals.set(signals.get() + 1);
                         host_live.set(false);
                         panic!(

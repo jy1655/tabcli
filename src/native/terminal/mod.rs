@@ -819,15 +819,18 @@ mod tests {
     #[cfg(windows)]
     fn absent_windows_herdr_handle() -> TerminalSession {
         TerminalSession::new(TerminalKind::Herdr, "t7".into())
-            .with_herdr_core(super::HerdrSurface {
-                socket: format!(r"\\.\pipe\tabcli-absent-core-{}", std::process::id()),
-                core_id: "core-a".into(),
-                created_ms: 1,
-                host_pid: 4,
-                birth: super::record::HerdrHostBirth::Windows {
-                    host_creation_time: 1,
+            .with_herdr_core(
+                super::HerdrSurface {
+                    socket: format!(r"\\.\pipe\tabcli-absent-core-{}", std::process::id()),
+                    core_id: "core-a".into(),
+                    created_ms: 1,
+                    host_pid: 4,
+                    birth: super::record::HerdrHostBirth::Windows {
+                        host_creation_time: 1,
+                    },
                 },
-            })
+                "unused",
+            )
             .with_binding(Some("session-herdr".into()))
     }
 

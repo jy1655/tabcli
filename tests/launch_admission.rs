@@ -39,6 +39,7 @@ impl Fixture {
             .current_dir(&self.base)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &self.root)
             .env_remove("AGENT_BRIDGE_NATIVE_SESSION_ID")
+            .env_remove("HC_TERMINAL_ID")
             .env_remove("HOME")
             .env_remove("USERPROFILE")
             .env_remove("CODEX_HOME")

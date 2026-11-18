@@ -53,6 +53,11 @@ pub(in crate::native) enum TerminalCloseAuthority {
     TeardownComplete(String),
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     SurfaceOnly,
+    /// The owner is verified dead and its exact surface is present in a kind that keeps a
+    /// surface whose program ended: the close may remove that surface only when the adapter
+    /// reads it ended, and never ends a running one.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    RemoveEnded,
     Absent,
 }
 
@@ -366,6 +371,12 @@ pub(in crate::native) fn decide(
                     if absent {
                         return Ok(TerminalCloseAuthority::Absent);
                     }
+                    // The owner ran inside a surface that outlives its program (a finished
+                    // Herdr terminal): it may be all that is left after the user closed the
+                    // tab. The adapter removes it only if it reads it ended.
+                    if observation.evidence().removes_ended_surface() {
+                        return Ok(TerminalCloseAuthority::RemoveEnded);
+                    }
                     bail!(
                         "the recorded native-session owner is no longer live; visible terminal cleanup is unverified and no close was sent"
                     );
@@ -469,17 +480,13 @@ pub(in crate::native) fn close_owned_surface(
                     deadline,
                 )
             },
-            |has_native_owner| {
+            |close| {
                 terminal::posix::close_owned_session(
                     terminal::posix_installed(),
                     directory,
                     id,
                     session,
-                    if has_native_owner {
-                        OwnedSurfaceClose::LiveOwner
-                    } else {
-                        OwnedSurfaceClose::SurfaceOnly
-                    },
+                    close,
                     deadline,
                 )
             },
@@ -502,7 +509,7 @@ pub(in crate::native) fn close_owned_surface(
 pub(in crate::native::terminal) fn close_owned_surface_with(
     authority: impl FnOnce() -> Result<TerminalCloseAuthority>,
     teardown: impl FnOnce() -> Result<terminal::CloseResult>,
-    close_surface: impl FnOnce(bool) -> Result<CloseOutcome>,
+    close_surface: impl FnOnce(OwnedSurfaceClose) -> Result<CloseOutcome>,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
     close_remaining(deadline)?;
@@ -515,7 +522,15 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
             reason: Some(reason),
         }),
         TerminalCloseAuthority::Absent => Ok(CloseOutcome::Missing.into()),
-        authority => close_surface(authority == TerminalCloseAuthority::LiveOwner).map(Into::into),
+        TerminalCloseAuthority::LiveOwner => {
+            close_surface(OwnedSurfaceClose::LiveOwner).map(Into::into)
+        }
+        TerminalCloseAuthority::SurfaceOnly => {
+            close_surface(OwnedSurfaceClose::SurfaceOnly).map(Into::into)
+        }
+        TerminalCloseAuthority::RemoveEnded => {
+            close_surface(OwnedSurfaceClose::RemoveEnded).map(Into::into)
+        }
     }
 }
 
