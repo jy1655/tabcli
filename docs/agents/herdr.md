@@ -4,6 +4,10 @@
   running Herdr Core. Bridge speaks newline JSON-RPC 2.0, protocol generation 1, on the core's
   own socket (measured with hc 0.1.21, 2026-11-18). It never runs `hc`, whose CLI starts a
   missing core, and never starts, restarts or stops a core. Other platforms refuse the kind.
+- When the core is absent, direct the user to open Herdr from the desktop or start hc outside
+  an agent session. Starting it from an agent can contaminate every terminal with that agent's
+  caller markers. Removing markers in Bridge's launch host protects its own children, not
+  unrelated terminals or the core; never repair the core by restarting it as a side effect.
 - The socket is the one `hc` uses (herdr-core `paths.rs`): `HC_SOCKET`, else `socket` in
   `$XDG_CONFIG_HOME/herdr-core/config.toml`, else `<session>.sock` in
   `$XDG_RUNTIME_DIR/herdr-core`, `/run/user/<uid>/herdr-core` or the state directory of

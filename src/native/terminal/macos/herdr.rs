@@ -338,7 +338,7 @@ struct SocketConnection {
 
 fn not_running(socket: &Path) -> anyhow::Error {
     anyhow!(
-        "no Herdr Core is running at {}; open Herdr or run `hc server start`, then retry. Bridge does not start or restart a core",
+        "no Herdr Core is running at {}; open Herdr from the desktop or start hc from a shell outside an agent session, then retry. Bridge does not start or restart a core",
         socket.display()
     )
 }

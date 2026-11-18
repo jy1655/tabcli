@@ -124,7 +124,9 @@ whose scripting exposes no screen text. See [screen](cli.md#screen).
 
 ## macOS / Herdr Core
 
-Open Herdr or start `hc` before launching a Bridge session. This adapter uses an already running,
+Open Herdr from the desktop or start `hc` from a shell outside an agent session before launching
+a Bridge session. Starting hc inside an agent can give the core that agent's session markers,
+which it then passes to every terminal. This adapter uses an already running,
 local Herdr Core (`hc`), not the older `herdr` TUI. It never starts or restarts the core.
 Use an explicit choice from any terminal, or let detection select it inside an hc terminal:
 
@@ -152,7 +154,9 @@ Agy and Pi use the addressed paste API, without forcing input past a blocked UI.
 have reached the terminal is never repeated automatically.
 
 The launch host clears inherited provider caller markers before starting the CLI, including
-markers retained by a core that was started from an assistant's shell. It does not change the
+markers retained by a core that was started from an assistant's shell. In particular, inherited
+`CLAUDE_CODE_CHILD_SESSION` must not disable Claude transcript storage or peer registration.
+Bridge removes the caller identity rather than forcing persistence on a nested session. It does not change the
 core's environment for other terminals. Bridge reads only the visible screen (`lines=0`) and
 never scrolls history. It cannot atomically compare a dialog and press a key through hc, so
 workspace trust dialogs must be handled by the user through Herdr or `hc attach`.
