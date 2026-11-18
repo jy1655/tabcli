@@ -1094,17 +1094,23 @@ fn remove_created(
         (Ok(()), _) => cause.context(format!(
             "the Herdr terminal {address} this launch created was removed; nothing was started"
         )),
-        (Err(error), Some(identity)) => RetainedLaunchSurface::new(
+        (Err(error), Some(identity)) => retain_unremoved(
             created_handle(address, identity),
-            format!(
-                "{cause:#}; Herdr terminal {address} could not be removed: {error:#}; its handle is retained for close"
-            ),
-        )
-        .into(),
+            format!("{cause:#}; Herdr terminal {address} could not be removed: {error:#}"),
+        ),
         (Err(error), None) => anyhow!(
             "{cause:#}; removing Herdr terminal {address} on core {core_id} failed: {error:#}; its launch host starts nothing without a binding"
         ),
     }
+}
+
+// Only a complete identity, proved during creation, can be handed to the launcher.
+fn retain_unremoved(surface: TerminalSession, reason: String) -> anyhow::Error {
+    RetainedLaunchSurface::new(
+        surface,
+        format!("{reason}; its handle is retained for close"),
+    )
+    .into()
 }
 
 /// Ends the program of `address` and removes the finished terminal, on a linked connection.
@@ -1408,7 +1414,17 @@ impl<C: Core> PosixTerminalAdapter for Adapter<C> {
             // The program of the terminal waits for the binding above; nothing is typed.
             |_, _| Ok(()),
             |session, deadline| {
-                close_until(&self.core, session, Some(directory), deadline).map(|_| ())
+                close_until(&self.core, session, Some(directory), deadline)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        retain_unremoved(
+                            session.clone(),
+                            format!(
+                                "Herdr terminal {} could not be removed: {error:#}",
+                                session.id
+                            ),
+                        )
+                    })
             },
             bind,
             unbind,

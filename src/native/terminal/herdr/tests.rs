@@ -1050,6 +1050,43 @@ fn open_removes_its_terminal_when_binding_fails() {
     assert_eq!(core.terminal("t7").unwrap()["state"], "live");
 }
 
+#[test]
+fn failed_binding_and_removal_preserve_the_herdr_surface_for_close() {
+    use crate::native::session::launch;
+
+    let root = tempfile::tempdir().unwrap();
+    let (directory, store, _) =
+        launch::test_support::pending_launch("session-herdr", root.path(), Duration::from_secs(30));
+    let core = FakeCore::new();
+    core.inject("terminal.rm", Injected::Instead(refused("internal")));
+    let adapter = Adapter::with_core(core.clone());
+    let error = adapter
+        .open_bound_tab(
+            #[cfg(target_os = "macos")]
+            MacosOpenMode::TabFirst,
+            "launch",
+            directory.path(),
+            later(),
+            Box::new(|_| bail!("bind failed")),
+            Box::new(|| panic!("cannot unbind after unconfirmed removal")),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("bind failed"));
+    assert_eq!(core.terminal("t7").unwrap()["state"], "finished");
+    launch::terminal_failed(&store, &error).unwrap();
+    let handle = store
+        .terminal()
+        .expect("launcher retained the Herdr handle");
+    assert_eq!(handle.id, "t7");
+    assert_eq!(handle.herdr_core().unwrap().core_id, "core-a");
+    assert_eq!(
+        close_until(&core, &handle, Some(directory.path()), later()).unwrap(),
+        CloseOutcome::Closed
+    );
+    assert_eq!(core.params("terminal.kill").len(), 1);
+    assert!(core.terminal("t7").is_none());
+}
+
 // The installed connection over a real socket: bounded reads, one reply line per request,
 // and a written request without an answer is never reported as not sent.
 #[test]
