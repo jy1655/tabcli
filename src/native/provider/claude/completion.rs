@@ -33,7 +33,7 @@ pub(in crate::native::provider) use questions::read as question_emissions;
 use records::{
     Binding, Candidate, Continuation, Deflection, Diagnostic, LaunchMode, QuestionMode, Ready,
 };
-pub(super) use records::{native_mode, needs_legacy_prefix};
+pub(super) use records::{frame_format, native_mode};
 #[cfg(test)]
 pub(in crate::native) use test_support::CompletionRecordFixture;
 

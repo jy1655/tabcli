@@ -19,6 +19,11 @@ const MARKER_INSTRUCTION: &str = "End your final response with this exact line:"
 // flight across an upgrade keeps that frame.
 const LEGACY_FRAME_START: &str = "[Agent Bridge native delegation]\nSource: ";
 
+pub(super) enum FrameFormat {
+    Compact,
+    LegacyPrefix,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ClaudeTurn {
     schema: u32,
@@ -107,8 +112,23 @@ impl ClaudeTurn {
     pub(super) fn expected_message(&self) -> Option<&str> {
         self.expected_message.as_deref()
     }
-    pub(super) fn target_message(&self, prompt: &str) -> String {
-        format!("{prompt}\n\n{MARKER_INSTRUCTION}\n{}", self.marker)
+    pub(super) fn target_message(&self, format: FrameFormat, prompt: &str) -> String {
+        use crate::native::session::primitives::{
+            EXTERNAL_SOURCE, delegation_source, valid_session_id,
+        };
+        let prefix = match format {
+            FrameFormat::Compact => String::new(),
+            FrameFormat::LegacyPrefix => {
+                let source = delegation_source();
+                let source = if valid_session_id(&source) {
+                    &source
+                } else {
+                    EXTERNAL_SOURCE
+                };
+                format!("{LEGACY_FRAME_START}{source}\n\n")
+            }
+        };
+        format!("{prefix}{prompt}\n\n{MARKER_INSTRUCTION}\n{}", self.marker)
     }
 
     // Whether `text` is a frame this adapter built for this turn's marker: the current frame,

@@ -270,17 +270,7 @@ fn cross_session_message_plan(
         summary: CROSS_SESSION_SUMMARY.to_owned(),
         message: reference.clone(),
     };
-    let mut message = pending.target_message(prompt);
-    if completion::needs_legacy_prefix(directory)? {
-        use crate::native::session::primitives::{delegation_source, valid_session_id};
-        let source = delegation_source();
-        let source = if valid_session_id(&source) {
-            &source
-        } else {
-            "external"
-        };
-        message = format!("[Agent Bridge native delegation]\nSource: {source}\n\n{message}");
-    }
+    let message = pending.target_message(completion::frame_format(directory)?, prompt);
     let guard = MessageGuard {
         reference,
         input: SendMessageInput {

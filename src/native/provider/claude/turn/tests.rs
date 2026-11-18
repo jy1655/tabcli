@@ -30,7 +30,7 @@ fn pending_record_round_trip_pins_json_marker_and_retention() {
         "<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"
     );
     assert_eq!(
-        read_back.target_message("prompt"),
+        read_back.target_message(FrameFormat::Compact, "prompt"),
         "prompt\n\nEnd your final response with this exact line:\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"
     );
     drop(installed);
@@ -44,7 +44,7 @@ fn pending_record_round_trip_pins_json_marker_and_retention() {
 fn target_message_adds_only_the_marker_instruction() {
     let turn = ClaudeTurn::new("claude-turn-safe123").unwrap();
     assert_eq!(
-        turn.target_message("prompt"),
+        turn.target_message(FrameFormat::Compact, "prompt"),
         "prompt\n\nEnd your final response with this exact line:\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"
     );
 }
@@ -78,9 +78,13 @@ fn native_pending_record_accepts_the_short_frame_and_the_legacy_frame() {
     // completion hook can still be an earlier binary; both readers accept that form.
     let prefixed = format!(
         "[Agent Bridge native delegation]\nSource: external\n\n{}",
-        turn.target_message("body")
+        turn.target_message(FrameFormat::Compact, "body")
     );
-    for accepted in [turn.target_message("body"), legacy.clone(), prefixed] {
+    for accepted in [
+        turn.target_message(FrameFormat::Compact, "body"),
+        legacy.clone(),
+        prefixed,
+    ] {
         write(&accepted);
         assert_eq!(
             read_native(&store, token).unwrap().expected_message(),
@@ -89,7 +93,7 @@ fn native_pending_record_accepts_the_short_frame_and_the_legacy_frame() {
     }
     for refused in [
         format!("body\n\n{marker}"),
-        turn.target_message("body").replace(
+        turn.target_message(FrameFormat::Compact, "body").replace(
             marker,
             "<!-- agent-bridge-claude-turn:claude-turn-other -->",
         ),

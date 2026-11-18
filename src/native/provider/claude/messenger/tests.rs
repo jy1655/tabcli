@@ -1,7 +1,7 @@
 use super::*;
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 #[cfg(unix)]
-use crate::native::provider::claude::turn::ClaudeTurn;
+use crate::native::provider::claude::turn::{ClaudeTurn, FrameFormat};
 #[cfg(windows)]
 use std::process::Command;
 use std::time::Instant;
@@ -824,7 +824,7 @@ fn cross_session_process_never_receives_the_payload() {
     let directory = managed_session_directory(root.path());
     let executable = root.path().join("fake-claude");
     let pending = ClaudeTurn::new("claude-turn-safe123").unwrap();
-    let expected_message = pending.target_message("follow-up secret");
+    let expected_message = pending.target_message(FrameFormat::Compact, "follow-up secret");
     std::fs::write(
         &executable,
         format!(

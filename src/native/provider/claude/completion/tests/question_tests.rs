@@ -135,9 +135,10 @@ fn claude_questions_require_original_turn_and_never_follow_a_new_claim() {
         .unwrap();
     crate::native::session::update_status(f.root.path(), SessionState::Working, None, None)
         .unwrap();
-    let next_message = ClaudeTurn::new("claude-turn-next")
-        .unwrap()
-        .target_message("[Agent Bridge native delegation]\nSource: external\n\nnext request");
+    let next_message = ClaudeTurn::new("claude-turn-next").unwrap().target_message(
+        FrameFormat::Compact,
+        "[Agent Bridge native delegation]\nSource: external\n\nnext request",
+    );
     install_pending(
         f.root.path(),
         "claude-turn-next",

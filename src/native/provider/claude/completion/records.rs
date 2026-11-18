@@ -34,6 +34,7 @@
 //! - [`read_doctor`]: doctor reads at most [`DOCTOR_READ_LIMIT`] bytes of strict UTF-8 and
 //!   classifies what does not decode. A record past that bound tells doctor nothing; admission
 //!   reads it again with the live policy.
+use super::claude_turn::FrameFormat;
 use super::{valid_claude_conversation_id, valid_identity};
 use crate::native::provider::QuestionEmission;
 use crate::native::session::{Reader, Store, primitives::unix_ms, requests::Receipt};
@@ -217,9 +218,13 @@ pub(in crate::native::provider::claude) fn native_mode(directory: &Path) -> Resu
 
 /// A pre-#396 native hook checks for the old delegation and Source prefix in
 /// its pending record. Keep that prefix for every request to such a launch.
-pub(in crate::native::provider::claude) fn needs_legacy_prefix(directory: &Path) -> Result<bool> {
-    Ok(read_live::<LaunchMode>(&Reader::open_unchecked(directory))?
-        .is_some_and(|mode| mode.mode == Mode::NativeV1 && !mode.compact_prompt))
+pub(in crate::native::provider::claude) fn frame_format(directory: &Path) -> Result<FrameFormat> {
+    let mode = read_live::<LaunchMode>(&Reader::open_unchecked(directory))?;
+    if mode.is_some_and(|mode| mode.mode == Mode::NativeV1 && !mode.compact_prompt) {
+        Ok(FrameFormat::LegacyPrefix)
+    } else {
+        Ok(FrameFormat::Compact)
+    }
 }
 
 /// The question deflection this launch recorded: none for a launch before the record existed,
