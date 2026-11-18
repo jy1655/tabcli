@@ -4020,6 +4020,9 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
             ])
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, &root)
+            // This fixture has its own home and no Herdr Core. Exercise workspace admission
+            // independently of the terminal running the test harness.
+            .env_remove("HC_TERMINAL_ID")
             .env("HOME", base.path())
             .env("CODEX_HOME", &codex_home)
             .output()

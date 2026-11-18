@@ -19,11 +19,14 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 
 /// Which authority the owned close runs under: the attested owner is live, or only the
 /// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
-/// work for a live owner only.
+/// work for a live owner only. `RemoveEnded` reaches only a kind whose close evidence keeps
+/// a surface whose program ended: the owner died with it, and the adapter removes that
+/// surface only when it reads it ended, never ending a running program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum OwnedSurfaceClose {
     LiveOwner,
     SurfaceOnly,
+    RemoveEnded,
 }
 
 pub(in crate::native::terminal) trait PosixTerminalAdapter {
@@ -236,6 +239,15 @@ pub(in crate::native::terminal) fn close_owned_session(
     close: OwnedSurfaceClose,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    // Every other adapter would close its surface under this authority; refuse it first.
+    if close == OwnedSurfaceClose::RemoveEnded
+        && !super::close_evidence(session.kind).removes_ended_surface()
+    {
+        bail!(
+            "{} keeps no surface after its program ends; no close was sent and the handle is retained",
+            session.kind.display_name()
+        );
+    }
     adapters
         .adapter(session.kind)?
         .close_owned_session(directory, id, session, close, deadline)
@@ -493,6 +505,40 @@ mod tests {
             key: super::super::DialogKey::Enter,
         };
         assert!(guarded_dialog_input(&Fake, &refused, &input, deadline).is_err());
+    }
+
+    // The fake would close its surface under any authority. A kind whose close evidence keeps
+    // no ended surface is refused the remove-only close before its adapter is reached.
+    #[test]
+    fn remove_ended_is_refused_before_an_adapter_that_keeps_no_ended_surface() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for kind in [
+            TerminalKind::Iterm2,
+            TerminalKind::AppleTerminal,
+            TerminalKind::Ghostty,
+            TerminalKind::Warp,
+            TerminalKind::WezTerm,
+            TerminalKind::WindowsConsole,
+            TerminalKind::Tmux,
+        ] {
+            let mut surface = handle();
+            surface.kind = kind;
+            let error = close_owned_session(
+                &Fake,
+                Path::new("/unused"),
+                "session-fake",
+                &surface,
+                OwnedSurfaceClose::RemoveEnded,
+                deadline,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("keeps no surface after its program ends; no close was sent"),
+                "{kind:?}: {error:#}"
+            );
+        }
     }
 
     fn handle() -> TerminalSession {

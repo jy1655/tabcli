@@ -26,7 +26,9 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         #[cfg(target_os = "macos")]
         binding_names_host: crate::native::terminal::herdr::binding_names_this_host,
     }),
-    close_evidence: CloseEvidenceChoice::PresenceOnly,
+    // A terminal that ended outside Bridge (its tab closed, `hc kill`, or its program
+    // exited) stays on the core, finished, until something calls `terminal.rm`.
+    close_evidence: CloseEvidenceChoice::PresenceWithEndedSurface,
     // `terminal.read` with no history lines returns the visible screen only.
     screen_read_refusal: None,
     guarded_input_refusal: Some(

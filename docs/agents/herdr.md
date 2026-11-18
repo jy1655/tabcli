@@ -20,10 +20,13 @@
   only `not_found` from the recorded core proves a terminal gone (addresses are not reused on
   a core). Calls pass no `caller`, so Bridge marks nothing seen for another terminal.
 - `terminal.run` gets argv `[tabcli, native-herdr-host, <session directory>,
-  --launch-command, <script>]`, `no_parent`, `no_notify`, `keep: false`, `rm: false`, the
+  --launch-command, <script>]`, `no_notify`, `keep: false`, `rm: false`, the
   labels `tabcli-session` and a random `tabcli-launch`, and a random local name
-  (`tabcli-` and 24 hexadecimal digits). Without `no_parent` a terminal started inside Herdr
-  ends with the caller's terminal, and hc types notes into the caller. The created terminal
+  (`tabcli-` and 24 hexadecimal digits). On the launch connection, verify the local caller's
+  marker, live terminal and program ancestry before setting `parent` and `outlive_parent`.
+  With no verified caller use `no_parent`. A parented terminal appears under its caller in
+  the app and counts in hc child waits. hc stores `die_with_parent: false` and `notify: false`
+  in its terminal registry. The created terminal
   is read back on the same connection (argv, launch label, name, live, not kept) with its
   program's PID and birth: `Terminal.pid` is the program's own PID and stays after
   it finishes (measured 2026-11-18). Linux verifies the socket peer with `SO_PEERCRED` and
@@ -53,7 +56,12 @@
 - Every later operation requires the recorded address, core id and `created_ms`, an argv
   naming this session's directory, the recorded program PID, `keep` false and, while live,
   the recorded birth. A terminal set to keep (`hc keep`) can run a replacement program and
-  is refused until keep is off. A remote address (`machine/t7`) is never accepted.
+  is refused until keep is off. For a temporary pane, the user can adopt the terminal with
+  `herdr-app do terminal.keep` and release it with `terminal.park`, which disables core keep.
+  Bridge never adds a space label or changes keep to counter the app. If the pane ends
+  with keep still set, hc 0.1.21 only lets a user change keep on a live terminal. Document
+  manual removal of the verified finished address on the recorded core before retrying
+  explicit close. A remote address (`machine/t7`) is never accepted.
 - Input is `terminal.send` with the exact prompt text, without `force` (which answers a
   blocked dialog) and without `caller`. hc brackets the paste itself when the program asked
   for it, so the envelope is raw. A refusal the core gives before typing (`blocked`,
@@ -69,7 +77,13 @@
   checked against the recorded creation and program again, so a terminal set to keep or
   running a replacement in between is left alone and its handle retained. A close whose kill
   reply was lost fails instead of repeating it, and the next close finishes from what it
-  reads (a finished terminal is only removed). The same rule applies when a launch removes a
+  reads (a finished terminal is only removed). When the owner has already exited without a
+  close intent, explicit close verifies its bound identity and reads the exact finished,
+  unkept terminal again. It checks the launch label, sends one `terminal.rm`, and confirms
+  absence on that core. It never sends `terminal.kill` on this path. Handles created by
+  0.4.45 and 0.4.46 omit the nonce; for those, the original identity checks also require the
+  launch label to agree with the terminal's generated name. A failed read or removal keeps
+  the handle for retry. The same rule for rechecking identity applies when a launch removes a
   terminal it created but could not use. The core has no conditional kill or remove, so
   another client of the same user can still change the terminal between Bridge's last read
   and its action; Bridge does not claim more. hc does not sweep detached processes. Bridge
@@ -79,7 +93,9 @@
   inherited and is ignored. Selection reads only the environment. Launch admission
   (`terminal::admit_selection`) then requires the caller's terminal to be live on the
   addressed core with this process among its program's descendants, and refuses otherwise
-  without opening another terminal. An explicit `--terminal herdr` does not check the caller.
+  without opening another terminal. An explicit `--terminal herdr` can launch outside Herdr.
+  Both selection modes check the caller on the connection that creates the child before
+  naming a parent.
 - OSC 7501 status words, `hc wait` and templates are never request, completion or close
   evidence. Provider launch options under Herdr belong to that provider's boundary.
 - Unit tests use a scripted core plus a real-socket connection test. Live launch, input,

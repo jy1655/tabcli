@@ -42,6 +42,7 @@ struct FakeState {
     inject: BTreeMap<&'static str, VecDeque<Injected>>,
     births: BTreeMap<u32, HerdrHostBirth>,
     parents: BTreeMap<u32, u32>,
+    unreadable_parent: Option<u32>,
     caller: Option<String>,
     current_pid: u32,
     /// Terminals of configured remote machines, which hc's list also returns.
@@ -252,7 +253,11 @@ impl Core for FakeCore {
         self.0.borrow().current_pid
     }
     fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
-        Ok(self.0.borrow().parents.get(&pid).copied())
+        let state = self.0.borrow();
+        if state.unreadable_parent == Some(pid) {
+            bail!("process {pid} is unreadable");
+        }
+        Ok(state.parents.get(&pid).copied())
     }
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
         Ok(self.0.borrow().births.get(&pid).copied())
@@ -476,9 +481,104 @@ fn terminals_are_local_and_fully_described() {
 }
 
 #[test]
-fn creation_runs_the_launch_host_detached_from_any_caller_terminal() {
+fn creation_parents_the_child_to_the_verified_caller_on_the_launch_connection() {
     let core = FakeCore::new();
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": 300, "argv": ["shell"],
+               "created_ms": 1, "labels": {}}),
+    );
     core.0.borrow_mut().caller = Some("t3".into());
+    core.0.borrow_mut().parents = BTreeMap::from([(900, 800), (800, 300)]);
+    verify_caller(&core, later()).unwrap();
+    core.clear_calls();
+
+    created(&core);
+    let run = &core.params("terminal.run")[0];
+    assert_eq!(run["parent"], json!("t3"));
+    assert_eq!(run["outlive_parent"], true);
+    assert_eq!(run["no_notify"], true);
+    assert_eq!(run["keep"], false);
+    assert!(run.get("no_parent").is_none());
+    assert!(run.get("caller").is_none());
+    assert_eq!(
+        &core.methods()[..4],
+        ["connect", "hello", "terminal.get", "terminal.run"]
+    );
+    assert_eq!(core.params("terminal.get")[0], json!({"terminal": "t3"}));
+}
+
+#[test]
+fn creation_never_parents_to_a_stale_or_remote_marker() {
+    for (marker, state, pid) in [
+        ("t3", "live", 700),     // A different local program.
+        ("t3", "finished", 900), // This PID on a finished terminal.
+        ("t9", "live", 900),     // No such local terminal.
+        ("remote/t3", "live", 900),
+    ] {
+        let core = FakeCore::new();
+        core.0.borrow_mut().caller = Some(marker.into());
+        core.0.borrow_mut().terminals.insert(
+            "t3".into(),
+            json!({"address": "t3", "state": state, "pid": pid, "argv": ["shell"],
+                   "created_ms": 1}),
+        );
+        created(&core);
+        let run = &core.params("terminal.run")[0];
+        assert_eq!(run["no_parent"], true);
+        assert!(run.get("parent").is_none());
+        assert!(run.get("outlive_parent").is_none());
+        assert!(
+            core.params("terminal.get")
+                .iter()
+                .all(|p| p["terminal"] != "remote/t3")
+        );
+    }
+}
+
+#[test]
+fn explicit_creation_survives_a_caller_check_that_refuses_automatic_selection() {
+    for unreadable_process in [true, false] {
+        let core = FakeCore::new();
+        core.0.borrow_mut().caller = Some("t3".into());
+        core.0.borrow_mut().terminals.insert(
+            "t3".into(),
+            json!({"address": "t3", "state": "live", "pid": 300, "argv": ["shell"], "created_ms": 1}),
+        );
+        let arrange = || {
+            if unreadable_process {
+                core.0.borrow_mut().unreadable_parent = Some(900);
+            } else {
+                core.inject("terminal.get", Injected::Instead(refused("unavailable")));
+            }
+        };
+        arrange();
+        assert!(verify_caller(&core, later()).is_err());
+        assert!(core.params("terminal.run").is_empty());
+        arrange();
+        core.clear_calls();
+        created(&core);
+        assert_eq!(
+            &core.methods()[..6],
+            [
+                "connect",
+                "hello",
+                "terminal.get",
+                "connect",
+                "hello",
+                "terminal.run"
+            ]
+        );
+        let calls = core.params("terminal.run");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["no_parent"], true);
+        assert!(calls[0].get("parent").is_none());
+    }
+}
+
+#[test]
+fn creation_outside_herdr_runs_the_launch_host_without_a_parent() {
+    let core = FakeCore::new();
     let session = created(&core);
     assert_eq!(session.kind, TerminalKind::Herdr);
     assert_eq!(session.id, "t7");
@@ -934,6 +1034,29 @@ fn sends_classify_refusals_before_input_apart_from_uncertain_delivery() {
 }
 
 #[test]
+fn a_finished_kept_terminal_reports_the_recovery_its_core_accepts() {
+    let core = FakeCore::new();
+    let session = created(&core);
+    core.set("t7", "state", json!("finished"));
+    core.set("t7", "keep", json!(true));
+    core.clear_calls();
+    let error = surface_present(
+        &core,
+        &session,
+        Path::new(DIRECTORY),
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    let message = error_text(&error);
+    assert!(
+        message.contains(&format!("HC_SOCKET='{SOCKET}' hc rm t7")),
+        "{message}"
+    );
+    assert!(!message.contains("--off"), "{message}");
+    assert!(core.params("terminal.rm").is_empty());
+}
+
+#[test]
 fn the_launch_host_binds_only_to_its_own_terminal_and_program() {
     let core = FakeCore::new();
     let session = created(&core);
@@ -1003,7 +1126,8 @@ fn the_attach_command_names_the_recorded_socket() {
     );
     let mut recorded = session.herdr_core().unwrap().clone();
     recorded.socket = "/state/with space/x.sock".into();
-    session = TerminalSession::new(TerminalKind::Herdr, "t7".into()).with_herdr_core(recorded);
+    session = TerminalSession::new(TerminalKind::Herdr, "t7".into())
+        .with_herdr_core(recorded, session.herdr_launch_nonce().unwrap());
     assert_eq!(
         attach_command(&session).unwrap(),
         "HC_SOCKET='/state/with space/x.sock' hc attach t7"
@@ -1299,3 +1423,6 @@ fn a_name_that_resolves_to_another_terminal_fails_closed() {
     assert_eq!(core.params("terminal.run").len(), 1);
     assert!(core.terminal("t7").is_some());
 }
+
+// #399: the dead-owner close of a terminal that ended outside Bridge.
+mod ended_close;

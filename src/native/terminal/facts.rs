@@ -23,6 +23,10 @@ pub(in crate::native) struct SurfaceFacts {
 pub(in crate::native) enum CloseEvidenceChoice {
     PresenceOnly,
     PresenceOnlyWithOwnerlessContext,
+    /// Presence, and a surface whose program ended stays until it is removed (a finished
+    /// Herdr terminal): once its owner is verified dead, a close may remove that surface
+    /// but never end a running one.
+    PresenceWithEndedSurface,
     AppleTerminal,
     /// Whole host created exclusively by Bridge and recorded by incarnation.
     BridgeCreatedHost,
