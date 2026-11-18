@@ -76,14 +76,20 @@ pub(super) fn launch_stage_check(
             }
         }
         HostObservation::NotRecorded => match known_terminal {
-            Some(kind) if !kind.uses_launch_host() => not_applicable(kind),
-            _ if !cfg!(target_os = "macos") => Check::new(
-                CheckId::LAUNCH_STAGE,
-                Unavailable,
-                Reason::LAUNCH_STAGE_NOT_APPLICABLE,
-                "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",
-                "No action is needed.",
-            ),
+            Some(kind) if !kind.has_launch_host_form() => not_applicable(kind),
+            _ if !known_terminal.map_or(
+                cfg!(target_os = "macos"),
+                TerminalKind::captures_shell_environment,
+            ) =>
+            {
+                Check::new(
+                    CheckId::LAUNCH_STAGE,
+                    Unavailable,
+                    Reason::LAUNCH_STAGE_NOT_APPLICABLE,
+                    "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",
+                    "No action is needed.",
+                )
+            }
             _ => Check::new(
                 CheckId::LAUNCH_STAGE,
                 Unknown,
@@ -220,7 +226,7 @@ pub(super) fn shell_environment_check(
                 "Run doctor --provider PROVIDER --probe from the terminal you launch with.",
             );
         }
-        ProbeContext::Terminal(kind) if !cfg!(target_os = "macos") || !kind.uses_launch_host() => {
+        ProbeContext::Terminal(kind) if !kind.captures_shell_environment() => {
             return Check::new(
                 CheckId::SHELL_ENVIRONMENT,
                 Unavailable,
@@ -813,7 +819,7 @@ mod tests {
             );
             actual.push(format!(
                 "{kind:?}: {} | {} | {} | {} | probe ran {} {} | {}",
-                kind.uses_launch_host(),
+                kind.has_launch_host_form(),
                 stage["reason_code"].as_str().unwrap(),
                 stage["detail"].as_str().unwrap(),
                 stage["evidence"],

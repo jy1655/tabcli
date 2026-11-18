@@ -1,5 +1,5 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, LaunchHostFacts, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, LaunchHost, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -17,7 +17,12 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-herdr-host",
-    launch_host: Some(LaunchHostFacts {
+    #[cfg(target_os = "linux")]
+    launch_host: Some(LaunchHost::BoundBash(
+        crate::native::terminal::herdr::binding_names_this_host,
+    )),
+    #[cfg(not(target_os = "linux"))]
+    launch_host: Some(LaunchHost::ShellCapture {
         #[cfg(target_os = "macos")]
         binding_names_host: crate::native::terminal::herdr::binding_names_this_host,
     }),

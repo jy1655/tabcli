@@ -29,7 +29,7 @@ pub(in crate::native::terminal) fn run(
     let name = kind.display_name();
     run_bound_host(directory, &BoundHostSpec { name }, |session_id| {
         let store = Store::open_unchecked(directory);
-        if !kind.uses_launch_host() {
+        if !kind.captures_shell_environment() {
             bail!("unsupported launch host");
         }
         let prefix = kind.as_str();
@@ -470,12 +470,8 @@ fn await_handoff(
 // Whether the bound surface of this Session names this host's own terminal surface, by the
 // check that the kind registers for its launch host.
 fn matches_surface(surface: &TerminalSession, kind: TerminalKind) -> bool {
-    surface.kind == kind
-        && kind
-            .registration()
-            .launch_host
-            .as_ref()
-            .is_some_and(|host| (host.binding_names_host)(surface))
+    matches!(kind.registration().launch_host, Some(super::super::facts::LaunchHost::ShellCapture { binding_names_host: check })
+        if surface.kind == kind && check(surface))
 }
 
 #[cfg(test)]

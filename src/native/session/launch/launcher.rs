@@ -30,16 +30,11 @@ pub(in crate::native) fn start(
         expected_claim_token,
         deadline,
     )?;
-    // Herdr on Linux uses the bound bash handoff. The stage record belongs
-    // to the macOS shell-environment capture host.
-    let linux_herdr = cfg!(target_os = "linux") && terminal_kind == terminal::TerminalKind::Herdr;
-    if terminal_kind.uses_launch_host() && !linux_herdr {
-        launch::host::initialize(
-            &Store::open_unchecked(&created.directory),
-            expected_claim_token,
-            terminal_kind,
-        )?;
-    }
+    launch::host::initialize_for_launch(
+        &Store::open_unchecked(&created.directory),
+        expected_claim_token,
+        terminal_kind,
+    )?;
     let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,
