@@ -1108,7 +1108,7 @@ fn remove_created(
 fn retain_unremoved(surface: TerminalSession, reason: String) -> anyhow::Error {
     RetainedLaunchSurface::new(
         surface,
-        format!("{reason}; its handle is retained for close"),
+        format!("{reason}; returning the confirmed handle to the launcher"),
     )
     .into()
 }

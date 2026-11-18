@@ -7,6 +7,24 @@ use std::process::Command;
 use std::time::Instant;
 
 #[test]
+fn message_plan_refuses_an_unknown_completion_mode_schema_before_framing() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = managed_session_directory(root.path());
+    crate::native::session::Store::open_unchecked(&directory)
+        .private("claude-completion-mode.json")
+        .write_json(&serde_json::json!({"schema":2,"mode":"native_v1","reason":"future"}))
+        .unwrap();
+    let result = cross_session_message_plan(&directory, TEST_REQUEST, "follow up");
+    assert_eq!(
+        result
+            .err()
+            .expect("unsupported mode accepted for framing")
+            .to_string(),
+        "unsupported Claude completion mode schema"
+    );
+}
+
+#[test]
 fn a_follow_up_to_a_pre_compact_claude_hook_keeps_its_required_prefix() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-legacy");

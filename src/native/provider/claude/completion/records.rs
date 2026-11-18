@@ -206,20 +206,23 @@ pub(super) fn write<T: Record>(store: &Store, record: &T) -> Result<()> {
     store.private(T::FILE).write_json(record)
 }
 
-/// Whether this launch selected native completion: no record means it did not, and an
-/// unreadable or unsupported record is an error.
-pub(in crate::native::provider::claude) fn native_mode(directory: &Path) -> Result<bool> {
-    match read_live::<LaunchMode>(&Reader::open_unchecked(directory))? {
-        Some(mode) if mode.supported() => Ok(mode.mode == Mode::NativeV1),
-        Some(_) => bail!("unsupported Claude completion mode schema"),
-        None => Ok(false),
+fn recorded_mode(directory: &Path) -> Result<Option<LaunchMode>> {
+    let mode = read_live::<LaunchMode>(&Reader::open_unchecked(directory))?;
+    if mode.as_ref().is_some_and(|mode| !mode.supported()) {
+        bail!("unsupported Claude completion mode schema");
     }
+    Ok(mode)
+}
+
+/// Whether the recorded launch selected native completion.
+pub(in crate::native::provider::claude) fn native_mode(directory: &Path) -> Result<bool> {
+    Ok(recorded_mode(directory)?.is_some_and(|mode| mode.mode == Mode::NativeV1))
 }
 
 /// A pre-#396 native hook checks for the old delegation and Source prefix in
 /// its pending record. Keep that prefix for every request to such a launch.
 pub(in crate::native::provider::claude) fn frame_format(directory: &Path) -> Result<FrameFormat> {
-    let mode = read_live::<LaunchMode>(&Reader::open_unchecked(directory))?;
+    let mode = recorded_mode(directory)?;
     if mode.is_some_and(|mode| mode.mode == Mode::NativeV1 && !mode.compact_prompt) {
         Ok(FrameFormat::LegacyPrefix)
     } else {

@@ -42,6 +42,9 @@
   `terminal.list` is not used, because hc's list also asks every configured remote machine.
   Bridge retains the handle when the identity is complete but removal failed, and otherwise
   reports the name and that nothing starts without a binding.
+  If saving the binding for a confirmed terminal fails and removal also fails, the adapter
+  returns that same confirmed handle to the launcher. The launcher uses the current Claim
+  and Close records to decide whether to save it. A later close checks its identity again.
 - The core gives programs its own environment, not the caller's, and it can carry another
   session's markers: the core on the owner's Mac on 2026-11-18 carried Claude Code's
   child-session and messaging variables. Both launch hosts remove the adapters' caller markers
