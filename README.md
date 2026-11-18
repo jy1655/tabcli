@@ -5,7 +5,7 @@
 Use `tabcli` to launch the Codex, Claude Code, Agy, and Pi CLIs you already have installed and
 signed in to, in terminal tabs, windows, or tmux panes you can watch. Read the result, send
 follow-up work to the same conversation, and explicitly close the session when you finish.
-TAB runs on macOS, native Windows, and Linux through tmux. Linux processes in WSL are not
+TAB runs on macOS, native Windows, and Linux through tmux or Herdr Core. Linux processes in WSL are not
 verified, and Warp support is limited.
 
 To delegate from your assistant without writing global instructions, install the
@@ -83,6 +83,7 @@ settings, and limitations. These are not checks of every combination on the curr
 | Native Windows | Implemented | All four providers, 2026-10-02 |
 | Windows Terminal tab | Preferred surface | Tab creation/follow-up/close, 2026-10-01 |
 | Windows console window | Fallback | Initial prompt/close, 2026-10-01 |
+| Linux / Herdr Core | Implemented | [hc 0.1.21 round trips](docs/verification/2026-11-18-linux-herdr.md) |
 | Linux / tmux | Implemented | [Four providers, 2026-11-17](docs/verification/2026-11-17-linux-6-tmux-3.6.md) |
 | Linux process in WSL | Not verified | No live evidence |
 
@@ -92,8 +93,8 @@ window and uses a console window when a tab cannot be created. See
 [terminal selection and settings](docs/terminals.md#selection-and-settings), including
 `settings macos-open-mode` and `settings windows-tab-window`.
 
-On macOS, `--terminal herdr` opens sessions in an already running Herdr Core (`hc`). Herdr
-terminals are detected automatically; see [Herdr support](docs/terminals.md#macos--herdr-core).
+On macOS and Linux, `--terminal herdr` opens sessions in an already running Herdr Core (`hc`). Herdr
+terminals are detected automatically; see [Herdr support](docs/terminals.md#herdr-core-on-macos-and-linux).
 
 Linux defaults to tmux 3.2 or later and opens no GUI window. Attach with the printed
 `tmux -S '<socket>' attach` command (`attach_command` in JSON); see
@@ -232,7 +233,7 @@ Before the first launch, install and sign in to the provider CLI, and resolve it
 prompt for your project. The iTerm2, Terminal.app, and Ghostty integrations use macOS Automation.
 If launch reports an Apple Events permission error, follow the
 [macOS permission checks](docs/macos-permissions.md). Native Windows requires PowerShell 7
-(`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd. Linux requires tmux 3.2 or later
+(`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd. The Linux tmux surface requires tmux 3.2 or later
 on `PATH`; see [Linux / tmux](docs/terminals.md#linux--tmux).
 
 ## Install an assistant plugin

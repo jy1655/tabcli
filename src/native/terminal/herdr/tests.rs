@@ -5,6 +5,21 @@ use std::{
     rc::Rc,
 };
 
+fn test_birth(start: u64) -> HerdrHostBirth {
+    #[cfg(target_os = "macos")]
+    return HerdrHostBirth::Macos {
+        host_start_seconds: 1_800_000_000,
+        host_start_microseconds: start,
+    };
+    #[cfg(target_os = "linux")]
+    return HerdrHostBirth::Linux {
+        linux_birth: crate::native::terminal::LinuxBirth {
+            boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
+            starttime_ticks: start,
+        },
+    };
+}
+
 const SOCKET: &str = "/state/herdr-core/default/default.sock";
 const DIRECTORY: &str = "/state/session-herdr1";
 const SESSION: &str = "session-herdr1";
@@ -25,7 +40,7 @@ struct FakeState {
     next: u32,
     calls: Vec<(String, Value)>,
     inject: BTreeMap<&'static str, VecDeque<Injected>>,
-    births: BTreeMap<u32, (u64, u64)>,
+    births: BTreeMap<u32, HerdrHostBirth>,
     parents: BTreeMap<u32, u32>,
     caller: Option<String>,
     current_pid: u32,
@@ -113,7 +128,7 @@ impl FakeConnection {
                 let address = format!("t{}", state.next);
                 state.next += 1;
                 let pid = 4000 + state.next;
-                state.births.insert(pid, (1_800_000_000, u64::from(pid)));
+                state.births.insert(pid, test_birth(u64::from(pid)));
                 let value = json!({
                     "address": address, "state": "live", "pid": pid, "name": params["name"],
                     "argv": params["argv"], "keep": params["keep"], "rm": params["rm"],
@@ -239,7 +254,7 @@ impl Core for FakeCore {
     fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
         Ok(self.0.borrow().parents.get(&pid).copied())
     }
-    fn process_start(&self, pid: u32) -> Result<Option<(u64, u64)>> {
+    fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
         Ok(self.0.borrow().births.get(&pid).copied())
     }
     fn launch_nonce(&self) -> Result<String> {
@@ -476,13 +491,7 @@ fn creation_runs_the_launch_host_detached_from_any_caller_terminal() {
         recorded.created_ms,
         terminal["created_ms"].as_u64().unwrap()
     );
-    assert_eq!(
-        (
-            recorded.host_start_seconds,
-            recorded.host_start_microseconds
-        ),
-        core.0.borrow().births[&recorded.host_pid]
-    );
+    assert_eq!(recorded.birth, core.0.borrow().births[&recorded.host_pid]);
     let run = &core.params("terminal.run")[0];
     assert_eq!(
         run,
@@ -683,7 +692,7 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
         fn parent_pid(&self, _: u32) -> Result<Option<u32>> {
             Ok(None)
         }
-        fn process_start(&self, _: u32) -> Result<Option<(u64, u64)>> {
+        fn process_start(&self, _: u32) -> Result<Option<HerdrHostBirth>> {
             Ok(None)
         }
         fn launch_nonce(&self) -> Result<String> {
@@ -838,7 +847,7 @@ fn a_terminal_that_is_no_longer_the_created_one_is_never_closed() {
     let core = FakeCore::new();
     let session = created(&core);
     let pid = session.herdr_core().unwrap().host_pid;
-    core.0.borrow_mut().births.insert(pid, (1, 1));
+    core.0.borrow_mut().births.insert(pid, test_birth(1));
     let text = error_text(&read_screen(&core, &session, later()).unwrap_err());
     assert!(text.contains("another process"), "{text}");
     // Another session's directory in the argv is another session's terminal.
@@ -1010,6 +1019,7 @@ fn open_removes_its_terminal_when_binding_fails() {
     let adapter = Adapter::with_core(core.clone());
     let error = adapter
         .open_bound_tab(
+            #[cfg(target_os = "macos")]
             MacosOpenMode::TabFirst,
             "launch",
             Path::new(DIRECTORY),
@@ -1024,6 +1034,7 @@ fn open_removes_its_terminal_when_binding_fails() {
     let adapter = Adapter::with_core(core.clone());
     let bound = adapter
         .open_bound_tab(
+            #[cfg(target_os = "macos")]
             MacosOpenMode::NewWindow,
             "launch",
             Path::new(DIRECTORY),
@@ -1045,6 +1056,7 @@ fn open_removes_its_terminal_when_binding_fails() {
 fn the_socket_connection_bounds_every_reply() {
     use std::os::unix::net::UnixListener;
     let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("c.sock");
     let error = SocketConnection::open(&socket, later()).err().unwrap();
     assert!(error_text(&error).contains("no Herdr Core is running"));

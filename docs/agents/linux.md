@@ -1,8 +1,9 @@
 # Current Linux Surface Boundary
 
-- Linux supports tmux only, at least 3.2, resolved as an executable on an absolute PATH entry
-  and used by canonical path. It is the Linux default; other terminal kinds refuse Linux,
-  and tmux refuses macOS and Windows. WSL is not verified.
+- Linux supports tmux and a running local [Herdr Core](herdr.md). Inside an hc terminal,
+  automatic selection verifies the caller on that core. Elsewhere it defaults to tmux.
+  tmux requires version 3.2+ on an absolute PATH entry and uses its canonical path.
+  WSL is not verified. The tmux server rules below apply only to tmux.
 - One server belongs to one managed session (owner's decision). Keep its socket at
   `<session directory>/tmux.sock`; refuse an existing path or a path of 108 bytes or more
   before running tmux, suggesting a shorter state directory. No GUI opens in this release.
@@ -18,7 +19,9 @@
   being gone (exit, PID reuse, another boot); a live server whose socket refuses is an error.
 - The pane host waits for its exact binding, discards startup input, then runs
   `bash --noprofile --norc -m -c`. Keep job control and the wrapper's foreground process group.
-  No shell startup files run; inherit the caller's environment with provider-private removal.
+  The same Linux bash handoff serves Herdr after checking its terminal address and host PID.
+  No shell startup files run. tmux inherits the caller's environment, Herdr the core's.
+  Both remove provider-private caller markers.
   Do not infer profile PATH additions or node availability from a provider launcher existing.
 - Codex uses its queue and Claude official messaging. Agy/Pi paste into the exact pane via
   one uniquely named stdin-loaded buffer and raw `paste-buffer -d -r`. Before paste starts,

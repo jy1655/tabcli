@@ -650,7 +650,6 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
             terminal::TerminalKind::Warp,
             terminal::TerminalKind::WezTerm,
             terminal::TerminalKind::WindowsConsole,
-            terminal::TerminalKind::Herdr,
         ]
     } else {
         &terminal::TerminalKind::ALL

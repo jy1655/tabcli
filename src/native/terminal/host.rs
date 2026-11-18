@@ -273,6 +273,16 @@ fn run_launch_host(directory: PathBuf, command: String, kind: TerminalKind) -> R
     {
         super::macos::launch_host::run(&directory, &command, kind)
     }
+    #[cfg(target_os = "linux")]
+    if kind == TerminalKind::Herdr {
+        return super::linux::host::run(&directory, &command, kind, |surface| {
+            anyhow::ensure!(
+                super::herdr::binding_names_this_host(surface),
+                "Herdr surface binding does not name this launch host"
+            );
+            Ok(())
+        });
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (directory, command, kind);

@@ -63,10 +63,7 @@ pub(super) fn select_macos_host(
     has_iterm_session_id: bool,
     has_term_session_id: bool,
 ) -> TerminalKind {
-    if preferred.is_none()
-        && hc_terminal
-        && term_program.is_some_and(|value| value.eq_ignore_ascii_case("ghostty"))
-    {
+    if preferred.is_none() && super::herdr_environment(hc_terminal, term_program) {
         return TerminalKind::Herdr;
     }
     select_macos_terminal(

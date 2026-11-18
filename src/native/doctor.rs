@@ -86,7 +86,7 @@ struct Diagnosis {
     checks: Vec<Check>,
 }
 
-// The tmux that every managed session on Linux starts its own server with. Its version is
+// The tmux executable used for sessions on the Linux tmux surface. Its version is
 // read only with --probe, like a provider's.
 #[cfg(target_os = "linux")]
 fn tmux_check(probe: bool, deadline: Instant) -> Check {
@@ -110,7 +110,7 @@ fn tmux_check(probe: bool, deadline: Instant) -> Check {
             );
         }
     };
-    let attach = "Each managed session starts its own tmux server; ask and inspect print the command that attaches to it.";
+    let attach = "Each tmux session starts its own server; ask and inspect print the command that attaches to it.";
     if !probe {
         return Check::new(
             CheckId::TMUX,
@@ -240,7 +240,9 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
             ),
         });
         #[cfg(target_os = "linux")]
-        checks.push(tmux_check(request.probe, deadline));
+        if selected_terminal == Some(terminal::TerminalKind::Tmux) {
+            checks.push(tmux_check(request.probe, deadline));
+        }
     }
     let mut session_terminal = None;
     let manifest = directory.as_ref().and_then(|directory| {

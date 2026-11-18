@@ -182,17 +182,21 @@ fn creation_proven_host_close_is_independent_of_owner_and_intents() {
     );
 }
 #[test]
-fn linux_selects_tmux_and_refuses_every_other_kind() {
+fn linux_registers_tmux_and_herdr() {
     use super::super::TerminalKind;
     use crate::native::failure_kind::{FailureKind, classify};
-    assert_eq!(select(None).unwrap(), TerminalKind::Tmux);
+    assert_eq!(
+        select(Some(TerminalKind::Herdr)).unwrap(),
+        TerminalKind::Herdr
+    );
+    assert!(INSTALLED.adapter(TerminalKind::Herdr).is_ok());
     assert_eq!(
         select(Some(TerminalKind::Tmux)).unwrap(),
         TerminalKind::Tmux
     );
     assert!(INSTALLED.adapter(TerminalKind::Tmux).is_ok());
     for kind in TerminalKind::ALL {
-        if kind == TerminalKind::Tmux {
+        if matches!(kind, TerminalKind::Tmux | TerminalKind::Herdr) {
             continue;
         }
         let error = select(Some(kind)).unwrap_err();
@@ -200,7 +204,7 @@ fn linux_selects_tmux_and_refuses_every_other_kind() {
         assert_eq!(
             error.to_string(),
             format!(
-                "{} is not available on Linux; use tmux",
+                "{} is not available on Linux; use tmux or Herdr",
                 kind.display_name()
             )
         );

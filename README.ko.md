@@ -2,7 +2,7 @@
 
 [English](README.md) · 한국어 README는 영어 README를 따르며, 내용이 다르면 영어 README를 기준으로 합니다.
 
-`tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 지켜볼 수 있는 터미널 탭, 창 또는 tmux pane에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS, Windows에서 직접 실행하는 환경과 tmux를 통한 Linux 실행을 지원합니다. WSL 안의 Linux 프로세스는 미검증이며 Warp 지원은 제한적입니다.
+`tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 지켜볼 수 있는 터미널 탭, 창 또는 tmux pane에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS, Windows에서 직접 실행하는 환경과 tmux 또는 Herdr Core를 통한 Linux 실행을 지원합니다. WSL 안의 Linux 프로세스는 미검증이며 Warp 지원은 제한적입니다.
 
 전역 에이전트 지침을 직접 작성하지 않고 위임하려면 Claude Code, Codex, Agy, Pi용
 [에이전트 브리지 플러그인](#에이전트-플러그인-설치)을 설치하세요. 네 패키지는 동일한
@@ -67,6 +67,7 @@ closed session-K7m2Qx
 | Windows에서 직접 실행 | 구현됨 | 네 CLI 모두, 2026-10-02 |
 | Windows Terminal 탭 | 우선 사용 | 탭 생성/후속 요청/종료, 2026-10-01 |
 | Windows 콘솔 창 | 대체 경로 | 초기 요청/종료, 2026-10-01 |
+| Linux / Herdr Core | 구현됨 | [hc 0.1.21 왕복 검증](docs/verification/2026-11-18-linux-herdr.md) |
 | Linux / tmux | 구현됨 | [네 CLI, 2026-11-17](docs/verification/2026-11-17-linux-6-tmux-3.6.md) |
 | WSL 안의 Linux 프로세스 | 미검증 | 실제 실행 기록 없음 |
 
@@ -76,7 +77,7 @@ Linux는 기본적으로 tmux 3.2 이상을 사용하며 GUI 창을 열지 않�
 `tmux -S '<socket>' attach` 명령(JSON의 `attach_command`)으로 접속합니다.
 [Linux / tmux](docs/terminals.md#linux--tmux)를 참고합니다.
 
-macOS에서는 `--terminal herdr`로 실행 중인 Herdr Core(`hc`) 안에 세션을 엽니다. Herdr 터미널 내부에서는 자동 감지합니다. [Herdr 지원](docs/terminals.md#macos--herdr-core)을 참고하세요.
+macOS와 Linux에서는 `--terminal herdr`로 실행 중인 Herdr Core(`hc`) 안에 세션을 엽니다. Herdr 터미널 내부에서는 자동 감지합니다. [Herdr 지원](docs/terminals.md#herdr-core-on-macos-and-linux)을 참고하세요.
 
 Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 있어야 사용할 수 있습니다. 터미널 입력을 제출하지 못하므로 Agy와 Pi의 후속 요청은 지원하지 않습니다. 로그인한 CLI로 요청·결과·후속 요청·종료를 거치는 경로도 미검증입니다. 이 두 CLI에는 다른 터미널을 사용합니다.
 
@@ -145,7 +146,7 @@ cargo install --git https://github.com/jy1655/tabcli --tag v0.4.45 --locked
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.
 
-첫 실행 전에 사용할 에이전트 CLI를 설치하고 로그인한 뒤, 해당 프로젝트의 작업 디렉터리 신뢰 질문을 처리합니다. iTerm2, Terminal.app, Ghostty 연동은 macOS Automation을 사용합니다. 실행 중 Apple Events 권한 오류가 나면 [macOS 승인 확인 절차](docs/macos-permissions.md)를 따릅니다. Windows에서 직접 실행할 때는 cmd에서 호출하더라도 `PATH`에 PowerShell 7(`pwsh.exe`)이 있어야 합니다. Linux에서는 `PATH`에 tmux 3.2 이상이 있어야 합니다. [Linux / tmux](docs/terminals.md#linux--tmux)를 참고하세요.
+첫 실행 전에 사용할 에이전트 CLI를 설치하고 로그인한 뒤, 해당 프로젝트의 작업 디렉터리 신뢰 질문을 처리합니다. iTerm2, Terminal.app, Ghostty 연동은 macOS Automation을 사용합니다. 실행 중 Apple Events 권한 오류가 나면 [macOS 승인 확인 절차](docs/macos-permissions.md)를 따릅니다. Windows에서 직접 실행할 때는 cmd에서 호출하더라도 `PATH`에 PowerShell 7(`pwsh.exe`)이 있어야 합니다. Linux에서 tmux를 선택하면 `PATH`에 tmux 3.2 이상이 있어야 합니다. [Linux / tmux](docs/terminals.md#linux--tmux)를 참고하세요.
 
 ## 에이전트 플러그인 설치
 

@@ -46,8 +46,22 @@ pub(in crate::native) struct HerdrSurface {
     pub(in crate::native) core_id: String,
     pub(in crate::native) created_ms: u64,
     pub(in crate::native) host_pid: u32,
-    pub(in crate::native) host_start_seconds: u64,
-    pub(in crate::native) host_start_microseconds: u64,
+    #[serde(flatten)]
+    pub(in crate::native) birth: HerdrHostBirth,
+}
+
+// Keep the macOS wire fields written since 0.4.45. Linux ticks identify a
+// process only on their own boot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(in crate::native) enum HerdrHostBirth {
+    Macos {
+        host_start_seconds: u64,
+        host_start_microseconds: u64,
+    },
+    Linux {
+        linux_birth: LinuxBirth,
+    },
 }
 
 /// Only a creation-proven adapter may publish this incarnation. Registration's
@@ -118,13 +132,13 @@ impl TerminalSession {
         self.wezterm_mux.as_ref()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_herdr_core(mut self, core: HerdrSurface) -> Self {
         self.herdr_core = Some(core);
         self
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn herdr_core(&self) -> Option<&HerdrSurface> {
         self.herdr_core.as_ref()
     }

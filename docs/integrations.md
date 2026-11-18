@@ -49,7 +49,7 @@ delivery and terminal support differ by provider and platform; see [providers](p
 - `tabcli` 0.4.22 or newer on `PATH`, installed as described in the
   [README](../README.md#install). Check it with `tabcli --version`. The minimum CLI version is
   independent of the integration's version; each package records it in `integration.json`.
-- macOS, native Windows, or Linux with tmux 3.2 or later on an absolute `PATH` entry. Linux
+- macOS, native Windows, or Linux with tmux 3.2 or later on an absolute `PATH` entry or a running local Herdr Core. Linux
   opens no GUI; use the printed attach command. A Linux process in WSL is not verified.
 - On native Windows, PowerShell 7 (`pwsh.exe`) on an absolute `PATH` entry, and Windows
   Terminal's `wt.exe` for tabs. See [terminals](terminals.md#requirements-and-first-run-prompts).

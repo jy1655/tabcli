@@ -30,7 +30,10 @@ pub(in crate::native) fn start(
         expected_claim_token,
         deadline,
     )?;
-    if terminal_kind.uses_launch_host() {
+    // Herdr on Linux uses the bound bash handoff. The stage record belongs
+    // to the macOS shell-environment capture host.
+    let linux_herdr = cfg!(target_os = "linux") && terminal_kind == terminal::TerminalKind::Herdr;
+    if terminal_kind.uses_launch_host() && !linux_herdr {
         launch::host::initialize(
             &Store::open_unchecked(&created.directory),
             expected_claim_token,

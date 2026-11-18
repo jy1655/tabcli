@@ -92,7 +92,7 @@ impl TerminalKind {
 pub(super) mod apple_terminal;
 #[path = "macos/ghostty/facts.rs"]
 pub(super) mod ghostty;
-#[path = "macos/herdr/facts.rs"]
+#[path = "herdr/facts.rs"]
 pub(super) mod herdr;
 #[path = "macos/iterm2/facts.rs"]
 pub(super) mod iterm2;

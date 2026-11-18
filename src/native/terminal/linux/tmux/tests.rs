@@ -838,38 +838,6 @@ fn a_real_tmux_server_is_created_proven_written_read_and_ended() {
 }
 
 #[test]
-fn the_launch_bash_runs_no_startup_file_but_keeps_bash_env_for_the_provider() {
-    let root = tempfile::tempdir().unwrap();
-    let startup = root.path().join("startup.sh");
-    let ran = root.path().join("ran");
-    let seen = root.path().join("seen");
-    std::fs::write(&startup, format!("touch '{}'\n", ran.display())).unwrap();
-    let command = format!("printf '%s' \"$BASH_ENV\" > '{}'", seen.display());
-    let script = bash_script(&command, Some(startup.as_os_str()));
-    let BashScript::WithoutStartupFile(script) = script else {
-        panic!("{script:?}")
-    };
-    let status = Command::new("/bin/bash")
-        .env("BASH_ENV", &startup)
-        .env_remove("BASH_ENV")
-        .args(["--noprofile", "--norc", "-m", "-c", &script])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    assert!(!ran.exists(), "BASH_ENV ran before the launch command");
-    assert_eq!(
-        std::fs::read_to_string(&seen).unwrap(),
-        startup.to_str().unwrap()
-    );
-    assert_eq!(bash_script("cmd", None), BashScript::Plain("cmd".into()));
-    use std::os::unix::ffi::OsStrExt;
-    assert_eq!(
-        bash_script("cmd", Some(OsStr::from_bytes(b"/x\xff"))),
-        BashScript::WithoutStartupFile("cmd".into())
-    );
-}
-
-#[test]
 fn a_delivery_keeps_time_to_delete_its_buffer_after_any_failed_paste() {
     let (_root, path) = prompt();
     // Too short to keep the reserve: nothing is loaded.

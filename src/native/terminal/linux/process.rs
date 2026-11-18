@@ -52,6 +52,10 @@ fn parse_stat(bytes: &[u8], pid: u32) -> Result<Stat> {
 fn read_stat(pid: u32) -> Result<Option<Stat>> {
     read_stat_with(pid, || fs::read(format!("/proc/{pid}/stat")))
 }
+pub(in crate::native::terminal) fn parent_pid(pid: u32) -> Result<Option<u32>> {
+    Ok(read_stat(pid)?.map(|stat| stat.parent))
+}
+
 fn read_stat_with(
     pid: u32,
     read_pid_entry: impl FnOnce() -> std::io::Result<Vec<u8>>,
