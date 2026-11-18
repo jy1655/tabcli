@@ -54,7 +54,9 @@ pub(in crate::native) struct HerdrSurface {
 }
 
 // Keep the macOS wire fields written since 0.4.45. Linux ticks identify a
-// process only on their own boot.
+// process only on their own boot. A Windows creation time (100 ns since 1601, from
+// `GetProcessTimes`) identifies the process holding its PID: Windows reuses a PID only
+// after every handle to the earlier process is closed, and a later process starts later.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub(in crate::native) enum HerdrHostBirth {
@@ -64,6 +66,9 @@ pub(in crate::native) enum HerdrHostBirth {
     },
     Linux {
         linux_birth: LinuxBirth,
+    },
+    Windows {
+        host_creation_time: u64,
     },
 }
 
@@ -136,7 +141,7 @@ impl TerminalSession {
         self.wezterm_mux.as_ref()
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn with_herdr_core(
         mut self,
         core: HerdrSurface,
@@ -147,7 +152,7 @@ impl TerminalSession {
         self
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn herdr_core(&self) -> Option<&HerdrSurface> {
         self.herdr_core.as_ref()
     }
@@ -291,6 +296,48 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    // Each platform's host birth keeps its own wire fields, so a handle written on one
+    // platform is read back as the same birth anywhere and never as another platform's.
+    #[test]
+    fn herdr_host_births_keep_their_platform_wire_fields() {
+        let surface = |birth: Value| {
+            let mut wire = json!({"terminal": "herdr", "session_id": "t7",
+                "managed_session_id": "session-record",
+                "herdr_core": {"socket": r"\\.\pipe\herdr-core-u-default.sock",
+                               "core_id": "core", "created_ms": 13, "host_pid": 14}});
+            for (field, value) in birth.as_object().unwrap() {
+                wire["herdr_core"][field] = value.clone();
+            }
+            wire
+        };
+        for (birth, expected) in [
+            (
+                json!({"host_creation_time": 133_000_000_000_000_000_u64}),
+                HerdrHostBirth::Windows {
+                    host_creation_time: 133_000_000_000_000_000,
+                },
+            ),
+            (
+                json!({"host_start_seconds": 15, "host_start_microseconds": 16}),
+                HerdrHostBirth::Macos {
+                    host_start_seconds: 15,
+                    host_start_microseconds: 16,
+                },
+            ),
+        ] {
+            let wire = surface(birth);
+            let record: TerminalSession = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(record.herdr_core.as_ref().unwrap().birth, expected);
+            assert_eq!(serde_json::to_value(&record).unwrap(), wire);
+        }
+        // A birth carrying another platform's field as well is no birth at all.
+        let mixed = surface(json!({"host_creation_time": 1, "host_start_seconds": 2,
+            "host_start_microseconds": 3}));
+        assert!(serde_json::from_value::<TerminalSession>(mixed).is_err());
+        let wrong = surface(json!({"host_creation_time": "1"}));
+        assert!(serde_json::from_value::<TerminalSession>(wrong).is_err());
     }
 
     #[test]

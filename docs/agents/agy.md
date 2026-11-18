@@ -33,7 +33,8 @@
   received. Do not put a window back. The reload logged right after `Starting new
   conversation` is that conversation's reload, never the trust reload. Agy logs `Full
   redraw completed` on the Windows console only, so the Windows rule requires it and the
-  macOS rule does not.
+  macOS rule does not. A Windows Herdr terminal keeps the Windows rule unmeasured: if Agy does
+  not log that line there, the paste is withheld and reported not sent, never sent blind.
 - The trust dialog matcher accepts only the exact dialog, alone or followed by a footer
   that names an Agy model family (`Gemini `, `Claude `, `GPT-`): the footer shows the
   saved model, which is not always a Gemini one, and appears about a second after the

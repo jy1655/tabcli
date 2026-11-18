@@ -2,7 +2,7 @@ use crate::native::terminal::facts::{
     CloseEvidenceChoice, LaunchHost, PasteEnvelope, Registration, SurfaceFacts,
 };
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::launch::{BindingBudget, BindingFacts};
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
@@ -21,7 +21,12 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     launch_host: Some(LaunchHost::BoundBash(
         crate::native::terminal::herdr::binding_names_this_host,
     )),
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    launch_host: Some(LaunchHost::BoundPowerShell(
+        crate::native::terminal::herdr::binding_names_this_host,
+        &WINDOWS_BINDING,
+    )),
+    #[cfg(not(any(target_os = "linux", windows)))]
     launch_host: Some(LaunchHost::ShellCapture {
         #[cfg(target_os = "macos")]
         binding_names_host: crate::native::terminal::herdr::binding_names_this_host,
@@ -40,4 +45,12 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         cancelled: "Herdr launch was cancelled or timed out before surface binding",
         budget: BindingBudget::RemainingReceiptCapped,
     }),
+};
+
+/// The binding the Windows launch host waits for.
+#[cfg(windows)]
+const WINDOWS_BINDING: BindingFacts = BindingFacts {
+    host: "Herdr",
+    cancelled: "Herdr launch was cancelled or timed out before surface binding",
+    budget: BindingBudget::RemainingReceiptCapped,
 };

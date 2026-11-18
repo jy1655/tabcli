@@ -13,7 +13,8 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
+// Shared with the Windows Herdr surface, which binds the same way.
+pub(in crate::native::terminal) use super::open_with;
 pub(in crate::native::terminal) type BindSurface<'a> =
     Box<dyn FnOnce(&mut TerminalSession) -> Result<()> + 'a>;
 
@@ -131,31 +132,6 @@ where
         Box::new(bind),
         Box::new(unbind),
     )
-}
-
-pub(in crate::native::terminal) fn open_with(
-    deadline: Instant,
-    create: impl FnOnce(Instant) -> Result<TerminalSession>,
-    start: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
-    cleanup: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
-    bind: impl FnOnce(&mut TerminalSession) -> Result<()>,
-    unbind: impl FnOnce() -> Result<()>,
-) -> Result<TerminalSession> {
-    let startup_deadline = deadline
-        .checked_sub(STARTUP_CLEANUP_RESERVE)
-        .filter(|candidate| *candidate > Instant::now())
-        .context("terminal startup timeout leaves no room for exact surface cleanup")?;
-    let mut session = create(startup_deadline)?;
-    let start_session = session.clone();
-    let cleanup_session = session.clone();
-    super::bind_surface_before_start(
-        &mut session,
-        bind,
-        || start(&start_session, startup_deadline),
-        || cleanup(&cleanup_session, deadline),
-        unbind,
-    )?;
-    Ok(session)
 }
 
 pub(in crate::native::terminal) fn send_file(

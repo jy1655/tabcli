@@ -4,11 +4,14 @@
 //! of the dead owner is injected.
 use super::*;
 use crate::native::process_identity::{Gone, ProcessObservation};
+use crate::native::session::Store;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 use crate::native::session::{self, CoreRecord, SessionState};
 use crate::native::terminal::close_authority::{
     close_owned_surface_with, test_support::TestObservation,
 };
+use crate::native::terminal::ownership::NativeSessionOwner;
+use crate::native::terminal::posix::PosixTerminalAdapter;
 
 fn gone(gone: Gone) -> OwnerAttestation {
     OwnerAttestation {

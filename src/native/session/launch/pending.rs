@@ -6,12 +6,12 @@
 //! locked spawn fence is final.
 use super::{Phase, Record};
 use crate::native::session::primitives::unix_ms;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use crate::native::session::{CoreRecord, record};
 use crate::native::session::{Reader, SessionState, turn};
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use crate::native::terminal::TerminalSession;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 use anyhow::Context;
 use anyhow::Result;
 
@@ -24,10 +24,10 @@ pub(in crate::native) enum Expiry<'a> {
     /// The caller's own budget on its clock, then the receipt's recorded deadline. Only the
     /// macOS binding wait has a budget of its own.
     #[cfg_attr(
-        not(any(target_os = "macos", target_os = "linux", test)),
+        not(any(target_os = "macos", target_os = "linux", windows, test)),
         allow(dead_code)
     )]
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
     BudgetOrReceipt(&'a mut dyn FnMut() -> bool),
 }
 
@@ -101,7 +101,7 @@ pub(in crate::native) fn judge(
 /// `None` while no surface is bound. An undecodable handle carries the caller's `invalid`
 /// context; a handle of another Session fails with the binding's own error. The caller
 /// judges the kind and whether the surface names its host.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 pub(in crate::native) fn bound_surface<C>(
     reader: &Reader,
     session_id: &str,

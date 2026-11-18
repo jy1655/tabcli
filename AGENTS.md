@@ -99,7 +99,7 @@ Paths mentioned inside the boundary files are relative to the repository root.
 | [Current Linux Surface Boundary](docs/agents/linux.md) | Linux launch, input, observation, close, process identity or exec budgets; `src/native/terminal/linux/`. |
 | [Current Windows Surface Boundary](docs/agents/windows.md) | Windows console/tab launch, focus, host, control or record publication; `src/native/terminal/windows/`, `src/native/console_control.rs` and `src/native/console_control/`. |
 | [Current macOS Shell Startup Boundary](docs/agents/macos-shell.md) | macOS shell capture or launch host; `src/native/terminal/macos/` (especially iTerm2/WezTerm). |
-| [Current Herdr Surface Boundary](docs/agents/herdr.md) | Herdr socket, launch, caller verification, input, screen or close; `src/native/terminal/herdr.rs` and `src/native/terminal/herdr/`. |
+| [Current Herdr Surface Boundary](docs/agents/herdr.md) | Herdr socket or Windows pipe, launch, caller verification, input, screen or close; `src/native/terminal/herdr.rs`, `src/native/terminal/herdr/` and `src/native/terminal/windows/launch_host.rs`. |
 | [Trust Store Boundary](docs/agents/trust.md) | Workspace consent, provider trust readers, launch dialogs or reopen admission; `src/native/consent/` and provider trust code. |
 | [Observation and Self-Test Boundary](docs/agents/observation.md) | Queries, screen, timelines, delivery refusal, version notes or self-test; `src/native/query/`, `src/native/self_test/` and diagnostics. |
 | [Current Attestation Boundary](docs/agents/attestation.md) | Owner/process observation, repair, wait, prune, close or reopen; process identity and ownership code on every platform. |

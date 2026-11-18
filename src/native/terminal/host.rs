@@ -285,6 +285,17 @@ fn run_launch_host(directory: PathBuf, command: String, kind: TerminalKind) -> R
                 Ok(())
             })
         }
+        #[cfg(windows)]
+        Some(super::facts::LaunchHost::BoundPowerShell(matches, binding)) => {
+            super::windows::launch_host::run(&directory, &command, kind, binding, |surface| {
+                anyhow::ensure!(
+                    matches(surface),
+                    "{} surface binding does not name this launch host",
+                    kind.display_name()
+                );
+                Ok(())
+            })
+        }
         _ => {
             let _ = (directory, command);
             bail!("native launch hosts are only available on macOS")

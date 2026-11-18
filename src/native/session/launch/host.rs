@@ -497,10 +497,12 @@ mod tests {
         let (_dir, store, token) = fixture();
         initialize_for_launch(&store, &token, TerminalKind::Herdr).unwrap();
         let observed = observe(&store, super::super::read(&store).unwrap().as_ref());
-        #[cfg(not(target_os = "linux"))]
+        // Only the macOS host captures a shell; the Linux bash and Windows PowerShell
+        // handoffs record no stages.
+        #[cfg(not(any(target_os = "linux", windows)))]
         assert!(matches!(observed, HostObservation::Recorded(host)
             if host.terminal == TerminalKind::Herdr && host.stage == Stage::AwaitingHost));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         assert!(matches!(observed, HostObservation::NotRecorded));
     }
 

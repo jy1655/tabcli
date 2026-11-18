@@ -30,13 +30,28 @@ pub(in crate::native) fn set_private_permissions(path: &Path, directory: bool) -
 // token even when the calling thread impersonates. Read that same TokenUser, not the
 // thread token or TokenOwner (which can be Administrators on an elevated runner).
 // Query on every call: neither a cached identity nor cached permissions are authority.
-fn process_user_sid() -> Result<String> {
+pub(in crate::native) fn process_user_sid() -> Result<String> {
     let mut raw = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to open the Windows process token");
     }
-    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    token_user_sid(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+/// The user SID in the primary token of the process that the borrowed handle opens: whose
+/// process it is. Processes are opened by the process module, never here; this module
+/// only reads the token of a handle it is lent.
+pub(in crate::native) fn process_handle_user_sid(process: &OwnedHandle) -> Result<String> {
+    let mut raw = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open the Windows process token");
+    }
+    token_user_sid(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+fn token_user_sid(token: OwnedHandle) -> Result<String> {
     let mut needed = 0;
     let queried = unsafe {
         GetTokenInformation(

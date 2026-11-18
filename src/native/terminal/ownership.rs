@@ -637,7 +637,11 @@ pub(in crate::native) fn verified_terminal_surface_owner(
     session.verify_managed_session(expected_session_id)?;
     #[cfg(windows)]
     let owner = {
-        let _ = timeout;
+        // A Herdr terminal is proved on its recorded core, as on macOS and Linux, before
+        // its owner; a managed console is proved through its owner alone.
+        if session.kind == terminal::TerminalKind::Herdr {
+            terminal::verify_windows_herdr_surface(session, timeout)?;
+        }
         Some(verified_windows_native_owner(
             directory,
             expected_session_id,
@@ -680,7 +684,10 @@ pub(in crate::native) fn close_dead_owner_surface_with(
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
     #[cfg(windows)]
-    if session.kind != terminal::TerminalKind::WindowsConsole {
+    if !matches!(
+        session.kind,
+        terminal::TerminalKind::WindowsConsole | terminal::TerminalKind::Herdr
+    ) {
         bail!("dead Windows native owner has a non-Windows terminal handle")
     }
     close_remaining(deadline)?;

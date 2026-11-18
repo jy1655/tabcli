@@ -338,7 +338,15 @@ trait NativeProviderAdapter: Sync {
     fn reopen(&self) -> Result<&'static dyn ReopenSupport>;
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()>;
     fn run_control(&self, arguments: &[String]) -> Result<()>;
+    // Whether this adapter's launch and turn transports can run on a surface of `surface`
+    // on this platform, decided before any session exists. `Err` names the capability the
+    // surface lacks for this provider. No default: each adapter states its own answer.
+    // `Ok` is a code path, not live evidence.
+    fn surface_support(&self, surface: super::terminal::TerminalKind) -> SurfaceSupport;
 }
+
+/// An adapter's answer on a surface kind; the refusal names the missing capability.
+pub(super) type SurfaceSupport = std::result::Result<(), &'static str>;
 
 fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
     match provider {
@@ -418,6 +426,29 @@ pub(super) fn run_control(provider: FirstPartyCli, arguments: &[String]) -> Resu
     adapter(provider).run_control(arguments)
 }
 
+pub(super) fn surface_support(
+    provider: FirstPartyCli,
+    surface: super::terminal::TerminalKind,
+) -> SurfaceSupport {
+    adapter(provider).surface_support(surface)
+}
+
+/// The admission of a selected surface for a provider, before any session exists: the
+/// provider adapter's own refusal, as an unsupported failure.
+pub(super) fn admit_surface(
+    provider: FirstPartyCli,
+    surface: super::terminal::TerminalKind,
+) -> Result<()> {
+    surface_support(provider, surface).map_err(|reason| {
+        super::failure_kind::Unsupported::new(format!(
+            "{} on {} is unsupported on this platform: {reason}",
+            provider.as_str(),
+            surface.display_name()
+        ))
+        .into()
+    })
+}
+
 pub(super) fn initial_transport(provider: FirstPartyCli) -> Box<dyn Transport> {
     adapter(provider).initial_transport()
 }
@@ -447,6 +478,57 @@ fn transport_test_context<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Each adapter answers for itself. Only Codex refuses a surface, and only Herdr on
+    // native Windows, naming the missing capability; the refusal is an unsupported
+    // failure, and the managed console and every other surface stay admitted.
+    #[test]
+    fn adapters_declare_which_surfaces_their_transports_run_on() {
+        use super::super::failure_kind::{FailureKind, classify};
+        use super::super::terminal::TerminalKind;
+        for provider in agent_bridge::supported_clis().iter().copied() {
+            for surface in TerminalKind::ALL {
+                let refused = cfg!(windows)
+                    && provider == FirstPartyCli::Codex
+                    && surface == TerminalKind::Herdr;
+                match (admit_surface(provider, surface), refused) {
+                    (Ok(()), false) => {}
+                    (Err(error), true) => {
+                        let text = format!("{error:#}");
+                        assert!(
+                            text.starts_with(
+                                "codex on Herdr is unsupported on this platform: Codex's Windows initial prompt is the injected console paste (#124)"
+                            ),
+                            "{text}"
+                        );
+                        assert!(
+                            text.ends_with("Choose --terminal windows-console"),
+                            "{text}"
+                        );
+                        assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+                    }
+                    (result, refused) => {
+                        panic!(
+                            "{provider:?} on {surface:?}: {result:?}, expected refused={refused}"
+                        )
+                    }
+                }
+            }
+        }
+        assert!(
+            CODEX_WINDOWS_HERDR_REFUSAL_WORDS
+                .iter()
+                .all(|words| codex::windows_herdr_refusal().contains(words))
+        );
+    }
+
+    // The concrete facts the Codex refusal rests on, so that its text cannot drift from them.
+    const CODEX_WINDOWS_HERDR_REFUSAL_WORDS: [&str; 4] = [
+        "without Return",
+        "only against the exact accepted screen",
+        "32,767 characters",
+        "8,191 and no line break through an npm codex.cmd",
+    ];
 
     #[test]
     fn read_only_observations_dispatch_through_adapters() {

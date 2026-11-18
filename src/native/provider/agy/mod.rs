@@ -442,6 +442,15 @@ impl NativeProviderAdapter for AgyAdapter {
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Agy does not expose Agent Bridge provider controls")
     }
+
+    // Agy's pastes go through the surface's own transport (a Herdr terminal's
+    // `terminal.send`), each behind Agy's own log readiness and receipt; nothing needs the
+    // managed console. On native Windows the readiness rule also needs `Full redraw
+    // completed`, measured on the console only: without it in an hc terminal the paste is
+    // withheld and reported not sent. Windows Herdr has no live evidence yet.
+    fn surface_support(&self, _surface: terminal::TerminalKind) -> super::SurfaceSupport {
+        Ok(())
+    }
 }
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {

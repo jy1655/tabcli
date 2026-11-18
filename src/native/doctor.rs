@@ -199,7 +199,12 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     let mut observations = json!({});
     let mut selected_terminal = None;
     if request.provider.is_some() {
-        let selected = terminal::select(None);
+        let selected = terminal::select_for(
+            None,
+            request.provider.map(|provider| {
+                provider::surface_support(provider, terminal::TerminalKind::Herdr).is_ok()
+            }),
+        );
         selected_terminal = selected.as_ref().ok().copied();
         let (availability, reason, evidence) = match selected {
             Ok(kind) if kind.supported_on_this_platform() => (

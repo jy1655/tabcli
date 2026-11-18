@@ -193,17 +193,51 @@ pub(in crate::native) fn read_store(path: &Path) -> Result<Option<String>> {
 /// a workspace into the store that this user never approved.
 #[cfg(windows)]
 fn windows_store_is_private(owner: &str, writers: &[String], own: &[String]) -> Result<()> {
+    windows_is_private("trust store", owner, writers, own)
+}
+
+// The one Windows privacy rule, for whatever `noun` names: owned by one of this process's
+// own owners, and changeable by no account but those owners, the system, the
+// Administrators group and `OWNER RIGHTS`.
+#[cfg(windows)]
+fn windows_is_private(noun: &str, owner: &str, writers: &[String], own: &[String]) -> Result<()> {
     const SYSTEM_WRITERS: [&str; 3] = ["S-1-5-18", "S-1-5-32-544", "S-1-3-4"];
     if !own.iter().any(|sid| sid == owner) {
-        bail!("trust store owner differs from current user");
+        bail!("{noun} owner differs from current user");
     }
     if let Some(other) = writers
         .iter()
         .find(|sid| !own.contains(sid) && !SYSTEM_WRITERS.contains(&sid.as_str()))
     {
-        bail!("trust store can be changed by another account ({other})");
+        bail!("{noun} can be changed by another account ({other})");
     }
     Ok(())
+}
+
+/// A session directory that a Windows launch host is about to trust, read through
+/// `directory`, a handle the caller opened on the directory itself (not through a reparse
+/// point). It is this user's own under the trust store's rule (`windows_is_private`), where
+/// changing a directory also means adding, removing or deleting its entries and deleting or
+/// renaming the directory: `FILE_DELETE_CHILD` and `DELETE` count as well. The trust store's
+/// own check is unchanged.
+#[cfg(windows)]
+pub(in crate::native) fn windows_directory_is_private(directory: &File) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD};
+    const NOUN: &str = "session directory";
+    let (owner, writers) =
+        windows_access(directory, store_change() | FILE_DELETE_CHILD | DELETE, NOUN)?;
+    windows_is_private(NOUN, &owner, &writers, &windows_current_owners()?)
+}
+
+// What an access rule must allow for an account to change a trust store's content or its
+// access list.
+#[cfg(windows)]
+fn store_change() -> u32 {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_ALL, GENERIC_WRITE},
+        Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER},
+    };
+    FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL
 }
 
 /// The owner of an open trust store, and every account that an access rule of the store
@@ -214,21 +248,25 @@ fn windows_store_is_private(owner: &str, writers: &[String], own: &[String]) -> 
 /// access away, and an inherit-only rule does not apply to the store itself.
 #[cfg(windows)]
 fn windows_store_access(file: &File) -> Result<(String, Vec<String>)> {
+    windows_access(file, store_change(), "trust store")
+}
+
+// The owner of what `file` opens, and every account that an access rule allows any of the
+// `change` rights, under the trust store's reading of its access list.
+#[cfg(windows)]
+fn windows_access(file: &File, change: u32, noun: &str) -> Result<(String, Vec<String>)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
-        Foundation::{GENERIC_ALL, GENERIC_WRITE, LocalFree},
+        Foundation::LocalFree,
         Security::{
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
             Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
             DACL_SECURITY_INFORMATION, GetAce, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
         },
-        Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER},
     };
     // `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE` of `winnt.h`.
     const ALLOWED: u8 = 0;
     const DENIED: u8 = 1;
-    const CHANGE: u32 =
-        FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
 
     let mut owner = std::ptr::null_mut();
     let mut access_list: *mut ACL = std::ptr::null_mut();
@@ -247,19 +285,19 @@ fn windows_store_access(file: &File) -> Result<(String, Vec<String>)> {
     };
     if error != 0 {
         return Err(std::io::Error::from_raw_os_error(error as i32))
-            .context("cannot read the trust store's owner and access list");
+            .with_context(|| format!("cannot read the {noun}'s owner and access list"));
     }
     let result = (|| {
         let owner = windows_sid(owner)?;
         if access_list.is_null() {
-            bail!("trust store has no access list, so every account can change it");
+            bail!("{noun} has no access list, so every account can change it");
         }
         let mut writers = Vec::new();
         for index in 0..u32::from(unsafe { (*access_list).AceCount }) {
             let mut rule = std::ptr::null_mut();
             if unsafe { GetAce(access_list, index, &mut rule) } == 0 {
                 return Err(std::io::Error::last_os_error())
-                    .context("cannot read an access rule of the trust store");
+                    .with_context(|| format!("cannot read an access rule of the {noun}"));
             }
             let header = unsafe { *rule.cast::<ACE_HEADER>() };
             if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 || header.AceType == DENIED {
@@ -268,10 +306,10 @@ fn windows_store_access(file: &File) -> Result<(String, Vec<String>)> {
             if header.AceType != ALLOWED
                 || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
             {
-                bail!("trust store has an access rule that cannot be evaluated");
+                bail!("{noun} has an access rule that cannot be evaluated");
             }
             let allowed = rule.cast::<ACCESS_ALLOWED_ACE>();
-            if unsafe { (*allowed).Mask } & CHANGE != 0 {
+            if unsafe { (*allowed).Mask } & change != 0 {
                 let sid =
                     windows_sid(unsafe { std::ptr::addr_of_mut!((*allowed).SidStart) }.cast())?;
                 if !writers.contains(&sid) {

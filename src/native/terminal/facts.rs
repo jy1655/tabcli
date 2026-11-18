@@ -3,9 +3,9 @@
 //! lookup (surface facts, host command, launch host, close evidence, declared refusals
 //! and the macOS binding facts) reads that registration.
 use super::TerminalKind;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use super::TerminalSession;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::launch::BindingFacts;
 
 #[derive(Clone, Copy)]
@@ -42,6 +42,11 @@ pub(in crate::native) enum LaunchHost {
     },
     #[cfg(target_os = "linux")]
     BoundBash(fn(&TerminalSession) -> bool),
+    /// Windows has no exec: the host waits for its binding, then starts the console root's
+    /// PowerShell in its own console and ends with it. `Registration::binding` serves the
+    /// macOS and Linux dispatch, so this host carries the binding it waits for.
+    #[cfg(windows)]
+    BoundPowerShell(fn(&TerminalSession) -> bool, &'static BindingFacts),
 }
 
 /// One kind's registration. A refusal of `None` means the kind supports the

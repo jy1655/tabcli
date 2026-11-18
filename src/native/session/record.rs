@@ -252,7 +252,7 @@ pub(in crate::native) fn terminal(
 /// Retained-handle repair decodes the handle from its bytes: the whole input must be UTF-8
 /// (`invalid UTF-8`, see [`utf8`]), then serde's shape diagnostics, not the text reader's
 /// I/O diagnostic.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn terminal_bytes(
     bytes: &[u8],
 ) -> Result<crate::native::terminal::TerminalSession> {

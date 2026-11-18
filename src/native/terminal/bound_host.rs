@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use std::path::Path;
 
@@ -39,8 +40,11 @@ pub(super) fn run_bound_host<T>(
     run(admit(directory, spec)?)
 }
 
-/// One admission for every macOS/Linux host, in one order: an absolute path, a session-id file
+/// One admission for every bound host, in one order: an absolute path, a session-id file
 /// name, an existing path, a real directory (never a symlink), private to the current user.
+/// On Windows the last two are read again from a handle opened on the directory itself, not
+/// through a reparse point: no reparse point, and the trust store's access-list rule with
+/// the rights that change a directory's entries (`consent::windows_directory_is_private`).
 /// Decided 2026-10-30: the per-host orders and refusal texts this replaces changed which
 /// refusal a defective directory reported; the refusal vocabulary is now one template.
 fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
@@ -61,10 +65,50 @@ fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
             directory.display()
         );
     }
+    #[cfg(unix)]
     if !owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }) {
         bail!("{name} launch directory is not private to the current user");
     }
+    #[cfg(windows)]
+    windows_private_directory(directory, name)?;
     Ok(id)
+}
+
+// The directory as the handle that opened it reports it, so that a reparse point or a
+// directory replaced after the path was read is seen. A failure to open it or to read its
+// access list refuses the launch.
+#[cfg(windows)]
+fn windows_private_directory(directory: &Path, name: &str) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    };
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)
+        .with_context(|| {
+            format!(
+                "cannot open {name} launch directory {}",
+                directory.display()
+            )
+        })?;
+    let metadata = opened.metadata().with_context(|| {
+        format!(
+            "cannot inspect {name} launch directory {}",
+            directory.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        bail!(
+            "refusing non-directory {name} launch path: {}",
+            directory.display()
+        );
+    }
+    crate::native::consent::windows_directory_is_private(&opened)
+        .with_context(|| format!("{name} launch directory is not private to the current user"))
 }
 
 #[cfg(target_os = "macos")]
@@ -80,8 +124,10 @@ pub(super) fn binding_names_host(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+#[cfg(all(test, windows))]
+mod windows_tests;
 
 /// The tmux host's handoff (no exec here): admit the private directory, wait for the
 /// pending launch's binding, validate this host's adapter-owned environment against
@@ -105,8 +151,37 @@ pub(in crate::native::terminal) fn prepare_bound_launch(
         Ok(())
     })
 }
+/// The Windows Herdr host's handoff, in the same order: after its exact binding, the
+/// console input typed into the new terminal is discarded, so that an Enter cannot answer
+/// the first dialog the provider shows. A console that cannot be flushed refuses the launch.
+#[cfg(windows)]
+pub(in crate::native::terminal) fn prepare_bound_launch(
+    directory: &Path,
+    spec: &BoundHostSpec,
+    facts: &crate::native::session::launch::BindingFacts,
+    clock: &mut dyn crate::native::clock::Clock,
+    validate_binding: impl FnOnce(&super::TerminalSession) -> Result<()>,
+) -> Result<super::TerminalSession> {
+    use std::os::windows::io::AsRawHandle;
+    prepare_bound_launch_with(directory, spec, facts, clock, validate_binding, || {
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+            .with_context(|| format!("cannot open the {} console input", spec.name))?;
+        if unsafe {
+            windows_sys::Win32::System::Console::FlushConsoleInputBuffer(input.as_raw_handle())
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot discard {} startup input", spec.name));
+        }
+        Ok(())
+    })
+}
+
 // Compiled into every test build, so that macOS runs the handoff tests too.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn prepare_bound_launch_with(
     directory: &Path,
     spec: &BoundHostSpec,

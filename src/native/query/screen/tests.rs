@@ -640,7 +640,6 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
             terminal::TerminalKind::Warp,
             terminal::TerminalKind::WezTerm,
             terminal::TerminalKind::Tmux,
-            terminal::TerminalKind::Herdr,
         ]
     } else if cfg!(target_os = "linux") {
         &[

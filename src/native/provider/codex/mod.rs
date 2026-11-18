@@ -385,7 +385,25 @@ impl NativeProviderAdapter for CodexAdapter {
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Codex does not expose Agent Bridge provider controls")
     }
+
+    // Elsewhere Herdr takes Codex's initial prompt as a launch argument with `--no-daemon`
+    // (version-gated at launch from the recorded surface). Native Windows has neither route
+    // on Herdr; see the refusal. Replace it with a Windows Herdr route that keeps Codex's
+    // argument semantics and size, or a first-party addressed input.
+    fn surface_support(&self, surface: terminal::TerminalKind) -> super::SurfaceSupport {
+        if cfg!(windows) && surface == terminal::TerminalKind::Herdr {
+            return Err(CODEX_WINDOWS_HERDR_UNSUPPORTED);
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+pub(super) fn windows_herdr_refusal() -> &'static str {
+    CODEX_WINDOWS_HERDR_UNSUPPORTED
+}
+
+const CODEX_WINDOWS_HERDR_UNSUPPORTED: &str = "Codex's Windows initial prompt is the injected console paste (#124), which writes the text without Return and then sends one Return only against the exact accepted screen; Herdr's terminal.send always submits with the text and compares no screen. The launch-argument route Herdr uses on macOS and Linux would put the framed multi-line prompt on a Windows command line, which holds at most 32,767 characters (8,191 and no line break through an npm codex.cmd), less than a prompt can be with context attached. Choose --terminal windows-console";
 
 // Codex's home: `config.toml` under `CODEX_HOME`, or under `.codex` in the user home. An
 // empty `CODEX_HOME` keeps the relative spelling, `config.toml` in the caller's working

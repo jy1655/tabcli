@@ -377,6 +377,13 @@ impl NativeProviderAdapter for PiAdapter {
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Pi does not expose Agent Bridge provider controls")
     }
+
+    // Pi's turns go through the surface's own transport (a Herdr terminal's `terminal.send`)
+    // with Pi-owned readiness and, on Windows, the per-turn input receipt; nothing needs the
+    // managed console. The live record is in the Herdr boundary.
+    fn surface_support(&self, _surface: terminal::TerminalKind) -> super::SurfaceSupport {
+        Ok(())
+    }
 }
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {

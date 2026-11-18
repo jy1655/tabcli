@@ -231,6 +231,8 @@ pub(super) fn resolve_with(
         workspace_noun,
         admission_refusal,
     } = resolution;
+    // A surface the provider's adapter cannot run on is refused before anything is resolved.
+    crate::native::provider::admit_surface(provider, terminal_kind)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -284,7 +286,16 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
-    let terminal_kind = terminal::select(request.terminal)?;
+    let terminal_kind = terminal::select_for(
+        request.terminal,
+        Some(
+            crate::native::provider::surface_support(
+                request.provider,
+                terminal::TerminalKind::Herdr,
+            )
+            .is_ok(),
+        ),
+    )?;
     terminal::admit_selection(request.terminal, terminal_kind)?;
     resolve(fresh_resolution(request, attached, terminal_kind), deadline)
 }

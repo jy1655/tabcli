@@ -267,6 +267,18 @@ impl NativeProviderAdapter for ClaudeAdapter {
             _ => bail!("unsupported Claude Agent Bridge provider control"),
         }
     }
+
+    // Claude takes every turn through its own messaging (ListAgents and SendMessage), and
+    // its registry checks read process identities, not the surface. Its workspace dialog is
+    // answered only on a surface that takes a guarded key; on Herdr the user answers it, as
+    // on macOS and Linux. Nothing needs the managed console; Windows Herdr has no live
+    // evidence yet.
+    fn surface_support(
+        &self,
+        _surface: crate::native::terminal::TerminalKind,
+    ) -> super::SurfaceSupport {
+        Ok(())
+    }
 }
 
 struct ClaudeReopen;

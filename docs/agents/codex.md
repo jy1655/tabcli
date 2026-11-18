@@ -6,6 +6,14 @@
   never an inherited `HC_TERMINAL_ID`. Other surfaces retain their launch arguments.
   The version floor is eligibility; ask, queue follow-up and completion need separate
   live verification. No Codex configuration file or daemon is changed.
+- On native Windows the adapter refuses a Herdr terminal (`surface_support`), before any
+  session exists: the initial prompt there is the injected console paste below (text without
+  Return, then one Return against the exact accepted screen), which `terminal.send` cannot
+  do, and the launch-argument route above would put the multi-line framed prompt on a Windows
+  command line (32,767 characters; 8,191 and no line break through an npm `codex.cmd`).
+  Inside an hc terminal the automatic choice for Codex stays the managed console. Replace the
+  refusal with a Windows Herdr route that keeps argument semantics and size, or a
+  first-party addressed input.
 
 - The injected Windows initial paste is a bounded best-effort console fallback (#124),
   pinned to Codex 0.163.0. It assumes no concurrent input; screen snapshots are not atomic
