@@ -65,6 +65,7 @@ closed session-K7m2Qx
 | macOS / Herdr Core | 구현됨 | [네 CLI, hc 0.1.21, 2026-11-18](docs/verification/2026-11-18-herdr.md) |
 | macOS / Warp | 제한적 | 미검증 |
 | Windows에서 직접 실행 | 구현됨 | 네 CLI 모두, 2026-10-02 |
+| Windows / Herdr Core | Claude, Agy, Pi 지원 | [Windows 11에서 Pi 실기 검증, hc 0.1.21](https://github.com/jy1655/tabcli/pull/398) |
 | Windows Terminal 탭 | 우선 사용 | 탭 생성/후속 요청/종료, 2026-10-01 |
 | Windows 콘솔 창 | 대체 경로 | 초기 요청/종료, 2026-10-01 |
 | Linux / Herdr Core | 구현됨 | [hc 0.1.21 왕복 검증](docs/verification/2026-11-18-linux-herdr.md) |
@@ -77,7 +78,7 @@ Linux는 기본적으로 tmux 3.2 이상을 사용하며 GUI 창을 열지 않�
 `tmux -S '<socket>' attach` 명령(JSON의 `attach_command`)으로 접속합니다.
 [Linux / tmux](docs/terminals.md#linux--tmux)를 참고합니다.
 
-macOS와 Linux에서는 `--terminal herdr`로 실행 중인 Herdr Core(`hc`) 안에 세션을 엽니다. Herdr 터미널 내부에서는 자동 감지합니다. [Herdr 지원](docs/terminals.md#herdr-core-on-macos-and-linux)을 참고하세요.
+macOS와 Linux에서는 `--terminal herdr`로 실행 중인 Herdr Core(`hc`) 안에 세션을 엽니다. Herdr 터미널 내부에서는 자동 감지합니다. [Herdr 지원](docs/terminals.md#herdr-core-on-macos-and-linux)을 참고하세요. Windows에서도 Claude, Agy, Pi는 [로컬 Herdr Core](docs/terminals.md#herdr-core-on-native-windows)를 사용할 수 있습니다.
 
 Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 있어야 사용할 수 있습니다. 터미널 입력을 제출하지 못하므로 Agy와 Pi의 후속 요청은 지원하지 않습니다. 로그인한 CLI로 요청·결과·후속 요청·종료를 거치는 경로도 미검증입니다. 이 두 CLI에는 다른 터미널을 사용합니다.
 

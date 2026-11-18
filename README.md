@@ -81,6 +81,7 @@ settings, and limitations. These are not checks of every combination on the curr
 | macOS / Herdr Core | Implemented | [Four providers, hc 0.1.21, 2026-11-18](docs/verification/2026-11-18-herdr.md) |
 | macOS / Warp | Limited | Not verified |
 | Native Windows | Implemented | All four providers, 2026-10-02 |
+| Windows / Herdr Core | Claude, Agy and Pi | [Pi on Windows 11, hc 0.1.21](https://github.com/jy1655/tabcli/pull/398) |
 | Windows Terminal tab | Preferred surface | Tab creation/follow-up/close, 2026-10-01 |
 | Windows console window | Fallback | Initial prompt/close, 2026-10-01 |
 | Linux / Herdr Core | Implemented | [hc 0.1.21 round trips](docs/verification/2026-11-18-linux-herdr.md) |
@@ -95,6 +96,7 @@ window and uses a console window when a tab cannot be created. See
 
 On macOS and Linux, `--terminal herdr` opens sessions in an already running Herdr Core (`hc`). Herdr
 terminals are detected automatically; see [Herdr support](docs/terminals.md#herdr-core-on-macos-and-linux).
+On native Windows, Claude, Agy and Pi can also use a [local Herdr Core](docs/terminals.md#herdr-core-on-native-windows).
 
 Linux defaults to tmux 3.2 or later and opens no GUI window. Attach with the printed
 `tmux -S '<socket>' attach` command (`attach_command` in JSON); see
