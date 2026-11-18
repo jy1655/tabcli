@@ -1,5 +1,12 @@
 # Current Codex Boundary
 
+- Herdr launches require stable Codex 0.169.0 or newer and explicitly pass
+  `--no-daemon`, so tool processes retain the hc terminal identity instead of running
+  in the shared app-server. The Codex adapter decides from the recorded surface,
+  never an inherited `HC_TERMINAL_ID`. Other surfaces retain their launch arguments.
+  The version floor is eligibility; ask, queue follow-up and completion need separate
+  live verification. No Codex configuration file or daemon is changed.
+
 - The injected Windows initial paste is a bounded best-effort console fallback (#124),
   pinned to Codex 0.163.0. It assumes no concurrent input; screen snapshots are not atomic
   with TUI transitions and placeholder counts are not content receipts. Non-injected or

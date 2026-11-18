@@ -369,6 +369,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         failure: None,
     },
     CommandSpec {
+        name: terminal::host::HERDR_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
+        contract: None,
+        failure: None,
+    },
+    CommandSpec {
         name: terminal::host::GHOSTTY_HOST_COMMAND,
         parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         contract: None,

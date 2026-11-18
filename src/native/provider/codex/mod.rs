@@ -446,6 +446,7 @@ fn prepare_launch_for_platform(
     windows: bool,
     authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
 ) -> Result<LaunchPlan> {
+    let no_daemon = herdr_requires_local_runtime(context.directory)?;
     let claim_token =
         session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Codex launch has no native turn claim")?;
@@ -454,6 +455,9 @@ fn prepare_launch_for_platform(
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
+    if no_daemon {
+        arguments.push(OsString::from("--no-daemon"));
+    }
     if let Some(effort) = context.effort {
         arguments.extend(
             provider_effort_args(FirstPartyCli::Codex, effort)?
@@ -501,6 +505,31 @@ fn prepare_launch_for_platform(
         watcher: Box::new(transcript::Watcher),
         environment_removals: launch_environment_removals(),
     })
+}
+
+// hc's terminal identity must reach Codex's tool processes. A shared app-server
+// would run them outside that terminal. This is Codex launch policy, selected from
+// the bound surface rather than an inherited HC_TERMINAL_ID (which can be stale).
+fn herdr_requires_local_runtime(directory: &Path) -> Result<bool> {
+    let reader = Reader::open_unchecked(directory);
+    let Some(text) = reader
+        .record(crate::native::session::CoreRecord::Terminal)
+        .text()?
+    else {
+        return Ok(false);
+    };
+    let surface = crate::native::session::record::terminal(&text)?;
+    if surface.kind != terminal::TerminalKind::Herdr {
+        return Ok(false);
+    }
+    let version_text = reader.manifest()?.provider_version;
+    let version = codex_version(&version_text)?;
+    if version < Version::new(0, 169, 0) || !version.pre.is_empty() {
+        bail!(
+            "Herdr requires stable Codex 0.169.0 or newer with --no-daemon; recorded version: {version_text}"
+        );
+    }
+    Ok(true)
 }
 
 // A record without prompt sizes, as a binary before them wrote it; the tests use it for

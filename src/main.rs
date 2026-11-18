@@ -30,8 +30,9 @@ Usage:
 {usage}  {PUBLIC_COMMAND} --help | --version
 
 Runtime:
-  macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm from the invoking environment
-  and opens a real surface for Codex, Claude, Agy, or Pi. The macOS default is
+  macOS detects Ghostty, Herdr, iTerm2, Terminal.app, Warp, or WezTerm from the invoking
+  environment and opens a real surface for Codex, Claude, Agy, or Pi. Herdr needs a
+  running Herdr Core, which Bridge never starts or restarts. The macOS default is
   tab-first: create a new tab in a supported existing local window, with a new
   window only when a safe tab target or creation API is unavailable.
   settings macos-open-mode new-window always requests a new window;
@@ -411,7 +412,7 @@ mod tests {
         let (public, hidden): (Vec<_>, Vec<_>) =
             native::COMMANDS.iter().partition(|entry| entry.is_public());
         assert_eq!(public.len(), 19);
-        assert_eq!(hidden.len(), 11);
+        assert_eq!(hidden.len(), 12);
         for entry in hidden {
             assert!(!advertised.contains(entry.name), "{}", entry.name);
         }
@@ -645,7 +646,8 @@ mod tests {
             "private directory stays until you remove it",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
-            "macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm",
+            "macOS detects Ghostty, Herdr, iTerm2, Terminal.app, Warp, or WezTerm",
+            "Herdr needs a\n  running Herdr Core, which Bridge never starts or restarts",
             "tab-first: create a new tab in a supported existing local window",
             "settings macos-open-mode new-window always requests a new window",
             "settings macos-open-mode tab-first restores the default",

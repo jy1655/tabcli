@@ -78,6 +78,7 @@ settings, and limitations. These are not checks of every combination on the curr
 | macOS / Terminal.app | Implemented | Codex, 2026-10-07 |
 | macOS / Ghostty | Implemented | [Four providers, 1.4.0, 2026-10-28](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md) |
 | macOS / WezTerm | Implemented | Codex/Claude/Agy, 2026-10-07 |
+| macOS / Herdr Core | Implemented | [Four providers, hc 0.1.21, 2026-11-18](docs/verification/2026-11-18-herdr.md) |
 | macOS / Warp | Limited | Not verified |
 | Native Windows | Implemented | All four providers, 2026-10-02 |
 | Windows Terminal tab | Preferred surface | Tab creation/follow-up/close, 2026-10-01 |
@@ -90,6 +91,9 @@ Terminal.app always opens a new window. Windows prefers a tab in a dedicated Win
 window and uses a console window when a tab cannot be created. See
 [terminal selection and settings](docs/terminals.md#selection-and-settings), including
 `settings macos-open-mode` and `settings windows-tab-window`.
+
+On macOS, `--terminal herdr` opens sessions in an already running Herdr Core (`hc`). Herdr
+terminals are detected automatically; see [Herdr support](docs/terminals.md#macos--herdr-core).
 
 Linux defaults to tmux 3.2 or later and opens no GUI window. Attach with the printed
 `tmux -S '<socket>' attach` command (`attach_command` in JSON); see
@@ -187,25 +191,25 @@ Download the archive for your platform and its matching `.sha256` file from
 `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz` for x86_64 Linux with glibc 2.39 or newer
 (Ubuntu 24.04 or later).
 
-For version 0.4.44, verify the checksum in the download directory before extracting.
+For version 0.4.45, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.4.44-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.44-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.45-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.45-aarch64-apple-darwin.tar.gz
 ```
 
 On Linux, likewise:
 
 ```sh
-sha256sum -c tabcli-0.4.44-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf tabcli-0.4.44-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c tabcli-0.4.45-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.45-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.4.44-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.45-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -218,7 +222,7 @@ Put the extracted `tabcli` (macOS, Linux) or `tabcli.exe` (Windows) in a directo
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.44 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.45 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated

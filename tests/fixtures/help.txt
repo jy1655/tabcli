@@ -3,10 +3,10 @@ tabcli <version>: Terminal Agent Bridge: visible terminal sessions for coding ag
 Usage:
   tabcli describe [COMMAND] [--json]
   tabcli ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|tmux|warp|wezterm|windows-console>]
+      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|herdr|iterm2|terminal|tmux|warp|wezterm|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
   tabcli self-test <codex|claude|agy|pi> [--workspace PATH]
-      [--terminal <ghostty|iterm2|terminal|tmux|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]
+      [--terminal <ghostty|herdr|iterm2|terminal|tmux|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]
       [--yolo] [--timeout-secs N] [--isolated] [--json]
   tabcli tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
@@ -40,8 +40,9 @@ Usage:
   tabcli --help | --version
 
 Runtime:
-  macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm from the invoking environment
-  and opens a real surface for Codex, Claude, Agy, or Pi. The macOS default is
+  macOS detects Ghostty, Herdr, iTerm2, Terminal.app, Warp, or WezTerm from the invoking
+  environment and opens a real surface for Codex, Claude, Agy, or Pi. Herdr needs a
+  running Herdr Core, which Bridge never starts or restarts. The macOS default is
   tab-first: create a new tab in a supported existing local window, with a new
   window only when a safe tab target or creation API is unavailable.
   settings macos-open-mode new-window always requests a new window;

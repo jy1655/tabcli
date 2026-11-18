@@ -468,6 +468,84 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
     }
 }
 
+#[test]
+fn herdr_codex_launch_keeps_tools_in_the_terminal_process() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    Store::open_unchecked(&directory)
+        .private("terminal.json")
+        .write_json(&serde_json::json!({
+            "terminal": "herdr", "session_id": "t99",
+            "managed_session_id": "session-hooks"
+        }))
+        .unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/tabcli"),
+            directory: &directory,
+            workspace: root.path(),
+            title: "Herdr Codex",
+            prompt: "test task",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        false,
+        |_, _| Ok(false),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.arguments
+            .iter()
+            .filter(|arg| *arg == "--no-daemon")
+            .count(),
+        1,
+        "Herdr requires Codex tool commands to run inside its terminal"
+    );
+    assert_eq!(
+        plan.initial_prompt,
+        InitialPromptDisposition::AcceptedAtSpawn
+    );
+}
+
+#[test]
+fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
+    for (version, accepted) in [
+        ("codex-cli 0.168.0", false),
+        ("codex-cli 0.169.0-alpha.1", false),
+        ("codex-cli 0.169.0", true),
+        ("codex-cli 0.170.0", true),
+        ("unknown", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = test_support::launch_session(root.path(), Some(version));
+        let store = Store::open_unchecked(&directory);
+        store
+            .private("terminal.json")
+            .write_json(&serde_json::json!({"terminal":"herdr","session_id":"t1"}))
+            .unwrap();
+        assert_eq!(
+            herdr_requires_local_runtime(&directory).is_ok(),
+            accepted,
+            "{version}"
+        );
+        assert!(read_pending_turn(&directory).unwrap().is_none());
+        // The same provider version on an existing surface has no new version gate.
+        store
+            .private("terminal.json")
+            .write_json(&serde_json::json!({"terminal":"iterm2","session_id":"pane"}))
+            .unwrap();
+        assert!(!herdr_requires_local_runtime(&directory).unwrap());
+    }
+    let root = tempfile::tempdir().unwrap();
+    assert!(!herdr_requires_local_runtime(root.path()).unwrap());
+    Store::open_unchecked(root.path())
+        .private("terminal.json")
+        .write_private(b"{broken")
+        .unwrap();
+    assert!(herdr_requires_local_runtime(root.path()).is_err());
+}
+
 // Launches and probes drop both providers' caller identities while preserving configuration.
 #[test]
 fn launch_and_probe_drop_caller_identities_and_keep_configuration() {

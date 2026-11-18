@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 
 use super::{
     CloseOutcome, DialogKey, GuardedDialogInput, TerminalKind, TerminalSendFailure,
-    TerminalSendResult, TerminalSession, macos_selection::select_macos_terminal,
+    TerminalSendResult, TerminalSession, macos_selection::select_macos_host,
 };
 
 pub(super) use super::posix::PosixTerminalAdapter as MacTerminalAdapter;
@@ -35,6 +35,7 @@ pub(in crate::native) use applescript::testing as automation_testing;
 #[cfg(test)]
 use test_support::Unused as UnusedAdapter;
 pub(in crate::native) mod ghostty;
+pub(in crate::native) mod herdr;
 pub(in crate::native) mod iterm2;
 pub(in crate::native) mod warp;
 pub(in crate::native) mod wezterm;
@@ -42,8 +43,9 @@ pub(in crate::native) mod wezterm;
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     let term_program = env::var("TERM_PROGRAM").ok();
     let term = env::var("TERM").ok();
-    Ok(select_macos_terminal(
+    Ok(select_macos_host(
         preferred,
+        env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
         term_program.as_deref(),
         term.as_deref(),
         env::var_os("ITERM_SESSION_ID").is_some(),
@@ -51,37 +53,60 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     ))
 }
 
-/// The five macOS adapters, each over the dependency its own constructor took.
+/// The six macOS adapters, each over the dependency its own constructor took.
 /// Generic so that a test adapter needs neither `Sync` nor `'static`: the recording
 /// automation is reference counted, the WezTerm test host is deliberately not `Sync`,
 /// and Terminal.app's observation constructor borrows local callbacks.
-pub(super) struct Dispatch<I, T, G, Z, W> {
+pub(super) struct Dispatch<I, T, G, Z, W, H = herdr::InstalledAdapter> {
     iterm2: I,
     apple_terminal: T,
     ghostty: G,
     wezterm: Z,
     warp: W,
+    herdr: H,
 }
 
 impl<I, T, G, Z, W> Dispatch<I, T, G, Z, W> {
     pub(super) const fn new(iterm2: I, apple_terminal: T, ghostty: G, wezterm: Z, warp: W) -> Self {
+        Self::with_herdr(
+            iterm2,
+            apple_terminal,
+            ghostty,
+            wezterm,
+            warp,
+            herdr::Adapter::installed(),
+        )
+    }
+}
+
+impl<I, T, G, Z, W, H> Dispatch<I, T, G, Z, W, H> {
+    pub(super) const fn with_herdr(
+        iterm2: I,
+        apple_terminal: T,
+        ghostty: G,
+        wezterm: Z,
+        warp: W,
+        herdr: H,
+    ) -> Self {
         Self {
             iterm2,
             apple_terminal,
             ghostty,
             wezterm,
             warp,
+            herdr,
         }
     }
 }
 
-impl<I, T, G, Z, W> Adapters for Dispatch<I, T, G, Z, W>
+impl<I, T, G, Z, W, H> Adapters for Dispatch<I, T, G, Z, W, H>
 where
     I: MacTerminalAdapter,
     T: MacTerminalAdapter,
     G: MacTerminalAdapter,
     Z: MacTerminalAdapter,
     W: MacTerminalAdapter,
+    H: MacTerminalAdapter,
 {
     fn adapter(&self, kind: TerminalKind) -> Result<&dyn MacTerminalAdapter> {
         match kind {
@@ -90,6 +115,7 @@ where
             TerminalKind::Ghostty => Ok(&self.ghostty),
             TerminalKind::WezTerm => Ok(&self.wezterm),
             TerminalKind::Warp => Ok(&self.warp),
+            TerminalKind::Herdr => Ok(&self.herdr),
             TerminalKind::WindowsConsole => bail!(Unsupported::new(
                 "Windows Console is only available on Windows"
             )),
@@ -115,8 +141,8 @@ static INSTALLED_DISPATCH: InstalledDispatch = Dispatch::new(
 );
 
 /// The adapters over the installed terminals: `osascript` for iTerm2 and Terminal.app,
-/// Ghostty's scripting dictionary and `osascript`, the installed `wezterm`, and the
-/// installed Warp Control clients. Production passes this to every shared operation.
+/// Ghostty's scripting dictionary and `osascript`, the installed `wezterm`, the
+/// installed Warp Control clients, and the running Herdr Core's socket. Production passes this to every shared operation.
 pub(super) static INSTALLED: &(dyn Adapters + Sync) = &INSTALLED_DISPATCH;
 
 /// A dispatch for a test of Terminal.app alone, over the given automation; the other

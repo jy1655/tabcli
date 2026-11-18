@@ -78,6 +78,7 @@ impl TerminalKind {
             Self::WezTerm => &wezterm::REGISTRATION,
             Self::WindowsConsole => &windows::REGISTRATION,
             Self::Tmux => &tmux::REGISTRATION,
+            Self::Herdr => &herdr::REGISTRATION,
         }
     }
 
@@ -91,6 +92,8 @@ impl TerminalKind {
 pub(super) mod apple_terminal;
 #[path = "macos/ghostty/facts.rs"]
 pub(super) mod ghostty;
+#[path = "macos/herdr/facts.rs"]
+pub(super) mod herdr;
 #[path = "macos/iterm2/facts.rs"]
 pub(super) mod iterm2;
 #[path = "linux/tmux/facts.rs"]
@@ -112,7 +115,7 @@ pub(in crate::native) enum PasteEnvelope {
 mod tests {
     use super::*;
 
-    const KINDS: [TerminalKind; 7] = [
+    const KINDS: [TerminalKind; 8] = [
         TerminalKind::Iterm2,
         TerminalKind::AppleTerminal,
         TerminalKind::Ghostty,
@@ -120,6 +123,7 @@ mod tests {
         TerminalKind::WezTerm,
         TerminalKind::WindowsConsole,
         TerminalKind::Tmux,
+        TerminalKind::Herdr,
     ];
 
     // A kind that guards dialog input declares no refusal; a kind that refuses screen
@@ -175,6 +179,13 @@ mod tests {
                 Err(_) => assert!(!kind.uses_launch_host(), "{kind:?}"),
             }
         }
-        assert_eq!(launch_hosts, [TerminalKind::Iterm2, TerminalKind::WezTerm]);
+        assert_eq!(
+            launch_hosts,
+            [
+                TerminalKind::Iterm2,
+                TerminalKind::WezTerm,
+                TerminalKind::Herdr
+            ]
+        );
     }
 }

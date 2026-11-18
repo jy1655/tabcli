@@ -54,7 +54,9 @@ below explain its workspace-trust requirements and delivery limits.
 ## Codex
 
 Install and sign in to `codex`. You need 0.147.0 or newer to launch, and 0.149.0 or newer for
-follow-ups. Open the project in Codex first and resolve its workspace-trust prompt.
+follow-ups. On Herdr, stable 0.169.0 or newer is required and Bridge passes `--no-daemon` so
+tool processes stay inside the hc terminal. Other surfaces keep their existing launch flags.
+Open the project in Codex first and resolve its workspace-trust prompt.
 
 On macOS and Linux, Bridge passes the initial prompt as a launch argument. On native Windows, it waits for
 Codex's startup delay and either verified workspace trust or the empty composer before typing

@@ -287,6 +287,7 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
     let terminal_kind = terminal::select(request.terminal)?;
+    terminal::admit_selection(request.terminal, terminal_kind)?;
     resolve(fresh_resolution(request, attached, terminal_kind), deadline)
 }
 

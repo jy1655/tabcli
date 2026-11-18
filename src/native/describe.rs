@@ -51,7 +51,7 @@ pub(super) const DESCRIBE: Contract = Contract {
 pub(super) const ASK: Contract = Contract {
     summary: "Start a new visible provider session and submit a prompt.",
     synopsis: &[
-        "ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]\n      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|tmux|warp|wezterm|windows-console>]\n      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]",
+        "ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]\n      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|herdr|iterm2|terminal|tmux|warp|wezterm|windows-console>]\n      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]",
     ],
     possible_effects: &[
         ReadsRecords,
@@ -82,7 +82,7 @@ pub(super) const ASK: Contract = Contract {
 pub(super) const SELF_TEST: Contract = Contract {
     summary: "Exercise a real provider round trip and close the session it creates.",
     synopsis: &[
-        "self-test <codex|claude|agy|pi> [--workspace PATH]\n      [--terminal <ghostty|iterm2|terminal|tmux|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]\n      [--yolo] [--timeout-secs N] [--isolated] [--json]",
+        "self-test <codex|claude|agy|pi> [--workspace PATH]\n      [--terminal <ghostty|herdr|iterm2|terminal|tmux|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]\n      [--yolo] [--timeout-secs N] [--isolated] [--json]",
     ],
     possible_effects: &[
         ReadsRecords,

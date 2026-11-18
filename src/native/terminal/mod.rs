@@ -121,11 +121,13 @@ pub(crate) enum TerminalKind {
     WezTerm,
     WindowsConsole,
     Tmux,
+    /// A terminal of a running Herdr Core (`hc`), addressed through its local socket.
+    Herdr,
 }
 
 impl TerminalKind {
     /// Every kind, in declaration order.
-    pub(in crate::native) const ALL: [Self; 7] = [
+    pub(in crate::native) const ALL: [Self; 8] = [
         Self::Iterm2,
         Self::AppleTerminal,
         Self::Ghostty,
@@ -133,13 +135,17 @@ impl TerminalKind {
         Self::WezTerm,
         Self::WindowsConsole,
         Self::Tmux,
+        Self::Herdr,
     ];
 
     pub(super) const fn supported_on_this_platform(self) -> bool {
         match self {
-            Self::Iterm2 | Self::AppleTerminal | Self::Ghostty | Self::Warp | Self::WezTerm => {
-                cfg!(target_os = "macos")
-            }
+            Self::Iterm2
+            | Self::AppleTerminal
+            | Self::Ghostty
+            | Self::Warp
+            | Self::WezTerm
+            | Self::Herdr => cfg!(target_os = "macos"),
             Self::WindowsConsole => cfg!(windows),
             Self::Tmux => cfg!(target_os = "linux"),
         }
@@ -154,6 +160,7 @@ impl TerminalKind {
             Self::WezTerm => "wezterm",
             Self::WindowsConsole => "windows-console",
             Self::Tmux => "tmux",
+            Self::Herdr => "herdr",
         }
     }
 
@@ -166,6 +173,7 @@ impl TerminalKind {
             Self::WezTerm => "WezTerm",
             Self::WindowsConsole => "Windows Console",
             Self::Tmux => "tmux",
+            Self::Herdr => "Herdr",
         }
     }
 }
@@ -180,18 +188,21 @@ impl FromStr for TerminalKind {
             "wezterm" => Ok(Self::WezTerm),
             "windows-console" | "windows" | "console" => Ok(Self::WindowsConsole),
             "tmux" => Ok(Self::Tmux),
+            "herdr" | "hc" | "herdr-core" => Ok(Self::Herdr),
             "iterm" | "iterm.app" | "iterm2" => Ok(Self::Iterm2),
             "apple-terminal" | "apple_terminal" | "default" | "terminal" | "terminal.app" => {
                 Ok(Self::AppleTerminal)
             }
             _ => Err(format!(
-                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, tmux, warp, wezterm, or windows-console"
+                "unsupported terminal {value:?}; expected ghostty, herdr, iterm2, terminal, tmux, warp, wezterm, or windows-console"
             )),
         }
     }
 }
 
 mod record;
+#[cfg(target_os = "macos")]
+pub(in crate::native) use record::HerdrSurface;
 #[cfg(target_os = "linux")]
 pub(in crate::native) use record::LinuxHostIdentity;
 pub(in crate::native) use record::TerminalSession;
@@ -320,6 +331,35 @@ pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure
 
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
+}
+
+/// The launch admission of a selected surface, before any session is created. A kind that
+/// `select` chose from the caller's environment proves that environment here: inside Herdr
+/// the caller's `HC_TERMINAL_ID` must name a live terminal of the running core that this
+/// process runs in. Selection itself reads only the environment and opens nothing.
+pub(super) fn admit_selection(
+    preferred: Option<TerminalKind>,
+    selected: TerminalKind,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if preferred.is_none() && selected == TerminalKind::Herdr {
+        return macos::herdr::verify_caller_terminal();
+    }
+    let _ = (preferred, selected);
+    Ok(())
+}
+
+/// The command a user runs to watch or type in a surface that has no window of its own.
+pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return linux::tmux::attach_command(session);
+    #[cfg(target_os = "macos")]
+    return macos::herdr::attach_command(session);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = session;
+        None
+    }
 }
 
 // `directory` is the private directory of the managed session. Windows and Warp use it
@@ -701,6 +741,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(TerminalKind::WezTerm).unwrap(),
             "wezterm"
+        );
+        for alias in ["herdr", "Herdr", "hc", "herdr-core"] {
+            assert_eq!(TerminalKind::from_str(alias), Ok(TerminalKind::Herdr));
+        }
+        assert_eq!(serde_json::to_value(TerminalKind::Herdr).unwrap(), "herdr");
+        assert_eq!(
+            TerminalKind::Herdr.supported_on_this_platform(),
+            cfg!(target_os = "macos")
         );
         assert_eq!(
             TerminalKind::from_str("windows-console"),
