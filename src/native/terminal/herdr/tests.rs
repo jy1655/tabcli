@@ -1065,10 +1065,16 @@ fn a_finished_kept_terminal_reports_the_recovery_its_core_accepts() {
     )
     .unwrap_err();
     let message = error_text(&error);
-    assert!(
-        message.contains(&format!("HC_SOCKET='{SOCKET}' hc rm t7")),
-        "{message}"
-    );
+    for command in ["get", "rm"] {
+        let expected = if cfg!(windows) {
+            format!(
+                "$env:HC_SOCKET = '{SOCKET}'; try {{ hc {command} t7 }} finally {{ $env:HC_SOCKET = $prior }}"
+            )
+        } else {
+            format!("HC_SOCKET='{SOCKET}' hc {command} t7")
+        };
+        assert!(message.contains(&expected), "{message}");
+    }
     assert!(!message.contains("--off"), "{message}");
     assert!(core.params("terminal.rm").is_empty());
 }
