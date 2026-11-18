@@ -28,7 +28,7 @@ pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native::terminal) mod bound_host;
 pub(in crate::native) mod close_authority;
 #[cfg(target_os = "linux")]
@@ -57,7 +57,7 @@ use anyhow::Result;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod herdr;
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
@@ -109,8 +109,6 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 use refusing as platform;
-#[cfg(target_os = "windows")]
-use windows as platform;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -145,7 +143,7 @@ impl TerminalKind {
             Self::Iterm2 | Self::AppleTerminal | Self::Ghostty | Self::Warp | Self::WezTerm => {
                 cfg!(target_os = "macos")
             }
-            Self::Herdr => cfg!(any(target_os = "macos", target_os = "linux")),
+            Self::Herdr => cfg!(any(target_os = "macos", target_os = "linux", windows)),
             Self::WindowsConsole => cfg!(windows),
             Self::Tmux => cfg!(target_os = "linux"),
         }
@@ -201,7 +199,7 @@ impl FromStr for TerminalKind {
 }
 
 mod record;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) use record::HerdrSurface;
 #[cfg(target_os = "linux")]
 pub(in crate::native) use record::LinuxHostIdentity;
@@ -217,7 +215,7 @@ pub(super) struct RetainedLaunchSurface {
 }
 
 impl RetainedLaunchSurface {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(super) fn new(surface: TerminalSession, message: String) -> Self {
         Self {
             surface,
@@ -330,7 +328,24 @@ impl TerminalSendFailure {
 pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
 
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
-    platform::select(preferred)
+    select_for(preferred, None)
+}
+
+/// The terminal for a launch of `provider`, which a reopen does not know before it reads
+/// its source. Only on Windows does the provider change the automatic choice: inside an hc
+/// terminal it is Herdr for a provider that a Windows Herdr terminal carries, and the
+/// managed console otherwise, as before Herdr reached Windows. An explicit choice wins.
+pub(super) fn select_for(
+    preferred: Option<TerminalKind>,
+    provider: Option<agent_bridge::FirstPartyCli>,
+) -> Result<TerminalKind> {
+    #[cfg(windows)]
+    return windows::select(preferred, provider);
+    #[cfg(not(windows))]
+    {
+        let _ = provider;
+        platform::select(preferred)
+    }
 }
 
 fn herdr_environment(marker: bool, term_program: Option<&str>) -> bool {
@@ -345,7 +360,7 @@ pub(super) fn admit_selection(
     preferred: Option<TerminalKind>,
     selected: TerminalKind,
 ) -> Result<()> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     if preferred.is_none() && selected == TerminalKind::Herdr {
         return herdr::verify_caller_terminal();
     }
@@ -353,9 +368,49 @@ pub(super) fn admit_selection(
     Ok(())
 }
 
+/// Whether the selected surface carries this provider on this platform. On Windows a Herdr
+/// terminal carries Pi only: the Windows input paths of the other providers are verified on
+/// the managed console alone and are refused here, before any session exists.
+pub(super) fn admit_provider(
+    kind: TerminalKind,
+    provider: agent_bridge::FirstPartyCli,
+) -> Result<()> {
+    if cfg!(windows) && kind == TerminalKind::Herdr {
+        return windows_herdr_carries(provider).map_err(|reason| {
+            crate::native::failure_kind::Unsupported::new(format!(
+                "Herdr on Windows is unsupported for {} in this release: {reason}; choose --terminal windows-console",
+                provider.as_str()
+            ))
+            .into()
+        });
+    }
+    Ok(())
+}
+
+/// The providers a Windows Herdr terminal carries, and why each other one is refused.
+/// Pi's Windows input is a terminal transport with its own per-turn receipt, which Herdr's
+/// `terminal.send` carries as the console did; the others depend on the managed console.
+fn windows_herdr_carries(
+    provider: agent_bridge::FirstPartyCli,
+) -> std::result::Result<(), &'static str> {
+    use agent_bridge::FirstPartyCli::{Agy, Claude, Codex, Pi};
+    match provider {
+        Pi => Ok(()),
+        Codex => Err(
+            "its Windows initial prompt is an injected console paste with a guarded Return (#124), which a Herdr terminal does not provide",
+        ),
+        Claude => Err(
+            "its Windows workspace approval answers the console's dialog, and its Windows owner checks were verified in the managed console only",
+        ),
+        Agy => Err(
+            "its Windows input receipts and readiness gate were measured on the managed console only",
+        ),
+    }
+}
+
 /// The command a user runs to watch or type in a surface that has no window of its own.
 pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<String> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     if session.kind == TerminalKind::Herdr {
         return herdr::attach_command(session);
     }
@@ -390,6 +445,11 @@ where
     }
     #[cfg(windows)]
     {
+        // A Herdr terminal is created by its core and runs Bridge's launch host; nothing of
+        // the managed console is involved.
+        if kind == TerminalKind::Herdr {
+            return herdr::Adapter::installed().open(command, directory, deadline, bind, unbind);
+        }
         windows::open_bound_tab(kind, command, directory, deadline, bind, unbind)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -468,6 +528,41 @@ where
     Ok(())
 }
 
+/// Time kept back from a launch's deadline for removing the exact surface it created.
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
+
+/// Creates a surface whose program waits for its binding, binds it, then starts it; a
+/// binding or start that fails removes exactly the created surface. The startup deadline
+/// keeps back time for that removal.
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+pub(in crate::native::terminal) fn open_with(
+    deadline: Instant,
+    create: impl FnOnce(Instant) -> Result<TerminalSession>,
+    start: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
+    cleanup: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
+    bind: impl FnOnce(&mut TerminalSession) -> Result<()>,
+    unbind: impl FnOnce() -> Result<()>,
+) -> Result<TerminalSession> {
+    let startup_deadline = deadline
+        .checked_sub(STARTUP_CLEANUP_RESERVE)
+        .filter(|candidate| *candidate > Instant::now())
+        .ok_or_else(|| {
+            anyhow::anyhow!("terminal startup timeout leaves no room for exact surface cleanup")
+        })?;
+    let mut session = create(startup_deadline)?;
+    let start_session = session.clone();
+    let cleanup_session = session.clone();
+    bind_surface_before_start(
+        &mut session,
+        bind,
+        || start(&start_session, startup_deadline),
+        || cleanup(&cleanup_session, deadline),
+        unbind,
+    )?;
+    Ok(session)
+}
+
 // A cleanup that hands back its proven surface keeps that type, so that the launch failure
 // records the handle for a later close; any other cleanup failure is one line of text.
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
@@ -488,6 +583,9 @@ pub(super) fn send_file(
 ) -> TerminalSendResult {
     #[cfg(windows)]
     {
+        if session.kind == TerminalKind::Herdr {
+            return herdr::Adapter::installed().send(session, prompt_path, deadline);
+        }
         crate::native::console_control::installed().send_file(session, prompt_path, deadline)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -523,7 +621,12 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return posix::read_screen(posix_installed(), session, deadline);
     #[cfg(windows)]
-    return crate::native::console_control::installed().read_screen(session, deadline);
+    {
+        if session.kind == TerminalKind::Herdr {
+            return herdr::Adapter::installed().screen(session, deadline);
+        }
+        crate::native::console_control::installed().read_screen(session, deadline)
+    }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (session, deadline);
@@ -548,8 +651,16 @@ pub(super) fn guarded_dialog_input(
         })
     }
     #[cfg(windows)]
-    return crate::native::console_control::installed()
-        .guarded_dialog_input(directory, session, input, deadline);
+    {
+        // Herdr declares the refusal; it is answered before any console helper runs.
+        if session.kind == TerminalKind::Herdr
+            && let Some(refusal) = session.kind.registration().guarded_input_refusal
+        {
+            return Err(anyhow::anyhow!(refusal));
+        }
+        crate::native::console_control::installed()
+            .guarded_dialog_input(directory, session, input, deadline)
+    }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (directory, session, input, deadline);
@@ -566,6 +677,16 @@ pub(super) fn verify_posix_surface(
     posix::verify_surface(posix_installed(), directory, session, timeout)
 }
 
+/// The live Herdr terminal of a Windows handle on its recorded core: the surface part of
+/// the ownership proof, as `verify_posix_surface` is elsewhere.
+#[cfg(windows)]
+pub(super) fn verify_windows_herdr_surface(
+    session: &TerminalSession,
+    timeout: Option<std::time::Duration>,
+) -> Result<()> {
+    herdr::Adapter::installed().verify(session, timeout)
+}
+
 pub(super) fn close_session_until(
     directory: &Path,
     session: &TerminalSession,
@@ -578,6 +699,9 @@ pub(super) fn close_session_until(
     }
     #[cfg(windows)]
     {
+        if session.kind == TerminalKind::Herdr {
+            return herdr::Adapter::installed().close(directory, session, deadline);
+        }
         crate::native::console_control::installed()
             .close_session_until(directory, session, deadline)
     }
@@ -600,6 +724,9 @@ pub(super) fn surface_present(
     }
     #[cfg(windows)]
     {
+        if session.kind == TerminalKind::Herdr {
+            return herdr::Adapter::installed().present(directory, session, timeout);
+        }
         windows::surface_present(directory, session, timeout)
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -728,6 +855,147 @@ mod tests {
         TerminalSession::new(TerminalKind::Iterm2, "test-session".to_owned())
     }
 
+    // On Windows a Herdr terminal carries Pi only; every other surface, and every surface
+    // elsewhere, is refused here for no provider. The refusal is an Unsupported failure
+    // that names the provider and the console alternative.
+    #[test]
+    fn windows_herdr_carries_pi_only_and_refuses_the_others_before_any_session() {
+        use crate::native::failure_kind::{FailureKind, classify};
+        use agent_bridge::FirstPartyCli;
+        assert!(super::windows_herdr_carries(FirstPartyCli::Pi).is_ok());
+        for provider in [
+            FirstPartyCli::Codex,
+            FirstPartyCli::Claude,
+            FirstPartyCli::Agy,
+        ] {
+            assert!(
+                super::windows_herdr_carries(provider).is_err(),
+                "{provider:?}"
+            );
+        }
+        for kind in TerminalKind::ALL {
+            for provider in agent_bridge::supported_clis().iter().copied() {
+                let admitted = super::admit_provider(kind, provider);
+                if cfg!(windows) && kind == TerminalKind::Herdr && provider != FirstPartyCli::Pi {
+                    let error = admitted.unwrap_err();
+                    let text = format!("{error:#}");
+                    assert!(
+                        text.starts_with(&format!(
+                            "Herdr on Windows is unsupported for {} in this release: ",
+                            provider.as_str()
+                        )),
+                        "{text}"
+                    );
+                    assert!(
+                        text.ends_with("; choose --terminal windows-console"),
+                        "{text}"
+                    );
+                    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+                } else {
+                    admitted.unwrap_or_else(|error| panic!("{kind:?} {provider:?}: {error:#}"));
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn absent_windows_herdr_handle() -> TerminalSession {
+        TerminalSession::new(TerminalKind::Herdr, "t7".into())
+            .with_herdr_core(super::HerdrSurface {
+                socket: format!(r"\\.\pipe\tabcli-absent-core-{}", std::process::id()),
+                core_id: "core-a".into(),
+                created_ms: 1,
+                host_pid: 4,
+                birth: super::record::HerdrHostBirth::Windows {
+                    host_creation_time: 1,
+                },
+            })
+            .with_binding(Some("session-herdr".into()))
+    }
+
+    // Every surface operation on a Windows Herdr handle goes to its recorded core, never to
+    // the console helper: with no core there, each one names the missing core, a send is
+    // known unsent, a close is unknown (never Missing), and a guarded dialog answer is
+    // refused as Herdr declares.
+    #[cfg(windows)]
+    #[test]
+    fn windows_herdr_handles_never_reach_the_console_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-herdr");
+        std::fs::create_dir(&directory).unwrap();
+        let prompt = directory.join("prompt.txt");
+        std::fs::write(&prompt, "hello").unwrap();
+        let handle = absent_windows_herdr_handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let missing = "no Herdr Core is running";
+        let failure = super::send_file(&handle, &prompt, deadline).unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+        assert!(format!("{:#}", failure.error()).contains(missing));
+        let error = super::read_screen(&handle, deadline).unwrap_err();
+        assert!(format!("{error:#}").contains(missing), "{error:#}");
+        let error = super::close_session_until(&directory, &handle, deadline).unwrap_err();
+        assert!(format!("{error:#}").contains(missing), "{error:#}");
+        let error = super::surface_present(&directory, &handle, std::time::Duration::from_secs(5))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(missing), "{error:#}");
+        let input = super::GuardedDialogInput {
+            expected_claim: None,
+            expires_unix_ms: None,
+            screen: String::new(),
+            key: super::DialogKey::Enter,
+        };
+        assert_eq!(
+            super::guarded_dialog_input(&directory, &handle, &input, deadline)
+                .unwrap_err()
+                .to_string(),
+            TerminalKind::Herdr
+                .registration()
+                .guarded_input_refusal
+                .unwrap()
+        );
+    }
+
+    // The Windows ownership proof checks a Herdr terminal on its core before the owner, as
+    // macOS and Linux do; a dead owner's Herdr handle may be closed like a console's.
+    #[cfg(windows)]
+    #[test]
+    fn windows_herdr_ownership_proves_the_terminal_and_allows_a_dead_owner_close() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-herdr");
+        std::fs::create_dir(&directory).unwrap();
+        let handle = absent_windows_herdr_handle();
+        let error = super::ownership::verified_terminal_surface_owner(
+            &directory,
+            "session-herdr",
+            &handle,
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no Herdr Core is running"),
+            "{error:#}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(
+            super::ownership::close_dead_owner_surface_with(
+                &handle,
+                |_| Ok(super::CloseOutcome::Closed),
+                deadline,
+            )
+            .unwrap(),
+            super::CloseOutcome::Closed
+        );
+        let foreign = TerminalSession::new(TerminalKind::Iterm2, "x".into());
+        assert!(
+            super::ownership::close_dead_owner_surface_with(
+                &foreign,
+                |_| panic!("a foreign handle is never closed"),
+                deadline,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn explicit_terminal_names_have_stable_canonical_values() {
         for alias in ["iterm", "iTerm2", "iTerm.app"] {
@@ -756,7 +1024,7 @@ mod tests {
         assert_eq!(serde_json::to_value(TerminalKind::Herdr).unwrap(), "herdr");
         assert_eq!(
             TerminalKind::Herdr.supported_on_this_platform(),
-            cfg!(any(target_os = "macos", target_os = "linux"))
+            cfg!(any(target_os = "macos", target_os = "linux", windows))
         );
         assert_eq!(
             TerminalKind::from_str("windows-console"),
@@ -769,7 +1037,10 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_selects_its_managed_console_transport() {
-        assert_eq!(super::select(None).unwrap(), TerminalKind::WindowsConsole);
+        assert_eq!(
+            super::windows::select_from(None, false, None, None).unwrap(),
+            TerminalKind::WindowsConsole
+        );
         assert_eq!(
             super::select(Some(TerminalKind::WindowsConsole)).unwrap(),
             TerminalKind::WindowsConsole

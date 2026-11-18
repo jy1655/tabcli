@@ -40,8 +40,9 @@ use windows_sys::Win32::{
 use super::{ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity};
 
 mod focus;
+pub(in crate::native::terminal) mod launch_host;
 mod process;
-pub(in crate::native) use process::observe_process_identity;
+pub(in crate::native) use process::{observe_process_identity, process_user_sid_of};
 mod security;
 mod tab;
 pub(in crate::native) use process::query_process_identity;
@@ -50,7 +51,7 @@ use process::{
     open_verified_control_process, query_process_identity_from_handle,
     verify_control_process_identity,
 };
-pub(in crate::native) use security::set_private_permissions;
+pub(in crate::native) use security::{process_user_sid, set_private_permissions};
 pub(super) use tab::run_host as run_console_host;
 
 pub(super) fn surface_present(
@@ -84,11 +85,38 @@ const CLOSE_ATTACH_WAIT: Duration = Duration::from_secs(1);
 // and how long it then waits for a host it had to end.
 const TAB_HOST_EXIT_WAIT: Duration = Duration::from_secs(1);
 
-pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
+pub(super) fn select(
+    preferred: Option<TerminalKind>,
+    provider: Option<agent_bridge::FirstPartyCli>,
+) -> Result<TerminalKind> {
+    select_from(
+        preferred,
+        std::env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        provider,
+    )
+}
+
+// An explicit choice wins. Inside a Herdr terminal (hc's identity, as on macOS and Linux) the
+// automatic choice is Herdr for a provider that a Windows Herdr terminal carries, which
+// launch admission then proves; for any other provider, an unknown one included, and
+// outside hc it is the managed console. Selection reads the environment and the request
+// only and opens nothing.
+pub(super) fn select_from(
+    preferred: Option<TerminalKind>,
+    hc_terminal: bool,
+    term_program: Option<&str>,
+    provider: Option<agent_bridge::FirstPartyCli>,
+) -> Result<TerminalKind> {
+    let carried = provider.is_some_and(|provider| super::windows_herdr_carries(provider).is_ok());
     match preferred {
+        None if carried && super::herdr_environment(hc_terminal, term_program) => {
+            Ok(TerminalKind::Herdr)
+        }
         None | Some(TerminalKind::WindowsConsole) => Ok(TerminalKind::WindowsConsole),
+        Some(TerminalKind::Herdr) => Ok(TerminalKind::Herdr),
         Some(kind) => bail!(Unsupported::new(format!(
-            "{} is not available on Windows; use windows-console",
+            "{} is not available on Windows; use windows-console or herdr",
             kind.display_name()
         ))),
     }
@@ -473,17 +501,24 @@ pub(in crate::native) fn console_launch_command_line(
     powershell: &Path,
     command: &str,
 ) -> Result<String> {
-    if command.contains('"') {
-        bail!("Windows console launch command contains an unsupported double quote");
-    }
+    let arguments = console_root_arguments(command)?;
     // PowerShell derives PSHOME and its module search path from the launch path.
     let powershell = crate::native::provider_process::windows_command_path(powershell);
     let powershell_text = powershell.to_string_lossy();
     if powershell_text.contains('"') {
         bail!("PowerShell 7 executable path contains an unsupported double quote");
     }
+    Ok(format!("\"{powershell_text}\" {arguments}"))
+}
+
+// The console root's arguments after its executable. A Windows launch host that starts the
+// root itself passes exactly these, so that the root is the same on every Windows surface.
+pub(in crate::native) fn console_root_arguments(command: &str) -> Result<String> {
+    if command.contains('"') {
+        bail!("Windows console launch command contains an unsupported double quote");
+    }
     Ok(format!(
-        "\"{powershell_text}\" -NoLogo -NoProfile -Command \"{}\"",
+        "-NoLogo -NoProfile -Command \"{}\"",
         console_command_line(command)
     ))
 }

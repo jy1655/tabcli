@@ -38,7 +38,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod admission_tests;
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) mod binding_tests;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
@@ -116,7 +116,7 @@ impl Record {
 /// conversion counts as `u64::MAX` milliseconds, and an instant the monotonic clock cannot
 /// represent is the furthest one short of it that it can. The macOS launch host and binding
 /// wait use it.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 pub(in crate::native) fn saturating_deadline(now: Instant, remaining: Option<Duration>) -> Instant {
     let remaining = remaining.unwrap_or(Duration::from_millis(u64::MAX));
     if let Some(deadline) = now.checked_add(remaining) {
@@ -145,17 +145,17 @@ pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
 }
 
 /// Adapters declare binding diagnostics and budget; the shared wait owns observation order.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) struct BindingFacts {
     pub(in crate::native) host: &'static str,
     pub(in crate::native) cancelled: &'static str,
     pub(in crate::native) budget: BindingBudget,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) enum BindingBudget {
     // Only macOS kinds measure their binding from the start timeout.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
     StartTimeout,
     RemainingReceiptCapped,
 }
@@ -163,7 +163,7 @@ pub(in crate::native) enum BindingBudget {
 /// Observe a pending launch until its managed surface is bound. This is an ordered,
 /// unlocked observation, not authorization to spawn; `spawn` owns that final fence. The
 /// budget and every retry read `clock`; the host passes the system clock.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn wait_for_binding(
     reader: &Reader,
     session_id: &str,

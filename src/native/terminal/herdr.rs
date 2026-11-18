@@ -1,11 +1,12 @@
 //! Herdr: a terminal of an already running Herdr Core (`hc`), reached through the core's own
-//! local socket with newline JSON-RPC 2.0 (protocol generation 1). Bridge never starts,
-//! restarts or stops a core, and never addresses a terminal it did not create.
+//! local endpoint with newline JSON-RPC 2.0 (protocol generation 1): its protected Unix
+//! socket on macOS and Linux (`unix.rs`), its named pipe on Windows (`pipe.rs`). Bridge never
+//! starts, restarts or stops a core, and never addresses a terminal it did not create.
 //!
 //! Every action opens one connection, checks `hello` (generation, the methods it uses and,
 //! for an existing surface, the recorded permanent core id) and runs on that same
 //! connection, so a core replaced between the identity check and the action is refused.
-//! The handle names the address (`t7`, one terminal forever on its core), the socket, the
+//! The handle names the address (`t7`, one terminal forever on its core), the endpoint, the
 //! core id, the creation time and the incarnation of the program the core started:
 //! Bridge's launch host, which waits for a binding that names its own address and PID
 //! before the provider can start. A terminal whose reply was lost therefore starts nothing.
@@ -14,20 +15,11 @@
 //! otherwise end with the caller's terminal and type notes into it), `keep: false` and
 //! `rm: false`. Prompts go through `terminal.send` without `force`, which refuses a blocked
 //! program; screen reads ask for no history, which could scroll a full-screen program.
-//! Status words (OSC 7501) are never request evidence. The socket is the one `hc` uses:
-//! `HC_SOCKET`, else `socket` in the config, else `<session>.sock` in the runtime or state
-//! directory of `HC_SESSION` (herdr-core 0.1.21 `paths.rs`).
-use super::posix::{self, OwnedSurfaceClose, PosixTerminalAdapter};
-use super::posix_ownership::{SYSTEM_READS, verified_posix_terminal_owner_with};
+//! Status words (OSC 7501) are never request evidence. The endpoint is the one `hc` uses:
+//! `HC_SOCKET`, else `socket` in the config, else the platform default for `HC_SESSION`
+//! (herdr-core 0.1.21 `paths.rs`).
 use super::record::HerdrHostBirth;
-use crate::native::private_to_user::owned_and_not_writable_by_others;
-use crate::native::session::Store;
 use crate::native::session::close::budget::close_remaining;
-#[cfg(target_os = "macos")]
-use crate::native::settings::MacosOpenMode;
-use crate::native::terminal::ownership::{
-    self, NativeSessionOwner, OwnerGroups, OwnerStop, OwnerStopIntent, ProvenShell,
-};
 use crate::native::terminal::{
     CloseOutcome, HerdrSurface, RetainedLaunchSurface, TerminalKind, TerminalSendFailure,
     TerminalSendResult, TerminalSession,
@@ -35,19 +27,25 @@ use crate::native::terminal::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
-    io::{Read, Write},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt},
-        io::AsRawFd,
-        net::UnixStream,
-    },
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+mod pipe;
+#[cfg(unix)]
+mod unix;
+// Pure, so that every test platform resolves the Windows endpoint as hc does.
+#[cfg(any(windows, test))]
+mod windows_endpoint;
+
+#[cfg(windows)]
+pub(in crate::native::terminal) use pipe::Installed;
+#[cfg(unix)]
+pub(in crate::native::terminal) use unix::Installed;
 
 const HOST_COMMAND: &str = TerminalKind::Herdr.registration().host_command;
 const GENERATION: u64 = 1;
@@ -83,11 +81,6 @@ const RUN_REFUSED_BEFORE_CREATE: [&str; 10] = [
     "unknown_method",
     "unsupported_generation",
 ];
-// sockaddr_un.sun_path reserves one byte for the trailing NUL.
-#[cfg(target_os = "macos")]
-const MAX_SOCKET_PATH: usize = 103;
-#[cfg(target_os = "linux")]
-const MAX_SOCKET_PATH: usize = 107;
 const MAX_REPLY: usize = 8 * 1024 * 1024;
 const MAX_SEND_TEXT: usize = 1024 * 1024;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -159,100 +152,17 @@ pub(in crate::native::terminal) trait Core {
     }
 }
 
-pub(in crate::native::terminal) struct Installed;
-
-impl Core for Installed {
-    fn endpoint(&self) -> Result<PathBuf> {
-        resolve_socket(&EndpointInputs::from_env(), &read_config_socket)
-    }
-
-    fn connect(&self, socket: &Path, deadline: Instant) -> Result<Box<dyn Connection + '_>> {
-        Ok(Box::new(SocketConnection::open(socket, deadline)?))
-    }
-
-    fn executable(&self) -> Result<PathBuf> {
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")
-    }
-
-    fn caller_terminal(&self) -> Option<String> {
-        std::env::var("HC_TERMINAL_ID")
-            .ok()
-            .filter(|value| !value.is_empty())
-    }
-
-    fn current_pid(&self) -> u32 {
-        std::process::id()
-    }
-
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
-        #[cfg(target_os = "macos")]
-        return Ok(super::macos::process::macos_process_info(pid)?.map(|info| info.parent_pid));
-        #[cfg(target_os = "linux")]
-        return super::linux::process::parent_pid(pid);
-    }
-
-    fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
-        #[cfg(target_os = "macos")]
-        return Ok(super::macos::process::macos_process_start(pid)?.map(
-            |(host_start_seconds, host_start_microseconds)| HerdrHostBirth::Macos {
-                host_start_seconds,
-                host_start_microseconds,
-            },
-        ));
-        #[cfg(target_os = "linux")]
-        return Ok(super::linux::process::process_birth(pid)?
-            .map(|linux_birth| HerdrHostBirth::Linux { linux_birth }));
-    }
-
-    fn launch_nonce(&self) -> Result<String> {
-        let mut bytes = [0_u8; 16];
-        fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-    }
+/// The `HC_TERMINAL_ID` of this process: the terminal hc says this process runs in.
+fn caller_terminal_from_env() -> Option<String> {
+    std::env::var("HC_TERMINAL_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
-/// The environment that decides where `hc` looks for its core.
-#[derive(Clone, Debug, Default)]
-pub(super) struct EndpointInputs {
-    pub(super) hc_socket: Option<OsString>,
-    pub(super) hc_session: Option<String>,
-    pub(super) home: Option<OsString>,
-    pub(super) xdg_state_home: Option<OsString>,
-    pub(super) xdg_config_home: Option<OsString>,
-    pub(super) xdg_runtime_dir: Option<OsString>,
-    /// `/run/user/<uid>` when that directory exists.
-    pub(super) run_user: Option<PathBuf>,
-}
-
-impl EndpointInputs {
-    fn from_env() -> Self {
-        let run_user = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
-        Self {
-            hc_socket: std::env::var_os("HC_SOCKET"),
-            hc_session: std::env::var("HC_SESSION").ok(),
-            home: std::env::var_os("HOME"),
-            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
-            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
-            xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-            run_user: run_user.is_dir().then_some(run_user),
-        }
-    }
-}
-
-fn nonempty(value: &Option<OsString>) -> Option<&OsStr> {
-    value.as_deref().filter(|value| !value.is_empty())
-}
-
-/// The socket of the core that `hc` addresses from these inputs. A session name or socket
-/// that `hc` itself would refuse, and a configuration it cannot read, are refused here
-/// too: Bridge never guesses another endpoint.
-pub(super) fn resolve_socket(
-    inputs: &EndpointInputs,
-    config_socket: &dyn Fn(&Path) -> Result<Option<String>>,
-) -> Result<PathBuf> {
-    let session = inputs
-        .hc_session
-        .as_deref()
+/// The session name `hc` derives from `HC_SESSION` (herdr-core `paths.rs`): trimmed,
+/// `default` when empty, and refused when it cannot name a folder or a pipe.
+fn core_session(raw: Option<&str>) -> Result<&str> {
+    let session = raw
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or("default");
@@ -264,52 +174,13 @@ pub(super) fn resolve_socket(
     {
         bail!("HC_SESSION {session:?} cannot name a Herdr Core");
     }
-    let home = || {
-        nonempty(&inputs.home)
-            .map(PathBuf::from)
-            .context("HOME is not set, so the Herdr Core socket cannot be located")
-    };
-    let state = match nonempty(&inputs.xdg_state_home) {
-        Some(state) => PathBuf::from(state),
-        None => home()?.join(".local/state"),
-    }
-    .join("herdr-core")
-    .join(session);
-    let chosen = match nonempty(&inputs.hc_socket) {
-        Some(socket) => Some(PathBuf::from(socket)),
-        None => {
-            let config = match nonempty(&inputs.xdg_config_home) {
-                Some(config) => PathBuf::from(config),
-                None => home()?.join(".config"),
-            }
-            .join("herdr-core")
-            .join("config.toml");
-            config_socket(&config)?.map(PathBuf::from)
-        }
-    };
-    let socket = match chosen {
-        Some(socket) => socket,
-        None => {
-            let run = match nonempty(&inputs.xdg_runtime_dir) {
-                Some(run) => Some(PathBuf::from(run).join("herdr-core")),
-                None => inputs.run_user.as_ref().map(|run| run.join("herdr-core")),
-            };
-            run.unwrap_or(state).join(format!("{session}.sock"))
-        }
-    };
-    if !socket.is_absolute() {
-        bail!(
-            "the Herdr Core socket {} is not an absolute path",
-            socket.display()
-        );
-    }
-    if socket.as_os_str().len() > MAX_SOCKET_PATH {
-        bail!(
-            "the Herdr Core socket {} is longer than this system allows",
-            socket.display()
-        );
-    }
-    Ok(socket)
+    Ok(session)
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .context("terminal automation timeout is too large")
 }
 
 /// The `socket` setting of an `hc` configuration file: absent when the file does not exist
@@ -345,116 +216,58 @@ pub(super) fn config_socket(text: &str) -> Result<Option<String>> {
     }
 }
 
-/// The connection of the installed adapter: the protected socket of a core that runs as
-/// this user, with every read and write bounded by the deadline.
-struct SocketConnection {
-    stream: UnixStream,
+fn not_running(endpoint: &Path) -> anyhow::Error {
+    anyhow!(
+        "no Herdr Core is running at {}; open Herdr from the desktop or start hc from a shell outside an agent session, then retry. Bridge does not start or restart a core",
+        endpoint.display()
+    )
+}
+
+/// A byte stream of one connection whose every read and write ends by a deadline. A
+/// timeout is `TimedOut` or `WouldBlock`. `Ok(0)` from a write means the peer stopped
+/// reading, and from a read the end of the stream. A write that ran out of time after part
+/// of its bytes reached the peer reports those bytes, so that the request is never
+/// reported unsent when the core may have read it.
+pub(super) trait Stream {
+    fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize>;
+    fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize>;
+}
+
+/// The time left before `deadline`, or a timeout once none is left.
+pub(super) fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+}
+
+fn timed_out(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// One request, then its one reply line, at a time over a bounded stream: the framing both
+/// installed transports share. A request is unsent only while none of its bytes was
+/// written; after that, a missing or invalid reply leaves it unanswered, never unsent.
+pub(super) struct Framed<S> {
+    stream: S,
     next_id: u64,
     pending: Vec<u8>,
 }
 
-fn not_running(socket: &Path) -> anyhow::Error {
-    anyhow!(
-        "no Herdr Core is running at {}; open Herdr from the desktop or start hc from a shell outside an agent session, then retry. Bridge does not start or restart a core",
-        socket.display()
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<libc::uid_t> {
-    let (mut uid, mut gid) = (0, 0);
-    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(uid)
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<libc::uid_t> {
-    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut size = size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            cred.as_mut_ptr().cast(),
-            &mut size,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    if size as usize != size_of::<libc::ucred>() {
-        return Err(std::io::Error::other(
-            "incomplete Unix socket peer credentials",
-        ));
-    }
-    Ok(unsafe { cred.assume_init() }.uid)
-}
-
-impl SocketConnection {
-    fn open(socket: &Path, deadline: Instant) -> Result<Self> {
-        let uid = unsafe { libc::geteuid() };
-        let metadata = match fs::symlink_metadata(socket) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(not_running(socket));
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot inspect Herdr socket {}", socket.display()));
-            }
-        };
-        let directory = socket
-            .parent()
-            .context("Herdr socket has no parent directory")?;
-        let directory = fs::symlink_metadata(directory)
-            .with_context(|| format!("cannot inspect {}", directory.display()))?;
-        if !metadata.file_type().is_socket()
-            || metadata.uid() != uid
-            || !directory.is_dir()
-            || !owned_and_not_writable_by_others(&directory, uid)
-        {
-            bail!(
-                "{} is not a protected Herdr Core socket of this user",
-                socket.display()
-            );
-        }
-        let stream = match UnixStream::connect(socket) {
-            Ok(stream) => stream,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return Err(not_running(socket));
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot connect to {}", socket.display()));
-            }
-        };
-        if peer_uid(&stream).context("cannot identify the Herdr Core socket's user")? != uid {
-            bail!("the process at {} is not this user's", socket.display());
-        }
-        if Instant::now() >= deadline {
-            bail!("Herdr connection timed out");
-        }
-        Ok(Self {
+impl<S> Framed<S> {
+    pub(super) fn new(stream: S) -> Self {
+        Self {
             stream,
             next_id: 1,
             pending: Vec::new(),
-        })
+        }
     }
+}
 
-    fn remaining(deadline: Instant) -> Option<Duration> {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-    }
-
+impl<S: Stream> Framed<S> {
     fn read_line(&mut self, deadline: Instant) -> Result<Vec<u8>> {
         let mut buffer = [0_u8; 64 * 1024];
         loop {
@@ -465,18 +278,9 @@ impl SocketConnection {
             if self.pending.len() > MAX_REPLY {
                 bail!("Herdr reply exceeds {MAX_REPLY} bytes");
             }
-            let remaining = Self::remaining(deadline).context("Herdr reply timed out")?;
-            self.stream.set_read_timeout(Some(remaining))?;
-            let read = match self.stream.read(&mut buffer) {
+            let read = match self.stream.read_before(&mut buffer, deadline) {
                 Ok(read) => read,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    bail!("Herdr reply timed out")
-                }
+                Err(error) if timed_out(&error) => bail!("Herdr reply timed out"),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error).context("lost the Herdr Core connection"),
             };
@@ -488,7 +292,7 @@ impl SocketConnection {
     }
 }
 
-impl Connection for SocketConnection {
+impl<S: Stream> Connection for Framed<S> {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -496,38 +300,29 @@ impl Connection for SocketConnection {
             .to_string()
             .into_bytes();
         request.push(b'\n');
+        let lost = |written: usize, error: anyhow::Error| {
+            if written == 0 {
+                CallError::NotSent(error)
+            } else {
+                CallError::Unanswered(error)
+            }
+        };
         let mut written = 0;
         while written < request.len() {
-            let Some(remaining) = Self::remaining(deadline) else {
-                let error = anyhow!("Herdr request timed out");
-                return Err(if written == 0 {
-                    CallError::NotSent(error)
-                } else {
-                    CallError::Unanswered(error)
-                });
-            };
-            let result = self
-                .stream
-                .set_write_timeout(Some(remaining))
-                .and_then(|()| self.stream.write(&request[written..]));
-            match result {
+            match self.stream.write_before(&request[written..], deadline) {
                 Ok(0) => {
-                    let error = anyhow!("the Herdr Core stopped reading");
-                    return Err(if written == 0 {
-                        CallError::NotSent(error)
-                    } else {
-                        CallError::Unanswered(error)
-                    });
+                    return Err(lost(written, anyhow!("the Herdr Core stopped reading")));
                 }
                 Ok(count) => written += count,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if timed_out(&error) => {
+                    return Err(lost(written, anyhow!("Herdr request timed out")));
+                }
                 Err(error) => {
-                    let error = anyhow::Error::new(error).context("cannot write to the Herdr Core");
-                    return Err(if written == 0 {
-                        CallError::NotSent(error)
-                    } else {
-                        CallError::Unanswered(error)
-                    });
+                    return Err(lost(
+                        written,
+                        anyhow::Error::new(error).context("cannot write to the Herdr Core"),
+                    ));
                 }
             }
         }
@@ -777,10 +572,19 @@ fn target(session: &TerminalSession) -> Result<&HerdrSurface> {
     let core = session
         .herdr_core()
         .context("Herdr handle has no recorded core")?;
-    if core.core_id.is_empty() || !Path::new(&core.socket).is_absolute() {
+    if core.core_id.is_empty() || !usable_endpoint(&core.socket) {
         bail!("Herdr handle records no usable core");
     }
     Ok(core)
+}
+
+/// A recorded endpoint this platform can address: an absolute socket path, or on Windows a
+/// local named pipe. A handle written on another platform names no endpoint here.
+fn usable_endpoint(endpoint: &str) -> bool {
+    #[cfg(windows)]
+    return windows_endpoint::local_pipe_name(Path::new(endpoint)).is_ok();
+    #[cfg(unix)]
+    return Path::new(endpoint).is_absolute();
 }
 
 /// Whether the reported terminal is still the one this handle created. The argv names the
@@ -1200,7 +1004,7 @@ fn surface_present(
     directory: &Path,
     timeout: Duration,
 ) -> Result<bool> {
-    let deadline = posix::timeout_deadline(timeout)?;
+    let deadline = deadline_after(timeout)?;
     let recorded = target(session)?;
     let mut linked = link(
         core,
@@ -1222,7 +1026,7 @@ fn verify_surface(
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    let deadline = posix::timeout_deadline(timeout.unwrap_or(VERIFY_TIMEOUT))?;
+    let deadline = deadline_after(timeout.unwrap_or(VERIFY_TIMEOUT))?;
     live_target(core, session, deadline).map(|_| ())
 }
 
@@ -1344,7 +1148,7 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
 }
 
 pub(in crate::native::terminal) fn verify_caller_terminal() -> Result<()> {
-    verify_caller(&Installed, posix::timeout_deadline(CALLER_TIMEOUT)?)
+    verify_caller(&Installed, deadline_after(CALLER_TIMEOUT)?)
 }
 
 /// Whether `surface` names the Herdr terminal `terminal` whose program is `pid`: the one
@@ -1371,22 +1175,34 @@ pub(in crate::native::terminal) fn binding_names_this_host(surface: &TerminalSes
     )
 }
 
-/// How a user watches or types in the terminal: Herdr itself, or `hc attach`.
+/// How a user watches or types in the terminal: Herdr itself, or `hc attach` given the
+/// recorded endpoint, in the platform's own shell (PowerShell on Windows).
 pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<String> {
     let core = target(session).ok()?;
-    Some(format!(
-        "HC_SOCKET={} hc attach {}",
-        crate::native::terminal::shell_quote(OsStr::from_bytes(core.socket.as_bytes())),
-        session.id
-    ))
+    Some(attach_line(&core.socket, &session.id, cfg!(windows)))
+}
+
+fn attach_line(endpoint: &str, address: &str, powershell: bool) -> String {
+    if powershell {
+        format!(
+            "$env:HC_SOCKET = '{}'; hc attach {address}",
+            endpoint.replace('\'', "''")
+        )
+    } else {
+        format!(
+            "HC_SOCKET='{}' hc attach {address}",
+            endpoint.replace('\'', "'\"'\"'")
+        )
+    }
 }
 
 pub(in crate::native::terminal) struct Adapter<C: Core> {
     core: C,
 }
+#[cfg(unix)]
 pub(in crate::native::terminal) type InstalledAdapter = Adapter<Installed>;
 impl Adapter<Installed> {
-    /// The adapter over the running Herdr Core's socket and this machine's processes.
+    /// The adapter over the running Herdr Core's endpoint and this machine's processes.
     pub(super) const fn installed() -> Self {
         Self { core: Installed }
     }
@@ -1397,21 +1213,24 @@ impl<C: Core> Adapter<C> {
         Self { core }
     }
 }
-impl<C: Core> PosixTerminalAdapter for Adapter<C> {
-    // Herdr has no window to choose: the open mode does not apply.
-    fn open_bound_tab(
+
+/// The surface operations, the same on every platform; each platform's terminal dispatch
+/// reaches them (the POSIX adapter trait on macOS and Linux, the Windows dispatch by kind).
+impl<C: Core> Adapter<C> {
+    /// Creates the terminal and binds it before its launch host starts anything. Herdr has
+    /// no window to choose. The program of the terminal waits for the binding; nothing is
+    /// typed. A failed binding removes exactly the created terminal.
+    pub(in crate::native::terminal) fn open(
         &self,
-        #[cfg(target_os = "macos")] _mode: MacosOpenMode,
         command: &str,
         directory: &Path,
         deadline: Instant,
-        bind: posix::BindSurface<'_>,
-        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+        bind: impl FnOnce(&mut TerminalSession) -> Result<()>,
+        unbind: impl FnOnce() -> Result<()>,
     ) -> Result<TerminalSession> {
-        posix::open_with(
+        super::open_with(
             deadline,
             |startup_deadline| create(&self.core, command, directory, startup_deadline, deadline),
-            // The program of the terminal waits for the binding above; nothing is typed.
             |_, _| Ok(()),
             |session, deadline| {
                 close_until(&self.core, session, Some(directory), deadline)
@@ -1430,7 +1249,8 @@ impl<C: Core> PosixTerminalAdapter for Adapter<C> {
             unbind,
         )
     }
-    fn send_file(
+
+    pub(in crate::native::terminal) fn send(
         &self,
         session: &TerminalSession,
         prompt_path: &Path,
@@ -1438,16 +1258,17 @@ impl<C: Core> PosixTerminalAdapter for Adapter<C> {
     ) -> TerminalSendResult {
         send_file(&self.core, session, prompt_path, deadline)
     }
-    // Herdr names no TTY for a terminal; the program's incarnation proves the surface.
-    fn verify_surface(
+
+    /// Herdr names no TTY for a terminal; the program's incarnation proves the surface.
+    pub(in crate::native::terminal) fn verify(
         &self,
-        _directory: &Path,
         session: &TerminalSession,
         timeout: Option<Duration>,
-    ) -> Result<Option<String>> {
-        verify_surface(&self.core, session, timeout).map(|()| None)
+    ) -> Result<()> {
+        verify_surface(&self.core, session, timeout)
     }
-    fn surface_present(
+
+    pub(in crate::native::terminal) fn present(
         &self,
         directory: &Path,
         session: &TerminalSession,
@@ -1455,56 +1276,133 @@ impl<C: Core> PosixTerminalAdapter for Adapter<C> {
     ) -> Result<bool> {
         surface_present(&self.core, session, directory, timeout)
     }
-    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+
+    pub(in crate::native::terminal) fn screen(
+        &self,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<String> {
         read_screen(&self.core, session, deadline)
     }
-    // Guarded dialog input is declared unsupported in the registration.
-    fn close_session_until(
+
+    pub(in crate::native::terminal) fn close(
         &self,
         directory: &Path,
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_until(&self.core, session, Some(directory), deadline)
-    }
-    fn close_owned_session(
-        &self,
-        directory: &Path,
-        id: &str,
-        session: &TerminalSession,
-        close: OwnedSurfaceClose,
-        deadline: Instant,
-    ) -> Result<CloseOutcome> {
-        if close == OwnedSurfaceClose::LiveOwner {
-            record_live_owner_intent(directory, id, session, deadline)?;
-        }
         close_until(&self.core, session, Some(directory), deadline)
     }
 }
 
-// Herdr's part of the owner stop, as for WezTerm: nothing is stopped before the terminal is
-// ended, but the intent is recorded first, because ending the terminal ends the owner.
-fn record_live_owner_intent(
-    directory: &Path,
-    id: &str,
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<()> {
-    ownership::stop_attested_owner(
-        &Store::open_unchecked(directory),
-        id,
-        session,
-        OwnerStopIntent::Close,
-        OwnerStop {
-            attest: || {
-                verified_posix_terminal_owner_with(directory, id, session, None, SYSTEM_READS)
+#[cfg(unix)]
+mod posix_adapter {
+    use super::{Adapter, Core};
+    use crate::native::session::Store;
+    #[cfg(target_os = "macos")]
+    use crate::native::settings::MacosOpenMode;
+    use crate::native::terminal::ownership::{
+        self, NativeSessionOwner, OwnerGroups, OwnerStop, OwnerStopIntent, ProvenShell,
+    };
+    use crate::native::terminal::posix::{self, OwnedSurfaceClose, PosixTerminalAdapter};
+    use crate::native::terminal::posix_ownership::{
+        SYSTEM_READS, verified_posix_terminal_owner_with,
+    };
+    use crate::native::terminal::{CloseOutcome, TerminalSendResult, TerminalSession};
+    use anyhow::Result;
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    impl<C: Core> PosixTerminalAdapter for Adapter<C> {
+        // Herdr has no window to choose: the open mode does not apply.
+        fn open_bound_tab(
+            &self,
+            #[cfg(target_os = "macos")] _mode: MacosOpenMode,
+            command: &str,
+            directory: &Path,
+            deadline: Instant,
+            bind: posix::BindSurface<'_>,
+            unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+        ) -> Result<TerminalSession> {
+            self.open(command, directory, deadline, bind, unbind)
+        }
+        fn send_file(
+            &self,
+            session: &TerminalSession,
+            prompt_path: &Path,
+            deadline: Instant,
+        ) -> TerminalSendResult {
+            self.send(session, prompt_path, deadline)
+        }
+        fn verify_surface(
+            &self,
+            _directory: &Path,
+            session: &TerminalSession,
+            timeout: Option<Duration>,
+        ) -> Result<Option<String>> {
+            self.verify(session, timeout).map(|()| None)
+        }
+        fn surface_present(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            timeout: Duration,
+        ) -> Result<bool> {
+            self.present(directory, session, timeout)
+        }
+        fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+            self.screen(session, deadline)
+        }
+        // Guarded dialog input is declared unsupported in the registration.
+        fn close_session_until(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            deadline: Instant,
+        ) -> Result<CloseOutcome> {
+            self.close(directory, session, deadline)
+        }
+        fn close_owned_session(
+            &self,
+            directory: &Path,
+            id: &str,
+            session: &TerminalSession,
+            close: OwnedSurfaceClose,
+            deadline: Instant,
+        ) -> Result<CloseOutcome> {
+            if close == OwnedSurfaceClose::LiveOwner {
+                record_live_owner_intent(directory, id, session, deadline)?;
+            }
+            self.close(directory, session, deadline)
+        }
+    }
+
+    // Herdr's part of the owner stop, as for WezTerm: nothing is stopped before the terminal
+    // is ended, but the intent is recorded first, because ending the terminal ends the owner.
+    fn record_live_owner_intent(
+        directory: &Path,
+        id: &str,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<()> {
+        ownership::stop_attested_owner(
+            &Store::open_unchecked(directory),
+            id,
+            session,
+            OwnerStopIntent::Close,
+            OwnerStop {
+                attest: || {
+                    verified_posix_terminal_owner_with(directory, id, session, None, SYSTEM_READS)
+                },
+                shell: ProvenShell,
+                record_incarnation: |_: &mut NativeSessionOwner| Ok(()),
+                stop: |_: OwnerGroups<()>| Ok(()),
             },
-            shell: ProvenShell,
-            record_incarnation: |_: &mut NativeSessionOwner| Ok(()),
-            stop: |_: OwnerGroups<()>| Ok(()),
-        },
-        deadline,
-    )
+            deadline,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -231,6 +231,8 @@ pub(super) fn resolve_with(
         workspace_noun,
         admission_refusal,
     } = resolution;
+    // A surface that cannot carry this provider is refused before anything is resolved.
+    terminal::admit_provider(terminal_kind, provider)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -284,7 +286,7 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
-    let terminal_kind = terminal::select(request.terminal)?;
+    let terminal_kind = terminal::select_for(request.terminal, Some(request.provider))?;
     terminal::admit_selection(request.terminal, terminal_kind)?;
     resolve(fresh_resolution(request, attached, terminal_kind), deadline)
 }

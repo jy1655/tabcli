@@ -1236,13 +1236,13 @@ fn attached_dispatch_holds_claim_until_write_returns() {
 fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
     use crate::native::failure_kind::{FailureKind, classify};
     assert_eq!(
-        super::select(None).unwrap(),
+        super::select_from(None, false, None, None).unwrap(),
         terminal::TerminalKind::WindowsConsole
     );
-    let refused = super::select(Some(terminal::TerminalKind::Iterm2)).unwrap_err();
+    let refused = super::select(Some(terminal::TerminalKind::Iterm2), None).unwrap_err();
     assert_eq!(
         format!("{refused:#}"),
-        "iTerm2 is not available on Windows; use windows-console"
+        "iTerm2 is not available on Windows; use windows-console or herdr"
     );
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
     // The open guard refuses before any process, binding or unbinding.
@@ -1305,4 +1305,41 @@ fn claim_dispatch_refuses_replaced_claim_and_keeps_not_ended_policy() {
         .unwrap(),
         None::<()>
     );
+}
+
+// Inside a Herdr terminal (hc gives every program HC_TERMINAL_ID and TERM_PROGRAM=ghostty)
+// the automatic choice is Herdr for Pi, which a Windows Herdr terminal carries; any other
+// provider, and a reopen whose provider is not yet known, keeps the managed console it had
+// before. An inherited marker under another TERM_PROGRAM is ignored, and an explicit
+// choice always wins (admission then refuses a provider Herdr does not carry).
+#[test]
+fn windows_selection_chooses_herdr_from_hc_identity_for_a_carried_provider_only() {
+    use agent_bridge::FirstPartyCli::{Agy, Claude, Codex, Pi};
+    use terminal::TerminalKind::{Herdr, WindowsConsole};
+    for (preferred, hc_terminal, term_program, provider, expected) in [
+        (None, true, Some("ghostty"), Some(Pi), Herdr),
+        (None, true, Some("Ghostty"), Some(Pi), Herdr),
+        (None, true, Some("ghostty"), Some(Codex), WindowsConsole),
+        (None, true, Some("ghostty"), Some(Claude), WindowsConsole),
+        (None, true, Some("ghostty"), Some(Agy), WindowsConsole),
+        (None, true, Some("ghostty"), None, WindowsConsole),
+        (None, true, None, Some(Pi), WindowsConsole),
+        (None, true, Some("vscode"), Some(Pi), WindowsConsole),
+        (None, false, Some("ghostty"), Some(Pi), WindowsConsole),
+        (
+            Some(WindowsConsole),
+            true,
+            Some("ghostty"),
+            Some(Pi),
+            WindowsConsole,
+        ),
+        (Some(Herdr), false, None, Some(Codex), Herdr),
+        (Some(Herdr), false, None, None, Herdr),
+    ] {
+        assert_eq!(
+            super::select_from(preferred, hc_terminal, term_program, provider).unwrap(),
+            expected,
+            "{preferred:?} {hc_terminal} {term_program:?} {provider:?}"
+        );
+    }
 }

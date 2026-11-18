@@ -52,6 +52,19 @@ pub(super) fn open_verified_control_process(
     Ok(handle)
 }
 
+/// The user SID of the process holding `pid`: whose process it is. It is opened for limited
+/// query only, and its token is read through the security module, which opens no process.
+/// A process this one may not inspect is an error, never another user.
+pub(in crate::native) fn process_user_sid_of(pid: u32) -> Result<String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open Windows process {pid}"));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    super::security::process_handle_user_sid(&handle)
+}
+
 pub(in crate::native) fn query_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {

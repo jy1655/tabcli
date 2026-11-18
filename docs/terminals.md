@@ -2,7 +2,8 @@
 
 Choose the terminal where Bridge opens your sessions, and check what it will close when you finish.
 On macOS, Bridge detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
-Windows Terminal tab, then a separate console window. Linux detects Herdr and otherwise uses tmux.
+Windows Terminal tab, then a separate console window, or Herdr for Pi inside an hc terminal. Linux
+detects Herdr and otherwise uses tmux.
 Use `--terminal` to override the selection.
 
 Bridge creates a new surface for each session: a tab, window, pane, or console. It does not adopt
@@ -21,6 +22,11 @@ On Linux, select a running local Herdr Core with `--terminal herdr` or a private
 with `--terminal tmux`. Automatic selection verifies a Herdr caller when both
 `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID` are present. Failed verification
 refuses the launch. Otherwise Linux uses tmux.
+
+On Windows, `--terminal herdr` selects a running local Herdr Core, which carries Pi only in this
+release; Codex, Claude and Agy are refused there before any session exists. Inside an hc
+terminal the automatic choice is Herdr for Pi, verified like on Linux, and the managed console for
+the other providers and for `reopen`.
 
 On macOS an explicit option wins. With `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`,
 Bridge selects Herdr and verifies the calling terminal before launch. Stale Herdr markers refuse
@@ -74,7 +80,7 @@ tab host has already decided to start its root, Bridge waits for that launch; de
 does not create a second surface.
 
 Bridge uses its terminal adapter to create the surface, check ownership, deliver terminal input
-where needed, and close it. The Windows rows below describe native Windows; Herdr Core also runs on Linux.
+where needed, and close it. The Windows rows below describe native Windows; Herdr Core runs on all three.
 
 | Platform | Terminal | Creation | Fallback input | Close | Screen read |
 | --- | --- | --- | --- | --- | --- |
@@ -84,6 +90,7 @@ where needed, and close it. The Windows rows below describe native Windows; Herd
 | macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI | Exact-pane CLI text |
 | macOS | Warp | Tab/window URI | Unsupported | Bound tab/window | Unsupported |
 | macOS and Linux | Herdr Core | New hc terminal | Addressed API paste | Exact terminal | Visible screen |
+| Windows (Pi only) | Herdr Core | New hc terminal | Addressed API paste | Exact terminal | Visible screen |
 | Linux | tmux | Detached server and pane | Exact-pane raw paste | Whole session server | Visible pane text |
 | Windows | Terminal tab | Tab | Console input | Console and tab | Console window text |
 | Windows | Console window | Window fallback | Console input | Console | Console window text |
@@ -142,7 +149,7 @@ The new session appears in Herdr. Use the normal `result`, `tell`, `screen`, and
 commands; the returned `attach_command` selects the recorded socket and terminal for `hc attach`.
 Use the address returned by this launch, not an existing terminal. Herdr displays a generated
 `tabcli-<24 hex digits>` name. `macos-open-mode` does not affect Herdr's layout.
-On Linux the terminal starts bash with job control and without shell startup files. The core's environment must provide the tools the CLI needs. Native Windows and remote hc machines are unsupported.
+On Linux the terminal starts bash with job control and without shell startup files. The core's environment must provide the tools the CLI needs. Remote hc machines are unsupported; native Windows is described below.
 
 Bridge pins the local socket, core identity and the created terminal. Later commands use that
 binding even when the caller's `HC_SESSION` or `HC_SOCKET` changes. A replaced or unreachable
@@ -164,6 +171,27 @@ Bridge removes the caller identity rather than forcing persistence on a nested s
 core's environment for other terminals. Bridge reads only the visible screen (`lines=0`) and
 never scrolls history. It cannot atomically compare a dialog and press a key through hc, so
 workspace trust dialogs must be handled by the user through Herdr or `hc attach`.
+
+### Herdr Core on native Windows
+
+Install hc for Windows and open Herdr from the desktop, or run `hc server start` in a normal
+(not elevated) desktop terminal outside an agent session. Bridge connects only to the core's
+local named pipe, the one `hc` uses (`HC_SOCKET`, the `socket` setting, or
+`\\.\pipe\herdr-core-<user>-<session>.sock`), and only when the process serving it runs as
+your Windows user. An elevated core refuses an unelevated Bridge.
+
+```powershell
+tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."
+```
+
+The terminal runs Bridge's launch host, which waits for its binding and then starts the same
+PowerShell 7 root that a managed console runs, so PowerShell 7 must be on the core's `PATH`.
+Pi keeps its Windows input rules: a one-line prompt, its startup check and its per-turn input
+receipt; Herdr's `terminal.send` delivers it. The returned `attach_command` is a PowerShell line
+that sets `HC_SOCKET` for `hc attach`. Close ends the whole terminal. A session whose provider
+ended on its own is closed without contacting the core, and its finished terminal stays in
+Herdr until you remove it (`hc rm <address>`). Codex, Claude and Agy are refused here until
+their Windows paths are verified on Herdr; use `--terminal windows-console` for them.
 
 ## Linux / tmux
 
@@ -514,6 +542,7 @@ for the tested binary, CLI versions, settings, and date.
 | macOS | WezTerm | Implemented | GUI identity/input/close | Codex/Claude [M12]; Agy [M11] |
 | macOS | Warp | Limited | Control/URI/partial launch/close | Not verified |
 | Linux | Herdr Core | Implemented | Adapter and socket tests | [Linux hc 0.1.21](verification/2026-11-18-linux-herdr.md) |
+| Windows | Herdr Core (Pi) | Implemented | Adapter, pipe, process and dispatch tests | Not verified |
 | Linux | tmux | Implemented | Linux surface tests; real tmux when installed | Four providers [L6] |
 | Linux process in WSL | tmux | Not verified | No live evidence | Not verified |
 | Windows | Terminal tab | Implemented | Host/console/identity/input/focus | Four providers [W02] |

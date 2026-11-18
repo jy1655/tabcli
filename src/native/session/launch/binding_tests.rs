@@ -433,3 +433,20 @@ fn linux_binding_wait_uses_the_same_ordered_pending_launch_judgment() {
         wait_for_binding(&Reader::open_unchecked(directory), id, &facts, clock).map(|_| ())
     });
 }
+
+// The Windows Herdr host waits with the binding its registration carries, through the same
+// ordered pending-launch judgment.
+#[cfg(windows)]
+#[test]
+fn windows_herdr_binding_wait_uses_the_same_ordered_pending_launch_judgment() {
+    use crate::native::terminal::{TerminalKind, facts::LaunchHost};
+    let Some(LaunchHost::BoundPowerShell(_, facts)) =
+        TerminalKind::Herdr.registration().launch_host
+    else {
+        panic!("Herdr registers the bound PowerShell host on Windows");
+    };
+    assert_eq!(facts.host, "Herdr");
+    characterize("Herdr", |directory, id, clock| {
+        wait_for_binding(&Reader::open_unchecked(directory), id, facts, clock).map(|_| ())
+    });
+}

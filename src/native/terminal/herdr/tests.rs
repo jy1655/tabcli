@@ -18,9 +18,17 @@ fn test_birth(start: u64) -> HerdrHostBirth {
             starttime_ticks: start,
         },
     };
+    #[cfg(windows)]
+    return HerdrHostBirth::Windows {
+        host_creation_time: 134_000_000_000_000_000 + start,
+    };
 }
 
+// The recorded endpoint each platform addresses: a socket path, or a local named pipe.
+#[cfg(unix)]
 const SOCKET: &str = "/state/herdr-core/default/default.sock";
+#[cfg(windows)]
+const SOCKET: &str = r"\\.\pipe\herdr-core-tester-default.sock";
 const DIRECTORY: &str = "/state/session-herdr1";
 const SESSION: &str = "session-herdr1";
 
@@ -284,8 +292,10 @@ fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+#[cfg(unix)]
 #[test]
 fn endpoint_follows_hc_and_refuses_what_hc_would_refuse() {
+    use super::unix::{EndpointInputs, resolve_socket};
     let no_config = |_: &Path| -> Result<Option<String>> { Ok(None) };
     let base = EndpointInputs {
         home: Some("/Users/u".into()),
@@ -996,19 +1006,32 @@ fn an_automatic_choice_proves_the_caller_runs_inside_its_terminal() {
 #[test]
 fn the_attach_command_names_the_recorded_socket() {
     let core = FakeCore::new();
-    let mut session = created(&core);
-    assert_eq!(
-        attach_command(&session).unwrap(),
+    let session = created(&core);
+    let expected = if cfg!(windows) {
+        format!("$env:HC_SOCKET = '{SOCKET}'; hc attach t7")
+    } else {
         format!("HC_SOCKET='{SOCKET}' hc attach t7")
-    );
-    let mut recorded = session.herdr_core().unwrap().clone();
-    recorded.socket = "/state/with space/x.sock".into();
-    session = TerminalSession::new(TerminalKind::Herdr, "t7".into()).with_herdr_core(recorded);
+    };
+    assert_eq!(attach_command(&session).unwrap(), expected);
+    // Each shell's own quoting: POSIX ends and reopens the quote, PowerShell doubles it.
     assert_eq!(
-        attach_command(&session).unwrap(),
-        "HC_SOCKET='/state/with space/x.sock' hc attach t7"
+        attach_line("/state/it's here/x.sock", "t7", false),
+        "HC_SOCKET='/state/it'\"'\"'s here/x.sock' hc attach t7"
+    );
+    assert_eq!(
+        attach_line(r"\\.\pipe\herdr-core-o'neil-default.sock", "t7", true),
+        r"$env:HC_SOCKET = '\\.\pipe\herdr-core-o''neil-default.sock'; hc attach t7"
     );
     assert!(attach_command(&TerminalSession::new(TerminalKind::Iterm2, "x".into())).is_none());
+    // A handle that records another platform's endpoint names no core here.
+    let mut foreign = session.herdr_core().unwrap().clone();
+    foreign.socket = if cfg!(windows) {
+        "/state/herdr-core/default/default.sock".into()
+    } else {
+        r"\\.\pipe\herdr-core-tester-default.sock".into()
+    };
+    let foreign = TerminalSession::new(TerminalKind::Herdr, "t7".into()).with_herdr_core(foreign);
+    assert!(attach_command(&foreign).is_none());
 }
 
 // A failed binding before the provider starts removes exactly the created terminal, found
@@ -1018,14 +1041,12 @@ fn open_removes_its_terminal_when_binding_fails() {
     let core = FakeCore::new();
     let adapter = Adapter::with_core(core.clone());
     let error = adapter
-        .open_bound_tab(
-            #[cfg(target_os = "macos")]
-            MacosOpenMode::TabFirst,
+        .open(
             "launch",
             Path::new(DIRECTORY),
             Instant::now() + Duration::from_secs(10),
-            Box::new(|_| bail!("bind failed")),
-            Box::new(|| Ok(())),
+            |_| bail!("bind failed"),
+            || Ok(()),
         )
         .unwrap_err();
     assert_eq!(error.to_string(), "bind failed");
@@ -1033,17 +1054,15 @@ fn open_removes_its_terminal_when_binding_fails() {
     let core = FakeCore::new();
     let adapter = Adapter::with_core(core.clone());
     let bound = adapter
-        .open_bound_tab(
-            #[cfg(target_os = "macos")]
-            MacosOpenMode::NewWindow,
+        .open(
             "launch",
             Path::new(DIRECTORY),
             Instant::now() + Duration::from_secs(10),
-            Box::new(|session| {
+            |session| {
                 session.managed_session_id = Some(SESSION.into());
                 Ok(())
-            }),
-            Box::new(|| panic!("no unbind on success")),
+            },
+            || panic!("no unbind on success"),
         )
         .unwrap();
     assert_eq!(bound.id, "t7");
@@ -1061,14 +1080,12 @@ fn failed_binding_and_removal_preserve_the_herdr_surface_for_close() {
     core.inject("terminal.rm", Injected::Instead(refused("internal")));
     let adapter = Adapter::with_core(core.clone());
     let error = adapter
-        .open_bound_tab(
-            #[cfg(target_os = "macos")]
-            MacosOpenMode::TabFirst,
+        .open(
             "launch",
             directory.path(),
             later(),
-            Box::new(|_| bail!("bind failed")),
-            Box::new(|| panic!("cannot unbind after unconfirmed removal")),
+            |_| bail!("bind failed"),
+            || panic!("cannot unbind after unconfirmed removal"),
         )
         .unwrap_err();
     assert!(format!("{error:#}").contains("bind failed"));
@@ -1089,13 +1106,16 @@ fn failed_binding_and_removal_preserve_the_herdr_surface_for_close() {
 
 // The installed connection over a real socket: bounded reads, one reply line per request,
 // and a written request without an answer is never reported as not sent.
+#[cfg(unix)]
 #[test]
 fn the_socket_connection_bounds_every_reply() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("c.sock");
-    let error = SocketConnection::open(&socket, later()).err().unwrap();
+    let error = super::unix::open(&socket, later()).err().unwrap();
     assert!(error_text(&error).contains("no Herdr Core is running"));
     let listener = UnixListener::bind(&socket).unwrap();
     let server = thread::spawn(move || {
@@ -1119,14 +1139,14 @@ fn the_socket_connection_bounds_every_reply() {
             }
         }
     });
-    let mut connection = SocketConnection::open(&socket, later()).unwrap();
+    let mut connection = super::unix::open(&socket, later()).unwrap();
     assert_eq!(
         connection
             .call("hello", json!({"generation": 1}), later())
             .unwrap(),
         json!({"ok": true})
     );
-    let mut connection = SocketConnection::open(&socket, later()).unwrap();
+    let mut connection = super::unix::open(&socket, later()).unwrap();
     let started = Instant::now();
     let error = connection
         .call(
@@ -1137,16 +1157,15 @@ fn the_socket_connection_bounds_every_reply() {
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     assert!(started.elapsed() < Duration::from_millis(550));
-    let mut connection = SocketConnection::open(&socket, later()).unwrap();
+    let mut connection = super::unix::open(&socket, later()).unwrap();
     let error = connection
         .call("terminal.get", json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();
     // A socket in a directory that others can write is not this user's core.
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
-    let error = SocketConnection::open(&socket, later()).err().unwrap();
+    let error = super::unix::open(&socket, later()).err().unwrap();
     assert!(error_text(&error).contains("is not a protected Herdr Core socket"));
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
 }
@@ -1298,4 +1317,394 @@ fn a_name_that_resolves_to_another_terminal_fails_closed() {
     assert!(core.params("terminal.kill").is_empty());
     assert_eq!(core.params("terminal.run").len(), 1);
     assert!(core.terminal("t7").is_some());
+}
+
+// --- Windows (2026-11-18): endpoint, framing and transport. ---
+
+// hc 0.1.21 on Windows: HC_SOCKET, else `socket` in the config under XDG_CONFIG_HOME,
+// APPDATA or the profile's Roaming folder, else `\\.\pipe\herdr-core-<user>-<session>.sock`
+// with only the ASCII letters and digits of USERNAME. Pure, so it runs on every platform.
+#[test]
+fn the_windows_endpoint_follows_hc_and_accepts_only_a_local_pipe() {
+    use super::windows_endpoint::{WindowsEndpointInputs, local_pipe_name, resolve_pipe};
+    let no_config = |_: &Path| -> Result<Option<String>> { Ok(None) };
+    let base = WindowsEndpointInputs {
+        appdata: Some(r"C:\Users\Jo Doe\AppData\Roaming".into()),
+        userprofile: Some(r"C:\Users\Jo Doe".into()),
+        username: Some("Jo Doe.1".into()),
+        ..WindowsEndpointInputs::default()
+    };
+    let pipe = |inputs: &WindowsEndpointInputs| {
+        resolve_pipe(inputs, &no_config).map(|path| path.to_str().unwrap().to_owned())
+    };
+    assert_eq!(
+        pipe(&base).unwrap(),
+        r"\\.\pipe\herdr-core-JoDoe1-default.sock"
+    );
+    let mut inputs = base.clone();
+    inputs.hc_session = Some(" smoke ".into());
+    assert_eq!(
+        pipe(&inputs).unwrap(),
+        r"\\.\pipe\herdr-core-JoDoe1-smoke.sock"
+    );
+    // hc keeps the user part empty when USERNAME is unset.
+    let mut inputs = base.clone();
+    inputs.username = None;
+    assert_eq!(pipe(&inputs).unwrap(), r"\\.\pipe\herdr-core--default.sock");
+    // The configuration is read where hc reads it, and HC_SOCKET wins over it.
+    let seen = std::cell::RefCell::new(Vec::new());
+    let configured = |path: &Path| -> Result<Option<String>> {
+        seen.borrow_mut().push(path.to_path_buf());
+        Ok(Some(r"\\.\pipe\configured.sock".into()))
+    };
+    assert_eq!(
+        resolve_pipe(&base, &configured).unwrap(),
+        Path::new(r"\\.\pipe\configured.sock")
+    );
+    let mut inputs = base.clone();
+    inputs.xdg_config_home = Some(r"D:\xdg".into());
+    resolve_pipe(&inputs, &configured).unwrap();
+    let mut inputs = base.clone();
+    inputs.appdata = None;
+    resolve_pipe(&inputs, &configured).unwrap();
+    let separator = std::path::MAIN_SEPARATOR;
+    let expected: Vec<String> = [
+        r"C:\Users\Jo Doe\AppData\Roaming",
+        r"D:\xdg",
+        &format!(r"C:\Users\Jo Doe{separator}AppData{separator}Roaming"),
+    ]
+    .iter()
+    .map(|home| format!("{home}{separator}herdr-core{separator}config.toml"))
+    .collect();
+    let seen: Vec<String> = seen
+        .borrow()
+        .iter()
+        .map(|path| path.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(seen, expected);
+    let mut inputs = base.clone();
+    inputs.hc_socket = Some(r"\\.\PIPE\explicit.sock".into());
+    assert_eq!(
+        resolve_pipe(&inputs, &|_| panic!("HC_SOCKET is read first")).unwrap(),
+        Path::new(r"\\.\PIPE\explicit.sock")
+    );
+    // Refused: what hc refuses, a profile-less configuration, and any endpoint that is not a
+    // local named pipe (another machine's pipe, a file, a socket path).
+    for (field, value, expected) in [
+        ("session", "a:b", "cannot name a Herdr Core"),
+        ("session", "..", "cannot name a Herdr Core"),
+        (
+            "socket",
+            r"\\host\pipe\herdr.sock",
+            "is not a local named pipe",
+        ),
+        (
+            "socket",
+            r"C:\Users\Jo\hc.sock",
+            "is not a local named pipe",
+        ),
+        ("socket", "/state/default.sock", "is not a local named pipe"),
+        (
+            "socket",
+            r"\\?\pipe\herdr.sock",
+            "is not a local named pipe",
+        ),
+        ("socket", r"\\.\pipe\", "is not a local named pipe"),
+        (
+            "socket",
+            &format!(r"\\.\pipe\{}", "x".repeat(250)),
+            "longer than Windows allows",
+        ),
+    ] {
+        let mut inputs = base.clone();
+        match field {
+            "session" => inputs.hc_session = Some(value.into()),
+            _ => inputs.hc_socket = Some(value.into()),
+        }
+        let error = error_text(&resolve_pipe(&inputs, &no_config).unwrap_err());
+        assert!(error.contains(expected), "{value}: {error}");
+    }
+    let mut inputs = base.clone();
+    inputs.hc_socket = None;
+    let configured_file = |_: &Path| -> Result<Option<String>> { Ok(Some(r"C:\hc.sock".into())) };
+    assert!(
+        error_text(&resolve_pipe(&inputs, &configured_file).unwrap_err())
+            .contains("is not a local named pipe")
+    );
+    let broken = |_: &Path| -> Result<Option<String>> { bail!("cannot parse") };
+    assert!(resolve_pipe(&base, &broken).is_err());
+    let homeless = WindowsEndpointInputs::default();
+    assert!(
+        error_text(&resolve_pipe(&homeless, &no_config).unwrap_err())
+            .contains("neither APPDATA nor USERPROFILE is set")
+    );
+    assert_eq!(
+        local_pipe_name(Path::new(r"\\.\pipe\herdr-core-u-default.sock")).unwrap(),
+        "herdr-core-u-default.sock"
+    );
+}
+
+/// A stream that answers each write and read from a script: the shared framing's view of
+/// either installed transport.
+#[derive(Default)]
+struct ScriptedStream {
+    writes: VecDeque<std::io::Result<usize>>,
+    reads: VecDeque<std::io::Result<Vec<u8>>>,
+    written: Vec<u8>,
+}
+
+impl Stream for ScriptedStream {
+    fn write_before(&mut self, bytes: &[u8], _: Instant) -> std::io::Result<usize> {
+        let count = self.writes.pop_front().unwrap_or(Ok(bytes.len()))?;
+        let count = count.min(bytes.len());
+        self.written.extend_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+    fn read_before(&mut self, buffer: &mut [u8], _: Instant) -> std::io::Result<usize> {
+        let bytes = self.reads.pop_front().unwrap_or(Ok(Vec::new()))?;
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+}
+
+fn io(kind: std::io::ErrorKind) -> std::io::Error {
+    std::io::Error::from(kind)
+}
+
+// Both transports share one rule: a request is unsent only while none of its bytes was
+// written. A request whose bytes were partly written, or whose reply is missing, late or
+// invalid, is unanswered and never sent again.
+#[test]
+fn the_shared_framing_reports_unsent_only_before_any_byte_was_written() {
+    use std::io::ErrorKind::{BrokenPipe, Interrupted, TimedOut, WouldBlock};
+    let call = |stream: ScriptedStream| {
+        let mut framed = Framed::new(stream);
+        let result = framed.call("terminal.send", json!({"text": "x"}), later());
+        (result, framed.stream.written)
+    };
+    let reply =
+        |id: u64| format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"turn":1}}}}"#).into_bytes();
+    // A reply split across reads, after an interrupted write was repeated.
+    let mut first = reply(1);
+    let second = first.split_off(10);
+    let (result, written) = call(ScriptedStream {
+        writes: VecDeque::from([Err(io(Interrupted)), Ok(7)]),
+        reads: VecDeque::from([Ok(first), Ok([second, b"\n".to_vec()].concat())]),
+        ..ScriptedStream::default()
+    });
+    assert_eq!(result.unwrap(), json!({"turn": 1}));
+    assert!(written.ends_with(b"\n"));
+    let request: Value = serde_json::from_slice(&written[..written.len() - 1]).unwrap();
+    assert_eq!(request["id"], 1);
+    for (writes, unsent) in [
+        (vec![Err(io(TimedOut))], true),
+        (vec![Err(io(WouldBlock))], true),
+        (vec![Ok(0)], true),
+        (vec![Err(io(BrokenPipe))], true),
+        (vec![Ok(5), Err(io(TimedOut))], false),
+        (vec![Ok(5), Ok(0)], false),
+        (vec![Ok(5), Err(io(BrokenPipe))], false),
+    ] {
+        let (result, _) = call(ScriptedStream {
+            writes: writes.into(),
+            ..ScriptedStream::default()
+        });
+        match result {
+            Err(CallError::NotSent(_)) => assert!(unsent),
+            Err(CallError::Unanswered(_)) => assert!(!unsent),
+            other => panic!("{other:?}"),
+        }
+    }
+    for (reads, expected) in [
+        (vec![Err(io(TimedOut))], "Herdr reply timed out"),
+        (vec![Err(io(WouldBlock))], "Herdr reply timed out"),
+        (vec![Ok(Vec::new())], "closed the connection"),
+        (vec![Err(io(BrokenPipe))], "lost the Herdr Core connection"),
+        (
+            vec![Ok([reply(2), b"\n".to_vec()].concat())],
+            "does not answer request 1",
+        ),
+        (vec![Ok(b"no json\n".to_vec())], "is not JSON"),
+    ] {
+        let (result, _) = call(ScriptedStream {
+            reads: reads.into(),
+            ..ScriptedStream::default()
+        });
+        match result {
+            Err(CallError::Unanswered(error)) => {
+                assert!(error_text(&error).contains(expected), "{error:#}")
+            }
+            other => panic!("{expected}: {other:?}"),
+        }
+    }
+    // A reply that never ends is bounded.
+    let (result, _) = call(ScriptedStream {
+        reads: std::iter::repeat_with(|| Ok(vec![b'x'; 64 * 1024]))
+            .take(MAX_REPLY / (64 * 1024) + 2)
+            .collect(),
+        ..ScriptedStream::default()
+    });
+    match result {
+        Err(CallError::Unanswered(error)) => {
+            assert!(error_text(&error).contains("reply exceeds"), "{error:#}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// The installed pipe transport over a real named pipe of this user: one reply line per
+// request, a silent core bounded by the deadline and reported unanswered, a closed one
+// unanswered, a missing one not running, and a name that is no local pipe refused before
+// anything is opened.
+#[cfg(windows)]
+#[test]
+fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
+    use std::io::{Read, Write};
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+        System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_TYPE_BYTE, PIPE_WAIT,
+        },
+    };
+    let name = format!(r"\\.\pipe\tabcli-herdr-test-{}", std::process::id());
+    let error = super::pipe::open(Path::new(&name), later()).err().unwrap();
+    assert!(
+        error_text(&error).contains("no Herdr Core is running"),
+        "{error:#}"
+    );
+    let error = super::pipe::open(Path::new(r"C:\Windows\win.ini"), later())
+        .err()
+        .unwrap();
+    assert!(
+        error_text(&error).contains("is not a local named pipe"),
+        "{error:#}"
+    );
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // One listening instance at a time, so that each connection reaches the instance the
+    // server serves next. The next one listens before the last one closes: a client that
+    // finds none listening waits for it (busy) instead of finding no core at all.
+    fn instance(wide: &[u16]) -> usize {
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                4,
+                65536,
+                65536,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(
+            raw,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        raw as usize
+    }
+    let first = instance(&wide);
+    let server = thread::spawn(move || {
+        let mut current = first;
+        for (index, reply) in ["answer", "silent", "close"].into_iter().enumerate() {
+            let raw = current as windows_sys::Win32::Foundation::HANDLE;
+            unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) };
+            let mut stream = unsafe { fs::File::from_raw_handle(raw) };
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+                request.push(byte[0]);
+            }
+            let request: Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request["jsonrpc"], "2.0");
+            match reply {
+                "answer" => {
+                    let line =
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": true}});
+                    stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+                    // Until the client has read the reply and gone.
+                    let _ = stream.read(&mut byte);
+                }
+                "silent" => thread::sleep(Duration::from_millis(600)),
+                _ => {}
+            }
+            if index < 2 {
+                current = instance(&wide);
+            }
+            drop(stream);
+        }
+    });
+    let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
+    assert_eq!(
+        connection
+            .call("hello", json!({"generation": 1}), later())
+            .unwrap(),
+        json!({"ok": true})
+    );
+    drop(connection);
+    let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
+    let started = Instant::now();
+    let error = connection
+        .call(
+            "terminal.send",
+            json!({}),
+            Instant::now() + Duration::from_millis(200),
+        )
+        .unwrap_err();
+    assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
+    assert!(started.elapsed() < Duration::from_millis(550));
+    drop(connection);
+    let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
+    let error = connection
+        .call("terminal.get", json!({}), later())
+        .unwrap_err();
+    assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
+    server.join().unwrap();
+    // The server check compares account SIDs, which Windows spells without regard to case.
+    assert!(super::pipe::same_user(
+        "S-1-5-21-1-2-3-1001",
+        "s-1-5-21-1-2-3-1001"
+    ));
+    assert!(!super::pipe::same_user(
+        "S-1-5-21-1-2-3-1001",
+        "S-1-5-21-1-2-3-1002"
+    ));
+}
+
+// The installed Windows reads of this machine's processes: this process's birth is its
+// creation time, a missing process has none, its parent was created no later than it, and
+// a launch token is 32 hexadecimal digits.
+#[cfg(windows)]
+#[test]
+fn the_windows_core_reads_births_parents_and_random_tokens() {
+    let core = super::Installed;
+    let pid = std::process::id();
+    let created = super::pipe::creation_time(pid).unwrap().unwrap();
+    assert_eq!(
+        core.process_start(pid).unwrap(),
+        Some(HerdrHostBirth::Windows {
+            host_creation_time: created
+        })
+    );
+    assert_eq!(core.process_start(u32::MAX - 3).unwrap(), None);
+    let mut child = std::process::Command::new("cmd.exe")
+        .args(["/C", "ping -n 3 127.0.0.1 >NUL"])
+        .spawn()
+        .unwrap();
+    assert_eq!(core.parent_pid(child.id()).unwrap(), Some(pid));
+    let parent = core.parent_pid(pid).unwrap();
+    if let Some(parent) = parent {
+        assert!(super::pipe::creation_time(parent).unwrap().unwrap() <= created);
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(core.parent_pid(child.id()).unwrap(), None);
+    let token = core.launch_nonce().unwrap();
+    assert_eq!(token.len(), 32);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(token, core.launch_nonce().unwrap());
 }
