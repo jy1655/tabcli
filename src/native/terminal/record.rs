@@ -34,6 +34,9 @@ pub(in crate::native) struct TerminalSession {
     /// The Herdr Core that holds a Herdr surface and the program it started there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     herdr_core: Option<HerdrSurface>,
+    // Older readers accept new top-level fields. Their flattened Herdr birth is strict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    herdr_launch_nonce: Option<String>,
 }
 
 /// A Herdr terminal's creation identity: the core that answered on `socket` with its
@@ -87,6 +90,7 @@ impl TerminalSession {
             linux_host: None,
             tmux_socket: None,
             herdr_core: None,
+            herdr_launch_nonce: None,
         }
     }
 
@@ -133,14 +137,24 @@ impl TerminalSession {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(in crate::native) fn with_herdr_core(mut self, core: HerdrSurface) -> Self {
+    pub(in crate::native) fn with_herdr_core(
+        mut self,
+        core: HerdrSurface,
+        launch_nonce: &str,
+    ) -> Self {
         self.herdr_core = Some(core);
+        self.herdr_launch_nonce = Some(launch_nonce.to_owned());
         self
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn herdr_core(&self) -> Option<&HerdrSurface> {
         self.herdr_core.as_ref()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(in crate::native::terminal) fn herdr_launch_nonce(&self) -> Option<&str> {
+        self.herdr_launch_nonce.as_deref()
     }
 
     #[cfg(target_os = "linux")]
@@ -192,6 +206,7 @@ mod tests {
             "linux_host": {"pid": 11, "linux_birth": {
                 "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 12}},
             "tmux_socket": "/session-record/tmux.sock",
+            "herdr_launch_nonce": "0123456789abcdef0123456789abcdef",
             "herdr_core": {"socket": "/state/default.sock", "core_id": "core", "created_ms": 13,
                            "host_pid": 14, "host_start_seconds": 15, "host_start_microseconds": 16}
         })
@@ -215,6 +230,7 @@ mod tests {
                 "linux_host",
                 "tmux_socket",
                 "herdr_core",
+                "herdr_launch_nonce",
             ] {
                 let mut changed = wire.clone();
                 changed.as_object_mut().unwrap().remove(field);

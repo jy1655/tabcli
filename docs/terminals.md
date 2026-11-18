@@ -138,18 +138,32 @@ Use an explicit choice from any terminal, or let detection select it inside an h
 tabcli ask claude --terminal herdr --workspace /path/to/project --prompt "Explain this project."
 ```
 
-The new session appears in Herdr. Use the normal `result`, `tell`, `screen`, and `close-session`
-commands; the returned `attach_command` selects the recorded socket and terminal for `hc attach`.
-Use the address returned by this launch, not an existing terminal. Herdr displays a generated
-`tabcli-<24 hex digits>` name. `macos-open-mode` does not affect Herdr's layout.
+When you launch from a verified Herdr terminal, the app lists the new session as a sub-agent
+under the caller's tab. This also works with an explicit `--terminal herdr`. Open the sub-agent
+to watch the session or answer a provider dialog. From outside Herdr, an explicit launch
+creates a parentless terminal. The returned `attach_command` opens that exact session from a
+shell in either case. Herdr displays a generated `tabcli-<24 hex digits>` name.
+`macos-open-mode` does not affect this layout.
+
+For a temporary tab, run `herdr-app do terminal.keep --terminal <address>` using the local
+address in `terminal_session_id`. Herdr enables core keep when it adopts a terminal into a
+pane, so Bridge refuses screen, input and close while a replacement program could run there.
+Use `herdr-app do terminal.park --terminal <address>` to remove the pane, disable keep and
+leave the program running. Bridge then rechecks its identity. Park before closing if you
+want the session to continue. If you already closed the pane with keep enabled, check that
+`hc get <address>` on the recorded core reports `finished` for this session. Remove that
+finished terminal with `hc rm <address>`, then run `tabcli close-session <session> --explicit`.
+The returned `attach_command` names the socket to use for these hc commands.
 On Linux the terminal starts bash with job control and without shell startup files. The core's environment must provide the tools the CLI needs. Native Windows and remote hc machines are unsupported.
 
 Bridge pins the local socket, core identity and the created terminal. Later commands use that
 binding even when the caller's `HC_SESSION` or `HC_SOCKET` changes. A replaced or unreachable
 core is not evidence that a terminal is gone. Queries connect without starting a service.
-The terminal is created without a parent, automatic notes or shell recovery: hc does not type
-child notifications into the caller, and ending the caller does not end this conversation.
-Close acts only on this session's terminal, never the core or other terminals.
+A parented session counts in the caller's `hc wait --children`. The core does not type child
+notifications into the caller, and the session continues when the caller ends.
+If the original program ends outside Bridge with keep off, run
+`tabcli close-session <session> --explicit` as usual. Bridge verifies and removes the
+finished terminal and closes the session record.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for

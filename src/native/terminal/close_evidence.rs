@@ -47,22 +47,29 @@ pub(in crate::native) trait CloseEvidence {
         &self,
         owner: &NativeSessionOwner,
     ) -> Result<Option<MacTerminalAppIdentity>>;
+    /// Whether a present surface can be one whose program ended and that stays until it is
+    /// removed. After its owner's verified death a close may then remove such a surface; the
+    /// adapter removes it only when it reads it ended, and never ends a running program.
+    fn removes_ended_surface(&self) -> bool;
 }
 
 // Presence alone: the adapter has no app-incarnation evidence, so an absent surface
 // is one its presence query does not find, nothing ever ends an incarnation, a
 // recorded close intent resumes as surface-only authority without rereading the owner
 // or the presence, and no incarnation is derived. Every kind but Terminal.app selects
-// it; the one declared variation is the context that Warp and WezTerm add when the
-// owner record is absent and the surface is not proven absent.
+// it; the declared variations are the context that Warp and WezTerm add when the
+// owner record is absent and the surface is not proven absent, and Herdr's finished
+// terminal, which stays after its program ended until it is removed.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PresenceOnly {
     ownerless_context: Option<&'static str>,
+    ended_surface: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static PRESENCE_ONLY: PresenceOnly = PresenceOnly {
     ownerless_context: None,
+    ended_surface: false,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -70,6 +77,13 @@ static PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT: PresenceOnly = PresenceOnly {
     ownerless_context: Some(
         "could not prove absence of the ownerless startup surface; no close was sent",
     ),
+    ended_surface: false,
+};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static PRESENCE_WITH_ENDED_SURFACE: PresenceOnly = PresenceOnly {
+    ownerless_context: None,
+    ended_surface: true,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -109,6 +123,10 @@ impl CloseEvidence for PresenceOnly {
     ) -> Result<Option<MacTerminalAppIdentity>> {
         Ok(None)
     }
+
+    fn removes_ended_surface(&self) -> bool {
+        self.ended_surface
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -126,6 +144,7 @@ pub(in crate::native) fn for_kind(kind: super::TerminalKind) -> &'static dyn Clo
         CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext => {
             &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT
         }
+        CloseEvidenceChoice::PresenceWithEndedSurface => &PRESENCE_WITH_ENDED_SURFACE,
     }
 }
 
@@ -142,6 +161,7 @@ mod tests {
             TerminalKind::Warp,
             TerminalKind::WezTerm,
             TerminalKind::WindowsConsole,
+            TerminalKind::Herdr,
         ] {
             let evidence = for_kind(kind);
             assert!(matches!(
@@ -218,6 +238,28 @@ mod tests {
             assert_eq!(
                 evidence.startup_retained_reason(),
                 "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
+            );
+        }
+    }
+
+    // Only Herdr keeps a surface after its program ends (a finished terminal stays on the
+    // core until `terminal.rm`), so only Herdr's dead-owner close may remove one.
+    #[test]
+    fn only_herdr_keeps_an_ended_surface() {
+        for kind in [
+            TerminalKind::Iterm2,
+            TerminalKind::AppleTerminal,
+            TerminalKind::Ghostty,
+            TerminalKind::Warp,
+            TerminalKind::WezTerm,
+            TerminalKind::WindowsConsole,
+            TerminalKind::Tmux,
+            TerminalKind::Herdr,
+        ] {
+            assert_eq!(
+                for_kind(kind).removes_ended_surface(),
+                kind == TerminalKind::Herdr,
+                "{kind:?}"
             );
         }
     }
