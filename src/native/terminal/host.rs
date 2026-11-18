@@ -19,6 +19,8 @@ pub(in crate::native) const CONSOLE_HOST_COMMAND: &str =
     TerminalKind::WindowsConsole.registration().host_command;
 pub(in crate::native) const TMUX_HOST_COMMAND: &str =
     TerminalKind::Tmux.registration().host_command;
+pub(in crate::native) const HERDR_HOST_COMMAND: &str =
+    TerminalKind::Herdr.registration().host_command;
 
 /// The flag that hands a launch host the command it runs on its bound terminal. Only the host
 /// command of a kind that uses the launch host takes it.
@@ -112,7 +114,11 @@ fn parse_directory_host(
         Some(TerminalKind::AppleTerminal) => Ok(HostCommand::AppleTerminal { directory }),
         Some(TerminalKind::WezTerm) => Ok(HostCommand::WezTerm { directory }),
         Some(TerminalKind::WindowsConsole) => Ok(HostCommand::Console { directory }),
-        Some(TerminalKind::Ghostty | TerminalKind::Warp | TerminalKind::Tmux) | None => {
+        // A Herdr terminal has no legacy host: it is only ever given the launch form.
+        Some(
+            TerminalKind::Ghostty | TerminalKind::Warp | TerminalKind::Tmux | TerminalKind::Herdr,
+        )
+        | None => {
             bail!("unknown native host command: {command}")
         }
     }
@@ -437,6 +443,10 @@ mod tests {
             ),
             format!("{TMUX_HOST_COMMAND} [1] refused: {form}"),
         ];
+        let mut herdr = launch_host(HERDR_HOST_COMMAND, "herdr").to_vec();
+        herdr[6] = format!(
+            "{HERDR_HOST_COMMAND} [1] refused: unknown native host command: {HERDR_HOST_COMMAND}"
+        );
         let expected: Vec<String> = [
             launch_host(ITERM2_HOST_COMMAND, "iterm2").to_vec(),
             directory_host(APPLE_TERMINAL_HOST_COMMAND, "apple-terminal"),
@@ -445,6 +455,7 @@ mod tests {
             launch_host(WEZTERM_HOST_COMMAND, "wezterm").to_vec(),
             directory_host(CONSOLE_HOST_COMMAND, "windows-console"),
             tmux,
+            herdr,
         ]
         .concat();
         assert_eq!(actual, expected);

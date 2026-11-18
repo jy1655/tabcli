@@ -130,7 +130,7 @@ fn common_error_precedence_matrix() {
         error(
             command,
             &["--terminal", "iterm2", "--terminal", "bad"],
-            "unsupported terminal \"bad\"; expected ghostty, iterm2, terminal, tmux, warp, wezterm, or windows-console",
+            "unsupported terminal \"bad\"; expected ghostty, herdr, iterm2, terminal, tmux, warp, wezterm, or windows-console",
         );
         for options in [
             vec!["--timeout-secs", "0"],
@@ -339,6 +339,10 @@ fn success_defaults_values_and_terminal_alias_matrix() {
             (&["ghostty", "GHOSTTY"][..], terminal::TerminalKind::Ghostty),
             (&["warp", "warpterminal"], terminal::TerminalKind::Warp),
             (&["wezterm"], terminal::TerminalKind::WezTerm),
+            (
+                &["herdr", "hc", "herdr-core"],
+                terminal::TerminalKind::Herdr,
+            ),
             (
                 &["windows-console", "windows", "console"],
                 terminal::TerminalKind::WindowsConsole,

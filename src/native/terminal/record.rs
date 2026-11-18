@@ -31,6 +31,23 @@ pub(in crate::native) struct TerminalSession {
     /// The socket of a tmux surface's own server, in its session directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tmux_socket: Option<String>,
+    /// The Herdr Core that holds a Herdr surface and the program it started there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    herdr_core: Option<HerdrSurface>,
+}
+
+/// A Herdr terminal's creation identity: the core that answered on `socket` with its
+/// permanent `core_id` (the address `t7` names one terminal forever on that core), when the
+/// core created it, and the incarnation of the program it started, Bridge's launch host.
+/// Only the Herdr adapter constructs it from a creation it verified.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(in crate::native) struct HerdrSurface {
+    pub(in crate::native) socket: String,
+    pub(in crate::native) core_id: String,
+    pub(in crate::native) created_ms: u64,
+    pub(in crate::native) host_pid: u32,
+    pub(in crate::native) host_start_seconds: u64,
+    pub(in crate::native) host_start_microseconds: u64,
 }
 
 /// Only a creation-proven adapter may publish this incarnation. Registration's
@@ -55,6 +72,7 @@ impl TerminalSession {
             wezterm_mux: None,
             linux_host: None,
             tmux_socket: None,
+            herdr_core: None,
         }
     }
 
@@ -98,6 +116,17 @@ impl TerminalSession {
     #[cfg(any(target_os = "macos", test))]
     pub(in crate::native) fn wezterm_mux(&self) -> Option<&WezTermMux> {
         self.wezterm_mux.as_ref()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) fn with_herdr_core(mut self, core: HerdrSurface) -> Self {
+        self.herdr_core = Some(core);
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) fn herdr_core(&self) -> Option<&HerdrSurface> {
+        self.herdr_core.as_ref()
     }
 
     #[cfg(target_os = "linux")]
@@ -148,7 +177,9 @@ mod tests {
                             "start_microseconds": 10, "owns_gui": false},
             "linux_host": {"pid": 11, "linux_birth": {
                 "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 12}},
-            "tmux_socket": "/session-record/tmux.sock"
+            "tmux_socket": "/session-record/tmux.sock",
+            "herdr_core": {"socket": "/state/default.sock", "core_id": "core", "created_ms": 13,
+                           "host_pid": 14, "host_start_seconds": 15, "host_start_microseconds": 16}
         })
     }
 
@@ -169,6 +200,7 @@ mod tests {
                 "wezterm_mux",
                 "linux_host",
                 "tmux_socket",
+                "herdr_core",
             ] {
                 let mut changed = wire.clone();
                 changed.as_object_mut().unwrap().remove(field);
@@ -220,6 +252,7 @@ mod tests {
             "wezterm_mux",
             "linux_host",
             "tmux_socket",
+            "herdr_core",
         ] {
             let mut malformed = mixed_record();
             malformed[field] = json!(42);

@@ -81,7 +81,7 @@ pub(super) fn launch_stage_check(
                 CheckId::LAUNCH_STAGE,
                 Unavailable,
                 Reason::LAUNCH_STAGE_NOT_APPLICABLE,
-                "Launch host records exist only for macOS iTerm2 and WezTerm launches.",
+                "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",
                 "No action is needed.",
             ),
             _ => Check::new(
@@ -123,7 +123,7 @@ fn not_applicable(kind: TerminalKind) -> Check {
         CheckId::LAUNCH_STAGE,
         Availability::Unavailable,
         Reason::LAUNCH_STAGE_NOT_APPLICABLE,
-        "Launch host records exist only for macOS iTerm2 and WezTerm launches.",
+        "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",
         "No action is needed.",
     )
     .evidence(json!({"terminal": kind}))
@@ -225,7 +225,7 @@ pub(super) fn shell_environment_check(
                 CheckId::SHELL_ENVIRONMENT,
                 Unavailable,
                 Reason::SHELL_ENVIRONMENT_PROBE_NOT_APPLICABLE,
-                "Only macOS iTerm2 and WezTerm launches prepare the shell environment this way.",
+                "Only macOS iTerm2, WezTerm and Herdr launches prepare the shell environment this way.",
                 "No action is needed.",
             )
             .evidence(json!({"terminal": kind}));
@@ -471,6 +471,7 @@ mod tests {
         for (terminal, name) in [
             (TerminalKind::Iterm2, "iTerm2"),
             (TerminalKind::WezTerm, "WezTerm"),
+            (TerminalKind::Herdr, "Herdr"),
         ] {
             let named = |stage, failure| {
                 let mut record = host(stage, failure);
@@ -509,6 +510,9 @@ mod tests {
             "WezTerm: unavailable launch_host_failed | The WezTerm launch host failed after stage environment_preparing: capture_exit_nonzero, exit status 3. | \"wezterm\"",
             "WezTerm: available launch_stage_observed | The WezTerm launch host recorded stage launch_shell_starting; the shell environment was prepared without a terminal. | \"wezterm\"",
             "WezTerm: unknown launch_stage_observed | The last recorded stage of the WezTerm launch host is host_started. A retained earlier stage does not prove that the step is still running. | \"wezterm\"",
+            "Herdr: unavailable launch_host_failed | The Herdr launch host failed after stage environment_preparing: capture_exit_nonzero, exit status 3. | \"herdr\"",
+            "Herdr: available launch_stage_observed | The Herdr launch host recorded stage launch_shell_starting; the shell environment was prepared without a terminal. | \"herdr\"",
+            "Herdr: unknown launch_stage_observed | The last recorded stage of the Herdr launch host is host_started. A retained earlier stage does not prove that the step is still running. | \"herdr\"",
         ];
         assert_eq!(actual, expected);
     }
@@ -820,9 +824,9 @@ mod tests {
         }
         const NOT_RECORDED: &str = "No launch host record is retained. A session from an earlier release, another terminal, or a launch that did not reach surface creation has none; absence is not evidence that the host never started.";
         const NO_RECORDS: &str =
-            "Launch host records exist only for macOS iTerm2 and WezTerm launches.";
+            "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.";
         const NO_PROBE: &str =
-            "Only macOS iTerm2 and WezTerm launches prepare the shell environment this way.";
+            "Only macOS iTerm2, WezTerm and Herdr launches prepare the shell environment this way.";
         let host = |kind: &str| {
             if cfg!(target_os = "macos") {
                 format!(
@@ -847,6 +851,7 @@ mod tests {
             host("WezTerm"),
             other("WindowsConsole", "windows-console"),
             other("Tmux", "tmux"),
+            host("Herdr"),
         ];
         assert_eq!(actual, expected);
     }

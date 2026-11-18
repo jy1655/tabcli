@@ -300,6 +300,7 @@ pub(super) fn resolution<'a>(
 impl ResolvedReopen {
     fn resolve(request: ReopenRequest, deadline: Instant) -> Result<Self> {
         let terminal_kind = terminal::select(request.terminal)?;
+        terminal::admit_selection(request.terminal, terminal_kind)?;
         let source_directory = Reader::session_directory(&request.id)?;
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner

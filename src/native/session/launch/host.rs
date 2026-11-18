@@ -925,7 +925,7 @@ mod tests {
     // their wire names; the writer refuses any other kind.
     #[test]
     fn record_accepts_exactly_the_registered_launch_host_kinds() {
-        assert_eq!(LAUNCH_HOST_NAMES, ["iterm2", "wezterm"]);
+        assert_eq!(LAUNCH_HOST_NAMES, ["iterm2", "wezterm", "herdr"]);
         let (_dir, store, token) = fixture();
         initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         let mut host = serde_json::to_value(read(&store)).unwrap();
@@ -942,7 +942,7 @@ mod tests {
                 Err(error) => {
                     assert!(!kind.uses_launch_host(), "{kind:?}");
                     let expected = format!(
-                        "unknown variant `{}`, expected `iterm2` or `wezterm` at line 1 column ",
+                        "unknown variant `{}`, expected one of `iterm2`, `wezterm`, `herdr` at line 1 column ",
                         kind.as_str()
                     );
                     assert!(error.to_string().starts_with(&expected), "{error}");
@@ -953,7 +953,7 @@ mod tests {
         let error = initialize(&store, &token, TerminalKind::Ghostty).unwrap_err();
         assert!(
             format!("{error:#}").starts_with(
-                "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 1 column "
+                "unknown variant `ghostty`, expected one of `iterm2`, `wezterm`, `herdr` at line 1 column "
             ),
             "{error:#}"
         );
@@ -972,6 +972,7 @@ mod tests {
         for (terminal, word) in [
             (TerminalKind::Iterm2, "iterm2"),
             (TerminalKind::WezTerm, "wezterm"),
+            (TerminalKind::Herdr, "herdr"),
         ] {
             let (_dir, store, token) = fixture();
             initialize(&store, &token, terminal).unwrap();
@@ -1024,6 +1025,7 @@ mod tests {
         let actual: Vec<_> = [
             r#""iterm2""#,
             r#""wezterm""#,
+            r#""herdr""#,
             r#""ghostty""#,
             r#""kitty""#,
             r#""ITERM2""#,
@@ -1050,25 +1052,26 @@ mod tests {
         let expected = [
             r#""iterm2" => recorded "iterm2""#,
             r#""wezterm" => recorded "wezterm""#,
-            r#""ghostty" => unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23"#,
-            r#""kitty" => unknown variant `kitty`, expected `iterm2` or `wezterm` at line 5 column 21"#,
-            r#""ITERM2" => unknown variant `ITERM2`, expected `iterm2` or `wezterm` at line 5 column 22"#,
-            r#""WezTerm" => unknown variant `WezTerm`, expected `iterm2` or `wezterm` at line 5 column 23"#,
-            r#""apple-terminal" => unknown variant `apple-terminal`, expected `iterm2` or `wezterm` at line 5 column 30"#,
-            r#""warp" => unknown variant `warp`, expected `iterm2` or `wezterm` at line 5 column 20"#,
-            r#""windows-console" => unknown variant `windows-console`, expected `iterm2` or `wezterm` at line 5 column 31"#,
-            r#""" => unknown variant ``, expected `iterm2` or `wezterm` at line 5 column 16"#,
+            r#""herdr" => recorded "herdr""#,
+            r#""ghostty" => unknown variant `ghostty`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 23"#,
+            r#""kitty" => unknown variant `kitty`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 21"#,
+            r#""ITERM2" => unknown variant `ITERM2`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 22"#,
+            r#""WezTerm" => unknown variant `WezTerm`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 23"#,
+            r#""apple-terminal" => unknown variant `apple-terminal`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 30"#,
+            r#""warp" => unknown variant `warp`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 20"#,
+            r#""windows-console" => unknown variant `windows-console`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 31"#,
+            r#""" => unknown variant ``, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 16"#,
             "1 => expected value at line 5 column 15",
             "null => expected value at line 5 column 15",
             "true => expected value at line 5 column 15",
             r#"["iterm2"] => expected value at line 5 column 15"#,
             r#"{"iterm2": null} => recorded "iterm2""#,
             r#"{"wezterm": null} => recorded "wezterm""#,
-            r#"{"ghostty": null} => unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 24"#,
+            r#"{"ghostty": null} => unknown variant `ghostty`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 24"#,
             r#"{"iterm2": 1} => invalid type: integer `1`, expected unit at line 5 column 26"#,
             "{} => expected value at line 5 column 16",
             r#"{"iterm2": null, "wezterm": null} => expected value at line 5 column 29"#,
-            r#""ghostty"   => unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23"#,
+            r#""ghostty"   => unknown variant `ghostty`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 23"#,
         ];
         assert_eq!(actual, expected);
         std::fs::write(
@@ -1079,7 +1082,7 @@ mod tests {
         match observe(&store, super::super::read(&store).unwrap().as_ref()) {
             HostObservation::Unreadable(reason) => assert_eq!(
                 reason,
-                "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23"
+                "unknown variant `ghostty`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 23"
             ),
             other => panic!("{other:?}"),
         }
@@ -1143,7 +1146,7 @@ mod tests {
         let expected = [
             r#"iterm2: "observed" "iterm2""#,
             r#"wezterm: "observed" "wezterm""#,
-            r#"ghostty: "unreadable" "unknown variant `ghostty`, expected `iterm2` or `wezterm` at line 5 column 23""#,
+            r#"ghostty: "unreadable" "unknown variant `ghostty`, expected one of `iterm2`, `wezterm`, `herdr` at line 5 column 23""#,
         ];
         assert_eq!(actual, expected);
     }

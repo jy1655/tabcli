@@ -12,15 +12,17 @@ process inside WSL would use tmux, but has not been verified. See [CLI commands]
 ## Selection and settings
 
 `ask` and `self-test` accept `--terminal`; `reopen` currently supports native Windows Claude only.
-The documented terminal names are `ghostty`, `iterm2`, `terminal`, `tmux`, `warp`, `wezterm`, and
+The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmux`, `warp`, `wezterm`, and
 `windows-console`. Parsing is case-insensitive. Accepted aliases are `iterm`, `iterm.app`,
 `apple-terminal`, `apple_terminal`, `default`, `terminal.app`, `warpterminal`, `windows`, and
-`console`. Structured output names Terminal.app `apple-terminal`.
+`console`, and `hc` or `herdr-core` (Herdr). Structured output names Terminal.app `apple-terminal`.
 
 On Linux, tmux is the default; `--terminal tmux` selects it explicitly. Every other kind is
 refused with `<Name> is not available on Linux; use tmux`. tmux is refused on macOS and Windows.
 
-On macOS an explicit option wins. Otherwise Bridge first examines `TERM_PROGRAM`, recognizing those
+On macOS an explicit option wins. With `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`,
+Bridge selects Herdr and verifies the calling terminal before launch. Stale Herdr markers refuse
+the launch instead of opening Ghostty. Otherwise Bridge examines `TERM_PROGRAM`, recognizing those
 terminal families. An unrecognized value falls back to Terminal.app. Only when `TERM_PROGRAM` is
 absent does it check `TERM=xterm-ghostty`, then the presence of `ITERM_SESSION_ID`, then
 `TERM_SESSION_ID`; no match also falls back to Terminal.app. Detection selects an application, not
@@ -70,8 +72,7 @@ tab host has already decided to start its root, Bridge waits for that launch; de
 does not create a second surface.
 
 Bridge uses its terminal adapter to create the surface, check ownership, deliver terminal input
-where needed, and close it. The Windows rows below describe native Windows; the five application
-adapters above them are macOS-only.
+where needed, and close it. The Windows rows below describe native Windows; the application adapters and Herdr are macOS-only.
 
 | Platform | Terminal | Creation | Fallback input | Close | Screen read |
 | --- | --- | --- | --- | --- | --- |
@@ -80,6 +81,7 @@ adapters above them are macOS-only.
 | macOS | Ghostty | Tab or window | Terminal scripting | Owned surface; proven failed-launch handle retained | Unsupported |
 | macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI | Exact-pane CLI text |
 | macOS | Warp | Tab/window URI | Unsupported | Bound tab/window | Unsupported |
+| macOS | Herdr Core | New hc terminal | Addressed API paste | Exact terminal | Visible screen |
 | Linux | tmux | Detached server and pane | Exact-pane raw paste | Whole session server | Visible pane text |
 | Windows | Terminal tab | Tab | Console input | Console and tab | Console window text |
 | Windows | Console window | Window fallback | Console input | Console | Console window text |
@@ -119,6 +121,41 @@ running when it checks; an application that quits between that check and the rea
 again by the scripting call. On native Windows a caller without a console can get a console
 window from the console helper; this is not verified. `screen` is refused for Ghostty and Warp,
 whose scripting exposes no screen text. See [screen](cli.md#screen).
+
+## macOS / Herdr Core
+
+Open Herdr or start `hc` before launching a Bridge session. This adapter uses an already running,
+local Herdr Core (`hc`), not the older `herdr` TUI. It never starts or restarts the core.
+Use an explicit choice from any terminal, or let detection select it inside an hc terminal:
+
+```sh
+tabcli ask claude --terminal herdr --workspace /path/to/project --prompt "Explain this project."
+```
+
+The new session appears in Herdr. Use the normal `result`, `tell`, `screen`, and `close-session`
+commands; the returned `attach_command` selects the recorded socket and terminal for `hc attach`.
+Use the address returned by this launch, not an existing terminal. Herdr displays a generated
+`tabcli-<24 hex digits>` name. `macos-open-mode` does not affect Herdr's layout.
+Linux and native Windows do not support this adapter, and remote hc machines are not addressed.
+
+Bridge pins the local socket, core identity and the created terminal. Later commands use that
+binding even when the caller's `HC_SESSION` or `HC_SOCKET` changes. A replaced or unreachable
+core is not evidence that a terminal is gone. Queries connect without starting a service.
+The terminal is created without a parent, automatic notes or shell recovery: hc does not type
+child notifications into the caller, and ending the caller does not end this conversation.
+Close acts only on this session's terminal, never the core or other terminals.
+
+Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
+inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
+follow-ups. Herdr's OSC status and `hc wait` are not Bridge request-completion evidence.
+Agy and Pi use the addressed paste API, without forcing input past a blocked UI. A send that may
+have reached the terminal is never repeated automatically.
+
+The launch host clears inherited provider caller markers before starting the CLI, including
+markers retained by a core that was started from an assistant's shell. It does not change the
+core's environment for other terminals. Bridge reads only the visible screen (`lines=0`) and
+never scrolls history. It cannot atomically compare a dialog and press a key through hc, so
+workspace trust dialogs must be handled by the user through Herdr or `hc attach`.
 
 ## Linux / tmux
 

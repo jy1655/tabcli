@@ -173,7 +173,7 @@ defaults to `<provider> · <workspace-basename>` (or `workspace` when the basena
 Titles keep at most 80 characters, replace controls with spaces, collapse whitespace, and must
 remain nonempty. They are record labels; a terminal can also use its own ownership title.
 
-`--terminal` defaults to platform detection (tmux on Linux). Documented values are `ghostty`, `iterm2`, `terminal`,
+`--terminal` defaults to platform detection (tmux on Linux). Documented values are `ghostty`, `herdr` (alias `hc`, macOS only), `iterm2`, `terminal`,
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
 
@@ -1956,7 +1956,8 @@ Provider trust lookup follows these environment settings:
 - `CLAUDE_CONFIG_DIR`: read `.claude.json` here; the default directory is home.
 - `PI_CODING_AGENT_DIR`: read `trust.json` here; the default is `.pi/agent` under home.
 
-On macOS, `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, and `TERM_SESSION_ID` select the terminal as
+On macOS, `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr; otherwise
+`TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, and `TERM_SESSION_ID` select the terminal as
 described under [terminal selection](terminals.md#selection-and-settings).
 
 Use the state-root override to choose a separate registry; it is not a switch that isolates the

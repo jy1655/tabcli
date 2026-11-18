@@ -215,11 +215,9 @@ fn emit_session_result(
     for (key, field) in questions.iter().chain(extra) {
         value[key.as_str()] = field.clone();
     }
-    // A tmux session has no window of its own: this is how the user watches or types in it.
-    #[cfg(target_os = "linux")]
-    let attach = terminal::linux::tmux::attach_command(terminal_session);
-    #[cfg(not(target_os = "linux"))]
-    let attach: Option<String> = None;
+    // A tmux or Herdr session has no window of its own: this is how the user watches or
+    // types in it.
+    let attach = terminal::attach_command(terminal_session);
     if let Some(attach) = &attach {
         value["attach_command"] = serde_json::json!(attach);
     }
