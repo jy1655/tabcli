@@ -29,6 +29,7 @@ impl Fixture {
         store
             .private(MODE_FILE)
             .write_json(&LaunchMode {
+                compact_prompt: false,
                 schema: 1,
                 mode: Mode::NativeV1,
                 reason: "test".into(),
@@ -436,6 +437,7 @@ fn legacy_sessions_refuse_new_input_with_platform_specific_recovery() {
             f.store()
                 .private(MODE_FILE)
                 .write_json(&LaunchMode {
+                    compact_prompt: false,
                     schema: 1,
                     mode: Mode::LegacyStop,
                     reason: "platform_legacy".into(),

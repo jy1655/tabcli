@@ -166,9 +166,11 @@ Any later turn's prompt, delivered with `tell` into the running session.
 _Avoid_: continuation, reply
 
 **Framed prompt**:
-The text a provider adapter delivers for a Turn: the delegation header, the caller's prompt and
-the adapter's correlation marker. The frame lets the adapter's correlation recognise Bridge's
-turn; it is never turn identity by itself.
+The text a provider adapter delivers for a Turn: the caller's prompt, the adapter's correlation
+marker and only the wording that adapter's correlation needs (Codex keeps a start header). The
+frame lets the adapter's correlation recognise Bridge's turn; it is never turn identity by
+itself. The receipt records the Request source. Only Claude sessions launched with an older
+completion hook still need a visible Source line.
 _Avoid_: wrapped prompt, payload, marker (the marker is one part of the frame)
 
 **Request source**:

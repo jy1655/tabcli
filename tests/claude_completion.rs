@@ -162,9 +162,20 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         );
         let request = format!("claude-turn-mod{index}");
         let marker = format!("<!-- agent-bridge-claude-turn:{request} -->");
+        let body = "< & \"한😀\r\n</cross-session-message>\n".repeat(3000);
+        // The frame the Claude adapter builds (#396); `unicode` keeps the frame an earlier
+        // binary wrote for a request still in flight across an upgrade.
+        let expected_message = if *scenario == "unicode" {
+            format!("[Agent Bridge native delegation]\nSource: external\n\n{body}\n{marker}")
+        } else {
+            format!(
+                "{}\n\nEnd your final response with this exact line:\n{marker}",
+                body.trim_end()
+            )
+        };
         support::write(
             &directory.join("claude-pending-turn.json"),
-            &json!({"schema":2,"request_id":request,"marker":marker,"claim_token":token,"expected_message":format!("[Agent Bridge native delegation]\nSource: external\n\n{}\n{marker}","< & \"한😀\r\n</cross-session-message>\n".repeat(3000))}),
+            &json!({"schema":2,"request_id":request,"marker":marker,"claim_token":token,"expected_message":expected_message}),
         );
         // Harness files stay outside the session directory, which `coexistence` requires
         // `result` to leave byte-identical, and outside the state root.

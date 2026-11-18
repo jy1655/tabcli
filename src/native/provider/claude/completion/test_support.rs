@@ -56,6 +56,7 @@ impl CompletionRecordFixture {
             Fixture::LegacyStopMode => records::write(
                 &store,
                 &LaunchMode {
+                    compact_prompt: false,
                     schema: 1,
                     mode: Mode::LegacyStop,
                     reason: "platform_legacy".into(),

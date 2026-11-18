@@ -99,6 +99,12 @@
   a message typed into the TUI during the turn is steered into the same turn without the
   header (#65). The title turn is a temporary thread with hooks disabled, so it sends no
   hook payload, but its legacy notify can still arrive first; keep the #61 fixtures.
+- The delegation header `[Agent Bridge native delegation]` is the Codex frame's own first
+  line (#396): the shared layer adds no framing and the request receipt keeps the Request
+  source, so the frame has no Source line. Keep the header byte-identical: the transcript
+  watcher of a running owner that an earlier binary started checks it, and a prompt that
+  binary framed (with its Source line) still begins with it. Shorten it only together with
+  a reader that also accepts the old header in every running owner.
 - `Stop` is not the end of the turn: every Stop handler runs while Codex decides whether
   to stop, and another handler's block continues the same turn (`session/turn.rs`).
   Bridge records the last Stop as a candidate (`codex-candidate-<claim>.json`) and never

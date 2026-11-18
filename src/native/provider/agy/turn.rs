@@ -69,7 +69,7 @@ pub(super) fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result
 
 pub(super) fn correlated_prompt(prompt: &str, pending: &PendingAgyTurn) -> String {
     format!(
-        "{prompt}\n\n[Agent Bridge Agy turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
+        "{prompt}\n\n[Agent Bridge Agy turn protocol]\nEnd your final response with this exact line:\n{}",
         pending.marker
     )
 }
@@ -84,7 +84,7 @@ pub(super) fn terminal_correlated_prompt(
     }
     let encoded = serde_json::to_string(prompt)?;
     Ok(format!(
-        "[Agent Bridge Agy Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker {} on its own final line; do not alter or omit it. Request JSON: {encoded}",
+        "[Agent Bridge Agy Windows console turn protocol] End your final response with this exact line: {} Request (JSON): {encoded}",
         pending.marker
     ))
 }

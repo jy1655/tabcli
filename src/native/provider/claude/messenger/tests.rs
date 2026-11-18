@@ -7,6 +7,25 @@ use std::process::Command;
 use std::time::Instant;
 
 #[test]
+fn a_follow_up_to_a_pre_compact_claude_hook_keeps_its_required_prefix() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-legacy");
+    std::fs::create_dir(&directory).unwrap();
+    crate::native::session::Store::open_unchecked(&directory).private("claude-completion-mode.json").write_json(
+        &serde_json::json!({"schema":1, "mode":"native_v1", "reason":"macos_stable_2_1_302_or_newer", "claude_version":"2.1.327"}),
+    ).unwrap();
+    let plan = cross_session_message_plan(&directory, TEST_REQUEST, "follow up").unwrap();
+    // The old native hook rejects a pending record without this exact prefix.
+    let message = &plan.guard.input.message;
+    assert!(
+        message.starts_with("[Agent Bridge native delegation]\nSource: "),
+        "{message}"
+    );
+    assert!(message.contains("\n\nfollow up\n"));
+    assert!(message.ends_with(&format!("<!-- agent-bridge-claude-turn:{TEST_REQUEST} -->")));
+}
+
+#[test]
 fn declared_message_prepares_only_identity_and_leaves_pending_ownership_in_send() {
     use crate::native::delivery::TurnKind;
     let directory = tempfile::tempdir().unwrap();

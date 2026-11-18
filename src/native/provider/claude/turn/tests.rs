@@ -31,7 +31,7 @@ fn pending_record_round_trip_pins_json_marker_and_retention() {
     );
     assert_eq!(
         read_back.target_message("prompt"),
-        "prompt\n\n[Agent Bridge Claude turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"
+        "prompt\n\nEnd your final response with this exact line:\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"
     );
     drop(installed);
     assert!(read(&store).unwrap().is_none());
@@ -39,10 +39,21 @@ fn pending_record_round_trip_pins_json_marker_and_retention() {
     assert_eq!(read(&store).unwrap().unwrap().id(), turn.id());
 }
 
-// The native record is recognized by the header that frames every prompt Bridge sends, not
-// by a copy of its text: a prompt the framing function built is accepted, another is not.
+// #396: the frame is the prompt, one instruction line and the marker; no header or label.
 #[test]
-fn native_pending_record_is_recognized_by_the_shared_delegation_frame() {
+fn target_message_adds_only_the_marker_instruction() {
+    let turn = ClaudeTurn::new("claude-turn-safe123").unwrap();
+    assert_eq!(
+        turn.target_message("prompt"),
+        "prompt\n\nEnd your final response with this exact line:\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"
+    );
+}
+
+// The native record is recognized by the frame this adapter builds (#396), or by the frame
+// an earlier binary built for a request still in flight across an upgrade: the shared
+// delegation header and Source line ahead of the body, the marker at the end.
+#[test]
+fn native_pending_record_accepts_the_short_frame_and_the_legacy_frame() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());
     let turn = ClaudeTurn::new("claude-turn-safe123").unwrap();
@@ -59,18 +70,33 @@ fn native_pending_record_is_recognized_by_the_shared_delegation_frame() {
             }))
             .unwrap();
     };
-    let framed = turn.target_message(&crate::native::native_delegation_prompt("external", "body"));
-    write(&framed);
-    assert_eq!(
-        read_native(&store, token).unwrap().expected_message(),
-        Some(framed.as_str())
+    let marker = turn.marker();
+    let legacy = format!(
+        "[Agent Bridge native delegation]\nSource: external\n\nbody\n\n[Agent Bridge Claude turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{marker}"
     );
-    write(&framed.replacen(
-        crate::native::NATIVE_DELEGATION_HEADER,
-        "[Another header]",
-        1,
-    ));
-    assert!(read_native(&store, token).is_err());
-    write(&framed.replacen("\nSource: ", "\nOrigin: ", 1));
-    assert!(read_native(&store, token).is_err());
+    // The messenger keeps the legacy start ahead of the current frame for a launch whose
+    // completion hook can still be an earlier binary; both readers accept that form.
+    let prefixed = format!(
+        "[Agent Bridge native delegation]\nSource: external\n\n{}",
+        turn.target_message("body")
+    );
+    for accepted in [turn.target_message("body"), legacy.clone(), prefixed] {
+        write(&accepted);
+        assert_eq!(
+            read_native(&store, token).unwrap().expected_message(),
+            Some(accepted.as_str())
+        );
+    }
+    for refused in [
+        format!("body\n\n{marker}"),
+        turn.target_message("body").replace(
+            marker,
+            "<!-- agent-bridge-claude-turn:claude-turn-other -->",
+        ),
+        legacy.replacen("[Agent Bridge native delegation]", "[Another header]", 1),
+        legacy.replacen("\nSource: ", "\nOrigin: ", 1),
+    ] {
+        write(&refused);
+        assert!(read_native(&store, token).is_err(), "{refused:?}");
+    }
 }

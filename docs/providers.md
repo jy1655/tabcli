@@ -451,7 +451,7 @@ the record, never the current setting. With deflection on, a `tool.call` hook re
 main-loop `AskUserQuestion` call raised by the engine with a fixed reason: no person is at the
 dialog, do not call the tool again in this turn, end the turn now with
 `QUESTION FOR CALLER: <question> Options: <option labels>`, expect the answer as a follow-up,
-and keep every requirement of the request's turn protocol, including its final-line marker.
+and end that response with the marker line the request ends with.
 The question then reaches the caller as the ordinary Result and the caller answers with `tell`
 ([question deflection](cli.md#question-deflection)). `tool.call` carries no turn identity and
 the step result's tool uses carry no call id, so the module refuses only a call whose

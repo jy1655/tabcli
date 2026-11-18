@@ -5,7 +5,7 @@ use super::super::{PENDING_TURN_FILE, read_pending_turn};
 use super::*;
 use crate::native::clock::SystemClock;
 #[cfg(unix)]
-use crate::native::native_delegation_prompt;
+use crate::native::delegation_prompt;
 #[cfg(unix)]
 use crate::native::provider::NativeProviderAdapter;
 #[cfg(unix)]
@@ -310,8 +310,8 @@ fn codex_native_queue_runs_the_provider_command_with_the_claim_marker() {
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     let claim_token = claim.token().to_owned();
     claim.retain();
-    // The prompt as `tell` hands it to the adapter: already framed.
-    let prompt = native_delegation_prompt("external", "follow up");
+    // The prompt as `tell` hands it to the adapter: trimmed, with no shared framing (#396).
+    let prompt = delegation_prompt("follow up");
 
     send_native_queue_message(
         CrossSessionMessageContext {
@@ -339,7 +339,7 @@ fn codex_native_queue_runs_the_provider_command_with_the_claim_marker() {
     assert_eq!(
         arguments[4],
         format!(
-            "[Agent Bridge native delegation]\nSource: external\n\nfollow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
+            "[Agent Bridge native delegation]\n\nfollow up\n\nOmit this marker from your reply:\n<!-- agent-bridge-codex-turn:{claim_token} -->"
         )
     );
     assert!(!directory.join("daemon-argv.bin").exists());
@@ -791,7 +791,7 @@ fn check_windows_queue_command_line_boundary(units: usize, refused: bool) {
     let (claim, _) =
         turn::claim_ready(&Store::open_unchecked(directory), "session-codexqueue", &[]).unwrap();
     let pending = PendingCodexTurn::new(claim.token()).unwrap();
-    let mut prompt = crate::native::native_delegation_prompt("external", "boundary ");
+    let mut prompt = crate::native::delegation_prompt("boundary ");
     let measure = |prompt: &str| {
         windows_command_line_units(
             &queue_command(

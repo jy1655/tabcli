@@ -1,6 +1,6 @@
 use super::super::{ADAPTER, PENDING_TURN_FILE, install_pending_turn};
 use super::*;
-use crate::native::native_delegation_prompt;
+use crate::native::delegation_prompt;
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::session::primitives::{event_paths, read_json};
 use crate::native::session::schema::SessionEvent;
@@ -52,9 +52,7 @@ fn codex_hook_correlates_exact_output_from_the_official_input_messages() {
         "thread-id": "codex-thread",
         "turn-id": "codex-turn",
         "input-messages": [correlated_prompt(
-            &native_delegation_prompt(
-                "external",
-                "Reply with exactly EXACT_OUTPUT and nothing else.",
+            &delegation_prompt("Reply with exactly EXACT_OUTPUT and nothing else.",
             ),
             &pending,
         )],
@@ -81,8 +79,7 @@ fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let pending = claim_pending_turn(directory.path());
     let prompt = correlated_prompt(
-        &native_delegation_prompt(
-            "external",
+        &delegation_prompt(
             "Reply with the single word READY and nothing else. Do not use any tools.",
         ),
         &pending,
@@ -140,8 +137,7 @@ fn codex_hook_accepts_the_turn_steered_by_a_message_typed_into_the_tui() {
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let pending = claim_pending_turn(directory.path());
     let prompt = correlated_prompt(
-        &native_delegation_prompt(
-            "external",
+        &delegation_prompt(
             "Run the shell command `sleep 90` and wait for it to complete. Do nothing else in the meantime. When it has finished, reply with exactly the single word DONE.",
         ),
         &pending,
@@ -228,10 +224,7 @@ fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
     std::fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let pending = claim_pending_turn(directory.path());
-    let prompt = correlated_prompt(
-        &native_delegation_prompt("external", "Reply READY."),
-        &pending,
-    );
+    let prompt = correlated_prompt(&delegation_prompt("Reply READY."), &pending);
     // The active file quotes the request heading itself.
     let with_context = format!(
         "# Context from my IDE setup:\n\n## Active file: src/prompt.rs\n\n## Active selection of the file:\nconst PROMPT_REQUEST_BEGIN: &str = \"## My request for Codex:\";\n\n## My request for Codex:\n{prompt}"
@@ -425,7 +418,7 @@ fn codex_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
                 "thread-id": "managed-thread",
                 "turn-id": "delayed-old-turn-with-a-new-id",
                 "input-messages": [correlated_prompt(
-                    &native_delegation_prompt("external", "old prompt"),
+                    &delegation_prompt("old prompt"),
                     &initial_pending,
                 )],
                 "last-assistant-message": "delayed old result",
@@ -444,8 +437,8 @@ fn framed_for_requires_the_header_and_the_trailing_marker() {
     std::fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let pending = claim_pending_turn(directory.path());
-    let header = native_delegation_prompt("external", "Reply READY.");
-    let prompt = correlated_prompt(&header, &pending);
+    let header = format!("{DELEGATION_HEADER}\n\nReply READY.");
+    let prompt = correlated_prompt("Reply READY.", &pending);
     let with_context = format!(
         "# Context from my IDE setup:\n\n## Active file: src/prompt.rs\n\n## My request for Codex:\n{prompt}"
     );
@@ -458,6 +451,34 @@ fn framed_for_requires_the_header_and_the_trailing_marker() {
         (format!("{prompt} \n\n"), true),
     ] {
         assert_eq!(framed_for(&message, &pending), framed, "{message:?}");
+    }
+}
+
+// #396: the delegation header is the Codex frame's own start anchor (#61, #65) now that the
+// shared layer adds none. It stays byte-identical because the transcript watcher of a
+// running owner started by an earlier binary checks it, and a prompt framed by that binary,
+// Source line included, still correlates here.
+#[test]
+fn the_codex_frame_owns_the_delegation_header_and_accepts_the_legacy_source_line() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let pending = claim_pending_turn(directory.path());
+    let framed = correlated_prompt("Reply READY.", &pending);
+    assert_eq!(
+        framed,
+        format!(
+            "[Agent Bridge native delegation]\n\nReply READY.\n\nOmit this marker from your reply:\n{}",
+            pending.marker
+        )
+    );
+    let legacy = framed.replacen(
+        "[Agent Bridge native delegation]\n",
+        "[Agent Bridge native delegation]\nSource: session-parent1\n",
+        1,
+    );
+    for message in [framed, legacy] {
+        assert!(framed_for(&message, &pending), "{message:?}");
     }
 }
 

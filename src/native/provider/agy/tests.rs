@@ -184,8 +184,21 @@ fn windows_console_prompt_preserves_multiline_input_without_raw_submission_keys(
             .chars()
             .all(|character| !matches!(character, '\r' | '\n' | '\t'))
     );
-    assert!(framed.contains(&serde_json::to_string(prompt).unwrap()));
-    assert!(framed.contains(&pending.marker));
+    let encoded = serde_json::to_string(prompt).unwrap();
+    assert_eq!(
+        framed,
+        format!(
+            "[Agent Bridge Agy Windows console turn protocol] End your final response with this exact line: {} Request (JSON): {encoded}",
+            pending.marker
+        )
+    );
+    assert_eq!(
+        correlated_prompt(prompt, &pending),
+        format!(
+            "{prompt}\n\n[Agent Bridge Agy turn protocol]\nEnd your final response with this exact line:\n{}",
+            pending.marker
+        )
+    );
 }
 
 #[test]

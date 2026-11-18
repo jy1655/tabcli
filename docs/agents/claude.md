@@ -62,6 +62,16 @@
   change. The official turn id stays adapter-private; core `turn_id` must remain the
   Bridge correlation id because delivery waits for it. Replace envelope matching when
   official SendMessage returns an addressed target-turn identity.
+- The frame is the caller's prompt, one line `End your final response with this exact line:`
+  and the marker (#396). Claude's own peer envelope names the sending session and the request
+  receipt keeps the Request source, so the frame carries no delegation header, Source line or
+  protocol label. The pending-record check accepts that frame and the start an earlier binary
+  wrote (`[Agent Bridge native delegation]`, a `Source:` line, the marker at the end), which a
+  request in flight across an upgrade still has. An earlier binary's check requires that start,
+  so a launch recorded without `compact_prompt` keeps it ahead of the frame on every request:
+  its completion hook can still be that binary. Completion depends on the exact marker suffix,
+  not on the wording. The [Linux Herdr check](../verification/2026-11-18-linux-herdr.md) covers
+  new sessions and a follow-up to a v0.4.45 hook.
 - Classic Stop and StopFailure never settle a native-mode claim: any other Stop handler,
   including the user's own, can block that stop and continue the turn. A nonempty normal
   bound answer without the exact suffix marker is a retained candidate, never a Result.
@@ -115,7 +125,8 @@
   launch; the adapter writes the module's switch and `claude-question-mode.json`, and every
   later read uses that record. With it on, a `tool.call` hook refuses a main-loop
   `AskUserQuestion` call raised by the engine with one fixed reason: end the turn with the
-  question, keep the turn protocol's marker, expect the answer as a follow-up `tell`.
+  question, end it with the marker line the request ends with, expect the answer as a
+  follow-up `tell`. The reason names no frame label, so it fits every Bridge frame.
   `tool.call` carries no turn identity and `turn.step` tool uses carry no call id, so a call
   is refused only when its `tool_use_id` matches a tool chunk this module passed in the
   observed main-loop step; the chunk's position among the step's tool chunks is its tool-use

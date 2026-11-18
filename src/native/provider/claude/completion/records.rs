@@ -73,6 +73,9 @@ pub(super) struct LaunchMode {
     pub(super) mode: Mode,
     pub(super) reason: String,
     pub(super) claude_version: Option<String>,
+    // Older launches can still invoke a v0.4.45 native-hook executable.
+    #[serde(default)]
+    pub(super) compact_prompt: bool,
 }
 
 impl Record for LaunchMode {
@@ -92,6 +95,7 @@ impl LaunchMode {
             }
             .into(),
             claude_version: Some(version),
+            compact_prompt: true,
         }
     }
 
@@ -209,6 +213,13 @@ pub(in crate::native::provider::claude) fn native_mode(directory: &Path) -> Resu
         Some(_) => bail!("unsupported Claude completion mode schema"),
         None => Ok(false),
     }
+}
+
+/// A pre-#396 native hook checks for the old delegation and Source prefix in
+/// its pending record. Keep that prefix for every request to such a launch.
+pub(in crate::native::provider::claude) fn needs_legacy_prefix(directory: &Path) -> Result<bool> {
+    Ok(read_live::<LaunchMode>(&Reader::open_unchecked(directory))?
+        .is_some_and(|mode| mode.mode == Mode::NativeV1 && !mode.compact_prompt))
 }
 
 /// The question deflection this launch recorded: none for a launch before the record existed,

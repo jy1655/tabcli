@@ -959,7 +959,7 @@ A Bridge-managed Claude session has nobody at its `AskUserQuestion` dialog. A Cl
 launched with `settings claude-question-deflection on` (the default) has its question plugin
 refuse a model's own main-loop `AskUserQuestion` call before any dialog, with a fixed reason that
 tells the child to end its turn with the question (`QUESTION FOR CALLER: <question> Options:
-<option labels>`) while keeping the request's turn protocol. That turn completes as an ordinary
+<option labels>`) and the request's final marker line. That turn completes as an ordinary
 Result, the emission record still holds the structured question, and the caller answers with an
 ordinary `tell`. Bridge waits for nothing, injects no answer and adds no transport.
 
@@ -1855,8 +1855,9 @@ Use these options only with commands whose synopsis lists them:
 The value must fit the supported clock range.
 
 Prompts must contain non-whitespace text. Control characters other than newline and tab are
-rejected. Bridge trims the prompt's outer whitespace and adds delegation framing and provider
-correlation material. `--detach` still waits for the required launch and delivery steps; it is not a
+rejected. Bridge trims the prompt's outer whitespace. The provider adapter adds its request
+correlation marker and any instructions needed to interpret it. The request receipt records
+the source. `--detach` still waits for the required launch and delivery steps; it is not a
 request to skip those checks. When you see `accepted` and a null `result`, use `result SESSION
 --request REQUEST --wait` to wait for the result.
 

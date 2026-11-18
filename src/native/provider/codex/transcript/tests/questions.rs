@@ -31,7 +31,7 @@ fn question_fixture() -> (
     claim.retain();
     let payload = json!({"hook_event_name":"UserPromptSubmit", "session_id":THREAD,
         "turn_id":"turn-1", "transcript_path":directory.join("rollout.jsonl"),
-        "prompt":correlated_prompt(&crate::native::native_delegation_prompt("external", "test"), &pending)});
+        "prompt":correlated_prompt(&crate::native::delegation_prompt("test"), &pending)});
     ADAPTER.handle_hook(&directory, &payload).unwrap();
     append(&directory.join("rollout.jsonl"), &prefix(&payload));
     (root, directory, pending, payload, Observer::default())

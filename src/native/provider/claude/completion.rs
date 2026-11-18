@@ -30,10 +30,10 @@ mod records;
 mod test_support;
 pub(super) use diagnose::checks as doctor_checks;
 pub(in crate::native::provider) use questions::read as question_emissions;
-pub(super) use records::native_mode;
 use records::{
     Binding, Candidate, Continuation, Deflection, Diagnostic, LaunchMode, QuestionMode, Ready,
 };
+pub(super) use records::{native_mode, needs_legacy_prefix};
 #[cfg(test)]
 pub(in crate::native) use test_support::CompletionRecordFixture;
 
@@ -58,9 +58,10 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
             "{platform} Claude completion requires stable Claude Code 2.1.302 or newer; recorded version: {version}"
         );
     }
-    let mode = LaunchMode::native(windows, version);
+    let mut mode = LaunchMode::native(windows, version);
     let store = Store::open_unchecked(directory);
     if let Some(existing) = records::read_live::<LaunchMode>(&store)? {
+        mode.compact_prompt = existing.compact_prompt;
         if existing != mode {
             bail!("a different Claude completion mode was already recorded for this launch");
         }

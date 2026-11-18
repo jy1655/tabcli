@@ -139,7 +139,7 @@ if (scenario === "coexistence") {
     answer: `marked answer without a target start\n${pending.marker}` });
   retained("marked answer alone supplies no input binding");
   const variants = [
-    ["rewritten body with marker intact", start.text.replace("Source: external", "Source: changed")],
+    ["rewritten body with marker intact", start.text.replace("한😀", "한😁")],
     ["stripped peer envelope", peerBody],
     ["combined queued input", `${start.text}\nAnother queued input`],
     ["unrelated turn", "A separate manual request"],
@@ -301,8 +301,8 @@ if (scenario.startsWith("questions")) {
       assert.match(result.deny, /Do not call AskUserQuestion again in this turn\./);
       assert.match(result.deny, /QUESTION FOR CALLER: <question> Options: <option labels>\./);
       assert.match(result.deny, /follow-up message/);
-      assert.match(result.deny, /\[Agent Bridge Claude turn protocol\] in the request still applies/);
-      assert.match(result.deny, /exact marker on its own final line\.$/);
+      assert.doesNotMatch(result.deny, /turn protocol/);
+      assert.match(result.deny, /End that final response with the exact marker line the request ends with\.$/);
     }
     // Deflection off: the same observed call reaches the dialog; observation is unchanged.
     const offHandlers = new Map();

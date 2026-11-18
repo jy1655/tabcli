@@ -5,13 +5,11 @@ use super::args::{
 };
 use crate::native::failure_kind::DeliveryUncertain;
 use crate::native::provider_installation::{check_provider_version_until, resolve_provider};
-use crate::native::session::primitives::delegation_source;
 use crate::native::session::{Reader, SessionState, Store, launch, requests, turn, update_status};
 use crate::native::turn_report::TurnReport;
 use crate::native::{
     CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, context,
-    create_session, delivery, native_delegation_prompt, sanitize_title, session_start, terminal,
-    turn_run,
+    create_session, delegation_prompt, delivery, sanitize_title, session_start, terminal, turn_run,
 };
 use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND, checked_deadline_from};
 use anyhow::{Context, Result, bail};
@@ -316,12 +314,12 @@ pub(super) fn fresh_resolution(
     }
 }
 
-// Delegation framing and consent recording precede any source provenance binding.
+// The initial prompt and consent are recorded before any source provenance binding.
 pub(super) fn create_with_consent(
     mut spec: SessionSpec,
     assessment: Option<&consent::Assessment>,
 ) -> Result<CreatedSession> {
-    spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
+    spec.prompt = delegation_prompt(&spec.prompt);
     let created = create_session(spec)?;
     record_consent(&created, assessment)?;
     Ok(created)

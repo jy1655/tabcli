@@ -514,10 +514,7 @@ mod tests {
             ResolvedContext::default().prompt_with_attachments("plain"),
             "plain"
         );
-        assert_eq!(
-            native_delegation_prompt("parent", &prompt),
-            format!("[Agent Bridge native delegation]\nSource: parent\n\n{expected}")
-        );
+        assert_eq!(delegation_prompt(&prompt), expected);
     }
 
     #[test]
@@ -1085,8 +1082,7 @@ mod tests {
         let references =
             parse_all(&["session-src/request-done", "session-src/event-0.json"]).unwrap();
         let resolved = resolve_in(root.path(), &references).unwrap();
-        let prompt =
-            native_delegation_prompt("external", &resolved.prompt_with_attachments("continue"));
+        let prompt = delegation_prompt(&resolved.prompt_with_attachments("continue"));
         assert!(prompt.contains("recorded answer") && prompt.contains("legacy answer"));
 
         // The same call `tell` makes once resolution succeeds, up to the durable receipt.

@@ -371,7 +371,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
         serde_json::to_string(&[bridge.to_string_lossy().as_ref(), "native-hook", "codex"])
             .unwrap()
     );
-    let prompt = crate::native::native_delegation_prompt("parent", "review this");
+    let prompt = crate::native::delegation_prompt("review this");
     for consent in [false, true] {
         for windows in [false, true] {
             for yolo in [false, true] {
@@ -431,7 +431,13 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         expected.extend([OsString::from("-c"), OsString::from(&notify)]);
                         if !windows {
                             let framed = correlated_prompt(&prompt, &pending);
-                            assert!(framed.starts_with(&prompt), "{label}");
+                            assert!(
+                                framed.starts_with(&format!(
+                                    "{}\n\n{prompt}\n\n",
+                                    super::correlation::DELEGATION_HEADER
+                                )),
+                                "{label}"
+                            );
                             assert!(framed.ends_with(&pending.marker), "{label}");
                             expected.extend([
                                 OsString::from("-C"),
@@ -627,10 +633,7 @@ fn lifecycle_binding_and_stop_keep_the_claim_pending() {
     std::fs::create_dir(directory.join("events")).unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
     let pending = install_pending_turn(directory, claim.token()).unwrap();
-    let prompt = correlated_prompt(
-        &crate::native::native_delegation_prompt("external", "hello"),
-        &pending,
-    );
+    let prompt = correlated_prompt(&crate::native::delegation_prompt("hello"), &pending);
     let payload = serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"01234567-89ab-cdef-0123-456789abcdef", "turn_id":"turn-1", "transcript_path":"rollout.jsonl", "prompt":prompt});
     ADAPTER.handle_hook(directory, &payload).unwrap();
     assert!(
