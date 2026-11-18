@@ -103,7 +103,7 @@ pub(super) fn local_pipe_name(pipe: &Path) -> Result<&str> {
         .get(..LOCAL_PIPE_PREFIX.len())
         .filter(|prefix| prefix.eq_ignore_ascii_case(LOCAL_PIPE_PREFIX))
         .map(|_| &text[LOCAL_PIPE_PREFIX.len()..])
-        .filter(|name| !name.is_empty() && !name.contains('\0'))
+        .filter(|name| !name.is_empty() && !name.contains(['\\', '/', '\0']))
         .with_context(|| {
             format!(
                 "the Herdr Core endpoint {text} is not a local named pipe ({LOCAL_PIPE_PREFIX}<name>); Bridge connects to no other endpoint"

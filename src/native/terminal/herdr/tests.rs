@@ -1414,6 +1414,16 @@ fn the_windows_endpoint_follows_hc_and_accepts_only_a_local_pipe() {
         ("socket", r"\\.\pipe\", "is not a local named pipe"),
         (
             "socket",
+            r"\\.\pipe\group\name",
+            "is not a local named pipe",
+        ),
+        (
+            "socket",
+            r"\\.\pipe\group/name",
+            "is not a local named pipe",
+        ),
+        (
+            "socket",
             &format!(r"\\.\pipe\{}", "x".repeat(250)),
             "longer than Windows allows",
         ),

@@ -1357,6 +1357,32 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn dead_owner_repair_retains_unreadable_surface_identity() {
+    for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-damaged");
+        fs::create_dir(&directory).unwrap();
+        write_owned_terminal_state(&directory, "exited", reaped_child_pid());
+        fs::remove_file(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+        let record = directory.join(name);
+        fs::write(&record, b"{").unwrap();
+        let store = Store::open_unchecked(&directory);
+        let result = repair_dead_owner_with(
+            &store,
+            |_| Ok(false),
+            terminal::surface_outlives_owner,
+            |_| panic!("an unreadable handle grants no close authority"),
+            budget::close_deadline(),
+        );
+        assert!(result.is_err(), "repair accepted a damaged {name}");
+        assert_eq!(fs::read(record).unwrap(), b"{");
+        assert_eq!(store.status().unwrap().state, SessionState::Exited);
+        assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists());
+    }
+}
+
 // A Windows Herdr terminal outlives its native owner. A dead owner's repair never takes the
 // owner's death for the terminal's absence: it closes the exact handle through the core, and
 // a close that fails (no core, a core that refuses) leaves the handle, the state and the

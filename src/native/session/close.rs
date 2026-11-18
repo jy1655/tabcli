@@ -964,16 +964,21 @@ where
 }
 
 // Whether the session still holds a Herdr handle, active or claimed by an interrupted close.
-// A handle that cannot be decoded names no terminal Bridge could close and keeps the
-// console's disposition.
+// A damaged handle might name a Herdr terminal. Keep the records until the surface can
+// be identified; an exited owner does not prove that the terminal is gone.
 #[cfg(windows)]
 fn retains_windows_herdr_handle(store: &Store) -> Result<bool> {
     for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-        if let Some(bytes) = store.record(record).bytes()?
-            && super::record::terminal_bytes(&bytes)
-                .is_ok_and(|surface| surface.kind == terminal::TerminalKind::Herdr)
-        {
-            return Ok(true);
+        if let Some(bytes) = store.record(record).bytes()? {
+            let surface = super::record::terminal_bytes(&bytes).with_context(|| {
+                format!(
+                    "cannot identify the retained terminal handle {}",
+                    record.name()
+                )
+            })?;
+            if surface.kind == terminal::TerminalKind::Herdr {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
