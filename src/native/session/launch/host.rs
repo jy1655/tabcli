@@ -14,7 +14,7 @@ const LAUNCH_HOST_COUNT: usize = {
     let mut count = 0;
     let mut index = 0;
     while index < TerminalKind::ALL.len() {
-        if TerminalKind::ALL[index].uses_launch_host() {
+        if TerminalKind::ALL[index].has_launch_host_form() {
             count += 1;
         }
         index += 1;
@@ -30,7 +30,7 @@ const LAUNCH_HOST_NAMES: [&str; LAUNCH_HOST_COUNT] = {
     let mut next = 0;
     while index < TerminalKind::ALL.len() {
         let kind = TerminalKind::ALL[index];
-        if kind.uses_launch_host() {
+        if kind.has_launch_host_form() {
             names[next] = kind.as_str();
             next += 1;
         }
@@ -58,7 +58,7 @@ where
         fn visit_str<E: Error>(self, value: &str) -> std::result::Result<TerminalKind, E> {
             TerminalKind::ALL
                 .into_iter()
-                .find(|kind| kind.uses_launch_host() && kind.as_str() == value)
+                .find(|kind| kind.has_launch_host_form() && kind.as_str() == value)
                 .ok_or_else(|| E::unknown_variant(value, &LAUNCH_HOST_NAMES))
         }
     }
@@ -304,6 +304,17 @@ fn write(store: &Store, host: &HostRecord) -> Result<()> {
     store.record(CoreRecord::LaunchHost).write_json(host)
 }
 
+pub(super) fn initialize_for_launch(
+    store: &Store,
+    token: &str,
+    terminal: TerminalKind,
+) -> Result<()> {
+    if terminal.records_launch_stages() {
+        initialize(store, token, terminal)?;
+    }
+    Ok(())
+}
+
 pub(in crate::native) fn initialize(
     store: &Store,
     token: &str,
@@ -481,6 +492,18 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+    #[test]
+    fn a_herdr_launch_initializes_stages_only_for_the_capture_handoff() {
+        let (_dir, store, token) = fixture();
+        initialize_for_launch(&store, &token, TerminalKind::Herdr).unwrap();
+        let observed = observe(&store, super::super::read(&store).unwrap().as_ref());
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(observed, HostObservation::Recorded(host)
+            if host.terminal == TerminalKind::Herdr && host.stage == Stage::AwaitingHost));
+        #[cfg(target_os = "linux")]
+        assert!(matches!(observed, HostObservation::NotRecorded));
+    }
+
     #[test]
     fn admission_forward_progress_and_failure_are_immutable() {
         let (_dir, store, token) = fixture();
@@ -935,12 +958,12 @@ mod tests {
             host["terminal"] = wire;
             match record::launch_host(&serde_json::to_vec(&host).unwrap()) {
                 Ok(HostObservation::Recorded(record)) => {
-                    assert!(kind.uses_launch_host(), "{kind:?}");
+                    assert!(kind.has_launch_host_form(), "{kind:?}");
                     assert_eq!(record.terminal, kind);
                 }
                 Ok(other) => panic!("{kind:?}: {other:?}"),
                 Err(error) => {
-                    assert!(!kind.uses_launch_host(), "{kind:?}");
+                    assert!(!kind.has_launch_host_form(), "{kind:?}");
                     let expected = format!(
                         "unknown variant `{}`, expected one of `iterm2`, `wezterm`, `herdr` at line 1 column ",
                         kind.as_str()

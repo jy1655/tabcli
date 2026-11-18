@@ -35,7 +35,7 @@ pub(in crate::native) use applescript::testing as automation_testing;
 #[cfg(test)]
 use test_support::Unused as UnusedAdapter;
 pub(in crate::native) mod ghostty;
-pub(in crate::native) mod herdr;
+use super::herdr;
 pub(in crate::native) mod iterm2;
 pub(in crate::native) mod warp;
 pub(in crate::native) mod wezterm;

@@ -246,8 +246,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   host command, whether its launch runs the launch host, close-evidence choice, refusal
   messages for screen reads and guarded dialog input and, on macOS, its binding facts, and the
   shared lookups (`facts`, `close_evidence`, `host`, the command table) read that registration.
-  The launcher, the host command parser, the launch host, the `launch-host.json` decoder and
-  doctor read the launch-host fact (`uses_launch_host`) instead of naming kinds. The installed
+  Command parsing and historical `launch-host.json` reads use the portable launch-host form.
+  Dispatch, stage initialization and the doctor probe use its local handoff: Herdr uses bound
+  bash on Linux and shell environment capture on macOS. The installed
   macOS dispatch is a value built from each adapter's injectable dependency (the AppleScript
   automation, the Ghostty and Warp runners, the WezTerm host); a test builds one with a
   recording automation or a fake runner. The shared macOS operations refuse an operation the kind declares unsupported from
@@ -699,8 +700,8 @@ repair settles the records without resending a prompt or guessing ownership of a
   Close decision consumes its process observation before reading owner or intent records.
   Register the kind once: its `facts.rs` declares one `Registration` with the close facts,
   paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, whether its
-  launch runs the launch host (`LaunchHostFacts`, carrying on macOS the adapter's check that a
-  binding names that host), the close-evidence choice, the refusal message for each operation
+  launch uses the portable launch-host form and its local `LaunchHost` handoff (including
+  the adapter's binding check), the close-evidence choice, the refusal message for each operation
   the kind does not support and, on macOS, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
   exhaustive lookup on every build target; the shared lookups and the shared macOS refusals read
   it, so nothing else needs a per-kind match. For macOS operations, implement the

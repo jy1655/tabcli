@@ -63,7 +63,8 @@ Runtime:
   settings windows-tab-window current opens the tab in the most recently used
   Windows Terminal window instead, where the new tab takes the keyboard inside
   that window; dedicated, the default, leaves the windows you work in alone.
-  Linux is not yet supported.
+  Linux detects Herdr inside an hc terminal and otherwise defaults to tmux 3.2 or later.
+  Use --terminal herdr for a running local Herdr Core or --terminal tmux for a private server.
   Agent Bridge controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
   ask, reopen, and self-test refuse a workspace that is the Codex memory

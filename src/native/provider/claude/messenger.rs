@@ -270,12 +270,13 @@ fn cross_session_message_plan(
         summary: CROSS_SESSION_SUMMARY.to_owned(),
         message: reference.clone(),
     };
+    let message = pending.target_message(completion::frame_format(directory)?, prompt);
     let guard = MessageGuard {
         reference,
         input: SendMessageInput {
             to: recipient,
             summary: CROSS_SESSION_SUMMARY.to_owned(),
-            message: pending.target_message(prompt),
+            message,
         },
     };
     let stdin = serde_json::to_string(&envelope)?;

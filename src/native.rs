@@ -523,33 +523,11 @@ fn create_session_within(
     })
 }
 
-// The first line of every prompt that Bridge sends to a provider. It is framing, not an
-// identity: an adapter can tell by it a prompt that Bridge sent from a text that a
-// provider put around the same prompt, and nothing more.
-const NATIVE_DELEGATION_HEADER: &str = "[Agent Bridge native delegation]";
-
-fn native_delegation_prompt(source: &str, prompt: &str) -> String {
-    let source = source
-        .chars()
-        .take(128)
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let source = if source.trim().is_empty() {
-        "external"
-    } else {
-        source.trim()
-    };
-    format!(
-        "{NATIVE_DELEGATION_HEADER}\nSource: {}\n\n{}",
-        source,
-        prompt.trim()
-    )
+// The caller's prompt as every adapter receives it (#396). Bridge adds no shared visible
+// framing: the Request source lives in the request receipt, and each provider adapter adds
+// only the framing its own correlation needs.
+fn delegation_prompt(prompt: &str) -> String {
+    prompt.trim().to_owned()
 }
 
 fn sanitize_title(value: &str) -> Result<String> {

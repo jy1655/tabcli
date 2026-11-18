@@ -460,7 +460,7 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
             .write_json(&settings)
             .unwrap();
         let executable = Path::new(exe);
-        let prompt = "[Agent Bridge native delegation]\nSource: test\n\nhello";
+        let prompt = "hello";
         let plan = codex::prepare_launch_for_platform(
             LaunchContext {
                 bridge_executable: executable,
@@ -715,8 +715,7 @@ fn assert_real_shell_preserves_large_stdin(is_cmd: bool) {
         update_status(&directory, SessionState::Working, None, None).unwrap();
         let reader = Reader::open_unchecked(&directory);
         let claim = turn::current_claim_token(&reader).unwrap().unwrap();
-        let prompt =
-            crate::native::native_delegation_prompt("external", "Reply in Korean with emoji.");
+        let prompt = crate::native::delegation_prompt("Reply in Korean with emoji.");
         let pending = codex::install_pending_turn_for_prompt(&directory, &claim, &prompt).unwrap();
         let framed = codex::correlated_prompt(&prompt, &pending);
         assert!(framed.ends_with(&pending.marker));
@@ -799,7 +798,7 @@ fn windows_lifecycle_hook_binary_never_blocks_or_writes_stdout() {
         .unwrap();
     let pending = codex::install_pending_turn(&directory, &token).unwrap();
     let prompt = codex::correlated_prompt(
-        &crate::native::native_delegation_prompt("external", &"한글😀".repeat(5000)),
+        &crate::native::delegation_prompt(&"한글😀".repeat(5000)),
         &pending,
     );
     let thread = "01234567-89ab-cdef-0123-456789abcdef";
@@ -1004,7 +1003,7 @@ fn the_launch_plan_propagates_a_failed_notice_record_instead_of_returning_argume
             None,
         )
         .unwrap();
-        let prompt = "[Agent Bridge native delegation]\nSource: test\n\nhello";
+        let prompt = "hello";
         // The dispatch the launch wrapper calls; a plan is the only way to the provider command.
         let result = with_fault_budget(PLAN_NOTICE_WRITE_START + passed, || {
             crate::native::provider::prepare_launch(

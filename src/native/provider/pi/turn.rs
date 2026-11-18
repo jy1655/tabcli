@@ -122,10 +122,7 @@ pub(super) fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result
 }
 
 pub(super) fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
-    format!(
-        "{prompt}\n\n[Agent Bridge Pi turn protocol]\nCorrelation marker for the Agent Bridge extension:\n{}",
-        pending.marker
-    )
+    format!("{prompt}\n\n{}", pending.marker)
 }
 
 pub(super) fn terminal_correlated_prompt(
@@ -138,7 +135,7 @@ pub(super) fn terminal_correlated_prompt(
     }
     let encoded = serde_json::to_string(prompt)?;
     Ok(format!(
-        "[Agent Bridge Pi Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs, and complete it as one turn. Request JSON: {encoded} Correlation marker for the Agent Bridge extension: {}",
+        "Use this JSON string as the request: {encoded} {}",
         pending.marker
     ))
 }

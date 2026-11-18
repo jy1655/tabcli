@@ -19,9 +19,7 @@ use super::super::{
 };
 use super::pidfd::VerifiedPidfd;
 use super::process::{creation_floor, process_birth};
-use crate::native::clock::SystemClock;
 use crate::native::process_env::CommandOutputFailure;
-use crate::native::session::launch::BindingFacts;
 use crate::native::session::{RecordReader, Store};
 use crate::native::terminal::ownership::{
     self, NativeSessionOwner, OwnerGroups, OwnerStop, OwnerStopIntent, ProvenShell,
@@ -30,14 +28,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::{
     ffi::{OsStr, OsString},
     io::{Seek, SeekFrom, Write},
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
 const HOST_COMMAND: &str = TerminalKind::Tmux.registration().host_command;
-const BINDING: &BindingFacts = TerminalKind::Tmux.registration().binding();
 /// The server socket, in the session directory: Bridge creates that directory private to
 /// the user, so no other server can already listen there.
 pub(in crate::native) const SOCKET_FILE: &str = "tmux.sock";
@@ -949,80 +945,20 @@ fn binding_names_host(
         && pane == Some(OsStr::new(target.pane))
 }
 
-/// What bash runs. A non-interactive bash runs the file named by `BASH_ENV` before its
-/// command, which `--noprofile --norc` does not stop; the launch must not run it, but the
-/// provider keeps the variable, so the script exports it again. A value that is not UTF-8
-/// cannot be quoted exactly and is dropped.
-#[derive(Debug, Eq, PartialEq)]
-enum BashScript {
-    Plain(String),
-    WithoutStartupFile(String),
-}
-
-fn bash_script(command: &str, bash_env: Option<&OsStr>) -> BashScript {
-    match bash_env {
-        None => BashScript::Plain(command.to_owned()),
-        Some(value) => BashScript::WithoutStartupFile(match value.to_str() {
-            Some(_) => format!(
-                "export BASH_ENV={}\n{command}",
-                crate::native::terminal::shell_quote(value)
-            ),
-            None => command.to_owned(),
-        }),
-    }
-}
-
-/// The pane program: admitted, bound to exactly this pane and server, its startup input
-/// discarded, it becomes bash running the launch command with job control, so that the
-/// command leads its own foreground process group on the pane's terminal. bash reads no
-/// startup file: the pane has the environment of the process that started the server.
+/// Validate tmux's pane and server markers before the shared Linux bash handoff.
 pub(in crate::native) fn run_host(directory: &Path, command: &str) -> Result<()> {
-    use super::super::bound_host::{BoundHostSpec, prepare_bound_launch};
-    let prepared = prepare_bound_launch(
-        directory,
-        &BoundHostSpec { name: BINDING.host },
-        BINDING,
-        &mut SystemClock,
-        |surface| {
-            if binding_names_host(
+    super::host::run(directory, command, TerminalKind::Tmux, |surface| {
+        anyhow::ensure!(
+            binding_names_host(
                 surface,
                 directory,
                 std::env::var_os("TMUX").as_deref(),
-                std::env::var_os("TMUX_PANE").as_deref(),
-            ) {
-                Ok(())
-            } else {
-                bail!("tmux surface binding does not name the pane of this launch host")
-            }
-        },
-    );
-    if let Err(error) = prepared {
-        // The pane ends with this process and takes the message with it.
-        crate::native::session::launch::log(
-            &Store::open_unchecked(directory),
-            &format!("tmux_host_refused: {error:#}"),
+                std::env::var_os("TMUX_PANE").as_deref()
+            ),
+            "tmux surface binding does not name the pane of this launch host"
         );
-        return Err(error);
-    }
-    // The pane already has the helper environment; the same removals keep it.
-    let mut bash = crate::native::process_env::helper_command("/bin/bash");
-    bash.arg0("bash");
-    let script = match bash_script(command, std::env::var_os("BASH_ENV").as_deref()) {
-        BashScript::Plain(script) => script,
-        BashScript::WithoutStartupFile(script) => {
-            bash.env_remove("BASH_ENV");
-            script
-        }
-    };
-    let error = bash
-        .args(["--noprofile", "--norc", "-m", "-c", &script])
-        .exec();
-    let error = anyhow::Error::new(error).context("could not start bash for the tmux launch");
-    crate::native::session::launch::log(
-        &Store::open_unchecked(directory),
-        &format!("tmux_host_refused: {error:#}"),
-    );
-    Err(error)
+        Ok(())
+    })
 }
 
 #[cfg(test)]

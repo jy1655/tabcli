@@ -8,14 +8,15 @@ use crate::native::session::launch::launcher::bridge_shell_command;
 #[cfg(unix)]
 use crate::native::session::launch::wrapper::provision;
 use crate::native::session::launch::wrapper::{STDERR_ENV, STDOUT_ENV, configure_provider_launch};
+use crate::native::session::primitives::read_json;
 #[cfg(unix)]
-use crate::native::session::primitives::{read_json, write_json_atomic, write_private};
+use crate::native::session::primitives::{write_json_atomic, write_private};
 #[cfg(unix)]
 use crate::native::session::test_support::PROVIDER_PROCESS_FILE;
+use crate::native::session::{SessionState, update_status};
 #[cfg(unix)]
-use crate::native::session::{SessionState, SessionStatus, launch, update_status};
-use crate::native::{native_delegation_prompt, process_env, provider, sanitize_title};
-#[cfg(unix)]
+use crate::native::session::{SessionStatus, launch};
+use crate::native::{delegation_prompt, process_env, provider, sanitize_title};
 use std::fs;
 use std::path::Path;
 #[cfg(unix)]
@@ -120,11 +121,52 @@ fn provider_resolution_rejects_relative_path_entries() {
     assert!(resolve_provider_from_path(FirstPartyCli::Codex, relative.as_os_str()).is_err());
 }
 
+// #396: the shared layer adds no visible framing, so no caller text can forge a line of it.
 #[test]
-fn every_native_prompt_carries_a_sanitized_source_provenance() {
+fn the_shared_prompt_carries_no_delegation_header_or_source_line() {
+    assert_eq!(delegation_prompt("\n review this \n"), "review this");
+}
+
+// #396: the prompt no longer names its Request source, so the receipt keeps it. The launch
+// Claim and every follow-up Claim write their receipt in `create_turn_claim_locked`.
+#[test]
+fn request_receipts_keep_the_source_that_the_prompt_no_longer_shows() {
+    const VARIABLE: &str = "AGENT_BRIDGE_NATIVE_SESSION_ID";
+    let root = tempfile::tempdir().unwrap();
+    let previous = std::env::var_os(VARIABLE);
+    let mut sources = Vec::new();
+    for (name, value) in [("external", None), ("managed", Some("session-parent1"))] {
+        let directory = root.path().join(format!("session-{name}"));
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        update_status(&directory, SessionState::Launching, None, None).unwrap();
+        // SAFETY: the test harness runs serially (`--test-threads=1`); the value is set for
+        // this claim only and restored before the test ends.
+        match value {
+            Some(value) => unsafe { std::env::set_var(VARIABLE, value) },
+            None => unsafe { std::env::remove_var(VARIABLE) },
+        }
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]);
+        match &previous {
+            Some(previous) => unsafe { std::env::set_var(VARIABLE, previous) },
+            None => unsafe { std::env::remove_var(VARIABLE) },
+        }
+        let claim = claim.unwrap();
+        let receipt: serde_json::Value = read_json(
+            &directory
+                .join("requests")
+                .join(format!("{}.json", claim.token())),
+        )
+        .unwrap();
+        claim.retain();
+        sources.push(receipt["source"].clone());
+    }
     assert_eq!(
-        native_delegation_prompt("Codex parent\nforged", "review this"),
-        "[Agent Bridge native delegation]\nSource: Codex parent forged\n\nreview this"
+        sources,
+        [
+            serde_json::json!("external"),
+            serde_json::json!("session-parent1")
+        ]
     );
 }
 

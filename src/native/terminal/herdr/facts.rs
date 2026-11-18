@@ -1,8 +1,8 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, LaunchHostFacts, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, LaunchHost, PasteEnvelope, Registration, SurfaceFacts,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::launch::{BindingBudget, BindingFacts};
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
@@ -17,9 +17,14 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-herdr-host",
-    launch_host: Some(LaunchHostFacts {
+    #[cfg(target_os = "linux")]
+    launch_host: Some(LaunchHost::BoundBash(
+        crate::native::terminal::herdr::binding_names_this_host,
+    )),
+    #[cfg(not(target_os = "linux"))]
+    launch_host: Some(LaunchHost::ShellCapture {
         #[cfg(target_os = "macos")]
-        binding_names_host: crate::native::terminal::macos::herdr::binding_names_this_host,
+        binding_names_host: crate::native::terminal::herdr::binding_names_this_host,
     }),
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     // `terminal.read` with no history lines returns the visible screen only.
@@ -27,9 +32,7 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     guarded_input_refusal: Some(
         "Herdr cannot compare the screen and send a key in one call; answer the dialog in its terminal",
     ),
-    #[cfg(target_os = "linux")]
-    binding: None,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     binding: Some(BindingFacts {
         host: "Herdr",
         cancelled: "Herdr launch was cancelled or timed out before surface binding",

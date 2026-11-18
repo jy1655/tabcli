@@ -34,6 +34,7 @@
 //! - [`read_doctor`]: doctor reads at most [`DOCTOR_READ_LIMIT`] bytes of strict UTF-8 and
 //!   classifies what does not decode. A record past that bound tells doctor nothing; admission
 //!   reads it again with the live policy.
+use super::claude_turn::FrameFormat;
 use super::{valid_claude_conversation_id, valid_identity};
 use crate::native::provider::QuestionEmission;
 use crate::native::session::{Reader, Store, primitives::unix_ms, requests::Receipt};
@@ -73,6 +74,9 @@ pub(super) struct LaunchMode {
     pub(super) mode: Mode,
     pub(super) reason: String,
     pub(super) claude_version: Option<String>,
+    // Older launches can still invoke a v0.4.45 native-hook executable.
+    #[serde(default)]
+    pub(super) compact_prompt: bool,
 }
 
 impl Record for LaunchMode {
@@ -92,6 +96,7 @@ impl LaunchMode {
             }
             .into(),
             claude_version: Some(version),
+            compact_prompt: true,
         }
     }
 
@@ -201,13 +206,27 @@ pub(super) fn write<T: Record>(store: &Store, record: &T) -> Result<()> {
     store.private(T::FILE).write_json(record)
 }
 
-/// Whether this launch selected native completion: no record means it did not, and an
-/// unreadable or unsupported record is an error.
+fn recorded_mode(directory: &Path) -> Result<Option<LaunchMode>> {
+    let mode = read_live::<LaunchMode>(&Reader::open_unchecked(directory))?;
+    if mode.as_ref().is_some_and(|mode| !mode.supported()) {
+        bail!("unsupported Claude completion mode schema");
+    }
+    Ok(mode)
+}
+
+/// Whether the recorded launch selected native completion.
 pub(in crate::native::provider::claude) fn native_mode(directory: &Path) -> Result<bool> {
-    match read_live::<LaunchMode>(&Reader::open_unchecked(directory))? {
-        Some(mode) if mode.supported() => Ok(mode.mode == Mode::NativeV1),
-        Some(_) => bail!("unsupported Claude completion mode schema"),
-        None => Ok(false),
+    Ok(recorded_mode(directory)?.is_some_and(|mode| mode.mode == Mode::NativeV1))
+}
+
+/// A pre-#396 native hook checks for the old delegation and Source prefix in
+/// its pending record. Keep that prefix for every request to such a launch.
+pub(in crate::native::provider::claude) fn frame_format(directory: &Path) -> Result<FrameFormat> {
+    let mode = recorded_mode(directory)?;
+    if mode.is_some_and(|mode| mode.mode == Mode::NativeV1 && !mode.compact_prompt) {
+        Ok(FrameFormat::LegacyPrefix)
+    } else {
+        Ok(FrameFormat::Compact)
     }
 }
 

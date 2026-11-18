@@ -67,7 +67,7 @@ pub(crate) enum HostCommand {
 
 pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCommand> {
     if let Some(kind) = kind_of(command)
-        && kind.uses_launch_host()
+        && kind.has_launch_host_form()
         && let [_, flag, launch_command] = rest
         && flag == LAUNCH_COMMAND_FLAG
     {
@@ -269,14 +269,26 @@ pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
 }
 
 fn run_launch_host(directory: PathBuf, command: String, kind: TerminalKind) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        super::macos::launch_host::run(&directory, &command, kind)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (directory, command, kind);
-        bail!("native launch hosts are only available on macOS")
+    match kind.registration().launch_host {
+        #[cfg(target_os = "macos")]
+        Some(super::facts::LaunchHost::ShellCapture { .. }) => {
+            super::macos::launch_host::run(&directory, &command, kind)
+        }
+        #[cfg(target_os = "linux")]
+        Some(super::facts::LaunchHost::BoundBash(matches)) => {
+            super::linux::host::run(&directory, &command, kind, |surface| {
+                anyhow::ensure!(
+                    matches(surface),
+                    "{} surface binding does not name this launch host",
+                    kind.display_name()
+                );
+                Ok(())
+            })
+        }
+        _ => {
+            let _ = (directory, command);
+            bail!("native launch hosts are only available on macOS")
+        }
     }
 }
 

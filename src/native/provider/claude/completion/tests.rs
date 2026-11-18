@@ -1,3 +1,4 @@
+use super::claude_turn::FrameFormat;
 use super::records::*;
 use super::*;
 use crate::native::clock::FakeClock;
@@ -29,6 +30,7 @@ impl Fixture {
         store
             .private(MODE_FILE)
             .write_json(&LaunchMode {
+                compact_prompt: false,
                 schema: 1,
                 mode: Mode::NativeV1,
                 reason: "test".into(),
@@ -37,6 +39,7 @@ impl Fixture {
             .unwrap();
         let pending = ClaudeTurn::new(REQUEST).unwrap();
         let message = pending.target_message(
+            FrameFormat::Compact,
             "[Agent Bridge native delegation]\nSource: external\n\n< & \"한😀\r\n</cross-session-message>",
         );
         install_pending(root.path(), REQUEST, Some(&token), &message)
@@ -283,8 +286,10 @@ fn late_old_frames_and_markers_cannot_settle_a_successor_claim() {
     let token = successor.token().to_owned();
     assert_ne!(token, f.token);
     let pending = ClaudeTurn::new("claude-turn-successor").unwrap();
-    let message = pending
-        .target_message("[Agent Bridge native delegation]\nSource: external\n\nSuccessor input");
+    let message = pending.target_message(
+        FrameFormat::Compact,
+        "[Agent Bridge native delegation]\nSource: external\n\nSuccessor input",
+    );
     install_pending(f.root.path(), pending.id(), Some(&token), &message)
         .unwrap()
         .retain();
@@ -353,7 +358,10 @@ fn old_pending_cleanup_cannot_delete_a_new_request() {
     let f = Fixture::new();
     let old = install_pending(f.root.path(), REQUEST, Some(&f.token), &f.message).unwrap();
     let next = ClaudeTurn::new("claude-turn-next").unwrap();
-    let message = next.target_message("[Agent Bridge native delegation]\nSource: external\n\nnext");
+    let message = next.target_message(
+        FrameFormat::Compact,
+        "[Agent Bridge native delegation]\nSource: external\n\nnext",
+    );
     install_pending(f.root.path(), next.id(), Some(&f.token), &message)
         .unwrap()
         .retain();
@@ -436,6 +444,7 @@ fn legacy_sessions_refuse_new_input_with_platform_specific_recovery() {
             f.store()
                 .private(MODE_FILE)
                 .write_json(&LaunchMode {
+                    compact_prompt: false,
                     schema: 1,
                     mode: Mode::LegacyStop,
                     reason: "platform_legacy".into(),

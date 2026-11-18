@@ -6,12 +6,12 @@ use super::args::{
 use crate::native::reopen::{
     read_resumed_from, refuse_follow_up_to_shared_conversation, reopen_refusal_gate,
 };
-use crate::native::session::primitives::{delegation_source, require_valid_session_id};
+use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::{Reader, Store, turn};
 use crate::native::turn_report::TurnReport;
 use crate::native::{
-    DEFAULT_TIMEOUT_SECS, NativeCommand, context, delivery, native_delegation_prompt, session,
-    terminal, turn_run,
+    DEFAULT_TIMEOUT_SECS, NativeCommand, context, delegation_prompt, delivery, session, terminal,
+    turn_run,
 };
 use agent_bridge::{FirstPartyCli, checked_deadline_from};
 use anyhow::{Context, Result, bail};
@@ -107,10 +107,7 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
     )?;
     let previous_state =
         session::hold::follow_up_admission(&Reader::open_unchecked(&directory), &request.id)?;
-    let prompt = native_delegation_prompt(
-        &delegation_source(),
-        &attached.prompt_with_attachments(&request.prompt),
-    );
+    let prompt = delegation_prompt(&attached.prompt_with_attachments(&request.prompt));
     let resumed_from = read_resumed_from(&directory)?;
     let (mut claim, baseline) = turn::claim_ready(
         &Store::open_unchecked(&directory),

@@ -7,8 +7,8 @@ use crate::native::session::launch::wrapper::provision;
 use crate::native::session::launch::wrapper::record_provider_process;
 use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::primitives::{
-    delegation_source, event_paths, read_json, read_manifest, remove_file_if_present,
-    valid_event_file_name, write_json_atomic, write_private,
+    event_paths, read_json, read_manifest, remove_file_if_present, valid_event_file_name,
+    write_json_atomic, write_private,
 };
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
@@ -24,8 +24,8 @@ use crate::native::tests::{
     spawn_surviving_process, test_windows_process_identity, write_provider_process_record,
 };
 use crate::native::{
-    DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, create_session_within, delivery,
-    native_delegation_prompt, parse_args, provider, query, terminal,
+    DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, create_session_within, delegation_prompt,
+    delivery, parse_args, provider, query, terminal,
 };
 use agent_bridge::{FirstPartyCli, process_is_alive};
 use anyhow::bail;
@@ -979,7 +979,7 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     .unwrap();
     write_private(
         &directory.join("initial-prompt.txt"),
-        native_delegation_prompt("parent", "review this again").as_bytes(),
+        delegation_prompt("review this again").as_bytes(),
     )
     .unwrap();
     update_status(&directory, SessionState::Launching, None, None).unwrap();
@@ -1549,7 +1549,7 @@ fn write_reopen_launch_session(root: &Path, id: &str, provider: &Path) -> PathBu
     .unwrap();
     write_private(
         &directory.join("initial-prompt.txt"),
-        native_delegation_prompt("parent", "review this again").as_bytes(),
+        delegation_prompt("review this again").as_bytes(),
     )
     .unwrap();
     update_status(&directory, SessionState::Launching, None, None).unwrap();
@@ -3900,7 +3900,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
     assert_eq!(created.manifest.title, "new title");
     assert_eq!(
         fs::read_to_string(created.directory.join(CoreRecord::InitialPrompt.name())).unwrap(),
-        native_delegation_prompt(&delegation_source(), "new prompt")
+        "new prompt"
     );
     let directory = &adapter.source_directory;
     let marker: ReopenMarker = Reader::open_unchecked(directory)

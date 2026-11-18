@@ -569,8 +569,18 @@ fn windows_console_prompt_preserves_multiline_input_without_raw_submission_keys(
             .chars()
             .all(|character| !matches!(character, '\r' | '\n' | '\t'))
     );
-    assert!(framed.contains(&serde_json::to_string(prompt).unwrap()));
-    assert!(framed.contains(&pending.marker));
+    let encoded = serde_json::to_string(prompt).unwrap();
+    assert_eq!(
+        framed,
+        format!(
+            "Use this JSON string as the request: {encoded} {}",
+            pending.marker
+        )
+    );
+    assert_eq!(
+        correlated_prompt(prompt, &pending),
+        format!("{prompt}\n\n{}", pending.marker)
+    );
 }
 
 fn assert_core_record_contract(extension: &str) {
@@ -795,10 +805,6 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         if !windows {
                             let framed = correlated_prompt("pi prompt", &pending);
                             assert!(framed.starts_with("pi prompt"), "{label}");
-                            assert!(
-                                framed.contains("[Agent Bridge Pi turn protocol]"),
-                                "{label}"
-                            );
                             assert!(framed.ends_with(&pending.marker), "{label}");
                             expected.push(OsString::from(framed));
                         }

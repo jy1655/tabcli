@@ -36,6 +36,7 @@ fn put(directory: &Path, name: &str, bytes: &[u8]) {
 
 fn mode_record(schema: u32, mode: Mode) -> Vec<u8> {
     serde_json::to_vec(&LaunchMode {
+        compact_prompt: false,
         schema,
         mode,
         reason: "macos_stable_2_1_302_or_newer".into(),

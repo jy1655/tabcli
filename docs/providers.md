@@ -1,8 +1,8 @@
 # Providers
 
 Run an installed, signed-in `codex`, `claude`, `agy`, or `pi` through Bridge on macOS, native
-Windows, or Linux through tmux. Each session runs in a terminal surface you can watch; choose
-one from [terminal support](terminals.md). Linux opens no GUI; attach to its tmux pane.
+Windows, or Linux through tmux or Herdr Core. Each session runs in a terminal surface you can watch; choose
+one from [terminal support](terminals.md). Linux opens no GUI; use the returned attach command.
 
 “First-party CLI” means the provider's own command runs the conversation and tools under your
 existing login. Bridge has no credential store, cannot attach an independently launched CLI,
@@ -451,7 +451,7 @@ the record, never the current setting. With deflection on, a `tool.call` hook re
 main-loop `AskUserQuestion` call raised by the engine with a fixed reason: no person is at the
 dialog, do not call the tool again in this turn, end the turn now with
 `QUESTION FOR CALLER: <question> Options: <option labels>`, expect the answer as a follow-up,
-and keep every requirement of the request's turn protocol, including its final-line marker.
+and end that response with the marker line the request ends with.
 The question then reaches the caller as the ordinary Result and the caller answers with `tell`
 ([question deflection](cli.md#question-deflection)). `tool.call` carries no turn identity and
 the step result's tool uses carry no call id, so the module refuses only a call whose
@@ -744,7 +744,7 @@ command beforehand.
 
 ## Verification boundary
 
-The delivery paths above are implemented for macOS, native Windows, and Linux through tmux. Automated adapter and
+The delivery paths above are implemented for macOS, native Windows, and Linux through tmux or Herdr Core. Automated adapter and
 terminal tests cover transport choices, correlation, and refusals; they do not authenticate to
 model services. This table lists authenticated live evidence and its limits. Unlisted
 provider/terminal combinations are not verified.
@@ -760,6 +760,7 @@ provider/terminal combinations are not verified.
 | Claude/Windows | [2026-10-12 candidate 0.4.9][win49], [0.4.8 checks][win48], [reopen][old7] | 0.4.9 record does not give a Claude version; 0.4.8 used 2.1.296; reopen evidence dates to 2026-09-24 |
 | Agy/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
 | Pi/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
+| Linux / Herdr Core | [hc 0.1.21 round trips](verification/2026-11-18-linux-herdr.md) | Claude, Codex and Pi passed. Agy stopped at workspace trust before input. |
 | Four providers/Linux/tmux | [2026-11-17 debug build][linux6] | Ubuntu 26.04, Linux 7.0, x86_64, tmux 3.6 over SSH; Codex 0.169.0, Claude 2.1.326 (`--model opus`), Pi 1.5.2, Agy 1.5.9 (`--model gemini-3.8-flash-medium`); ask/tell/close; Claude/Agy trust refusals; default Agy model quota exhausted |
 | Linux process in WSL | Not verified | Would use tmux; no live evidence |
 
@@ -780,7 +781,7 @@ Warp requires a reachable official Control endpoint and provable surface ownersh
 submit terminal input, so Agy and Pi follow-ups are unsupported there; choose another terminal
 for those providers. Warp has automated tests. The [0.1.1 check][mac11] returned an empty Warp
 instance list; Warp was not exercised for [0.1.2][mac12] or the 0.4.9 and Ghostty 1.4.0 Mac runs (#63, #87).
-Linux requires tmux 3.2 or later. It never answers workspace-trust dialogs; trust the workspace
+Linux requires tmux 3.2 or later for tmux, or a running local Herdr Core for Herdr. Neither surface answers workspace-trust dialogs; trust the workspace
 through the provider beforehand. See [terminal support](terminals.md#linux--tmux) for attachment,
 paste delivery, shell environment, and close behavior.
 

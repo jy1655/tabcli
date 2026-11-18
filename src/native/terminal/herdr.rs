@@ -17,12 +17,14 @@
 //! Status words (OSC 7501) are never request evidence. The socket is the one `hc` uses:
 //! `HC_SOCKET`, else `socket` in the config, else `<session>.sock` in the runtime or state
 //! directory of `HC_SESSION` (herdr-core 0.1.21 `paths.rs`).
-use super::OwnedSurfaceClose;
-use super::ownership::{SYSTEM_READS, verified_macos_terminal_owner_with};
-use super::{MacTerminalAdapter, MacosOpenMode};
+use super::posix::{self, OwnedSurfaceClose, PosixTerminalAdapter};
+use super::posix_ownership::{SYSTEM_READS, verified_posix_terminal_owner_with};
+use super::record::HerdrHostBirth;
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::Store;
 use crate::native::session::close::budget::close_remaining;
+#[cfg(target_os = "macos")]
+use crate::native::settings::MacosOpenMode;
 use crate::native::terminal::ownership::{
     self, NativeSessionOwner, OwnerGroups, OwnerStop, OwnerStopIntent, ProvenShell,
 };
@@ -81,8 +83,11 @@ const RUN_REFUSED_BEFORE_CREATE: [&str; 10] = [
     "unknown_method",
     "unsupported_generation",
 ];
-/// macOS `sockaddr_un.sun_path` holds 104 bytes including the terminating NUL.
+// sockaddr_un.sun_path reserves one byte for the trailing NUL.
+#[cfg(target_os = "macos")]
 const MAX_SOCKET_PATH: usize = 103;
+#[cfg(target_os = "linux")]
+const MAX_SOCKET_PATH: usize = 107;
 const MAX_REPLY: usize = 8 * 1024 * 1024;
 const MAX_SEND_TEXT: usize = 1024 * 1024;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -147,7 +152,7 @@ pub(in crate::native::terminal) trait Core {
     /// The parent of a live process; `None` when there is no such process.
     fn parent_pid(&self, pid: u32) -> Result<Option<u32>>;
     /// The birth of a live process; `None` when there is no such process.
-    fn process_start(&self, pid: u32) -> Result<Option<(u64, u64)>>;
+    fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>>;
     fn launch_nonce(&self) -> Result<String>;
     fn pause(&self, deadline: Instant) {
         thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
@@ -180,11 +185,23 @@ impl Core for Installed {
     }
 
     fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
-        Ok(super::process::macos_process_info(pid)?.map(|info| info.parent_pid))
+        #[cfg(target_os = "macos")]
+        return Ok(super::macos::process::macos_process_info(pid)?.map(|info| info.parent_pid));
+        #[cfg(target_os = "linux")]
+        return super::linux::process::parent_pid(pid);
     }
 
-    fn process_start(&self, pid: u32) -> Result<Option<(u64, u64)>> {
-        super::process::macos_process_start(pid)
+    fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
+        #[cfg(target_os = "macos")]
+        return Ok(super::macos::process::macos_process_start(pid)?.map(
+            |(host_start_seconds, host_start_microseconds)| HerdrHostBirth::Macos {
+                host_start_seconds,
+                host_start_microseconds,
+            },
+        ));
+        #[cfg(target_os = "linux")]
+        return Ok(super::linux::process::process_birth(pid)?
+            .map(|linux_birth| HerdrHostBirth::Linux { linux_birth }));
     }
 
     fn launch_nonce(&self) -> Result<String> {
@@ -343,6 +360,39 @@ fn not_running(socket: &Path) -> anyhow::Error {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &UnixStream) -> std::io::Result<libc::uid_t> {
+    let (mut uid, mut gid) = (0, 0);
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> std::io::Result<libc::uid_t> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut size = size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size as usize != size_of::<libc::ucred>() {
+        return Err(std::io::Error::other(
+            "incomplete Unix socket peer credentials",
+        ));
+    }
+    Ok(unsafe { cred.assume_init() }.uid)
+}
+
 impl SocketConnection {
     fn open(socket: &Path, deadline: Instant) -> Result<Self> {
         let uid = unsafe { libc::geteuid() };
@@ -386,13 +436,7 @@ impl SocketConnection {
                     .with_context(|| format!("cannot connect to {}", socket.display()));
             }
         };
-        let mut peer_uid = 0;
-        let mut peer_gid = 0;
-        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot identify the Herdr Core socket's user");
-        }
-        if peer_uid != uid {
+        if peer_uid(&stream).context("cannot identify the Herdr Core socket's user")? != uid {
             bail!("the process at {} is not this user's", socket.display());
         }
         if Instant::now() >= deadline {
@@ -778,11 +822,7 @@ fn require_identity(
     }
     if observed.state == State::Live
         && let Some(birth) = core.process_start(recorded.host_pid)?
-        && birth
-            != (
-                recorded.host_start_seconds,
-                recorded.host_start_microseconds,
-            )
+        && birth != recorded.birth
     {
         bail!("the program of Herdr terminal {address} is another process than the one recorded");
     }
@@ -940,7 +980,7 @@ fn confirm_created(
     let pid = observed
         .pid
         .with_context(|| format!("created Herdr terminal {address} reports no program yet"))?;
-    let (host_start_seconds, host_start_microseconds) = core
+    let birth = core
         .process_start(pid)?
         .with_context(|| format!("the program of Herdr terminal {address} already ended"))?;
     let again = get(linked, address, deadline)?
@@ -954,8 +994,7 @@ fn confirm_created(
         core_id: linked.core_id.clone(),
         created_ms: observed.created_ms,
         host_pid: pid,
-        host_start_seconds,
-        host_start_microseconds,
+        birth,
     })
 }
 
@@ -1039,15 +1078,14 @@ fn remove_created(
         };
         same(&first)?;
         if let Some(pid) = first.pid
-            && let Ok(Some((seconds, microseconds))) = core.process_start(pid)
+            && let Ok(Some(birth)) = core.process_start(pid)
         {
             identity = Some(HerdrSurface {
                 socket: socket.to_string_lossy().into_owned(),
                 core_id: core_id.to_owned(),
                 created_ms: first.created_ms,
                 host_pid: pid,
-                host_start_seconds: seconds,
-                host_start_microseconds: microseconds,
+                birth,
             });
         }
         end_and_remove(core, &mut linked, address, deadline, &same).map(|_| ())
@@ -1056,17 +1094,23 @@ fn remove_created(
         (Ok(()), _) => cause.context(format!(
             "the Herdr terminal {address} this launch created was removed; nothing was started"
         )),
-        (Err(error), Some(identity)) => RetainedLaunchSurface::new(
+        (Err(error), Some(identity)) => retain_unremoved(
             created_handle(address, identity),
-            format!(
-                "{cause:#}; Herdr terminal {address} could not be removed: {error:#}; its handle is retained for close"
-            ),
-        )
-        .into(),
+            format!("{cause:#}; Herdr terminal {address} could not be removed: {error:#}"),
+        ),
         (Err(error), None) => anyhow!(
             "{cause:#}; removing Herdr terminal {address} on core {core_id} failed: {error:#}; its launch host starts nothing without a binding"
         ),
     }
+}
+
+// Only a complete identity, proved during creation, can be handed to the launcher.
+fn retain_unremoved(surface: TerminalSession, reason: String) -> anyhow::Error {
+    RetainedLaunchSurface::new(
+        surface,
+        format!("{reason}; returning the confirmed handle to the launcher"),
+    )
+    .into()
 }
 
 /// Ends the program of `address` and removes the finished terminal, on a linked connection.
@@ -1156,7 +1200,7 @@ fn surface_present(
     directory: &Path,
     timeout: Duration,
 ) -> Result<bool> {
-    let deadline = super::timeout_deadline(timeout)?;
+    let deadline = posix::timeout_deadline(timeout)?;
     let recorded = target(session)?;
     let mut linked = link(
         core,
@@ -1178,7 +1222,7 @@ fn verify_surface(
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    let deadline = super::timeout_deadline(timeout.unwrap_or(VERIFY_TIMEOUT))?;
+    let deadline = posix::timeout_deadline(timeout.unwrap_or(VERIFY_TIMEOUT))?;
     live_target(core, session, deadline).map(|_| ())
 }
 
@@ -1300,7 +1344,7 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
 }
 
 pub(in crate::native::terminal) fn verify_caller_terminal() -> Result<()> {
-    verify_caller(&Installed, super::timeout_deadline(CALLER_TIMEOUT)?)
+    verify_caller(&Installed, posix::timeout_deadline(CALLER_TIMEOUT)?)
 }
 
 /// Whether `surface` names the Herdr terminal `terminal` whose program is `pid`: the one
@@ -1353,24 +1397,34 @@ impl<C: Core> Adapter<C> {
         Self { core }
     }
 }
-impl<C: Core> MacTerminalAdapter for Adapter<C> {
+impl<C: Core> PosixTerminalAdapter for Adapter<C> {
     // Herdr has no window to choose: the open mode does not apply.
     fn open_bound_tab(
         &self,
-        _mode: MacosOpenMode,
+        #[cfg(target_os = "macos")] _mode: MacosOpenMode,
         command: &str,
         directory: &Path,
         deadline: Instant,
-        bind: super::BindSurface<'_>,
+        bind: posix::BindSurface<'_>,
         unbind: Box<dyn FnOnce() -> Result<()> + '_>,
     ) -> Result<TerminalSession> {
-        super::open_with(
+        posix::open_with(
             deadline,
             |startup_deadline| create(&self.core, command, directory, startup_deadline, deadline),
             // The program of the terminal waits for the binding above; nothing is typed.
             |_, _| Ok(()),
             |session, deadline| {
-                close_until(&self.core, session, Some(directory), deadline).map(|_| ())
+                close_until(&self.core, session, Some(directory), deadline)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        retain_unremoved(
+                            session.clone(),
+                            format!(
+                                "Herdr terminal {} could not be removed: {error:#}",
+                                session.id
+                            ),
+                        )
+                    })
             },
             bind,
             unbind,
@@ -1443,7 +1497,7 @@ fn record_live_owner_intent(
         OwnerStopIntent::Close,
         OwnerStop {
             attest: || {
-                verified_macos_terminal_owner_with(directory, id, session, None, SYSTEM_READS)
+                verified_posix_terminal_owner_with(directory, id, session, None, SYSTEM_READS)
             },
             shell: ProvenShell,
             record_incarnation: |_: &mut NativeSessionOwner| Ok(()),

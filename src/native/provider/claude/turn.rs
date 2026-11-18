@@ -11,6 +11,18 @@ use std::{
 
 static CROSS_SESSION_TURN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
+// The one line of the frame ahead of the marker (#396). SendMessage's own envelope names the
+// sending session, so the frame carries no header and no source.
+const MARKER_INSTRUCTION: &str = "End your final response with this exact line:";
+// The start of a frame written by a binary before #396, which put the shared delegation
+// header and the Request source ahead of the body. A pending record of a request still in
+// flight across an upgrade keeps that frame.
+const LEGACY_FRAME_START: &str = "[Agent Bridge native delegation]\nSource: ";
+
+pub(super) enum FrameFormat {
+    Compact,
+    LegacyPrefix,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ClaudeTurn {
@@ -100,11 +112,32 @@ impl ClaudeTurn {
     pub(super) fn expected_message(&self) -> Option<&str> {
         self.expected_message.as_deref()
     }
-    pub(super) fn target_message(&self, prompt: &str) -> String {
-        format!(
-            "{prompt}\n\n[Agent Bridge Claude turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
-            self.marker
-        )
+    pub(super) fn target_message(&self, format: FrameFormat, prompt: &str) -> String {
+        use crate::native::session::primitives::{
+            EXTERNAL_SOURCE, delegation_source, valid_session_id,
+        };
+        let prefix = match format {
+            FrameFormat::Compact => String::new(),
+            FrameFormat::LegacyPrefix => {
+                let source = delegation_source();
+                let source = if valid_session_id(&source) {
+                    &source
+                } else {
+                    EXTERNAL_SOURCE
+                };
+                format!("{LEGACY_FRAME_START}{source}\n\n")
+            }
+        };
+        format!("{prefix}{prompt}\n\n{MARKER_INSTRUCTION}\n{}", self.marker)
+    }
+
+    // Whether `text` is a frame this adapter built for this turn's marker: the current frame,
+    // or the legacy frame of a request delivered before #396.
+    fn frames(&self, text: &str) -> bool {
+        text.strip_suffix(&self.marker).is_some_and(|rest| {
+            rest.ends_with(&format!("\n\n{MARKER_INSTRUCTION}\n"))
+                || text.starts_with(LEGACY_FRAME_START)
+        })
     }
 
     pub(super) fn correlated_response<'a>(&self, message: &'a str) -> Result<&'a str> {
@@ -168,11 +201,10 @@ pub(super) fn read_native(reader: &Reader, token: &str) -> Result<ClaudeTurn> {
     if pending.schema != 2
         || pending.marker != expected.marker
         || pending.claim_token.as_deref() != Some(token)
-        || !pending.expected_message.as_deref().is_some_and(|text| {
-            text.strip_prefix(crate::native::NATIVE_DELEGATION_HEADER)
-                .is_some_and(|rest| rest.starts_with("\nSource: "))
-                && text.ends_with(&pending.marker)
-        })
+        || !pending
+            .expected_message
+            .as_deref()
+            .is_some_and(|text| expected.frames(text))
     {
         bail!("Claude native pending record does not identify the current framed request");
     }

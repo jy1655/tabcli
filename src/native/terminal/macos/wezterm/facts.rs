@@ -1,5 +1,5 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, LaunchHostFacts, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, LaunchHost, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 #[cfg(target_os = "macos")]
@@ -13,7 +13,7 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-wezterm-host",
-    launch_host: Some(LaunchHostFacts {
+    launch_host: Some(LaunchHost::ShellCapture {
         #[cfg(target_os = "macos")]
         binding_names_host: crate::native::terminal::macos::wezterm::binding_names_this_host,
     }),

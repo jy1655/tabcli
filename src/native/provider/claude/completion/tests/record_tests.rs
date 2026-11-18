@@ -155,6 +155,7 @@ fn live_record_refusals_keep_their_texts() {
     let directory = root.path();
     let mode = directory.join(MODE_FILE);
     let schema_two = serde_json::to_vec(&LaunchMode {
+        compact_prompt: false,
         schema: 2,
         mode: Mode::NativeV1,
         reason: "r".into(),
@@ -203,6 +204,7 @@ fn live_record_refusals_keep_their_texts() {
         directory,
         MODE_FILE,
         &serde_json::to_vec(&LaunchMode {
+            compact_prompt: false,
             schema: 1,
             mode: Mode::NativeV1,
             reason: "r".into(),
@@ -301,7 +303,7 @@ fn the_writers_record_their_exact_shapes() {
     prepare(&directory, true).unwrap();
     assert_eq!(
         std::fs::read_to_string(directory.join(MODE_FILE)).unwrap(),
-        "{\n  \"schema\": 1,\n  \"mode\": \"native_v1\",\n  \"reason\": \"windows_stable_2_1_302_or_newer\",\n  \"claude_version\": \"2.1.318 (Claude Code)\"\n}"
+        "{\n  \"schema\": 1,\n  \"mode\": \"native_v1\",\n  \"reason\": \"windows_stable_2_1_302_or_newer\",\n  \"claude_version\": \"2.1.318 (Claude Code)\",\n  \"compact_prompt\": true\n}"
     );
     assert_eq!(
         std::fs::read_to_string(directory.join(QUESTION_MODE_FILE)).unwrap(),

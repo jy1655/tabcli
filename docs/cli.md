@@ -173,7 +173,7 @@ defaults to `<provider> · <workspace-basename>` (or `workspace` when the basena
 Titles keep at most 80 characters, replace controls with spaces, collapse whitespace, and must
 remain nonempty. They are record labels; a terminal can also use its own ownership title.
 
-`--terminal` defaults to platform detection (tmux on Linux). Documented values are `ghostty`, `herdr` (alias `hc`, macOS only), `iterm2`, `terminal`,
+`--terminal` defaults to platform detection (Herdr inside an hc terminal on Linux, otherwise tmux on Linux). Documented values are `ghostty`, `herdr` (aliases `hc` and `herdr-core`, macOS and Linux), `iterm2`, `terminal`,
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
 
@@ -860,7 +860,7 @@ text, not when the terminal drew it. At most 512 KiB of UTF-8 is returned: the l
 after the capture, so it bounds what is returned, not what the read holds in memory, and a larger
 screen fails instead of being cut.
 
-On Linux, `screen` uses tmux `capture-pane -p`: the 50 visible application rows, even while
+For a tmux session, `screen` uses tmux `capture-pane -p`: the 50 visible application rows, even while
 an attached viewer scrolls in copy mode. See [Linux / tmux](terminals.md#linux--tmux).
 
 The text is what the terminal showed at one moment. Bridge does not interpret it, and it is not
@@ -959,7 +959,7 @@ A Bridge-managed Claude session has nobody at its `AskUserQuestion` dialog. A Cl
 launched with `settings claude-question-deflection on` (the default) has its question plugin
 refuse a model's own main-loop `AskUserQuestion` call before any dialog, with a fixed reason that
 tells the child to end its turn with the question (`QUESTION FOR CALLER: <question> Options:
-<option labels>`) while keeping the request's turn protocol. That turn completes as an ordinary
+<option labels>`) and the request's final marker line. That turn completes as an ordinary
 Result, the emission record still holds the structured question, and the caller answers with an
 ordinary `tell`. Bridge waits for nothing, injects no answer and adds no transport.
 
@@ -1277,7 +1277,7 @@ The report starts human output with `scope`, describing the inputs used by these
 
 Scope is not proof of an effective runtime configuration or of delivery.
 
-On Linux, the `platform` check reports a supported platform. The `tmux` check reports
+On Linux, the `platform` check reports a supported platform. When the default selection is tmux, the `tmux` check reports
 `tmux_found`, `tmux_too_old`, or `tmux_unavailable`. tmux must be executable on an absolute
 `PATH` entry and at least version 3.2. As with provider versions, `tmux -V` runs only with
 `--probe`; without it no tmux version is read.
@@ -1711,7 +1711,7 @@ process teardown, and terminal automation. It does not guarantee that the close 
 A timeout means the close was not confirmed and may have partly happened. A rerun observes
 the session and establishes authority again; it may still refuse the close.
 
-On Linux, explicit close ends the session's entire tmux server, including windows you added.
+For a tmux session, explicit close ends the session's entire tmux server, including windows you added.
 The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;
 a repeated close or a server already ended sends no further signal. Pane processes can take
 a few seconds to end after close returns. See [Linux / tmux](terminals.md#linux--tmux).
@@ -1855,8 +1855,9 @@ Use these options only with commands whose synopsis lists them:
 The value must fit the supported clock range.
 
 Prompts must contain non-whitespace text. Control characters other than newline and tab are
-rejected. Bridge trims the prompt's outer whitespace and adds delegation framing and provider
-correlation material. `--detach` still waits for the required launch and delivery steps; it is not a
+rejected. Bridge trims the prompt's outer whitespace. The provider adapter adds its request
+correlation marker and any instructions needed to interpret it. The request receipt records
+the source. `--detach` still waits for the required launch and delivery steps; it is not a
 request to skip those checks. When you see `accepted` and a null `result`, use `result SESSION
 --request REQUEST --wait` to wait for the result.
 
@@ -1956,7 +1957,8 @@ Provider trust lookup follows these environment settings:
 - `CLAUDE_CONFIG_DIR`: read `.claude.json` here; the default directory is home.
 - `PI_CODING_AGENT_DIR`: read `trust.json` here; the default is `.pi/agent` under home.
 
-On macOS, `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr; otherwise
+On Linux and macOS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr.
+Otherwise Linux uses tmux. On macOS,
 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, and `TERM_SESSION_ID` select the terminal as
 described under [terminal selection](terminals.md#selection-and-settings).
 

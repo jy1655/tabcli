@@ -887,10 +887,7 @@ fn body_prefix_without_marker_never_authorizes_submission() {
 fn windows_transport_bytes_split_exact_framing_and_only_one_terminal_lf() {
     let (mut io, claim, _) = Fake::new();
     let pending = super::super::super::install_pending_turn(io.root.path(), &io.token).unwrap();
-    let framed = super::super::super::correlation::correlated_prompt(
-        "[Agent Bridge native delegation]\n한글😀",
-        &pending,
-    );
+    let framed = super::super::super::correlation::correlated_prompt("한글😀", &pending);
     let bytes = crate::native::delivery::terminal_input_bytes(
         terminal::TerminalKind::WindowsConsole,
         &framed,
@@ -913,10 +910,12 @@ fn windows_transport_bytes_split_exact_framing_and_only_one_terminal_lf() {
 }
 
 fn live_frame(prompt: &str, marker: &str) -> String {
-    // Exercise Bridge's real pre-framing trim, not an invented Codex LF collapse.
+    // The frame these live captures were made with: before #396 the shared layer put its
+    // header and a Source line ahead of the prompt. Exercise Bridge's real pre-framing trim,
+    // not an invented Codex LF collapse.
     format!(
-        "{}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{marker}",
-        crate::native::native_delegation_prompt("external", prompt)
+        "[Agent Bridge native delegation]\nSource: external\n\n{}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{marker}",
+        crate::native::delegation_prompt(prompt)
     )
 }
 fn capture(json: &str) -> String {

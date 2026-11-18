@@ -20,9 +20,16 @@ pub(super) fn marker(claim_token: &str) -> String {
     format!("<!-- agent-bridge-codex-turn:{claim_token} -->")
 }
 
+// The first line of every framed prompt: the start anchor of `begins_with_bridge_prompt`.
+// The shared layer added it, with a Source line, before #396; the Codex frame keeps it
+// because a title turn can quote the whole prompt behind its own text (#61) and a steered
+// TUI message has none (#65). Keep the exact text: the transcript watcher of a running
+// owner that an earlier binary started checks it.
+pub(super) const DELEGATION_HEADER: &str = "[Agent Bridge native delegation]";
+
 pub(super) fn correlated_prompt(prompt: &str, pending: &PendingCodexTurn) -> String {
     format!(
-        "{prompt}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{}",
+        "{DELEGATION_HEADER}\n\n{prompt}\n\nOmit this marker from your reply:\n{}",
         pending.marker
     )
 }
@@ -54,10 +61,11 @@ pub(super) fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Opti
 const IDE_CONTEXT_HEADING: &str = "# Context from my IDE setup:";
 const IDE_REQUEST_HEADING: &str = "## My request for Codex:";
 
-// Require the delegation header, directly or after the exact IDE wrapper.
+// Require the delegation header, directly or after the exact IDE wrapper. A prompt framed
+// before #396 has its Source line after the header and still begins with it.
 // Try every request heading because context and prompt can themselves quote it.
 pub(super) fn begins_with_bridge_prompt(message: &str) -> bool {
-    let header = crate::native::NATIVE_DELEGATION_HEADER;
+    let header = DELEGATION_HEADER;
     let message = message.trim_start();
     message.starts_with(header)
         || (message.starts_with(IDE_CONTEXT_HEADING)

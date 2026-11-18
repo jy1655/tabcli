@@ -16,7 +16,7 @@ fn fixture() -> (tempfile::TempDir, PendingCodexTurn, Value) {
     claim.retain();
     let payload = json!({"hook_event_name":"UserPromptSubmit", "session_id":THREAD,
         "turn_id":"turn-1", "transcript_path":root.path().join("rollout.jsonl"),
-        "prompt":correlated_prompt(&crate::native::native_delegation_prompt("external", "test"), &pending)});
+        "prompt":correlated_prompt(&crate::native::delegation_prompt("test"), &pending)});
     (root, pending, payload)
 }
 fn line(kind: &str, payload: Value) -> Vec<u8> {
@@ -108,7 +108,7 @@ fn next_claim(root: &Path, payload: &mut Value) -> PendingCodexTurn {
     claim.retain();
     payload["turn_id"] = json!(format!("turn-{}", pending.claim_token));
     payload["prompt"] = json!(correlated_prompt(
-        &crate::native::native_delegation_prompt("external", "next"),
+        &crate::native::delegation_prompt("next"),
         &pending
     ));
     pending
@@ -140,7 +140,7 @@ fn terminal_split_at_every_byte_boundary_including_korean_and_emoji() {
 fn input_utf8_split_and_no_trailing_newline_wait_without_diagnostic_churn() {
     let (root, pending, mut payload) = fixture();
     payload["prompt"] = json!(correlated_prompt(
-        &crate::native::native_delegation_prompt("external", "한😀"),
+        &crate::native::delegation_prompt("한😀"),
         &pending
     ));
     ADAPTER.handle_hook(root.path(), &payload).unwrap();
@@ -270,13 +270,13 @@ fn complete_prefix_requires_one_user_text_with_matching_turn_and_framing() {
                     json!(["agents_md.instructions", "environments.environment_context"])
             }
             "split_content" => {
-                input["content"] = json!([{"type":"input_text","text":crate::native::NATIVE_DELEGATION_HEADER},{"type":"input_text","text":pending.marker}])
+                input["content"] = json!([{"type":"input_text","text":super::super::correlation::DELEGATION_HEADER},{"type":"input_text","text":pending.marker}])
             }
             "no_header" => {
                 input["content"][0]["text"] = json!(format!("quoted {}", pending.marker))
             }
             "no_marker" => {
-                input["content"][0]["text"] = json!(crate::native::NATIVE_DELEGATION_HEADER)
+                input["content"][0]["text"] = json!(super::super::correlation::DELEGATION_HEADER)
             }
             "metadata_absent" => {
                 input

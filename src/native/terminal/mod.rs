@@ -57,6 +57,8 @@ use anyhow::Result;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod herdr;
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
 // Pure wire validation is exercised on every test platform.
@@ -140,12 +142,10 @@ impl TerminalKind {
 
     pub(super) const fn supported_on_this_platform(self) -> bool {
         match self {
-            Self::Iterm2
-            | Self::AppleTerminal
-            | Self::Ghostty
-            | Self::Warp
-            | Self::WezTerm
-            | Self::Herdr => cfg!(target_os = "macos"),
+            Self::Iterm2 | Self::AppleTerminal | Self::Ghostty | Self::Warp | Self::WezTerm => {
+                cfg!(target_os = "macos")
+            }
+            Self::Herdr => cfg!(any(target_os = "macos", target_os = "linux")),
             Self::WindowsConsole => cfg!(windows),
             Self::Tmux => cfg!(target_os = "linux"),
         }
@@ -201,7 +201,7 @@ impl FromStr for TerminalKind {
 }
 
 mod record;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) use record::HerdrSurface;
 #[cfg(target_os = "linux")]
 pub(in crate::native) use record::LinuxHostIdentity;
@@ -333,6 +333,10 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
 
+fn herdr_environment(marker: bool, term_program: Option<&str>) -> bool {
+    marker && term_program.is_some_and(|value| value.eq_ignore_ascii_case("ghostty"))
+}
+
 /// The launch admission of a selected surface, before any session is created. A kind that
 /// `select` chose from the caller's environment proves that environment here: inside Herdr
 /// the caller's `HC_TERMINAL_ID` must name a live terminal of the running core that this
@@ -341,9 +345,9 @@ pub(super) fn admit_selection(
     preferred: Option<TerminalKind>,
     selected: TerminalKind,
 ) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if preferred.is_none() && selected == TerminalKind::Herdr {
-        return macos::herdr::verify_caller_terminal();
+        return herdr::verify_caller_terminal();
     }
     let _ = (preferred, selected);
     Ok(())
@@ -351,10 +355,14 @@ pub(super) fn admit_selection(
 
 /// The command a user runs to watch or type in a surface that has no window of its own.
 pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if session.kind == TerminalKind::Herdr {
+        return herdr::attach_command(session);
+    }
     #[cfg(target_os = "linux")]
     return linux::tmux::attach_command(session);
     #[cfg(target_os = "macos")]
-    return macos::herdr::attach_command(session);
+    return None;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = session;
@@ -748,7 +756,7 @@ mod tests {
         assert_eq!(serde_json::to_value(TerminalKind::Herdr).unwrap(), "herdr");
         assert_eq!(
             TerminalKind::Herdr.supported_on_this_platform(),
-            cfg!(target_os = "macos")
+            cfg!(any(target_os = "macos", target_os = "linux"))
         );
         assert_eq!(
             TerminalKind::from_str("windows-console"),

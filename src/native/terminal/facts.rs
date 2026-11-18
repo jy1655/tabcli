@@ -3,7 +3,7 @@
 //! lookup (surface facts, host command, launch host, close evidence, declared refusals
 //! and the macOS binding facts) reads that registration.
 use super::TerminalKind;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::TerminalSession;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::launch::BindingFacts;
@@ -28,15 +28,16 @@ pub(in crate::native) enum CloseEvidenceChoice {
     BridgeCreatedHost,
 }
 
-/// A kind whose launch runs the terminal-less launch host (`terminal/macos/launch_host.rs`)
-/// as its surface program. The launcher records `launch-host.json` for it, its host command
-/// takes `--launch-command`, the record names it, and doctor reports its recorded stage.
-pub(in crate::native) struct LaunchHostFacts {
-    /// Whether a bound surface names the terminal surface that the calling host runs in, as
-    /// the terminal names that surface in the host's environment. The adapter owns this
-    /// check; its legacy host decides with the same rule.
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) binding_names_host: fn(&TerminalSession) -> bool,
+/// The local program behind a registered launch-host command. The command form
+/// and historical stage records remain readable on every platform.
+#[derive(Clone, Copy)]
+pub(in crate::native) enum LaunchHost {
+    ShellCapture {
+        #[cfg(target_os = "macos")]
+        binding_names_host: fn(&TerminalSession) -> bool,
+    },
+    #[cfg(target_os = "linux")]
+    BoundBash(fn(&TerminalSession) -> bool),
 }
 
 /// One kind's registration. A refusal of `None` means the kind supports the
@@ -46,8 +47,8 @@ pub(in crate::native) struct LaunchHostFacts {
 pub(in crate::native) struct Registration {
     pub(in crate::native) facts: SurfaceFacts,
     pub(in crate::native) host_command: &'static str,
-    /// `Some` when the kind's launch runs the launch host.
-    pub(in crate::native) launch_host: Option<LaunchHostFacts>,
+    /// A recognized launch-host command and record kind, with its local handoff.
+    pub(in crate::native) launch_host: Option<LaunchHost>,
     pub(in crate::native) close_evidence: CloseEvidenceChoice,
     pub(in crate::native) screen_read_refusal: Option<&'static str>,
     pub(in crate::native) guarded_input_refusal: Option<&'static str>,
@@ -82,9 +83,22 @@ impl TerminalKind {
         }
     }
 
-    /// Whether this kind's launch runs the terminal-less launch host.
-    pub(in crate::native) const fn uses_launch_host(self) -> bool {
+    /// Whether the launch-host command form and historical stage record can name this kind.
+    pub(in crate::native) const fn has_launch_host_form(self) -> bool {
         self.registration().launch_host.is_some()
+    }
+
+    /// The launcher initializes stages before the spawn fence for capture hosts.
+    pub(in crate::native) const fn records_launch_stages(self) -> bool {
+        matches!(
+            self.registration().launch_host,
+            Some(LaunchHost::ShellCapture { .. })
+        )
+    }
+
+    /// Whether this machine can run the registered capture or its doctor probe.
+    pub(in crate::native) const fn captures_shell_environment(self) -> bool {
+        cfg!(target_os = "macos") && self.records_launch_stages()
     }
 }
 
@@ -92,7 +106,7 @@ impl TerminalKind {
 pub(super) mod apple_terminal;
 #[path = "macos/ghostty/facts.rs"]
 pub(super) mod ghostty;
-#[path = "macos/herdr/facts.rs"]
+#[path = "herdr/facts.rs"]
 pub(super) mod herdr;
 #[path = "macos/iterm2/facts.rs"]
 pub(super) mod iterm2;
@@ -167,16 +181,16 @@ mod tests {
             match parse(kind.registration().host_command, &launch_form) {
                 Ok(HostCommand::Launch { kind: parsed, .. }) => {
                     assert_eq!(parsed, kind);
-                    assert!(kind.uses_launch_host(), "{kind:?}");
+                    assert!(kind.has_launch_host_form(), "{kind:?}");
                     launch_hosts.push(kind);
                 }
                 // tmux runs its own pane host, which takes the same flag.
                 Ok(HostCommand::Tmux { .. }) => {
                     assert_eq!(kind, TerminalKind::Tmux);
-                    assert!(!kind.uses_launch_host());
+                    assert!(!kind.has_launch_host_form());
                 }
                 Ok(other) => panic!("{kind:?}: {other:?}"),
-                Err(_) => assert!(!kind.uses_launch_host(), "{kind:?}"),
+                Err(_) => assert!(!kind.has_launch_host_form(), "{kind:?}"),
             }
         }
         assert_eq!(

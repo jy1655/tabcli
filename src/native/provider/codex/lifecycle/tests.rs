@@ -15,7 +15,7 @@ fn fixture() -> (tempfile::TempDir, PendingCodexTurn, Value) {
     let payload = json!({"hook_event_name":"UserPromptSubmit", "session_id":THREAD,
         "turn_id":"turn-1", "transcript_path":"rollout.jsonl", "cwd":"workspace",
         "model":"model", "permission_mode":"default",
-        "prompt":correlated_prompt(&crate::native::native_delegation_prompt("external", "한글😀"), &pending)});
+        "prompt":correlated_prompt(&crate::native::delegation_prompt("한글😀"), &pending)});
     (root, pending, payload)
 }
 fn record(directory: &Path, prefix: &str, token: &str) -> Option<Value> {
@@ -39,9 +39,9 @@ fn submit_rejects_unframed_unmarked_null_path_invalid_thread_and_established_oth
         ("prompt", json!("steered")),
         (
             "prompt",
-            json!(crate::native::native_delegation_prompt(
-                "external",
-                "no marker"
+            json!(format!(
+                "{}\n\nno marker",
+                super::super::correlation::DELEGATION_HEADER
             )),
         ),
         ("transcript_path", Value::Null),

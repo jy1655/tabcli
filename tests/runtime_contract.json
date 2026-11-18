@@ -8,12 +8,10 @@
     ".prefix(\"pending-prompt-\")": 1
   },
   "src/native.rs": {
-    "const NATIVE_DELEGATION_HEADER: &str = \"[Agent Bridge native delegation]\";": 1,
     "name: \"native-session\"": 1,
     "name: \"native-hook\"": 1,
     "name: \"native-provider-control\"": 1,
     "name: \"native-console-control\"": 1,
-    "[Agent Bridge native delegation]": 1,
     "native-console-control": 1,
     "native-hook": 1,
     "native-provider-control": 2,
@@ -138,10 +136,11 @@
     "marker: format!(\"<!-- agent-bridge-claude-turn:{request_id} -->\"),": 1,
     "agent-bridge-claude-turn": 1,
     "claude-pending-turn.json": 1,
-    "[Agent Bridge Claude turn protocol]": 1,
     "pub(super) struct ClaudeTurn {\n    schema: u32,\n    request_id: String,\n    marker: String,": 1,
     "if !(request_id.starts_with(\"claude-turn-\")\n            && request_id.len() <= 128\n            && request_id\n                .bytes()\n                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))\n        {\n            bail!(\"invalid Claude cross-session turn id\")\n        }": 1,
-    "schema: 1,\n            request_id: request_id.to_owned(),": 1
+    "schema: 1,\n            request_id: request_id.to_owned(),": 1,
+    "const MARKER_INSTRUCTION: &str = \"End your final response with this exact line:\";": 1,
+    "const LEGACY_FRAME_START: &str = \"[Agent Bridge native delegation]\\nSource: \";": 1
   },
   "src/native/provider/claude/trust.rs": {
     "Accessing workspace:": 1,
@@ -209,14 +208,16 @@
     "failed to read thread:": 1
   },
   "src/native/provider/codex/correlation.rs": {
-    "[Agent Bridge Codex turn metadata; do not include this metadata in the response]": 1,
+    "Omit this marker from your reply:": 1,
     "format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\")": 1,
     "agent-bridge-codex-turn": 1,
     "const IDE_CONTEXT_HEADING: &str = \"# Context from my IDE setup:\";": 1,
     "const IDE_REQUEST_HEADING: &str = \"## My request for Codex:\";": 1,
     "agent-turn-complete": 1,
     "input-messages": 1,
-    "\"type\"": 1
+    "\"type\"": 1,
+    "pub(super) const DELEGATION_HEADER: &str = \"[Agent Bridge native delegation]\";": 1,
+    "[Agent Bridge native delegation]": 1
   },
   "src/native/provider/pi/mod.rs": {
     "context.directory.join(\"pi-agent-bridge.js\")": 1,
@@ -234,8 +235,7 @@
     "marker: format!(\"<!-- agent-bridge-pi-turn:{claim_token} -->\"),": 1,
     "schema: 1,": 1,
     "claim_token: claim_token.to_owned(),": 1,
-    "[Agent Bridge Pi Windows console turn protocol]": 1,
-    "[Agent Bridge Pi turn protocol]": 1,
+    "Use this JSON string as the request:": 1,
     "agent-bridge-pi-turn": 1,
     "pi-pending-turn.json": 1
   },

@@ -1,14 +1,14 @@
 import { report } from "./report.js";
 import { deflect } from "./config.js";
 
-// No person is at a managed session's dialog. The turn protocol's marker requirement is
-// restated so that ending the turn early keeps the final line Bridge completes on.
+// No person is at a managed session's dialog. The request's marker requirement is restated
+// so that ending the turn early keeps the final line Bridge completes on. It names no frame
+// label, so it fits the frame of every Bridge version: each one ends with the marker line.
 const REASON = "Agent Bridge managed session: no person is at this question dialog, and the caller " +
   "cannot see it. Do not call AskUserQuestion again in this turn. End this turn now with the " +
   "question as your final response, in this form: QUESTION FOR CALLER: <question> Options: " +
   "<option labels>. The caller will send the answer as a follow-up message; continue from there. " +
-  "Every requirement of the [Agent Bridge Claude turn protocol] in the request still applies to " +
-  "this final response, including its exact marker on its own final line.";
+  "End that final response with the exact marker line the request ends with.";
 
 // Question text and option labels in order: what the record retains, never the whole input.
 function projection(questions) {

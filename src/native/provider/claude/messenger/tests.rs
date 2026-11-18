@@ -1,10 +1,47 @@
 use super::*;
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 #[cfg(unix)]
-use crate::native::provider::claude::turn::ClaudeTurn;
+use crate::native::provider::claude::turn::{ClaudeTurn, FrameFormat};
 #[cfg(windows)]
 use std::process::Command;
 use std::time::Instant;
+
+#[test]
+fn message_plan_refuses_an_unknown_completion_mode_schema_before_framing() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = managed_session_directory(root.path());
+    crate::native::session::Store::open_unchecked(&directory)
+        .private("claude-completion-mode.json")
+        .write_json(&serde_json::json!({"schema":2,"mode":"native_v1","reason":"future"}))
+        .unwrap();
+    let result = cross_session_message_plan(&directory, TEST_REQUEST, "follow up");
+    assert_eq!(
+        result
+            .err()
+            .expect("unsupported mode accepted for framing")
+            .to_string(),
+        "unsupported Claude completion mode schema"
+    );
+}
+
+#[test]
+fn a_follow_up_to_a_pre_compact_claude_hook_keeps_its_required_prefix() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-legacy");
+    std::fs::create_dir(&directory).unwrap();
+    crate::native::session::Store::open_unchecked(&directory).private("claude-completion-mode.json").write_json(
+        &serde_json::json!({"schema":1, "mode":"native_v1", "reason":"macos_stable_2_1_302_or_newer", "claude_version":"2.1.327"}),
+    ).unwrap();
+    let plan = cross_session_message_plan(&directory, TEST_REQUEST, "follow up").unwrap();
+    // The old native hook rejects a pending record without this exact prefix.
+    let message = &plan.guard.input.message;
+    assert!(
+        message.starts_with("[Agent Bridge native delegation]\nSource: "),
+        "{message}"
+    );
+    assert!(message.contains("\n\nfollow up\n"));
+    assert!(message.ends_with(&format!("<!-- agent-bridge-claude-turn:{TEST_REQUEST} -->")));
+}
 
 #[test]
 fn declared_message_prepares_only_identity_and_leaves_pending_ownership_in_send() {
@@ -805,7 +842,7 @@ fn cross_session_process_never_receives_the_payload() {
     let directory = managed_session_directory(root.path());
     let executable = root.path().join("fake-claude");
     let pending = ClaudeTurn::new("claude-turn-safe123").unwrap();
-    let expected_message = pending.target_message("follow-up secret");
+    let expected_message = pending.target_message(FrameFormat::Compact, "follow-up secret");
     std::fs::write(
         &executable,
         format!(

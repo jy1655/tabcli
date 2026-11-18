@@ -1,6 +1,6 @@
 # Current Herdr Surface Boundary
 
-- Herdr is a macOS surface (`--terminal herdr`, also `hc` and `herdr-core`) in an already
+- Herdr is a Linux and macOS surface (`--terminal herdr`, also `hc` and `herdr-core`) in an already
   running Herdr Core. Bridge speaks newline JSON-RPC 2.0, protocol generation 1, on the core's
   own socket (measured with hc 0.1.21, 2026-11-18). It never runs `hc`, whose CLI starts a
   missing core, and never starts, restarts or stops a core. Other platforms refuse the kind.
@@ -26,10 +26,11 @@
   ends with the caller's terminal, and hc types notes into the caller. The created terminal
   is read back on the same connection (argv, launch label, name, live, not kept) with its
   program's PID and birth: `Terminal.pid` is the program's own PID and stays after
-  it finishes (measured 2026-11-18). The handle records address, socket, core id,
+  it finishes (measured 2026-11-18). Linux verifies the socket peer with `SO_PEERCRED` and
+  records program birth as boot ID plus procfs start ticks. The handle records address, socket, core id,
   `created_ms` and that program incarnation.
-- The program is the macOS launch host (Current macOS Shell Startup Boundary). It binds only
-  when `HC_TERMINAL_ID` names the bound address and its own PID is the recorded program, and
+- The Linux host runs the [bound bash handoff](linux.md). The macOS host runs the
+  [shell environment capture](macos-shell.md). Either host binds only when `HC_TERMINAL_ID` names the bound address and its own PID is the recorded program, and
   refuses at the launch receipt deadline otherwise. That is the fence for a `terminal.run`
   whose result is uncertain: no reply, a reply without a local address, or an error other
   than those herdr-core gives before the terminal exists (`invalid_params`, `name_taken`,
@@ -41,10 +42,13 @@
   `terminal.list` is not used, because hc's list also asks every configured remote machine.
   Bridge retains the handle when the identity is complete but removal failed, and otherwise
   reports the name and that nothing starts without a binding.
+  If saving the binding for a confirmed terminal fails and removal also fails, the adapter
+  returns that same confirmed handle to the launcher. The launcher uses the current Claim
+  and Close records to decide whether to save it. A later close checks its identity again.
 - The core gives programs its own environment, not the caller's, and it can carry another
   session's markers: the core on the owner's Mac on 2026-11-18 carried Claude Code's
-  child-session and messaging variables. The launch host's capture, then removal of the
-  adapters' caller markers, keeps them from the provider. Do not ask users to restart their
+  child-session and messaging variables. Both launch hosts remove the adapters' caller markers
+  before starting the provider. The macOS host also removes them around shell capture. Do not ask users to restart their
   core for this.
 - Every later operation requires the recorded address, core id and `created_ms`, an argv
   naming this session's directory, the recorded program PID, `keep` false and, while live,
