@@ -194,25 +194,25 @@ Download the archive for your platform and its matching `.sha256` file from
 `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz` for x86_64 Linux with glibc 2.39 or newer
 (Ubuntu 24.04 or later).
 
-For version 0.4.46, verify the checksum in the download directory before extracting.
+For version 0.4.47, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.4.46-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.46-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.47-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.47-aarch64-apple-darwin.tar.gz
 ```
 
 On Linux, likewise:
 
 ```sh
-sha256sum -c tabcli-0.4.46-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf tabcli-0.4.46-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.4.46-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.47-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -225,7 +225,7 @@ Put the extracted `tabcli` (macOS, Linux) or `tabcli.exe` (Windows) in a directo
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.46 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.47 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated
