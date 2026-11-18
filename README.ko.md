@@ -65,6 +65,7 @@ closed session-K7m2Qx
 | macOS / Herdr Core | 구현됨 | [네 CLI, hc 0.1.21, 2026-11-18](docs/verification/2026-11-18-herdr.md) |
 | macOS / Warp | 제한적 | 미검증 |
 | Windows에서 직접 실행 | 구현됨 | 네 CLI 모두, 2026-10-02 |
+| Windows / Herdr Core | Claude, Agy, Pi 지원 | [Windows 11에서 Pi 실기 검증, hc 0.1.21](https://github.com/jy1655/tabcli/pull/398) |
 | Windows Terminal 탭 | 우선 사용 | 탭 생성/후속 요청/종료, 2026-10-01 |
 | Windows 콘솔 창 | 대체 경로 | 초기 요청/종료, 2026-10-01 |
 | Linux / Herdr Core | 구현됨 | [hc 0.1.21 왕복 검증](docs/verification/2026-11-18-linux-herdr.md) |
@@ -77,7 +78,7 @@ Linux는 기본적으로 tmux 3.2 이상을 사용하며 GUI 창을 열지 않�
 `tmux -S '<socket>' attach` 명령(JSON의 `attach_command`)으로 접속합니다.
 [Linux / tmux](docs/terminals.md#linux--tmux)를 참고합니다.
 
-macOS와 Linux에서는 `--terminal herdr`로 실행 중인 Herdr Core(`hc`) 안에 세션을 엽니다. Herdr 터미널 내부에서는 자동 감지합니다. [Herdr 지원](docs/terminals.md#herdr-core-on-macos-and-linux)을 참고하세요.
+macOS와 Linux에서는 `--terminal herdr`로 실행 중인 Herdr Core(`hc`) 안에 세션을 엽니다. Herdr 터미널 내부에서는 자동 감지합니다. [Herdr 지원](docs/terminals.md#herdr-core-on-macos-and-linux)을 참고하세요. Windows에서도 Claude, Agy, Pi는 [로컬 Herdr Core](docs/terminals.md#herdr-core-on-native-windows)를 사용할 수 있습니다.
 
 Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 있어야 사용할 수 있습니다. 터미널 입력을 제출하지 못하므로 Agy와 Pi의 후속 요청은 지원하지 않습니다. 로그인한 CLI로 요청·결과·후속 요청·종료를 거치는 경로도 미검증입니다. 이 두 CLI에는 다른 터미널을 사용합니다.
 
@@ -112,24 +113,24 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`, glibc 2.39 이상(Ubuntu 24.04 이상)의 x86_64 Linux는 `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz`를 사용합니다.
 
-0.4.46 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
+0.4.47 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
 ```sh
-shasum -a 256 -c tabcli-0.4.46-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.46-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.47-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.47-aarch64-apple-darwin.tar.gz
 ```
 
 Linux에서도 같은 방식으로 진행합니다.
 
 ```sh
-sha256sum -c tabcli-0.4.46-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf tabcli-0.4.46-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Windows에서는 PowerShell에서 실행합니다.
 
 ```powershell
-$archive = "tabcli-0.4.46-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.47-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -141,7 +142,7 @@ Expand-Archive $archive -DestinationPath .\tabcli
 소스에서 설치하려면 Rust 1.97.1 이상과 Cargo가 필요합니다.
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.46 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.47 --locked
 ```
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.

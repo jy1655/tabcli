@@ -93,7 +93,27 @@ Check the contents with `tar -tzf <archive>` and `unzip -Z1 <archive>`.
 The contents of each tar (macOS and Linux) must be exactly `tabcli`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`; the zip
 contents must be exactly `tabcli.exe`, `LICENSE`, and `THIRD_PARTY_NOTICES.md`.
 Check archive paths and file types before extracting into a new directory.
-Compare LICENSE and THIRD_PARTY_NOTICES.md with the commit. Each platform's binary
+Compare the two text members in each tar byte-for-byte with the Git blobs at
+`$release_commit`. For the Windows ZIP, the checkout uses CRLF for those two files.
+From the repository root, check the expected checkout bytes directly:
+
+```bash
+python3 - "$release_commit" "$release_dir/windows/tabcli-${release_tag#v}-x86_64-pc-windows-msvc.zip" <<'PY'
+import subprocess
+import sys
+import zipfile
+
+commit, archive = sys.argv[1:]
+with zipfile.ZipFile(archive) as bundle:
+    for member in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+        blob = subprocess.check_output(["git", "show", f"{commit}:{member}"])
+        if bundle.read(member) != blob.replace(b"\n", b"\r\n"):
+            raise SystemExit(f"Windows archive differs from the tagged text: {member}")
+PY
+```
+
+Keep every comparison between a downloaded asset and its workflow artifact byte-exact,
+including the Windows ZIP and its checksum. Each platform's binary
 `--version` must match `tabcli <version>` and the output from that CI job.
 Authenticated runtime results are separate; state explicitly if they were omitted.
 
@@ -161,8 +181,24 @@ gh release verify-asset "$release_tag" <downloaded-linux-checksum> -R "$release_
 ```
 
 Also run `gh release verify-asset` on each of the eight downloaded integration files when
-present, and rerun the integration verifier on their readback directory. Record all fourteen
-digests. Installing/updating a host integration is a separate operation from publishing these
+present. After checking the complete fourteen-file download, run the verifier from the
+validated source checkout on the four host ZIPs and their four checksums. Set
+`readback_dir` to that full download and use a new directory for the selected files:
+
+```bash
+(
+  set -eu
+  integration_dir="$release_dir/published-integrations"
+  mkdir "$integration_dir"
+  for host in claude codex agy pi; do
+    archive="agent-bridge-$host-${release_tag#v}.zip"
+    cp "$readback_dir/$archive" "$readback_dir/$archive.sha256" "$integration_dir/"
+  done
+  python3 scripts/integrations.py verify --output "$integration_dir"
+)
+```
+
+Record all fourteen digests. Installing/updating a host integration is a separate operation from publishing these
 assets; it must not update the engine, change consent, or remove a binary used by an open session.
 
 Do not record failed verification as success. Checks after publication cannot undo publication,
