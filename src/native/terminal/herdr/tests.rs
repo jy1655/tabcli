@@ -1008,7 +1008,9 @@ fn the_attach_command_names_the_recorded_socket() {
     let core = FakeCore::new();
     let session = created(&core);
     let expected = if cfg!(windows) {
-        format!("$env:HC_SOCKET = '{SOCKET}'; hc attach t7")
+        format!(
+            "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = '{SOCKET}'; try {{ hc attach t7 }} finally {{ $env:HC_SOCKET = $prior }} }}"
+        )
     } else {
         format!("HC_SOCKET='{SOCKET}' hc attach t7")
     };
@@ -1020,7 +1022,7 @@ fn the_attach_command_names_the_recorded_socket() {
     );
     assert_eq!(
         attach_line(r"\\.\pipe\herdr-core-o'neil-default.sock", "t7", true),
-        r"$env:HC_SOCKET = '\\.\pipe\herdr-core-o''neil-default.sock'; hc attach t7"
+        r"& { $prior = $env:HC_SOCKET; $env:HC_SOCKET = '\\.\pipe\herdr-core-o''neil-default.sock'; try { hc attach t7 } finally { $env:HC_SOCKET = $prior } }"
     );
     assert!(attach_command(&TerminalSession::new(TerminalKind::Iterm2, "x".into())).is_none());
     // A handle that records another platform's endpoint names no core here.
@@ -1707,4 +1709,61 @@ fn the_windows_core_reads_births_parents_and_random_tokens() {
     assert_eq!(token.len(), 32);
     assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_ne!(token, core.launch_nonce().unwrap());
+}
+
+// The PowerShell attach line, run by PowerShell 7 with a stand-in `hc`: hc sees the recorded
+// endpoint, quoted exactly, and afterwards HC_SOCKET is what it was before (unset, or the
+// earlier value), so later commands in the user's shell keep their own core.
+#[cfg(windows)]
+#[test]
+fn the_powershell_attach_line_scopes_hc_socket_to_hc() {
+    let pwsh = crate::native::terminal::windows::powershell_executable().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let seen = root.path().join("seen.txt");
+    let script = root.path().join("attach.ps1");
+    for (prior, endpoint) in [
+        (None, r"\\.\pipe\herdr-core-tester-default.sock"),
+        (
+            Some(r"\\.\pipe\earlier core"),
+            r"\\.\pipe\o'neil $x `y; hc.sock",
+        ),
+    ] {
+        let _ = fs::remove_file(&seen);
+        fs::write(
+            &script,
+            format!(
+                "function hc {{ Set-Content -LiteralPath $env:TABCLI_TEST_SEEN -Value ($env:HC_SOCKET + ' ' + ($args -join ' ')) -NoNewline }}\n{}\nif (Test-Path Env:HC_SOCKET) {{ 'present:' + $env:HC_SOCKET }} else {{ 'absent' }}\n",
+                attach_line(endpoint, "t7", true)
+            ),
+        )
+        .unwrap();
+        let mut command = std::process::Command::new(&pwsh);
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+            ])
+            .arg("-File")
+            .arg(&script)
+            .env("TABCLI_TEST_SEEN", &seen);
+        match prior {
+            Some(prior) => command.env("HC_SOCKET", prior),
+            None => command.env_remove("HC_SOCKET"),
+        };
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_to_string(&seen).unwrap(),
+            format!("{endpoint} attach t7")
+        );
+        let after = String::from_utf8(output.stdout).unwrap();
+        let expected = match prior {
+            Some(prior) => format!("present:{prior}"),
+            None => "absent".to_owned(),
+        };
+        assert_eq!(after.trim_end(), expected);
+    }
 }

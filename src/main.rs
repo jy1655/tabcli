@@ -53,7 +53,7 @@ Runtime:
   settings windows-tab-window current opens the tab in the most recently used
   Windows Terminal window instead, where the new tab takes the keyboard inside
   that window; dedicated, the default, leaves the windows you work in alone.
-  Inside an hc terminal Windows selects Herdr for Pi, the one provider it carries there.
+  Inside an hc terminal Windows selects Herdr, except for Codex, which Herdr cannot run.
   Linux detects Herdr inside an hc terminal and otherwise defaults to tmux 3.2 or later.
   Use --terminal herdr for a running local Herdr Core or --terminal tmux for a private server.
   Agent Bridge controls only sessions that it launched.

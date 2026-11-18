@@ -15,6 +15,8 @@ pub(in crate::native) use record::{
     Assessment, ConsentState, SessionConsentObservation, applied, assess, authorized, observe,
     record, run,
 };
+#[cfg(windows)]
+pub(in crate::native) use store::windows_directory_is_private;
 pub(in crate::native) use store::{
     Environment, Evidence, Identity, Trust, identity, native_key, read_store, user_home,
 };

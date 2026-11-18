@@ -39,7 +39,7 @@
   interactive input with per-turn acceptance identity.
   A Windows Herdr terminal keeps this contract unchanged (the same framing, startup wait and
   receipt); only the attempt is Herdr's `terminal.send`, whose refusal before typing is not
-  sent and whose uncertain outcome is never resent. It was not run live (2026-11-18).
+  sent and whose uncertain outcome is never resent. Live evidence is in the Herdr boundary.
 
 - A Pi pending turn is installed (the launch plan while the session is Launching, and a
   follow-up before delivery) only for the current Claim of a session that has no close

@@ -87,30 +87,28 @@ const TAB_HOST_EXIT_WAIT: Duration = Duration::from_secs(1);
 
 pub(super) fn select(
     preferred: Option<TerminalKind>,
-    provider: Option<agent_bridge::FirstPartyCli>,
+    herdr_runs_provider: bool,
 ) -> Result<TerminalKind> {
     select_from(
         preferred,
         std::env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
         std::env::var("TERM_PROGRAM").ok().as_deref(),
-        provider,
+        herdr_runs_provider,
     )
 }
 
 // An explicit choice wins. Inside a Herdr terminal (hc's identity, as on macOS and Linux) the
-// automatic choice is Herdr for a provider that a Windows Herdr terminal carries, which
-// launch admission then proves; for any other provider, an unknown one included, and
-// outside hc it is the managed console. Selection reads the environment and the request
-// only and opens nothing.
+// automatic choice is Herdr when the provider's adapter runs there, which launch admission
+// then proves; for any other provider, an unknown one included, and outside hc it is the
+// managed console. Selection reads the environment and the request only and opens nothing.
 pub(super) fn select_from(
     preferred: Option<TerminalKind>,
     hc_terminal: bool,
     term_program: Option<&str>,
-    provider: Option<agent_bridge::FirstPartyCli>,
+    herdr_runs_provider: bool,
 ) -> Result<TerminalKind> {
-    let carried = provider.is_some_and(|provider| super::windows_herdr_carries(provider).is_ok());
     match preferred {
-        None if carried && super::herdr_environment(hc_terminal, term_program) => {
+        None if herdr_runs_provider && super::herdr_environment(hc_terminal, term_program) => {
             Ok(TerminalKind::Herdr)
         }
         None | Some(TerminalKind::WindowsConsole) => Ok(TerminalKind::WindowsConsole),

@@ -902,7 +902,12 @@ where
     let repair_error = Some(repair_error);
     #[cfg(windows)]
     {
-        if matches!(status.state, SessionState::Exited | SessionState::Failed) {
+        // A Herdr terminal outlives its owner: the core keeps it, finished, until it is
+        // removed, and the owner's death proves nothing about it. Its handle is closed
+        // through the verified core, as a running console is, and retained when that close
+        // fails. A console ends with its root, so an ended session needs no helper.
+        let herdr = retains_windows_herdr_handle(store)?;
+        if matches!(status.state, SessionState::Exited | SessionState::Failed) && !herdr {
             crate::native::session::close::budget::close_remaining(deadline)?;
             mark_session_closed(store, repair_error)?;
             return Ok(true);
@@ -916,7 +921,11 @@ where
             |surface| close_terminal(surface).map(Into::into),
             deadline,
         )
-        .context("failed to close a Windows console whose native owner exited")?;
+        .context(if herdr {
+            "failed to close a Herdr terminal whose native owner exited; its handle is retained"
+        } else {
+            "failed to close a Windows console whose native owner exited"
+        })?;
         Ok(true)
     }
     #[cfg(not(windows))]
@@ -952,6 +961,22 @@ where
         mark_session_closed(store, repair_error)?;
         Ok(true)
     }
+}
+
+// Whether the session still holds a Herdr handle, active or claimed by an interrupted close.
+// A handle that cannot be decoded names no terminal Bridge could close and keeps the
+// console's disposition.
+#[cfg(windows)]
+fn retains_windows_herdr_handle(store: &Store) -> Result<bool> {
+    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
+        if let Some(bytes) = store.record(record).bytes()?
+            && super::record::terminal_bytes(&bytes)
+                .is_ok_and(|surface| surface.kind == terminal::TerminalKind::Herdr)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

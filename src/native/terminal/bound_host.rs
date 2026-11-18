@@ -89,10 +89,18 @@ fn windows_private_directory(directory: &Path, name: &str) -> Result<()> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(directory)
-        .with_context(|| format!("cannot open {name} launch directory {}", directory.display()))?;
-    let metadata = opened
-        .metadata()
-        .with_context(|| format!("cannot inspect {name} launch directory {}", directory.display()))?;
+        .with_context(|| {
+            format!(
+                "cannot open {name} launch directory {}",
+                directory.display()
+            )
+        })?;
+    let metadata = opened.metadata().with_context(|| {
+        format!(
+            "cannot inspect {name} launch directory {}",
+            directory.display()
+        )
+    })?;
     if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         bail!(
             "refusing non-directory {name} launch path: {}",

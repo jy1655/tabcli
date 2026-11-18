@@ -1182,10 +1182,13 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
     Some(attach_line(&core.socket, &session.id, cfg!(windows)))
 }
 
+// POSIX shells scope an assignment before a command to that command. PowerShell has no such
+// form, so the line sets `HC_SOCKET` in its own script block and restores what was there
+// (nothing, when it was unset) however `hc` ends, Ctrl+C included.
 fn attach_line(endpoint: &str, address: &str, powershell: bool) -> String {
     if powershell {
         format!(
-            "$env:HC_SOCKET = '{}'; hc attach {address}",
+            "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = '{}'; try {{ hc attach {address} }} finally {{ $env:HC_SOCKET = $prior }} }}",
             endpoint.replace('\'', "''")
         )
     } else {

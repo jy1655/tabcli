@@ -3,7 +3,7 @@
 - Herdr is a Linux, macOS and Windows surface (`--terminal herdr`, also `hc` and `herdr-core`) in
   an already running Herdr Core. Bridge speaks newline JSON-RPC 2.0, protocol generation 1, on
   the core's own socket or, on Windows, its named pipe (measured with hc 0.1.21 on macOS and
-  Linux, 2026-11-18; Windows from the hc 0.1.21 source, not yet live). It never runs `hc`, whose
+  Linux, 2026-11-18; on Windows from the hc 0.1.21 source and one Pi run below). It never runs `hc`, whose
   CLI starts a missing core, and never starts, restarts or stops a core. Other platforms refuse
   the kind. The Windows-only rules are at the end of this file.
 - When the core is absent, direct the user to open Herdr from the desktop or start hc outside
@@ -78,7 +78,8 @@
   and its action; Bridge does not claim more. hc does not sweep detached processes. Bridge
   touches no other terminal and calls no core operation.
 - An explicit `--terminal` wins. Otherwise `HC_TERMINAL_ID` with `TERM_PROGRAM=ghostty` (the
-  identity hc gives every program) selects Herdr, on Windows only for a provider it carries;
+  identity hc gives every program) selects Herdr, on Windows only for a provider whose adapter
+  runs there;
   the marker under another `TERM_PROGRAM` was inherited and is ignored. Selection reads only
   the environment and, on Windows, the requested provider. Launch admission
   (`terminal::admit_selection`) then requires the caller's terminal to be live on the
@@ -101,7 +102,10 @@
   then requires the client end of a byte pipe whose server process (`GetNamedPipeServerProcessId`)
   has this user's SID in its token, the Windows counterpart of `SO_PEERCRED`. A missing pipe is
   a missing core; a pipe refusing access is an elevated or foreign core and is refused with that
-  hint. Both transports share one framing (`Framed`): a request is unsent only while none of its
+  hint. The process is opened for limited query in the Windows process module; the security
+  module only reads the token of the handle it is lent, and opens no process (its dependency
+  policy, `tests/windows_security_policy.rs`). Both transports share one framing (`Framed`): a
+  request is unsent only while none of its
   bytes was written. Pipe reads and writes are overlapped and waited for until the deadline; a
   pending one is then cancelled and its completion collected before its buffer is released, and
   bytes it moved before the cancellation count as written.
@@ -110,7 +114,11 @@
   a process snapshot and accepts a parent only while it is live and created no later than its
   child, because Windows keeps a dead parent's PID, which a later process can hold. A parent
   that cannot be inspected ends the walk, which can then only refuse.
-- The Windows launch host cannot exec. After the same binding wait, launch judgment and locked
+- The Windows launch host cannot exec. Its session directory is admitted as on Linux and then
+  read again from a handle opened on the directory itself (`FILE_FLAG_OPEN_REPARSE_POINT`): no
+  reparse point, and the trust store's access-list rule, where `FILE_DELETE_CHILD` and `DELETE`
+  also count as changing a directory (`consent::windows_directory_is_private`; the store's own
+  rule is unchanged). After the same binding wait, launch judgment and locked
   re-check as the Linux host (`bound_host::prepare_bound_launch_with`), it flushes `CONIN$` (a
   console it cannot flush refuses the launch), keeps itself running through Ctrl+C and
   Ctrl+Break with a handler routine (not inherited, unlike ignoring them), and starts PowerShell
@@ -118,22 +126,35 @@
   (`console_root_arguments`, which also removes `TERM`), through the helper command that drops
   caller markers. It exits with the root's code. The root shares the host's console and the
   core's job object, so `terminal.kill` (hc ends the job) ends the whole session.
-- A Windows Herdr terminal carries Pi only (`terminal::admit_provider`, before anything is
-  created): Codex's Windows initial prompt is the injected console paste (#124), Claude's
-  Windows workspace approval answers a console dialog and its Windows owner checks were verified
-  in the console only, and Agy's Windows receipts and readiness were measured on the console
-  only. Inside an hc terminal the automatic choice is Herdr for Pi and the managed console for
-  the others, as before; a reopen, whose provider is unknown at selection, keeps the console.
-  Lift a refusal only with that provider's Windows Herdr live evidence.
-- Pi keeps its Windows input contract on Herdr (single-line framing, startup readiness and the
-  per-turn input receipt; see the Pi boundary); only the transport is `terminal.send`. A Herdr
-  handle on Windows never reaches the console control helper: every surface operation is
-  dispatched by kind, and guarded dialog input is refused as on the other platforms.
+- Each provider adapter answers whether it runs on a surface (`surface_support`, required, no
+  default), before anything is created (`provider::admit_surface`). On Windows Herdr, Codex
+  refuses: its initial prompt is the injected console paste (#124), text without Return and one
+  Return against the exact accepted screen, which `terminal.send` cannot do, and the
+  launch-argument route used elsewhere would put the multi-line prompt on a Windows command
+  line (32,767 characters; 8,191 and no line break through `codex.cmd`). Claude (official
+  messaging; its dialog is left to the user, as on macOS and Linux), Agy (paste through the
+  surface behind its log readiness and receipt) and Pi run there. Inside an hc terminal the
+  automatic choice is Herdr when the provider's adapter runs there and the managed console
+  otherwise; a reopen, whose provider is unknown at selection, keeps the console.
+- A Herdr handle on Windows never reaches the console control helper: every surface operation
+  is dispatched by kind, and guarded dialog input is refused as on the other platforms. Pi and
+  Agy keep their Windows framing, readiness and receipts; only the transport is `terminal.send`.
+  Agy's Windows readiness also needs `Full redraw completed`, measured on the console only;
+  without it the paste is withheld and reported not sent.
 - The Windows ownership proof checks the Herdr terminal on its core, then the owner's process
-  identity. A dead owner's repair closes a running session's terminal through this adapter's
-  close. An Exited or Failed session is marked closed without a core call, as for the console,
-  so a terminal whose provider ended on its own stays on the core, finished, until `hc rm`.
-- Windows tests: endpoint resolution and the shared framing run on every platform; the pipe
-  transport (a real pipe of this user), process births, parents, tokens, the dispatch by kind
-  and the binding wait run on the Windows CI runner. A Windows Herdr launch, input, screen and
-  close with Pi still need a live run; do not cite these tests as one.
+  identity. The owner's death proves nothing about the terminal: a dead owner's repair, in any
+  repairable state, closes the exact Herdr handle through the verified core under the close
+  transaction's claim, and a close that fails (no core, another core, a changed terminal)
+  restores the handle and leaves state and claim for the next close. Only the core's
+  `not_found` proves the terminal gone. A console's ended session still settles from its records.
+- The PowerShell `attach_command` sets `HC_SOCKET` in its own script block and restores the
+  earlier value (or its absence) in `finally`, so later commands keep their own core.
+- Windows tests: endpoint resolution, the shared framing and the adapters' surface answers run
+  on every platform; the pipe transport (a real pipe of this user), process births, parents,
+  tokens, the dispatch by kind, the directory admission, the dead-owner repair, the attach line
+  under PowerShell 7 and the binding wait run on the Windows CI runner. Live (reported by the
+  verification session, 2026-11-18): an early candidate of this change passed the five native
+  Windows self-test steps with Pi 1.5.0 on hc 0.1.21, Windows 11 x64, as a standard desktop
+  user, with distinct turns and no terminal left after close; the release before it refused.
+  Claude and Agy on Windows Herdr have no live run; the review fixes after that candidate were
+  not run live.

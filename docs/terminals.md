@@ -2,7 +2,7 @@
 
 Choose the terminal where Bridge opens your sessions, and check what it will close when you finish.
 On macOS, Bridge detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
-Windows Terminal tab, then a separate console window, or Herdr for Pi inside an hc terminal. Linux
+Windows Terminal tab, then a separate console window, or Herdr inside an hc terminal. Linux
 detects Herdr and otherwise uses tmux.
 Use `--terminal` to override the selection.
 
@@ -23,10 +23,10 @@ with `--terminal tmux`. Automatic selection verifies a Herdr caller when both
 `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID` are present. Failed verification
 refuses the launch. Otherwise Linux uses tmux.
 
-On Windows, `--terminal herdr` selects a running local Herdr Core, which carries Pi only in this
-release; Codex, Claude and Agy are refused there before any session exists. Inside an hc
-terminal the automatic choice is Herdr for Pi, verified like on Linux, and the managed console for
-the other providers and for `reopen`.
+On Windows, `--terminal herdr` selects a running local Herdr Core. Codex is refused there before
+any session exists, because its Windows initial prompt needs the managed console. Inside an hc
+terminal the automatic choice is Herdr for Claude, Agy and Pi, verified like on Linux, and the
+managed console for Codex and for `reopen`.
 
 On macOS an explicit option wins. With `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`,
 Bridge selects Herdr and verifies the calling terminal before launch. Stale Herdr markers refuse
@@ -90,7 +90,7 @@ where needed, and close it. The Windows rows below describe native Windows; Herd
 | macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI | Exact-pane CLI text |
 | macOS | Warp | Tab/window URI | Unsupported | Bound tab/window | Unsupported |
 | macOS and Linux | Herdr Core | New hc terminal | Addressed API paste | Exact terminal | Visible screen |
-| Windows (Pi only) | Herdr Core | New hc terminal | Addressed API paste | Exact terminal | Visible screen |
+| Windows (not Codex) | Herdr Core | New hc terminal | Addressed API paste | Exact terminal | Visible screen |
 | Linux | tmux | Detached server and pane | Exact-pane raw paste | Whole session server | Visible pane text |
 | Windows | Terminal tab | Tab | Console input | Console and tab | Console window text |
 | Windows | Console window | Window fallback | Console input | Console | Console window text |
@@ -178,7 +178,9 @@ Install hc for Windows and open Herdr from the desktop, or run `hc server start`
 (not elevated) desktop terminal outside an agent session. Bridge connects only to the core's
 local named pipe, the one `hc` uses (`HC_SOCKET`, the `socket` setting, or
 `\\.\pipe\herdr-core-<user>-<session>.sock`), and only when the process serving it runs as
-your Windows user. An elevated core refuses an unelevated Bridge.
+your Windows user. An elevated core refuses an unelevated Bridge. The session directory must
+be a real, private directory: a junction, or an access list that lets another account change
+its entries, refuses the launch.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."
@@ -186,12 +188,14 @@ tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain 
 
 The terminal runs Bridge's launch host, which waits for its binding and then starts the same
 PowerShell 7 root that a managed console runs, so PowerShell 7 must be on the core's `PATH`.
-Pi keeps its Windows input rules: a one-line prompt, its startup check and its per-turn input
-receipt; Herdr's `terminal.send` delivers it. The returned `attach_command` is a PowerShell line
-that sets `HC_SOCKET` for `hc attach`. Close ends the whole terminal. A session whose provider
-ended on its own is closed without contacting the core, and its finished terminal stays in
-Herdr until you remove it (`hc rm <address>`). Codex, Claude and Agy are refused here until
-their Windows paths are verified on Herdr; use `--terminal windows-console` for them.
+Pi and Agy keep their Windows input rules (a one-line prompt, their startup checks and
+receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. Codex is refused:
+its Windows initial prompt is pasted and then submitted against the exact console screen, which
+Herdr cannot do, so use `--terminal windows-console` for it. The returned `attach_command` is a
+PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close ends the
+whole terminal. When a provider ends on its own, the next close or repair removes its finished
+terminal through the core; if the core cannot be reached, the session keeps its handle and a
+later close finishes it. Only Pi has been run live on Windows Herdr.
 
 ## Linux / tmux
 
@@ -542,7 +546,7 @@ for the tested binary, CLI versions, settings, and date.
 | macOS | WezTerm | Implemented | GUI identity/input/close | Codex/Claude [M12]; Agy [M11] |
 | macOS | Warp | Limited | Control/URI/partial launch/close | Not verified |
 | Linux | Herdr Core | Implemented | Adapter and socket tests | [Linux hc 0.1.21](verification/2026-11-18-linux-herdr.md) |
-| Windows | Herdr Core (Pi) | Implemented | Adapter, pipe, process and dispatch tests | Not verified |
+| Windows | Herdr Core | Implemented; Codex refused | Adapter, pipe, process, directory, repair and dispatch tests | Pi five self-test steps on an early candidate (2026-11-18, hc 0.1.21, Pi 1.5.0); Claude and Agy not verified |
 | Linux | tmux | Implemented | Linux surface tests; real tmux when installed | Four providers [L6] |
 | Linux process in WSL | tmux | Not verified | No live evidence | Not verified |
 | Windows | Terminal tab | Implemented | Host/console/identity/input/focus | Four providers [W02] |

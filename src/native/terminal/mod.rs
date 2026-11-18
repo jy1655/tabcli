@@ -331,19 +331,20 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     select_for(preferred, None)
 }
 
-/// The terminal for a launch of `provider`, which a reopen does not know before it reads
-/// its source. Only on Windows does the provider change the automatic choice: inside an hc
-/// terminal it is Herdr for a provider that a Windows Herdr terminal carries, and the
-/// managed console otherwise, as before Herdr reached Windows. An explicit choice wins.
+/// The terminal for a launch whose provider runs on Herdr here (`herdr_runs_provider`, its
+/// adapter's answer) or whose provider is not known yet (`None`, a reopen before it reads
+/// its source). Only on Windows does it change the automatic choice: inside an hc terminal
+/// it is Herdr when the provider runs there, and the managed console otherwise, as before
+/// Herdr reached Windows. An explicit choice wins; admission then asks the provider.
 pub(super) fn select_for(
     preferred: Option<TerminalKind>,
-    provider: Option<agent_bridge::FirstPartyCli>,
+    herdr_runs_provider: Option<bool>,
 ) -> Result<TerminalKind> {
     #[cfg(windows)]
-    return windows::select(preferred, provider);
+    return windows::select(preferred, herdr_runs_provider.unwrap_or(false));
     #[cfg(not(windows))]
     {
-        let _ = provider;
+        let _ = herdr_runs_provider;
         platform::select(preferred)
     }
 }
@@ -366,46 +367,6 @@ pub(super) fn admit_selection(
     }
     let _ = (preferred, selected);
     Ok(())
-}
-
-/// Whether the selected surface carries this provider on this platform. On Windows a Herdr
-/// terminal carries Pi only: the Windows input paths of the other providers are verified on
-/// the managed console alone and are refused here, before any session exists.
-pub(super) fn admit_provider(
-    kind: TerminalKind,
-    provider: agent_bridge::FirstPartyCli,
-) -> Result<()> {
-    if cfg!(windows) && kind == TerminalKind::Herdr {
-        return windows_herdr_carries(provider).map_err(|reason| {
-            crate::native::failure_kind::Unsupported::new(format!(
-                "Herdr on Windows is unsupported for {} in this release: {reason}; choose --terminal windows-console",
-                provider.as_str()
-            ))
-            .into()
-        });
-    }
-    Ok(())
-}
-
-/// The providers a Windows Herdr terminal carries, and why each other one is refused.
-/// Pi's Windows input is a terminal transport with its own per-turn receipt, which Herdr's
-/// `terminal.send` carries as the console did; the others depend on the managed console.
-fn windows_herdr_carries(
-    provider: agent_bridge::FirstPartyCli,
-) -> std::result::Result<(), &'static str> {
-    use agent_bridge::FirstPartyCli::{Agy, Claude, Codex, Pi};
-    match provider {
-        Pi => Ok(()),
-        Codex => Err(
-            "its Windows initial prompt is an injected console paste with a guarded Return (#124), which a Herdr terminal does not provide",
-        ),
-        Claude => Err(
-            "its Windows workspace approval answers the console's dialog, and its Windows owner checks were verified in the managed console only",
-        ),
-        Agy => Err(
-            "its Windows input receipts and readiness gate were measured on the managed console only",
-        ),
-    }
 }
 
 /// The command a user runs to watch or type in a surface that has no window of its own.
@@ -855,49 +816,6 @@ mod tests {
         TerminalSession::new(TerminalKind::Iterm2, "test-session".to_owned())
     }
 
-    // On Windows a Herdr terminal carries Pi only; every other surface, and every surface
-    // elsewhere, is refused here for no provider. The refusal is an Unsupported failure
-    // that names the provider and the console alternative.
-    #[test]
-    fn windows_herdr_carries_pi_only_and_refuses_the_others_before_any_session() {
-        use crate::native::failure_kind::{FailureKind, classify};
-        use agent_bridge::FirstPartyCli;
-        assert!(super::windows_herdr_carries(FirstPartyCli::Pi).is_ok());
-        for provider in [
-            FirstPartyCli::Codex,
-            FirstPartyCli::Claude,
-            FirstPartyCli::Agy,
-        ] {
-            assert!(
-                super::windows_herdr_carries(provider).is_err(),
-                "{provider:?}"
-            );
-        }
-        for kind in TerminalKind::ALL {
-            for provider in agent_bridge::supported_clis().iter().copied() {
-                let admitted = super::admit_provider(kind, provider);
-                if cfg!(windows) && kind == TerminalKind::Herdr && provider != FirstPartyCli::Pi {
-                    let error = admitted.unwrap_err();
-                    let text = format!("{error:#}");
-                    assert!(
-                        text.starts_with(&format!(
-                            "Herdr on Windows is unsupported for {} in this release: ",
-                            provider.as_str()
-                        )),
-                        "{text}"
-                    );
-                    assert!(
-                        text.ends_with("; choose --terminal windows-console"),
-                        "{text}"
-                    );
-                    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
-                } else {
-                    admitted.unwrap_or_else(|error| panic!("{kind:?} {provider:?}: {error:#}"));
-                }
-            }
-        }
-    }
-
     #[cfg(windows)]
     fn absent_windows_herdr_handle() -> TerminalSession {
         TerminalSession::new(TerminalKind::Herdr, "t7".into())
@@ -1038,7 +956,7 @@ mod tests {
     #[test]
     fn windows_selects_its_managed_console_transport() {
         assert_eq!(
-            super::windows::select_from(None, false, None, None).unwrap(),
+            super::windows::select_from(None, false, None, false).unwrap(),
             TerminalKind::WindowsConsole
         );
         assert_eq!(

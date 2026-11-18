@@ -781,9 +781,11 @@ Warp requires a reachable official Control endpoint and provable surface ownersh
 submit terminal input, so Agy and Pi follow-ups are unsupported there; choose another terminal
 for those providers. Warp has automated tests. The [0.1.1 check][mac11] returned an empty Warp
 instance list; Warp was not exercised for [0.1.2][mac12] or the 0.4.9 and Ghostty 1.4.0 Mac runs (#63, #87).
-On Windows, Herdr carries Pi only in this release: Codex, Claude and Agy are refused there before
-any session exists, because their Windows input or approval paths were verified on the managed
-console only. Pi on Windows Herdr has no live evidence yet.
+On Windows Herdr, Codex is refused before any session exists: its Windows initial prompt is a
+console paste submitted against the exact screen, and a Windows command line cannot carry the
+prompt as a launch argument. Claude, Agy and Pi run there; only Pi has a live run (an early
+candidate, 2026-11-18). Agy's Windows readiness needs a log line measured on the console only;
+without it the paste is withheld and reported not sent.
 Linux requires tmux 3.2 or later for tmux, or a running local Herdr Core for Herdr. Neither surface answers workspace-trust dialogs; trust the workspace
 through the provider beforehand. See [terminal support](terminals.md#linux--tmux) for attachment,
 paste delivery, shell environment, and close behavior.
