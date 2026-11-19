@@ -1,5 +1,5 @@
 name: Bug report
-description: Report an unexpected Agent Bridge behavior in English or Korean.
+description: Report unexpected TAB behavior in English or Korean.
 labels: [bug]
 body:
   - type: markdown
@@ -8,7 +8,7 @@ body:
         **Do not paste tokens, session directories, transcripts, or complete `doctor --json`
         output. Remove prompts from commands and redact paths and identifiers.**
         For vulnerabilities, use the private security-report link in the issue chooser.
-        If Bridge cannot start, give the release or source commit you attempted to use.
+        If TAB cannot start, give the release or source commit you attempted to use.
         Write "not applicable" for terminal or provider fields that the failure does not involve.
   - type: textarea
     id: behavior
@@ -32,7 +32,7 @@ body:
   - type: input
     id: bridge-version
     attributes:
-      label: Agent Bridge version
+      label: TAB version
       description: Paste the output of tabcli --version.
     validations:
       required: true
@@ -48,7 +48,7 @@ body:
     attributes:
       label: Terminal application and version
       description: >-
-        Name the terminal application that launched Bridge and the application hosting the
+        Name the terminal application that launched TAB and the application hosting the
         managed session, with their versions.
     validations:
       required: true

@@ -1,4 +1,4 @@
-//! Hosts a managed console in a tab of the Agent Bridge window of Windows Terminal.
+//! Hosts a managed console in a tab of the `agent-bridge` window of Windows Terminal.
 //!
 //! `wt.exe` creates the process of a new tab itself, so the launcher cannot create the
 //! console root suspended and attest it, as it does for a console window of its own. The
@@ -773,7 +773,7 @@ fn terminal_command_line(
     Ok(format!(
         "{} -w {target} new-tab {} {HOST_COMMAND} {}",
         tab_argument(terminal, "the Windows Terminal path")?,
-        tab_argument(bridge, "the Agent Bridge executable path")?,
+        tab_argument(bridge, "the TAB executable path")?,
         tab_argument(directory, "the session directory")?,
     ))
 }

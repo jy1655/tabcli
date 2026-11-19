@@ -1,7 +1,7 @@
 //! What a session's own action admissions would decide at this Snapshot. An observation is
 //! not a reservation: the action rechecks every gate under its own lock, and an admissible
 //! cancel records intent only, never interruption or completion. `tell` is observed through
-//! its Bridge record gates only; the gates it does not evaluate are named, never inferred.
+//! its TAB record gates only; the gates it does not evaluate are named, never inferred.
 use super::*;
 use crate::native::session::cancel::{self, Refusal, RefusalReason};
 use crate::native::session::owner::OwnerAttestation;
@@ -151,7 +151,7 @@ fn tell_value(
     }
 }
 
-/// `tell`'s Bridge record gates in the action's order, stopping at the first that does not
+/// `tell`'s TAB record gates in the action's order, stopping at the first that does not
 /// pass. On success, returns the gates this observation does not evaluate, in the action's
 /// order: the terminal surface probe, reopened-conversation exclusivity, and the provider's
 /// delivery readiness with the adapter gates it leaves to delivery.
@@ -289,7 +289,7 @@ fn surface_gate(surface: &Surface) -> std::result::Result<(), Stop> {
     }
 }
 
-/// Whether this session was configured to observe question emissions, and whether Bridge
+/// Whether this session was configured to observe question emissions, and whether TAB
 /// can answer one; each adapter states both.
 fn questions_value(reader: &Reader, records: &Snapshot) -> Value {
     let unknown = |reason: &str, detail: Option<&str>| {

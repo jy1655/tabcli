@@ -34,7 +34,7 @@ use reservation::{
 };
 pub(super) use reservation::{marker_check, record_reopen_refusal};
 
-// Where a reopened session's provider conversation came from: the closed Bridge session and
+// Where a reopened session's provider conversation came from: the closed TAB session and
 // the event whose provider session id was passed to the provider's official resume.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ResumedFrom {
@@ -54,7 +54,7 @@ struct ReopenProvenance {
 
 // Which boundary a resumed session's holder check runs at. The provider grants no
 // exclusive hold on a conversation, so the check is best-effort detection repeated at every
-// point Bridge is about to act on the conversation, never a reservation of it.
+// point TAB is about to act on the conversation, never a reservation of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum ResumedHolderCheck {
     // In the initial-prompt readiness window: the reopened process exists and has not

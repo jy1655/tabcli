@@ -375,7 +375,7 @@ fn the_windows_follow_up_gate_reads_only_the_claim_independent_capability() {
     let refused = |reason: &str| FollowUpStatic::Refused {
         reason: "pi_input_ack_unsupported",
         detail: format!(
-            "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent: {reason}"
+            "this Pi session cannot acknowledge Windows input; start a new TAB session; no console input was sent: {reason}"
         ),
     };
     assert_eq!(

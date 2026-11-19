@@ -758,7 +758,7 @@ fn the_adapter_gate_decides_last_and_names_the_waits_it_does_not_evaluate() {
             observe_past_owner_and_surface(&fixture.directory)["tell"],
             refused(
                 "pi_input_ack_unsupported",
-                "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent: Pi startup receipt is missing",
+                "this Pi session cannot acknowledge Windows input; start a new TAB session; no console input was sent: Pi startup receipt is missing",
             )
         );
     }

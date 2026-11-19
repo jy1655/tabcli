@@ -197,7 +197,7 @@ pub(in crate::native) fn receipt(
     requests::validate(&receipt).map_err(DecodeError::Rule)?;
     if receipt.claim_token != expected_token {
         return Err(DecodeError::Rule(anyhow::anyhow!(
-            "Bridge request receipt belongs to a different claim"
+            "TAB request receipt belongs to a different claim"
         )));
     }
     Ok(receipt)

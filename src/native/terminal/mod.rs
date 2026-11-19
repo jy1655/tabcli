@@ -406,7 +406,7 @@ where
     }
     #[cfg(windows)]
     {
-        // A Herdr terminal is created by its core and runs Bridge's launch host; nothing of
+        // A Herdr terminal is created by its core and runs TAB's launch host; nothing of
         // the managed console is involved.
         if kind == TerminalKind::Herdr {
             return herdr::Adapter::installed().open(command, directory, deadline, bind, unbind);

@@ -939,7 +939,7 @@ mod tests {
         let error = resolve_error(root.path(), "session-src/event-0.json");
         assert!(
             error.contains("request_state is unverifiable")
-                && error.contains("failed to read Bridge requests"),
+                && error.contains("failed to read TAB requests"),
             "{error}"
         );
         let error = resolve_error(root.path(), "session-src/request-done");

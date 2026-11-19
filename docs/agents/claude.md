@@ -40,17 +40,17 @@
   including WSL 2. Native Windows support is official from v2.1.234 and uses a
   per-session named pipe. Prefer the official path only when every runtime availability
   gate passes.
-- Use the official `ListAgents` and `SendMessage` path on every supported Agent Bridge
+- Use the official `ListAgents` and `SendMessage` path on every supported TAB
   platform. Do not restore the removed native-Windows `--print --resume` supervisor or
   silently fall back to terminal input when official messaging is unavailable.
 - New macOS, Linux, and native Windows launches, plus Windows reopens, select `native_v1` completion
-  before spawn from the recorded stable Claude version, at least 2.1.302, and load Bridge's session-local
+  before spawn from the recorded stable Claude version, at least 2.1.302, and load TAB's session-local
   completion module through Claude's official `--plugin-dir` flag.
   Actual `session.start` readiness is required before input; a version or plugin
   flag is no proof that the module ran. Missing readiness refuses delivery without a
   Stop fallback or a provider trust/policy override. Initial and follow-up prompts use
   `ListAgents` and `SendMessage`; argv carries no initial prompt and new settings add no
-  classic Bridge Stop hooks. The version floor establishes eligibility, not runtime readiness.
+  classic TAB Stop hooks. The version floor establishes eligibility, not runtime readiness.
 - Native completion observes only main-loop `turn.start` and `turn.complete`. Bind the
   whole expected message inside one anchored peer envelope to the live claim under the
   lifecycle lock, permitting only Claude's reversible insertion of one backslash after an
@@ -60,7 +60,7 @@
   reproducing its protected-tag grammar. Compare start/completion conversation
   and turn identities with each other, not the startup conversation, which `/clear` may
   change. The official turn id stays adapter-private; core `turn_id` must remain the
-  Bridge correlation id because delivery waits for it. Replace envelope matching when
+  TAB correlation id because delivery waits for it. Replace envelope matching when
   official SendMessage returns an addressed target-turn identity.
 - The frame is the caller's prompt, one line `End your final response with this exact line:`
   and the marker (#396). Claude's own peer envelope names the sending session and the request
@@ -78,7 +78,7 @@
   A marked bound answer settles normally. A different main-loop turn may settle only with
   a valid candidate of the exact current claim, pending request and immutable binding, in
   the same conversation, and a fully validated nonempty normal answer with that suffix.
-  Record both official identities privately before publication; keep the core Bridge id
+  Record both official identities privately before publication; keep the core TAB id
   and use `claude_mod_marked_continuation` provenance. A selected continuation cannot be
   replaced by a different continuation after interrupted publication. Strip only the suffix.
   Bound interruption, API error, refusal and empty answer still fail; those outcomes on an
@@ -112,7 +112,7 @@
   One Claude-owned 64 KiB record preserves a prefix and monotone incompleteness; a duplicate
   step/tool position is idempotent and conflicting content marks it incomplete. A repeated
   model step, a non-tool-use response carrying a question, or a lower hook's rewrite also
-  marks incompleteness. Hooks above Bridge can change the output after observation. Historical
+  marks incompleteness. Hooks above TAB can change the output after observation. Historical
   reads use the selected Receipt under the query's lock. Emitted means neither shown,
   pending, executed nor answered, and no query changes the Claim or permits a pending tell.
   Only question text and option labels are projected; no answer or permission is supplied.
@@ -126,7 +126,7 @@
   later read uses that record. With it on, a `tool.call` hook refuses a main-loop
   `AskUserQuestion` call raised by the engine with one fixed reason: end the turn with the
   question, end it with the marker line the request ends with, expect the answer as a
-  follow-up `tell`. The reason names no frame label, so it fits every Bridge frame.
+  follow-up `tell`. The reason names no frame label, so it fits every TAB frame.
   `tool.call` carries no turn identity and `turn.step` tool uses carry no call id, so a call
   is refused only when its `tool_use_id` matches a tool chunk this module passed in the
   observed main-loop step; the chunk's position among the step's tool chunks is its tool-use
@@ -196,7 +196,7 @@
 - Never let a managed Claude session or a messenger inherit Claude Code session markers
   (`CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`,
   `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and the rest of the set in
-  the Claude adapter). Agent Bridge is normally invoked from inside a Claude Code session,
+  the Claude adapter). TAB is normally invoked from inside a Claude Code session,
   and a `claude` that inherits `CLAUDE_CODE_CHILD_SESSION` treats itself as a nested child:
   it never registers its cross-session inbox, so `ListAgents` cannot find it and delivery
   fails (issue #42, observed 2026-09-24 with Claude Code 2.1.281). The removal list is
@@ -212,7 +212,7 @@
   in directly spawned non-Claude provider commands. Claude's full removal list and
   own-origin diagnostic remain unchanged. Non-provider commands on macOS and native Windows,
   including terminal automation that can start an application and helpers, drop the union
-  of the adapters' caller-session markers and Bridge's state directory, session directory,
+  of the adapters' caller-session markers and TAB's state directory, session directory,
   session id and executable variables. A child that needs one receives it explicitly. On
   Windows this includes `wt.exe`, its tab host, both PowerShell roots and console control
   helpers. The console control helper explicitly receives the selected state root;

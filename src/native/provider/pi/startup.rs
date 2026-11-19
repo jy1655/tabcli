@@ -46,7 +46,7 @@ fn send_initial_prompt_after_startup(
         loop {
             if Instant::now() >= deadline {
                 bail!(
-                    "Pi startup has not confirmed that project trust was resolved; no initial console input was sent. Resolve the prompt in the managed terminal, then close and start a new Bridge session if this request timed out"
+                    "Pi startup has not confirmed that project trust was resolved; no initial console input was sent. Resolve the prompt in the managed terminal, then close and start a new TAB session if this request timed out"
                 );
             }
             match (turn::ClaimCurrency {
@@ -67,7 +67,7 @@ fn send_initial_prompt_after_startup(
                 StartupReadiness::Absent => {}
                 StartupReadiness::Unreadable(error) => {
                     return Err(error.context(
-                        "invalid Pi startup receipt; start a new Bridge session; no initial console input was sent",
+                        "invalid Pi startup receipt; start a new TAB session; no initial console input was sent",
                     ));
                 }
                 StartupReadiness::Present(ready) => {

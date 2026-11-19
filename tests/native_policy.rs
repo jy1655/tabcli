@@ -1349,9 +1349,7 @@ fn public_identity_in_version_and_help() {
         ("--version", format!("tabcli {version}")),
         (
             "--help",
-            format!(
-                "tabcli {version}: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs"
-            ),
+            format!("tabcli {version}: TAB: visible terminal sessions for coding agent CLIs"),
         ),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))

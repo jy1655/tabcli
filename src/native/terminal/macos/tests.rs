@@ -324,7 +324,7 @@ fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {
 #[cfg(target_os = "macos")]
 #[test]
 fn terminal_app_ownership_proof_ignores_windows_that_existed_before_the_launch() {
-    const UNPROVEN: &str = "Agent Bridge could not prove the newly created Terminal.app window";
+    const UNPROVEN: &str = "TAB could not prove the newly created Terminal.app window";
     const DRIVER: &str = r#"
 on run argv
     set wantedTty to item 1 of argv

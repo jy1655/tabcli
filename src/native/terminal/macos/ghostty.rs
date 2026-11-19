@@ -269,7 +269,7 @@ on run argv
         try
             set targetWindow to first window whose id is wantedWindowId
         on error
-            error "Agent Bridge Ghostty window not found"
+            error "TAB Ghostty window not found"
         end try
         set targetTab to missing value
         repeat with candidateTab in tabs of targetWindow
@@ -278,7 +278,7 @@ on run argv
                 exit repeat
             end if
         end repeat
-        if targetTab is missing value then error "Agent Bridge Ghostty tab not found"
+        if targetTab is missing value then error "TAB Ghostty tab not found"
         set targetTerminal to missing value
         repeat with candidateTerminal in terminals of targetTab
             if id of candidateTerminal is wantedTerminalId then
@@ -286,7 +286,7 @@ on run argv
                 exit repeat
             end if
         end repeat
-        if targetTerminal is missing value then error "Agent Bridge Ghostty terminal not found"
+        if targetTerminal is missing value then error "TAB Ghostty terminal not found"
         input text promptText to targetTerminal
         send key "enter" to targetTerminal
         return "sent"
@@ -543,7 +543,7 @@ fn create_with_runner(
     runner.capable()?;
     let command = host::bootstrap(
         std::env::current_exe()
-            .context("failed to resolve Agent Bridge executable")?
+            .context("failed to resolve TAB executable")?
             .as_os_str(),
     )?;
     let before = snapshot(runner, deadline)?;
@@ -669,7 +669,7 @@ fn verify_surface_with_runner(
         super::timeout_deadline(timeout.unwrap_or(Duration::from_secs(10)))?,
     )?;
     if response != "present" {
-        bail!("Agent Bridge Ghostty owned terminal surface is missing");
+        bail!("TAB Ghostty owned terminal surface is missing");
     }
     Ok(())
 }
@@ -1064,15 +1064,15 @@ mod tests {
                 (Ok("present".into()), None),
                 (
                     Ok("missing".into()),
-                    Some("Agent Bridge Ghostty owned terminal surface is missing"),
+                    Some("TAB Ghostty owned terminal surface is missing"),
                 ),
                 (
                     Ok(String::new()),
-                    Some("Agent Bridge Ghostty owned terminal surface is missing"),
+                    Some("TAB Ghostty owned terminal surface is missing"),
                 ),
                 (
                     Ok("present\n".into()),
-                    Some("Agent Bridge Ghostty owned terminal surface is missing"),
+                    Some("TAB Ghostty owned terminal surface is missing"),
                 ),
                 (
                     Err(anyhow!("root failure").context("verify context")),

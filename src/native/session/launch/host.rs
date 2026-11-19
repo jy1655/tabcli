@@ -126,9 +126,9 @@ pub(in crate::native) enum Responsibility {
     StartupFiles,
     /// The launch deadline left no time for the step.
     Deadline,
-    /// The terminal did not identify the surface Bridge created.
+    /// The terminal did not identify the surface TAB created.
     SurfaceIdentity,
-    /// Bridge's own host step could not complete.
+    /// TAB's own host step could not complete.
     HostStep,
 }
 

@@ -87,7 +87,7 @@ pub(super) enum Decision<T> {
     /// No record: the session was launched by a binary that did not write it, and injected
     /// nothing the record describes.
     Absent,
-    /// A record Bridge cannot use: unreadable, over the bound, not UTF-8, malformed JSON, or one
+    /// A record TAB cannot use: unreadable, over the bound, not UTF-8, malformed JSON, or one
     /// that fails the validity floor. Each caller decides what that means for it.
     Unreadable(anyhow::Error),
     /// A record that passed the floor.
@@ -187,7 +187,7 @@ pub(super) fn lifecycle(directory: &Path) -> Decision<LaunchMode> {
         directory,
         FILE,
         "failed to parse Codex launch mode",
-        "Agent Bridge rejected invalid Codex launch mode",
+        "TAB rejected invalid Codex launch mode",
         LaunchMode::valid,
     )
 }
@@ -198,7 +198,7 @@ pub(super) fn notice(directory: &Path) -> Decision<NoticeMode> {
         directory,
         NOTICE_FILE,
         "failed to parse Codex question notice mode",
-        "Agent Bridge rejected invalid Codex question notice mode",
+        "TAB rejected invalid Codex question notice mode",
         NoticeMode::valid,
     )
 }

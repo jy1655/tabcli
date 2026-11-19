@@ -177,7 +177,7 @@ fn positional_and_command_specific_matrix() {
             parse_reopen(std::slice::from_ref(&value))
                 .unwrap_err()
                 .to_string(),
-            format!("invalid Agent Bridge session id: {value:?}")
+            format!("invalid TAB session id: {value:?}")
         );
     }
     for value in [

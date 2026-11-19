@@ -1,6 +1,6 @@
 # Current macOS Shell Startup Boundary
 
-- iTerm2 and WezTerm run Bridge's host as the surface program (#376). The host runs the user's
+- iTerm2 and WezTerm run TAB's host as the surface program (#376). The host runs the user's
   zsh login and interactive startup files once without a terminal (`/bin/zsh -l -i`, `setsid`,
   stdin `/dev/null`, environment on fd 3, output discarded), bounded by ten seconds and the
   launch receipt, then `execve`s `/bin/zsh -f -i -c <launch command>` with that environment.

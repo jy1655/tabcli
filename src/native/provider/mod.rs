@@ -158,7 +158,7 @@ pub(super) struct CrossSessionMessageContext<'a> {
     pub(super) bridge_executable: &'a Path,
     pub(super) directory: &'a Path,
     pub(super) provider_path: &'a Path,
-    // Adapter-selected turn correlation value, not a Bridge Request id:
+    // Adapter-selected turn correlation value, not a TAB Request id:
     // Codex uses the Claim token; Claude uses its adapter-generated claude-turn id.
     pub(super) correlation_id: &'a str,
     pub(super) prompt: &'a str,
@@ -235,7 +235,7 @@ pub(super) enum EmissionObservation {
     Unknown(String),
 }
 
-/// Whether Bridge can answer an emitted question for the provider.
+/// Whether TAB can answer an emitted question for the provider.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum QuestionResponse {
     Unsupported(&'static str),
@@ -328,8 +328,8 @@ trait NativeProviderAdapter: Sync {
     ) -> Result<super::consent::Trust>;
     fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
-    // Caller-environment variables removed from every short-lived provider query the
-    // bridge runs (version preflight, doctor probes). Each adapter states its own list;
+    // Caller-environment variables removed from every short-lived provider query that
+    // TAB runs (version preflight, doctor probes). Each adapter states its own list;
     // there is no shared default.
     fn probe_environment_removals(&self) -> &'static [&'static str];
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
@@ -606,7 +606,7 @@ mod tests {
                 if cfg!(windows) {
                     FollowUpStatic::Refused {
                         reason: "pi_input_ack_unsupported",
-                        detail: "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent: Pi startup receipt is missing".into(),
+                        detail: "this Pi session cannot acknowledge Windows input; start a new TAB session; no console input was sent: Pi startup receipt is missing".into(),
                     }
                 } else {
                     FollowUpStatic::Ok { unevaluated: &[] }

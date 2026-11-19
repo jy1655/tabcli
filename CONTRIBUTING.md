@@ -1,6 +1,6 @@
 # Contributing
 
-Send bug reports, fixes, or documentation corrections in English or Korean. Bridge's job is to
+Send bug reports, fixes, or documentation corrections in English or Korean. TAB's job is to
 launch, observe, continue, and close first-party coding-agent CLI sessions in visible terminal
 surfaces. Changes should help those operations without taking over what the provider CLI does.
 Review and support are best effort, with no promised response time.
@@ -22,7 +22,7 @@ will let us delete it. Keep provider-specific launch options, prompt delivery, a
 matching there too; shared code should track sessions rather than choose provider behavior.
 
 Proposals to replace provider-owned capabilities or attach to arbitrary existing CLI sessions
-are outside the current scope: Bridge controls sessions it launches. Read [AGENTS.md](AGENTS.md)
+are outside the current scope: TAB controls sessions it launches. Read [AGENTS.md](AGENTS.md)
 for the full rules and use the names in [CONTEXT.md](CONTEXT.md) when describing a change.
 
 ## Development setup

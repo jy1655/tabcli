@@ -1,12 +1,12 @@
 ---
 name: agent-bridge
-description: Delegate work to installed Claude Code, Codex, Agy, or Pi CLI sessions through Agent Bridge; retrieve exact results, continue conversations, and close task-owned sessions. Use when the user asks to work with another provider's coding assistant, names Agent Bridge or tabcli, asks for a separate terminal session they can watch, or has an existing Bridge session to read, continue, or close. Not for ordinary work by the current assistant alone. For a new child on the current assistant's own provider, use the assistant's own subagents unless the user named Bridge or asked for a watchable terminal session.
+description: Delegate work to installed Claude Code, Codex, Agy, or Pi CLI sessions through TAB; retrieve exact results, continue conversations, and close task-owned sessions. Use when the user asks to work with another provider's coding assistant, names TAB, tabcli, or the agent-bridge skill (with or without the hyphen), asks for a separate terminal session they can watch, or has an existing TAB session to read, continue, or close. Not for ordinary work by the current assistant alone. For a new child on the current assistant's own provider, use the assistant's own subagents unless the user named TAB or asked for a watchable terminal session.
 ---
 
-# Agent Bridge
+# TAB
 
-Use the installed `tabcli` engine to delegate the user's work. The invoking assistant and
-target provider are separate roles: any supported host can delegate to `codex`, `claude`,
+Use TAB as the product name in status updates. Run the installed `tabcli` executable.
+The invoking assistant and target provider are separate roles: any supported host can delegate to `codex`, `claude`,
 `agy`, or `pi`. Preserve the user's provider, workspace, scope, and permission choices.
 If this is itself a delegated task, do not delegate it again unless the task asks for that.
 
@@ -14,20 +14,20 @@ If this is itself a delegated task, do not delegate it again unless the task ask
 
 Decide this before any launch. These are the defaults; the user's own instructions about
 providers, models, terminals, and permissions refine them and win where they differ. The
-choice is about starting a new child: read, continue, and close an existing Bridge session
-through Bridge whatever its provider.
+choice is about starting a new child: read, continue, and close an existing TAB session
+through TAB whatever its provider.
 
-- **Another provider than yours** (for example Claude Code delegating to Codex): use Bridge.
+- **Another provider than yours** (for example Claude Code delegating to Codex): use TAB.
 - **Your own provider** (Codex to Codex, Claude Code to Claude Code): use your own subagent
   tool. The provider already connects you to its subagents, and their results come back to
-  you without a terminal. A Bridge child is a separate terminal session of its own: you can
-  read a question it asks, but you cannot answer until its request has ended. Use Bridge for
-  a same-provider child only when the user asks for Agent Bridge or tabcli (invoking this
+  you without a terminal. A TAB child is a separate terminal session of its own: you can
+  read a question it asks, but you cannot answer until its request has ended. Use TAB for
+  a same-provider child only when the user asks for TAB or tabcli (invoking this
   skill by name counts) or for a separate terminal session they can watch.
-- A request for subagents, parallel work, or orchestration does not select Bridge by itself,
+- A request for subagents, parallel work, or orchestration does not select TAB by itself,
   even when another skill prefers it.
 - If you have no subagent tool, or it cannot do what was asked, say so or do the work
-  yourself. Do not substitute Bridge without telling the user.
+  yourself. Do not substitute TAB without telling the user.
 
 ## Before launching
 
@@ -48,7 +48,7 @@ through Bridge whatever its provider.
   requested worktree when supplied. A child shares that directory: agree on file ownership
   or use a separate Git worktree when concurrent edits would collide. Do not switch another
   session's branch or overwrite its work.
-- Only the selected target CLI needs to be installed and authenticated. Bridge supports
+- Only the selected target CLI needs to be installed and authenticated. TAB supports
   macOS, native Windows, and Linux. Windows needs PowerShell 7 and defaults to
   `windows-console`. Linux detects a running local Herdr Core inside an hc terminal
   and otherwise defaults to tmux 3.2 or later. Linux opens no GUI and prints an attach
@@ -103,7 +103,7 @@ observes exact addresses together. Continue useful independent work between boun
 
 ## When a child emits a question
 
-Codex and Claude children can emit structured questions. Bridge reports that a question was
+Codex and Claude children can emit structured questions. TAB reports that a question was
 emitted, never that it is pending, was shown, or was answered, and it sends no answers.
 Absent question fields do not prove that no question was asked.
 
@@ -118,7 +118,7 @@ Absent question fields do not prove that no question was asked.
   session is `ready`. It is a new request and does not resolve the earlier emission. Never
   send it while the request is pending or type into the managed terminal.
 - If the adopted contract's `result` features include `question_deflection`, a result with
-  `question_deflected: true` means Bridge refused a Claude child's question dialog and told the
+  `question_deflected: true` means TAB refused a Claude child's question dialog and told the
   child to end its turn with the question instead of finishing. Read the result and its
   `question_emissions` (`tabcli result SESSION --request REQUEST --json`); relay the question to
   the user with your own question tool, or answer it from your own context, then continue the
@@ -134,13 +134,13 @@ Absent question fields do not prove that no question was asked.
   message does not join the running turn: read the question with `result --request` or
   `wait --questions`. What the wait means depends on the session:
   - When the adopted contract's `inspect` features include `question_notice` and the session
-    reports `capabilities.questions.response.state` `answer_after_turn`, Bridge told the child
+    reports `capabilities.questions.response.state` `answer_after_turn`, TAB told the child
     that no reply can arrive during its turn and to end the turn with a `QUESTION FOR CALLER:`
     line. Wait for the request to end. The notice is advice: a child that ignores it can keep
     its turn, and the request, open.
   - Without that state, which is the default (the user turns the notice on with
-    `settings codex-question-notice on`), Bridge told the child nothing: it may be working, or
-    waiting in its turn for a reply Bridge cannot deliver. If the request stays pending, report
+    `settings codex-question-notice on`), TAB told the child nothing: it may be working, or
+    waiting in its turn for a reply TAB cannot deliver. If the request stays pending, report
     the question and the request address to the user.
 
 ## When an operation does not finish
@@ -179,7 +179,7 @@ of launching again.
 
 Never automatically resend an uncertain delivery or restart a request merely because a
 wait expired. A failed or unresolved request needs its recorded reason assessed; do not
-rewrite Bridge records, synthesize a completion, or type directly into the managed terminal.
+rewrite TAB records, synthesize a completion, or type directly into the managed terminal.
 Use [setup and recovery](references/setup.md) for missing programs, trust/permission gates,
 incompatible versions, or unavailable provider capabilities. Report a genuine blocker with
 the request address and required user action, preserving the pending work.

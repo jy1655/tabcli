@@ -92,7 +92,7 @@ setting! {
 setting! {
     /// A launch admission preference, never close authority: whether `ask`, `reopen` and
     /// `self-test` start a session whose workspace is the Codex memory workspace or lies
-    /// inside it. Codex's background memory consolidation delegated through Bridge from
+    /// inside it. Codex's background memory consolidation delegated through TAB from
     /// there and left sessions open (issue #216), so the default refuses.
     pub(super) enum CodexMemoryWorkspace {
         #[default]

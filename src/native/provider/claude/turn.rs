@@ -222,7 +222,7 @@ pub(super) fn read(reader: &Reader) -> Result<Option<ClaudeTurn>> {
         Ok(expected) if expected.schema == pending.schema && expected.marker == pending.marker
     );
     if !valid_pending {
-        bail!("Agent Bridge rejected invalid Claude turn correlation state")
+        bail!("TAB rejected invalid Claude turn correlation state")
     }
     Ok(Some(pending))
 }
@@ -261,7 +261,7 @@ fn handle_uncorrelated_stop(store: &Store, payload: &serde_json::Value) -> Resul
 pub(super) fn on_stop_failure(store: &Store, payload: &serde_json::Value) -> Result<()> {
     if store.private(PENDING_TURN_FILE).text()?.is_some() {
         // SendMessage does not return the target prompt identity that would let
-        // Agent Bridge bind this failure to the delivered request. Leave the
+        // TAB bind this failure to the delivered request. Leave the
         // pending turn claimed instead of attributing an unrelated failure.
         return Ok(());
     }

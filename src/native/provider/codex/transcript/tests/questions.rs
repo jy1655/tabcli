@@ -323,7 +323,7 @@ fn question_wait_orders_sessions_by_input_and_validates_every_readable_address()
     )
     .unwrap();
     let error = wait(&[&first_address, &other_address, "--questions"]).unwrap_err();
-    assert!(format!("{error:#}").contains("no such Bridge request"));
+    assert!(format!("{error:#}").contains("no such TAB request"));
     assert_pending(&directory, &pending);
 }
 

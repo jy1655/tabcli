@@ -146,7 +146,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
 
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
         Ok(super::CancelSupport::Unsupported(
-            "in this release the Bridge integration for claude does not support cancel".to_owned(),
+            "in this release the TAB integration for claude does not support cancel".to_owned(),
         ))
     }
 
@@ -174,8 +174,8 @@ impl NativeProviderAdapter for ClaudeAdapter {
 
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // A `claude --version` or doctor probe is not an interactive session, but it is
-        // still a `claude` started by the bridge: it drops the same markers so that no
-        // bridge-run Claude process is classified by an inherited session identity.
+        // still a `claude` started by TAB: it drops the same markers so that no
+        // TAB-run Claude process is classified by an inherited session identity.
         launch_environment_removals()
     }
 
@@ -264,7 +264,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         match arguments {
             [action, request @ ..] if action == "message-guard" => run_message_guard(request),
             [action, request_id] if action == "message-receipt" => run_message_receipt(request_id),
-            _ => bail!("unsupported Claude Agent Bridge provider control"),
+            _ => bail!("unsupported Claude TAB provider control"),
         }
     }
 

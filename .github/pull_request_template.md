@@ -1,6 +1,6 @@
 ## Summary
 
-Describe what failed or was missing and what Bridge does after this change, in English or Korean.
+Describe what failed or was missing and what TAB does after this change, in English or Korean.
 
 Link the issue, or say there is none:
 

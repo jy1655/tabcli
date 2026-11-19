@@ -100,7 +100,7 @@ pub(super) fn hook_command(bridge_executable: &Path) -> Option<String> {
     }
 }
 
-/// The hooks Bridge injects into a new launch, in the order of the `-c hooks=` value. The set is
+/// The hooks TAB injects into a new launch, in the order of the `-c hooks=` value. The set is
 /// closed: the value, the hook-trust probe's rows and the native hook dispatch all go through it,
 /// so a new member is a compile error in the dispatch until it is handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,7 +140,7 @@ impl Hook {
         }
     }
 
-    /// The member a hook payload's event name names; any other name is none of Bridge's hooks.
+    /// The member a hook payload's event name names; any other name is none of TAB's hooks.
     pub(super) fn from_event(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|hook| hook.event() == name)
     }
@@ -214,7 +214,7 @@ pub(super) struct Eligibility {
 
 impl Eligibility {
     /// `version` is the Codex version output the launch records; one that does not parse is
-    /// unknown. `setting` is the lifecycle hooks setting, and `launcher` is whether this Bridge
+    /// unknown. `setting` is the lifecycle hooks setting, and `launcher` is whether this TAB
     /// executable has a hook command.
     pub(super) fn new(version: Option<&str>, setting: CodexLifecycleHooks, launcher: bool) -> Self {
         let version = version.and_then(|version| codex_version(version).ok());

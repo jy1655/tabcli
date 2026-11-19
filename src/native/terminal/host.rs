@@ -425,7 +425,7 @@ mod tests {
                 format!("{command} [3] refused: {command} requires one session directory"),
                 format!("{command} [4] refused: {command} requires one session directory"),
                 format!("{command} [3] refused: {command} requires an absolute session directory"),
-                format!("{command} [3] refused: invalid Agent Bridge session id: \"invalid id\""),
+                format!("{command} [3] refused: invalid TAB session id: \"invalid id\""),
                 format!("{command} [1] host {kind} <dir>"),
             ]
         };
@@ -461,9 +461,7 @@ mod tests {
             format!(
                 "{TMUX_HOST_COMMAND} [3] refused: {TMUX_HOST_COMMAND} requires an absolute session directory"
             ),
-            format!(
-                "{TMUX_HOST_COMMAND} [3] refused: invalid Agent Bridge session id: \"invalid id\""
-            ),
+            format!("{TMUX_HOST_COMMAND} [3] refused: invalid TAB session id: \"invalid id\""),
             format!("{TMUX_HOST_COMMAND} [1] refused: {form}"),
         ];
         let mut herdr = launch_host(HERDR_HOST_COMMAND, "herdr").to_vec();

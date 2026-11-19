@@ -81,11 +81,11 @@ fn preflight_preserves_first_error_and_never_writes_a_log() {
         // invalid name is refused for its name.
         assert_eq!(
             format!("{:#}", run(&shared).unwrap_err()),
-            "invalid Agent Bridge session id: \"invalid-shared\""
+            "invalid TAB session id: \"invalid-shared\""
         );
         assert_eq!(
             format!("{:#}", run(&invalid).unwrap_err()),
-            "invalid Agent Bridge session id: \"invalid-private\""
+            "invalid TAB session id: \"invalid-private\""
         );
         for path in [relative_path.as_path(), &private, &shared, &invalid] {
             assert_eq!(
@@ -129,7 +129,7 @@ fn every_host_admits_in_one_order_with_one_refusal_vocabulary() {
             let expected = if path == relative {
                 Some(format!("{name} launch directory must be absolute"))
             } else if path == invalid {
-                Some("invalid Agent Bridge session id: \"invalid-shared\"".to_string())
+                Some("invalid TAB session id: \"invalid-shared\"".to_string())
             } else if path == missing {
                 Some(format!(
                     "no such {name} launch directory: {}: {}",

@@ -4,8 +4,8 @@
 //! hc serves `\\.\pipe\herdr-core-<user>-<session>.sock` with a DACL that admits only
 //! SYSTEM and its own user, rejects remote clients, and labels the pipe with its integrity
 //! level so that a lower process cannot open an elevated core's pipe. hc itself checks no
-//! server: it connects with `SECURITY_IDENTIFICATION` only. Bridge also connects so (a
-//! server cannot act as Bridge's user), then requires the pipe's server process to run as
+//! server: it connects with `SECURITY_IDENTIFICATION` only. TAB also connects so (a
+//! server cannot act as TAB's user), then requires the pipe's server process to run as
 //! this user, from its token, as `SO_PEERCRED` and `getpeereid` prove on Unix. Every read
 //! and write is overlapped and waited for no longer than the call's deadline; one that runs
 //! out of time is cancelled and its completion collected before its buffer is released.
@@ -65,7 +65,7 @@ impl Core for Installed {
     }
 
     fn executable(&self) -> Result<PathBuf> {
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")
+        std::env::current_exe().context("failed to resolve TAB executable")
     }
 
     fn caller_terminal(&self) -> Option<String> {

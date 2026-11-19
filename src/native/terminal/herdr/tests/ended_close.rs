@@ -1,4 +1,4 @@
-//! #399: the Herdr terminal ended outside Bridge (its tab or pane was closed, `hc kill`, or its
+//! #399: the Herdr terminal ended outside TAB (its tab or pane was closed, `hc kill`, or its
 //! program exited) and took the native-session owner with it. An explicit close runs the
 //! session's real close records and decision over the scripted core; only the OS observation
 //! of the dead owner is injected.
@@ -51,7 +51,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A ready session whose Herdr terminal `t7` Bridge created on the scripted core.
+    /// A ready session whose Herdr terminal `t7` TAB created on the scripted core.
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join(SESSION);
@@ -82,7 +82,7 @@ impl Fixture {
         Store::open_unchecked(&self.directory)
     }
 
-    /// The terminal ends outside Bridge: the core keeps it, finished, with its program PID.
+    /// The terminal ends outside TAB: the core keeps it, finished, with its program PID.
     fn finish(&self) {
         self.core.set("t7", "state", json!("finished"));
     }
@@ -405,7 +405,7 @@ fn an_ended_terminal_that_changes_before_its_removal_is_left_alone() {
     }
 }
 
-// Earlier Bridge versions confirmed the launch label and generated name at creation but
+// Earlier TAB versions confirmed the launch label and generated name at creation but
 // did not save the nonce in the surface record. Keep those records usable on upgrade.
 #[test]
 fn ended_close_checks_the_launch_label_with_current_and_legacy_records() {

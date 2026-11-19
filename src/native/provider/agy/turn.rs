@@ -50,7 +50,7 @@ pub(super) fn read_pending_turn(directory: &Path) -> Result<Option<PendingAgyTur
         serde_json::from_str(&text).context("failed to parse the pending Agy turn")?;
     let expected = PendingAgyTurn::new(&pending.claim_token)?;
     if pending.schema != expected.schema || pending.marker != expected.marker {
-        bail!("Agent Bridge rejected invalid Agy turn correlation state")
+        bail!("TAB rejected invalid Agy turn correlation state")
     }
     Ok(Some(pending))
 }

@@ -7,7 +7,7 @@ no transport of its own: every launch, delivery, consent decision and close stil
 the installed `tabcli` and its provider adapters.
 
 The skill carries the general delegation rule, so it applies wherever the integration is
-installed: Bridge for another provider's assistant, the assistant's own subagents for a child on
+installed: TAB for another provider's assistant, the assistant's own subagents for a child on
 its own provider. What differs per person or machine (the terminal, a permission mode, a model
 or effort, how many sessions to run at once) belongs in your own instructions, which the skill
 tells the assistant to follow.
@@ -44,7 +44,7 @@ delivery and terminal support differ by provider and platform; see [providers](p
 
 ## Requirements
 
-### Agent Bridge CLI
+### Executable
 
 - `tabcli` 0.4.22 or newer on `PATH`, installed as described in the
   [README](../README.md#install). Check it with `tabcli --version`. The minimum CLI version is
@@ -64,7 +64,7 @@ applications and starts the target provider's CLI. The host must let its shell t
 
 Default restrictions stopped delegation in the recorded checks:
 
-- Codex with the `workspace-write` sandbox was denied access to Bridge's private state before
+- Codex with the `workspace-write` sandbox was denied access to TAB's private state before
   any session was created.
 - Agy in `--print` mode loaded the skill but denied the `tabcli` command automatically.
 
@@ -75,12 +75,12 @@ The recorded checks used them only with the user's explicit approval. The integr
 enables them, adds allow rules or changes host settings, and the skill does not pass `--yolo` to
 the target provider unless you ask.
 
-Native Windows Agy 1.4.5 also needs its native shell task kept alive when Bridge uses a console
+Native Windows Agy 1.4.5 also needs its native shell task kept alive when TAB uses a console
 window on a desktop without a shell window. A completed `run_command` lost the detached
 target's owner even with permission bypass. The successful check used Agy's `run_command`
 with `IsDaemon: true` to start `pwsh -NoLogo -NoProfile`, then `manage_task` to send commands
 and inspect output on that same task. It read the initial result before composing the
-follow-up, confirmed Bridge close, then exited the shell. The skill carries this procedure;
+follow-up, confirmed TAB close, then exited the shell. The skill carries this procedure;
 it requires those native tools to be available and does not install a background service.
 
 ### Target provider
@@ -90,7 +90,7 @@ it requires those native tools to be available and does not install a background
 - The provider executable on an absolute `PATH` entry. `tabcli` does not see shell functions or
   aliases: in the recorded checks, a `codex` that existed only as a PowerShell function failed
   the launch before a session was created.
-- The provider's workspace trust resolved for the project you delegate in. Bridge reuses only
+- The provider's workspace trust resolved for the project you delegate in. TAB reuses only
   verified existing consent for an exact workspace and never grants new trust. See
   [workspace trust and consent](security-and-data.md#workspace-trust-and-consent).
 
@@ -98,9 +98,9 @@ it requires those native tools to be available and does not install a background
 
 The skill asks the assistant to:
 
-- use Bridge for another provider's assistant, and its own subagents for a child on its own
-  provider unless you ask for Agent Bridge, `tabcli` or a separate terminal session you can
-  watch; a request for subagents or parallel work does not select Bridge by itself;
+- use TAB for another provider's assistant, and its own subagents for a child on its own
+  provider unless you ask for TAB, `tabcli` or a separate terminal session you can
+  watch; a request for subagents or parallel work does not select TAB by itself;
 - find `tabcli`, check its version and select the workspace explicitly;
 - start work with `ask`, usually with `--prompt-file` and `--detach`, and continue it with
   `tell` on the returned session;
@@ -292,7 +292,7 @@ a new session. Codex 0.163.0 has no separate plugin update command.
 
 To change a catalog to a new extracted release directory or Git tag, remove this plugin and
 its catalog with the commands below, add the new source with `marketplace add`, and install
-again. This catalog contains only Agent Bridge; do not remove an unrelated catalog.
+again. This catalog contains only TAB; do not remove an unrelated catalog.
 
 ### Remove
 
@@ -417,7 +417,7 @@ When you upgrade `tabcli`:
   session uses.
 
 Installing, updating or removing an integration does not install or update `tabcli` and does not
-change Bridge settings, consent records or session records. There is no unified updater. A
+change TAB settings, consent records or session records. There is no unified updater. A
 future updater must keep the executable paths that open sessions and their hooks use, respect
 session-format compatibility and never remove a binary still in use.
 

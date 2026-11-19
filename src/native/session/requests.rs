@@ -1,4 +1,4 @@
-//! Immutable Bridge request addresses. Provider-owned correlation still decides completion.
+//! Immutable TAB request addresses. Provider-owned correlation still decides completion.
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::turn::valid_turn_claim_token;
 
@@ -63,7 +63,7 @@ pub(in crate::native) fn validate(receipt: &Receipt) -> Result<()> {
             .iter()
             .any(|source| validate_context_source(source).is_err())
     {
-        bail!("invalid Bridge request receipt")
+        bail!("invalid TAB request receipt")
     }
     Ok(())
 }
@@ -138,13 +138,13 @@ pub(in crate::native) fn requests_directory_present(reader: &Reader) -> Result<b
     match fs::symlink_metadata(&root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!(
-                "failed to read Bridge requests: refusing linked requests directory: {}",
+                "failed to read TAB requests: refusing linked requests directory: {}",
                 root.display()
             )
         }
         Ok(metadata) if !metadata.is_dir() => {
             bail!(
-                "failed to read Bridge requests: refusing non-directory requests path: {}",
+                "failed to read TAB requests: refusing non-directory requests path: {}",
                 root.display()
             )
         }
@@ -173,7 +173,7 @@ pub(in crate::native) fn for_claim(reader: &Reader, claim_token: &str) -> Result
     };
     record::receipt(&bytes, claim_token)
         .map(Some)
-        .map_err(|error| error.context("invalid Bridge request receipt"))
+        .map_err(|error| error.context("invalid TAB request receipt"))
 }
 
 #[derive(Default)]
@@ -192,7 +192,7 @@ pub(in crate::native) fn tokens(reader: &Reader) -> Result<Option<Vec<String>>> 
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("failed to read Bridge requests"),
+        Err(error) => return Err(error).context("failed to read TAB requests"),
     };
     let mut tokens = Vec::new();
     for entry in entries {

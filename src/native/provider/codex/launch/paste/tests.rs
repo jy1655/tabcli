@@ -911,7 +911,7 @@ fn windows_transport_bytes_split_exact_framing_and_only_one_terminal_lf() {
 
 fn live_frame(prompt: &str, marker: &str) -> String {
     // The frame these live captures were made with: before #396 the shared layer put its
-    // header and a Source line ahead of the prompt. Exercise Bridge's real pre-framing trim,
+    // header and a Source line ahead of the prompt. Exercise TAB's real pre-framing trim,
     // not an invented Codex LF collapse.
     format!(
         "[Agent Bridge native delegation]\nSource: external\n\n{}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{marker}",

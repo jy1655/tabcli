@@ -10,9 +10,9 @@
   require retirement notification on every release path and a two-record publication
   protocol to avoid retaining abort authority. Tests execute the extension with real core
   writer output and round-trip its output through Rust readers. Replace these core reads
-  when Pi provides an addressed interruption endpoint and Bridge has an adapter claim
+  when Pi provides an addressed interruption endpoint and TAB has an adapter claim
   retirement boundary.
-  Both reads take Bridge's core read policy (owner's decision, 2026-11-16): a link at the
+  Both reads take TAB's core read policy (owner's decision, 2026-11-16): a link at the
   record's path, dangling or not, or any entry that is not a regular file is refused, and
   the bytes are decoded as fatal UTF-8; a refusal reads as no Claim or no cancel intent.
   The extension is copied into the session directory at launch, so a Pi session already
@@ -20,7 +20,7 @@
   invalid UTF-8 lossily, until it is relaunched.
 
 - Native Windows Pi input has no verified addressed first-party endpoint with per-turn
-  acceptance. Bridge requires the installed extension's actual schema 2 startup record
+  acceptance. TAB requires the installed extension's actual schema 2 startup record
   with `input_ack_schema: 1` before one console attempt, never a version inference.
   The extension matches the complete framed prompt's SHA-256 and UTF-8 byte length to
   Pi pending state at `before_agent_start`. Reading the whole trimmed core `turn.claim`
@@ -34,7 +34,7 @@
   retirement or close, then re-read once; later publication can still leave Uncertain.
   Never resend text or Return. This fallback assumes no concurrent input and cannot
   distinguish a manual exact copy of the framed prompt. Keep open sessions on the same
-  or a newer Bridge binary, including `AGENT_BRIDGE_EXECUTABLE`: older follow-ups can
+  or a newer TAB binary, including `AGENT_BRIDGE_EXECUTABLE`: older follow-ups can
   strip the startup input capability. Replace this fallback when Pi exposes addressed
   interactive input with per-turn acceptance identity.
   A Windows Herdr terminal keeps this contract unchanged (the same framing, startup wait and
@@ -70,7 +70,7 @@
   inference. Other modules do not read Pi's acceptance record.
 - Retry and compaction can settle without a new aborted `agent_end`; record what Pi
   reports, not what the cancel intended. Pi returns queued messages to the editor on
-  abort. Bridge uses no Pi queue and deletes no editor input. Tell the user to check
+  abort. TAB uses no Pi queue and deletes no editor input. Tell the user to check
   the surface before another `tell`, whose paste can combine with restored input.
 - Usage comes only from the signal Pi documents as usage: the `usage` of every assistant
   message, which the extension sums over every `agent_end` of the correlated claim until

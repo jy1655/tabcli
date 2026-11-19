@@ -416,9 +416,9 @@ fn timeline_names_every_receipt_the_request_index_refuses() {
         std::collections::BTreeMap::from([
             (
                 "requests/123-457-1.json",
-                "Bridge request receipt belongs to a different claim"
+                "TAB request receipt belongs to a different claim"
             ),
-            ("requests/123-459-3.json", "invalid Bridge request receipt"),
+            ("requests/123-459-3.json", "invalid TAB request receipt"),
             (
                 "requests/123-460-4.json",
                 "key must be a string at line 1 column 2"
@@ -1000,7 +1000,7 @@ fn result_human_output_reports_bridge_elapsed_and_legacy_reason() {
     };
     assert!(
         human(&["result", "session-observe", "--latest"])
-            .contains("Bridge observed elapsed: not computable (missing_receipt)")
+            .contains("TAB observed elapsed: not computable (missing_receipt)")
     );
     fs::create_dir(fixture.directory.join("requests")).unwrap();
     write(
@@ -1012,11 +1012,9 @@ fn result_human_output_reports_bridge_elapsed_and_legacy_reason() {
     );
     assert!(
         human(&["result", "session-observe", "--request", "request-elapsed"])
-            .contains("Bridge observed elapsed: 2 ms")
+            .contains("TAB observed elapsed: 2 ms")
     );
-    assert!(
-        human(&["result", "session-observe", "--list"]).contains("Bridge observed elapsed: 2 ms")
-    );
+    assert!(human(&["result", "session-observe", "--list"]).contains("TAB observed elapsed: 2 ms"));
 }
 
 #[test]
@@ -2297,7 +2295,7 @@ fn cancel_without_provider_capability_refuses_without_changing_claim_or_intent()
                 "this session was started by an extension without cancel support; start a new session".to_owned()
             } else {
                 format!(
-                    "in this release the Bridge integration for {provider} does not support cancel"
+                    "in this release the TAB integration for {provider} does not support cancel"
                 )
             };
             assert_eq!(

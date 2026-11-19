@@ -70,7 +70,7 @@ pub(super) fn run(request: SessionsRequest) -> Result<()> {
     if request.json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else if sessions.is_empty() {
-        println!("no native Agent Bridge sessions");
+        println!("no native TAB sessions");
     } else {
         for session in sessions {
             println!(

@@ -1442,11 +1442,10 @@ fn host_launch_command<'a>(
     attempt: &str,
     command: &str,
 ) -> Result<(&'a str, String)> {
-    let executable =
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let executable = std::env::current_exe().context("failed to resolve TAB executable")?;
     let executable = executable
         .to_str()
-        .context("Agent Bridge executable path is not valid UTF-8")?;
+        .context("TAB executable path is not valid UTF-8")?;
     let directory_text = directory
         .to_str()
         .context("Warp session directory is not valid UTF-8")?;

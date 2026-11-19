@@ -136,10 +136,10 @@ fn run_native_adapter_smoke(provider: &str) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let title = format!("Agent Bridge live {provider} {nonce} 한글");
+    let title = format!("TAB live {provider} {nonce} 한글");
     let prompt = format!("Reply with exactly this marker and nothing else: {marker}");
     let prompt_directory = tempfile::Builder::new()
-        .prefix("Agent Bridge LIVE prompts ")
+        .prefix("TAB LIVE prompts ")
         .tempdir()
         .unwrap();
     let initial_prompt_path = prompt_directory.path().join("초기 prompt 입력.txt");

@@ -37,7 +37,7 @@ pub(super) struct Frame {
 // Use native command creation and an interactive clean shell for foreground jobs.
 // Source only the host-proven launch; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(super) fn bootstrap(executable: &OsStr) -> Result<String> {
-    validate_shell_command_component(executable, "Agent Bridge executable")?;
+    validate_shell_command_component(executable, "TAB executable")?;
     Ok(format!(
         "/bin/zsh -f -i -c {}",
         crate::native::terminal::shell_quote(OsStr::new(&format!(

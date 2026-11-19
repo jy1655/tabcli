@@ -50,7 +50,7 @@ on soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
             end if
         end if
     end repeat
-    if matchCount is not 1 then error "Agent Bridge could not prove the newly created Terminal.app window"
+    if matchCount is not 1 then error "TAB could not prove the newly created Terminal.app window"
     return matchedWindowId
 end soleNewWindowWithTty
 
@@ -97,8 +97,8 @@ on run argv
         set targetTty to tty of targetTab
         set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)
         set targetWindow to first window whose id is targetWindowId
-        if id of targetWindow is not targetWindowId then error "Agent Bridge lost its newly created Terminal.app window"
-        if tty of targetTab is not targetTty then error "Agent Bridge lost its newly created Terminal.app tty"
+        if id of targetWindow is not targetWindowId then error "TAB lost its newly created Terminal.app window"
+        if tty of targetTab is not targetTty then error "TAB lost its newly created Terminal.app tty"
         -- Terminal is not brought forward, and the new window does not keep the
         -- keyboard. The front position is taken back only from the new window: a
         -- window the user chose meanwhile stays in front. It is given only to a
@@ -121,12 +121,12 @@ on run argv
     set wantedWindowId to item 2 of argv as integer
     set promptPath to item 3 of argv
     set promptText to read (POSIX file promptPath) as «class utf8»
-    if not application "Terminal" is running then error "Agent Bridge Terminal.app send: not running"
+    if not application "Terminal" is running then error "TAB Terminal.app send: not running"
     tell application "Terminal"
         try
             set targetWindow to first window whose id is wantedWindowId
         on error
-            error "Agent Bridge Terminal.app window not found"
+            error "TAB Terminal.app window not found"
         end try
         set targetTab to missing value
         set matchCount to 0
@@ -136,9 +136,9 @@ on run argv
                 set matchCount to matchCount + 1
             end if
         end repeat
-        if matchCount is not 1 then error "Agent Bridge Terminal.app ownership proof did not match exactly one tab"
-        if id of targetWindow is not wantedWindowId then error "Agent Bridge Terminal.app window identity changed"
-        if tty of targetTab is not wantedTty then error "Agent Bridge Terminal.app tty identity changed"
+        if matchCount is not 1 then error "TAB Terminal.app ownership proof did not match exactly one tab"
+        if id of targetWindow is not wantedWindowId then error "TAB Terminal.app window identity changed"
+        if tty of targetTab is not wantedTty then error "TAB Terminal.app tty identity changed"
         do script promptText in targetTab
         return "sent"
     end tell
@@ -159,8 +159,8 @@ on run argv
             if tty of candidateTab is wantedTty then set matchCount to matchCount + 1
         end repeat
         if matchCount is 1 then return wantedTty
-        if matchCount is 0 then error "Agent Bridge Terminal.app window no longer matches a tab of the recorded tty"
-        error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
+        if matchCount is 0 then error "TAB Terminal.app window no longer matches a tab of the recorded tty"
+        error "TAB Terminal.app ownership proof matched multiple tabs"
     end tell
 end run
 "#;
@@ -188,9 +188,9 @@ on run argv
                 set matchCount to matchCount + 1
             end if
         end repeat
-        if matchCount is 0 then error "Agent Bridge Terminal.app window no longer holds its tab"
-        if matchCount is not 1 then error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
-        if (count of tabs of targetWindow) is not 1 then error "Agent Bridge refuses to close a Terminal.app window containing another tab"
+        if matchCount is 0 then error "TAB Terminal.app window no longer holds its tab"
+        if matchCount is not 1 then error "TAB Terminal.app ownership proof matched multiple tabs"
+        if (count of tabs of targetWindow) is not 1 then error "TAB refuses to close a Terminal.app window containing another tab"
 
         -- Rust terminates the attested foreground process group before this
         -- script runs. Wait for Terminal to observe that transition without
@@ -199,11 +199,11 @@ on run argv
             if not busy of targetTab then exit repeat
             delay 0.05
         end repeat
-        if busy of targetTab then error "Agent Bridge could not stop the foreground process in its Terminal.app tab"
+        if busy of targetTab then error "TAB could not stop the foreground process in its Terminal.app tab"
 
-        if id of targetWindow is not wantedWindowId then error "Agent Bridge Terminal.app window identity changed before close"
-        if not my isOwnedTty(tty of targetTab, wantedTty) then error "Agent Bridge Terminal.app tab changed before close"
-        if (count of tabs of targetWindow) is not 1 then error "Agent Bridge refuses to close a Terminal.app window containing another tab"
+        if id of targetWindow is not wantedWindowId then error "TAB Terminal.app window identity changed before close"
+        if not my isOwnedTty(tty of targetTab, wantedTty) then error "TAB Terminal.app tab changed before close"
+        if (count of tabs of targetWindow) is not 1 then error "TAB refuses to close a Terminal.app window containing another tab"
         close targetWindow
         return "closed"
     end tell
@@ -262,8 +262,7 @@ fn create_tab(
 }
 
 fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
-    let executable =
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let executable = std::env::current_exe().context("failed to resolve TAB executable")?;
     let host = format!(
         "{} {HOST_COMMAND} {}",
         crate::native::terminal::shell_quote(executable.as_os_str()),
@@ -381,7 +380,7 @@ fn verify_tab_with_deadline(
         deadline,
     )?;
     if response != session.id {
-        bail!("Agent Bridge Terminal.app owned tab is missing");
+        bail!("TAB Terminal.app owned tab is missing");
     }
     Ok(response)
 }
@@ -669,7 +668,7 @@ pub(in crate::native) const SCREEN_SCRIPT: &str = r#"
 on run argv
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
-    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
+    if not application "Terminal" is running then error "TAB Terminal.app screen: not running"
     tell application "Terminal"
         set w to first window whose id is wantedWindowId
         set matchedTab to missing value
@@ -687,7 +686,7 @@ on run argv
 end run
 
 on screenOf(w, wantedTty)
-    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
+    if not application "Terminal" is running then error "TAB Terminal.app screen: not running"
     tell application "Terminal"
         -- "contents of <variable>" dereferences an AppleScript reference; use
         -- the tab specifier to read Terminal's text property instead.
@@ -696,7 +695,7 @@ on screenOf(w, wantedTty)
 end screenOf
 
 on sendKey(targetTab, keyName)
-    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
+    if not application "Terminal" is running then error "TAB Terminal.app screen: not running"
     tell application "Terminal"
         if keyName is "down-enter" then
             do script ((ASCII character 27) & "[B") in targetTab
@@ -1237,7 +1236,7 @@ mod tests {
     const LIVE: &str = r#"{id:8341, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
     // The form that windows 8341 and 8345 reported after their shells were killed
     // with no confirmation pending: the old name followed by U+0001
-    // (docs/verification/2026-10-01-terminal-proof.md). Bridge kills the shell
+    // (docs/verification/2026-10-01-terminal-proof.md). TAB kills the shell
     // before it closes the window.
     const KILLED: &str = r#"{id:8341, tabs:{{tty:"/dev/ttys014" & (character id 1), busy:false}}}"#;
     const CHANGED: &str = r#"{id:8341, tabs:{{tty:"/dev/ttys020", busy:false}}}"#;
@@ -1383,7 +1382,7 @@ mod tests {
     }
 
     // An Apple Event to a Terminal that is not running launches it, without the
-    // windows Bridge created.
+    // windows TAB created.
     const MOCK: &str = r#"
 on mockEvent()
     if not mockRunning then
@@ -1546,17 +1545,17 @@ end mockClose
             (
                 SEND_FILE_SCRIPT,
                 vec![TTY, WINDOW, path],
-                "Agent Bridge Terminal.app send: not running",
+                "TAB Terminal.app send: not running",
             ),
             (
                 super::SCREEN_SCRIPT,
                 vec![TTY, WINDOW],
-                "Agent Bridge Terminal.app screen: not running",
+                "TAB Terminal.app screen: not running",
             ),
             (
                 super::SCREEN_SCRIPT,
                 vec![TTY, WINDOW, "trust this directory?", "enter"],
-                "Agent Bridge Terminal.app screen: not running",
+                "TAB Terminal.app screen: not running",
             ),
         ] {
             let (response, events) = replay(script, &STOPPED, &args);
@@ -1611,7 +1610,7 @@ end mockClose
             let (response, events) = replay(&script, &STOPPED, &[]);
             let error = response.unwrap_err();
             assert!(
-                error.contains("Agent Bridge Terminal.app screen: not running"),
+                error.contains("TAB Terminal.app screen: not running"),
                 "{error}"
             );
             assert!(events.is_empty(), "{events:?}");
@@ -1636,7 +1635,7 @@ end mockClose
         assert!(failure.delivery_may_have_occurred());
         let error = format!("{:#}", failure.error());
         assert!(
-            error.contains("Agent Bridge Terminal.app send: not running"),
+            error.contains("TAB Terminal.app send: not running"),
             "{error}"
         );
         assert!(!error.contains("launched Terminal"), "{error}");
@@ -2526,7 +2525,7 @@ end run
         let unnamed = root.path().join("not-a-session");
         std::fs::create_dir(&unnamed).unwrap();
         crate::native::session::primitives::set_private_directory_permissions(&unnamed).unwrap();
-        refused(&unnamed, "invalid Agent Bridge session id");
+        refused(&unnamed, "invalid TAB session id");
 
         refused(
             &root.path().join("session-missing"),

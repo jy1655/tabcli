@@ -20,7 +20,7 @@ pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
 
 // Records the spawned provider process before the session leaves its launch state. The
 // caller still holds the child handle, so on Windows the pid cannot have been reused
-// between the spawn and the identity query. The record names the process Bridge spawned:
+// between the spawn and the identity query. The record names the process TAB spawned:
 // for a native executable that is the provider itself; for a `.ps1` or `.cmd` shim it is
 // the shim, which waits on the provider and whose own survival is what the record can
 // verify.
@@ -258,7 +258,7 @@ pub(in crate::native) fn configure_provider_launch(
     provider_stderr(command);
 }
 
-/// The shell redirects only Bridge's stderr. The provider keeps the original terminal
+/// The shell redirects only TAB's stderr. The provider keeps the original terminal
 /// stderr, so logging does not turn its interactive surface into a pipe or a file.
 pub(in crate::native) fn provider_stderr(command: &mut Command) {
     command.env_remove(STDERR_ENV);

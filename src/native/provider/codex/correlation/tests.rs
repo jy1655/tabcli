@@ -125,7 +125,7 @@ fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
     assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
 }
 
-// Issue #65. A message typed into the managed TUI while Bridge's turn was running is
+// Issue #65. A message typed into the managed TUI while TAB's turn was running is
 // steered into that turn: the completion's `input-messages` carries the framed prompt
 // first and the typed text last, and the answer follows both (codex-cli 0.163.0, macOS,
 // 2026-10-17, session-g3V0ph; both payloads recorded with a temporary build). The title
@@ -159,7 +159,7 @@ fn codex_hook_accepts_the_turn_steered_by_a_message_typed_into_the_tui() {
     ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
     assert!(event_paths(directory.path()).unwrap().is_empty());
 
-    // The typed text alone, as Codex would report a turn of its own, is not Bridge's turn.
+    // The typed text alone, as Codex would report a turn of its own, is not TAB's turn.
     ADAPTER
         .handle_hook(
             directory.path(),
@@ -216,7 +216,7 @@ fn codex_hook_accepts_the_turn_steered_by_a_message_typed_into_the_tui() {
 
 // With `/ide` on, the TUI puts its IDE context in front of the message
 // (codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3). That turn is still the
-// one Bridge started; the title turn that quotes it is not. Not observed live: the
+// one TAB started; the title turn that quotes it is not. Not observed live: the
 // wrapper is taken from Codex's source.
 #[test]
 fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
@@ -242,7 +242,7 @@ fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
     for refused in [
         // The title turn quotes the whole message, context included.
         format!("Generate a concise, single-line task title.\n\nUser prompt:\n{with_context}"),
-        // A context without Bridge's prompt behind any request heading.
+        // A context without TAB's prompt behind any request heading.
         format!(
             "# Context from my IDE setup:\n\n## My request for Codex:\nSummarise this.\n{}",
             pending.marker

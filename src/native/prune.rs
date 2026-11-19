@@ -72,7 +72,7 @@ pub(super) fn run(request: PruneRequest) -> Result<()> {
             }))?
         );
     } else if removed.is_empty() {
-        println!("no eligible closed Agent Bridge sessions");
+        println!("no eligible closed TAB sessions");
     } else {
         for id in &removed {
             println!("pruned {id}");

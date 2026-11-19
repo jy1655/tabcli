@@ -201,7 +201,7 @@ pub(super) fn tool_confirmation_check(
         Ok(Some((tool, request_id))) => (
             Reason::AGY_TOOL_CONFIRMATION_OBSERVED,
             format!(
-                "This session's {AGY_LOG_FILE} shows the pending turn waiting for user approval of {tool} in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open."
+                "This session's {AGY_LOG_FILE} shows the pending turn waiting for user approval of {tool} in the terminal. TAB does not answer it. This is the last observed confirmation, not proof that the dialog is still open."
             ),
             serde_json::json!({"log": directory.join(AGY_LOG_FILE), "tool": tool, "request_id": request_id}),
         ),
@@ -219,7 +219,7 @@ pub(super) fn tool_confirmation_check(
         ),
     };
     Check::new(CheckId::AGY_TOOL_CONFIRMATION, Unknown, reason, detail,
-        "Observation only. Review any approval prompt in the managed terminal yourself; Bridge does not approve, resend, or release the turn claim.")
+        "Observation only. Review any approval prompt in the managed terminal yourself; TAB does not approve, resend, or release the turn claim.")
         .evidence(evidence)
 }
 

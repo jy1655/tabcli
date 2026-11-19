@@ -1,6 +1,6 @@
 # Command reference
 
-Terminal Agent Bridge (TAB) is installed as `tabcli`.
+TAB is installed as `tabcli`.
 
 ## Discover the command contract
 
@@ -43,7 +43,7 @@ command reads the visible text of a managed terminal surface: `screen` returns i
 Feature keys are scoped to their command. `result.features` containing `question_emissions`
 and `wait.features` containing `questions` and `after_question` advertise the existing question
 observation interface. They do not prove that a particular provider/session can observe a question,
-that a dialog is pending, or that Bridge can answer it. A question return from `wait` with
+that a dialog is pending, or that TAB can answer it. A question return from `wait` with
 `ended: null` is not completion. Keep the request address and use the returned cursor on the next wait.
 `question_deflection` in the features of `ask`, `tell`, `reopen`, `result`, `wait`, `status` and
 `inspect` advertises the [question deflection](#question-deflection) fields in that command's JSON,
@@ -69,7 +69,7 @@ for `tabcli <COMMAND> --help`.
 
 Use `ask` to start a provider session, `result` to read its result, `tell` to continue it, and
 `close-session` to close it when you are done. These commands leave the provider visible in a
-terminal surface: the tab, window, pane, or console that Bridge creates for the session.
+terminal surface: the tab, window, pane, or console that TAB creates for the session.
 
 Start in a project directory with an installed, authenticated provider. This example uses Codex with
 its defaults. Replace `/path/to/project` with your directory, then use the ids printed by your own
@@ -104,7 +104,7 @@ tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --json
 }
 ```
 
-The session stays open after a result. Send a follow-up to continue the same conversation; Bridge
+The session stays open after a result. Send a follow-up to continue the same conversation; TAB
 gives it a new request id.
 
 ```sh
@@ -132,7 +132,7 @@ For a timeout or delivery error, use the
 [shared recovery instructions](#shared-prompt-and-output-options) before sending another prompt.
 
 The synopses below use `PROVIDER` for `codex`, `claude`, `agy`, or `pi`. `SESSION` and `REQUEST` are
-Bridge ids, not the provider's conversation or turn ids. See [providers](providers.md) for
+TAB ids, not the provider's conversation or turn ids. See [providers](providers.md) for
 installation requirements and [terminals](terminals.md) for terminal selection.
 
 Run `tabcli --help` (or `-h`) for the main help and `tabcli --version` (or `-V`) for the
@@ -177,20 +177,20 @@ remain nonempty. They are record labels; a terminal can also use its own ownersh
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
 
-`--model` and `--effort` default to no Bridge override and must be nonempty when provided. Provider
+`--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort
-option, or Pi's thinking option; Bridge does not enumerate allowed effort values. Model strings are
+option, or Pi's thinking option; TAB does not enumerate allowed effort values. Model strings are
 forwarded with provider-specific normalization described in
 [providers](providers.md). These options configure the new session only.
 
-`--yolo` defaults to off and is never inherited as a Bridge option. When explicitly supplied, Codex,
+`--yolo` defaults to off and is never inherited as a TAB option. When explicitly supplied, Codex,
 Claude, and Agy receive their native bypass options; Pi receives its project-local trust approval
 option, while its native tool policy remains in force. Provider settings and environment still
 matter. This option is not a universal way to dismiss workspace trust dialogs: Claude Code
-2.1.321 shows its workspace trust dialog under bypass too, and Bridge answers it only with
+2.1.321 shows its workspace trust dialog under bypass too, and TAB answers it only with
 verified consent for the exact workspace, as without `--yolo`. When the folder's
 `.claude/settings.local.json` pre-approves tool permissions, Claude Code 2.1.322 adds a
-paragraph about them to that dialog; Bridge answers that form only for a session launched with
+paragraph about them to that dialog; TAB answers that form only for a session launched with
 `--yolo`, because "Yes" there accepts those pre-approvals too, and only when the paragraph
 lists exactly two permissions, the one form observed so far.
 
@@ -207,12 +207,12 @@ After arguments have been parsed successfully, with `--json`, failures before a 
 print an error object containing only `ok: false`, `error`, `schema_version`, and the optional
 [`failure_kind`](#failure_kind) hint; later failures include the request address.
 
-Without `--detach`, exit 0 means Bridge received a successful result. With it, exit 0 means the
+Without `--detach`, exit 0 means TAB received a successful result. With it, exit 0 means the
 launch and delivery steps succeeded; retrieve the result using the returned request id.
 
 Launch admission runs once the workspace is resolved and before the provider CLI is checked or any
 session record, consent record, or terminal surface exists. With the default setting
-`codex-memory-workspace refuse`, Bridge refuses a workspace that is the Codex memory workspace or lies
+`codex-memory-workspace refuse`, TAB refuses a workspace that is the Codex memory workspace or lies
 inside it, whatever the target provider:
 
 ```text
@@ -227,7 +227,7 @@ rejected; and with neither `HOME` nor `USERPROFILE` the launch fails even when `
 Both paths are compared after resolving links, by whole path components, so a sibling such as
 `memories-other` is outside. A memory workspace that does not exist protects nothing; one that cannot
 be resolved, or that is not a directory, fails the launch. The rule exists because Codex's
-background memory consolidation started Bridge sessions there that nobody closed; it also refuses a
+background memory consolidation started TAB sessions there that nobody closed; it also refuses a
 launch you start there yourself. Run `tabcli settings codex-memory-workspace allow` in the same
 state root to permit it. The refusal uses the error object above; no session or request id exists.
 
@@ -241,9 +241,9 @@ close the session and start a new one. Do not resend after uncertain delivery. F
 inspect the session if no dialog is present.
 
 If answering the trust dialog with verified consent fails, the error keeps any note that a key may
-have reached the dialog. A prompt that Bridge delivers after launch (Claude, and Agy on native
+have reached the dialog. A prompt that TAB delivers after launch (Claude, and Agy on native
 Windows) was not sent. While the session is still `awaiting-initial-input` and the request still
-holds its claim, Bridge records the request as `failed` with `provenance: "delivery_not_sent"` and
+holds its claim, TAB records the request as `failed` with `provenance: "delivery_not_sent"` and
 the session as `failed`; close it and start a new one. Other outcomes are left as recorded for
 inspection: an argument-delivered prompt (Agy on macOS) keeps its claim because Agy already has
 it; a provider that exited first, or a close, leaves the request `unresolved`; if recording the
@@ -267,7 +267,7 @@ tabcli tell SESSION (--prompt TEXT | --prompt-file PATH)
 
 See the command and output in the [opening workflow](#command-reference).
 
-Bridge checks the hold before changing any target records, then finishes interrupted record
+TAB checks the hold before changing any target records, then finishes interrupted record
 updates and verifies that it still controls the surface. The session must be `ready` and not held;
 an unfinished request blocks another follow-up. A hold set after delivery began does not stop that
 turn. All listed options follow the shared rules; the timeout defaults to 900 seconds. There are no workspace, model,
@@ -284,7 +284,7 @@ terminal fallback. See [providers](providers.md) for readiness and receipt gates
 On native Windows, Codex follow-ups also have a measured command-line size refusal; see the
 [Codex send-side limit](providers.md#codex) for the limit and remedy.
 On native Windows, Pi waits for its extension's per-turn submission receipt even with `--detach`.
-That wait shares the request deadline. Bridge refuses input before typing when the session's
+That wait shares the request deadline. TAB refuses input before typing when the session's
 extension did not report the required capability. See
 [Pi](providers.md#pi) for uncertain-delivery recovery and receipt limits.
 
@@ -292,9 +292,9 @@ Exit behaviour matches `ask`. If you see `tell requires the ready state`, inspec
 wait for its active request with `result SESSION --request REQUEST --wait`. A closed session cannot
 accept `tell`; use `reopen` where supported or start a new session.
 
-For an ownership error, run `doctor SESSION` and check the managed surface. Bridge refuses input
+For an ownership error, run `doctor SESSION` and check the managed surface. TAB refuses input
 when it cannot prove that it controls that surface. For `delivery uncertain`, inspect the request
-named in the error. Bridge has not proved whether the provider received it and keeps the claim to
+named in the error. TAB has not proved whether the provider received it and keeps the claim to
 block duplicate delivery. Wait for that request or close the session; do not repeat `tell`.
 
 ## hold
@@ -305,7 +305,7 @@ Record or release the user's request to refuse further follow-ups.
 tabcli hold SESSION [--release] [--json]
 ```
 
-A hold refuses a follow-up whose delivery Bridge has not yet allowed to start. It does not stop
+A hold refuses a follow-up whose delivery TAB has not yet allowed to start. It does not stop
 an already allowed delivery, the current turn, the initial prompt, or direct input to the surface.
 `hold SESSION --release` allows later follow-ups to pass the hold check; they still require `ready`.
 An unreadable hold record also refuses admission until its intent can be read.
@@ -352,7 +352,7 @@ intent is no longer visible. A damaged cancel record does not hide a published R
 
 ## reopen
 
-Use `reopen` to continue a closed Claude conversation on native Windows in a new Bridge session.
+Use `reopen` to continue a closed Claude conversation on native Windows in a new TAB session.
 
 ```text
 tabcli reopen SESSION (--prompt TEXT | --prompt-file PATH) [--title NAME]
@@ -381,16 +381,16 @@ tabcli reopen session-C4r8Ta --prompt "Continue the review." --json
 This command supports only Claude Code on native Windows; the example assumes the source is a closed
 Claude session. The source must be closed, have a recorded Claude conversation id, and have readable
 results for its recorded requests. The workspace is reused from the source and must still exist.
-Bridge saves a marker on the source to allow only one reopen from it. Workspace consent is
+TAB saves a marker on the source to allow only one reopen from it. Workspace consent is
 assessed for the new session exactly as `ask` assesses it, from the current trust stores and
-Bridge's shared consent records, never from the source session's records; with verified consent
+TAB's shared consent records, never from the source session's records; with verified consent
 and without `--yolo`, a reopened session can take the same guarded trust-dialog answer as a fresh
 `ask`. The assessment and its record precede the source marker, so a failure in either leaves
 the source reopenable.
 
 Options follow `ask`, with a 900-second default timeout. The default title is `<provider> ·
 <workspace-basename> (reopened <source-session>)`. Model, effort, and bypass options are not copied
-from the source manifest: Bridge forwards only explicit overrides. Claude can restore its own
+from the source manifest: TAB forwards only explicit overrides. Claude can restore its own
 conversation settings, so omitting `--yolo` does not establish that bypass is off. There is no
 `--workspace` or `--context-result` option.
 
@@ -407,7 +407,7 @@ Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsuppor
 `source-not-closed`, `source-not-converged`, `request-unresolved`, and `source-identity-missing`.
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
 SESSION --explicit` on the source, then inspect it again. `request-unresolved` and
-`source-identity-missing` mean Bridge cannot verify the recorded results or find a conversation to
+`source-identity-missing` mean TAB cannot verify the recorded results or find a conversation to
 resume; inspect the source and use a new `ask` if that evidence is unavailable. A request that this
 release settled as `Delivery::NotSent` is a recorded `failed` request (`delivery_not_sent`) and does
 not block reopen. A receipt without any event does: one recorded by an earlier release, or a
@@ -425,7 +425,7 @@ new session is left failed with the refusal recorded, the source marker is relea
 command, or by the next `reopen` if the command did not get that far, and a new `reopen` of the
 source is admitted.
 
-`launch-failed` means the launcher failed after the initial request was recorded. Bridge
+`launch-failed` means the launcher failed after the initial request was recorded. TAB
 releases the source marker only with a matching launch receipt and proof that no provider
 spawn remains unresolved, or that the recorded provider process is verified gone. Live or
 unverifiable processes and missing, damaged or mismatched records retain the marker. A
@@ -438,11 +438,11 @@ stop the other resume yourself before trying another delivery. Run `doctor SESSI
 `reopen-verification-failed` or `already-reopened`; it reports other live holders and retained
 markers. Do not delete a marker to force a second resume.
 
-Bridge checks for other live holders before starting Claude, after registration, before initial
+TAB checks for other live holders before starting Claude, after registration, before initial
 delivery, and before each follow-up. These checks do not reserve the conversation; another Claude
 resume can start between them.
 
-After refusing a launch, Bridge releases the source marker only when it proves the refused launch
+After refusing a launch, TAB releases the source marker only when it proves the refused launch
 cannot still hold the conversation. Otherwise it keeps the marker. A later `reopen` checks the
 recorded refusal again and can release the marker once the provider process is verified gone.
 `doctor` reports this condition but never releases the marker. See [architecture](architecture.md).
@@ -484,7 +484,7 @@ Each row also carries `origin` and `origin_observation`, read the same way as in
 reading only observes: it runs after the repair above and changes no record.
 
 Human rows show id, state, provider, workspace, terminal, bypass flag, and recorded event count. An
-empty list prints `no native Agent Bridge sessions`. JSON is an array, not an `ok` envelope. The
+empty list prints `no native TAB sessions`. JSON is an array, not an `ok` envelope. The
 `results` count includes recorded events, not only successful published results. See the [JSON field
 reference](#json-field-reference).
 
@@ -590,7 +590,7 @@ See the [JSON field reference](#json-field-reference).
 
 ## inspect
 
-Use `inspect` after a timeout or delivery error to read what Bridge recorded without changing it.
+Use `inspect` after a timeout or delivery error to read what TAB recorded without changing it.
 
 ```text
 tabcli inspect SESSION [--timeline [--request REQUEST]] [--json]
@@ -665,7 +665,7 @@ change the session right after inspect releases its lock, and `cancel` rechecks 
 admissible cancel records intent only; it does not prove interruption or completion. Human and
 timeline output do not include capabilities.
 
-`capabilities.tell` evaluates only the gates `tell` decides from Bridge records, in the command's
+`capabilities.tell` evaluates only the gates `tell` decides from TAB records, in the command's
 order, and stops at the first gate that does not pass: the hold; what interrupted-update recovery
 and dead-owner repair would find about the owner's liveness, without performing either; the
 recorded terminal handle; the owner record's side of the surface ownership check, which `tell`'s
@@ -744,9 +744,9 @@ for observing question emissions:
 will be observed. A Codex session launched by 0.4.17 to 0.4.19 records the hook injection, but its
 transcript watcher records no question emissions. A malformed or unsupported launch record is
 `unknown` with `evidence_unreadable` and `detail`, never `unavailable`, as is a Claude question
-plugin manifest that is empty, is not valid JSON or does not name the plugin Bridge prepares.
+plugin manifest that is empty, is not valid JSON or does not name the plugin TAB prepares.
 
-Bridge has no addressed way to answer an open question dialog, and none of these fields grants
+TAB has no addressed way to answer an open question dialog, and none of these fields grants
 one. `response` reports the answer path the session's own launch records configured:
 
 | provider | state | reason |
@@ -842,7 +842,7 @@ WezTerm is addressed only through the recorded GUI process's own socket with `--
 Like every scripted read, the first read from an application that has no macOS Automation consent
 for the terminal can show the system's consent prompt; see [macOS permissions](macos-permissions.md).
 
-On native Windows the read runs Bridge's console helper, which attaches to the session's console.
+On native Windows the read runs TAB's console helper, which attaches to the session's console.
 The helper is started with the default creation flags, so a caller without a console of its own
 can get a console window from it, which can take the foreground. This is not verified; starting
 the screen helper detached is a follow-up.
@@ -855,7 +855,7 @@ that much after the deadline.
 
 Human output is the text alone, so it can be piped; control characters other than line feed and
 tab are escaped as in other human output. JSON `screen` is the text exactly as the adapter reported
-it, `terminal` is the recorded terminal kind, and `observed_unix_ms` is when Bridge received the
+it, `terminal` is the recorded terminal kind, and `observed_unix_ms` is when TAB received the
 text, not when the terminal drew it. At most 512 KiB of UTF-8 is returned: the limit is checked
 after the capture, so it bounds what is returned, not what the read holds in memory, and a larger
 screen fails instead of being cut.
@@ -863,10 +863,10 @@ screen fails instead of being cut.
 For a tmux session, `screen` uses tmux `capture-pane -p`: the 50 visible application rows, even while
 an attached viewer scrolls in copy mode. See [Linux / tmux](terminals.md#linux--tmux).
 
-The text is what the terminal showed at one moment. Bridge does not interpret it, and it is not
+The text is what the terminal showed at one moment. TAB does not interpret it, and it is not
 evidence of a request's state: read the request with `result`, `wait` or `inspect`. Do not type
 into the managed terminal to change what it shows. The text can contain secrets that the provider
-printed. Bridge does not write it to session records, logs or diagnostics. While a terminal call
+printed. TAB does not write it to session records, logs or diagnostics. While a terminal call
 runs, its output is staged in a temporary file in the system temporary directory, which is unlinked
 as soon as it is created on macOS and, on Windows, held without sharing and deleted when it is
 closed; it is gone when the call ends. Anything that keeps the command's output keeps the text.
@@ -933,20 +933,20 @@ Free-text questions use `options: null`. For example:
 
 Codex evidence requires a request bound through injected hooks; a notify-settled unbound
 request cannot have it. Claude evidence requires the original turn's native completion binding
-and a newly loaded optional Bridge plugin that observes completed main-loop model steps.
+and a newly loaded optional TAB plugin that observes completed main-loop model steps.
 It reads only the final engine/core trace return with `stopReason: tool_use`; missing trace
 evidence is unknown. It includes
 only the model's `AskUserQuestion` question text and option labels. Its `step:N/tool:M` id
 names the provider step and the call's position, not an addressed answer endpoint. It does
 not report questions from subagents, other plugins, or an unbound continuation turn.
 A repeated model step, an unfinished/refused question response, or a lower hook's rewrite
-marks the observation incomplete. Hooks above Bridge can change the response afterward;
+marks the observation incomplete. Hooks above TAB can change the response afterward;
 an emission does not establish that a dialog appeared or the tool ran. Refusing the optional
 question plugin does not remove the separate completion plugin.
 
 These fields report emission, without changing request state, result text, or exit status.
 `question_emitted: true` and `question_emission_count` (retained emission items, each with one
-or more questions) accompany the content. `question_observation: "incomplete"` means Bridge
+or more questions) accompany the content. `question_observation: "incomplete"` means TAB
 retained a limited prefix or rejected optional evidence. `"unreadable"` means the retained
 record could not be validated.
 Absence of these fields is unknown; it does not prove that no question existed.
@@ -955,13 +955,13 @@ does not resolve the earlier emission.
 
 ### Question deflection
 
-A Bridge-managed Claude session has nobody at its `AskUserQuestion` dialog. A Claude session
+A TAB-managed Claude session has nobody at its `AskUserQuestion` dialog. A Claude session
 launched with `settings claude-question-deflection on` (the default) has its question plugin
 refuse a model's own main-loop `AskUserQuestion` call before any dialog, with a fixed reason that
 tells the child to end its turn with the question (`QUESTION FOR CALLER: <question> Options:
 <option labels>`) and the request's final marker line. That turn completes as an ordinary
 Result, the emission record still holds the structured question, and the caller answers with an
-ordinary `tell`. Bridge waits for nothing, injects no answer and adds no transport.
+ordinary `tell`. TAB waits for nothing, injects no answer and adds no transport.
 
 Claude Code fires a settings `PreToolUse` hook beneath plugin `tool.call` hooks, so a `PreToolUse`
 hook of your own for `AskUserQuestion` (one that answers before display, for example) does not
@@ -978,7 +978,7 @@ was refused. Human output adds
 
 The evidence is that the plugin refused a call, not that the Result is a question or what the
 child wrote after the refusal: read the Result and `question_emissions` before treating the
-request as finished. Bridge neither strips nor parses the `QUESTION FOR CALLER:` prefix. A call
+request as finished. TAB neither strips nor parses the `QUESTION FOR CALLER:` prefix. A call
 is refused only when the plugin passed its streamed tool chunk in the observed main-loop step;
 subagent questions, a plugin's own questions and unobserved calls reach the dialog as before,
 and so does every call when the plugin's hook fails or overruns its budget. The flag is set only
@@ -994,7 +994,7 @@ Codex, Agy and Pi sessions never report deflection; Codex has the
 ### Question notice
 
 Codex's `request_user_input_async` tool is asynchronous: it emits the question and returns at
-once, and the turn goes on. A Bridge-managed Codex session has nobody at its terminal, and a child
+once, and the turn goes on. A TAB-managed Codex session has nobody at its terminal, and a child
 that waits for a reply keeps its turn, and the request, open. The question notice is an opt-in
 answer to that wait and is `off` by default. A Codex session launched with
 `settings codex-question-notice on`, with lifecycle hooks injected and a recorded
@@ -1005,7 +1005,7 @@ It lets the tool run and adds this notice for the model:
 No person is at this session's terminal, so no reply to this question can arrive during this turn. Do not wait or sleep for one. Finish the work that does not depend on the answer, then end your turn, and end your final message with the one line `QUESTION FOR CALLER: <question> Options: <option labels>`. The caller answers in a follow-up message.
 ```
 
-The question is still emitted and Bridge records it as for any Codex emission. Unlike Claude's
+The question is still emitted and TAB records it as for any Codex emission. Unlike Claude's
 [question deflection](#question-deflection), nothing is refused, because a refusal would cut short
 work the child does while its question is open, and no `deflected` flag or deflection field is
 reported. Each session keeps the decision recorded at its launch.
@@ -1013,7 +1013,7 @@ reported. Each session keeps the decision recorded at its launch.
 How to answer:
 
 - A request that has ended with `question_emitted: true` is answered with `tell`. Its Result
-  usually ends with the `QUESTION FOR CALLER:` line and can also hold finished work. Bridge
+  usually ends with the `QUESTION FOR CALLER:` line and can also hold finished work. TAB
   neither strips nor parses that line.
 - A request that is still `pending` with an emission means the child is still working. Read the
   question with `result --request` or `wait --questions`, and wait for the request to end: `tell`
@@ -1026,7 +1026,7 @@ record, and leaves your own `PreToolUse` hooks in place: Codex runs every matchi
 of yours that denies the tool blocks the question. If the hook cannot read its launch record it
 exits with status 1, which Codex reports as a failed hook before running the tool without the
 notice. `settings codex-question-notice off`, the default, launches later Codex sessions without
-it. Without the notice Bridge adds nothing to the question tool, and a child that waits for a reply
+it. Without the notice TAB adds nothing to the question tool, and a child that waits for a reply
 keeps its turn, and the request, open.
 Not verified: native Windows at runtime, Codex versions other than 0.166.0, more than one question
 in a turn, a `PreToolUse` hook of your own beside this one, and subagent questions.
@@ -1041,18 +1041,18 @@ count says that emissions were retained; it does not say that a question is pend
 shown, or was answered. A pending poll without `--questions` reads no question record, and
 waiting and exit behavior are unchanged. `result --list` and timeline are unchanged. Full
 context attachments are unchanged;
-compact context attachments also report `Questions: N emitted` when retained emissions exist. Bridge has no
+compact context attachments also report `Questions: N emitted` when retained emissions exist. TAB has no
 transport that answers a question. Opt-in [`wait --questions`](#wait) can return an emission
 before completion; default `wait` and `result --wait` continue waiting.
 
-Human output gives session, request when available, request state, Bridge-observed elapsed time,
+Human output gives session, request when available, request state, TAB-observed elapsed time,
 one usage line when the provider reported usage, the retained emission count, each emitted
 question title and its options
 with control characters escaped, result text, and error. List rows show event id,
 request state, request id or `legacy`, and elapsed time. See the
 [JSON field reference](#json-field-reference).
 
-Elapsed time measures receipt creation to the published event, as Bridge observed them. It is
+Elapsed time measures receipt creation to the published event, as TAB observed them. It is
 neither model nor billing time. An uncomputable value is null with a reason.
 
 Token usage is collected only from a signal the provider itself documents as usage; today that is
@@ -1096,7 +1096,7 @@ tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
 tabcli wait session-K7m2Qx/request-1791285000000000000-4217-0 session-P9n3Rs/request-1791285000000000000-4218-0 --json
 ```
 
-Each address must be `SESSION/REQUEST`, with a Bridge request id. At least one address is
+Each address must be `SESSION/REQUEST`, with a TAB request id. At least one address is
 required. Event names, `latest`, duplicate addresses, and paths are refused. Syntax and session
 directories are checked up front; receipts are validated when that session first yields a
 consistent observation. A busy session remains unconfirmed and does not block another session's
@@ -1144,7 +1144,7 @@ containing the selected `address`, the unchanged `request_state: "pending"`,
 `question_emissions`, and an `after_question` cursor. **Exit 0 here means an emission was
 observed, not that the Request completed.** Every address stays in `remaining`, including
 the selected Request. The Claim is unchanged; this return does not permit another `tell`
-while the Request is pending. Bridge does not send an answer or mark the question resolved.
+while the Request is pending. TAB does not send an answer or mark the question resolved.
 
 Resume with `--questions --after-question CURSOR`, copying `question.after_question` exactly.
 The cursor has the form `SESSION/REQUEST/EMISSION_ID` and applies only to that address.
@@ -1158,7 +1158,7 @@ the cursor does not return it again, so read `result --request` for the current 
 
 An absent or unreadable question record does not wake the caller. A retained incomplete
 prefix can wake it and carries `question_observation: "incomplete"`. A supplied cursor that
-cannot be found in the selected Request's readable retained evidence is an error; Bridge
+cannot be found in the selected Request's readable retained evidence is an error; TAB
 does not guess a new position. After a timeout, ordinary `result --request` can expose
 question-observation diagnostics. Each poll reads the optional bounded record under the
 same lifecycle read lock as its Request. This is polling, with no notification latency guarantee.
@@ -1316,7 +1316,7 @@ startup files, which can have side effects.
 
 Session reports add an `origin` check, and `observations` gains `origin` and
 `origin_observation` (see [origin observation](#origin-observation)). The check is `available` /
-`origin_external` for an initial request from outside Bridge, `available` / `origin_live` when the
+`origin_external` for an initial request from outside TAB, `available` / `origin_live` when the
 origin's attested owner is live, `unavailable` / `origin_ended` when the origin ended and this
 session is not closed, `available` / `origin_ended_session_closed` when both have ended, and
 `unknown` / `origin_unverified` otherwise, including when the session's own records could not be
@@ -1343,10 +1343,10 @@ object that `--json` places in `checks[].evidence`.
   time and kind (`task_complete`, `turn_aborted`, `agent-turn-complete`, or `not_observed`).
 
 Only with `--probe`, `codex_hook_trust` starts the installed Codex with the exact hooks override
-this Bridge executable would inject, then sends stdio JSON-RPC `initialize`, `initialized`, and
+this TAB executable would inject, then sends stdio JSON-RPC `initialize`, `initialized`, and
 `hooks/list` with this workspace. It ends the process tree after the response or ten seconds.
-It creates no Bridge scratch files or configuration writes. This is `source: current_probe`,
-not evidence about a session's live configuration or hook execution. Each of Bridge's two keys
+It creates no TAB scratch files or configuration writes. This is `source: current_probe`,
+not evidence about a session's live configuration or hook execution. Each of TAB's two keys
 reports `trustStatus`, `currentHash`, `expected_hash`, `hash_matches`, and `diagnostic`:
 `normalization drift` when the hashes differ. The override and the report add the
 [question notice](#question-notice) hook's key as a third only when a new launch would inject it:
@@ -1379,7 +1379,7 @@ receipt is readable, and `source`: `pending_turn_record` for the retained sizes,
 preserved initial prompt still exists. Off Windows it is `available` /
 `codex_notify_payload_no_limit` with the same evidence. On Windows it is `unavailable` /
 `codex_notify_payload_over_limit` when the estimate alone reaches the limit (the completion has
-probably failed to reach Bridge), `unavailable` / `codex_notify_payload_near_limit` when fewer
+probably failed to reach TAB), `unavailable` / `codex_notify_payload_near_limit` when fewer
 than 4,096 units remain for the answer, and `available` / `codex_notify_payload_within_limit`
 otherwise. It is `unknown` / `session_required` without a session, `unknown` /
 `codex_turn_not_pending` when no Codex turn is pending, and `unknown` /
@@ -1412,7 +1412,7 @@ record. Known rejected records explain a refusal, while valid historical readine
   will complete.
 - `unknown` / `claude_completion_readiness_not_observed`: native_v1 mode without a readiness
   record. The recorded version and settings do not prove that the module ran.
-- `unavailable` / `claude_completion_mode_absent`: no mode record. Bridge applies legacy
+- `unavailable` / `claude_completion_mode_absent`: no mode record. TAB applies legacy
   completion treatment while it is absent, but this does not establish the session's age:
   a launch still preparing or one that failed before completion preparation can also lack
   the record. Inspect the launch state and terminal before choosing recovery.
@@ -1490,7 +1490,7 @@ nothing else: <marker>`. The result must still equal the generated marker exactl
 On an Agy result timeout, self-test reads `doctor SESSION --json` before cleanup. If it
 reports a tool confirmation for that request, the step's `reason` includes the tool and
 approval observation. Without that evidence, the timeout reason is unchanged. The step
-remains `timed_out`; Bridge does not answer the approval or resend the request. `result`
+remains `timed_out`; TAB does not answer the approval or resend the request. `result`
 and `inspect` retain their existing output; use `doctor` for this Agy log diagnosis. On a
 Pi result timeout, self-test calls `doctor SESSION --probe --json` within five seconds
 and appends the same session's credential readiness to the step reason. This is a
@@ -1502,7 +1502,7 @@ and consent records. Isolation creates a private directory; ordinary settings an
 apply. The directory remains afterward. In either mode, the test closes only sessions it created,
 retains closed records, and never resends uncertain input. The test uses `ask`’s workspace-consent
 rules, including reuse of verified existing trust. It does not grant consent for an untrusted
-workspace. `--isolated` separates Bridge records, not provider trust stores.
+workspace. `--isolated` separates TAB records, not provider trust stores.
 
 Before it creates a private directory or runs any public command, the test resolves the workspace
 and applies [`ask`](#ask)'s launch admission. The ordinary mode uses the ordinary state root's
@@ -1539,7 +1539,7 @@ even though the launch failed.
 
 ## consent
 
-Use `consent` to inspect or stop Bridge's reuse of workspace trust for a directory.
+Use `consent` to inspect or stop TAB's reuse of workspace trust for a directory.
 
 ```text
 tabcli consent inspect|revoke|reset PATH [--json]
@@ -1564,8 +1564,8 @@ tabcli consent revoke /path/to/project
 }
 ```
 
-Inspect or change Bridge's workspace consent record for an existing directory. `inspect` reads its
-identity and saved record; it does not grant trust. `revoke` blocks Bridge's reuse of that consent.
+Inspect or change TAB's workspace consent record for an existing directory. `inspect` reads its
+identity and saved record; it does not grant trust. `revoke` blocks TAB's reuse of that consent.
 `reset` clears the saved source and revocation, allowing future assessment. Neither operation edits
 the provider's trust store or changes its tool permission mode.
 
@@ -1573,7 +1573,7 @@ There is no default action or path. `--json` is optional and off by default but 
 effect: all three actions print JSON. See the [JSON field reference](#json-field-reference) for the
 record fields.
 
-Successful reads/writes exit 0. An absent Bridge record is not an inspection error. Missing or
+Successful reads/writes exit 0. An absent TAB record is not an inspection error. Missing or
 non-directory workspaces, unsafe store access, or unreadable records fail. Check the directory and
 ownership named in the error; do not make a trust store writable by other accounts to get past the
 check. See [security and data](security-and-data.md) for exact-workspace evidence and store
@@ -1594,7 +1594,7 @@ tabcli settings claude-question-deflection on|off [--json] # default: on
 tabcli settings codex-question-notice on|off [--json] # default: off
 ```
 
-`codex-lifecycle-hooks` controls hook injection for new Codex launches only. It writes Bridge's
+`codex-lifecycle-hooks` controls hook injection for new Codex launches only. It writes TAB's
 setting, never Codex configuration. Existing sessions retain their recorded launch mode and
 Windows composer gate. Injection requires stable Codex 0.163.0+ and a supported executable
 path; it is not proof of hook execution. See [Codex](providers.md#codex) for trust hashes,
@@ -1635,7 +1635,7 @@ tabcli settings
 
 With no setting, read effective settings. Otherwise persist one setting in `settings.json` under the
 selected state root. Defaults are `windows-tab-window dedicated` and `macos-open-mode tab-first`.
-The Windows setting chooses the dedicated Agent Bridge window or the most recently used Windows
+The Windows setting chooses the dedicated TAB window or the most recently used Windows
 Terminal window; the macOS setting requests a tab first or always a new window. Each affects
 creation on its platform. Later changes do not change a surface's recorded close scope. See
 [terminals](terminals.md).
@@ -1681,8 +1681,8 @@ Both the close tombstone and status must say `closed` and be at or before the re
 Active capabilities or a blocking owner prevent pruning. Invalid, unsafe, or ineligible entries are
 skipped; pruning never closes a running session to make it eligible.
 
-Human output says `pruned SESSION` per removal and gives a count, or `no eligible closed Agent
-Bridge sessions`. JSON has `ok`, `closed_before_days`, and `pruned`.
+Human output says `pruned SESSION` per removal and gives a count, or `no eligible closed TAB
+sessions`. JSON has `ok`, `closed_before_days`, and `pruned`.
 
 No eligible sessions is success. Invalid retention, missing acknowledgement, and I/O or owner
 inspection errors can fail. Correct the retention value or include `--explicit` only when you intend
@@ -1703,7 +1703,7 @@ See the command and output in the [opening workflow](#command-reference).
 `--explicit` is required because this ends the session's surface. You can close active, exited, or
 failed sessions. Repeating a completed close succeeds without closing another surface; with
 `--with-started-from` it can still discover and close another session started from this one
-(see below). Bridge records the close in a tombstone and keeps the result history.
+(see below). TAB records the close in a tombstone and keeps the result history.
 
 `--timeout-secs N` sets the maximum time the close may take, in whole seconds from 1 through
 3600; the default is 60 seconds. The budget covers observation, ownership checks, lock waits,
@@ -1722,11 +1722,11 @@ close a session before you open its replacement. If the terminal answers slowly,
 longer `--timeout-secs`.
 
 On macOS, a terminal application can end while the session's processes survive, as observed
-after iTerm2 was killed. If the ownership proof fails, Bridge checks whether the recorded
+after iTerm2 was killed. If the ownership proof fails, TAB checks whether the recorded
 surface is absent. Terminal.app requires its incarnation-aware absence proof. Proven absence
-and owner attestation let Bridge record a teardown intent, attest the owner again, and send
+and owner attestation let TAB record a teardown intent, attest the owner again, and send
 SIGTERM to the process group the owner leads. It sends no SIGKILL and no signal to the shell.
-Bridge waits up to three seconds for ESRCH to prove the group is gone, then records `closed`
+TAB waits up to three seconds for ESRCH to prove the group is gone, then records `closed`
 with outcome `Missing`, consumes the handle, and retains the reason in `inspect`.
 
 If disappearance cannot be confirmed, close fails and keeps the intent and handle. Check the
@@ -1745,9 +1745,9 @@ the launcher is still creating the surface for this session (launch deadline <un
 
 After the deadline, or once launch is no longer pending, a handle-less close proceeds. If the
 launcher subsequently reports a retained Ghostty or Warp surface, the session stays closed with no new
-handle. Its error names the exact surface and says it may remain and is not closed by Bridge.
+handle. Its error names the exact surface and says it may remain and is not closed by TAB.
 The warning is appended to any existing error and survives repeated close. Check the surface
-in that terminal; another Bridge close does not close it.
+in that terminal; another TAB close does not close it.
 
 If the failed-launch handoff happens before close, while the launch still owns its claim and the
 session is still `launching`, the launcher saves the proven terminal, tab, and window ids in
@@ -1763,7 +1763,7 @@ for this failure is not implemented (#87); an explicit close refuses and preserv
 when absence cannot be proved. Check the named tab in Warp. This failure has not been observed
 live, and Warp remains not live-verified (#63).
 
-After a successful close, and only then, Bridge looks once for sessions whose initial request
+After a successful close, and only then, TAB looks once for sessions whose initial request
 names the closed session as its origin and that are not closed in their records. The scan reads
 records only: per session the manifest, the close tombstone and status, and for a session that is
 not closed its launch record and the one receipt of its initial request. It reads no request index,
@@ -1791,7 +1791,7 @@ The scan is the one described above, with the same bounds, and runs only after S
 Each listed session goes through the same close as an explicit `close-session` of it: the
 dead-owner repair, the owner attestation and the terminal-close authority checks. The
 recorded origin grants nothing; a session that its own explicit close would refuse is refused
-here with the same error. Immediately before each close, Bridge re-reads the session's records
+here with the same error. Immediately before each close, TAB re-reads the session's records
 and compares them with what the scan saw. A session that is not what the scan listed is
 skipped and not closed. The skip reasons are `closed_since_scan` (its records now say closed),
 `source_changed` (its initial request now names another source), `session_gone` (its directory
@@ -1808,7 +1808,7 @@ scan that stopped early still has its listed sessions closed while the deadline 
 an exhausted scan with no listed session exits 0 with `incomplete: true`, which does not
 establish that every session started from SESSION was closed.
 
-After each target closes, Bridge runs the same bounded scan for that target and attaches the
+After each target closes, TAB runs the same bounded scan for that target and attaches the
 result to its entry, so the sessions started from a closed target are visible without being
 closed. Sessions started from SESSION after the scan, or recorded only later, are not found.
 Repeating the flagged command can discover and close another session started from SESSION.
@@ -1828,10 +1828,10 @@ on stderr. In JSON, `closed` is `true` and `ok` is `false` then. A failure of th
 SESSION itself is reported as without the flag, and no target is closed. For a failed target,
 check its error, then close it with its own `close-session ID --explicit` once resolved.
 
-Exit 0 means Bridge completed the close. If the id is missing, check it with `sessions`; if the
+Exit 0 means TAB completed the close. If the id is missing, check it with `sessions`; if the
 command asks for acknowledgement, add `--explicit` only when you intend to close that session. For
 refused close authority, unreadable records, or terminal errors, run `doctor SESSION` and check the
-surface yourself. Bridge keeps the handle so you can retry the explicit close after resolving the
+surface yourself. TAB keeps the handle so you can retry the explicit close after resolving the
 error. If close was interrupted, the next close uses its saved records to finish; a dead PID alone
 does not establish that the surface closed. See
 [ownership and close](terminals.md#ownership-and-close).
@@ -1855,7 +1855,7 @@ Use these options only with commands whose synopsis lists them:
 The value must fit the supported clock range.
 
 Prompts must contain non-whitespace text. Control characters other than newline and tab are
-rejected. Bridge trims the prompt's outer whitespace. The provider adapter adds its request
+rejected. TAB trims the prompt's outer whitespace. The provider adapter adds its request
 correlation marker and any instructions needed to interpret it. The request receipt records
 the source. `--detach` still waits for the required launch and delivery steps; it is not a
 request to skip those checks. When you see `accepted` and a null `result`, use `result SESSION
@@ -1865,7 +1865,7 @@ For `ask`, `tell`, and `reopen`, the timeout is one command deadline shared by p
 or delivery, and result waiting. A timeout while waiting for a result does not cancel delivered
 work. A startup timeout can prevent a provider that has not started from launching. Startup has a
 separate ceiling of 30 seconds or the remaining command budget, whichever is shorter; increasing
-`--timeout-secs` does not extend that ceiling. Inspect the recorded request before retrying. Bridge
+`--timeout-secs` does not extend that ceiling. Inspect the recorded request before retrying. TAB
 allows one request at a time through a claim, the exclusive right to deliver that turn. If delivery
 is uncertain, it keeps the claim: another `tell` is blocked until completion or explicit close. Wait
 for that request or close the session; do not resend it.
@@ -1876,7 +1876,7 @@ published successful results before any session is created or any target is chan
 pending, unreadable, and unpublished results are rejected. Duplicate addresses and results with
 unsafe control characters or missing creation times are rejected. A result containing its own
 attachment delimiter is also rejected. The combined attached result bodies are limited to 256 KiB;
-attach fewer or smaller results if you exceed that limit. Bridge does not truncate attachments to
+attach fewer or smaller results if you exceed that limit. TAB does not truncate attachments to
 make them fit. Results are appended as delimited reference material and their provenance is saved as
 `context_sources`. For older records without a request receipt, `SESSION/EVENT` is accepted instead.
 This is reference material, not a resume of the source conversation.
@@ -1922,19 +1922,19 @@ provider-specific evidence. Queries accept any recorded state; they can still fa
 required records. `prune-sessions` requires `closed` records with no active capability or blocking
 owner.
 
-Hold is orthogonal to session state and refuses only follow-ups whose delivery Bridge has not yet
+Hold is orthogonal to session state and refuses only follow-ups whose delivery TAB has not yet
 allowed to start.
 
 Request states reported by `result` are `completed`, `failed`, `cancelled`, `pending`, `unresolved`,
 `recovery_required`, and `unavailable`; a waiting read can report `busy` when it times out without a
 consistent observation. `cancelled` occurs only for a correlated provider interruption (see
 [cancel](#cancel)). `accepted` is the detached command acknowledgement, not a published result.
-A follow-up or initial prompt that Bridge refused before anything was sent (a preparation, budget,
+A follow-up or initial prompt that TAB refused before anything was sent (a preparation, budget,
 hold or transport refusal, or a trust-dialog failure while the session still awaits a prompt
-delivered after launch) is `failed`: Bridge records a failure event for the receipt whose
+delivered after launch) is `failed`: TAB records a failure event for the receipt whose
 `error` is the refusal text and whose `provenance` is `delivery_not_sent`, with no provider
 session or turn id. `unresolved` is a receipt without any event: a refusal recorded by an earlier
-Bridge release, a reopened-conversation refusal, or a claim-stage race. Bridge never infers a
+TAB release, a reopened-conversation refusal, or a claim-stage race. TAB never infers a
 refusal from `status.error` and never repairs such receipts.
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
@@ -1947,7 +1947,7 @@ No query treats a missing result as an instruction to deliver the prompt again.
 ## Environment and internal interfaces
 
 Set `AGENT_BRIDGE_NATIVE_STATE_DIR` to choose the root for sessions, settings, and consent. Without
-it, Bridge uses `.agent-bridge/native-sessions` beneath `HOME`, or `USERPROFILE` if `HOME` is
+it, TAB uses `.agent-bridge/native-sessions` beneath `HOME`, or `USERPROFILE` if `HOME` is
 absent. Provider lookup uses absolute entries in `PATH`; platform helpers also use `PATH` where
 their adapters require it.
 
@@ -1964,7 +1964,7 @@ Otherwise Linux uses tmux. On macOS,
 described under [terminal selection](terminals.md#selection-and-settings).
 
 Use the state-root override to choose a separate registry; it is not a switch that isolates the
-provider's credentials or prevents network requests. Bridge runs no hosted service of its own and
+provider's credentials or prevents network requests. TAB runs no hosted service of its own and
 stores its records locally; provider CLIs still contact their services.
 
 The `native-*` commands and terminal host commands exist for managed surfaces, provider hooks, and
@@ -2000,7 +2000,7 @@ A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `ses
 An optional top-level field of a JSON error object, and of a timed-out `result --wait`. It is a
 diagnostic hint about the failed command, not a delivery record or a request state:
 
-- `delivery_uncertain`: when the command ran, Bridge settled this prompt's delivery as
+- `delivery_uncertain`: when the command ran, TAB settled this prompt's delivery as
   uncertain: the prompt may have reached the provider. It describes that delivery attempt, not the
   request's current state. Uncertainty alone does not release the claim, but the target may already
   have completed the request. Read the recorded state with `result` or `inspect`, and do not send
@@ -2133,7 +2133,7 @@ authenticated identity.
 | `origin_unverified` | managed | null | A recorded state this version does not know. |
 | `origin_busy` | managed | null | The origin's records changed while they were read. |
 | `origin_budget_exhausted` | any | null | The read budget ran out. |
-| `origin_external` | external | null | The initial request came from outside Bridge. |
+| `origin_external` | external | null | The initial request came from outside TAB. |
 | `initial_request_unavailable` | unknown | null | No launch record, an invalid one, or no receipt for its claim, as for sessions launched before 0.0.7. |
 | `initial_receipt_unreadable` | unknown | null | The initial request's receipt could not be read. |
 | `source_unavailable` | unknown | null | The initial receipt records no source. |
@@ -2221,7 +2221,7 @@ this field; it grants no additional close authority.
 Fields: `schema_version`, `ok`, `session`, `terminal`, `observed_unix_ms`, and `screen` (see
 [screen](#screen)). An error has `schema_version`, `ok: false`, `session` and `error`, and can
 carry the optional `failure_kind`: `unsupported` for Ghostty, Warp or a terminal of another
-platform, `timed_out` for a deadline that Bridge observed expire. No error carries screen text.
+platform, `timed_out` for a deadline that TAB observed expire. No error carries screen text.
 
 ### result
 
@@ -2301,7 +2301,7 @@ Fields: `schema_version`, `ok`, `session`, `request_id`, `session_state`, `sessi
 `requests[]` contains `result` summaries without the result body, plus `derived_from: "result"`,
 `result_command` (the command to query that request as JSON), and `delivery`. `delivery` is
 `"completion_recorded"` when a published completion is read, `"refused_not_sent"` when the
-recorded event is Bridge's delivery refusal (`provenance: "delivery_not_sent"`, nothing was sent),
+recorded event is TAB's delivery refusal (`provenance: "delivery_not_sent"`, nothing was sent),
 otherwise `"unknown"`. `delivery: "unknown"` does not mean that nothing was sent. A refusal
 event's entry has `stage: "delivery_refusal"`; a provider completion's has `stage: "completion"`.
 
@@ -2316,7 +2316,7 @@ python3 scripts/share_diagnostics.py < saved-doctor.json
 python3 scripts/share_diagnostics.py --format json < saved-timeline.json
 ```
 
-The formatter runs no Bridge or provider command, reads no session directory, uploads nothing,
+The formatter runs no TAB or provider command, reads no session directory, uploads nothing,
 and creates no files. To retain stdout, use your shell's exclusive/no-clobber redirection;
 ordinary shell redirection can overwrite an existing file independently of this script.
 Successful formatting exits 0; malformed, unsupported, ambiguous or oversized input exits 2

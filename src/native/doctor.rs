@@ -632,7 +632,7 @@ fn origin_check(
         (SourceKind::External, _) => Check::new(CheckId::ORIGIN,
             Availability::Available,
             Reason::ORIGIN_EXTERNAL,
-            "The initial request came from outside Agent Bridge; there is no managed origin to observe.",
+            "The initial request came from outside TAB; there is no managed origin to observe.",
             "No action is needed.",
         ),
         (_, Some(false)) => Check::new(CheckId::ORIGIN,

@@ -89,7 +89,7 @@ pub(super) fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn
         serde_json::from_slice(&text).context("failed to parse the pending Pi turn")?;
     let expected = PendingPiTurn::new(&pending.claim_token)?;
     if pending.schema != expected.schema || pending.marker != expected.marker {
-        bail!("Agent Bridge rejected invalid Pi turn correlation state")
+        bail!("TAB rejected invalid Pi turn correlation state")
     }
     if let Some(fingerprint) = &pending.windows_input {
         fingerprint.validate()?;

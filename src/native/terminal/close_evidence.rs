@@ -20,7 +20,7 @@ pub(in crate::native::terminal) fn created_host_incarnation(
     #[cfg(target_os = "linux")]
     return super::linux::tmux::created_host_incarnation(session).map(Some);
     #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("Bridge-created host evidence is unsupported on this platform")
+    anyhow::bail!("TAB-created host evidence is unsupported on this platform")
 }
 
 pub(in crate::native) enum ResumableAuthority {

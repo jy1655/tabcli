@@ -134,7 +134,7 @@ pub(super) const TELL: Contract = Contract {
     ],
 };
 pub(super) const HOLD: Contract = Contract {
-    summary: "Block or release future Bridge follow-up requests for a session.",
+    summary: "Block or release future TAB follow-up requests for a session.",
     synopsis: &["hold <session> [--release] [--json]"],
     possible_effects: &[ReadsRecords, WritesRecords],
     examples: &[
@@ -155,13 +155,13 @@ pub(super) const CANCEL: Contract = Contract {
     ],
 };
 pub(super) const CONSENT: Contract = Contract {
-    summary: "Inspect or invalidate Bridge's workspace consent evidence.",
+    summary: "Inspect or invalidate TAB's workspace consent evidence.",
     synopsis: &["consent <inspect|revoke|reset> PATH [--json]"],
     possible_effects: &[ReadsRecords, WritesRecords],
     examples: &[&["consent", "inspect", ".", "--json"]],
     features: &[],
     notes: &[
-        "inspect reads; revoke/reset change Bridge records, not provider trust stores. This is not a provider permission mode.",
+        "inspect reads; revoke/reset change TAB records, not provider trust stores. This is not a provider permission mode.",
         "Always prints JSON on success, without the common schema_version/ok envelope. Errors are reported on stderr without a JSON error object.",
     ],
 };
@@ -180,7 +180,7 @@ pub(super) const SETTINGS: Contract = Contract {
     ],
 };
 pub(super) const REOPEN: Contract = Contract {
-    summary: "Resume a closed provider conversation in a new Bridge session.",
+    summary: "Resume a closed provider conversation in a new TAB session.",
     synopsis: &[
         "reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]\n      [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]\n      [--detach] [--json]",
     ],
@@ -225,7 +225,7 @@ pub(super) const INSPECT: Contract = Contract {
     notes: &[
         "Observes records without repair or publication. --request filters a timeline and requires --timeline.",
         "JSON capabilities.cancel reports what cancel's admission would decide at this snapshot; cancel rechecks it, and an admissible cancel records intent, not interruption or completion.",
-        "JSON capabilities.tell evaluates tell's Bridge record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and the configured answer path: deflected_to_result (answer with tell), answer_after_turn (answer with tell once the request has ended) or unsupported.",
+        "JSON capabilities.tell evaluates tell's TAB record gates and lists in unevaluated the gates it does not evaluate, including Codex record gates that tell decides at delivery; admissible is an observation, not a reservation. capabilities.questions reports configured emission observation and the configured answer path: deflected_to_result (answer with tell), answer_after_turn (answer with tell once the request has ended) or unsupported.",
     ],
 };
 pub(super) const SCREEN: Contract = Contract {

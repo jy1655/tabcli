@@ -62,7 +62,7 @@ fn notice_mode_reader_rejects_invalid_schema_values_and_inconsistent_reason() {
     write(temp.path(), NOTICE_FILE, &off_without_reason);
     assert_eq!(
         error(notice(temp.path())),
-        "Agent Bridge rejected invalid Codex question notice mode"
+        "TAB rejected invalid Codex question notice mode"
     );
     write(temp.path(), NOTICE_FILE, &valid);
     assert!(notice(temp.path()).notice_hook_injected().unwrap());
@@ -108,7 +108,7 @@ fn launch_mode_reader_rejects_invalid_schema_values_and_inconsistent_reason() {
     write(temp.path(), FILE, &without_reason);
     assert_eq!(
         error(lifecycle(temp.path())),
-        "Agent Bridge rejected invalid Codex launch mode"
+        "TAB rejected invalid Codex launch mode"
     );
     std::fs::write(temp.path().join(FILE), b"{").unwrap();
     assert!(

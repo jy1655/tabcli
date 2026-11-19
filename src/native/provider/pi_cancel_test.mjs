@@ -241,7 +241,7 @@ for (const [name, accepted, errorMessage, expected] of [
   await f.start(f.first);
   await f.end("stop", f.records[0].response);
 }
-// The declared core-record reads refuse a link at turn.claim or cancel.json, as Bridge's
+// The declared core-record reads refuse a link at turn.claim or cancel.json, as TAB's
 // core read policy does: no cancel is read, so none is accepted.
 for (const [name, record] of [["linked_claim", "turn.claim"], ["linked_cancel", "cancel.json"]]) {
   const f = await fixture(name);

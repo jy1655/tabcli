@@ -49,7 +49,7 @@ impl Field {
     }
 }
 
-// Record text is untrusted even though Bridge wrote it: echo only a sanitized excerpt.
+// Record text is untrusted even though TAB wrote it: echo only a sanitized excerpt.
 fn excerpt(text: &str, limit: usize) -> (String, bool) {
     let safe = terminal_safe_text(text, false);
     let truncated = safe.chars().count() > limit;
@@ -213,7 +213,7 @@ fn observe_diagnostic(reader: &Reader) -> Field {
 }
 
 const KEEP_RECORDS: &str = "Keep the records; doctor repairs, deletes and rewrites nothing. Inspect the session directory and the managed surface, and close the session if it cannot be used.";
-const SAME_BINARY: &str = "Use the Bridge binary that launched this session; do not downgrade the binary or AGENT_BRIDGE_EXECUTABLE while native-mode Claude sessions remain open.";
+const SAME_BINARY: &str = "Use the TAB binary that launched this session; do not downgrade the binary or AGENT_BRIDGE_EXECUTABLE while native-mode Claude sessions remain open.";
 const LEGACY_RECOVERY: &str = "Inspect the result and terminal, then close when appropriate. On macOS start a fresh ask with the needed context; on native Windows close and reopen to use native completion.";
 
 type Verdict = (Availability, Reason, &'static str, &'static str);
@@ -243,7 +243,7 @@ fn verdict(mode: State, selected: Option<Mode>, readiness: State) -> Verdict {
         (State::NotObserved, ..) => (
             Unavailable,
             Reason::CLAUDE_COMPLETION_MODE_ABSENT,
-            "No completion-mode record: Bridge applies legacy completion treatment while the record is absent and never upgrades from a version. This can be a pre-upgrade session or a launch that has not reached completion preparation. A pending Stop completion stays readable; new tells are refused.",
+            "No completion-mode record: TAB applies legacy completion treatment while the record is absent and never upgrades from a version. This can be a pre-upgrade session or a launch that has not reached completion preparation. A pending Stop completion stays readable; new tells are refused.",
             "Inspect the launch state and terminal first: an in-progress launch may not have prepared completion, and a failed launch needs its cause diagnosed. For an unusable pre-upgrade session, inspect its result and close when appropriate; on macOS start a fresh ask with needed context, or on native Windows close and reopen.",
         ),
         (State::Observed, Some(Mode::LegacyStop), _) => (

@@ -532,7 +532,7 @@ fn input_ack_legacy_or_unknown_capability_refuses_both_transports_before_input()
             let observed = super::windows_follow_up_static(&fixture.store);
             let mut scenario = InputScenario::new(|_| Ok(()));
             let error = deliver_pi(&fixture, claim, initial, &mut scenario).unwrap_err();
-            assert!(format!("{error:#}").contains("start a new Bridge session"));
+            assert!(format!("{error:#}").contains("start a new TAB session"));
             match observed {
                 crate::native::provider::FollowUpStatic::Refused { reason, detail } => {
                     assert_eq!(reason, "pi_input_ack_unsupported");

@@ -56,7 +56,7 @@ impl Automation for Osascript {
         if !failure.timed_out() {
             return failure.into_error();
         }
-        // The call ran until Bridge's deadline. A new Ghostty surface was never observed
+        // The call ran until TAB's deadline. A new Ghostty surface was never observed
         // to become ready while the screen was locked (2026-10-11), and a first launch can
         // be waiting on an Automation prompt, so the message names the lock and the page
         // that says what to check.

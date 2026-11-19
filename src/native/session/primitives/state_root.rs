@@ -99,7 +99,7 @@ pub(in crate::native) fn state_root_durability_receipt_present(root: &Path) -> b
 /// Syncs the directory that holds the entry of `root`, then the one that holds its
 /// parent's entry, and so on. The walk stops after the sync that makes durable an entry
 /// sitting directly in the filesystem root or in one of `durable_directories`, whose own
-/// entries are not the bridge's to establish, or after `STATE_ROOT_ANCESTRY_SYNC_LIMIT`
+/// entries are not TAB's to establish, or after `STATE_ROOT_ANCESTRY_SYNC_LIMIT`
 /// entries.
 pub(in crate::native) fn sync_state_root_ancestry(
     root: &Path,
@@ -178,10 +178,10 @@ pub(in crate::native) fn session_directory(id: &str) -> Result<PathBuf> {
 pub(in crate::native) fn session_directory_in(root: &Path, id: &str) -> Result<PathBuf> {
     require_valid_session_id(id)?;
     let directory = root.join(id);
-    let metadata = fs::symlink_metadata(&directory)
-        .with_context(|| format!("no such Agent Bridge session: {id}"))?;
+    let metadata =
+        fs::symlink_metadata(&directory).with_context(|| format!("no such TAB session: {id}"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("refusing non-directory Agent Bridge session: {id}");
+        bail!("refusing non-directory TAB session: {id}");
     }
     Ok(directory)
 }

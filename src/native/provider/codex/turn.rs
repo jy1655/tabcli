@@ -291,7 +291,7 @@ pub(super) fn pending(reader: &Reader) -> Result<Option<PendingCodexTurn>> {
         serde_json::from_str(&text).context("failed to parse the pending Codex turn")?;
     let expected = PendingCodexTurn::new(&pending.claim_token)?;
     if pending.schema != expected.schema || pending.marker != expected.marker {
-        bail!("Agent Bridge rejected invalid Codex turn correlation state")
+        bail!("TAB rejected invalid Codex turn correlation state")
     }
     Ok(Some(pending))
 }

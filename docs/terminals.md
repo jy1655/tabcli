@@ -1,13 +1,13 @@
 # Terminal surfaces
 
-Choose the terminal where Bridge opens your sessions, and check what it will close when you finish.
-On macOS, Bridge detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
+Choose the terminal where TAB opens your sessions, and check what it will close when you finish.
+On macOS, TAB detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
 Windows Terminal tab, then a separate console window, or Herdr inside an hc terminal. Linux
 detects Herdr and otherwise uses tmux.
 Use `--terminal` to override the selection.
 
-Bridge creates a new surface for each session: a tab, window, pane, or console. It does not adopt
-one of your existing tabs or attach to an independently running provider CLI. A Linux Bridge
+TAB creates a new surface for each session: a tab, window, pane, or console. It does not adopt
+one of your existing tabs or attach to an independently running provider CLI. A Linux TAB
 process inside WSL would use tmux, but has not been verified. See [CLI commands](cli.md) for a worked session.
 
 ## Selection and settings
@@ -29,8 +29,8 @@ terminal the automatic choice is Herdr for Claude, Agy and Pi, verified like on 
 managed console for Codex and for `reopen`.
 
 On macOS an explicit option wins. With `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`,
-Bridge selects Herdr and verifies the calling terminal before launch. Stale Herdr markers refuse
-the launch instead of opening Ghostty. Otherwise Bridge examines `TERM_PROGRAM`, recognizing those
+TAB selects Herdr and verifies the calling terminal before launch. Stale Herdr markers refuse
+the launch instead of opening Ghostty. Otherwise TAB examines `TERM_PROGRAM`, recognizing those
 terminal families. An unrecognized value falls back to Terminal.app. Only when `TERM_PROGRAM` is
 absent does it check `TERM=xterm-ghostty`, then the presence of `ITERM_SESSION_ID`, then
 `TERM_SESSION_ID`; no match also falls back to Terminal.app. Detection selects an application, not
@@ -46,17 +46,17 @@ Run `tabcli settings macos-open-mode tab-first` to restore the default.
 The macOS default is `tab-first`: request a new tab in a safely usable existing local window, with a
 new window when a safe target or creation API is unavailable. `new-window` always requests a new
 window. Terminal.app always uses a new window because its native scripting interface has no new-tab
-creation command. Once a creation has an uncertain outcome, Bridge does not create another surface.
+creation command. Once a creation has an uncertain outcome, TAB does not create another surface.
 Inspect the session and look for its surface before starting a replacement.
 
 WezTerm discovers and verifies local GUI sockets, process identity, and a unique target window.
 Inherited WezTerm pane/socket variables do not select the target. Its new-window route starts a
-private GUI. Closing uses the saved creation scope, including whether Bridge owns that GUI; changing
-the setting later cannot make Bridge close more of that GUI.
+private GUI. Closing uses the saved creation scope, including whether TAB owns that GUI; changing
+the setting later cannot make TAB close more of that GUI.
 
-On native Windows, `--terminal windows-console` (also `windows` or `console`) lets Bridge
+On native Windows, `--terminal windows-console` (also `windows` or `console`) lets TAB
 choose its tab or console-window surface, whether you invoke it from
-PowerShell or cmd. Bridge tries a Windows Terminal tab first, then a separate console window. It
+PowerShell or cmd. TAB tries a Windows Terminal tab first, then a separate console window. It
 uses a separate window named `agent-bridge` by default:
 
 ```powershell
@@ -69,17 +69,17 @@ Run `tabcli settings windows-tab-window dedicated` to restore the default.
 `windows-tab-window current` chooses the most recently used Windows Terminal window. The new tab
 becomes selected inside that window; Windows Terminal has no supported command to select the earlier
 tab again. `dedicated` is the default and is also used if the setting cannot be read during tab
-selection. Both settings are stored under the selected Bridge state root. Neither affects the close
+selection. Both settings are stored under the selected TAB state root. Neither affects the close
 scope of existing sessions.
 
 A Windows tab is unavailable when the tab executable is not found on an absolute `PATH` entry, there
 is no desktop shell window, the command paths would be altered by Windows Terminal, or no host
-offers a root within the bounded wait. Bridge withdraws that tab request before creating a console
+offers a root within the bounded wait. TAB withdraws that tab request before creating a console
 window. A late host can leave an empty tab briefly, but only one surface starts the session. If the
-tab host has already decided to start its root, Bridge waits for that launch; delayed confirmation
+tab host has already decided to start its root, TAB waits for that launch; delayed confirmation
 does not create a second surface.
 
-Bridge uses its terminal adapter to create the surface, check ownership, deliver terminal input
+TAB uses its terminal adapter to create the surface, check ownership, deliver terminal input
 where needed, and close it. The Windows rows below describe native Windows; Herdr Core runs on all three.
 
 | Platform | Terminal | Creation | Fallback input | Close | Screen read |
@@ -136,7 +136,7 @@ whose scripting exposes no screen text. See [screen](cli.md#screen).
 ## Herdr Core on macOS and Linux
 
 Open Herdr from the desktop or start `hc` from a shell outside an agent session before launching
-a Bridge session. Starting hc inside an agent can give the core that agent's session markers,
+a TAB session. Starting hc inside an agent can give the core that agent's session markers,
 which it then passes to every terminal. This adapter uses an already running,
 local Herdr Core (`hc`), not the older `herdr` TUI. It never starts or restarts the core.
 Use an explicit choice from any terminal, or let detection select it inside an hc terminal:
@@ -154,45 +154,45 @@ shell in either case. Herdr displays a generated `tabcli-<24 hex digits>` name.
 
 For a temporary tab, run `herdr-app do terminal.keep --terminal <address>` using the local
 address in `terminal_session_id`. Herdr enables core keep when it adopts a terminal into a
-pane, so Bridge refuses screen, input and close while a replacement program could run there.
+pane, so TAB refuses screen, input and close while a replacement program could run there.
 Use `herdr-app do terminal.park --terminal <address>` to remove the pane, disable keep and
-leave the program running. Bridge then rechecks its identity. Park before closing if you
+leave the program running. TAB then rechecks its identity. Park before closing if you
 want the session to continue. If you already closed the pane with keep enabled, check that
 `hc get <address>` on the recorded core reports `finished` for this session. Remove that
 finished terminal with `hc rm <address>`, then run `tabcli close-session <session> --explicit`.
 The returned `attach_command` names the socket to use for these hc commands.
 On Linux the terminal starts bash with job control and without shell startup files. The core's environment must provide the tools the CLI needs. Remote hc machines are unsupported. See below for native Windows.
 
-Bridge pins the local socket, core identity and the created terminal. Later commands use that
+TAB pins the local socket, core identity and the created terminal. Later commands use that
 binding even when the caller's `HC_SESSION` or `HC_SOCKET` changes. A replaced or unreachable
 core is not evidence that a terminal is gone. Queries connect without starting a service.
 A parented session counts in the caller's `hc wait --children`. The core does not type child
 notifications into the caller, and the session continues when the caller ends.
-If the original program ends outside Bridge with keep off, run
-`tabcli close-session <session> --explicit` as usual. Bridge verifies and removes the
+If the original program ends outside TAB with keep off, run
+`tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
 finished terminal and closes the session record.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
-follow-ups. Herdr's OSC status and `hc wait` are not Bridge request-completion evidence.
+follow-ups. Herdr's OSC status and `hc wait` are not TAB request-completion evidence.
 Agy and Pi use the addressed paste API, without forcing input past a blocked UI. A send that may
 have reached the terminal is never repeated automatically.
 
 The launch host clears inherited provider caller markers before starting the CLI, including
 markers retained by a core that was started from an assistant's shell. In particular, inherited
 `CLAUDE_CODE_CHILD_SESSION` must not disable Claude transcript storage or peer registration.
-Bridge removes the caller identity rather than forcing persistence on a nested session. It does not change the
-core's environment for other terminals. Bridge reads only the visible screen (`lines=0`) and
+TAB removes the caller identity rather than forcing persistence on a nested session. It does not change the
+core's environment for other terminals. TAB reads only the visible screen (`lines=0`) and
 never scrolls history. It cannot atomically compare a dialog and press a key through hc, so
 workspace trust dialogs must be handled by the user through Herdr or `hc attach`.
 
 ### Herdr Core on native Windows
 
 Install hc for Windows and open Herdr from the desktop, or run `hc server start` in a normal
-(not elevated) desktop terminal outside an agent session. Bridge connects only to the core's
+(not elevated) desktop terminal outside an agent session. TAB connects only to the core's
 local named pipe, the one `hc` uses (`HC_SOCKET`, the `socket` setting, or
 `\\.\pipe\herdr-core-<user>-<session>.sock`), and only when the process serving it runs as
-your Windows user. An elevated core refuses an unelevated Bridge. The session directory must
+your Windows user. An elevated core refuses an unelevated TAB. The session directory must
 be a real, private directory: a junction, or an access list that lets another account change
 its entries, refuses the launch.
 
@@ -201,7 +201,7 @@ tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain 
 ```
 
 Windows creates a parentless Herdr terminal even when launched from inside Herdr.
-The terminal runs Bridge's launch host, which waits for its binding and then starts the same
+The terminal runs TAB's launch host, which waits for its binding and then starts the same
 PowerShell 7 root that a managed console runs, so PowerShell 7 must be on the core's `PATH`.
 Pi and Agy keep their Windows input rules (a one-line prompt, their startup checks and
 receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. Codex is refused:
@@ -215,7 +215,7 @@ later close finishes it. Only Pi has been run live on Windows Herdr.
 ## Linux / tmux
 
 This surface requires tmux 3.2 or later, resolved as an executable `tmux` on an absolute `PATH` entry;
-Bridge uses its canonical path. No GUI window is opened. Use the shell-quoted command printed
+TAB uses its canonical path. No GUI window is opened. Use the shell-quoted command printed
 by `ask`/`tell` as `attach: ...`, or the JSON `attach_command` from turn output and `inspect`:
 
 ```sh
@@ -224,18 +224,18 @@ tmux -S '<socket>' attach
 
 Each managed session owns one tmux server. Its socket is `<session directory>/tmux.sock`, under
 `~/.agent-bridge/native-sessions` by default, or `AGENT_BRIDGE_NATIVE_STATE_DIR`. The Unix socket
-path must be shorter than 108 bytes; Bridge refuses a longer path before running tmux and
+path must be shorter than 108 bytes; TAB refuses a longer path before running tmux and
 suggests a shorter state directory. An existing socket path is also refused.
 
 The server starts detached with `-f /dev/null`, one session named `agent-bridge`, and a 200x50
 window. Your tmux configuration, key bindings, and options are not loaded. Client commands drop
-`TMUX`, `TMUX_PANE`, and `TMUX_TMPDIR`, so invoking Bridge inside tmux never addresses that
+`TMUX`, `TMUX_PANE`, and `TMUX_TMPDIR`, so invoking TAB inside tmux never addresses that
 outer server. The pane host waits for binding to the exact pane and server, discards startup
 input, then runs the launch command with `bash --noprofile --norc -m -c`. Job control puts the
 provider wrapper in the pane's foreground process group.
 
 No shell startup files are read. The pane inherits the calling process's environment after
-Bridge's usual provider-private variable removal. Profile/rc exports, shell functions, and
+TAB's usual provider-private variable removal. Profile/rc exports, shell functions, and
 PATH additions absent from that process are unavailable. Node-based Codex and Pi launchers
 use `#!/usr/bin/env node`, so `node` must be on that PATH.
 
@@ -247,7 +247,7 @@ after it starts is delivery-uncertain and nothing is replayed. An attached viewe
 does not stop delivery. `screen` uses `capture-pane -p` to read the application's visible
 50 rows, including while a viewer scrolls in copy mode.
 
-Bridge never answers dialogs in tmux: `tmux cannot compare the screen and send a key in one
+TAB never answers dialogs in tmux: `tmux cannot compare the screen and send a key in one
 call; answer the dialog in its pane`. A Claude or Agy workspace-trust dialog stops launch with
 `the workspace trust dialog cannot be answered with a guarded key in tmux; no key was sent;
 use the provider's own workspace trust prompt, then launch again`. The pane is kept so you can
@@ -279,31 +279,31 @@ self-test PROVIDER` when you want to open a surface and make real model calls. S
 [providers](providers.md) and
 [CLI reference](cli.md); a passing executable/version check is not a delivery guarantee.
 
-On macOS, install the selected application. Bridge addresses iTerm2 by its bundle identifier,
+On macOS, install the selected application. TAB addresses iTerm2 by its bundle identifier,
 `com.googlecode.iterm2`, so a launch starts iTerm2 when it is not running; addressing it by name
 failed before it ran (#99). The iTerm2, Terminal.app, and Ghostty scripting routes
 can require macOS Automation consent. If the first launch times out in Automation, check for a
 visible system prompt and follow [macOS permissions](macos-permissions.md).
-Review and answer prompts yourself; Bridge does not grant system access. After handling the
+Review and answer prompts yourself; TAB does not grant system access. After handling the
 permission prompt, inspect the failed session and close any surface it created before starting
 another. WezTerm uses its official CLI and a verified local GUI connection.
 
 Claude and Agy workspace-trust recognition requires the complete exact path on one screen
 line. A long path wrapped across rows is not an exact match. Use a wider terminal or the
-provider's own trust prompt; Bridge does not guess the wrapped path or approve a different
+provider's own trust prompt; TAB does not guess the wrapped path or approve a different
 dialog. If the launch has already failed, inspect and close that session before starting a
-new one. A prompt that Bridge delivers after launch was not sent; while the session is still
+new one. A prompt that TAB delivers after launch was not sent; while the session is still
 `awaiting-initial-input`, its request is recorded as `failed`, and [ask](cli.md#ask) describes
 the other outcomes.
 See the [macOS consent verification](verification/2026-10-27-macos-28-consent.md)
 for the measured layouts and their limits.
 
-Bridge expects Ghostty at `/Applications/Ghostty.app` with the required native scripting commands.
+TAB expects Ghostty at `/Applications/Ghostty.app` with the required native scripting commands.
 If you see `Ghostty native scripting dictionary is unavailable` or `Ghostty native scripting lacks
-…`, install a compatible application there or select another terminal. Bridge reads
+…`, install a compatible application there or select another terminal. TAB reads
 `/Applications/Ghostty.app/Contents/Resources/Ghostty.sdef` and requires `new surface
 configuration`, `new tab`, `new window`, `select tab`, `input text`, and `close tab`.
-Ghostty's scripting dictionary exposes no screen text, so Bridge cannot check a trust dialog
+Ghostty's scripting dictionary exposes no screen text, so TAB cannot check a trust dialog
 before answering it; guarded responses need scripting access to the exact terminal's screen text.
 
 WezTerm's CLI has no compare-and-send command, and a mux Lua callback is not atomic with screen
@@ -319,13 +319,13 @@ no server experiment sets it. A Stable or Preview installation therefore shows n
 Scripting page and never publishes an endpoint, whatever the user does; its embedded CLI answers
 `No running Warp instances with local control were found` (Stable `0.2026.10.07.08.29.00`,
 2026-10-11). Warp's own specification (`specs/warp-control-cli/PRODUCT.md`) describes an opt-in on
-public channels, so the gap is upstream, not a Bridge check. The condition is removable when Warp
+public channels, so the gap is upstream, not a TAB check. The condition is removable when Warp
 enables the flag on a public channel, or with a Warp built with `--features warp_control_cli`; the
 adapter already knows the OSS channel bundle.
 
 The tab route also requires enabled TabConfigs; new-window mode uses the separate Launch
 Configuration URI. Installed application/version checks alone are insufficient: required control
-actions and the bound instance must be available. Bridge uses ownership titles to prove the created
+actions and the bound instance must be available. TAB uses ownership titles to prove the created
 surface. Warp's Control API cannot submit terminal input, so Agy/Pi follow-ups are unsupported
 there. Codex/Claude native input paths do not remove the terminal's creation and ownership checks.
 If the Control endpoint is unavailable, select another terminal. Warp remains limited (#63);
@@ -340,7 +340,7 @@ On native Windows, install PowerShell 7 with `pwsh.exe` discoverable on an absol
 Windows Terminal's `wt.exe` must likewise be discoverable for tabs; it is optional for the console
 window fallback. If `pwsh.exe` is not found, correct its `PATH` entry before launching again. Both
 launch forms run the same PowerShell root and provider configuration. If initial input waits on
-workspace trust, look at the managed surface and decide whether to trust that directory. Bridge does
+workspace trust, look at the managed surface and decide whether to trust that directory. TAB does
 not treat an empty screen as proof of trust, blindly press Enter, or resend input whose receipt is
 uncertain.
 
@@ -348,15 +348,15 @@ Agy's terminal fallback needs provider-owned readiness and a receipt (#43, #48).
 initial paste and macOS follow-ups require both exact workspace trust in Agy's store and this
 session's log evidence of workspace customization loading. Readiness requires startup and a quiet
 period, plus redraw on Windows; there is no additional reload window. If input is withheld because
-Bridge cannot verify this session’s trust, check the surface. If it shows the composer instead of a
+TAB cannot verify this session’s trust, check the surface. If it shows the composer instead of a
 trust dialog, or input remains withheld after approval, close the session and start a new one. Do
 not resend after uncertain delivery. A missing receipt leaves delivery uncertain. Inspect the
 request and wait for its result or close the session; do not paste again. Codex's addressed queue
 avoids relying on the currently displayed agent thread, but manual agent-picker changes and
 additional TUI input have separate verification limits (#57, #65). Consult
-[provider documentation](providers.md) before mixing manual input with Bridge requests.
+[provider documentation](providers.md) before mixing manual input with TAB requests.
 
-Windows launches remove adapter-owned caller-session markers and Bridge's inherited state
+Windows launches remove adapter-owned caller-session markers and TAB's inherited state
 root, session directory, session id and executable from `wt.exe`, its tab host, both
 PowerShell roots and helpers. The markers include the five that a Codex tool shell carries:
 `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_DAEMON_SHUTDOWN_FILE` and
@@ -364,7 +364,7 @@ PowerShell roots and helpers. The markers include the five that a Codex tool she
 hints and sandbox context, such as `CODEX_HOME`, stay. The tab host receives only the new
 attempt marker from this context. The bootstrap sets the selected state root for the wrapper;
 the wrapper supplies its new session directory, id and executable to the provider and its
-hooks. Console control helpers explicitly receive the selected state root. These Bridge
+hooks. Console control helpers explicitly receive the selected state root. These TAB
 variables in a managed provider are expected; their values must describe the new session.
 This does not remove all Claude or Codex configuration or plugin context, or retroactively
 clean an existing terminal application's environment. Restart an already contaminated
@@ -372,7 +372,7 @@ terminal application.
 
 ### Shell startup files (iTerm2 and WezTerm)
 
-iTerm2 and WezTerm start Bridge's host as the program of the new surface. Before the launch,
+iTerm2 and WezTerm start TAB's host as the program of the new surface. Before the launch,
 the host runs your zsh login and interactive startup files once, without a terminal:
 `/bin/zsh -l -i` in a new session with no controlling terminal and standard input from
 `/dev/null`. It keeps only the exported environment that run produces, then starts the launch
@@ -402,32 +402,32 @@ starts a clean shell with the launcher's `PATH`.
 Open sessions, including finished sessions that were not closed, load the terminal. For bulk
 delegation, cap the number of open sessions and close a session before opening the next.
 On a slow terminal, give `close-session` a longer `--timeout-secs` budget. When a running
-WezTerm GUI does not answer its pane listing in time, Bridge reports it as busy instead of
+WezTerm GUI does not answer its pane listing in time, TAB reports it as busy instead of
 opening another window.
 
-`close-session` targets the surface Bridge created for that session, not whichever tab you have
+`close-session` targets the surface TAB created for that session, not whichever tab you have
 selected. It preserves surfaces outside that session; tmux close includes every window added to
-the session's server. If Bridge cannot prove ownership or absence of the recorded
+the session's server. If TAB cannot prove ownership or absence of the recorded
 surface, it refuses the close and keeps the handle.
 
-The owner is the Bridge process that launched the session. Before signalling it, Bridge checks that
+The owner is the TAB process that launched the session. Before signalling it, TAB checks that
 the recorded owner is still the same process. On macOS it compares the PID, process birth,
 controlling TTY, and process groups; Linux uses procfs birth and control identity; Windows uses
 process identity. This check is called owner
-attestation. The surface handle also names its Bridge session. Reusing a PID or TTY does not
+attestation. The surface handle also names its TAB session. Reusing a PID or TTY does not
 transfer ownership to a new process.
 
-Terminal.app needs one more check: Bridge records which run of the application created the window,
+Terminal.app needs one more check: TAB records which run of the application created the window,
 using the application's PID and birth. That run is the app incarnation. A window id and TTY are
 meaningful only within it, so a restarted or second Terminal process cannot receive a close meant
-for the earlier one. Bridge checks the recorded surface and attested process groups before stopping
+for the earlier one. TAB checks the recorded surface and attested process groups before stopping
 them.
 
-Those checks determine whether Bridge can act with the live owner, act on the recorded surface
+Those checks determine whether TAB can act with the live owner, act on the recorded surface
 alone, end a live attested owner whose surface is proven absent, or leave it alone because it
 is proven absent. That decision is close authority. A newly
 selected tab or a window that appeared during launch provides no such authority. If none of the
-four outcomes is proven, Bridge refuses and keeps the handle. The
+four outcomes is proven, TAB refuses and keeps the handle. The
 [architecture reference](architecture.md) explains the records behind this decision.
 
 If a macOS terminal application has gone but the session's processes survive, as observed
@@ -436,7 +436,7 @@ proven absence permits owner teardown. Terminal.app uses the recorded app incarn
 absence checks; a present surface or an observation error keeps the original proof error.
 A restored iTerm2 session with a different unique id does not replace the recorded handle.
 
-Bridge attests the owner without the surface's tty reply, records a teardown intent naming
+TAB attests the owner without the surface's tty reply, records a teardown intent naming
 the session, handle, owner, process group and reason, then attests it again before signalling.
 It sends SIGTERM only to the group the owner leads and waits up to three seconds for ESRCH.
 It sends no SIGKILL and no shell signal. Once the group is gone, close consumes the handle and
@@ -447,14 +447,14 @@ EPERM and a zombie-only group do not establish absence. Check the reported error
 session's processes before retrying. Observation and signal are not one atomic operation.
 The group's disappearance does not prove that processes which left the group have ended.
 
-If Ghostty initialization fails after Bridge proves the created terminal, tab, and window ids,
-Bridge attempts the existing scoped cleanup once. If cleanup cannot confirm closure, the adapter
+If Ghostty initialization fails after TAB proves the created terminal, tab, and window ids,
+TAB attempts the existing scoped cleanup once. If cleanup cannot confirm closure, the adapter
 returns those ids as data. When the launch still owns its claim and is still `launching`, the
 launcher saves them in `terminal.json` and records `failed`; explicit close can close that exact
 surface later. A handle-less close during pending creation is refused until the launch deadline.
 If close completes after that deadline but before the failed-launch handoff, no handle is added
 to the closed session. Its error and launch log name the residual surface, which may remain and
-is not closed by Bridge. Repeating close preserves the warning and does not close that surface.
+is not closed by TAB. Repeating close preserves the warning and does not close that surface.
 Unproven creation evidence grants no close authority. This preserves failure evidence after an
 automation timeout; it does not establish what caused the timeout.
 
@@ -470,7 +470,7 @@ unimplemented (#87). Warp is not live-verified (#63), and this record-write fail
 been observed live.
 
 When a close fails, read the error and run `tabcli doctor SESSION`. Check the managed surface
-before retrying `tabcli close-session SESSION --explicit`. Bridge restores the handle after a
+before retrying `tabcli close-session SESSION --explicit`. TAB restores the handle after a
 terminal close error so the retry addresses the same surface. If close was interrupted, the saved
 closing handle, close intent where applicable, and tombstone show what remains to do. Repeating a
 completed close does not close anything else. Recorded results remain available until you explicitly
@@ -486,7 +486,7 @@ proven gone. Those records do not grant permission to signal another process.
 
 Ghostty currently records no close intent. Its retained handle does not enable an intent-based
 retry after the owner ends. Without separate failed-start close authority or proof that the surface
-is absent, Bridge refuses the close and retains the handle. Check the named surface in Ghostty.
+is absent, TAB refuses the close and retains the handle. Check the named surface in Ghostty.
 
 Windows repair can close the managed console whose owner exited, using the same close checks.
 Missing or unreadable evidence can stop repair. Run
@@ -495,22 +495,22 @@ to read the records without changing them.
 
 Terminal.app sometimes lists a window after closing it: the object has no tabs and is not visible
 (#64). Do not infer a running session from that list alone. Immediately after a successful close,
-Bridge accepts that hidden, empty object as closed. A later query or retry cannot use the same
-observation as proof on its own. When restoring focus, Bridge selects only a previously visible
+TAB accepts that hidden, empty object as closed. A later query or retry cannot use the same
+observation as proof on its own. When restoring focus, TAB selects only a previously visible
 window, so it does not bring the closed empty object back. See the
 [cleanup evidence](verification/2026-10-02-terminal-cleanup.md) and
 [follow-up verification](verification/2026-10-03-v0.1.0-issues.md) (Korean).
 
 On Windows, close ends the processes it finds in the managed console. It ends a remaining attested
 tab host last, with a successful exit, so Windows Terminal does not retain a failed tab. A process
-started during close can escape that enumeration; this limit applies to both surface forms. Bridge
+started during close can escape that enumeration; this limit applies to both surface forms. TAB
 ends an unattached root directly only when its records show that the wrapper never ran and its
 process identity still matches. The records must have no owner and no recorded spawn attempt;
 unreadable launch evidence does not qualify. Failure to attach alone is insufficient.
 
 ## Focus and keyboard behaviour
 
-A new surface can briefly select a tab or bring an application forward (#58). Bridge returns the
+A new surface can briefly select a tab or bring an application forward (#58). TAB returns the
 keyboard to where you were working only while it can distinguish its own selection from yours. If
 you select something else during launch, it leaves your selection alone under the checks below.
 
@@ -540,7 +540,7 @@ continue throughout the provider’s startup or model turn. During that period, 
 foreground independently while launch waits. It obtains the surface's host window from inside its
 console and gives the foreground back only from that identified window. A different window selected
 during launch becomes the restoration target. If the surface comes back more than 200 ms after
-restoration, Bridge treats it as a user selection and leaves it selected; earlier activation is
+restoration, TAB treats it as a user selection and leaves it selected; earlier activation is
 treated as launch-related. This cannot perfectly distinguish very fast user selection from
 application activation. The tab host discards input accumulated before it starts the root, so an
 early Enter cannot answer the provider's first dialog. A separate console window has no such host

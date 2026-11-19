@@ -11,7 +11,7 @@ use std::{
 };
 
 /// The local named-pipe namespace. hc creates its pipes there with
-/// `PIPE_REJECT_REMOTE_CLIENTS`; Bridge connects to nothing else, so another machine's
+/// `PIPE_REJECT_REMOTE_CLIENTS`; TAB connects to nothing else, so another machine's
 /// pipe (`\\host\pipe\...`) and a file path are never a core.
 pub(super) const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\";
 /// hc's limit on a pipe name (`MAX_SOCKET_PATH` on Windows).
@@ -48,8 +48,8 @@ fn nonempty(value: &Option<OsString>) -> Option<&OsString> {
 
 /// The pipe of the core that `hc` addresses from these inputs. A session name `hc` would
 /// refuse, a configuration it cannot read and a name that is not a local pipe are refused:
-/// Bridge never guesses another endpoint. hc falls back to `C:\` for a missing profile;
-/// Bridge refuses instead of reading a configuration from there.
+/// TAB never guesses another endpoint. hc falls back to `C:\` for a missing profile;
+/// TAB refuses instead of reading a configuration from there.
 pub(super) fn resolve_pipe(
     inputs: &WindowsEndpointInputs,
     config_socket: &dyn Fn(&Path) -> Result<Option<String>>,
@@ -106,7 +106,7 @@ pub(super) fn local_pipe_name(pipe: &Path) -> Result<&str> {
         .filter(|name| !name.is_empty() && !name.contains(['\\', '/', '\0']))
         .with_context(|| {
             format!(
-                "the Herdr Core endpoint {text} is not a local named pipe ({LOCAL_PIPE_PREFIX}<name>); Bridge connects to no other endpoint"
+                "the Herdr Core endpoint {text} is not a local named pipe ({LOCAL_PIPE_PREFIX}<name>); TAB connects to no other endpoint"
             )
         })?;
     if text.len() > MAX_PIPE_NAME {

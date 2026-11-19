@@ -2085,7 +2085,7 @@ fn apple_terminal_close_retry_failure_or_interruption_keeps_the_intent_and_the_h
     {
         let closer = &mut |_: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
             Err(anyhow::anyhow!(
-                "Agent Bridge Terminal.app window no longer holds its tab"
+                "TAB Terminal.app window no longer holds its tab"
             ))
         };
         session_close::close(

@@ -335,7 +335,7 @@ impl NativeProviderAdapter for AgyAdapter {
 
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
         Ok(super::CancelSupport::Unsupported(
-            "in this release the Bridge integration for agy does not support cancel".to_owned(),
+            "in this release the TAB integration for agy does not support cancel".to_owned(),
         ))
     }
 
@@ -440,7 +440,7 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
-        bail!("Agy does not expose Agent Bridge provider controls")
+        bail!("Agy does not expose TAB provider controls")
     }
 
     // Agy's pastes go through the surface's own transport (a Herdr terminal's

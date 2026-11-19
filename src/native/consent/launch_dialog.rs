@@ -289,7 +289,7 @@ impl LaunchDialog<'_> {
             if trusted {
                 if responded {
                     applied(directory, "provider-workspace-dialog")
-                        .context("provider trust is confirmed; recording the Bridge applied marker failed; no input was retried")?;
+                        .context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")?;
                 }
                 return Ok(());
             }

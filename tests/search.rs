@@ -630,7 +630,7 @@ fn unreadable_request_directory_is_reported_not_treated_as_legacy() {
     let reasons = reasons_for(&found, Some("session-a"));
     assert_eq!(reasons.len(), 1, "{found}");
     assert!(
-        reasons[0].starts_with("request index incomplete: failed to read Bridge requests"),
+        reasons[0].starts_with("request index incomplete: failed to read TAB requests"),
         "{}",
         reasons[0]
     );

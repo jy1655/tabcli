@@ -313,7 +313,7 @@ fn submission_check_timeout_is_uncertain() {
     assert!(failure.delivery_may_have_occurred());
     assert_eq!(
         failure.error().to_string(),
-        "Codex composer still holds the pasted prompt; the submission was not observed. Press Enter in the surface or close the session; Agent Bridge does not resend"
+        "Codex composer still holds the pasted prompt; the submission was not observed. Press Enter in the surface or close the session; TAB does not resend"
     );
 }
 

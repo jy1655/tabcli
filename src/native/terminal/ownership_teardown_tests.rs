@@ -1034,10 +1034,7 @@ fn terminal_app_live_owner_close_refuses_an_unverified_surface_before_the_owner(
         crate::native::session::close::budget::close_deadline(),
     )
     .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Agent Bridge Terminal.app owned tab is missing"
-    );
+    assert_eq!(error.to_string(), "TAB Terminal.app owned tab is missing");
     automation.assert_finished();
     assert!(
         !Store::open_unchecked(dir.path())

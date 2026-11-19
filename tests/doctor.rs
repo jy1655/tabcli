@@ -1533,7 +1533,7 @@ fn hold_check_reports_each_part_without_changing_other_checks() {
 }
 
 // The Agy workspace-trust row, through the public command and a controlled caller
-// environment: Bridge locates Agy's store under HOME, otherwise USERPROFILE, and reports
+// environment: TAB locates Agy's store under HOME, otherwise USERPROFILE, and reports
 // what it observed without answering the dialog. Every row keeps the same fields.
 #[test]
 fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
@@ -1545,7 +1545,7 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     let home = tempfile::tempdir().unwrap();
     // A provider store is evidence only when nobody but the user can change it. The temporary
     // directory inherits what the system allows, and a PC with the Codex sandbox lets another
-    // account modify its files, so the home is made private the way Bridge's own records are
+    // account modify its files, so the home is made private the way TAB's own records are
     // before the store is written (#240).
     make_private(home.path());
     fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();

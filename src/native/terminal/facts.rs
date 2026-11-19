@@ -28,7 +28,7 @@ pub(in crate::native) enum CloseEvidenceChoice {
     /// but never end a running one.
     PresenceWithEndedSurface,
     AppleTerminal,
-    /// Whole host created exclusively by Bridge and recorded by incarnation.
+    /// Whole host created exclusively by TAB and recorded by incarnation.
     BridgeCreatedHost,
 }
 

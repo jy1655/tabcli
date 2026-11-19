@@ -94,8 +94,8 @@ fn fake(replies: impl IntoIterator<Item = Reply>) -> Fake {
         budgets: Vec::new(),
         sessions: vec![
             json!({"id":"session-foreign","title":"different title"}),
-            json!({"id":"session-similar","title":"Agent Bridge self-test AB_marker extra"}),
-            json!({"id":"session-owned","title":"Agent Bridge self-test AB_marker"}),
+            json!({"id":"session-similar","title":"TAB self-test AB_marker extra"}),
+            json!({"id":"session-owned","title":"TAB self-test AB_marker"}),
         ],
         ownership_error: false,
         isolated: false,
@@ -186,7 +186,7 @@ fn identical_answers_require_distinct_requests_and_events() {
     assert!(
         fake.calls[0]
             .windows(2)
-            .any(|args| args == ["--title", "Agent Bridge self-test AB_marker"])
+            .any(|args| args == ["--title", "TAB self-test AB_marker"])
     );
 }
 
@@ -449,12 +449,12 @@ fn exact_title_lookup_never_selects_other_sessions_and_is_read_only() {
         root: root.path().to_owned(),
         isolated: false,
     };
-    let title = "Agent Bridge self-test AB_marker";
+    let title = "TAB self-test AB_marker";
     assert!(installed.owned_session(workspace.path(), title).is_err());
     let mut snapshots = Vec::new();
     for (id, session_title) in [
         ("session-foreign", "different title"),
-        ("session-similar", "Agent Bridge self-test AB_marker extra"),
+        ("session-similar", "TAB self-test AB_marker extra"),
         ("session-owned", title),
     ] {
         let directory = root.path().join(id);
@@ -541,8 +541,8 @@ fn ambiguous_title_lookup_never_closes_anything() {
     for sessions in [
         vec![],
         vec![
-            json!({"id":"session-owned","title":"Agent Bridge self-test AB_marker"}),
-            json!({"id":"session-second","title":"Agent Bridge self-test AB_marker"}),
+            json!({"id":"session-owned","title":"TAB self-test AB_marker"}),
+            json!({"id":"session-second","title":"TAB self-test AB_marker"}),
         ],
     ] {
         let count = sessions.len();
@@ -963,7 +963,7 @@ fn closed_residual_surface_cleanup_is_not_verified() {
 #[test]
 fn agy_result_timeouts_append_only_the_same_requests_doctor_observation() {
     const REASON: &str = "waiting timed out; the request was not cancelled or resent";
-    const DETAIL: &str = "This session's agy.log shows the pending turn waiting for user approval of RunCommand in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open.";
+    const DETAIL: &str = "This session's agy.log shows the pending turn waiting for user approval of RunCommand in the terminal. TAB does not answer it. This is the last observed confirmation, not proof that the dialog is still open.";
     for follow_up in [false, true] {
         for evidence in [
             "matching",

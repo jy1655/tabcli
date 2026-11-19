@@ -44,7 +44,7 @@ pub(in crate::native) fn valid_session_id(value: &str) -> bool {
 
 pub(in crate::native) fn require_valid_session_id(value: &str) -> Result<()> {
     if !valid_session_id(value) {
-        bail!("invalid Agent Bridge session id: {value:?}");
+        bail!("invalid TAB session id: {value:?}");
     }
     Ok(())
 }

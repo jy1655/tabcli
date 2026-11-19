@@ -835,7 +835,7 @@ pub(super) fn create_surface(
 }
 
 fn host_pane_program(command: &str, directory: &Path) -> Result<[String; 5]> {
-    let executable = env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let executable = env::current_exe().context("failed to resolve TAB executable")?;
     Ok(host_program(&executable, directory, command))
 }
 

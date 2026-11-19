@@ -321,7 +321,7 @@ pub(super) fn run_message_guard(request: &[String]) -> Result<()> {
         MessageGuardDecision::Allow(input) => serde_json::json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "Agent Bridge supplied the addressed SendMessage payload",
+            "permissionDecisionReason": "TAB supplied the addressed SendMessage payload",
             "updatedInput": input,
         }),
         MessageGuardDecision::Deny => serde_json::json!({
@@ -947,7 +947,7 @@ fn confirm_executed_payload(files: &MessengerFiles, send_id: &str) -> Result<()>
     let receipt: MessageReceipt = read_message_evidence(&files.receipt)?
         .context("Claude did not report the executed SendMessage input")?;
     if !receipt.verified {
-        bail!("Claude executed SendMessage without the addressed Agent Bridge payload")
+        bail!("Claude executed SendMessage without the addressed TAB payload")
     }
     if [&allowed.tool_use_id, &receipt.tool_use_id]
         .into_iter()

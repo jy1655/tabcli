@@ -93,7 +93,7 @@ pub(in crate::native) fn bridge_shell_command(
     for (value, field) in [
         (workspace.as_os_str(), "workspace"),
         (state_root.as_os_str(), "state root"),
-        (executable.as_os_str(), "Agent Bridge executable"),
+        (executable.as_os_str(), "TAB executable"),
         (std::ffi::OsStr::new(id), "session id"),
     ] {
         validate_shell_command_component(value, field)?;
@@ -128,7 +128,7 @@ pub(in crate::native) fn bridge_shell_command(
     for (value, field) in [
         (workspace.as_os_str(), "workspace"),
         (state_root.as_os_str(), "state root"),
-        (executable.as_os_str(), "Agent Bridge executable"),
+        (executable.as_os_str(), "TAB executable"),
         (std::ffi::OsStr::new(id), "session id"),
     ] {
         validate_shell_command_component(value, field)?;

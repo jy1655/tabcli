@@ -27,9 +27,9 @@ export async function report($, event, data, observedConversation) {
       } catch {}
     }
     $.ui.log(event === "question.emissions"
-      ? "Agent Bridge could not retain this question observation; ordinary tool execution continues."
+      ? "TAB could not retain this question observation; ordinary tool execution continues."
       : event === "question.deflected"
-        ? "Agent Bridge could not record this question deflection; the question call was still refused."
-        : `Agent Bridge could not record Claude ${event}; inspect the session before sending again.`);
+        ? "TAB could not record this question deflection; the question call was still refused."
+        : `TAB could not record Claude ${event}; inspect the session before sending again.`);
   } catch {}
 }
