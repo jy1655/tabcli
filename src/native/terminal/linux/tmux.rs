@@ -1,4 +1,4 @@
-//! tmux: one tmux server per managed session, started by Bridge for that launch and ended
+//! tmux: one tmux server per managed session, started by TAB for that launch and ended
 //! by its close. The user watches or types by attaching to the server's socket.
 //!
 //! The handle names the pane (`id`, `%N`), its window (`tab_id`, `@N`) and its tmux session
@@ -34,11 +34,11 @@ use std::{
 };
 
 const HOST_COMMAND: &str = TerminalKind::Tmux.registration().host_command;
-/// The server socket, in the session directory: Bridge creates that directory private to
+/// The server socket, in the session directory: TAB creates that directory private to
 /// the user, so no other server can already listen there.
 pub(in crate::native) const SOCKET_FILE: &str = "tmux.sock";
 /// The tmux session's name. Every server holds only this one session, so the name needs no
-/// session id; it must not repeat the Bridge session id, which Claude's agent listing shows
+/// session id; it must not repeat the TAB session id, which Claude's agent listing shows
 /// next to the tmux session it runs in, so a recipient name would be listed twice.
 pub(in crate::native) const SESSION_NAME: &str = "agent-bridge";
 const COLUMNS: &str = "200";
@@ -98,7 +98,7 @@ pub(super) trait Host {
     fn server(&self, pid: u32, birth: LinuxBirth) -> Result<Option<Box<dyn Server>>>;
     /// Whether anything exists at this path (a symlink is not followed).
     fn path_exists(&self, path: &Path) -> Result<bool>;
-    /// This Bridge executable, which the pane runs as its host.
+    /// This TAB executable, which the pane runs as its host.
     fn bridge_executable(&self) -> Result<PathBuf>;
 }
 
@@ -434,7 +434,7 @@ fn require_pane(host: &dyn Host, target: &Target<'_>, deadline: Instant) -> Resu
         .with_context(|| format!("tmux pane {} of this session is gone", target.pane))
 }
 
-/// The pane program: this Bridge's tmux host, given the session directory and the launch
+/// The pane program: this TAB executable's tmux host, given the session directory and the launch
 /// command as separate arguments. With more than one argument tmux runs it without a shell.
 pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -> Vec<OsString> {
     vec![

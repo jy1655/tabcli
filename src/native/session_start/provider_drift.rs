@@ -1,6 +1,6 @@
 //! A read-only note for an initial prompt that was not delivered: whether the provider's
 //! version differs from the one that last completed a request on this state root. A provider
-//! update can change a startup screen that Bridge waits behind, and the failure alone does
+//! update can change a startup screen that TAB waits behind, and the failure alone does
 //! not say so. The note states the two recorded versions and nothing about the cause; it
 //! reads manifests and events only and writes nothing.
 //!
@@ -68,7 +68,7 @@ fn note_until(
         let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        // Bridge creates session directories only; another name or kind is not history.
+        // TAB creates session directories only; another name or kind is not history.
         if !valid_session_id(&id) || id == session || !entry.file_type().ok()?.is_dir() {
             continue;
         }

@@ -10,7 +10,7 @@
 - Start detached with `-f /dev/null`, one tmux session named `agent-bridge`, and a 200x50
   window. Never load the user's tmux configuration. Drop `TMUX`, `TMUX_PANE`, and
   `TMUX_TMPDIR` from client commands so an outer tmux cannot become the addressed server.
-  Naming the tmux session after the Bridge id made Claude list the recipient twice on M8
+  Naming the tmux session after the TAB id made Claude list the recipient twice on M8
   (2026-11-17, Claude 2.1.326); preserve the fixed session name.
 - Bind pane, window, session, socket and server incarnation (pid plus boot id and procfs
   start ticks). Creation proves this boot and a birth no earlier than the clock reading
@@ -40,6 +40,6 @@
 - Measure Linux provider commands before spawn: each argument or environment string including
   NUL fits `MAX_ARG_STRLEN` (32 pages, 131072 bytes on 4 KiB pages), and argv plus environment
   fits `ARG_MAX`. Refuse oversized commands with nothing sent, including Codex queue messages.
-  Codex starts legacy notify itself, so Bridge cannot premeasure that command. A 256 KiB
+  Codex starts legacy notify itself, so TAB cannot premeasure that command. A 256 KiB
   context attachment can exceed a command budget; long material belongs at a workspace path.
 

@@ -1,4 +1,4 @@
-# Terminal Agent Bridge (TAB)
+# TAB
 
 [한국어](README.ko.md) follows this README; this one is the reference when they differ.
 
@@ -9,7 +9,7 @@ TAB runs on macOS, native Windows, and Linux through tmux or Herdr Core. Linux p
 verified, and Warp support is limited.
 
 To delegate from your assistant without writing global instructions, install the
-[Agent Bridge plugin](#install-an-assistant-plugin) for Claude Code, Codex, Agy, or Pi.
+[TAB plugin](#install-an-assistant-plugin) for Claude Code, Codex, Agy, or Pi.
 Each package contains the same workflow skill and uses your installed `tabcli`.
 
 ## Try a session
@@ -104,7 +104,7 @@ Linux defaults to tmux 3.2 or later and opens no GUI window. Attach with the pri
 
 By default, `ask`, `reopen`, and `self-test` refuse to launch any provider in the Codex memory
 workspace (`$CODEX_HOME/memories`, default `~/.codex/memories`) or a directory inside it, before
-any session or terminal exists. Codex's background memory consolidation started Bridge sessions
+any session or terminal exists. Codex's background memory consolidation started TAB sessions
 there that nobody closed. The refusal also applies to a launch you start there yourself;
 `tabcli settings codex-memory-workspace allow` permits it. See [`ask`](docs/cli.md#ask).
 
@@ -122,7 +122,7 @@ round trip and close are not verified. Choose another terminal for those provide
 Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude needs working
 cross-session messaging in its installed backend and configuration, not only a recent version.
 New macOS, Linux, and Windows Claude launches, plus Windows reopens, require stable 2.1.302 or newer
-and a Bridge completion module that Claude loads and that reports readiness.
+and a TAB completion module that Claude loads and that reports readiness.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
 - [2026-10-28 Ghostty 1.4.0, published 0.4.29](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md):
@@ -134,7 +134,7 @@ See [provider requirements](docs/providers.md) for delivery paths and failure ha
 - [2026-10-22 Windows, Claude native completion re-verification](docs/verification/2026-10-22-windows-260-reverification.md):
   the first re-check at `fa50fb8` failed the background-continuation case. The corrected
   `49bb9d1` binary, with Claude Code 2.1.308, kept the unmarked interims of a background `ask`
-  and `tell` as candidates and published their marked finals with the original Bridge ids.
+  and `tell` as candidates and published their marked finals with the original TAB ids.
   A genuine unmarked final stayed pending after the caller timed out. This verifies the marker
   protocol, not provider-owned parentage.
 - [2026-10-19 Windows, Claude native completion owner checks](docs/verification/2026-10-19-windows-249-claude-native-completion.md):
@@ -194,25 +194,25 @@ Download the archive for your platform and its matching `.sha256` file from
 `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz` for x86_64 Linux with glibc 2.39 or newer
 (Ubuntu 24.04 or later).
 
-For version 0.4.47, verify the checksum in the download directory before extracting.
+For version 0.4.48, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.4.47-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.47-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.48-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.48-aarch64-apple-darwin.tar.gz
 ```
 
 On Linux, likewise:
 
 ```sh
-sha256sum -c tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c tabcli-0.4.48-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.48-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.4.47-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.48-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -225,7 +225,7 @@ Put the extracted `tabcli` (macOS, Linux) or `tabcli.exe` (Windows) in a directo
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.47 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.48 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated
@@ -235,7 +235,7 @@ Before the first launch, install and sign in to the provider CLI, and resolve it
 prompt for your project. The iTerm2, Terminal.app, and Ghostty integrations use macOS Automation.
 If launch reports an Apple Events permission error, follow the
 [macOS permission checks](docs/macos-permissions.md). Native Windows requires PowerShell 7
-(`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd. The Linux tmux surface requires tmux 3.2 or later
+(`pwsh.exe`) on `PATH`, even when you invoke TAB from cmd. The Linux tmux surface requires tmux 3.2 or later
 on `PATH`; see [Linux / tmux](docs/terminals.md#linux--tmux).
 
 ## Install an assistant plugin
@@ -323,28 +323,28 @@ See the [CLI reference](docs/cli.md) for options, output fields, and recovery st
 
 ## Before you rely on it
 
-Bridge is not a model client or a sandbox. It cannot attach to a session it did not launch.
+TAB is not a model client or a sandbox. It cannot attach to a session it did not launch.
 It runs no hosted service of its own; the provider CLIs make requests to their configured services
 under your existing login.
 
-**A Bridge-launched Claude session accepts cross-session messages from other Claude sessions on
+**A TAB-launched Claude session accepts cross-session messages from other Claude sessions on
 the same account. With `--yolo`, that work runs without Claude's permission checks.** Do not use
 that combination unless you control the account's other Claude sessions. Read
 [Claude inbound messages](docs/security-and-data.md#claude-inbound-messages).
 
-`--yolo` forwards the provider's own bypass flag; Bridge adds no sandbox. Pi is different: its
+`--yolo` forwards the provider's own bypass flag; TAB adds no sandbox. Pi is different: its
 `--approve` grants project approval while its native tool policy stays in effect. Existing provider
 settings still apply. See [permission modes](docs/security-and-data.md#permission-modes).
 
-Workspace trust stays with the provider. Bridge can reuse verified existing consent for an exact
+Workspace trust stays with the provider. TAB can reuse verified existing consent for an exact
 workspace; it does not grant new trust. If a trust dialog holds up work, review it in the managed
 surface. See [workspace trust and consent](docs/security-and-data.md#workspace-trust-and-consent).
 
-To see whose decision Bridge recorded for a directory, run `tabcli consent inspect PATH`.
+To see whose decision TAB recorded for a directory, run `tabcli consent inspect PATH`.
 `consent revoke PATH` stops that reuse and leaves the provider's own trust alone; `consent reset PATH`
 clears the saved source and the revocation, so that the next launch assesses the directory again;
 it approves nothing itself. Only workspace trust is shared this way. Tool permissions, `--yolo`, credential
-prompts and every other provider approval are never answered by Bridge. Bridge records a directory's
+prompts and every other provider approval are never answered by TAB. TAB records a directory's
 identity when it first records consent for it; a directory that was replaced before that point
 cannot be told from the original by its path.
 
@@ -359,7 +359,7 @@ files are removed earlier. Windows uses `HOME`, then `USERPROFILE`, for the home
 [local records](docs/security-and-data.md#local-records).
 
 To uninstall, close your sessions, follow
-[Close sessions and remove Bridge data](docs/security-and-data.md#list-close-and-remove-sessions),
+[Close sessions and remove TAB data](docs/security-and-data.md#list-close-and-remove-sessions),
 then remove the downloaded executable or run `cargo uninstall tabcli` for a Cargo installation.
 Provider history and credentials are separate.
 

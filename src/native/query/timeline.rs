@@ -366,7 +366,7 @@ fn request_summaries(
                     "{PUBLIC_COMMAND} result {id} --request {} --json",
                     receipt.request_id
                 ));
-                // A refusal event is Bridge's record that nothing was sent; it is not a
+                // A refusal event is TAB's record that nothing was sent; it is not a
                 // provider completion.
                 result["delivery"] = json!(if refused {
                     "refused_not_sent"
@@ -391,7 +391,7 @@ fn request_summaries(
     summaries
 }
 
-/// A Bridge-owned refusal event: nothing was sent for its receipt (`delivery_not_sent`).
+/// A TAB-owned refusal event: nothing was sent for its receipt (`delivery_not_sent`).
 fn is_delivery_refusal(event: &SessionEvent) -> bool {
     event.provenance.as_deref() == Some(turn::DELIVERY_NOT_SENT_PROVENANCE)
 }

@@ -249,7 +249,7 @@ macro_rules! session_lookup {
 pub(in crate::native) const SEND_FILE_SCRIPT: &str = concat!(
     r#"
 on run argv
-    if application id "com.googlecode.iterm2" is not running then error "Agent Bridge iTerm session not found; iTerm2 is not running"
+    if application id "com.googlecode.iterm2" is not running then error "TAB iTerm session not found; iTerm2 is not running"
     set wantedId to item 1 of argv
     set promptPath to item 2 of argv
     set carriageReturn to return
@@ -259,7 +259,7 @@ on run argv
         "write targetSession text carriageReturn newline false",
         r#"return "sent""#,
     ),
-    r#"    error "Agent Bridge iTerm session not found"
+    r#"    error "TAB iTerm session not found"
 end run
 "#
 );
@@ -267,7 +267,7 @@ end run
 pub(in crate::native) const VERIFY_SESSION_SCRIPT: &str = concat!(
     r#"
 on run argv
-    if application id "com.googlecode.iterm2" is not running then error "Agent Bridge iTerm2 ownership proof found iTerm2 not running"
+    if application id "com.googlecode.iterm2" is not running then error "TAB iTerm2 ownership proof found iTerm2 not running"
     set wantedId to item 1 of argv
     set matchedTty to missing value
     set matchCount to 0
@@ -276,8 +276,8 @@ on run argv
         "set matchedTty to tty of targetSession",
         "set matchCount to matchCount + 1",
     ),
-    r#"    if matchCount is not 1 then error "Agent Bridge iTerm2 ownership proof did not match exactly one session"
-    if matchedTty is missing value or matchedTty is "" then error "Agent Bridge iTerm2 session has no tty"
+    r#"    if matchCount is not 1 then error "TAB iTerm2 ownership proof did not match exactly one session"
+    if matchedTty is missing value or matchedTty is "" then error "TAB iTerm2 session has no tty"
     return matchedTty
 end run
 "#
@@ -328,8 +328,7 @@ fn create_tab(
 }
 
 fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
-    let executable =
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let executable = std::env::current_exe().context("failed to resolve TAB executable")?;
     Ok(host_command(&executable, directory, command))
 }
 
@@ -1258,8 +1257,8 @@ end run
         assert_eq!(
             lookups_on_model(true, absent),
             named([
-                "error: Agent Bridge iTerm session not found [get windows;]",
-                "error: Agent Bridge iTerm2 ownership proof did not match exactly one session [get windows;]",
+                "error: TAB iTerm session not found [get windows;]",
+                "error: TAB iTerm2 ownership proof did not match exactly one session [get windows;]",
                 "missing [get windows;]",
                 "missing [get windows;]",
                 screen_missing,
@@ -1273,8 +1272,8 @@ end run
         assert_eq!(
             lookups_on_model(false, REORDERING),
             named([
-                "error: Agent Bridge iTerm session not found; iTerm2 is not running []",
-                "error: Agent Bridge iTerm2 ownership proof found iTerm2 not running []",
+                "error: TAB iTerm session not found; iTerm2 is not running []",
+                "error: TAB iTerm2 ownership proof found iTerm2 not running []",
                 "missing []",
                 "missing []",
                 screen_stopped,
@@ -1293,7 +1292,7 @@ end run
             lookups_on_model(true, duplicate),
             named([
                 "sent [get windows;write file /tmp/prompt to A2;write return to A2;]",
-                "error: Agent Bridge iTerm2 ownership proof did not match exactly one session [get windows;]",
+                "error: TAB iTerm2 ownership proof did not match exactly one session [get windows;]",
                 "present [get windows;]",
                 "closed [get windows;close A2;]",
                 "AB_SCREEN_BEGINscreen A2AB_SCREEN_END [get windows;]",
@@ -1309,7 +1308,7 @@ end run
             ];
             assert_eq!(
                 lookup_on_model(VERIFY_SESSION_SCRIPT, true, untyped, &["wanted"]),
-                "error: Agent Bridge iTerm2 session has no tty [get windows;]"
+                "error: TAB iTerm2 session has no tty [get windows;]"
             );
         }
     }

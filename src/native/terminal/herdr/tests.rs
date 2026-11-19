@@ -666,7 +666,7 @@ fn a_refused_run_creates_nothing_and_is_not_recovered() {
 #[test]
 fn a_lost_run_reply_removes_only_the_exact_labelled_terminal() {
     let core = FakeCore::new();
-    // Another terminal of the user and another launch of Bridge stay untouched.
+    // Another terminal of the user and another launch of TAB stay untouched.
     core.0.borrow_mut().terminals.insert(
         "t1".into(),
         json!({"address": "t1", "state": "live", "pid": 11, "argv": ["zsh"],
@@ -1920,6 +1920,6 @@ fn the_powershell_attach_line_scopes_hc_socket_to_hc() {
     }
 }
 
-// #399: the dead-owner close of a terminal that ended outside Bridge.
+// #399: the dead-owner close of a terminal that ended outside TAB.
 #[cfg(unix)]
 mod ended_close;

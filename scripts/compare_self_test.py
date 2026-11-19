@@ -110,12 +110,12 @@ def identity(document, label, insufficient):
         bridge = {}
     for field in ("version", "binary_sha256", "source_revision"):
         if not known_text(bridge.get(field)):
-            insufficient.append(f"{label}: missing Bridge identity {field}")
+            insufficient.append(f"{label}: missing TAB identity {field}")
     if not isinstance(bridge.get("binary_sha256"), str) or not re.fullmatch(
             r"[0-9a-f]{64}", bridge["binary_sha256"]):
         insufficient.append(f"{label}: binary_sha256 must be lowercase SHA-256")
     if type(bridge.get("source_dirty")) is not bool:
-        insufficient.append(f"{label}: Bridge source_dirty must be a boolean")
+        insufficient.append(f"{label}: TAB source_dirty must be a boolean")
     return conditions, bridge
 
 
@@ -218,9 +218,9 @@ def summarize(document, provenance, label, insufficient, incompatible):
                     and observed != conditions[field]):
                 incompatible.append(f"{here}: report disagrees with condition {field}")
         if not known_text(report.get("bridge_version")):
-            insufficient.append(f"{here}: missing/invalid report Bridge version")
+            insufficient.append(f"{here}: missing/invalid report TAB version")
         elif "version" in bridge and report["bridge_version"] != bridge["version"]:
-            incompatible.append(f"{here}: report disagrees with Bridge version")
+            incompatible.append(f"{here}: report disagrees with TAB version")
         marker = report.get("marker")
         if not known_text(marker):
             insufficient.append(f"{here}: missing self-test marker identity")
@@ -329,7 +329,7 @@ def compare(before, after):
             "incompatible": incompatible, "bridge_changes": changes,
             "before": summaries[0], "after": summaries[1], "differences": differences,
             "limits": ["User-supplied conditions are attestations, not independently verified.",
-                       "Elapsed milliseconds are Bridge observations, not model or billing time.",
+                       "Elapsed milliseconds are TAB observations, not model or billing time.",
                        "Timeout/failure durations are stopping points, not successful completion latency.",
                        "Unpaired descriptive samples; no significance, causality or performance gate.",
                        "No outliers removed; confirmed skipped steps retain reported zero outside measured timings.",
@@ -361,7 +361,7 @@ def human(report):
         lines.append(f"{key} (all reported outcomes): " + "; ".join(parts))
     for reason in report["incompatible"] + report["insufficient"]:
         lines.append("- " + reason)
-    lines += ["Bridge elapsed observations only; no model/billing time or causal claim.",
+    lines += ["TAB elapsed observations only; no model/billing time or causal claim.",
               "All samples retained. p95 requires 20 valid samples; JSON includes outcome strata and limits."]
     return "\n".join(lines) + "\n"
 

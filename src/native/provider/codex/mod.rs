@@ -45,7 +45,7 @@ pub(super) struct CodexAdapter;
 // children; its hooks and legacy notify replay the inherited process environment without
 // replacing them. On Windows the socket marker's presence enables a local control-socket
 // app-server's PID-checked shutdown route, and the file marker belongs to one updater.
-// A Bridge launch is an independent session, so these five caller-owned names stay out of
+// A TAB launch is an independent session, so these five caller-owned names stay out of
 // it. Configuration, install hints and sandbox or proxy context stay: never strip a
 // `CODEX_` prefix. The other adapters select this list by reference. Revisit an entry when
 // Codex stops exporting it or isolates it across every child path, including hooks, notify
@@ -222,7 +222,7 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
         Ok(super::CancelSupport::Unsupported(
-            "in this release the Bridge integration for codex does not support cancel".to_owned(),
+            "in this release the TAB integration for codex does not support cancel".to_owned(),
         ))
     }
 
@@ -329,7 +329,7 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
         // A hook payload names its event; a legacy notify payload names none. An event outside
-        // Bridge's injected set is ignored.
+        // TAB's injected set is ignored.
         if let Some(event) = codex_string(payload, "hook_event_name") {
             return match hooks::Hook::from_event(event) {
                 Some(hooks::Hook::UserPromptSubmit) => {
@@ -383,7 +383,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
-        bail!("Codex does not expose Agent Bridge provider controls")
+        bail!("Codex does not expose TAB provider controls")
     }
 
     // Elsewhere Herdr takes Codex's initial prompt as a launch argument with `--no-daemon`
@@ -437,7 +437,7 @@ impl Home {
     }
 }
 
-// The Codex memory workspace of the caller's environment. Bridge's launch admission
+// The Codex memory workspace of the caller's environment. TAB's launch admission
 // refuses that workspace by default (issue #216); the location is Codex's, so it is
 // declared here.
 pub(super) fn memory_workspace(

@@ -18,7 +18,7 @@ impl Address {
     fn parse(value: &str) -> Result<Self> {
         let invalid = || {
             anyhow::anyhow!(
-                "invalid wait address {value:?}; expected SESSION/REQUEST with a Bridge request id"
+                "invalid wait address {value:?}; expected SESSION/REQUEST with a TAB request id"
             )
         };
         let (session, request) = value.split_once('/').ok_or_else(invalid)?;
@@ -997,7 +997,7 @@ mod tests {
             assert!(error.contains(if damage {
                 "no readable receipt"
             } else {
-                "no such Bridge request"
+                "no such TAB request"
             }));
         }
     }

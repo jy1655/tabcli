@@ -478,7 +478,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
         "{error:#}"
     );
 
-    // Unchanged: a receipt without an event (a refusal recorded by an earlier Bridge, or a
+    // Unchanged: a receipt without an event (a refusal recorded by an earlier TAB release, or a
     // reopened-conversation refusal) is never inferred to be a refusal; it stays unresolved.
     let unresolved = write_closed_reopen_source(
         root.path(),
@@ -1924,7 +1924,7 @@ fn settlement_rechecks_replaced_session_directories_without_touching_outside_rec
         if typed {
             assert_eq!(gate, Some(ReopenGate::ProviderUnsupported));
             assert!(
-                detail.contains("refusing non-directory Agent Bridge session"),
+                detail.contains("refusing non-directory TAB session"),
                 "{detail}"
             );
             assert!(

@@ -126,7 +126,7 @@ OMISSIONS = (
 )
 PROVENANCE = (
     "Offline projection of supplied public JSON; not authenticated, refreshed, or runtime proof. "
-    "Counts describe supplied arrays, not a complete session history. Request elapsed time is Bridge "
+    "Counts describe supplied arrays, not a complete session history. Request elapsed time is TAB "
     "receipt-to-result wall time, not model or billing time."
 )
 
@@ -419,7 +419,7 @@ def render(summary, output_format):
     # The projection emits ASCII literals and validated numeric version components only.
     payload = json.dumps(summary, ensure_ascii=True, allow_nan=False, indent=2, sort_keys=True) + "\n"
     if output_format == "markdown":
-        payload = "# Agent Bridge diagnostic summary\n\n```json\n" + payload + "```\n"
+        payload = "# TAB diagnostic summary\n\n```json\n" + payload + "```\n"
     if len(payload.encode("ascii")) > MAX_OUTPUT_BYTES:
         raise InputError("summary output limit exceeded")
     return payload

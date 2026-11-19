@@ -74,7 +74,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   through which the macOS launch host records its stages and failure, with the check that the
   admitted host incarnation may still act for the pending launch. It also owns what the
   renderers share about the record: the words of its stages and failure reasons, the one
-  responsibility class of each reason (startup files, deadline, surface identity or Bridge's
+  responsibility class of each reason (startup files, deadline, surface identity or TAB's
   host step), which status.error and doctor's action each map to their own words, the
   capture timeout's detail, and the record fields that the timeline and doctor both show
   (each places `updated_unix_ms` itself). Doctor judges the record once, in its Observation,
@@ -105,7 +105,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   select Claude's caller-identity subset, which excludes its four execution hints; Codex's
   queue uses the same selection as its probes and launches. Claude's own list and diagnostic
   stay unchanged. Non-provider children on
-  macOS and Windows remove the union of adapter caller-session markers and Bridge's four session
+  macOS and Windows remove the union of adapter caller-session markers and TAB's four session
   variables; helpers and the bootstrap explicitly supply the context each child needs.
   Windows Terminal and both console roots use the same filtered environment block.
 - `src/native/delivery.rs` consumes one Claim and owns readiness, injected reopen gates,
@@ -178,7 +178,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   bound-answer candidate and the selected marked continuation. New macOS, Linux, and Windows launches
   select native completion from the recorded stable version, load the session-local module,
   and await its actual readiness before messaging. No initial prompt travels in argv.
-  The two official turn ids stay private; core publication retains the Bridge correlation id.
+  The two official turn ids stay private; core publication retains the TAB correlation id.
   Candidate and selection writes
   use the lifecycle lock; core Report rechecks the claim at publication. `inspect` asks the
   adapter for a read-only candidate observation under its existing reader lock, without
@@ -438,7 +438,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   root unless isolation is requested; it is not called implicitly by another command.
 - `src/native/consent.rs` preserves the public consent path and re-exports four concerns:
   `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
-  `consent/record.rs` owns Bridge's consent Record and command; `consent/launch_dialog.rs` owns
+  `consent/record.rs` owns TAB's consent Record and command; `consent/launch_dialog.rs` owns
   a launch's workspace dialog step in one entry, from the decision whether to wait for the
   dialog at all to the one guarded response, through its `DialogSurface` seam (which also
   answers whether the surface takes a guarded key) and each provider adapter's launch-dialog
@@ -449,7 +449,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   one trust wait. Consent snapshots the caller's environment once per boundary and asks each
   adapter for a workspace's trust against the adapter's own home, or the recorded source store
   for a recheck; it knows no provider path. Provider stores are still read through consent's
-  store reader and never written by Bridge. The wait checks the ended-session rule first and
+  store reader and never written by TAB. The wait checks the ended-session rule first and
   serves the Codex paste gate and the Agy delivery gate with their own readiness and messages.
   Its `SessionConsentObservation` preserves the raw diagnostic JSON while exposing known state
   and applied-marker accessors. Unknown or damaged diagnostic records are not authorization; the
@@ -492,7 +492,7 @@ The serialized state strings and permitted changes are:
 | `exited`, `failed` | `closed` |
 | `closed` | None |
 
-Hold is orthogonal to this state table: it refuses follow-ups whose delivery Bridge has not yet
+Hold is orthogonal to this state table: it refuses follow-ups whose delivery TAB has not yet
 allowed to start, without changing the current turn.
 
 `resume-pending` remains readable for compatibility; it is not the modern `reopen` mechanism.

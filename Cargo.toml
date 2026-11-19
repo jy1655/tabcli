@@ -1,8 +1,8 @@
 [package]
 name = "tabcli"
-version = "0.4.47"
+version = "0.4.48"
 edition = "2024"
-description = "Terminal Agent Bridge (TAB): run Codex, Claude Code, Agy, and Pi CLIs in visible terminal tabs"
+description = "TAB: run Codex, Claude Code, Agy, and Pi CLIs in visible terminal tabs"
 license = "MIT"
 repository = "https://github.com/jy1655/tabcli"
 readme = "README.md"

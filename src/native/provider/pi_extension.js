@@ -122,7 +122,7 @@ function wait(milliseconds) {
 
 async function deliverResult(executable, payload) {
   if (!executable) {
-    return { ok: false, detail: "Agent Bridge executable is unavailable" };
+    return { ok: false, detail: "TAB executable is unavailable" };
   }
   let detail = "native hook failed";
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -242,7 +242,7 @@ export default function (pi) {
       renameSync(temporary, join(directory, `pi-input-accepted-${candidate.claim_token}.json`));
     } catch {
       try { unlinkSync(temporary); } catch {}
-      ctx.ui.notify("Agent Bridge could not record Pi input submission. Delivery may remain uncertain; do not resend.", "warning");
+      ctx.ui.notify("TAB could not record Pi input submission. Delivery may remain uncertain; do not resend.", "warning");
     }
   }
 
@@ -260,7 +260,7 @@ export default function (pi) {
     catch { return undefined; }
   }
 
-  // The declared reads of Bridge's core records take Bridge's core read policy: a link at
+  // The declared reads of TAB's core records take TAB's core read policy: a link at
   // the record's path, or anything but a regular file, is refused, and the text must be
   // UTF-8. A refusal throws, and every caller reads it as no record. A byte-order mark
   // stays in the text, as the earlier "utf8" read kept it.
@@ -336,7 +336,7 @@ export default function (pi) {
     } catch {
       try { unlinkSync(temporary); } catch {}
       if (process.platform === "win32") {
-        ctx.ui.notify("Agent Bridge could not confirm Pi startup; the initial console input will remain withheld.", "warning");
+        ctx.ui.notify("TAB could not confirm Pi startup; the initial console input will remain withheld.", "warning");
       }
     }
   });
@@ -364,7 +364,7 @@ export default function (pi) {
     try { publishInput(ctx); } catch {}
     if (undelivered && pending) {
       if (!persistHookFailure(pending, "a prior result remained undelivered")) {
-        ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
+        ctx.ui.notify("TAB still cannot recover the previous Pi result.", "warning");
         return;
       }
       undelivered = false;
@@ -415,11 +415,11 @@ export default function (pi) {
       if (persistHookFailure(payload, delivery.detail)) {
         pending = undefined;
         usage = undefined;
-        ctx.ui.notify("Agent Bridge marked this undelivered Pi result as failed.", "warning");
+        ctx.ui.notify("TAB marked this undelivered Pi result as failed.", "warning");
         return;
       }
       undelivered = true;
-      ctx.ui.notify("Agent Bridge could not record or recover this Pi result.", "warning");
+      ctx.ui.notify("TAB could not record or recover this Pi result.", "warning");
       return;
     }
     pending = undefined;

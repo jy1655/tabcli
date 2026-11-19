@@ -1,8 +1,12 @@
-# Terminal Agent Bridge (TAB)
+# TAB
 
-Agent Bridge launches, observes, continues, and closes first-party CLI sessions (Codex, Claude,
+TAB launches, observes, continues, and closes first-party CLI sessions (Codex, Claude,
 Agy, Pi) inside terminal surfaces the user can see. This glossary names the concepts the code
 and its documents share; `AGENTS.md` holds the decisions about them.
+
+**TAB** is the product name. Use it in status messages, diagnostics and documentation.
+The repository, Cargo package and executable are named `tabcli`. Another terminal tool
+already installs an executable named `tab`. [tab-rs](https://github.com/austinjones/tab-rs#installation)
 
 ## Language
 
@@ -10,7 +14,7 @@ and its documents share; `AGENTS.md` holds the decisions about them.
 
 **Session**:
 One managed provider conversation in one terminal surface, identified by a session id and
-owned by Bridge from launch to close.
+owned by TAB from launch to close.
 _Avoid_: child, tab, process
 
 **Session directory**:
@@ -18,9 +22,9 @@ The private directory that holds every record of one session.
 _Avoid_: state dir, workdir
 
 **Record**:
-One durable fact about a session that Bridge wrote and later reads back (status, manifest,
+One durable fact about a session that TAB wrote and later reads back (status, manifest,
 owner, claim, receipt, event, journal, tombstone). A record is evidence, never a cache.
-Bridge's own (core) records are read under one policy: a regular file reached without a link
+TAB's own (core) records are read under one policy: a regular file reached without a link
 at its path, its text strict UTF-8; anything else is unreadable, never followed or guessed.
 _Avoid_: file, state file, metadata
 
@@ -99,7 +103,7 @@ binding wait adds its own budget.
 _Avoid_: eligible launch, live launch, open launch
 
 **Completion journal**:
-The record of a provider completion that Bridge accepted but has not yet published as an
+The record of a provider completion that TAB accepted but has not yet published as an
 event. Recovery publishes or discards it.
 _Avoid_: pending result, buffer
 
@@ -113,7 +117,7 @@ uncertain; an uncertain delivery is never retried blindly.
 _Avoid_: send, submit, paste (these name transports, not the act)
 
 **Input evidence** (Agy):
-What Agy's own log and transcript prove about Bridge's input: the readiness gate before a
+What Agy's own log and transcript prove about TAB's input: the readiness gate before a
 paste, its `HandleUserInput` receipt, and the marker in exactly one `USER_INPUT` step for
 an argument-delivered initial turn. A tool confirmation is an observation correlated to
 that input, not proof of approval or a dialog that remains open.
@@ -168,14 +172,14 @@ _Avoid_: continuation, reply
 **Framed prompt**:
 The text a provider adapter delivers for a Turn: the caller's prompt, the adapter's correlation
 marker and only the wording that adapter's correlation needs (Codex keeps a start header). The
-frame lets the adapter's correlation recognise Bridge's turn; it is never turn identity by
+frame lets the adapter's correlation recognise TAB's turn; it is never turn identity by
 itself. The receipt records the Request source. Only Claude sessions launched with an older
 completion hook still need a visible Source line.
 _Avoid_: wrapped prompt, payload, marker (the marker is one part of the frame)
 
 **Request source**:
-The id of the managed session that Bridge recorded as having issued one request, or the
-external mark when the request came from outside Bridge. Without that record, or when it
+The id of the managed session that TAB recorded as having issued one request, or the
+external mark when the request came from outside TAB. Without that record, or when it
 cannot be read, the source is unknown. It is not an authenticated identity of the caller and
 not an Owner.
 _Avoid_: parent, caller process
@@ -195,7 +199,7 @@ _Avoid_: orphan, abandoned, stranded
 
 **Hold**:
 The user's recorded request that a session take no further follow-up: a follow-up whose delivery
-Bridge has not yet allowed to start is refused until the hold is released. A hold does not stop
+TAB has not yet allowed to start is refused until the hold is released. A hold does not stop
 the current turn or direct input to the surface.
 _Avoid_: pause, freeze, mute, lock (the lock is a different thing)
 
@@ -220,7 +224,7 @@ interprets the console helper's replies; it does not establish authority over th
 _Avoid_: console owner, input policy
 
 **Owner**:
-The Bridge process that launched a session and is attested as controlling its surface.
+The TAB process that launched a session and is attested as controlling its surface.
 _Avoid_: parent, launcher process
 
 **Owner record**:
@@ -299,10 +303,10 @@ _Avoid_: error code, failure phase
 **Workspace trust**:
 A provider's own recorded consent to work in an exact workspace, read from a store only the
 user can change.
-_Avoid_: approval, permission (Bridge's own permission mode is a different axis)
+_Avoid_: approval, permission (TAB's own permission mode is a different axis)
 
 **Launch dialog**:
-The dialog a provider shows at startup, asking whether to trust the workspace. Bridge answers
+The dialog a provider shows at startup, asking whether to trust the workspace. TAB answers
 it at most once with a guarded key, and only for a launch whose Workspace trust consent is
 verified; which screens count and what the provider's bypass option changes is each provider
 adapter's own policy.

@@ -11,7 +11,7 @@ fn fixture() -> (tempfile::TempDir, PendingCodexTurn, Value) {
     let claim = turn::claim(&Store::open_unchecked(root.path()), &[]).unwrap();
     let pending = install_pending_turn(root.path(), claim.token()).unwrap();
     claim.retain();
-    // Mac R0 run E fields, including model/permission_mode unknown to Bridge.
+    // Mac R0 run E fields, including model/permission_mode unknown to TAB.
     let payload = json!({"hook_event_name":"UserPromptSubmit", "session_id":THREAD,
         "turn_id":"turn-1", "transcript_path":"rollout.jsonl", "cwd":"workspace",
         "model":"model", "permission_mode":"default",

@@ -21,8 +21,8 @@ or hashes for workspace/configuration snapshots; do not put credentials in metad
 do not establish a resolved identity. Extra conditions are compared too.
 
 For a release comparison, keep these conditions fixed and deliberately change only
-the Bridge identity. Record the exact executable's SHA-256, its version, source revision
-and whether that source was dirty. The script permits all four Bridge identity fields
+the TAB identity. Record the exact executable's SHA-256, its version, source revision
+and whether that source was dirty. The script permits all four TAB identity fields
 to differ. A binary hash identifies the binary even when built from a dirty checkout;
 keep the source diff separately if source-level attribution matters. If provider versions,
 models or workspace scenarios change, collect a separate experiment instead.
@@ -40,7 +40,7 @@ run_exit=$?
 This collection command makes real model calls and opens a real surface. The comparison
 tool does neither. Capture `run_exit` immediately, retain stdout/stderr on failures, and
 inspect cleanup and the surface before the next attempt. Never resend an uncertain
-delivery automatically. Isolated mode isolates Bridge records, not provider trust or
+delivery automatically. Isolated mode isolates TAB records, not provider trust or
 caches. Cold/warm describes deliberate preparation; the comparator cannot establish it.
 Consider alternating baseline order to reduce drift, and record load/cache limitations.
 Use the same declared trial plan and include every attempt; do not stop only after a pass.
@@ -71,7 +71,7 @@ reducing it to the numeric version makes the wrapper disagree with the unchanged
     "start_state": "warm: record-the-exact-preparation",
     "isolated": true,
     "workspace_scenario": "workspace-content-hash-and-trust-state",
-    "configuration": "relevant-provider-and-Bridge-config-hash",
+    "configuration": "relevant-provider-and-TAB-config-hash",
     "scenario": "schema-1-marker-roundtrip; timeout=120s; declared-trial-plan"
   },
   "bridge": {
@@ -161,7 +161,7 @@ inspect outcome strata and cleanup before interpreting them.
 Timeout and failure durations are observed stopping points, not successful completion
 latencies; a faster failure is not evidence of an improvement.
 
-These are Bridge-observed elapsed times, including provider waits, terminal work,
+These are TAB-observed elapsed times, including provider waits, terminal work,
 discovery, diagnostics and cleanup as recorded. They are neither model execution time nor
 billing/token usage. Hosted load, provider service load and cache state can remain uncontrolled
 even when recorded conditions agree. The tool accepts at most 8 MiB per input, 1,000 runs

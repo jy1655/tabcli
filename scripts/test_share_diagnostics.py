@@ -356,7 +356,7 @@ class ShareDiagnosticsTests(unittest.TestCase):
                                 input=json.dumps(source).encode(), capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, b"")
-        self.assertEqual(result.stdout.splitlines()[0], b"# Agent Bridge diagnostic summary")
+        self.assertEqual(result.stdout.splitlines()[0], b"# TAB diagnostic summary")
         for value in attention:
             self.assertIn(value.encode("ascii"), result.stdout)
 

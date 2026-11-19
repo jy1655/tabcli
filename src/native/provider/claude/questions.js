@@ -2,9 +2,9 @@ import { report } from "./report.js";
 import { deflect } from "./config.js";
 
 // No person is at a managed session's dialog. The request's marker requirement is restated
-// so that ending the turn early keeps the final line Bridge completes on. It names no frame
-// label, so it fits the frame of every Bridge version: each one ends with the marker line.
-const REASON = "Agent Bridge managed session: no person is at this question dialog, and the caller " +
+// so that ending the turn early keeps the final line TAB completes on. It names no frame
+// label, so it fits the frame of every TAB version: each one ends with the marker line.
+const REASON = "TAB managed session: no person is at this question dialog, and the caller " +
   "cannot see it. Do not call AskUserQuestion again in this turn. End this turn now with the " +
   "question as your final response, in this form: QUESTION FOR CALLER: <question> Options: " +
   "<option labels>. The caller will send the answer as a follow-up message; continue from there. " +
@@ -45,7 +45,7 @@ function observed(stream, step) {
 // A refusal marks the retained emission only when the step's engine/core evidence holds the
 // same projected questions at the refused call's position. Otherwise no item is named. The
 // wire carries the refused questions: a repeated step can leave an earlier question retained
-// at this position, and Bridge sets the flag only on an item with the same text and labels.
+// at this position, and TAB sets the flag only on an item with the same text and labels.
 async function attribute($, step, refusal) {
   const evidence = step.keys.get(refusal.index);
   if (evidence !== undefined && evidence === refusal.key) {
@@ -131,7 +131,7 @@ export function register(on) {
     if (deflect !== true || e.agentId !== undefined || next.origin?.plugin !== "engine" ||
         next.origin?.tier !== "core") return next(e);
     const step = current;
-    // A hook above Bridge can dispatch the same call again: same refusal, recorded once.
+    // A hook above TAB can dispatch the same call again: same refusal, recorded once.
     if (step?.denied.has(e.tool_use_id)) return { deny: REASON };
     if (!step?.calls.has(e.tool_use_id)) return next(e);
     const refusal = { index: step.calls.get(e.tool_use_id), key: projection(e.questions),

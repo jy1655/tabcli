@@ -28,7 +28,7 @@ before changing the implementation.
 
 Claude's native completion tests replay an exact addressed start, an unmarked bound interim
 and a marked completion with a different official turn id. They assert a retained claim before
-the final, an unchanged original binding, one result and the original Bridge wait identity.
+the final, an unchanged original binding, one result and the original TAB wait identity.
 The continuation tests cover malformed or missing candidates, unrelated outcomes, close and
 claim replacement, timeout retention and interruption between identity selection and publication.
 `tests/claude_completion.rs` executes the real JS module through native-hook, including helper
@@ -64,7 +64,7 @@ delivery or completion policy changes are implied by these tests.
 | --- | --- |
 | `native_messenger_success_without_target_turn_keeps_the_claim` | A controlled messenger passes the real guard, executed-input receipt and stream confirmation. With no target turn, the waiter reports a timeout and a second claim is refused. Both preserve every session file, including the claim, pending input, status and receipt, and publish no result. |
 | `coexistence` in `tests/claude_completion.rs` | The real completion module and native-hook reader reject a marked final without a start, a changed body with its marker intact, a removed peer envelope, combined input and an unrelated turn. Each checkpoint preserves the claim, pending record, status and receipt; `result` stays pending and changes no session records. |
-| The same `coexistence` fixture's exact-input control | After those rejections, the unchanged addressed frame and matching marked final publish exactly one result with the original Bridge correlation id. No input is resent. |
+| The same `coexistence` fixture's exact-input control | After those rejections, the unchanged addressed frame and matching marked final publish exactly one result with the original TAB correlation id. No input is resent. |
 | `late_old_frames_and_markers_cannot_settle_a_successor_claim` | A real successor claim and pending record survive the old request's start/final and an unbound answer copying the successor marker. The successor's own exact frame still completes, and the first result remains unchanged. |
 
 Run these checks from the repository root with Node.js available:
@@ -76,7 +76,7 @@ cargo test --all-features --test claude_completion -- --test-threads=1
 ```
 
 The Node harness invokes the candidate's native-hook binary; it is not a standalone mock
-of Bridge's lifecycle. Its synthetic starts use the same peer framing and protected-tag
+of TAB's lifecycle. Its synthetic starts use the same peer framing and protected-tag
 quoting as the existing large-wire fixture. A successful sender and a target completion
 are separate evidence surfaces. A missing target turn alone does not diagnose consumed input.
 The marked-continuation fallback retains its existing limits: these negative fixtures have
@@ -98,7 +98,7 @@ an optional diagnostic recipe, not an automated gate or permission to change use
    its action to a unique harmless probe nonce; other input must pass through unchanged.
    Log observed hook entry, invocation of the next handler, and actual return values in
    a bounded private log (for example, 64 KiB total), marking truncation or failure unknown.
-3. Add that plugin only to the task-owned launch, preserving Bridge's completion plugin.
+3. Add that plugin only to the task-owned launch, preserving TAB's completion plugin.
    Do not infer runtime ordering from argument order. Instrument observed `turn.start` and
    `turn.complete` identities/text for the nonce, and the receive hook's actual trace.
    A configured consume/rewrite mode is not evidence that the hook ran or took effect.
@@ -112,7 +112,7 @@ an optional diagnostic recipe, not an automated gate or permission to change use
    `tell` while claimed, or use a caller timeout to retire the claim. Close only the probe's
    session when appropriate; use another fresh session for the next mode.
 6. Record configured mode/order separately from observed receive outcome, observed
-   start/completion identities, sender result and Bridge request state. Missing or truncated
+   start/completion identities, sender result and TAB request state. Missing or truncated
    observations stay `NOT-VERIFIED`. Preserve eligible evidence under the workspace policy;
    remove only the task-owned diagnostic plugin after its sessions are closed.
 
@@ -364,7 +364,7 @@ requested a `RunCommand` approval with the earlier wording in one default-mode r
 (Agy 1.3.0, 2026-10-07). Unit fixtures verify the read-only `doctor` observation and its
 inclusion in a self-test result timeout reason. They do not prove that the new wording
 prevents approval prompts. For live verification, record the installed Agy version and
-compare default-mode runs with the old and new wording. Bridge does not answer approvals.
+compare default-mode runs with the old and new wording. TAB does not answer approvals.
 
 For Pi, an initial or follow-up result timeout reads `doctor SESSION --probe --json`
 within five seconds before cleanup and includes the session's provider credential readiness
@@ -378,7 +378,7 @@ An unconfirmed self-test close is `not_verified`, including a timeout. The clean
 the session and carries its recorded surface error. A Ghostty failed-launch handle remains available
 to explicit close only when its handoff precedes close and the launch still owns the session.
 A close after the launch deadline but before the handoff leaves the residual surface named in the
-closed session's error, with no recoverable handle; Bridge does not close it. That recorded residual
+closed session's error, with no recoverable handle; TAB does not close it. That recorded residual
 surface is also preserved as typed status evidence and exposed by `inspect` as
 `residual_surface: "unverified"`; changing the error text cannot clear it. It makes cleanup
 `not_verified` even when a handle-less close succeeded. A successful recovery
@@ -441,7 +441,7 @@ Record any model, effort, or bypass override you add to the command.
 
 Create a dated Markdown record under `docs/verification/`. Include:
 
-- The tested commit, Bridge version, binary SHA-256, build method, OS, and architecture.
+- The tested commit, TAB version, binary SHA-256, build method, OS, and architecture.
 - Provider CLI and terminal versions, caller environment, and relevant consent settings.
 - Commands and explicit overrides, including whether ordinary or isolated records were used.
 - Automated check results, with ignored tests and checks not run stated separately.

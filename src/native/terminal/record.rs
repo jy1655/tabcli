@@ -41,7 +41,7 @@ pub(in crate::native) struct TerminalSession {
 
 /// A Herdr terminal's creation identity: the core that answered on `socket` with its
 /// permanent `core_id` (the address `t7` names one terminal forever on that core), when the
-/// core created it, and the incarnation of the program it started, Bridge's launch host.
+/// core created it, and the incarnation of the program it started, TAB's launch host.
 /// Only the Herdr adapter constructs it from a creation it verified.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(in crate::native) struct HerdrSurface {

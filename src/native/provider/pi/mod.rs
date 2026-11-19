@@ -375,7 +375,7 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
-        bail!("Pi does not expose Agent Bridge provider controls")
+        bail!("Pi does not expose TAB provider controls")
     }
 
     // Pi's turns go through the surface's own transport (a Herdr terminal's `terminal.send`)

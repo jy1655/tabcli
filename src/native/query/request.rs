@@ -257,7 +257,7 @@ impl<'a> From<Result<Option<&'a SessionEvent>, &anyhow::Error>> for ElapsedEvent
     }
 }
 
-// Bridge wall-clock time from receipt creation to the published completion event's
+// TAB wall-clock time from receipt creation to the published completion event's
 // timestamp, including dispatch and delivery waits; never model or billing time.
 pub(in crate::native) fn observed_elapsed<'a>(
     receipt: Option<&requests::Receipt>,
@@ -336,9 +336,9 @@ pub(super) fn usage_text(value: &Value) -> Option<String> {
 
 pub(super) fn elapsed_text(value: &Value) -> String {
     match &value["bridge_observed_elapsed_ms"] {
-        Value::Number(ms) => format!("Bridge observed elapsed: {ms} ms"),
+        Value::Number(ms) => format!("TAB observed elapsed: {ms} ms"),
         _ => format!(
-            "Bridge observed elapsed: not computable ({})",
+            "TAB observed elapsed: not computable ({})",
             value["bridge_observed_elapsed_reason"]
                 .as_str()
                 .unwrap_or("unknown")
@@ -383,7 +383,7 @@ impl Snapshot {
                         if self.unreadable_requests > 0 || self.request_index_error.is_some() {
                             format!("no readable receipt for request {id}; the request index is incomplete")
                         } else {
-                            format!("no such Bridge request: {id}; legacy events have no request mapping")
+                            format!("no such TAB request: {id}; legacy events have no request mapping")
                         }
                     })?,
             ),
@@ -540,13 +540,13 @@ mod elapsed_tests {
     fn human_elapsed_distinguishes_zero_from_uncomputable() {
         assert_eq!(
             elapsed_text(&json!({"bridge_observed_elapsed_ms": 0})),
-            "Bridge observed elapsed: 0 ms"
+            "TAB observed elapsed: 0 ms"
         );
         assert_eq!(
             elapsed_text(
                 &json!({"bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "missing_receipt"})
             ),
-            "Bridge observed elapsed: not computable (missing_receipt)"
+            "TAB observed elapsed: not computable (missing_receipt)"
         );
     }
 }

@@ -23,7 +23,7 @@ use std::{
 const POST_TEXT_RESERVE: Duration = Duration::from_secs(20);
 const PASTE_SPLIT_GAP: Duration = Duration::from_millis(150);
 const POLL: Duration = Duration::from_millis(250);
-const RECOVERY: &str = "Check tabcli result <session> and the surface. Only if the entire draft remains in the composer with no dialog or running turn, consider pressing Enter once. Otherwise close the session or diagnose with doctor. Bridge resends neither text nor Return.";
+const RECOVERY: &str = "Check tabcli result <session> and the surface. Only if the entire draft remains in the composer with no dialog or running turn, consider pressing Enter once. Otherwise close the session or diagnose with doctor. TAB resends neither text nor Return.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Segment {
@@ -230,7 +230,7 @@ fn composer_segments(
 
 // rust-v0.163.0 chat_composer/paste_input.rs:145-176 normalizes CRLF/CR,
 // sanitizes controls/CSI (history_cell/messages.rs:25-85), then counts scalars.
-// It does NOT collapse triple LF. Bridge trims the source before framing,
+// It does NOT collapse triple LF. TAB trims the source before framing,
 // explaining the real 25596->25595 / 1094->1093 differences.
 // Blockquote expansion at 163-175 depends on insertion target and burst
 // boundaries, which captures cannot establish. Refuse that fallback.

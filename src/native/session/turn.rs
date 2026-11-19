@@ -133,7 +133,7 @@ impl ClaimCurrency<'_> {
     }
 }
 
-/// Provenance of a Bridge-owned failure event that records a delivery refusal: nothing was
+/// Provenance of a TAB-owned failure event that records a delivery refusal: nothing was
 /// sent to the provider, and the event's error is the refusal text.
 pub(in crate::native) const DELIVERY_NOT_SENT_PROVENANCE: &str = "delivery_not_sent";
 
@@ -435,7 +435,7 @@ fn bound_pending_completion(
 
 /// The final delivery fact after the adapter has decided whether a fallback is safe.
 /// Settlement never sends input or publishes a provider result. The one event it records
-/// is a refusal: a Bridge-owned failure event with [`DELIVERY_NOT_SENT_PROVENANCE`] whose
+/// is a refusal: a TAB-owned failure event with [`DELIVERY_NOT_SENT_PROVENANCE`] whose
 /// error is the refusal text, evidence that nothing was sent for that receipt. The
 /// request reads `failed` from it where a receipt without an event reads `unresolved`.
 pub(in crate::native) enum Delivery<'a> {

@@ -1,29 +1,29 @@
 # Providers
 
-Run an installed, signed-in `codex`, `claude`, `agy`, or `pi` through Bridge on macOS, native
+Run an installed, signed-in `codex`, `claude`, `agy`, or `pi` through TAB on macOS, native
 Windows, or Linux through tmux or Herdr Core. Each session runs in a terminal surface you can watch; choose
 one from [terminal support](terminals.md). Linux opens no GUI; use the returned attach command.
 
 “First-party CLI” means the provider's own command runs the conversation and tools under your
-existing login. Bridge has no credential store, cannot attach an independently launched CLI,
+existing login. TAB has no credential store, cannot attach an independently launched CLI,
 and does not start, stop, or restart a provider's shared daemon. Provider transcripts and
-permission settings remain separate from Bridge's records.
+permission settings remain separate from TAB's records.
 
-Bridge uses each provider's own launch, delivery, and completion mechanisms where available.
+TAB uses each provider's own launch, delivery, and completion mechanisms where available.
 Where those are missing, the fallback stays specific to that provider and is meant to be removed
 when the provider supplies the missing feature.
 
-Bridge does not grant new workspace trust. With verified existing consent, it can answer Claude
+TAB does not grant new workspace trust. With verified existing consent, it can answer Claude
 or Agy startup trust dialogs in iTerm2, Terminal.app, and the native Windows console. In other
-terminals, approve the workspace in the provider before launching through Bridge. Read
+terminals, approve the workspace in the provider before launching through TAB. Read
 [workspace trust and consent](security-and-data.md#workspace-trust-and-consent) for the checks.
 The [CLI reference](cli.md) lists the request and result commands.
 
 ## Versions and launch options
 
-Install and initialize the CLI before launching it through Bridge. These are the minimum
-versions Bridge accepts at launch; Codex follow-ups need a newer version, as explained below.
-Omit `--model` and `--effort` to use the provider's defaults. Bridge forwards the listed flags for
+Install and initialize the CLI before launching it through TAB. These are the minimum
+versions TAB accepts at launch; Codex follow-ups need a newer version, as explained below.
+Omit `--model` and `--effort` to use the provider's defaults. TAB forwards the listed flags for
 `--yolo`; the provider's own configuration still determines its permission mode.
 
 | CLI | Minimum launch version | `--model` | `--effort` | `--yolo` forwards |
@@ -33,14 +33,14 @@ Omit `--model` and `--effort` to use the provider's defaults. Bridge forwards th
 | `agy` | 1.1.12 | `--model` | `--effort` | `--dangerously-skip-permissions` |
 | `pi` | 0.84.1 | `--model` | `--thinking` | `--approve` |
 
-Codex's bypass flag is `--dangerously-bypass-approvals-and-sandbox`. Bridge adds no sandbox around
-these flags. Pi also receives `--approve` when Bridge applies verified workspace consent; this
+Codex's bypass flag is `--dangerously-bypass-approvals-and-sandbox`. TAB adds no sandbox around
+these flags. Pi also receives `--approve` when TAB applies verified workspace consent; this
 approves project resources and does not disable Pi's tool policy. Read
 [security and data](security-and-data.md) before using `--yolo`.
 
-For Codex models, Bridge removes a nonempty `openai-codex/` prefix. Claude maps `Fable5` to
+For Codex models, TAB removes a nonempty `openai-codex/` prefix. Claude maps `Fable5` to
 `Fable`. Pi maps `Fable` to `anthropic/claude-fable-5`. Other identifiers pass through unchanged.
-Use an identifier accepted by your installed provider; Bridge does not maintain a model catalog.
+Use an identifier accepted by your installed provider; TAB does not maintain a model catalog.
 
 To ask about a project, run:
 
@@ -54,13 +54,13 @@ below explain its workspace-trust requirements and delivery limits.
 ## Codex
 
 Install and sign in to `codex`. You need 0.147.0 or newer to launch, and 0.149.0 or newer for
-follow-ups. On Herdr, stable 0.169.0 or newer is required and Bridge passes `--no-daemon` so
+follow-ups. On Herdr, stable 0.169.0 or newer is required and TAB passes `--no-daemon` so
 tool processes stay inside the hc terminal. Other surfaces keep their existing launch flags.
 Open the project in Codex first and resolve its workspace-trust prompt.
 
-On macOS and Linux, Bridge passes the initial prompt as a launch argument. On native Windows, it waits for
+On macOS and Linux, TAB passes the initial prompt as a launch argument. On native Windows, it waits for
 Codex's startup delay and either verified workspace trust or the empty composer before typing
-when lifecycle hooks were not injected. For a session recorded as `injected`, Bridge always
+when lifecycle hooks were not injected. For a session recorded as `injected`, TAB always
 requires the visible empty `› Ask Codex to do anything` composer with no workspace dialog or
 hook-review picker. Stored exact trust and an applied trust override cannot skip that check.
 A visible composer still passes with repository-root trust and no exact project entry. The gate
@@ -73,9 +73,9 @@ An empty screen does not count as a ready composer.
 Windows console initial paste encodes each LF as Shift+Return, keeping submission Returns
 unmodified. This fallback assumes Codex's default keymap and an editable composer; custom
 bindings, Vim normal mode, history search and disabled input are outside its supported scope.
-Bridge does not interpret Codex keymaps. Tabs in this paste path are refused with
+TAB does not interpret Codex keymaps. Tabs in this paste path are refused with
 `replace tab characters with spaces`: no literal Tab encoding is proven to preserve text
-independently of timing and UI state. Native queue follow-ups are unaffected. Bridge normalizes
+independently of timing and UI state. Native queue follow-ups are unaffected. TAB normalizes
 CRLF to LF for `--prompt-file` before the input policy runs; inline `--prompt` is not normalized.
 The input policy rejects any remaining CR.
 Replace this fallback when Codex provides a newline-preserving input API or paste event on
@@ -88,14 +88,14 @@ key-down events only; a BMP character keeps its key-down and key-up pair. Agy an
 existing LF encoding and need separate provider evidence.
 
 For Windows initial launches recorded as `injected`, #124 uses a bounded best-effort console
-fallback pinned to Codex 0.163.0. After the positive composer gate, Bridge reserves at least
+fallback pinned to Codex 0.163.0. After the positive composer gate, TAB reserves at least
 20 s of the original deadline at admission; this is not a guaranteed post-text budget.
 It writes and drains the exact framed body as text only, verifies its scalar count, then waits 150 ms before writing and draining LF plus the claim
 marker and verifies that count. There is no screen observation between these writes.
 The final inline marker line is completion evidence under ordered console/reader/composer
 processing: earlier input was processed before the marker, and applying its paste clears
 burst suppression. Wrapped or scrolled inline body text does not need positional matching.
-If the tail merged into a final placeholder, Bridge instead requires the sum of placeholder
+If the tail merged into a final placeholder, TAB instead requires the sum of placeholder
 counts and visible inline scalars (physical rows joined with LF) to equal the framed prompt's
 Codex-normalized scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
 scrolling and literal placeholder collisions can make it ambiguous or misleading.
@@ -114,7 +114,7 @@ numbered pinned menu label inside the draft (such as `2. Quit` or `1. Review hoo
 hint-like draft line (such as `enter confirm · esc skip` quoted in a prompt) or a bare
 action word on its own draft line (such as `quit`, `back` or `confirm`) is refused
 as unresolved UI: rephrase the line or press Enter yourself after checking the surface.
-Bridge then requests one guarded Return: the helper compares the entire accepted screen and
+TAB then requests one guarded Return: the helper compares the entire accepted screen and
 writes no Return if it changed. Injected text and Return helpers also check the addressed claim,
 session status and original expiry under the lifecycle lock immediately at dispatch. This assumes no
 concurrent human input; screen comparison is not atomic with a TUI transition. A clipped or
@@ -137,7 +137,7 @@ Unknown custom status lines, history search and overlays are not inferred as dra
 maps CRLF/CR to LF and invokes
 [control/CSI sanitization](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/history_cell/messages.rs#L25-L85)
 before counting Unicode scalars. It preserves triple LF. The real 25596→25595 and
-1094→1093 differences come from Bridge's existing source-prompt trim before framing,
+1094→1093 differences come from TAB's existing source-prompt trim before framing,
 not Codex normalization. Blockquote expansion depends on insertion position and burst
 boundaries, so a merged-tail fallback containing blockquote lines remains ambiguous;
 an exact inline marker can still complete observation.
@@ -146,7 +146,7 @@ an exact inline marker can still complete observation.
 acceptance: another input hook may still reject the turn, and the transcript observer decides
 acceptance and result. A gate/reserve failure or proven pre-write refusal is `not_sent`.
 After body input, count mismatch, ambiguous or unreadable evidence, claim/session changes,
-tail failures, changed-screen refusal and missing binding are delivery-uncertain; Bridge keeps
+tail failures, changed-screen refusal and missing binding are delivery-uncertain; TAB keeps
 the claim and never automatically repeats text or Return. Missing binding includes a final
 composer classification: populated, positively empty, blocked, unreadable or ambiguous.
 This also applies when a launch is recorded as injected but `features.hooks=false` prevents binding.
@@ -160,27 +160,27 @@ Its consent-only admission does not prove that the surface is editable; it has n
 binding-based submission evidence. Missing launch records also use this explicit legacy route.
 
 `tell` uses `codex queue --thread <UUID> --message <TEXT>` to address the same conversation.
-Codex chooses a shared or embedded server; you do not need to start a shared daemon. Bridge waits
+Codex chooses a shared or embedded server; you do not need to start a shared daemon. TAB waits
 for Codex's exact queue acceptance, then for the turn's completion. Acceptance alone is not a
 result.
 
-A Bridge-launched Codex TUI runs on its embedded app server. Bridge passes its `notify` hook and
+A TAB-launched Codex TUI runs on its embedded app server. TAB passes its `notify` hook and
 the verified workspace trust as process-local `-c` overrides, and Codex keeps a TUI with such
 overrides off the shared background server (read from the 0.160.1 source; a warning was first
 recorded with 0.159.3). When Codex's daemon auto-start is enabled, the TUI's startup history
 says `Running without the shared background server: command-line configuration overrides (-c,
 --enable, --disable, or --search) requires embedded mode.` That line is expected (#89): result
 correlation and `tell` were verified in this mode. `/agents` in that TUI offers to start a
-background server; Bridge never answers that dialog, and you do not need to either.
+background server; TAB never answers that dialog, and you do not need to either.
 
 With Codex older than 0.149.0, `tell` fails before anything is typed and restores the session to
 `ready`. Upgrade Codex and launch a new session. A follow-up also needs the thread UUID from the
 first completed turn. If the queue is unavailable, run `tabcli doctor <session> --probe`
-and inspect the reported prerequisite. Bridge never falls back to typing a follow-up: the
+and inspect the reported prerequisite. TAB never falls back to typing a follow-up: the
 surface could be showing another thread or a picker.
 
 With stable Codex 0.163.0 or newer, `settings codex-lifecycle-hooks on` (the default), and a
-supported Bridge executable path, Bridge injects process-local `UserPromptSubmit` and `Stop`
+supported TAB executable path, TAB injects process-local `UserPromptSubmit` and `Stop`
 command hooks. Both call this executable's `native-hook codex`, receive JSON on stdin, use a
 30-second timeout, and run synchronously. Injection does not prove that hooks run: Codex's
 feature flags, disabled handlers, trust and managed configuration still govern availability.
@@ -190,25 +190,25 @@ Older/unknown/prerelease Codex versions and unavailable launchers retain notify.
 the hook executable path must contain only ASCII letters, digits, `_`, `.`, `:`, `\` or `-`;
 a path with spaces, Unicode or shell metacharacters makes hook injection unavailable.
 
-The same `-c hooks=...` value supplies `trusted_hash` for only Bridge's two synthetic
+The same `-c hooks=...` value supplies `trusted_hash` for only TAB's two synthetic
 session-flags keys (`user_prompt_submit:0:0` and `stop:0:0`). Hashes use Codex 0.163.0's
 normalized event label and selected platform command, timeout 30 and async false; they depend
-on this executable's path. Bridge writes no Codex config and sets no `enabled` flags. It leaves
+on this executable's path. TAB writes no Codex config and sets no `enabled` flags. It leaves
 unrelated trust state and user-disabled handlers to Codex's merge. Vector agreement proves
 normalization, not execution; doctor warns when the recorded launch version differs.
 
 Hash drift, or an unrelated untrusted hook, can open Codex's startup hook-review picker on both
-platforms. Bridge never answers it. On Windows the positive gate withholds all initial input;
+platforms. TAB never answers it. On Windows the positive gate withholds all initial input;
 at the deadline it reports `not_sent`, naming the picker when the last readable screen contains
 `Review hooks` or `Trust all and continue`, even if stale composer text is also visible.
 On macOS the argument-delivered prompt can wait behind the picker: a result timeout and no
 input-hook observation mean there is no observed initial-input acceptance, possibly because of
 a startup review screen; they do not prove `not_sent`. Inspect the managed surface yourself.
 `doctor SESSION --probe` can compare current hook trust/hashes; settings `off` is a fallback
-for new sessions, not permission for Bridge to answer a picker or resend uncertain input.
+for new sessions, not permission for TAB to answer a picker or resend uncertain input.
 
 An observed `UserPromptSubmit` binds the current claim to Codex's thread, turn and transcript.
-The prompt must carry Bridge's exact delegation framing (or the recognized IDE wrapper) and
+The prompt must carry TAB's exact delegation framing (or the recognized IDE wrapper) and
 trailing marker. `Stop` records only the latest candidate, which can precede continuation or
 compaction: it is neither a terminal signal nor a source of result text.
 For bound claims, the transcript watcher is the terminal signal. It reads from byte zero for
@@ -231,7 +231,7 @@ addressed first-party terminal signal with equivalent identity and settlement se
 
 The same watcher observes Codex's emitted async questions from completed `AgentMessage`
 items attributed to the bound turn, after it verifies accepted framed input. Only requests
-bound through Bridge's injected Codex hooks can have this evidence; unbound, notify-settled
+bound through TAB's injected Codex hooks can have this evidence; unbound, notify-settled
 claims cannot. The optional `codex-questions-<claim>.json` retains an ordered prefix within
 64 KiB of serialized JSON.
 Duplicate ids keep their first content; conflicting or invalid items and the size limit mark
@@ -247,7 +247,7 @@ that a question is still pending or has been answered. A Ready `tell` is a new r
 without a resolution receipt.
 Codex registers the tool only for a root session with its question configuration on and a
 model whose catalog offers it. Codex keeps the item only under its paginated rollout history;
-its legacy history policy can omit it. Bridge does not infer support from a version,
+its legacy history policy can omit it. TAB does not infer support from a version,
 parse question-shaped prose, or accept a raw `function_call` as emission evidence.
 Replace this transcript fallback when the same managed TUI exposes a verified official
 addressed question event or lifecycle. `wait --questions` can return retained emissions to a
@@ -288,9 +288,9 @@ verified addressed way to answer a question in the running turn of the injected 
 The macOS live check is recorded in
 [the question notice verification](verification/2026-11-05-macos-342-codex-question-notice.md).
 
-Unbound claims retain the `notify` fallback: Bridge accepts an assistant result ending with
+Unbound claims retain the `notify` fallback: TAB accepts an assistant result ending with
 the pending marker, or a completion whose string input begins with the delegation header and
-ends with that marker. A steered TUI input may follow Bridge's prompt; the answer serves both.
+ends with that marker. A steered TUI input may follow TAB's prompt; the answer serves both.
 These checks identify framing, not provenance: a copied framed prompt can still match. The
 first committed result establishes the thread, which later results must name. Notify stays
 until every supported configuration has a verified replacement or is explicitly unsupported,
@@ -299,7 +299,7 @@ unavailable launchers or transcripts. A bound transcript failure does not grant 
 Do not use an older separate binary for commands or recovery on sessions journaled by this
 binary, or downgrade the executable while they remain open; older readers lose provenance.
 
-IDE-wrapper support comes from Codex's source and Bridge's tests. A live session with `/ide`
+IDE-wrapper support comes from Codex's source and TAB's tests. A live session with `/ide`
 is not verified; see the [Windows verification record][win10].
 
 On native Windows an unbound request that still depends on `notify` has a payload size limit.
@@ -307,7 +307,7 @@ Codex runs the notify command with the whole JSON payload as one argument, and t
 carries the delivered prompt
 (`input-messages`) and the whole answer (`last-assistant-message`). Windows refuses a process
 command line of 32,767 UTF-16 units or more, so a long prompt with a long answer makes the spawn
-of `tabcli.exe` fail with error 206 and the completion never reaches Bridge: the request stays
+of `tabcli.exe` fail with error 206 and the completion never reaches TAB: the request stays
 `pending` for good and the session stays `working` until the caller's timeout (observed
 2026-10-11 with codex-cli 0.162.1: a 21,655-character prompt and a 12,586-character answer).
 For that unbound route, keep the delivered prompt and the requested
@@ -322,13 +322,13 @@ because Codex's argument quoting escapes each of them. See [doctor](cli.md#docto
 
 The native-queue follow-up has a send-side limit of its own on native Windows. `tell` starts
 `codex queue` with the framed prompt as one `--message` argument. Before spawning the queue
-client or writing its pending-turn record, Bridge measures the prepared command line, including
+client or writing its pending-turn record, TAB measures the prepared command line, including
 the launcher, arguments and Windows quoting, in UTF-16 units (excluding the terminating NUL).
 At 32,767 units or more it refuses delivery with the measured size, limit and remedy; nothing
 is sent, the request is recorded as `failed` with that refusal (`provenance: "delivery_not_sent"`)
 and the session returns to `ready` (issue #251).
 Shorten the follow-up and pass long material by path in the workspace. Codex's inner hop from
-`codex.ps1` to `node` is unmeasured and can still fail below Bridge's limit. The lifecycle-hook
+`codex.ps1` to `node` is unmeasured and can still fail below TAB's limit. The lifecycle-hook
 route does not change this send-side limit; the console-pasted initial prompt has no such limit
 beyond the paste defects of #124.
 
@@ -336,20 +336,20 @@ Codex exports the caller's session, thread and tool-call ids (`CODEX_SESSION_ID`
 `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`) to its tool shells, and on native Windows its daemon
 backend gives its own children shutdown markers (`CODEX_DAEMON_SHUTDOWN_FILE`,
 `CODEX_DAEMON_SHUTDOWN_SOCKET`). Codex hooks and the legacy `notify` replay the inherited
-environment without replacing these names. A Bridge session is independent of the shell that
-started it, so every Bridge launch, probe, messenger and Codex queue command, for all four
-providers, removes these five names, and so do the terminal and helper processes Bridge starts.
+environment without replacing these names. A TAB session is independent of the shell that
+started it, so every TAB launch, probe, messenger and Codex queue command, for all four
+providers, removes these five names, and so do the terminal and helper processes TAB starts.
 Codex configuration, credentials, install hints and sandbox or proxy context, such as
 `CODEX_HOME`, `CODEX_CA_CERTIFICATE` and `CODEX_SANDBOX`, stay. A hook or script inside a managed
 session no longer sees the outer Codex ids; pass any parent correlation explicitly. Evidence and
 open checks are in the [source notes](verification/2026-10-30-codex-caller-environment-source-notes.md).
 
-`reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
+`reopen` refuses closed Codex sessions. TAB still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.
 
 `cancel` is unsupported in this release's Codex integration. As of the 0.162.1 source
 review, `turn/interrupt` needs a connection to the app server executing the turn; an
-external connection to Bridge's embedded TUI server was not verified. The legacy `notify`
+external connection to TAB's embedded TUI server was not verified. The legacy `notify`
 is not interruption acknowledgement, and follow-up queue progress after interruption is
 unverified. Support needs an official connection to that running backend, correlated
 interruption completion, and verified follow-up resumption.
@@ -359,20 +359,20 @@ interruption completion, and verified follow-up resumption.
 Install and sign in to stable `claude` 2.1.302 or newer. Resolve workspace trust in Claude before launch,
 or use [existing workspace consent](security-and-data.md#workspace-trust-and-consent).
 New macOS, Linux, and native Windows launches, plus Windows reopens, require a recorded stable Claude
-Code 2.1.302 or newer and load a session-local Bridge completion module through Claude's official
-`--plugin-dir` flag. Bridge
+Code 2.1.302 or newer and load a session-local TAB completion module through Claude's official
+`--plugin-dir` flag. TAB
 waits for that module to report readiness before sending the initial prompt. Disabled hooks
 (`disableAllHooks: true`, observed on Windows and macOS), unresolved plugin trust or provider policy can withhold
-readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
+readiness; TAB sends no prompt and never substitutes a Stop hook or terminal input.
 The version floor establishes launch eligibility, not proof that the module ran.
 `tabcli doctor <session>` reports the recorded completion mode and readiness as
 `claude_completion` and the module's latest rejection as `claude_completion_diagnostic`;
 see [doctor](cli.md#doctor). Those rows read the session's records and nothing else.
 
-On all supported platforms, Bridge delivers the initial prompt after launch through Claude's official
+On all supported platforms, TAB delivers the initial prompt after launch through Claude's official
 cross-session messaging. The prompt is absent from argv. Every follow-up uses that messaging path too:
 a separate, nonpersistent Claude messenger model turn calls `ListAgents` to find your session
-and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session markers so a
+and `SendMessage` to deliver the prompt. TAB removes inherited Claude session markers so a
 launch from inside Claude does not create a nested session with an undiscoverable inbox; the list
 includes the caller's session id and transcript path that the Claude Code Codex plugin sets
 (`CODEX_COMPANION_SESSION_ID`, `CODEX_COMPANION_TRANSCRIPT_PATH`, #149). Claude launches,
@@ -386,7 +386,7 @@ and both `CODEX_COMPANION_*` names (#335). Direct non-Claude provider commands k
 `AI_AGENT`, `CLAUDE_EFFORT`, `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_EXECPATH`, as well as
 credentials and user configuration. Claude's own full removal list and the helper union
 are unchanged; this does not restore a variable a terminal or helper already removed.
-On macOS, non-provider helpers keep Claude's full list and Bridge's per-session variables out
+On macOS, non-provider helpers keep Claude's full list and TAB's per-session variables out
 of the processes they start, including a terminal application. An application already
 started by an earlier version keeps them until it is restarted. The [2026-10-12 Windows check][win48]
 verified scrubbing in the managed Codex process on both a Windows Terminal tab and a separate
@@ -396,7 +396,7 @@ remains open in [#111](https://github.com/jy1655/tabcli/issues/111).
 Messaging must be available in the running CLI's backend, features, and settings, and discovery
 must find the exact live local session. A recent version or saved inbound setting does not prove
 those conditions. If delivery fails, run `tabcli doctor <session>` and read the messaging
-checks. Bridge does not substitute terminal input.
+checks. TAB does not substitute terminal input.
 
 A proven not-sent follow-up releases its claim and restores `ready`. A proven not-sent
 initial delivery leaves the session `failed`; close it and start a new session. An uncertain
@@ -407,16 +407,16 @@ request, or explicitly close the session if you decide to abandon it.
 
 The messenger model sees a per-request reference, not your follow-up text. A `PreToolUse` hook
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
-what ran. On new sessions, Bridge's completion module forwards Claude's official
-`turn.start` and `turn.complete` events. Bridge binds the complete addressed prompt at
+what ran. On new sessions, TAB's completion module forwards Claude's official
+`turn.start` and `turn.complete` events. TAB binds the complete addressed prompt at
 `turn.start` to the current claim. A normal answer completes the request only with the
 exact delegation marker at its suffix.
 Claude can quote protected tags in the peer body by inserting a backslash after `<`;
 the comparison permits only that reversible insertion and admission reserves its wire space.
-If a Stop hook blocks the stop and Claude continues the turn, Bridge publishes nothing until
-the official `turn.complete`. Stored results retain Claude's conversation identity and Bridge's
+If a Stop hook blocks the stop and Claude continues the turn, TAB publishes nothing until
+the official `turn.complete`. Stored results retain Claude's conversation identity and TAB's
 request correlation id; the official turn id stays in the adapter's immutable binding.
-Bridge removes the marker only when it ends the answer.
+TAB removes the marker only when it ends the answer.
 
 An optional question plugin observes completed main-loop `turn.step` responses and
 retains structured `AskUserQuestion` emissions only for the original bound turn. It is
@@ -432,7 +432,7 @@ are observation cursors, not an endpoint for answering a dialog.
 The Claude-owned `claude-questions-<claim>.json` retains question text and option labels
 within a 64 KiB budget. Incomplete or conflicting evidence preserves the prior prefix and
 marks it incomplete. A repeated model step, a non-tool-use response carrying a question,
-or a lower hook's rewrite also marks incompleteness. Hooks above Bridge can still change
+or a lower hook's rewrite also marks incompleteness. Hooks above TAB can still change
 or discard the response after observation, so this does not prove a dialog was displayed
 or a tool executed. The helper has two 5-second attempts; a failure logs unavailable
 observation and leaves ordinary tool execution intact. Stream overhead and dialog delay
@@ -514,18 +514,18 @@ Legacy `StopFailure` cannot identify a pending cross-session request and leaves 
 Do not downgrade the binary or `AGENT_BRIDGE_EXECUTABLE` while native-mode Claude sessions
 remain open; older binaries cannot interpret their completion protocol.
 
-**Other Claude sessions on the same account can send work to your Bridge-launched session.**
+**Other Claude sessions on the same account can send work to your TAB-launched session.**
 With `--yolo`, that work runs with skipped permission checks. Do not use that combination if you
 do not control the account's other Claude sessions. See
 [Claude inbound messages](security-and-data.md#claude-inbound-messages).
 
-You can `reopen` a closed Claude session on native Windows. Bridge creates a new session and
+You can `reopen` a closed Claude session on native Windows. TAB creates a new session and
 runs `claude --resume` with the recorded conversation UUID. It checks for other live holders
 before launch and delivery, but Claude does not provide exclusive ownership: another session
 can resume between checks. A conflicting follow-up is refused before delivery and leaves the
 session ready. Close the other holder before trying again.
 
-macOS reopen is refused because its ownership path is not verified live. Bridge copies no model,
+macOS reopen is refused because its ownership path is not verified live. TAB copies no model,
 effort, or bypass option from the closed source. Claude applies its own
 [resume rules](https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores)
 and settings; omitting `--yolo` therefore does not prove that bypass is off.
@@ -540,9 +540,9 @@ Support needs an official way to interrupt this running interactive session from
 Agy's submission evidence is its receipt; it does not use Codex's composer protocol.
 
 Install and sign in to `agy` (Antigravity CLI) 1.1.12 or newer. Trust the exact project directory
-in Agy before launching it through Bridge.
+in Agy before launching it through TAB.
 
-On macOS and Linux, Bridge passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
+On macOS and Linux, TAB passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
 behind its workspace-trust dialog, so receiving the first result does not prove it is ready for
 a follow-up. Windows initial input and all follow-ups use terminal input because Agy has no
 integrated first-party input API or accepted-turn signal.
@@ -556,19 +556,19 @@ The Windows initial paste and macOS follow-ups also require Agy's trust entry fo
 workspace and a log entry showing that this session loaded the workspace customizations.
 Trusting the directory in another Agy session does not establish that this session is ready.
 
-If Bridge says the session's trust is unverified, no prompt was pasted. Look at the managed
+If TAB says the session's trust is unverified, no prompt was pasted. Look at the managed
 surface: approve a trust dialog if one is there and you trust the directory. After resolving it,
 retry a withheld macOS follow-up with `tell` if the session is `ready`. If the Windows initial
 request failed, close that session and run a new `ask`. If the composer is already visible, or
 input remains withheld, close the session and start a new one. A missing log entry alone does not
 prove a dialog is open.
 
-After input, Bridge requires a `HandleUserInput` receipt in the log carrying the turn marker.
+After input, TAB requires a `HandleUserInput` receipt in the log carrying the turn marker.
 A missing receipt is different from a withheld paste: the prompt could have arrived. The
 session stays `working`, retains its claim, and records the reason in its status. Do not resend;
 inspect the same request's result or explicitly close the session.
 
-Bridge reads completed results from Agy's transcript and checks the claim and final marker.
+TAB reads completed results from Agy's transcript and checks the claim and final marker.
 It can also report the observed quota-exhaustion failure from the log when the log proves it
 belongs to the pending turn. A result already written takes precedence over that failure.
 
@@ -580,14 +580,14 @@ tool, command, or file is needed; whether that prevents the prompt requires live
 `doctor SESSION` reports `agy_tool_confirmation_observed` when this session's own `agy.log`
 binds a `Surfacing tool confirmation` line to the pending turn, with no result, receipt
 failure, or executor error. It names the tool and says the turn is waiting for approval in
-the terminal and Bridge does not answer it. This is the last observed confirmation, not
+the terminal and TAB does not answer it. This is the last observed confirmation, not
 proof that the dialog remains open: no approval-resolution signal has been verified.
 The observation neither fails the request nor releases its claim. A later result or executor
 error follows the ordinary monitor rules. A self-test result timeout includes this diagnosis
 in its step reason when `doctor --json` identifies the same request.
 
 `reopen` refuses Agy sessions. Its presence records do not prove who still holds a conversation,
-and Bridge's transcript reader follows only a newly created conversation. Start a new session.
+and TAB's transcript reader follows only a newly created conversation. Start a new session.
 
 `cancel` is unsupported in this release's Agy integration. The 1.3.3 investigation found
 no documented cancel CLI/RPC for the running TUI. Neither an interruption log with turn
@@ -598,23 +598,23 @@ observed quota-failure log is not evidence of cancellation.
 ## Pi
 
 Install and sign in to `pi` 0.84.1 or newer. If Pi asks you to resolve project trust, answer that
-prompt before launching through Bridge.
+prompt before launching through TAB.
 
-On macOS and Linux, the initial prompt is a launch argument. On native Windows, Bridge waits for Pi's
+On macOS and Linux, the initial prompt is a launch argument. On native Windows, TAB waits for Pi's
 `session_start` event with reason `startup` for the current claim before typing. That event
 follows the trust procedure, including a possible decline; it does not grant shared consent.
 If the wait expires, the error says no initial console input was sent. Resolve the prompt in
-the managed surface, then close and start a new Bridge session. Follow-ups use terminal input.
+the managed surface, then close and start a new TAB session. Follow-ups use terminal input.
 
-Bridge installs a session-local extension that checks the actual `before_agent_start` prompt
+TAB installs a session-local extension that checks the actual `before_agent_start` prompt
 against the claim. It collects the result at `agent_end` and reports it at `agent_settled`, so an
 accepted prompt can produce an exact result body without an added marker. The result includes
 Pi's session and turn identity. Errors reported by those events are recorded too; a separate failure signal
-preserves an error when the extension cannot deliver the result to Bridge.
+preserves an error when the extension cannot deliver the result to TAB.
 
 On native Windows, both initial and follow-up input require the extension's
-`input_ack_schema: 1` startup capability. Bridge refuses input before typing when the session's
-extension did not report that capability and asks you to start a new session. Bridge sends one
+`input_ack_schema: 1` startup capability. TAB refuses input before typing when the session's
+extension did not report that capability and asks you to start a new session. TAB sends one
 console batch, then waits for that claim's `agent_start` receipt. The extension matches the
 SHA-256 and UTF-8 byte length of the complete framed prompt against `pi-pending-turn.json`
 before publishing `pi-input-accepted-<claim>.json`. It accepts both the older string-prompt
@@ -631,26 +631,26 @@ reports uncertain delivery even if Pi started the prompt. A result can still arr
 the request and Pi editor before further input; never retry the prompt or Return automatically.
 The receipt records historical submission, including after claim retirement or a Pi conversation
 change. It grants no result, input, or cancellation authority and stays with the session's
-retained records through close. Do not downgrade the Bridge binary or `AGENT_BRIDGE_EXECUTABLE`
+retained records through close. Do not downgrade the TAB binary or `AGENT_BRIDGE_EXECUTABLE`
 while these sessions remain open. An older binary can drop the startup input
 capability on a follow-up, causing later input to be refused. macOS keeps its existing input
 paths. Replace this receipt fallback when Pi exposes addressed interactive input with per-turn
 acceptance.
 
 `cancel` supports sessions whose installed extension has reported schema 2 in
-`pi-startup-ready.json`. Bridge carries that capability evidence to each new Claim when
+`pi-startup-ready.json`. TAB carries that capability evidence to each new Claim when
 installing its pending turn; the receipt must identify the current Claim. Schema 1,
 missing, or unreadable readiness is unsupported: start a new session. The readiness
 record is read within a 4 KiB bound and must carry a valid Pi session id; a record that
 fails either is unreadable, which refuses Windows input and leaves `cancel` unsupported.
 
 The extension uses Pi's official `ctx.abort()` API through an adapter-local fallback:
-every 200 ms during a run it reads Bridge's `cancel.json`, checks the active Claim and
+every 200 ms during a run it reads TAB's `cancel.json`, checks the active Claim and
 the correlated prompt, and calls abort at most once for that Claim. It reads
-`turn.claim` and `cancel.json` under Bridge's core read policy: a link at the record's
+`turn.claim` and `cancel.json` under TAB's core read policy: a link at the record's
 path or an entry that is not a regular file is refused, and the text must be UTF-8;
 a refused record reads as no Claim or no cancel intent. A Pi session launched by an
-earlier Bridge keeps the extension it was launched with until it is relaunched. This is a polling
+earlier TAB keeps the extension it was launched with until it is relaunched. This is a polling
 interval, not a response-time guarantee. `pi-cancel-accepted.json` records the call;
 it is published with a temporary file and rename. A failed write never causes another
 abort. The adapter removes acceptance when installing the next Claim or rolling back
@@ -667,16 +667,16 @@ or substring heuristic. Pi's [session abort][pi-session-abort] calls the agent's
 the [agent loop][pi-agent-loop] forwards the stream's final assistant message and ends
 on either `error` or `aborted`, without normalizing that outcome. These source paths
 confirm propagation, not the exact backend throw site in that live run.
-Direct Esc without this evidence remains an ordinary failure; Bridge does not infer an
+Direct Esc without this evidence remains an ordinary failure; TAB does not infer an
 actor. Normal completion can win the race. Retry or compaction waits may settle without
 a new `agent_end(aborted)`; the watcher stops at `agent_end`, and the Result then remains
 what Pi reported. Process exit before the result hook keeps the existing exit, close,
 and recovery semantics; the accepted record cannot confirm cancellation.
 
-Pi restores queued messages into the editor when aborting. Bridge does not use Pi's
+Pi restores queued messages into the editor when aborting. TAB does not use Pi's
 queue, so without input queued or left in the editor by the user, the editor is empty.
 **Inspect the managed surface before the next `tell` and clear or submit any restored
-input yourself.** Bridge does not delete editor contents or detect that they are empty;
+input yourself.** TAB does not delete editor contents or detect that they are empty;
 a terminal paste can otherwise combine with that input.
 
 This fallback follows Pi v1.0.4's [abort API][pi-abort], [context lifetime][pi-context],
@@ -716,7 +716,7 @@ Replace the extension's accumulation when Pi reports a turn's usage through an a
 first-party signal.
 
 Pi 1.0.0 can reject a prompt for missing credentials before an agent turn starts, without
-an extension event identifying that refusal. Bridge therefore leaves that request pending
+an extension event identifying that refusal. TAB therefore leaves that request pending
 and claimed. `doctor SESSION --probe` reports `pi_provider_credentials` using Pi's
 `auth check --no-refresh --json`, without a model call or credential output. It first asks
 Pi to resolve the recorded qualified model, then checks its provider with `--provider`;
@@ -728,18 +728,18 @@ unsupported responses are `unknown`. Without a session model or `--probe`, no au
 runs. A self-test result timeout includes this observation before cleanup; it does not
 record a failed request, release its claim, or resend input.
 
-`reopen` refuses Pi sessions because Bridge cannot verify whether a live process still holds
+`reopen` refuses Pi sessions because TAB cannot verify whether a live process still holds
 the conversation. Start a new session instead.
 
 ## Linux command limits
 
 Linux limits each argument or environment string, including its NUL, to `MAX_ARG_STRLEN`
 (32 pages: 128 KiB / 131072 bytes on 4 KiB pages), and argv plus environment to `ARG_MAX`.
-Bridge measures the provider command before spawn and refuses an oversized command with
+TAB measures the provider command before spawn and refuses an oversized command with
 nothing sent. This covers Codex initial prompts and `codex queue --message` follow-ups, Agy
 `--prompt-interactive`, and Pi positional prompts. Context attachments can reach 256 KiB;
 pass long material by path in the workspace instead. A prompt file does not remove these
-command limits. Codex starts its legacy notify program itself, so Bridge cannot measure that
+command limits. Codex starts its legacy notify program itself, so TAB cannot measure that
 command beforehand.
 
 ## Verification boundary

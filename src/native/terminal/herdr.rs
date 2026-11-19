@@ -1,6 +1,6 @@
 //! Herdr: a terminal of an already running Herdr Core (`hc`), reached through the core's own
 //! local endpoint with newline JSON-RPC 2.0 (protocol generation 1): its protected Unix
-//! socket on macOS and Linux (`unix.rs`), its named pipe on Windows (`pipe.rs`). Bridge never
+//! socket on macOS and Linux (`unix.rs`), its named pipe on Windows (`pipe.rs`). TAB never
 //! starts, restarts or stops a core, and never addresses a terminal it did not create.
 //!
 //! Every action opens one connection, checks `hello` (generation, the methods it uses and,
@@ -8,7 +8,7 @@
 //! connection, so a core replaced between the identity check and the action is refused.
 //! The handle names the address (`t7`, one terminal forever on its core), the endpoint, the
 //! core id, the creation time and the incarnation of the program the core started:
-//! Bridge's launch host, which waits for a binding that names its own address and PID
+//! TAB's launch host, which waits for a binding that names its own address and PID
 //! before the provider can start. A terminal whose reply was lost therefore starts nothing.
 //!
 //! On macOS and Linux creation names a verified caller as parent with `outlive_parent`.
@@ -58,7 +58,7 @@ const REQUIRED_METHODS: [&str; 6] = [
     "terminal.send",
     "terminal.read",
 ];
-/// The labels Bridge gives its terminals: the session, and the launch attempt.
+/// The labels TAB gives its terminals: the session, and the launch attempt.
 const SESSION_LABEL: &str = "tabcli-session";
 const LAUNCH_LABEL: &str = "tabcli-launch";
 /// Every terminal also gets a random local name, `tabcli-` and 24 hexadecimal digits (31 of
@@ -196,7 +196,7 @@ fn read_config_socket(path: &Path) -> Result<Option<String>> {
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "cannot read the Herdr configuration {}; Bridge does not guess the core's socket",
+                    "cannot read the Herdr configuration {}; TAB does not guess the core's socket",
                     path.display()
                 )
             });
@@ -204,7 +204,7 @@ fn read_config_socket(path: &Path) -> Result<Option<String>> {
     };
     config_socket(&text).with_context(|| {
         format!(
-            "cannot parse the Herdr configuration {}; Bridge does not guess the core's socket",
+            "cannot parse the Herdr configuration {}; TAB does not guess the core's socket",
             path.display()
         )
     })
@@ -222,7 +222,7 @@ pub(super) fn config_socket(text: &str) -> Result<Option<String>> {
 
 fn not_running(endpoint: &Path) -> anyhow::Error {
     anyhow!(
-        "no Herdr Core is running at {}; open Herdr from the desktop or start hc from a shell outside an agent session, then retry. Bridge does not start or restart a core",
+        "no Herdr Core is running at {}; open Herdr from the desktop or start hc from a shell outside an agent session, then retry. TAB does not start or restart a core",
         endpoint.display()
     )
 }
@@ -367,7 +367,7 @@ pub(super) fn parse_reply(line: &[u8], id: u64) -> Result<Value, CallError> {
         .ok_or_else(|| CallError::Unanswered(anyhow!("Herdr reply has neither result nor error")))
 }
 
-/// A connection whose `hello` named this core: generation 1, the methods Bridge uses, and,
+/// A connection whose `hello` named this core: generation 1, the methods TAB uses, and,
 /// when one is expected, the recorded core id.
 struct Linked<'a> {
     connection: Box<dyn Connection + 'a>,
@@ -401,7 +401,7 @@ fn link<'a>(
     })
 }
 
-/// The core id of a `hello` result that speaks generation 1 and offers Bridge's methods.
+/// The core id of a `hello` result that speaks generation 1 and offers TAB's methods.
 pub(super) fn validate_hello(hello: &Value) -> Result<String> {
     if hello.get("generation").and_then(Value::as_u64) != Some(GENERATION) {
         bail!("Herdr Core does not speak protocol generation {GENERATION}");
@@ -556,7 +556,7 @@ fn get(linked: &mut Linked<'_>, terminal: &str, deadline: Instant) -> Result<Opt
     }
 }
 
-/// The program Bridge asks the core to run: its launch host, given the session directory
+/// The program TAB asks the core to run: its launch host, given the session directory
 /// and the launch command.
 pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -> Vec<String> {
     vec![
@@ -1065,7 +1065,7 @@ fn remove_ended(
         .context("the close was stopped and the handle retained")?;
     if observed.state != State::Finished {
         bail!(
-            "Herdr terminal {address} is still running although its native-session owner is no longer live; Bridge does not end it without that owner, so no close was sent and the handle is retained"
+            "Herdr terminal {address} is still running although its native-session owner is no longer live; TAB does not end it without that owner, so no close was sent and the handle is retained"
         );
     }
     let nonce = observed
@@ -1163,9 +1163,7 @@ fn send_file(
         .context("failed to read the prompt")
         .and_then(|bytes| {
             if bytes.len() > MAX_SEND_TEXT {
-                bail!(
-                    "the prompt is larger than {MAX_SEND_TEXT} bytes, which Bridge sends to Herdr"
-                );
+                bail!("the prompt is larger than {MAX_SEND_TEXT} bytes, which TAB sends to Herdr");
             }
             String::from_utf8(bytes).context("the prompt is not UTF-8 text")
         })

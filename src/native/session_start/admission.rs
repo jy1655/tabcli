@@ -2,7 +2,7 @@
 //! before any session, record, consent or terminal surface exists, and it changes nothing.
 //!
 //! The only rule is the user's `codex-memory-workspace` setting. Codex's background memory
-//! consolidation delegated through Bridge from the Codex memory workspace and left the
+//! consolidation delegated through TAB from the Codex memory workspace and left the
 //! sessions open (issue #216), so a workspace that is that directory or lies inside it is
 //! refused by default, for every target provider. The location belongs to the Codex
 //! adapter; this module applies the setting to it. It is an admission policy for an

@@ -104,7 +104,7 @@ fn initial_readiness_with(
         }
         if clock.now() >= deadline {
             let picker = if contains_hook_review_label(&last_screen) {
-                " The last screen contained Review hooks or Trust all and continue (hook-review picker); Bridge never answers this picker."
+                " The last screen contained Review hooks or Trust all and continue (hook-review picker); TAB never answers this picker."
             } else {
                 ""
             };
@@ -183,7 +183,7 @@ fn wait_for_submission_with(
     }
     Err(terminal::TerminalSendFailure::delivery_uncertain(
         anyhow::anyhow!(
-            "Codex composer still holds the pasted prompt; the submission was not observed. Press Enter in the surface or close the session; Agent Bridge does not resend"
+            "Codex composer still holds the pasted prompt; the submission was not observed. Press Enter in the surface or close the session; TAB does not resend"
         ),
     ))
 }

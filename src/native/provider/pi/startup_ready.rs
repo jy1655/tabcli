@@ -3,7 +3,7 @@
 //!
 //! The session-local extension writes the record at its `session_start` hook, naming the
 //! Claim it saw and the schema of the turn capabilities it offers (schema 2 adds `cancel`;
-//! `input_ack_schema` 1 adds Windows input acknowledgement). Bridge never infers any of
+//! `input_ack_schema` 1 adds Windows input acknowledgement). TAB never infers any of
 //! this from a Pi version. Every reader goes through [`read`], so one bound, one validity
 //! floor and one session-id rule hold for the initial-paste gate, the Windows input
 //! preflight, `cancel` support and the follow-up carry-forward. The receipt reader in
@@ -34,7 +34,7 @@ pub(super) struct StartupReady {
 pub(super) enum StartupReadiness {
     /// No record: the extension has not reached `session_start`, or the session has none.
     Absent,
-    /// A record Bridge cannot use: unreadable, over the bound, malformed JSON, or one that
+    /// A record TAB cannot use: unreadable, over the bound, malformed JSON, or one that
     /// fails the validity floor (schema outside 1..=2, an invalid claim token, an invalid
     /// session id). Callers choose whether that is a refusal or merely "unsupported"; the
     /// reason is reported by the Windows input gates, while `cancel` support and the
@@ -141,7 +141,7 @@ pub(super) const WINDOWS_INPUT_ACK_ABSENT: &str =
     "Pi input acknowledgement capability is absent or unsupported";
 
 /// The context every Windows input capability refusal carries.
-pub(super) const WINDOWS_INPUT_REFUSAL: &str = "this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent";
+pub(super) const WINDOWS_INPUT_REFUSAL: &str = "this Pi session cannot acknowledge Windows input; start a new TAB session; no console input was sent";
 
 /// Carries the extension's startup evidence to `claim_token`, the Claim the caller holds
 /// under the lifecycle lock. Schema 2 is rewritten with the new token and nothing else

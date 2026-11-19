@@ -1,4 +1,4 @@
-//! Environment policy and deadline-bounded command execution for Bridge children.
+//! Environment policy and deadline-bounded command execution for TAB children.
 //! Provider adapters own their removal lists; helpers must not pass any caller's
 //! session identity into another application.
 use crate::native::session::primitives::{SESSION_DIR_ENV, STATE_DIR_ENV};

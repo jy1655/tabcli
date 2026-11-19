@@ -77,7 +77,7 @@ pub(super) fn parse_inspect(args: &[String]) -> Result<NativeCommand> {
             "--request" => {
                 let id = option_value(options, &mut index, "--request")?;
                 if !requests::valid_id(id) {
-                    bail!("invalid Bridge request id")
+                    bail!("invalid TAB request id")
                 }
                 set_once(&mut request, id.to_owned(), "--request")?;
             }
@@ -124,7 +124,7 @@ pub(super) fn parse_result(args: &[String]) -> Result<NativeCommand> {
             "--request" => {
                 let id = option_value(options, &mut index, "--request")?;
                 if !requests::valid_id(id) {
-                    bail!("invalid Bridge request id")
+                    bail!("invalid TAB request id")
                 }
                 set_once(
                     &mut selector,

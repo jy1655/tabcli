@@ -523,7 +523,7 @@ fn create_session_within(
     })
 }
 
-// The caller's prompt as every adapter receives it (#396). Bridge adds no shared visible
+// The caller's prompt as every adapter receives it (#396). TAB adds no shared visible
 // framing: the Request source lives in the request receipt, and each provider adapter adds
 // only the framing its own correlation needs.
 fn delegation_prompt(prompt: &str) -> String {

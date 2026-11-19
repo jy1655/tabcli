@@ -35,7 +35,7 @@ impl Core for Installed {
     }
 
     fn executable(&self) -> Result<PathBuf> {
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")
+        std::env::current_exe().context("failed to resolve TAB executable")
     }
 
     fn caller_terminal(&self) -> Option<String> {
@@ -112,7 +112,7 @@ fn nonempty(value: &Option<OsString>) -> Option<&OsStr> {
 
 /// The socket of the core that `hc` addresses from these inputs. A session name or socket
 /// that `hc` itself would refuse, and a configuration it cannot read, are refused here
-/// too: Bridge never guesses another endpoint.
+/// too: TAB never guesses another endpoint.
 pub(super) fn resolve_socket(
     inputs: &EndpointInputs,
     config_socket: &dyn Fn(&Path) -> Result<Option<String>>,

@@ -21,12 +21,12 @@
 - `created_unix_ms` of a receipt and of an event is optional only when a record is read,
   so that a damaged record can be reported with a reason. Every writer writes it, and no
   path may publish an event without it: the completion-journal validation rejects one.
-- The elapsed time is what Bridge observed between two records. Do not present it as
+- The elapsed time is what TAB observed between two records. Do not present it as
   model time or billing time, and do not collect provider usage from a signal that the
   provider does not document as usage. Usage a query shows is what the event records
   (`usage`, or `usage_reason` with the bounded `usage_error`); never estimate or total it.
 - A delivery refusal (`Delivery::NotSent`) is settled by `settle_delivery_refusal_locked`
-  as the receipt's failed event: Bridge-owned evidence of what was not sent, with
+  as the receipt's failed event: TAB-owned evidence of what was not sent, with
   `provenance: "delivery_not_sent"`, the refusal text as `error`, the session's provider
   from the manifest and no provider session or turn id. It is journaled through the same
   completion machinery under the one lifecycle lock, after a pending completion is
@@ -56,5 +56,5 @@
   consent for the exact workspace is reused through the provider's own approval, as
   in `ask`, and without it the self-test approves no workspace trust itself. An
   explicit `--yolo` only forwards the provider's own bypass option. `--isolated`
-  separates Bridge's records, not a provider's trust store. Nothing else may call it.
+  separates TAB's records, not a provider's trust store. Nothing else may call it.
 

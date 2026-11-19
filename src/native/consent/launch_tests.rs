@@ -440,7 +440,7 @@ fn launch_dialog_confirmed_trust_survives_applied_record_failure() {
     let detail = format!("{error:#}");
     assert!(detail.contains("provider trust is confirmed"), "{detail}");
     assert!(
-        detail.contains("recording the Bridge applied marker failed"),
+        detail.contains("recording the TAB applied marker failed"),
         "{detail}"
     );
     assert!(detail.contains("no input was retried"), "{detail}");

@@ -1,27 +1,27 @@
 # Security and data
 
-You can inspect Bridge's saved prompts and results and remove closed sessions without deleting
+You can inspect TAB's saved prompts and results and remove closed sessions without deleting
 provider history. Those records are private, unencrypted data under your account.
 
-Bridge does not sandbox provider tools. Provider CLIs send prompts and tool data to their
+TAB does not sandbox provider tools. Provider CLIs send prompts and tool data to their
 configured services under your existing login. That includes Claude's messenger turn and any
-result context attached to a prompt. Bridge runs no hosted service and has no credential store.
+result context attached to a prompt. TAB runs no hosted service and has no credential store.
 It cannot attach arbitrary existing CLI sessions.
 
 ## Claude inbound messages
 
-**Other Claude sessions on the same account can send work to a Bridge-launched Claude session.
+**Other Claude sessions on the same account can send work to a TAB-launched Claude session.
 If you launch it with `--yolo`, that work runs without Claude's permission checks.** Do not
 combine `--yolo` with an account whose other Claude sessions you do not control.
 
-Bridge verifies prompts sent by its own messenger, but does not filter incoming work from other
+TAB verifies prompts sent by its own messenger, but does not filter incoming work from other
 Claude sessions. Its messenger is a separate model turn: the model sees a per-request reference,
 and a hook supplies your exact prompt to the official delivery tool. The receiving session
 processes that prompt under its own provider settings.
 
 ## Permission modes
 
-Bridge adds the following flag only when you request `--yolo`, except that Pi's project approval
+TAB adds the following flag only when you request `--yolo`, except that Pi's project approval
 flag is also used for verified workspace consent:
 
 | Provider | Forwarded flag | What it bypasses |
@@ -31,27 +31,27 @@ flag is also used for verified workspace consent:
 | Agy | `--dangerously-skip-permissions` | Provider permission checks |
 | Pi | `--approve` | Project approval; native tool policy stays in effect |
 
-Bridge does not add another sandbox. It does not inherit `--yolo` from the calling session or
+TAB does not add another sandbox. It does not inherit `--yolo` from the calling session or
 copy it from a closed session during `reopen`. It also does not erase the provider's settings or
 environment. Check those settings if you need to know the effective permission mode: omitting
 `--yolo` on Claude reopen does not prove that bypass is off.
 
 ## Workspace trust and consent
 
-Approve a workspace in the provider itself when you decide to trust it. Bridge can reuse that
+Approve a workspace in the provider itself when you decide to trust it. TAB can reuse that
 existing decision for the exact directory. It records the canonical path, filesystem identity,
 owner, and provider that supplied the decision. Consent does not extend to parent or child
 directories, and a symlink alias cannot supply fresh consent. If the original provider removes
-its decision, Bridge does not silently choose another provider as the source.
+its decision, TAB does not silently choose another provider as the source.
 
-With verified existing consent, Bridge can answer Claude or Agy startup trust dialogs once in
+With verified existing consent, TAB can answer Claude or Agy startup trust dialogs once in
 iTerm2, Terminal.app, and the native Windows console; see
 [terminal requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts)
 for the terminal-specific limits.
 
-Before responding, Bridge checks that it owns the surface and checks the captured screen again.
+Before responding, TAB checks that it owns the surface and checks the captured screen again.
 It then checks that the provider saved its decision. Without verified consent, the dialog stays
-for you to answer. Bridge never writes a provider trust store directly; the provider saves the
+for you to answer. TAB never writes a provider trust store directly; the provider saves the
 decision after the guarded response. Codex instead receives a process-local configuration
 override, and Pi receives its one-run approval option.
 
@@ -63,13 +63,13 @@ tabcli consent inspect /path/to/project
 
 Use `tabcli consent revoke /path/to/project` to stop sharing that decision. This leaves
 provider-owned trust unchanged. Use `tabcli consent reset /path/to/project` when you want
-a later launch to assess fresh evidence; reset clears Bridge's source and revocation decision,
+a later launch to assess fresh evidence; reset clears TAB's source and revocation decision,
 but does not approve the workspace. Shared records live in `workspace-consent/` under the state
 root. Each session keeps its own assessment in `workspace-consent.json`; a reopened session
 assesses its workspace for itself, like a fresh `ask`, and inherits nothing from the source
 session's assessment.
 
-If consent is missing or unreadable, check the store Bridge reads. In these paths, home means
+If consent is missing or unreadable, check the store TAB reads. In these paths, home means
 `HOME` when set, otherwise `USERPROFILE`:
 
 - Codex: `config.toml` under `CODEX_HOME`, or `<home>/.codex/config.toml` when unset.
@@ -97,13 +97,13 @@ retry a withheld macOS Agy follow-up with `tell` only if the session is `ready`.
 initial request failed, close that session and run a new `ask`; a failed session cannot take
 `tell`. The [provider page](providers.md) gives the recovery steps for each CLI.
 
-If delivery is uncertain, Bridge keeps the claim and does not resend. It refuses another `tell`
+If delivery is uncertain, TAB keeps the claim and does not resend. It refuses another `tell`
 while the earlier request remains claimed. Inspect that request rather than repeating its prompt;
 follow the [provider-specific recovery instructions](providers.md).
 
 ## Local records
 
-Unless you set `AGENT_BRIDGE_NATIVE_STATE_DIR`, Bridge stores records at:
+Unless you set `AGENT_BRIDGE_NATIVE_STATE_DIR`, TAB stores records at:
 
 | Platform | State root |
 | --- | --- |
@@ -112,7 +112,7 @@ Unless you set `AGENT_BRIDGE_NATIVE_STATE_DIR`, Bridge stores records at:
 | Windows, with `HOME` unset | `$env:USERPROFILE\.agent-bridge\native-sessions` |
 
 The code uses `HOME` first, then `USERPROFILE`, on both platforms. The override replaces the
-entire root. `settings.json` in that root holds Bridge's surface-creation preferences.
+entire root. `settings.json` in that root holds TAB's surface-creation preferences.
 
 Inside a session directory, these are the records most useful when checking a request. Some
 exist only during a turn or after close; `agy.log` is specific to Agy.
@@ -155,7 +155,7 @@ contains no copied prompt, transcript, transcript path, timestamps, or tool outp
 validate it against the selected Receipt without opening provider history or writing records.
 A missing record is unknown, and an unreadable record changes no result or delivery authority.
 
-Bridge reads its own JSON records (`manifest.json`, `status.json`, `closed.json`,
+TAB reads its own JSON records (`manifest.json`, `status.json`, `closed.json`,
 `turn.completion.json`, `launch.json` and the receipts under `requests/`) through one decoder
 per record, in every command. The decoder takes the bytes as strict UTF-8, so a record with
 invalid UTF-8 is unreadable rather than read with replacement characters. A `*_unix_ms` value
@@ -173,20 +173,20 @@ symbolic link (on Windows, also a junction) or a non-directory at `events` with 
 behind it: `result`, `inspect` and `wait` fail, `status` reports the session as incomplete with
 that reason, and `sessions` shows `"results": 0` for it. A missing `events/` lists no results.
 
-Bridge makes private directories mode `0700` and private records mode `0600` on Unix. On Windows,
+TAB makes private directories mode `0700` and private records mode `0600` on Unix. On Windows,
 it installs a protected access list giving the current user full control, with inheritance for
 private directories. Administrators and the operating system can still access the data.
 
-Before accepting a trust store as evidence, Bridge checks who can change it. On Unix the current
+Before accepting a trust store as evidence, TAB checks who can change it. On Unix the current
 user must own it and other accounts must not have write access. On Windows it reads ownership
 and the access list from the same handle as the content. The owner must be the token user or
 default owner. No other account may write, append, or change ownership or the access list, except
 SYSTEM, Administrators, and OWNER RIGHTS. A missing or unrecognized access list is refused.
 This checks current access; it cannot establish who wrote the content earlier. The check does
 not exclude a process that already has the store open for writing. If a store fails this check,
-Bridge does not use it to approve workspace input.
+TAB does not use it to approve workspace input.
 
-Provider transcripts, credentials, and settings are separate. Deleting Bridge's root does not
+Provider transcripts, credentials, and settings are separate. Deleting TAB's root does not
 delete them or sign you out of the provider.
 
 ## List, close, and remove sessions
@@ -223,7 +223,7 @@ removal. Prune does not close active sessions for you.
 Some transient delivery records are removed as turns settle, so retained history does not include
 every intermediate delivery artifact.
 
-To remove all Bridge records, first close every session in the root you intend to delete. For
+To remove all TAB records, first close every session in the root you intend to delete. For
 the default macOS root, run this only after those closes succeed:
 
 ```sh
@@ -237,7 +237,7 @@ Remove-Item -LiteralPath "$env:USERPROFILE\.agent-bridge\native-sessions" -Recur
 ```
 
 If `HOME` or `AGENT_BRIDGE_NATIVE_STATE_DIR` selects another root, use that exact path instead.
-Remove additional roots separately. Inspect `~/.agent-bridge` for any legacy Bridge data before
+Remove additional roots separately. Inspect `~/.agent-bridge` for any legacy TAB data before
 removing that parent directory; current commands do not read or delete legacy data automatically.
 Provider history needs the provider's own removal procedure. Removing the executable is separate
 from deleting records.

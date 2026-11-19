@@ -9,11 +9,11 @@ Claude's first-run workspace trust and tool permissions, macOS permissions, and 
 | Computer Use refuses access to a terminal app with the message above | Computer Use's app safety policy | You cannot operate the terminal GUI through Computer Use. In a separately authorized shell environment, you can use the CLI diagnostics and `self-test` below. |
 | An actual Codex Auto-review `Denied` result and its reason | Approval review of a specific tool call | Check the exact action, target, and reason. In a supported Codex TUI, `/approve` requests one reconsideration of that denied action; it does not lift Computer Use's terminal app restriction. |
 | macOS asks whether to allow control of another app, or an Apple Events permission error occurs | Automation permission from the calling app to the target app | The user must check the actual calling app and target app pair in System Settings → Privacy & Security → Automation. |
-| Claude shows a workspace trust or tool execution approval screen | Claude's workspace trust and tool policy | Run Claude directly in the workspace you will pass to Bridge, review the prompt, and approve it. Check the rules with `/permissions`. Do not record this as permission to control the entire terminal app. |
+| Claude shows a workspace trust or tool execution approval screen | Claude's workspace trust and tool policy | Run Claude directly in the workspace you will pass to TAB, review the prompt, and approve it. Check the rules with `/permissions`. Do not record this as permission to control the entire terminal app. |
 | A keychain access dialog, `CSSMERR_CSP_OPERATION_AUTH_DENIED`, or a login failure message | A clue to a credential access or authentication problem | The user must check the requesting app and keychain item. Do not conclude from authentication failure alone that there is a keychain problem or that a token was revoked. |
 | Warp Control access fails or creation features are unavailable | Availability of Warp's endpoint, Scripting, and TabConfigs | Check the conditions in [requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts) and the actual error. A Stable or Preview build has no Settings > Scripting page, because Warp's `WarpControlCli` flag is enabled only in its internal builds; there is nothing for the user to turn on there. Approving Claude does not enable Warp features. |
 
-The [official Computer Use documentation](https://learn.chatgpt.com/docs/computer-use), checked on 2026-10-03, restricts bypassing security policies by operating terminal apps. The error above was confirmed again that day when accessing Warp (`dev.warp.Warp-Stable`) and Terminal.app (`com.apple.Terminal`). Do not report this error as merely an “automatic approval review denial.” Do not tell users that Always allow for ordinary apps, Full Access, or Bridge's `--yolo` lifts this restriction. Do not retry the denied app operation through another UI technology.
+The [official Computer Use documentation](https://learn.chatgpt.com/docs/computer-use), checked on 2026-10-03, restricts bypassing security policies by operating terminal apps. The error above was confirmed again that day when accessing Warp (`dev.warp.Warp-Stable`) and Terminal.app (`com.apple.Terminal`). Do not report this error as merely an “automatic approval review denial.” Do not tell users that Always allow for ordinary apps, Full Access, or TAB's `--yolo` lifts this restriction. Do not retry the denied app operation through another UI technology.
 
 The same official documentation distinguishes file edits and shell commands as subject to separate approval and sandbox policies. A Computer Use denial therefore does not require all CLI integration checks to be run manually by the user. An authorized shell tool can check the product's existing CLI/API. If the actual shell call is separately denied, follow that denial's reason; this explanation does not authorize bypassing it.
 
@@ -21,10 +21,10 @@ The same official documentation distinguishes file edits and shell commands as s
 
 ## First use of Claude
 
-1. Open the terminal you intend to use and change to the directory you will specify in Bridge's `--workspace`. Check the actual executable and version with `command -v claude` and `claude --version`, then run `claude`.
+1. Open the terminal you intend to use and change to the directory you will specify in TAB's `--workspace`. Check the actual executable and version with `command -v claude` and `claude --version`, then run `claude`.
 2. Review each login, workspace trust, and tool permission prompt shown. If you are already logged in and trust is valid, you do not need to approve it again. The approval scope follows Claude's settings and workspace. It does not mean “approving each terminal once permanently allows every project.” Distinguish one-time tool permission from saved rules. [Claude permissions documentation](https://code.claude.com/docs/en/permissions)
 3. The user handles a keychain dialog only if one actually appears. Apple's Allow Once permits this access only; Always Allow permits that access in the future as well. Do not record a workspace trust dialog as keychain approval. [Apple explanation](https://support.apple.com/en-euro/guide/keychain-access/kyca1243/mac)
-4. Request a short marker response that needs no tool execution to check that the CLI itself works. This success does not prove Bridge's follow-up delivery, tab creation, or cleanup.
+4. Request a short marker response that needs no tool execution to check that the CLI itself works. This success does not prove TAB's follow-up delivery, tab creation, or cleanup.
 
 Different shell environments in different terminals can select different Claude executables or configuration directories. Different `CLAUDE_CONFIG_DIR` values can also mean different authentication stores, so compare only the paths when needed. You do not need to print or copy authentication files or keychain secrets. [Claude authentication documentation](https://code.claude.com/docs/en/authentication)
 
@@ -34,7 +34,7 @@ Automation permission differs from tool approval inside Claude. The user must ch
 
 `doctor --provider claude --probe --json` checks availability, including the CLI path, version, and workspace. Claude's `--probe` does not call a model or messenger, so it does not prove successful delivery. Read existing requests with `inspect <session> --timeline --json` and `result <session> --request <request-id> --json`. Do not resend the same request while it is pending or delivery is uncertain.
 
-The `self-test` below checks Bridge's actual `ask`, `result`, `tell`, and `close-session` paths without calling Computer Use. Agents can also run it in an authorized shell environment. It makes real model calls and creates and closes a new terminal surface; it is different from a provider check without a visible surface. If an approval dialog appears, the user must review and handle it.
+The `self-test` below checks TAB's actual `ask`, `result`, `tell`, and `close-session` paths without calling Computer Use. Agents can also run it in an authorized shell environment. It makes real model calls and creates and closes a new terminal surface; it is different from a provider check without a visible surface. If an approval dialog appears, the user must review and handle it.
 
 First, record the exact source commit and the SHA-256 of the binary under test. The early candidate `3648cc65abf1d2a76f28ba6e17d78fbabafe25ff` included Warp, WezTerm, and `macos-open-mode` but still printed `0.0.10`. This is a historical candidate; do not infer identical source from the version string alone. For 0.1.0 checks, use the per-candidate hashes in the [focus and startup input verification record](verification/2026-10-03-v0.1.0-focus.md) (Korean). Use the absolute path to the binary under verification without replacing the installed copy.
 
@@ -79,7 +79,7 @@ ab_warp_exit=$?
 printf 'Warp exit=%s; report=%s\n' "$ab_warp_exit" "$ab_report_dir/warp-claude.json"
 ```
 
-`--isolated` separates Bridge state, not provider logins or settings. Settings and consent from the ordinary Bridge state root do not apply, so the checks above use the default `tab-first` policy. Do not report them as verification of a separate `new-window` setting. The timeout is a per-command budget, not a limit on the whole run. On failure, read the JSON, stderr, and actual screen before repeating the same command.
+`--isolated` separates TAB state, not provider logins or settings. Settings and consent from the ordinary TAB state root do not apply, so the checks above use the default `tab-first` policy. Do not report them as verification of a separate `new-window` setting. The timeout is a per-command budget, not a limit on the whole run. On failure, read the JSON, stderr, and actual screen before repeating the same command.
 
 Read the isolated run's records using `state_root` and `session` from the report.
 
@@ -132,11 +132,11 @@ Do not treat the 1.3.1 failure as a verified 1.4.0 limitation or the upstream fi
 ## Automation timeouts
 
 `<terminal> did not answer before the deadline` means that one AppleScript call to the terminal
-ran until Bridge's deadline and was ended there. When the launch recorded no surface handle, the
-session's error also says that no prompt was sent: Bridge has nothing to close, but a tab the
+ran until TAB's deadline and was ended there. When the launch recorded no surface handle, the
+session's error also says that no prompt was sent: TAB has nothing to close, but a tab the
 terminal created anyway may remain, so look at the terminal before launching again. When the
 check finds the screen locked at that moment, the message says so. A new Ghostty surface was never observed to
-become ready while the screen was locked (2026-10-11, Ghostty 1.3.1, measured with Bridge's own
+become ready while the screen was locked (2026-10-11, Ghostty 1.3.1, measured with TAB's own
 scripts: the created tab answered its ids within half a second and then reported that its terminal
 surface model was not available for the whole poll), which is the same symptom as the 2026-10-07
 observation above. Before retrying, record the lock state, whether the terminal application was

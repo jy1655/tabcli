@@ -269,10 +269,10 @@ pub(in crate::native) fn decide(
             }
             ProcessObservation::Gone(_) => Ok(TerminalCloseAuthority::Absent),
             ProcessObservation::Unknown(reason) => {
-                bail!("cannot verify Bridge-created host: {reason}")
+                bail!("cannot verify TAB-created host: {reason}")
             }
             ProcessObservation::Live(crate::native::process_identity::Attested::PidOnly) => {
-                bail!("Bridge-created host requires an incarnation")
+                bail!("TAB-created host requires an incarnation")
             }
         };
     }

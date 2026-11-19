@@ -1,14 +1,14 @@
 # Current Herdr Surface Boundary
 
 - Herdr is a Linux, macOS and Windows surface (`--terminal herdr`, also `hc` and `herdr-core`) in
-  an already running Herdr Core. Bridge speaks newline JSON-RPC 2.0, protocol generation 1, on
+  an already running Herdr Core. TAB speaks newline JSON-RPC 2.0, protocol generation 1, on
   the core's own socket or, on Windows, its named pipe (measured with hc 0.1.21 on macOS and
   Linux, 2026-11-18; on Windows from the hc 0.1.21 source and one Pi run below). It never runs `hc`, whose
   CLI starts a missing core, and never starts, restarts or stops a core. Other platforms refuse
   the kind. The Windows-only rules are at the end of this file.
 - When the core is absent, direct the user to open Herdr from the desktop or start hc outside
   an agent session. Starting it from an agent can contaminate every terminal with that agent's
-  caller markers. Removing markers in Bridge's launch host protects its own children, not
+  caller markers. Removing markers in TAB's launch host protects its own children, not
   unrelated terminals or the core; never repair the core by restarting it as a side effect.
 - The socket is the one `hc` uses (herdr-core `paths.rs`): `HC_SOCKET`, else `socket` in
   `$XDG_CONFIG_HOME/herdr-core/config.toml`, else `<session>.sock` in
@@ -16,11 +16,11 @@
   `HC_SESSION`. An unreadable or unparsable config, an invalid session name, and a relative or
   too long path are refused, never guessed around. The socket must be this user's, in a
   directory others cannot write, served by a process of this user.
-- Every action opens one connection, checks `hello` (generation 1, the six methods Bridge
+- Every action opens one connection, checks `hello` (generation 1, the six methods TAB
   uses and, for an existing handle, the recorded permanent `core.id`) and acts on that same
   connection. A missing or refusing socket or a different core id is unknown, never absence;
   only `not_found` from the recorded core proves a terminal gone (addresses are not reused on
-  a core). Calls pass no `caller`, so Bridge marks nothing seen for another terminal.
+  a core). Calls pass no `caller`, so TAB marks nothing seen for another terminal.
 - `terminal.run` gets argv `[tabcli, native-herdr-host, <session directory>,
   --launch-command, <script>]`, `no_notify`, `keep: false`, `rm: false`, the
   labels `tabcli-session` and a random `tabcli-launch`, and a random local name
@@ -42,11 +42,11 @@
   than those herdr-core gives before the terminal exists (`invalid_params`, `name_taken`,
   `spawn_failed` and the other kinds in the adapter). herdr-core 0.1.21 can answer
   `unavailable` or `internal` after creating the terminal, when saving its registry times out
-  or fails. Bridge never runs it again: it reads the launch's name on the same core (a name
+  or fails. TAB never runs it again: it reads the launch's name on the same core (a name
   resolves locally, to the live terminal holding it or else the latest finished one) and
   removes that terminal only when its address, argv, label and name are all the launch's.
   `terminal.list` is not used, because hc's list also asks every configured remote machine.
-  Bridge retains the handle when the identity is complete but removal failed, and otherwise
+  TAB retains the handle when the identity is complete but removal failed, and otherwise
   reports the name and that nothing starts without a binding.
   If saving the binding for a confirmed terminal fails and removal also fails, the adapter
   returns that same confirmed handle to the launcher. The launcher uses the current Claim
@@ -61,7 +61,7 @@
   the recorded birth. A terminal set to keep (`hc keep`) can run a replacement program and
   is refused until keep is off. For a temporary pane, the user can adopt the terminal with
   `herdr-app do terminal.keep` and release it with `terminal.park`, which disables core keep.
-  Bridge never adds a space label or changes keep to counter the app. If the pane ends
+  TAB never adds a space label or changes keep to counter the app. If the pane ends
   with keep still set, hc 0.1.21 only lets a user change keep on a live terminal. Document
   manual removal of the verified finished address on the recorded core before retrying
   explicit close. A remote address (`machine/t7`) is never accepted.
@@ -88,8 +88,8 @@
   launch label to agree with the terminal's generated name. A failed read or removal keeps
   the handle for retry. The same rule for rechecking identity applies when a launch removes a
   terminal it created but could not use. The core has no conditional kill or remove, so
-  another client of the same user can still change the terminal between Bridge's last read
-  and its action; Bridge does not claim more. hc does not sweep detached processes. Bridge
+  another client of the same user can still change the terminal between TAB's last read
+  and its action; TAB does not claim more. hc does not sweep detached processes. TAB
   touches no other terminal and calls no core operation.
 - An explicit `--terminal` wins. Otherwise `HC_TERMINAL_ID` with `TERM_PROGRAM=ghostty` (the
   identity hc gives every program) selects Herdr, on Windows only for a provider whose adapter
@@ -111,10 +111,10 @@
   else `\\.\pipe\herdr-core-<user>-<session>.sock`, where `<user>` keeps only the ASCII letters
   and digits of `USERNAME`. Only a local pipe (`\\.\pipe\<name>`, at most 256 characters) is
   accepted: another machine's pipe, a file or a socket path is refused. Where hc falls back to
-  `C:\` for a missing profile, Bridge refuses rather than read a configuration from there.
+  `C:\` for a missing profile, TAB refuses rather than read a configuration from there.
 - hc serves the pipe to SYSTEM and its own user only, rejects remote clients and labels it
-  with its integrity level; its own client checks no server. Bridge connects as hc does
-  (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, so a server cannot act as Bridge's user),
+  with its integrity level; its own client checks no server. TAB connects as hc does
+  (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, so a server cannot act as TAB's user),
   then requires the client end of a byte pipe whose server process (`GetNamedPipeServerProcessId`)
   has this user's SID in its token, the Windows counterpart of `SO_PEERCRED`. A missing pipe is
   a missing core; a pipe refusing access is an elevated or foreign core and is refused with that

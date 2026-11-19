@@ -1,6 +1,6 @@
 # Trust Store Boundary
 
-- A provider trust store, and a Bridge consent record, is evidence only when nobody but
+- A provider trust store, and a TAB consent record, is evidence only when nobody but
   the user can change it. On Unix that is the owner and the mode. On Windows it is the
   owner and the access list, both read from the handle that the content is read from: the
   owner must be the token's user or the token's default owner (the Administrators group
@@ -10,7 +10,7 @@
   rule that is neither a plain allow nor a plain deny are refused.
 - The check describes the store at the time of the read. It cannot tell who wrote the
   content earlier, and it does not exclude a writer that has the store open. Do not open
-  a provider store without write sharing to change that: Bridge polls Agy's store every
+  a provider store without write sharing to change that: TAB polls Agy's store every
   100 ms while Agy saves an approved decision, and a provider's own write would fail.
 - The gate that withholds an initial paste on native Windows asks another question than
   workspace consent: not whether the user approved this exact workspace, but whether the

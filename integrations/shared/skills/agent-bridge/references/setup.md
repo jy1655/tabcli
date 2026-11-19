@@ -5,7 +5,7 @@
 The integration contains instructions, not an engine, daemon, provider binary, credentials,
 or permission override. The **invoking host** must load this skill and permit shell execution
 and reading/writing its task prompt files. Its sandbox must allow the local terminal processes
-and Bridge state needed for the delegation. Respect the host's permission request or refusal;
+and TAB state needed for the delegation. Respect the host's permission request or refusal;
 do not change its global settings to make a command work.
 
 The **target provider** is the CLI selected in `ask`. Install and sign in to just that CLI.
@@ -19,7 +19,7 @@ the documentation's `v<installed-version>` Git tag when checking a release-speci
 The probe checks local capabilities; success does not establish authentication, trust,
 successful delivery, or completed work.
 
-Agent Bridge supports macOS, native Windows, and Linux through a running local Herdr Core
+TAB supports macOS, native Windows, and Linux through a running local Herdr Core
 or tmux 3.2 or later on an absolute `PATH` entry. Linux opens no GUI. Use the returned
 `attach_command` to let the user watch or type in the created terminal; do not
 type into it on the user's behalf. A Linux process inside WSL is not verified.
@@ -43,17 +43,17 @@ An older version or a missing required command needs an upgrade before this work
 Plugin and engine versions do not need to match. If a newer CLI changes a command, consult
 its `--help` rather than assuming the old invocation still works.
 
-Bridge resolves target executables from absolute PATH entries. A shell alias or function that
+TAB resolves target executables from absolute PATH entries. A shell alias or function that
 can run `codex` is not an installed executable on PATH, and an earlier obsolete launcher can
 shadow the current CLI. Use `doctor --provider PROVIDER --probe --json` to see the executable
-and version Bridge actually selects before changing setup. Correct only the intended PATH
+and version TAB actually selects before changing setup. Correct only the intended PATH
 entry; putting a directory of old launchers first can change other providers too.
 
 Upgrade through the CLI installation method the user chose, after accounting for open
 sessions. An open session's hooks and helpers can retain an absolute executable path. Keep
 that binary available, do not downgrade the binary used by an open session, and do not remove
 old release directories that those sessions still use. Installing/updating this integration
-does not install/update `tabcli` or change Bridge settings, consent, or session records.
+does not install/update `tabcli` or change TAB settings, consent, or session records.
 
 If the provider is missing or too old, report the selected provider's doctor finding and its
 installation link from the provider guide. Do not require the other three target CLIs.
@@ -64,7 +64,7 @@ request, copy, or print credentials as part of a prompt.
 
 Use an existing project directory. A trust refusal does not authorize accepting the dialog:
 the user must approve that exact workspace through the provider's own UI if they trust it.
-Bridge can reuse verified existing consent using its provider-specific gates. Do not edit
+TAB can reuse verified existing consent using its provider-specific gates. Do not edit
 trust stores, simulate approval, or add bypass flags to defeat a refusal. Once a failed
 initial launch is conclusively not sent, close that task-owned session before a deliberate
 new launch after the actual setup problem is fixed.

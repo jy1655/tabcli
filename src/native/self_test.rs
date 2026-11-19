@@ -441,7 +441,7 @@ fn orchestrate(
         steps: Vec::new(),
         cleanup_sessions: Vec::new(),
     };
-    let title = format!("Agent Bridge self-test {}", report.marker);
+    let title = format!("TAB self-test {}", report.marker);
     let mut args = arguments(&["ask", ask.provider.as_str(), "--workspace"]);
     args.push(ask.workspace.to_string_lossy().into_owned());
     args.extend(arguments(&[

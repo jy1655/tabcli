@@ -98,7 +98,7 @@ fn notify_payload_evidence(
     })
 }
 
-const NOTIFY_PAYLOAD_DETAIL: &str = "This request may still depend on notify (no binding observed or lifecycle hooks were not recorded as injected). Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can be larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the payload, so text with many quotation marks is undercounted. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
+const NOTIFY_PAYLOAD_DETAIL: &str = "This request may still depend on notify (no binding observed or lifecycle hooks were not recorded as injected). Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can be larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the payload, so text with many quotation marks is undercounted. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach TAB, and one near the limit that a long answer will.";
 const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending while the session is working after a long turn, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl) and close-session the session; never resend an uncertain turn. Otherwise keep delivered prompts and requested answers short on native Windows: put long material in workspace files and ask for a file-based report.";
 
 fn notify_payload_check(directory: Option<&Path>) -> crate::native::diagnostics::Check {
@@ -330,7 +330,7 @@ pub(super) fn diagnose_codex(
         Unavailable,
         Reason::CODEX_ACTIVE_TERMINAL_THREAD_UNVERIFIED,
         "A managed terminal and recorded result do not identify the thread currently selected in the Codex TUI. Unaddressed terminal follow-up is refused before input.",
-        "Use the thread-addressed native queue; inspect the queue version, thread and actual queue error. The daemon check is advisory; Agent Bridge does not start or restart the shared daemon.",
+        "Use the thread-addressed native queue; inspect the queue version, thread and actual queue error. The daemon check is advisory; TAB does not start or restart the shared daemon.",
     ));
     checks.push(Check::new(CheckId::CODEX_MCP,
         Unknown,

@@ -60,7 +60,7 @@ def records(path):
 
 
 def read_core_record(path):
-    """A Bridge session record under Bridge's core read policy: None when it is missing; a
+    """A TAB session record under TAB's core read policy: None when it is missing; a
     link, dangling or not, or any other entry that is not a regular file is refused; the
     text is decoded as strict UTF-8 with read_text()'s universal newlines."""
     try:
@@ -210,13 +210,13 @@ def verify_turn(bridge, output, session, request, ordinal, expected, timeout, en
         output, f"result-{ordinal}", environment, timeout=40,
     )
     if code or result.get("request_state") != "completed":
-        raise RuntimeError("The exact Bridge request did not complete")
+        raise RuntimeError("The exact TAB request did not complete")
     if result.get("provider_session_id") != official.get("conversation"):
         raise RuntimeError("The provider conversation does not match")
     actual = result.get("result")
-    print(f"{'ask' if ordinal == 1 else 'tell'}: provider=PROBE-FINAL bridge={actual}", flush=True)
+    print(f"{'ask' if ordinal == 1 else 'tell'}: provider=PROBE-FINAL TAB={actual}", flush=True)
     if actual != expected:
-        raise RuntimeError(f"Expected Bridge {expected}, got {actual!r}")
+        raise RuntimeError(f"Expected TAB {expected}, got {actual!r}")
 
 
 def main():

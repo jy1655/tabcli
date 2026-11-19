@@ -232,12 +232,12 @@ fn receipt_decoder_validates_and_binds_the_token() {
     rows.push((
         "token mismatch",
         field(RECEIPT, "claim_token", "4-5-6".into()),
-        Rule("Bridge request receipt belongs to a different claim"),
+        Rule("TAB request receipt belongs to a different claim"),
     ));
     rows.push((
         "invalid receipt",
         field(RECEIPT, "request_id", "not-a-request".into()),
-        Rule("invalid Bridge request receipt"),
+        Rule("invalid TAB request receipt"),
     ));
     rows.push((
         "missing time stays readable",

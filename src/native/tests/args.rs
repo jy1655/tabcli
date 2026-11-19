@@ -672,7 +672,7 @@ fn host_parser_errors_preserve_validation_precedence() {
                 "bad-input",
                 "bad-timeout",
             ],
-            "invalid Agent Bridge session id: \"bad-id\"",
+            "invalid TAB session id: \"bad-id\"",
         ),
         (
             vec![
@@ -733,7 +733,7 @@ fn host_parser_errors_preserve_validation_precedence() {
         );
         assert_eq!(
             error(&[name, "bad-id"]),
-            "invalid Agent Bridge session id: \"bad-id\""
+            "invalid TAB session id: \"bad-id\""
         );
         assert_eq!(
             error(&[name, "session-route"]),
@@ -750,7 +750,7 @@ fn host_parser_errors_preserve_validation_precedence() {
     );
     assert_eq!(
         error(&["native-warp-host", "bad-id", "bad"]),
-        "invalid Agent Bridge session id: \"bad-id\""
+        "invalid TAB session id: \"bad-id\""
     );
     assert_eq!(
         error(&["native-warp-host", "session-route", "bad"]),

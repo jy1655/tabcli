@@ -38,14 +38,14 @@ fn bridge_shell_command_quotes_the_workspace_and_executable() {
     let command = bridge_shell_command(
         Path::new("/tmp/project; touch nope"),
         Path::new("/tmp/state root"),
-        Path::new("/tmp/Agent Bridge/bin"),
+        Path::new("/tmp/TAB tools/bin"),
         "session-safe123",
     )
     .unwrap();
     #[cfg(unix)]
-    assert!(command.contains("cd '/tmp/project; touch nope' && AGENT_BRIDGE_LAUNCH_STDERR_FD=3 AGENT_BRIDGE_LAUNCH_STDOUT_FD=4 AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'"));
+    assert!(command.contains("cd '/tmp/project; touch nope' && AGENT_BRIDGE_LAUNCH_STDERR_FD=3 AGENT_BRIDGE_LAUNCH_STDOUT_FD=4 AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/TAB tools/bin' native-session 'session-safe123'"));
     #[cfg(windows)]
-    assert!(command.contains("Set-Location -LiteralPath '/tmp/project; touch nope' -ErrorAction Stop; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'"));
+    assert!(command.contains("Set-Location -LiteralPath '/tmp/project; touch nope' -ErrorAction Stop; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/TAB tools/bin' native-session 'session-safe123'"));
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn session_metadata_titles_drop_control_characters_and_are_bounded() {
 }
 
 // The wrapper runs exactly the adapter's plan: its complete argument list, in the
-// workspace, with the adapter's environment removals applied and Bridge's session
+// workspace, with the adapter's environment removals applied and TAB's session
 // variables set. Claude's removal list is non-empty, so a dropped list is observable; an
 // inherited CLAUDE_CODE_CHILD_SESSION is the marker that would stop the managed session
 // from registering its inbox (issue #42), and the Codex caller markers of a Codex tool

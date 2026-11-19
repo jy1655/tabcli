@@ -7,7 +7,7 @@ mod native;
 
 fn legacy_removal_message() -> String {
     format!(
-        "the embedded multi-PTY TUI was removed in agent-bridge 0.0.1; use `{PUBLIC_COMMAND} ask`, `{PUBLIC_COMMAND} tell`, `{PUBLIC_COMMAND} sessions`, `{PUBLIC_COMMAND} status`, `{PUBLIC_COMMAND} prune-sessions`, or `{PUBLIC_COMMAND} close-session`"
+        "the embedded multi-PTY TUI was removed in 0.0.1; use `{PUBLIC_COMMAND} ask`, `{PUBLIC_COMMAND} tell`, `{PUBLIC_COMMAND} sessions`, `{PUBLIC_COMMAND} status`, `{PUBLIC_COMMAND} prune-sessions`, or `{PUBLIC_COMMAND} close-session`"
     )
 }
 
@@ -24,7 +24,7 @@ enum Launch {
 
 fn help_text() -> String {
     format!(
-        "{PUBLIC_COMMAND} {}: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
+        "{PUBLIC_COMMAND} {}: TAB: visible terminal sessions for coding agent CLIs
 
 Usage:
 {usage}  {PUBLIC_COMMAND} --help | --version
@@ -32,7 +32,7 @@ Usage:
 Runtime:
   macOS detects Ghostty, Herdr, iTerm2, Terminal.app, Warp, or WezTerm from the invoking
   environment and opens a real surface for Codex, Claude, Agy, or Pi. Herdr needs a
-  running Herdr Core, which Bridge never starts or restarts. The macOS default is
+  running Herdr Core, which TAB never starts or restarts. The macOS default is
   tab-first: create a new tab in a supported existing local window, with a new
   window only when a safe tab target or creation API is unavailable.
   settings macos-open-mode new-window always requests a new window;
@@ -48,15 +48,15 @@ Runtime:
   Its control API cannot submit terminal input, so follow-ups without a
   provider-native input path are unsupported.
   Windows opens a managed PowerShell 7
-  console from either PowerShell or cmd: a tab of the Agent Bridge window of
-  Windows Terminal or, when no tab can be created, a console window of its own.
+  console from either PowerShell or cmd: a tab in a dedicated Windows Terminal window
+  or, when no tab can be created, a console window of its own.
   settings windows-tab-window current opens the tab in the most recently used
   Windows Terminal window instead, where the new tab takes the keyboard inside
   that window; dedicated, the default, leaves the windows you work in alone.
   Inside an hc terminal Windows selects Herdr, except for Codex, which Herdr cannot run.
   Linux detects Herdr inside an hc terminal and otherwise defaults to tmux 3.2 or later.
   Use --terminal herdr for a running local Herdr Core or --terminal tmux for a private server.
-  Agent Bridge controls only sessions that it launched.
+  TAB controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
   ask, reopen, and self-test refuse a workspace that is the Codex memory
   workspace or lies inside it, before any session record or terminal exists:
@@ -116,7 +116,7 @@ Session policy:
   reopen continues a closed session's provider conversation in a new session with a
   new id, terminal, and private settings, launched through the provider's official
   resume. This release supports only Claude Code on native Windows: its conversation
-  UUID is recorded in every Bridge event and its live-session registry proves
+  UUID is recorded in every TAB event and its live-session registry proves
   ownership by pid and process start time. Codex is refused until its thread
   writer-lock and queue gates exist; Agy and Pi are refused because they expose no
   verifiable ownership evidence. Reopen refuses a source that is not closed, has no
@@ -161,10 +161,10 @@ Session policy:
   foreign claude --resume can still register between two checks and interleave until
   the next one. doctor reports the other live holders of a reopened session's
   conversation, and on the source session it reports the marker and, for a retained
-  marker, why it is retained. doctor never releases a marker. Bridge forwards only an
+  marker, why it is retained. doctor never releases a marker. TAB forwards only an
   explicit --model, --effort, or --yolo and copies nothing from the source manifest.
   The effective model, permission mode, and effort are Claude's own decision from the
-  resumed session, its settings files, and its environment, which Bridge neither reads
+  resumed session, its settings files, and its environment, which TAB neither reads
   nor overrides. Per Claude's documented resume rules, the previous model is restored
   unless a --model flag or an ANTHROPIC_MODEL-family environment variable picks one at
   launch or the model is unavailable. A terminal claude --resume <session-id> restores
@@ -182,12 +182,12 @@ Session policy:
   admits one reopen. inspect and sessions --json report resumed_from for the new
   session.
 
-  hold refuses follow-ups whose delivery Bridge has not yet allowed to start.
+  hold refuses follow-ups whose delivery TAB has not yet allowed to start.
   --release lifts the hold; the current turn, initial prompt and direct surface
   input are unaffected. inspect/status report held as true, false or null when
   unreadable; doctor includes a separate hold check. Closed holds are preserved.
 
-  result reports bridge_observed_elapsed_ms from Bridge receipt creation to the
+  result reports bridge_observed_elapsed_ms from TAB receipt creation to the
   published completion event, not model or billing time. Uncomputable values are
   null with bridge_observed_elapsed_reason. inspect and finished ask/tell JSON
   report the same per-request measurement. Token usage is recorded only from a
@@ -565,7 +565,7 @@ mod tests {
             (vec!["screen"], "screen requires one session id"),
             (
                 vec!["screen", "--json"],
-                "invalid Agent Bridge session id: \"--json\"",
+                "invalid TAB session id: \"--json\"",
             ),
             (
                 vec!["screen", "session-route", "--bad"],
@@ -596,7 +596,7 @@ mod tests {
             ),
             (
                 vec!["wait", "broken"],
-                "invalid wait address \"broken\"; expected SESSION/REQUEST with a Bridge request id",
+                "invalid wait address \"broken\"; expected SESSION/REQUEST with a TAB request id",
             ),
         ] {
             assert_eq!(parse(&args).unwrap_err().to_string(), expected);
@@ -649,7 +649,7 @@ mod tests {
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, Herdr, iTerm2, Terminal.app, Warp, or WezTerm",
-            "Herdr needs a\n  running Herdr Core, which Bridge never starts or restarts",
+            "Herdr needs a\n  running Herdr Core, which TAB never starts or restarts",
             "tab-first: create a new tab in a supported existing local window",
             "settings macos-open-mode new-window always requests a new window",
             "settings macos-open-mode tab-first restores the default",
@@ -657,7 +657,7 @@ mod tests {
             "Use --terminal to override",
             "unknown host falls back to Terminal.app",
             "Windows opens a managed PowerShell 7\n  console from either PowerShell or cmd",
-            "a tab of the Agent Bridge window of\n  Windows Terminal",
+            "a tab in a dedicated Windows Terminal window",
             "when no tab can be created, a console window of its own",
             "settings [windows-tab-window <dedicated|current>] [--json]",
             "settings macos-open-mode <tab-first|new-window> [--json]",

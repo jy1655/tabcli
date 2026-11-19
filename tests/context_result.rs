@@ -433,7 +433,7 @@ fn a_source_the_receipt_would_reject_fails_resolution_before_ask_creates_anythin
         text.contains(&address)
             && text.contains("request_state is unreadable")
             && text.contains("invalid recorded provenance")
-            && !text.contains("invalid Bridge request receipt"),
+            && !text.contains("invalid TAB request receipt"),
         "{text}"
     );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();

@@ -25,8 +25,8 @@ pub(super) fn check(context: &Context<'_>) -> Check {
             Check::new(CheckId::CODEX_HOOK_TRUST,
                 if trusted { Availability::Available } else { Availability::Unavailable },
                 if trusted { Reason::CODEX_HOOK_TRUST_OBSERVED } else { Reason::CODEX_HOOK_TRUST_ATTENTION },
-                "Current installed Codex hooks/list probe with this Bridge executable's proposed override; not an observation of hook execution or this session's effective configuration.",
-                "Inspect trustStatus and hash_matches; normalization drift means currentHash differs. Bridge never answers the hook-review picker.")
+                "Current installed Codex hooks/list probe with this TAB executable's proposed override; not an observation of hook execution or this session's effective configuration.",
+                "Inspect trustStatus and hash_matches; normalization drift means currentHash differs. TAB never answers the hook-review picker.")
                 .evidence(evidence)
         }
         Err(error) => Check::new(CheckId::CODEX_HOOK_TRUST, Availability::Unavailable,
@@ -193,7 +193,7 @@ fn summarize(result: &Value, bridge: &Path, notice: bool) -> Result<Value> {
             }
         }
         if matches.len() != 1 {
-            bail!("Bridge hook key missing or ambiguous: {key}");
+            bail!("TAB hook key missing or ambiguous: {key}");
         }
         let hook = matches[0];
         let hash = hook["currentHash"]

@@ -297,7 +297,7 @@ if (scenario.startsWith("questions")) {
     const wires = from => calls.slice(from).map(call => JSON.parse(call.stdin));
     function refused(result) {
       assert.deepEqual(Object.keys(result), ["deny"]);
-      assert.match(result.deny, /^Agent Bridge managed session: no person is at this question dialog/);
+      assert.match(result.deny, /^TAB managed session: no person is at this question dialog/);
       assert.match(result.deny, /Do not call AskUserQuestion again in this turn\./);
       assert.match(result.deny, /QUESTION FOR CALLER: <question> Options: <option labels>\./);
       assert.match(result.deny, /follow-up message/);
@@ -323,7 +323,7 @@ if (scenario.startsWith("questions")) {
         assert.equal(await toolCall(unrefused), "dialog", JSON.stringify(unrefused));
       }
       refused(await toolCall({ id: "toolu-question-5" }));
-      // A hook above Bridge can dispatch the same call again: same refusal, recorded once.
+      // A hook above TAB can dispatch the same call again: same refusal, recorded once.
       refused(await toolCall({ id: "toolu-question-5" }));
       assert.equal(calls.length, from);
     } });
@@ -371,7 +371,7 @@ if (scenario.startsWith("questions")) {
     failDeflected = false;
     assert.deepEqual(wires(from).map(wire => wire.event), ["question.deflected", "question.deflected"]);
     assert.deepEqual(logs.slice(logged),
-      ["Agent Bridge could not record this question deflection; the question call was still refused."]);
+      ["TAB could not record this question deflection; the question call was still refused."]);
     // The record keeps items in step order, so this case follows step 9.
     // A repeated step asks another question at the same position and that call is refused: the
     // wire names the refused questions, so the first question retained there gets no flag.

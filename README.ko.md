@@ -1,11 +1,11 @@
-# Terminal Agent Bridge (TAB)
+# TAB
 
 [English](README.md) · 한국어 README는 영어 README를 따르며, 내용이 다르면 영어 README를 기준으로 합니다.
 
 `tabcli`로 이미 설치하고 로그인한 Codex, Claude Code, Agy, Pi를 지켜볼 수 있는 터미널 탭, 창 또는 tmux pane에서 실행합니다. 결과를 읽고 같은 대화에 후속 요청을 보낸 뒤, 작업을 마치면 세션을 명시적으로 닫습니다. TAB은 macOS, Windows에서 직접 실행하는 환경과 tmux 또는 Herdr Core를 통한 Linux 실행을 지원합니다. WSL 안의 Linux 프로세스는 미검증이며 Warp 지원은 제한적입니다.
 
 전역 에이전트 지침을 직접 작성하지 않고 위임하려면 Claude Code, Codex, Agy, Pi용
-[에이전트 브리지 플러그인](#에이전트-플러그인-설치)을 설치하세요. 네 패키지는 동일한
+[TAB 플러그인](#에이전트-플러그인-설치)을 설치하세요. 네 패키지는 동일한
 워크플로 스킬을 포함하며 이미 설치한 `tabcli`를 사용합니다.
 
 ## 세션 실행해 보기
@@ -89,12 +89,12 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 | Agy (`agy`) | 1.1.12 |
 | Pi (`pi`) | 0.84.1 |
 
-Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. macOS, Linux, Windows의 새 Claude 실행 및 Windows 재열기에는 안정 버전 2.1.302 이상과 실제 준비 신호를 보낸 Bridge 완료 모듈이 필요합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
+Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. macOS, Linux, Windows의 새 Claude 실행 및 Windows 재열기에는 안정 버전 2.1.302 이상과 실제 준비 신호를 보낸 TAB 완료 모듈이 필요합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
 - [2026-10-28 Ghostty 1.4.0, 배포된 0.4.29](docs/verification/2026-10-28-macos-104-ghostty-1.4.0.md):
   잠금 해제 상태의 Codex cold/warm 시작, 네 CLI의 요청·후속 요청·종료와 다른 탭·분할 화면 보존을 확인했습니다.
   기존 신뢰·승인과 명시적 `--yolo`를 사용했습니다. 1.4.0의 잠금 화면 동작은 미검증입니다.
-- [2026-10-22 Windows, Claude 네이티브 완료 재검증](docs/verification/2026-10-22-windows-260-reverification.md): `fa50fb8`의 첫 재검증은 백그라운드 이어짐 사례에서 실패했습니다. 수정한 `49bb9d1` 실행 파일은 Claude Code 2.1.308에서 백그라운드 `ask`와 `tell`의 표식 없는 중간 답을 후보로만 두고, 표식이 붙은 최종 답을 원래 Bridge id로 게시했습니다. 표식 없는 실제 최종 답은 호출자 제한 시간이 지난 뒤에도 대기 상태로 남았습니다. 이 검증은 표식 프로토콜을 확인한 것이며 provider가 보장하는 부모 관계를 확인한 것은 아닙니다.
+- [2026-10-22 Windows, Claude 네이티브 완료 재검증](docs/verification/2026-10-22-windows-260-reverification.md): `fa50fb8`의 첫 재검증은 백그라운드 이어짐 사례에서 실패했습니다. 수정한 `49bb9d1` 실행 파일은 Claude Code 2.1.308에서 백그라운드 `ask`와 `tell`의 표식 없는 중간 답을 후보로만 두고, 표식이 붙은 최종 답을 원래 TAB id로 게시했습니다. 표식 없는 실제 최종 답은 호출자 제한 시간이 지난 뒤에도 대기 상태로 남았습니다. 이 검증은 표식 프로토콜을 확인한 것이며 provider가 보장하는 부모 관계를 확인한 것은 아닙니다.
 - [2026-10-19 Windows, Claude 네이티브 완료 소유자 확인](docs/verification/2026-10-19-windows-249-claude-native-completion.md): `ask`와 `tell`은 차단된 Stop 초안을 게시하지 않고 이후 최종 답을 게시했으며, 보호 태그 인용도 확인했습니다. 훅을 끄면 준비 신호가 나오지 않았습니다. 표식 누락 결과는 2026-10-22 수정으로 대체되었습니다. 지금은 표식 없는 바인딩 답을 게시하지 않고 후보로 보관합니다.
 - [2026-10-15 macOS, 배포된 0.4.9](docs/verification/2026-10-15-macos-0.4.9.md): 배포 후 iTerm2에서 네 provider의 self-test를 모두 확인했습니다. Codex·Claude는 기본값, Pi는 명시한 모델, Agy는 `--yolo`를 사용했습니다. 별도 Ghostty 검사는 설치된 실행 파일과 이미 실행 중인 앱을 사용했습니다.
 - [2026-10-07 Windows, 0.2.6](docs/verification/2026-10-07-windows-0.2.6.md): 기본 권한 모드에서 Codex·Claude·Pi의 두 요청과 종료를 확인했습니다. Agy는 도구 승인 대기가 기록된 상태로 초기 결과 제한 시간을 넘겼으며 세션은 종료했습니다.
@@ -113,24 +113,24 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`, glibc 2.39 이상(Ubuntu 24.04 이상)의 x86_64 Linux는 `tabcli-<version>-x86_64-unknown-linux-gnu.tar.gz`를 사용합니다.
 
-0.4.47 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
+0.4.48 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
 ```sh
-shasum -a 256 -c tabcli-0.4.47-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.47-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.48-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.48-aarch64-apple-darwin.tar.gz
 ```
 
 Linux에서도 같은 방식으로 진행합니다.
 
 ```sh
-sha256sum -c tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf tabcli-0.4.47-x86_64-unknown-linux-gnu.tar.gz
+sha256sum -c tabcli-0.4.48-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf tabcli-0.4.48-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Windows에서는 PowerShell에서 실행합니다.
 
 ```powershell
-$archive = "tabcli-0.4.47-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.48-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -142,7 +142,7 @@ Expand-Archive $archive -DestinationPath .\tabcli
 소스에서 설치하려면 Rust 1.97.1 이상과 Cargo가 필요합니다.
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.47 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.48 --locked
 ```
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.
@@ -217,19 +217,19 @@ tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait
 
 ## 사용 전에 알아둘 경계
 
-Bridge는 모델 클라이언트나 샌드박스가 아닙니다. 직접 실행하지 않은 세션에는 연결하지 못합니다. Bridge가 운영하는 서버는 없습니다. 각 CLI가 설정된 서비스에 기존 계정으로 모델 요청을 보냅니다.
+TAB은 모델 클라이언트나 샌드박스가 아닙니다. 직접 실행하지 않은 세션에는 연결하지 못합니다. TAB이 운영하는 서버는 없습니다. 각 CLI가 설정된 서비스에 기존 계정으로 모델 요청을 보냅니다.
 
-**Bridge가 실행한 Claude 세션은 같은 계정의 다른 Claude 세션에서 오는 세션 간 메시지를 받습니다. `--yolo`로 실행했다면 다른 세션에서 받은 작업도 Claude의 권한 검사 없이 실행됩니다.** 같은 계정의 다른 Claude 세션을 통제하지 못한다면 이 조합을 쓰지 않습니다. [Claude 외부 메시지 수신](docs/security-and-data.md#claude-inbound-messages)을 확인합니다.
+**TAB이 실행한 Claude 세션은 같은 계정의 다른 Claude 세션에서 오는 세션 간 메시지를 받습니다. `--yolo`로 실행했다면 다른 세션에서 받은 작업도 Claude의 권한 검사 없이 실행됩니다.** 같은 계정의 다른 Claude 세션을 통제하지 못한다면 이 조합을 쓰지 않습니다. [Claude 외부 메시지 수신](docs/security-and-data.md#claude-inbound-messages)을 확인합니다.
 
-`--yolo`는 CLI 자체의 우회 옵션을 전달하며 Bridge는 별도 샌드박스를 추가하지 않습니다. Pi의 `--approve`는 프로젝트 승인만 처리하고 기본 도구 정책은 유지합니다. 기존 CLI 설정도 그대로 적용됩니다. [권한 모드](docs/security-and-data.md#permission-modes)를 참고합니다.
+`--yolo`는 CLI 자체의 우회 옵션을 전달하며 TAB은 별도 샌드박스를 추가하지 않습니다. Pi의 `--approve`는 프로젝트 승인만 처리하고 기본 도구 정책은 유지합니다. 기존 CLI 설정도 그대로 적용됩니다. [권한 모드](docs/security-and-data.md#permission-modes)를 참고합니다.
 
-작업 디렉터리 신뢰는 에이전트 CLI가 관리합니다. Bridge는 정확히 같은 디렉터리에 대해 검증된 기존 동의를 재사용하며, 새 신뢰를 부여하지 않습니다. 신뢰 대화상자 때문에 진행이 멈추면 관리 중인 터미널 화면에서 내용을 확인합니다. [작업 디렉터리 신뢰와 동의](docs/security-and-data.md#workspace-trust-and-consent)에 조건을 정리했습니다.
+작업 디렉터리 신뢰는 에이전트 CLI가 관리합니다. TAB은 정확히 같은 디렉터리에 대해 검증된 기존 동의를 재사용하며, 새 신뢰를 부여하지 않습니다. 신뢰 대화상자 때문에 진행이 멈추면 관리 중인 터미널 화면에서 내용을 확인합니다. [작업 디렉터리 신뢰와 동의](docs/security-and-data.md#workspace-trust-and-consent)에 조건을 정리했습니다.
 
 전달 결과가 불확실한 요청은 재전송하지 않습니다. 원래 요청을 조회하고 기다리거나 세션을 명시적으로 닫습니다. 같은 프롬프트를 다시 보내면 작업이 중복될 위험이 있습니다. [전달과 신뢰의 경계](docs/security-and-data.md#workspace-trust-and-consent)를 따릅니다.
 
 세션 기록에는 결과와 보관된 프롬프트 본문이 들어 있으며, `~/.agent-bridge/native-sessions` 아래에 암호화하지 않은 상태로 저장합니다. 세션을 닫아도 기록은 남지만 일부 임시 전달 파일은 그 전에 지웁니다. Windows의 홈 디렉터리는 `HOME`, `USERPROFILE` 순으로 정하며, `AGENT_BRIDGE_NATIVE_STATE_DIR`로 저장 위치를 바꿉니다. 기록을 공유하기 전에 내용을 검토합니다. [로컬 기록](docs/security-and-data.md#local-records)을 참고합니다.
 
-설치를 제거하려면 세션을 닫고 [세션 종료와 Bridge 데이터 삭제](docs/security-and-data.md#list-close-and-remove-sessions)에 따라 기록을 지운 뒤, 다운로드한 실행 파일을 삭제하거나 Cargo로 설치했다면 `cargo uninstall tabcli`를 실행합니다. 에이전트 CLI의 대화 기록과 자격증명은 별도로 관리됩니다.
+설치를 제거하려면 세션을 닫고 [세션 종료와 TAB 데이터 삭제](docs/security-and-data.md#list-close-and-remove-sessions)에 따라 기록을 지운 뒤, 다운로드한 실행 파일을 삭제하거나 Cargo로 설치했다면 `cargo uninstall tabcli`를 실행합니다. 에이전트 CLI의 대화 기록과 자격증명은 별도로 관리됩니다.
 
 ## `agent-bridge` 0.1.x에서 업그레이드
 

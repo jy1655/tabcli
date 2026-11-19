@@ -261,7 +261,7 @@ fn creation_starts_one_detached_server_with_a_direct_host_program_and_proves_it(
             format!("{socket} list-panes -a -F {PANE_FORMAT}"),
         ]
     );
-    // Claude lists the tmux session next to the Bridge session name; a session id here
+    // Claude lists the tmux session next to the TAB session name; a session id here
     // would list the recipient twice.
     assert!(!host.commands()[2].contains("-s session-tmuxtest"));
     assert!(host.server.log.borrow().is_empty());
@@ -761,7 +761,7 @@ fn the_adapter_creates_through_the_shared_bind_and_cleans_up_a_failed_bind() {
     assert_eq!(*adapter.host.server.log.borrow(), ["terminate"]);
 }
 
-// The installed tmux, with a pane program that echoes its input instead of this Bridge's
+// The installed tmux, with a pane program that echoes its input instead of this TAB's
 // host: creation, proof, paste, screen and end run against a real server.
 struct RealTmux(PathBuf);
 impl Host for RealTmux {

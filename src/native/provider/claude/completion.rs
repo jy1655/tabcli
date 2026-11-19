@@ -72,7 +72,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     std::fs::create_dir_all(plugin.join(".claude-plugin"))?;
     std::fs::create_dir_all(plugin.join("hooks"))?;
     store.private("claude-mod/.claude-plugin/plugin.json").write_json(&json!({
-        "name":"agent-bridge-completion", "version":"1.0.0", "description":"Observe official Claude turn completion for Agent Bridge."
+        "name":"agent-bridge-completion", "version":"1.0.0", "description":"Observe official Claude turn completion for TAB."
     }))?;
     store
         .private("claude-mod/hooks/hooks.json")
@@ -89,7 +89,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     std::fs::create_dir_all(questions.join(".claude-plugin"))?;
     std::fs::create_dir_all(questions.join("hooks"))?;
     store.private(QUESTION_PLUGIN_MANIFEST).write_json(&json!({
-        "name":QUESTION_PLUGIN_NAME, "version":"1.0.0", "description":"Observe official Claude question emissions for Agent Bridge."
+        "name":QUESTION_PLUGIN_NAME, "version":"1.0.0", "description":"Observe official Claude question emissions for TAB."
     }))?;
     store
         .private("claude-question-mod/hooks/hooks.json")

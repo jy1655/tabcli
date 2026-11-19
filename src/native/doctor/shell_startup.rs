@@ -112,7 +112,7 @@ pub(super) fn launch_stage_check(
             Unknown,
             Reason::LAUNCH_HOST_SCHEMA_UNSUPPORTED,
             format!("The launch host record has schema {schema}, which this build does not read."),
-            "Use the Bridge build that launched the session to read it.",
+            "Use the TAB build that launched the session to read it.",
         ),
         HostObservation::IdentityMismatch => Check::new(
             CheckId::LAUNCH_STAGE,
@@ -158,10 +158,10 @@ fn failure_action(reason: FailureReason, probe: &str) -> String {
             "The launch deadline left no time for this step. Check the terminal application and system load, then start a new session. {probe}"
         ),
         Responsibility::SurfaceIdentity => {
-            "The terminal did not identify the surface Bridge created. Close this session and start a new one; do not reuse its surface.".to_owned()
+            "The terminal did not identify the surface TAB created. Close this session and start a new one; do not reuse its surface.".to_owned()
         }
         Responsibility::HostStep => {
-            format!("Bridge could not complete this host step. Close this session and start a new one. {probe}")
+            format!("TAB could not complete this host step. Close this session and start a new one. {probe}")
         }
     }
 }
@@ -537,9 +537,9 @@ mod tests {
         let deadline = format!(
             "The launch deadline left no time for this step. Check the terminal application and system load, then start a new session. {probe}"
         );
-        let surface = "The terminal did not identify the surface Bridge created. Close this session and start a new one; do not reuse its surface.".to_owned();
+        let surface = "The terminal did not identify the surface TAB created. Close this session and start a new one; do not reuse its surface.".to_owned();
         let host_step = format!(
-            "Bridge could not complete this host step. Close this session and start a new one. {probe}"
+            "TAB could not complete this host step. Close this session and start a new one. {probe}"
         );
         let cases = [
             (

@@ -54,7 +54,7 @@ fn every_provider_declares_session_specific_cancel_support() {
                     "this session was started by an extension without cancel support; start a new session".to_owned()
                 } else {
                     format!(
-                        "in this release the Bridge integration for {} does not support cancel",
+                        "in this release the TAB integration for {} does not support cancel",
                         provider.as_str()
                     )
                 }

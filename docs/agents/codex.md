@@ -44,7 +44,7 @@
   but preserving internal blanks. No marker and no recognized footer remains ambiguous.
   Count normalization is CRLF/CR to LF and control/CSI sanitization, not blank-line collapse
   (Codex rust-v0.163.0 paste_input.rs:145-176; history_cell/messages.rs:25-85).
-  Bridge trims source prompts before framing: the live 25596/1094 estimates become
+  TAB trims source prompts before framing: the live 25596/1094 estimates become
   25595/1093 there. Cursor-dependent blockquote fallback stays ambiguous; exact inline
   marker evidence remains usable. Unknown custom status lines require that marker.
 - Recheck the current claim, session and deadline after blocking work and at input dispatch.
@@ -67,11 +67,11 @@
   Codex's environment, and must never exit with code 2 (that blocks the turn). The legacy
   `notify` is `hooks/src/legacy_notify.rs`: the whole payload as one argv argument,
   spawned and not awaited, marked for removal upstream; on native Windows a payload past
-  32,767 UTF-16 units never spawns (#127). Bridge therefore injects a `UserPromptSubmit`
+  32,767 UTF-16 units never spawns (#127). TAB therefore injects a `UserPromptSubmit`
   and a `Stop` command hook as one `-c hooks=` session-flag value and keeps `-c notify`
   as the fallback. The hook path is the official one; the notify path stays until every
   supported configuration has a verified replacement route (settings off, hook feature
-  off, a launcher the shell cannot run, a transcript Bridge cannot observe, and Codex
+  off, a launcher the shell cannot run, a transcript TAB cannot observe, and Codex
   below 0.163.0 all still complete through notify), and removing notify needs that
   capability matrix, not an upstream deletion.
 - Injection is decided at launch and recorded in `codex-launch-mode.json`: the recorded
@@ -83,14 +83,14 @@
   says what was configured; only the session's own records say what ran.
 - A non-managed hook runs only when `hooks.state.<key>.trusted_hash` equals the hash
   Codex computes from the normalized handler, and the state is read from the user and
-  session-flag layers, so Bridge passes the two hashes it computes itself: SHA-256 over
+  session-flag layers, so TAB passes the two hashes it computes itself: SHA-256 over
   the compact, key-sorted JSON of the TOML identity `{event_name, hooks:[{type, command,
   timeout, async}]}` (`discovery.rs:777-793`, `fingerprint.rs:54-65`), pinned to the four
   values Codex wrote on Windows and macOS (R0, 2026-10-18; keys
   `C:\<session-flags>\config.toml:<label>:0:0` and `/<session-flags>/config.toml:...`).
   This replication is a fallback with a drift risk: a hash Codex no longer accepts makes
   the TUI open its hook-review picker before the composer on both platforms, and the
-  picker holds the initial prompt (macOS awaits the review before `App::run`). Bridge
+  picker holds the initial prompt (macOS awaits the review before `App::run`). TAB
   never answers the picker. On Windows the Codex adapter requires the empty composer row
   before every initial paste of an injected launch, regardless of stored workspace trust
   or an applied trust override; a deadline names the picker as diagnosis. The doctor's
@@ -99,7 +99,7 @@
   never passed: it would run every user and project hook unreviewed.
 - `UserPromptSubmit` gives the turn's identity before the answer exists: `session_id`,
   `turn_id` and `transcript_path`. It proves inspection, not acceptance; another input
-  hook can still reject Bridge's input. Bridge binds the current claim to that identity
+  hook can still reject TAB's input. TAB binds the current claim to that identity
   (`codex-turn-<claim>.json`) only for a prompt that begins with the delegation header
   (directly or after the exact IDE wrapper) and ends with the pending marker, under the
   lifecycle lock against the live claim; an identical rebinding is idempotent, a
@@ -115,7 +115,7 @@
   a reader that also accepts the old header in every running owner.
 - `Stop` is not the end of the turn: every Stop handler runs while Codex decides whether
   to stop, and another handler's block continues the same turn (`session/turn.rs`).
-  Bridge records the last Stop as a candidate (`codex-candidate-<claim>.json`) and never
+  TAB records the last Stop as a candidate (`codex-candidate-<claim>.json`) and never
   publishes from it. Legacy notify runs after that decision but before the turn function
   returns, so a post-turn compaction interrupted by Esc can follow a notify success with
   `turn_aborted`. For a bound claim notify is therefore evidence only
@@ -214,7 +214,7 @@
   The notice is advice to the model: a child that ignores it can still wait in its turn, and
   then the Request stays pending, `tell` is refused and a queued message does not join the
   turn, exactly as before. The 0.166.0 floor is eligibility, not runtime proof. Codex runs every
-  matched `PreToolUse` handler; Bridge's group neither removes nor reorders a user's own, and a
+  matched `PreToolUse` handler; TAB's group neither removes nor reorders a user's own, and a
   user's hook that denies the tool blocks it, leaving no emission. Native Windows at runtime,
   other Codex versions, more than one question in a turn, a user's own `PreToolUse` hook beside
   this one and subagent questions are unverified. Replace this fallback when Codex offers a
@@ -230,7 +230,7 @@
   published, a model error failed the request from `task_complete{error}` with no Stop and no
   notify at all, `settings_off` and `features.hooks=false` settled through notify, and an
   untrusted user hook held the picker, which the Windows gate named at the deadline. Not
-  verified: Esc during post-turn compaction, a Bridge hash-drift build, and macOS. The
+  verified: Esc during post-turn compaction, a TAB hash-drift build, and macOS. The
   native-queue `tell` passes the framed prompt as one `--message` argument, so on native
   Windows a follow-up above the command-line limit fails to start `codex queue` before anything
   is sent (os error 206 at 35,520 characters; #251): a send-side limit that the hook route does
@@ -245,7 +245,7 @@
   stop it.
   Launch admission therefore refuses a workspace that is `memories` beside Codex's
   `config.toml` or lies inside it, for every target provider, unless the state root's
-  `codex-memory-workspace` setting is `allow`. This is Bridge's admission policy for an
+  `codex-memory-workspace` setting is `allow`. This is TAB's admission policy for an
   observed path, not a fallback for a Codex transport; the Codex adapter only declares the
   location. Re-examine the default when Codex's behavior is verified to stop through an
   official control or an upstream fix; do not disable it from a version check alone.
