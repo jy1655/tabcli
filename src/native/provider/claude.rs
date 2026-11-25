@@ -137,9 +137,6 @@ impl NativeProviderAdapter for ClaudeAdapter {
         None
     }
 
-    fn initial_transport(&self) -> Box<dyn Transport> {
-        Box::new(ClaudeMessage)
-    }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(ClaudeMessage)
     }
@@ -276,8 +273,9 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn surface_support(
         &self,
         _surface: crate::native::terminal::TerminalKind,
+        _version: Option<&str>,
     ) -> super::SurfaceSupport {
-        Ok(())
+        Ok(Box::new(ClaudeMessage))
     }
 }
 

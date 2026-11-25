@@ -125,10 +125,13 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   live here now; `tell`'s pre-check imports the first two.
 - `src/native/turn_run.rs` runs one Turn from a held Claim to its Result for `ask`, `tell` and
   `reopen`: it repeats the report address idempotently, composes delivery settlement through
-  `delivery::deliver_with`, the optional Claim-addressed `turn::wait`, and success rendering.
-  `emit_session_result_with` lives there. The caller's delivery-error hook is called exactly once for
-  a Delivery failure; wait and emission errors never reach it. `run_with` takes the Transport and
-  the `Checks` so the tail is tested at its own interface with the shared fake Transport.
+  `delivery::deliver`, the optional Claim-addressed `turn::wait`, and success rendering.
+  `run_initial` takes the initial `Transport` selected by `provider::admit_surface` so initial
+  delivery cannot diverge from surface admission; `run_follow_up` takes the adapter's follow-up
+  `Transport`. `emit_session_result_with` lives there. The caller's delivery-error hook is called
+  exactly once for a Delivery failure; wait and emission errors never reach it. `run_with` takes
+  the Transport and the `Checks` so the tail is tested at its own interface with the shared fake
+  Transport.
 - `src/native/turn_report.rs` keeps `TurnReport`: address-aware failure finishing. Callers call
   `TurnReport::finish` outside the Turn run, with their own extra fields.
 - `src/native/session_start.rs` owns the original start deadline and the Initial prompt
@@ -139,7 +142,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   initial Claim is settled in `session::launch` (`settle_unfenced_start`) as a fenced launch
   failure is; a failure after the fence keeps the launcher's own settlement, and Reopen
   settles its launch failures itself. The launchable-spec resolution that `ask` and `reopen`
-  share (`resolve`, fed a `Resolution` of what each supplies) lives here, the common option
+  share (`resolve`, fed a `Resolution` of what each supplies) lives here: it admits the selected
+  surface through `provider::admit_surface` before workspace resolution and probing (refusing
+  unconditionally unsupported platform/surface pairs) and again with the probed version right
+  after the provider version probe (refusing surface-specific version requirements before title,
+  consent, session, or terminal creation) and carries the admitted initial `Transport` into
+  `Start::run` and `turn_run::run_initial`. The common option
   validation they share lives in `args.rs`, and `tell` parses through the same option helper
   with the follow-up option set.
 - `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's
@@ -187,6 +195,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   adapter for a read-only candidate observation under its existing reader lock, without
   reconstructing missing records or changing completion. The provider's turn-final event does
   not prove request finality or parentage; see the explicit marker fallback in [Providers](providers.md).
+  Codex decides surface admission, the Herdr 0.169.0 stable version floor, `--no-daemon`, and
+  its initial-prompt route in one decision in `codex/mod.rs`, shared by `surface_support`
+  (returning the initial `Transport` before creation) and `prepare_launch` (from the recorded
+  surface and version).
   Codex's bound turn Records and guarded hook operations live in `codex/turn.rs`;
   settlement remains in `codex/transcript.rs`; the framed-prompt grammar (the frame, its
   recognition and the marker line) lives in `codex/correlation.rs`. Codex's two launch

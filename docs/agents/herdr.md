@@ -153,12 +153,18 @@
   (`console_root_arguments`, which also removes `TERM`), through the helper command that drops
   caller markers. It exits with the root's code. The root shares the host's console and the
   core's job object, so `terminal.kill` (hc ends the job) ends the whole session.
-- Each provider adapter answers whether it runs on a surface (`surface_support`, required, no
-  default), before anything is created (`provider::admit_surface`). On Windows Herdr, Codex
-  refuses: its initial prompt is the injected console paste (#124), text without Return and one
+- Each provider adapter answers whether it runs on a surface and returns its selected
+  initial `Transport` (`surface_support`, required, no default), before anything is
+  created (`provider::admit_surface`): first without a version
+  before resolution and probing (and for terminal selection via `provider::surface_support`),
+  and again with the probed version right after the CLI version probe, handing the
+  admitted `Transport` straight into initial delivery. On Windows Herdr, Codex
+  refuses immediately: its initial prompt is the injected console paste (#124), text without Return and one
   Return against the exact accepted screen, which `terminal.send` cannot do, and the
   launch-argument route used elsewhere would put the multi-line prompt on a Windows command
-  line (32,767 characters; 8,191 and no line break through `codex.cmd`). Claude (official
+  line (32,767 characters; 8,191 and no line break through `codex.cmd`). Off Windows, Codex
+  admits Herdr pre-probe and enforces stable 0.169.0 or newer once the version is known,
+  refusing older or prerelease versions before any session or terminal exists. Claude (official
   messaging; its dialog is left to the user, as on macOS and Linux), Agy (paste through the
   surface behind its log readiness and receipt) and Pi run there. Inside an hc terminal the
   automatic choice is Herdr when the provider's adapter runs there and the managed console

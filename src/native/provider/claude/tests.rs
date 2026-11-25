@@ -1109,10 +1109,13 @@ fn every_platform_uses_the_official_cross_session_path_without_resume_fallback()
         ADAPTER.follow_up_transport().facts().name,
         "provider-cross-session-message"
     );
-    assert_eq!(
-        ADAPTER.initial_transport().facts().name,
-        "provider-cross-session-message"
-    );
+    for surface in crate::native::terminal::TerminalKind::ALL {
+        assert_eq!(
+            ADAPTER.surface_support(surface, None).unwrap().facts().name,
+            "provider-cross-session-message",
+            "{surface:?}"
+        );
+    }
     assert_eq!(
         ClaudeMessage.facts().readiness,
         Readiness::AfterLaunch {

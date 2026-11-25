@@ -23,6 +23,39 @@ fn lifecycle_doctor_legacy_records_are_not_observed_and_write_nothing() {
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), before);
 }
 
+// The launch-mode warning reads the recorded version as the launch and every earlier release
+// read it: trailing punctuation is removed, and a two-version banner is read at its Codex token.
+#[test]
+fn lifecycle_doctor_reads_a_recorded_version_as_earlier_releases_did() {
+    use crate::native::session::Store;
+    for (version, warns) in [
+        ("codex-cli 0.163.0", false),
+        ("Codex version is 0.163.0.", false),
+        ("Codex version is 0.170.0.", true),
+        ("codex-cli 0.170.0+ (runtime 0.163.0)", true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = super::super::test_support::launch_session(root.path(), Some(version));
+        Store::open_unchecked(&dir)
+            .private(super::super::launch_decision::FILE)
+            .write_json(&serde_json::json!({
+                "schema":1,"lifecycle_hooks":"injected","reason":null,
+                "codex_version":version,"vector_codex_version":"0.163.0"
+            }))
+            .unwrap();
+        let evidence = lifecycle_evidence(&dir);
+        assert_eq!(
+            evidence["launch_mode"]["observation"], "observed",
+            "{version}"
+        );
+        assert_eq!(
+            evidence["launch_mode"].get("warning").is_some(),
+            warns,
+            "{version}"
+        );
+    }
+}
+
 #[test]
 fn lifecycle_doctor_records_current_and_last_claim_without_mutation() {
     use crate::native::session::{SessionState, Store, turn, update_status};
@@ -285,6 +318,9 @@ fn diagnostics_keep_launch_version_and_unprobed_daemon_observations_explicit() {
     for (version, expected) in [
         (Some("0.148.0"), Availability::Unavailable),
         (Some("0.153.2"), Availability::Available),
+        // Trailing punctuation reads as every earlier release read it.
+        (Some("Codex version is 0.148.0."), Availability::Unavailable),
+        (Some("Codex version is 0.170.0."), Availability::Available),
         (Some("unknown"), Availability::Unknown),
         (None, Availability::Unknown),
     ] {

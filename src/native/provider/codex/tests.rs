@@ -515,10 +515,342 @@ fn herdr_codex_launch_keeps_tools_in_the_terminal_process() {
 }
 
 #[test]
+fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
+    use crate::native::failure_kind::{FailureKind, classify};
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    Store::open_unchecked(&directory)
+        .private("terminal.json")
+        .write_json(&serde_json::json!({
+            "terminal": "herdr", "session_id": "t99",
+            "managed_session_id": "session-hooks"
+        }))
+        .unwrap();
+    let error = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new(r"C:\tabcli.exe"),
+            directory: &directory,
+            workspace: root.path(),
+            title: "Windows Herdr Codex",
+            prompt: "test task",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        true,
+        |_, _| Ok(false),
+    )
+    .err()
+    .expect("Windows Herdr launch plan must refuse Codex");
+    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+    assert_eq!(format!("{error:#}"), CODEX_WINDOWS_HERDR_UNSUPPORTED);
+    assert!(read_pending_turn(&directory).unwrap().is_none());
+}
+
+// The Herdr gate's version grammar (`herdr_codex_version`) as a table over its dimensions,
+// each cell checked through pre-creation admission and the recorded-launch check:
+// - label present once: the verdict is the field's, whatever precedes the label (nothing, a
+//   warning line, a timestamp on the label's line, a timestamped warning line, another
+//   program's version or a prerelease on its own line) and whatever follows the field
+//   (nothing, another version on its line, another version line);
+// - label absent: one bare word is read as the field; anything longer refuses;
+// - label layout: a second label, or a label without a field on its line, refuses.
+#[test]
+fn herdr_version_grammar_reads_only_the_labelled_field() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::provider::SurfaceRefusal;
+    use terminal::TerminalKind;
+
+    const REFUSAL: &str = "Herdr requires stable Codex 0.169.0 or newer with --no-daemon;";
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    let store = Store::open_unchecked(&directory);
+    store
+        .private("terminal.json")
+        .write_json(&serde_json::json!({"terminal":"herdr","session_id":"t1"}))
+        .unwrap();
+    let admits = |text: &str| -> bool {
+        let admission = surface_route(false, TerminalKind::Herdr, Some(text));
+        // The fixture's manifest, with this cell's text as the recorded version.
+        store
+            .private("manifest.json")
+            .write_json(&serde_json::json!({
+                "schema": 1, "id": "session-hooks", "provider": "codex", "provider_path": "codex",
+                "provider_version": text, "workspace": root.path(), "title": "hooks fixture",
+                "yolo": false, "created_unix_ms": 1
+            }))
+            .unwrap();
+        let recorded = recorded_surface_route(&directory, false);
+        match (admission, recorded) {
+            (Ok(admitted), Ok(launched)) => {
+                assert_eq!(admitted, SurfaceRoute::LaunchArgument { no_daemon: true });
+                assert_eq!(launched, admitted, "{text:?}");
+                true
+            }
+            (Err(SurfaceRefusal::Version(detail)), Err(error)) => {
+                assert!(
+                    detail.starts_with(&format!("{REFUSAL} version: {text}")),
+                    "{detail}"
+                );
+                assert!(
+                    format!("{error:#}")
+                        .starts_with(&format!("{REFUSAL} recorded version: {text}")),
+                    "{error:#}"
+                );
+                assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{text:?}");
+                false
+            }
+            (admission, recorded) => panic!(
+                "admission and the recorded launch disagree on {text:?}: {admission:?} / {:?}",
+                recorded.map_err(|error| format!("{error:#}"))
+            ),
+        }
+    };
+
+    // The field, and whether Herdr admits it.
+    let fields = [
+        ("0.169.0", true),          // stable, at the floor
+        ("0.170.0", true),          // stable, above the floor
+        ("v0.170.0", true),         // with the optional `v`
+        ("0.170.0+build.1", true),  // build metadata is not a prerelease
+        ("0.168.0", false),         // below the floor
+        ("0.170.0-alpha.1", false), // prerelease
+        ("0.170.0--", false),       // prerelease whose identifier is `-`
+        ("0.170.0+", false),        // malformed: empty build metadata
+        ("0.170.0.", false),        // malformed: trailing punctuation is not removed
+        ("0.170.0-01", false),      // malformed: leading zero in a numeric prerelease
+        ("(0.170.0)", false),       // malformed: brackets are not removed
+        ("unknown", false),         // not a version
+    ];
+    let before = [
+        "",
+        "warning: config.toml is deprecated\n",
+        "2026-11-25T10:00:00Z ",
+        "2026-11-25T10:00:00Z WARN slow start after 1.0.0\n",
+        "node v22.0.0\n",
+        "plugin 0.160.0-beta.1\n",
+    ];
+    let after = [
+        "",
+        " (runtime 22.0.0)",
+        " (protocol 0.1.0)",
+        "\nnode v22.0.0",
+    ];
+    for (field, admitted) in fields {
+        for prefix in before {
+            for suffix in after {
+                let text = format!("{prefix}codex-cli {field}{suffix}");
+                assert_eq!(admits(&text), admitted, "{text:?}");
+            }
+        }
+        // Without the label only a text of one word is read.
+        assert_eq!(admits(field), admitted, "{field:?}");
+        assert_eq!(admits(&format!("\n{field}\n")), admitted, "{field:?}");
+        for unlabelled in [
+            format!("codex {field}"),
+            format!("OpenAI Codex ({field})"),
+            format!("{field} (runtime 22.0.0)"),
+            format!("node v22.0.0\n{field}"),
+        ] {
+            assert!(!admits(&unlabelled), "{unlabelled:?}");
+        }
+        // A second label, or a label whose field is on another line, refuses.
+        for layout in [
+            format!("codex-cli {field}\ncodex-cli {field}"),
+            format!("warning: codex-cli is outdated\ncodex-cli {field}"),
+            format!("codex-cli\n{field}"),
+        ] {
+            assert!(!admits(&layout), "{layout:?}");
+        }
+    }
+    assert!(!admits("codex-cli"));
+}
+
+// Each refusal of the grammar names what refused: the field's own parse error, a missing
+// label, a label without a field, or a second label.
+#[test]
+fn herdr_version_refusals_name_the_rule_that_refused() {
+    let refusal = |text: &str| format!("{:#}", herdr_codex_version(text).unwrap_err());
+    for (text, field) in [
+        ("codex-cli 0.170.0+", "0.170.0+"),
+        ("codex-cli unknown (runtime 22.0.0)", "unknown"),
+        (
+            "2026-11-25T10:00:00Z codex-cli 0.170.0. (runtime 22.0.0)",
+            "0.170.0.",
+        ),
+        ("unknown", "unknown"),
+    ] {
+        let error = refusal(text);
+        assert!(
+            error.starts_with(&format!(
+                "Codex version {field:?} is not a semantic version: "
+            )),
+            "{text:?}: {error}"
+        );
+    }
+    assert_eq!(
+        refusal("OpenAI Codex (v0.170.0)"),
+        "found no `codex-cli` version label in \"OpenAI Codex (v0.170.0)\""
+    );
+    assert_eq!(
+        refusal("codex-cli\n0.170.0"),
+        "the `codex-cli` label has no version after it on its line in \"codex-cli\\n0.170.0\""
+    );
+    assert_eq!(
+        refusal("codex-cli 0.170.0\ncodex-cli 0.170.0"),
+        "found the `codex-cli` label more than once in \"codex-cli 0.170.0\\ncodex-cli 0.170.0\""
+    );
+    let prerelease = herdr_codex_version("codex-cli 0.170.0--").unwrap();
+    assert_eq!(prerelease.pre.as_str(), "-");
+    let build = herdr_codex_version("codex-cli 0.170.0+build.1").unwrap();
+    assert!(build.pre.is_empty());
+    assert_eq!(build.build.as_str(), "build.1");
+}
+
+// The queue floor, hook eligibility and the diagnostics read a recorded or probed version as
+// the general probe and every earlier release did, so a launch record v0.4.48 admitted keeps
+// its meaning. Only the Herdr gate reads more strictly.
+#[test]
+fn recorded_versions_keep_the_reading_of_earlier_releases() {
+    for (text, expected) in [
+        ("codex-cli 0.170.0", Version::new(0, 170, 0)),
+        ("Codex version is 0.170.0.", Version::new(0, 170, 0)),
+        ("codex-cli 0.170.0+", Version::new(0, 170, 0)),
+        ("codex-cli 0.170.0-", Version::new(0, 170, 0)),
+        ("OpenAI Codex (v0.170.0).", Version::new(0, 170, 0)),
+        (
+            "codex-cli 0.168.0+ (runtime 22.0.0)",
+            Version::new(0, 168, 0),
+        ),
+        (
+            "codex-cli 0.168.0- (protocol 1.0.0)",
+            Version::new(0, 168, 0),
+        ),
+    ] {
+        assert_eq!(codex_version(text).unwrap(), expected, "{text}");
+        assert!(codex_version_supports_native_queue(text).unwrap(), "{text}");
+    }
+    assert!(!codex_version_supports_native_queue("Codex version is 0.148.9.").unwrap());
+}
+
+#[test]
+fn surface_route_unifies_admission_version_floor_and_initial_transport_across_platforms() {
+    use crate::native::provider::SurfaceRefusal;
+    use terminal::TerminalKind;
+
+    for windows in [false, true] {
+        let default_transport = SurfaceRoute::platform_default(windows)
+            .initial_transport()
+            .facts();
+        for surface in TerminalKind::ALL {
+            for (version, herdr_version_ok) in [
+                (None, true),
+                (Some("codex-cli 0.147.0"), false),
+                (Some("codex-cli 0.168.0"), false),
+                (Some("codex-cli 0.169.0-alpha.1"), false),
+                (Some("codex-cli 0.170.0-alpha.1"), false),
+                (Some("codex-cli 0.170.0--"), false),
+                (Some("codex-cli 0.170.0+"), false),
+                (Some("codex-cli 0.170.0-"), false),
+                (Some("codex-cli 0.168.0+ (runtime 22.0.0)"), false),
+                (Some("codex-cli 0.168.0- (protocol 1.0.0)"), false),
+                (Some("codex-cli 0.170.0-01 (runtime 22.0.0)"), false),
+                (Some("codex-cli 0.169.0"), true),
+                (Some("codex-cli 0.170.0"), true),
+                (Some("codex-cli 0.170.0+build.1"), true),
+                (Some("codex-cli 0.170.0 (runtime 22.0.0)"), true),
+                (Some("unknown"), false),
+            ] {
+                let result = surface_route(windows, surface, version);
+                match (windows, surface) {
+                    (true, TerminalKind::Herdr) => {
+                        assert_eq!(
+                            result,
+                            Err(SurfaceRefusal::Platform(CODEX_WINDOWS_HERDR_UNSUPPORTED)),
+                            "windows={windows} surface={surface:?} version={version:?}"
+                        );
+                    }
+                    (true, _) => {
+                        let route = result.unwrap();
+                        assert_eq!(route, SurfaceRoute::ConsolePaste);
+                        assert!(!route.no_daemon());
+                        assert!(!route.passes_prompt_argument());
+                        let facts = route.initial_transport().facts();
+                        assert_eq!(facts.name, default_transport.name);
+                        assert_eq!(facts.readiness, default_transport.readiness);
+                        assert!(facts.surface.is_some());
+                    }
+                    (false, TerminalKind::Herdr) if !herdr_version_ok => {
+                        let Err(SurfaceRefusal::Version(detail)) = result else {
+                            panic!(
+                                "expected version refusal for non-Windows Herdr {version:?}: {result:?}"
+                            );
+                        };
+                        let version_text = version.unwrap();
+                        assert!(
+                            detail.starts_with(&format!(
+                                "Herdr requires stable Codex 0.169.0 or newer with --no-daemon; version: {version_text}"
+                            )),
+                            "{detail}"
+                        );
+                    }
+                    (false, TerminalKind::Herdr) => {
+                        let route = result.unwrap();
+                        assert_eq!(route, SurfaceRoute::LaunchArgument { no_daemon: true });
+                        assert!(route.no_daemon());
+                        assert!(route.passes_prompt_argument());
+                        let facts = route.initial_transport().facts();
+                        assert_eq!(facts.name, default_transport.name);
+                        assert_eq!(facts.readiness, default_transport.readiness);
+                        assert!(facts.surface.is_none());
+                    }
+                    (false, _) => {
+                        let route = result.unwrap();
+                        assert_eq!(route, SurfaceRoute::LaunchArgument { no_daemon: false });
+                        assert!(!route.no_daemon());
+                        assert!(route.passes_prompt_argument());
+                        let facts = route.initial_transport().facts();
+                        assert_eq!(facts.name, default_transport.name);
+                        assert_eq!(facts.readiness, default_transport.readiness);
+                        assert!(facts.surface.is_none());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
+    use crate::native::failure_kind::{FailureKind, classify};
+
+    let prepare = |directory: &Path, workspace: &Path, windows: bool| {
+        prepare_launch_for_platform(
+            LaunchContext {
+                bridge_executable: Path::new("/opt/tabcli"),
+                directory,
+                workspace,
+                title: "Codex surface test",
+                prompt: "test task",
+                yolo: false,
+                model: None,
+                effort: None,
+            },
+            windows,
+            |_, _| Ok(false),
+        )
+    };
+
     for (version, accepted) in [
         ("codex-cli 0.168.0", false),
         ("codex-cli 0.169.0-alpha.1", false),
+        ("codex-cli 0.170.0-alpha.1", false),
+        ("codex-cli 0.170.0--", false),
+        ("codex-cli 0.170.0+", false),
+        ("codex-cli 0.168.0+ (runtime 22.0.0)", false),
+        ("codex-cli 0.168.0- (protocol 1.0.0)", false),
+        ("codex-cli 0.170.0-01 (runtime 22.0.0)", false),
         ("codex-cli 0.169.0", true),
         ("codex-cli 0.170.0", true),
         ("unknown", false),
@@ -530,26 +862,102 @@ fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
             .private("terminal.json")
             .write_json(&serde_json::json!({"terminal":"herdr","session_id":"t1"}))
             .unwrap();
-        assert_eq!(
-            herdr_requires_local_runtime(&directory).is_ok(),
-            accepted,
-            "{version}"
-        );
-        assert!(read_pending_turn(&directory).unwrap().is_none());
-        // The same provider version on an existing surface has no new version gate.
+        let herdr_plan = prepare(&directory, root.path(), false);
+        assert_eq!(herdr_plan.is_ok(), accepted, "{version}");
+        if let Ok(plan) = herdr_plan {
+            assert_eq!(
+                plan.arguments
+                    .iter()
+                    .filter(|arg| *arg == "--no-daemon")
+                    .count(),
+                1,
+                "{version}"
+            );
+            assert_eq!(
+                plan.initial_prompt,
+                InitialPromptDisposition::AcceptedAtSpawn,
+                "{version}"
+            );
+        } else {
+            let error = herdr_plan.err().unwrap();
+            let detail = format!("{error:#}");
+            assert!(
+                detail.starts_with(&format!(
+                    "Herdr requires stable Codex 0.169.0 or newer with --no-daemon; recorded version: {version}"
+                )),
+                "{detail}"
+            );
+            assert_eq!(
+                classify(&error),
+                Some(FailureKind::Unsupported),
+                "{version}"
+            );
+            assert!(
+                read_pending_turn(&directory).unwrap().is_none(),
+                "{version}"
+            );
+        }
+
+        // The same provider version on a non-Herdr surface has no 0.169.0 floor or --no-daemon.
         store
             .private("terminal.json")
             .write_json(&serde_json::json!({"terminal":"iterm2","session_id":"pane"}))
             .unwrap();
-        assert!(!herdr_requires_local_runtime(&directory).unwrap());
+        let non_herdr_plan = prepare(&directory, root.path(), false).unwrap();
+        assert!(
+            !non_herdr_plan
+                .arguments
+                .iter()
+                .any(|arg| arg == "--no-daemon"),
+            "{version}"
+        );
+        assert_eq!(
+            non_herdr_plan.initial_prompt,
+            InitialPromptDisposition::AcceptedAtSpawn,
+            "{version}"
+        );
+
+        // Native Windows managed console uses ConsolePaste for every supported version.
+        store
+            .private("terminal.json")
+            .write_json(&serde_json::json!({"terminal":"windows-console","session_id":"console"}))
+            .unwrap();
+        let console_plan = prepare(&directory, root.path(), true).unwrap();
+        assert!(
+            !console_plan
+                .arguments
+                .iter()
+                .any(|arg| arg == "--no-daemon" || arg == "-C"),
+            "{version}"
+        );
+        assert_eq!(
+            console_plan.initial_prompt,
+            InitialPromptDisposition::AwaitingDelivery,
+            "{version}"
+        );
     }
+
+    // Without a bound surface record, launch planning uses the platform's default route;
+    // a malformed terminal record fails closed without installing a pending turn.
     let root = tempfile::tempdir().unwrap();
-    assert!(!herdr_requires_local_runtime(root.path()).unwrap());
-    Store::open_unchecked(root.path())
+    assert_eq!(
+        recorded_surface_route(root.path(), false).unwrap(),
+        SurfaceRoute::LaunchArgument { no_daemon: false }
+    );
+    assert_eq!(
+        recorded_surface_route(root.path(), true).unwrap(),
+        SurfaceRoute::ConsolePaste
+    );
+    let broken_dir = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    Store::open_unchecked(&broken_dir)
         .private("terminal.json")
         .write_private(b"{broken")
         .unwrap();
-    assert!(herdr_requires_local_runtime(root.path()).is_err());
+    let error = prepare(&broken_dir, root.path(), false)
+        .err()
+        .expect("malformed terminal.json must fail closed");
+    assert_eq!(classify(&error), None);
+    assert!(read_pending_turn(&broken_dir).unwrap().is_none());
 }
 
 // Launches and probes drop both providers' caller identities while preserving configuration.

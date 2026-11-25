@@ -81,7 +81,14 @@ fn every_provider_declares_initial_and_follow_up_transports() {
         if let Some(input) = follow.surface {
             assert_eq!(input.submit_count, count);
         }
-        let initial = provider::initial_transport(provider).facts();
+        let surface = if cfg!(windows) {
+            terminal::TerminalKind::WindowsConsole
+        } else {
+            terminal::TerminalKind::Iterm2
+        };
+        let initial = provider::admit_surface(provider, surface, None)
+            .unwrap()
+            .facts();
         if cfg!(windows) || provider == FirstPartyCli::Claude {
             assert_eq!(
                 initial.readiness,

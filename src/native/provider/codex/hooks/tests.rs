@@ -416,6 +416,40 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
             Some("launcher_unavailable"),
             Some("launcher_unavailable"),
         ),
+        // A two-version banner is read at its Codex token, never at the later version, and a
+        // version with trailing punctuation as every earlier release read it.
+        (
+            Some("codex-cli 0.162.0+ (runtime 22.0.0)"),
+            "on",
+            None,
+            available,
+            Some("version_below_0_163"),
+            NO_LIFECYCLE,
+        ),
+        (
+            Some("codex-cli 0.165.0+ (runtime 22.0.0)"),
+            "on",
+            Some("on"),
+            available,
+            None,
+            BELOW,
+        ),
+        (
+            Some("codex-cli 0.168.0+ (runtime 22.0.0)"),
+            "on",
+            Some("on"),
+            available,
+            None,
+            None,
+        ),
+        (
+            Some("Codex version is 0.170.0."),
+            "on",
+            Some("on"),
+            available,
+            None,
+            None,
+        ),
         (
             Some("unparseable"),
             "on",

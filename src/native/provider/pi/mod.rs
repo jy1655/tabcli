@@ -249,9 +249,6 @@ impl NativeProviderAdapter for PiAdapter {
         Some(APPLIED_MARKER)
     }
 
-    fn initial_transport(&self) -> Box<dyn Transport> {
-        initial_transport_for_platform(cfg!(windows))
-    }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(PiPaste::new())
     }
@@ -381,8 +378,12 @@ impl NativeProviderAdapter for PiAdapter {
     // Pi's turns go through the surface's own transport (a Herdr terminal's `terminal.send`)
     // with Pi-owned readiness and, on Windows, the per-turn input receipt; nothing needs the
     // managed console. The live record is in the Herdr boundary.
-    fn surface_support(&self, _surface: terminal::TerminalKind) -> super::SurfaceSupport {
-        Ok(())
+    fn surface_support(
+        &self,
+        _surface: terminal::TerminalKind,
+        _version: Option<&str>,
+    ) -> super::SurfaceSupport {
+        Ok(initial_transport_for_platform(cfg!(windows)))
     }
 }
 

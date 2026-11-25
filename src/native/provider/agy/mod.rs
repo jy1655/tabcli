@@ -326,9 +326,6 @@ impl NativeProviderAdapter for AgyAdapter {
         None
     }
 
-    fn initial_transport(&self) -> Box<dyn Transport> {
-        initial_transport_for_platform(cfg!(windows))
-    }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(AgyPaste::new())
     }
@@ -448,8 +445,12 @@ impl NativeProviderAdapter for AgyAdapter {
     // managed console. On native Windows the readiness rule also needs `Full redraw
     // completed`, measured on the console only: without it in an hc terminal the paste is
     // withheld and reported not sent. Windows Herdr has no live evidence yet.
-    fn surface_support(&self, _surface: terminal::TerminalKind) -> super::SurfaceSupport {
-        Ok(())
+    fn surface_support(
+        &self,
+        _surface: terminal::TerminalKind,
+        _version: Option<&str>,
+    ) -> super::SurfaceSupport {
+        Ok(initial_transport_for_platform(cfg!(windows)))
     }
 }
 

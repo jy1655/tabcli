@@ -1,16 +1,43 @@
 # Current Codex Boundary
 
-- Herdr launches require stable Codex 0.169.0 or newer and explicitly pass
+- The Codex adapter decides surface eligibility, the Herdr version floor, `--no-daemon`,
+  and the initial-prompt route in one place (`surface_route`), shared by `surface_support`
+  and `prepare_launch`. `surface_support` returns the selected initial `Transport`, which
+  `session_start` carries directly into `turn_run::run_initial` so initial delivery never
+  re-selects a transport independently.
+- Off Windows, Herdr launches require stable Codex 0.169.0 or newer and explicitly pass
   `--no-daemon`, so tool processes retain the hc terminal identity instead of running
-  in the shared app-server. The Codex adapter decides from the recorded surface,
-  never an inherited `HC_TERMINAL_ID`. Other surfaces retain their launch arguments.
+  in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
+  Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
+  session or terminal exists; `prepare_launch` applies the same decision from the recorded
+  surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. That gate reads
+  the version text by one grammar (`herdr_codex_version`). The label is the word
+  `codex-cli`, the start of every Codex `--version` output this repository records
+  (`OpenAI Codex (vX.Y.Z)` is only the TUI header in screen captures); the field is the next
+  word on the label's line, read whole as an optional `v` and SemVer with no punctuation
+  removed. With exactly one label, the field's result is the answer, error included: words
+  before the label (a warning, a timestamp, another program's version) and after the field
+  are never read as the version and are only scanned for a second label, so `0.170.0--` is a
+  prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
+  refused. Without a label, only a text of one word is read as the field. A second label, a
+  label without a field on its line and longer unlabelled text are refused. Compared with the
+  launch-time check of 0.4.48, which took the first token that parsed once punctuation was
+  trimmed, each rule only refuses more except one: a labelled stable field at or above the
+  floor is admitted even when noise before the label held a version that check would have
+  read first (below the floor or a prerelease).
+  The queue floor, hook eligibility and doctor keep the general probe's reading (the first
+  token that parses once surrounding punctuation is removed), under which earlier releases
+  wrote and admitted launch records.
+  Other surfaces retain their launch arguments and require no 0.169.0 floor.
   The version floor is eligibility; ask, queue follow-up and completion need separate
   live verification. No Codex configuration file or daemon is changed.
-- On native Windows the adapter refuses a Herdr terminal (`surface_support`), before any
-  session exists: the initial prompt there is the injected console paste below (text without
-  Return, then one Return against the exact accepted screen), which `terminal.send` cannot
-  do, and the launch-argument route above would put the multi-line framed prompt on a Windows
-  command line (32,767 characters; 8,191 and no line break through an npm `codex.cmd`).
+- On native Windows the adapter refuses a Herdr terminal in `surface_support` before any
+  resolution, probe, or session exists, and `prepare_launch` applies the same decision to
+  a recorded handle as a backstop: the initial prompt there is the injected console paste
+  below (text without Return, then one Return against the exact accepted screen), which
+  `terminal.send` cannot do, and the launch-argument route above would put the multi-line
+  framed prompt on a Windows command line (32,767 characters; 8,191 and no line break
+  through an npm `codex.cmd`).
   Inside an hc terminal the automatic choice for Codex stays the managed console. Replace the
   refusal with a Windows Herdr route that keeps argument semantics and size, or a
   first-party addressed input.
