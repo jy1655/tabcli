@@ -274,7 +274,7 @@ pub(super) fn resolution<'a>(
     request: &'a ReopenRequest,
     provider: FirstPartyCli,
     workspace: &'a Path,
-    terminal_kind: terminal::TerminalKind,
+    surface: terminal::Selection,
 ) -> session_start::Resolution<'a> {
     session_start::Resolution {
         provider,
@@ -288,7 +288,7 @@ pub(super) fn resolution<'a>(
         effort: request.effort.clone(),
         yolo: request.yolo,
         prompt: request.prompt.clone(),
-        terminal_kind,
+        surface,
         context_sources: Vec::new(),
         workspace_noun: "source workspace",
         admission_refusal: |error| {
@@ -299,8 +299,9 @@ pub(super) fn resolution<'a>(
 
 impl ResolvedReopen {
     fn resolve(request: ReopenRequest, deadline: Instant) -> Result<Self> {
-        // The source, and so its provider, is not read yet.
-        let terminal_kind = session_start::choose_launch_surface(request.terminal, None)?;
+        // The source, and so its provider, is not read yet: an automatic Herdr choice is
+        // checked against the caller now and decided with the provider in the resolution.
+        let surface = session_start::choose_launch_surface(request.terminal, None)?;
         let source_directory = Reader::session_directory(&request.id)?;
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
@@ -319,7 +320,7 @@ impl ResolvedReopen {
                 &request,
                 source.provider,
                 &source.manifest.workspace,
-                terminal_kind,
+                surface,
             ),
             deadline,
         )?;

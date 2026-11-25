@@ -9,6 +9,13 @@
   fails when a record changed while it read. What it derives is marked: the request
   summaries are what `result` reports at the time of the query and carry `derived_from`.
   Do not add an entry for something no record holds.
+- Doctor's `terminal_selection` row reports the Surface `ask` would choose
+  (`session_start::automatic_surface`), with the version doctor read under `--probe` and,
+  inside hc, the fallback as `evidence.fallback`. It opens no connection, so it never runs the
+  caller check of an automatic Herdr choice; without a read version it reports Herdr, unless
+  the provider is refused there for every version, and says which fallback a refused version
+  would get. In provider-only mode the executable and
+  version are therefore observed before that row; the report keeps its row order.
 - Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,
   its `launch_stage` row keeps `launch_host_failed` and directs the caller to the launch
   log for an input-flush or shell-start error. The shell-environment probe guidance applies

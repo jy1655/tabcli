@@ -340,7 +340,7 @@ trait NativeProviderAdapter: Sync {
     // Whether this adapter's launch and turn transports can run on a surface of `surface`
     // on this platform, decided before any session exists, and the initial-prompt Transport
     // selected for it. `version` is `None` before the CLI version has been probed (such as
-    // during terminal selection, unprobed doctor checks, or early platform admission) and
+    // during launch surface choice, unprobed doctor checks, or early platform admission) and
     // `Some` once the installed version is known. `Err` names the capability or version
     // requirement the surface lacks for this provider. No default: each adapter states its
     // own answer and initial Transport. `Ok` is a code path, not live evidence.
@@ -453,7 +453,8 @@ pub(super) fn run_control(provider: FirstPartyCli, arguments: &[String]) -> Resu
 }
 
 /// Whether `provider`'s adapter can run on `surface` on this platform before any CLI
-/// version probe. Terminal selection and unprobed diagnostics read this.
+/// version probe. Launch surface choice reads this to decide whether an automatic Herdr
+/// choice needs the caller check.
 pub(super) fn surface_support(
     provider: FirstPartyCli,
     surface: super::terminal::TerminalKind,

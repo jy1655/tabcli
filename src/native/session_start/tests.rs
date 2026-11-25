@@ -554,7 +554,11 @@ mod resolution {
                         context_results: Vec::new(),
                     };
                     resolve_with(
-                        fresh_resolution(&request, context::resolve(&[]).unwrap(), SELECTED),
+                        fresh_resolution(
+                            &request,
+                            context::resolve(&[]).unwrap(),
+                            terminal::Selection::Kind(SELECTED),
+                        ),
                         probe,
                     )
                 }
@@ -572,7 +576,12 @@ mod resolution {
                         json: false,
                     };
                     resolve_with(
-                        reopen::resolution(&request, FirstPartyCli::Codex, workspace, SELECTED),
+                        reopen::resolution(
+                            &request,
+                            FirstPartyCli::Codex,
+                            workspace,
+                            terminal::Selection::Kind(SELECTED),
+                        ),
                         probe,
                     )
                 }
@@ -1211,7 +1220,11 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         |provider, workspace: &Path, title: Option<&str>, surface, version: Option<&str>| {
             let ask = request(provider, workspace, title);
             resolve_with(
-                fresh_resolution(&ask, context::resolve(&[]).unwrap(), surface),
+                fresh_resolution(
+                    &ask,
+                    context::resolve(&[]).unwrap(),
+                    terminal::Selection::Kind(surface),
+                ),
                 |_| match version {
                     Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
                     None => panic!("probe must not run before early refusal"),
@@ -1346,7 +1359,137 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         )
         .unwrap();
     }
+
+    // An automatic Herdr choice (inside an hc terminal) is decided with the provider and its
+    // probed version, the same way on every platform: Herdr where the adapter admits it, and
+    // otherwise the Surface this platform chooses outside Herdr, with that Surface's own
+    // initial Transport. Neither admission refuses it: the workspace is still the first error.
+    let fallback = platform_fallback();
+    let automatic = |provider, workspace: &Path, version: Option<&str>| {
+        let ask = request(provider, workspace, None);
+        resolve_with(
+            fresh_resolution(
+                &ask,
+                context::resolve(&[]).unwrap(),
+                terminal::Selection::Herdr { fallback },
+            ),
+            |_| match version {
+                Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+                None => panic!("the probe must not run before the workspace is resolved"),
+            },
+        )
+    };
+    let error = automatic(FirstPartyCli::Codex, &missing, None)
+        .err()
+        .expect("a missing workspace refuses");
+    assert!(
+        error.to_string().contains("workspace does not exist"),
+        "{error:#}"
+    );
+    for (version, herdr) in [
+        ("codex-cli 0.169.0", !cfg!(windows)),
+        ("OpenAI Codex (v0.170.0)", !cfg!(windows)),
+        ("codex-cli 0.168.0", false),
+        ("codex-cli 0.170.0-alpha.1", false),
+        ("codex-cli 0.170.0+", false),
+    ] {
+        let resolved = automatic(FirstPartyCli::Codex, &project, Some(version))
+            .unwrap_or_else(|error| panic!("{version}: {error:#}"));
+        assert_eq!(
+            resolved.terminal_kind,
+            if herdr {
+                terminal::TerminalKind::Herdr
+            } else {
+                fallback
+            },
+            "{version}"
+        );
+        assert_eq!(
+            resolved.initial_transport.facts().name,
+            if cfg!(windows) {
+                "terminal-paste-fallback"
+            } else {
+                "launch-argument"
+            },
+            "{version}"
+        );
+    }
+    for provider in [FirstPartyCli::Claude, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        assert_eq!(
+            automatic(provider, &project, Some("fixture"))
+                .unwrap()
+                .terminal_kind,
+            terminal::TerminalKind::Herdr,
+            "{provider:?}"
+        );
+    }
     assert_no_sessions();
+}
+
+// The Surface this platform chooses outside Herdr, the fallback of an automatic Herdr choice
+// inside hc: Ghostty on macOS (hc gives `TERM_PROGRAM=ghostty`), tmux on Linux and the managed
+// console on Windows.
+fn platform_fallback() -> terminal::TerminalKind {
+    if cfg!(target_os = "macos") {
+        terminal::TerminalKind::Ghostty
+    } else if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else {
+        terminal::TerminalKind::Tmux
+    }
+}
+
+// The provider's admission of a selection: an automatic Herdr choice is Herdr where the
+// adapter admits it (before the probe and with the probed version) and its fallback with the
+// reason otherwise; an explicit Herdr keeps the refusal, in the same words; any other
+// selected kind is admitted as it is.
+#[test]
+fn admit_choice_gives_an_automatic_herdr_its_fallback_and_keeps_explicit_refusals() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use terminal::{Selection, TerminalKind::Herdr};
+    let fallback = platform_fallback();
+    for provider in agent_bridge::supported_clis().iter().copied() {
+        for version in [
+            None,
+            Some("codex-cli 0.169.0"),
+            Some("codex-cli 0.168.0"),
+            Some("OpenAI Codex (v0.168.0)"),
+        ] {
+            let case = format!("{provider:?} {version:?}");
+            let refused = provider == FirstPartyCli::Codex
+                && (cfg!(windows) || version.is_some_and(|version| version.contains("0.168.0")));
+            let automatic = admit_choice(provider, Selection::Herdr { fallback }, version).unwrap();
+            assert_eq!(
+                automatic.kind,
+                if refused { fallback } else { Herdr },
+                "{case}"
+            );
+            assert_eq!(automatic.herdr_refusal.is_some(), refused, "{case}");
+            match admit_choice(provider, Selection::Kind(Herdr), version) {
+                Ok(explicit) => {
+                    assert!(!refused, "{case}");
+                    assert_eq!(explicit.kind, Herdr, "{case}");
+                    assert_eq!(
+                        explicit.initial_transport.facts().name,
+                        automatic.initial_transport.facts().name,
+                        "{case}"
+                    );
+                }
+                Err(error) => {
+                    assert!(refused, "{case}");
+                    assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
+                    assert_eq!(
+                        format!("{error:#}"),
+                        format!("{:#}", automatic.herdr_refusal.unwrap()),
+                        "{case}"
+                    );
+                }
+            }
+            let selected = admit_choice(provider, Selection::Kind(fallback), version).unwrap();
+            assert_eq!(selected.kind, fallback, "{case}");
+            assert!(selected.herdr_refusal.is_none(), "{case}");
+        }
+    }
 }
 
 // Post-probe surface admission hands its selected initial Transport straight into Resolved
@@ -1409,7 +1552,11 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
             context_results: Vec::new(),
         };
         resolve_with(
-            fresh_resolution(&ask, context::resolve(&[]).unwrap(), surface),
+            fresh_resolution(
+                &ask,
+                context::resolve(&[]).unwrap(),
+                terminal::Selection::Kind(surface),
+            ),
             |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
         )
         .unwrap()

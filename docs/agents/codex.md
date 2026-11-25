@@ -9,7 +9,9 @@
   `--no-daemon`, so tool processes retain the hc terminal identity instead of running
   in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
   Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
-  session or terminal exists; `prepare_launch` applies the same decision from the recorded
+  session or terminal exists: an explicit `--terminal herdr` fails with that refusal, and an
+  automatic Herdr choice inside hc takes the OS's own terminal instead
+  (`session_start::admit_choice`); `prepare_launch` applies the same decision from the recorded
   surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. That gate reads
   the version text by one grammar (`herdr_codex_version`). The label is the word
   `codex-cli`, the start of every Codex `--version` output this repository records
@@ -44,8 +46,10 @@
   `terminal.send` cannot do, and the launch-argument route above would put the multi-line
   framed prompt on a Windows command line (32,767 characters; 8,191 and no line break
   through an npm `codex.cmd`).
-  Inside an hc terminal the automatic choice for Codex stays the managed console. Replace the
-  refusal with a Windows Herdr route that keeps argument semantics and size, or a
+  Inside an hc terminal the automatic choice for Codex is therefore the managed console, the
+  fallback every OS uses for a provider Herdr does not admit (on macOS and Linux, a Codex below
+  stable 0.169.0 gets Ghostty or tmux the same way; an explicit `--terminal herdr` is refused).
+  Replace the refusal with a Windows Herdr route that keeps argument semantics and size, or a
   first-party addressed input.
 
 - The injected Windows initial paste is a bounded best-effort console fallback (#124),

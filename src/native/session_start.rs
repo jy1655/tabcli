@@ -196,8 +196,9 @@ pub(super) struct Resolution<'a> {
     pub(super) yolo: bool,
     pub(super) prompt: String,
     // Chosen by `choose_launch_surface` at the command's own place in its order: `ask` after
-    // its context resolution, `reopen` before it inspects the source.
-    pub(super) terminal_kind: terminal::TerminalKind,
+    // its context resolution, `reopen` before it inspects the source. The resolution decides
+    // an automatic Herdr choice with the provider (`admit_choice`).
+    pub(super) surface: terminal::Selection,
     pub(super) context_sources: Vec<requests::ContextSource>,
     // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
     pub(super) workspace_noun: &'static str,
@@ -208,8 +209,9 @@ pub(super) struct Resolution<'a> {
 
 // The launchable spec of a start, after the command selected its terminal, in this order:
 // platform surface admission, the canonical workspace directory, state root and launch
-// admission, provider executable and version, version-aware surface admission, title, and
-// workspace consent. Nothing is created, so a failure changes nothing.
+// admission, provider executable and version, version-aware surface admission (which decides
+// an automatic Herdr choice), title, and workspace consent. Nothing is created, so a failure
+// changes nothing.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
     resolve_with(resolution, |provider| {
         let provider_path = resolve_provider(provider)?;
@@ -235,14 +237,15 @@ pub(super) fn resolve_with(
         effort,
         yolo,
         prompt,
-        terminal_kind,
+        surface,
         context_sources,
         workspace_noun,
         admission_refusal,
     } = resolution;
     // A surface the provider's adapter cannot run on at all on this platform is refused
-    // before anything is resolved or probed.
-    let _ = crate::native::provider::admit_surface(provider, terminal_kind, None)?;
+    // before anything is resolved or probed; an automatic Herdr choice it cannot run on takes
+    // its fallback instead.
+    admit_choice(provider, surface, None)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -259,11 +262,15 @@ pub(super) fn resolve_with(
         .and_then(|root| admission::check(&root, &workspace).map(|()| root))
         .map_err(admission_refusal)?;
     let (provider_path, provider_version) = probe(provider)?;
-    // Once the installed CLI version is known, re-admit the surface with it so any
-    // surface-specific version floor refuses before title, consent, session, or surface
-    // creation, and keep the initial Transport this decision selected for delivery.
-    let initial_transport =
-        crate::native::provider::admit_surface(provider, terminal_kind, Some(&provider_version))?;
+    // Once the installed CLI version is known, the choice is made again with it, before
+    // title, consent, session, or surface creation: a surface-specific version floor refuses
+    // an explicit choice and gives an automatic Herdr choice its fallback. The admitted
+    // Surface's initial Transport is kept for delivery.
+    let Admitted {
+        kind: terminal_kind,
+        initial_transport,
+        ..
+    } = admit_choice(provider, surface, Some(&provider_version))?;
     let requested_title = title.unwrap_or_else(|| {
         let workspace_name = workspace
             .file_name()
@@ -302,50 +309,91 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
-    let terminal_kind = choose_launch_surface(request.terminal, Some(request.provider))?;
-    resolve(fresh_resolution(request, attached, terminal_kind), deadline)
+    let surface = choose_launch_surface(request.terminal, Some(request.provider))?;
+    resolve(fresh_resolution(request, attached, surface), deadline)
 }
 
-// The kind of Surface a launch will start on, the one entry of `ask` and `reopen`, each at
-// its own place in its order (`Resolution::terminal_kind`). It creates nothing. An explicit
-// `--terminal` (`requested`) wins; otherwise `select_surface` chooses from the caller's
-// environment, and an automatic Herdr choice must then prove that this process runs in the
-// caller's Herdr terminal on the running core (`terminal::admit_selection`, the only step
-// that opens a connection). An explicit choice is not checked against the caller.
-// `provider` is `None` while it is not known: a reopen selects before it reads its source,
-// so on Windows its automatic choice is the managed console.
+// The terminal a launch will start on, the one entry of `ask` and `reopen`, each at its own
+// place in its order (`Resolution::surface`). It creates nothing, and it is the same on every
+// platform. An explicit `--terminal` (`requested`) wins; otherwise the caller's environment
+// selects (`terminal::select_for`): inside an hc terminal Herdr, with the Surface this
+// platform chooses outside Herdr as its fallback, and elsewhere that Surface.
 //
-// The provider's own admission of the Surface follows in `resolve`, once the provider is
-// known: before the workspace, and again with the probed version. On Windows an automatic
-// Herdr choice is made only where that same pre-probe answer accepts it, so the first
-// admission cannot refuse it there. On macOS and Linux the automatic choice does not depend
-// on the provider's answer, and the versioned admission can refuse an automatic Herdr choice
-// that passed the caller check (Codex below 0.169.0).
+// An automatic Herdr choice must prove that this process runs in the caller's Herdr terminal
+// on the running core (`terminal::admit_selection`, the only step that opens a connection),
+// or the launch is refused without opening another terminal. That check is skipped only
+// where the provider's adapter refuses Herdr on this platform for every version (Codex on
+// Windows, whose initial prompt needs the managed console): the choice is then its fallback,
+// which needs no Herdr caller. `provider` is `None` while it is not known (a reopen selects
+// before it reads its source), and the caller is then checked. An explicit choice is not
+// checked against the caller.
+//
+// `resolve` then decides with the provider (`admit_choice`), before the workspace and again
+// with the probed version: an automatic Herdr choice is Herdr where the adapter admits it,
+// and its fallback otherwise; an explicit choice the adapter does not admit is refused.
 pub(super) fn choose_launch_surface(
     requested: Option<terminal::TerminalKind>,
     provider: Option<FirstPartyCli>,
-) -> Result<terminal::TerminalKind> {
-    let selected = select_surface(requested, provider)?;
-    terminal::admit_selection(requested, selected)?;
-    Ok(selected)
+) -> Result<terminal::Selection> {
+    let selection = terminal::select_for(requested)?;
+    if provider.is_none_or(|provider| {
+        crate::native::provider::surface_support(provider, terminal::TerminalKind::Herdr).is_ok()
+    }) {
+        terminal::admit_selection(selection)?;
+    }
+    Ok(selection)
 }
 
-// The selection alone, without any admission; `doctor` reports it. It reads the environment
-// and, for a known provider, the adapter's Herdr answer before any version probe, which only
-// Windows uses to choose (Herdr inside hc only where the provider runs there); it opens
-// nothing. So it can name a Surface that `ask` then refuses: an automatic Herdr whose caller
-// check fails, or a provider version below the Surface's floor.
-pub(super) fn select_surface(
-    requested: Option<terminal::TerminalKind>,
-    provider: Option<FirstPartyCli>,
-) -> Result<terminal::TerminalKind> {
-    terminal::select_for(
-        requested,
-        provider.map(|provider| {
-            crate::native::provider::surface_support(provider, terminal::TerminalKind::Herdr)
-                .is_ok()
-        }),
-    )
+// The Surface a selection gives a provider, and the initial Transport its adapter selected
+// there.
+pub(super) struct Admitted {
+    pub(super) kind: terminal::TerminalKind,
+    pub(super) initial_transport: Box<dyn delivery::Transport>,
+    // Why an automatic Herdr choice took its fallback (`kind`), when it did.
+    pub(super) herdr_refusal: Option<anyhow::Error>,
+}
+
+// The provider's admission of a selection. `version` is `None` before the CLI version is
+// probed and `Some` once it is known. A selected kind is admitted or refused as it is, so an
+// explicit `--terminal herdr` keeps its refusal; an automatic Herdr choice is Herdr where the
+// adapter admits it, and otherwise its fallback, admitted the same way.
+pub(super) fn admit_choice(
+    provider: FirstPartyCli,
+    selection: terminal::Selection,
+    version: Option<&str>,
+) -> Result<Admitted> {
+    use crate::native::provider::admit_surface;
+    let (kind, herdr_refusal) = match selection {
+        terminal::Selection::Kind(kind) => (kind, None),
+        terminal::Selection::Herdr { fallback } => {
+            match admit_surface(provider, terminal::TerminalKind::Herdr, version) {
+                Ok(initial_transport) => {
+                    return Ok(Admitted {
+                        kind: terminal::TerminalKind::Herdr,
+                        initial_transport,
+                        herdr_refusal: None,
+                    });
+                }
+                Err(refusal) => (fallback, Some(refusal)),
+            }
+        }
+    };
+    Ok(Admitted {
+        kind,
+        initial_transport: admit_surface(provider, kind, version)?,
+        herdr_refusal,
+    })
+}
+
+// What `ask` would start `provider` on without `--terminal`, for `doctor`: the selection and
+// its admission with `version`, the probed version when doctor read one. It opens nothing:
+// the caller check of an automatic Herdr choice is not run.
+pub(super) fn automatic_surface(
+    provider: FirstPartyCli,
+    version: Option<&str>,
+) -> Result<(terminal::Selection, Admitted)> {
+    let selection = terminal::select_for(None)?;
+    Ok((selection, admit_choice(provider, selection, version)?))
 }
 
 // A fresh start's resolution: consent sees the workspace as requested, the default title
@@ -354,7 +402,7 @@ pub(super) fn select_surface(
 pub(super) fn fresh_resolution(
     request: &AskRequest,
     attached: context::ResolvedContext,
-    terminal_kind: terminal::TerminalKind,
+    surface: terminal::Selection,
 ) -> Resolution<'_> {
     Resolution {
         provider: request.provider,
@@ -366,7 +414,7 @@ pub(super) fn fresh_resolution(
         effort: request.effort.clone(),
         yolo: request.yolo,
         prompt: attached.prompt_with_attachments(&request.prompt),
-        terminal_kind,
+        surface,
         context_sources: attached.sources,
         workspace_noun: "workspace",
         admission_refusal: std::convert::identity,

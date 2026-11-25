@@ -1277,6 +1277,13 @@ The report starts human output with `scope`, describing the inputs used by these
 
 Scope is not proof of an effective runtime configuration or of delivery.
 
+In provider mode the `terminal_selection` check reports, as `evidence.terminal`, the terminal
+`ask` would choose without `--terminal`. Inside an hc terminal it also has `evidence.fallback`,
+the terminal used where Herdr does not admit the provider. With `--probe` the choice uses the
+version read; without it, `terminal` is `herdr` unless the provider is refused on Herdr for
+every version, and the detail names the fallback a refused version would get. Doctor never
+checks that it runs inside the calling Herdr terminal, which `ask` does before choosing Herdr.
+
 On Linux, the `platform` check reports a supported platform. When the default selection is tmux, the `tmux` check reports
 `tmux_found`, `tmux_too_old`, or `tmux_unavailable`. tmux must be executable on an absolute
 `PATH` entry and at least version 3.2. As with provider versions, `tmux -V` runs only with
@@ -1961,8 +1968,10 @@ Provider trust lookup follows these environment settings:
 - `CLAUDE_CONFIG_DIR`: read `.claude.json` here; the default directory is home.
 - `PI_CODING_AGENT_DIR`: read `trust.json` here; the default is `.pi/agent` under home.
 
-On Linux and macOS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr.
-On Windows they select Herdr for Claude, Agy and Pi; Codex keeps the managed console.
+On every OS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr
+for a provider that can run there at its installed version, and otherwise the terminal the OS
+would choose without them: Ghostty on macOS, tmux on Linux, the managed console on Windows
+(Codex below stable 0.169.0 on macOS and Linux, and Codex on Windows).
 Otherwise Linux uses tmux. On macOS,
 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, and `TERM_SESSION_ID` select the terminal as
 described under [terminal selection](terminals.md#selection-and-settings).
