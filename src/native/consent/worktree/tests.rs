@@ -389,3 +389,49 @@ fn no_link_on_the_way_counts() {
         format!("{} is a link", fixture.repository.join(".git").display())
     );
 }
+
+// On Windows a junction is a link too: a registration reached through one, and a `.git`
+// directory that is one, do not verify. Junctions need no privilege, unlike symbolic links.
+#[cfg(windows)]
+#[test]
+fn a_junction_on_the_way_is_a_link() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    let junction = |link: &Path, target: &Path| {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(native_key(link).unwrap())
+            .arg(native_key(target).unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J");
+    };
+    let pointer = fixture.worktree.join(".git");
+    let alias = root.join("alias");
+    junction(&alias, &fixture.repository);
+    fs::write(
+        &pointer,
+        format!(
+            "gitdir: {}\n",
+            git_path(&alias.join(".git/worktrees/worktree"))
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        main_worktree(&fixture.worktree).unwrap_err().to_string(),
+        format!("{} is a link", git_path(&alias))
+    );
+    fs::write(
+        &pointer,
+        format!("gitdir: {}\n", git_path(&fixture.registration)),
+    )
+    .unwrap();
+    assert!(main_worktree(&fixture.worktree).unwrap().is_some());
+    let real = root.join("real-git");
+    fs::rename(fixture.repository.join(".git"), &real).unwrap();
+    junction(&fixture.repository.join(".git"), &real);
+    assert_eq!(
+        main_worktree(&fixture.worktree).unwrap_err().to_string(),
+        format!("{} is a link", git_path(&fixture.repository.join(".git")))
+    );
+}
