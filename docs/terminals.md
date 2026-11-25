@@ -19,25 +19,27 @@ The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmu
 `console`, and `hc` or `herdr-core` (Herdr). Structured output names Terminal.app `apple-terminal`.
 
 Inside an hc terminal (`TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`, which hc gives
-every program) TAB chooses the same way on every OS unless `--terminal` says otherwise. It first
-verifies that the command runs in that Herdr terminal on the running core; failed verification
-refuses the launch instead of opening another terminal. It then uses Herdr when the provider,
-at its installed version, can run there, and otherwise the terminal the OS would choose
-outside Herdr: Ghostty on macOS (hc names it in `TERM_PROGRAM`), tmux on Linux and the managed
-console on Windows. Today that fallback applies to Codex below stable 0.169.0 on macOS and
-Linux, and to every Codex on Windows, where TAB skips the verification because Codex cannot run
-on Windows Herdr at any version. An explicit `--terminal herdr` that the provider cannot use is
-refused instead. The fallback terminal must be usable: a Mac without Ghostty, for example,
-fails when TAB opens it, as an explicit `--terminal ghostty` would. `tabcli doctor --provider
-<provider> --probe` reports the terminal `ask` would choose and its fallback.
+every program) TAB chooses the same way on every OS unless `--terminal` says otherwise. It uses
+Herdr when the provider, at its installed version, can run there, and otherwise the terminal
+the OS chooses with the Herdr marker ignored: Ghostty on macOS (hc names it in
+`TERM_PROGRAM`), tmux on Linux and the managed console on Windows. Today that fallback applies
+to Codex below stable 0.169.0 on macOS and Linux, and to every Codex on Windows. Before it uses
+Herdr, TAB verifies that the command runs in that Herdr terminal on the running core; failed
+verification refuses the launch instead of opening another terminal. A launch on the fallback
+needs no verification. An explicit `--terminal herdr` that the provider cannot use is refused
+instead. The fallback terminal must be usable: a Mac without Ghostty, for example, fails when
+TAB opens it, as an explicit `--terminal ghostty` would. `tabcli doctor --provider <provider>
+--probe`, run from the directory you launch from, reports the terminal `ask` would choose and
+its fallback.
 
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Outside hc, Linux uses tmux.
 
 On Windows, `--terminal herdr` selects a running local Herdr Core. Codex is refused there before
 any session exists, because its Windows initial prompt needs the managed console. Inside an hc
-terminal the automatic choice is Herdr for Claude, Agy and Pi, `reopen` included, and the
-managed console for Codex.
+terminal the automatic choice is Herdr for Claude, Agy and Pi, and the managed console for
+Codex. A `reopen` of an eligible Claude session, the only provider that can reopen there, gets
+Herdr the same way.
 
 On macOS an explicit option wins. Inside hc TAB chooses as described above. Otherwise TAB
 examines `TERM_PROGRAM`, recognizing those

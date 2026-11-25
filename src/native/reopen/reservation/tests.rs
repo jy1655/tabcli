@@ -4085,6 +4085,110 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
     );
 }
 
+// Inside a Herdr terminal whose caller cannot be verified (no core answers), a reopen of an
+// eligible closed Claude source reaches the Surface decision only after its source and its
+// provider's reopen support: on macOS and Linux Claude cannot reopen, and that is the refusal.
+// On Windows the source is eligible, the version is probed, and only then is the caller
+// checked, because the automatic choice is Herdr; an explicit managed console goes on to the
+// title. Nothing is created and the source is untouched.
+#[test]
+fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
+    const CHILD: &str = "TABCLI_REOPEN_SURFACE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let bin = base.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // A Claude that only answers `--version`.
+        #[cfg(windows)]
+        fs::write(bin.join("claude.cmd"), "@echo off\r\necho 2.1.302\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let claude = bin.join("claude");
+            fs::write(&claude, "#!/bin/sh\necho 2.1.302\n").unwrap();
+            fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut path = vec![bin];
+        #[cfg(windows)]
+        path.push(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"));
+        #[cfg(unix)]
+        path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        #[cfg(windows)]
+        let absent_core = format!(r"\\.\pipe\tabcli-reopen-surface-{}", std::process::id());
+        #[cfg(unix)]
+        let absent_core = base.path().join("absent.sock").display().to_string();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::reopen::reservation::tests::an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
+            .env("CODEX_HOME", base.path().join("codex"))
+            .env("CLAUDE_CONFIG_DIR", base.path().join("claude"))
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("HC_TERMINAL_ID", "t7")
+            .env("TERM_PROGRAM", "ghostty")
+            .env("HC_SOCKET", absent_core)
+            .env_remove("HC_SESSION")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let registry = root.parent().unwrap().join("claude-sessions");
+    fs::create_dir_all(&registry).unwrap();
+    provider::claude::override_session_registry_for_test(Some(registry));
+    let fixture = start_source_fixture(&root);
+    let directory = fixture.source_directory;
+    let before = snapshot_directory(&directory);
+    let reopen = |terminal| {
+        let request = ReopenRequest {
+            id: fixture.source_id.clone(),
+            prompt: "new prompt".into(),
+            title: Some("   ".into()),
+            model: None,
+            effort: None,
+            terminal,
+            yolo: false,
+            timeout: Duration::from_secs(30),
+            detach: false,
+            json: false,
+        };
+        ResolvedReopen::resolve(request, Instant::now() + Duration::from_secs(30))
+            .err()
+            .expect("reopen must be refused")
+    };
+    let automatic = reopen(None);
+    let console = cfg!(windows).then(|| reopen(Some(terminal::TerminalKind::WindowsConsole)));
+    provider::claude::override_session_registry_for_test(None);
+    if cfg!(windows) {
+        let text = format!("{automatic:#}");
+        assert!(text.starts_with("no Herdr Core is running at "), "{text}");
+        assert!(
+            text.ends_with("the automatic choice of Herdr was refused and no other terminal was opened. Run inside Herdr, or choose a terminal with --terminal"),
+            "{text}"
+        );
+        assert_eq!(reopen_refusal_gate(&automatic), None);
+        assert_eq!(format!("{:#}", console.unwrap()), "--title cannot be empty");
+    } else {
+        assert_eq!(
+            reopen_refusal_gate(&automatic),
+            Some(ReopenGate::ProviderUnsupported),
+            "{automatic:#}"
+        );
+    }
+    assert_eq!(snapshot_directory(&directory), before);
+    assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());
+}
+
 // A follow-up refused before anything was sent settles as the receipt's failed event, so
 // the reopen receipt gate accepts the closed session and resumes the older completed turn's
 // conversation; the refusal carries no provider identity and erases none.

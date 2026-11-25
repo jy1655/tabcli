@@ -548,15 +548,66 @@ fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
     assert!(read_pending_turn(&directory).unwrap().is_none());
 }
 
+// The readers of the released wrappers, frozen to state the handoffs of a pending launch:
+// what a wrapper of that release does with a Herdr record another release wrote. Each answers
+// whether the release launches Codex on Herdr with the recorded `--version` text.
+mod released {
+    use semver::Version;
+
+    const FLOOR: Version = Version::new(0, 169, 0);
+
+    fn admitted(version: Option<Version>) -> bool {
+        version.is_some_and(|version| version >= FLOOR && version.pre.is_empty())
+    }
+
+    // 0.4.48: the first token that parses once its surrounding punctuation and one leading
+    // `v` are removed.
+    pub(super) fn v0_4_48(text: &str) -> bool {
+        admitted(text.split_whitespace().find_map(|token| {
+            let trimmed = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+            Version::parse(trimmed.strip_prefix('v').unwrap_or(trimmed)).ok()
+        }))
+    }
+
+    // 0.4.49: the word after a single `codex-cli` label, or a text of one word, read whole.
+    pub(super) fn v0_4_49(text: &str) -> bool {
+        let lines = text
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let labels = lines
+            .iter()
+            .flat_map(|words| {
+                words
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, word)| **word == "codex-cli")
+                    .map(move |(index, _)| words.get(index + 1).copied())
+            })
+            .collect::<Vec<_>>();
+        let field = match labels.as_slice() {
+            [Some(field)] => *field,
+            [] => match lines.concat().as_slice() {
+                [word] => *word,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        admitted(Version::parse(field.strip_prefix('v').unwrap_or(field)).ok())
+    }
+}
+
 // The Herdr gate's version grammar (`herdr_codex_version`) as a table over its dimensions,
-// each cell checked through pre-creation admission and the recorded-launch check:
+// each cell checked through pre-creation admission and the recorded-launch check, which
+// always agree:
 // - label present once: the verdict is the field's, whatever precedes the label (nothing, a
 //   warning line, a timestamp on the label's line, a timestamped warning line, another
 //   program's version or a prerelease on its own line) and whatever follows the field
 //   (nothing, another version on its line, another version line);
-// - label absent: one bare word is read as the field; a longer text is read as the launch
-//   check of 0.4.48 read it (the first word that parses once its surrounding punctuation and
-//   one leading `v` are removed), whatever program that word belongs to;
+// - label absent: each word is read as the launch check of 0.4.48 read it (surrounding
+//   punctuation and one leading `v` removed), and the text names a version only when exactly
+//   one of its words reads as one; two or more such words, the same version twice included,
+//   are refused as ambiguous, and none is refused (owner's decisions 4B and B2, 2026-11-26);
 // - label layout: a second label, or a label without a field on its line, refuses.
 #[test]
 fn herdr_version_grammar_reads_only_the_labelled_field() {
@@ -610,9 +661,9 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         }
     };
 
-    // The field; whether Herdr admits it read whole (labelled, or alone); and how the
-    // reading of 0.4.48, which removes surrounding punctuation, takes it in a longer
-    // unlabelled text: admitted, refused, or not a version at all (`None`).
+    // The field; whether Herdr admits it read whole after the label; and how the word reading
+    // of 0.4.48, which removes surrounding punctuation, takes it: a version Herdr admits, one
+    // it refuses, or not a version at all (`None`).
     let fields = [
         ("0.169.0", true, Some(true)),           // stable, at the floor
         ("0.170.0", true, Some(true)),           // stable, above the floor
@@ -641,27 +692,26 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         " (protocol 0.1.0)",
         "\nnode v22.0.0",
     ];
-    for (field, admitted, legacy) in fields {
+    for (field, admitted, word) in fields {
         for prefix in before {
             for suffix in after {
                 let text = format!("{prefix}codex-cli {field}{suffix}");
                 assert_eq!(admits(&text), admitted, "{text:?}");
             }
         }
-        // Without the label one word is read whole, as the field.
-        assert_eq!(admits(field), admitted, "{field:?}");
-        assert_eq!(admits(&format!("\n{field}\n")), admitted, "{field:?}");
-        // A longer unlabelled text is read as 0.4.48 read it: its first word that parses
-        // once trimmed decides, even another program's version (owner's decision,
-        // 2026-11-26).
-        let legacy_admitted = legacy == Some(true);
+        // Without the label the field decides when it is the only word that reads as a
+        // version. Beside another version (`22.0.0` here, or the field repeated) the text is
+        // ambiguous; where the field is no version, that other version is the only one.
+        let alone = word == Some(true);
+        let other_alone = word.is_none();
         for (unlabelled, expected) in [
-            (format!("codex {field}"), legacy_admitted),
-            (format!("OpenAI Codex ({field})"), legacy_admitted),
-            // Where the field does not parse, `22.0.0` is the first version.
-            (format!("{field} (runtime 22.0.0)"), legacy.unwrap_or(true)),
-            // `v22.0.0` comes first and is read, whatever the field says.
-            (format!("node v22.0.0\n{field}"), true),
+            (field.to_owned(), alone),
+            (format!("\n{field}\n"), alone),
+            (format!("codex {field}"), alone),
+            (format!("OpenAI Codex ({field})"), alone),
+            (format!("{field} (runtime 22.0.0)"), other_alone),
+            (format!("node v22.0.0\n{field}"), other_alone),
+            (format!("codex {field} ({field})"), false),
         ] {
             assert_eq!(admits(&unlabelled), expected, "{unlabelled:?}");
         }
@@ -675,6 +725,78 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         }
     }
     assert!(!admits("codex-cli"));
+    assert!(!admits(""));
+}
+
+// A pending Herdr launch can be started by a wrapper of another release than the one that
+// recorded it (the binary at the launch's executable path was replaced in between). This
+// build's wrapper and admission read the recorded text by one rule, so each direction has a
+// restriction, stated in docs/agents/codex.md.
+#[test]
+fn pending_herdr_launches_across_the_wrapper_handoff() {
+    use terminal::TerminalKind;
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    let store = Store::open_unchecked(&directory);
+    store
+        .private("terminal.json")
+        .write_json(&serde_json::json!({"terminal":"herdr","session_id":"t1"}))
+        .unwrap();
+    let launches = |text: &str| {
+        store
+            .private("manifest.json")
+            .write_json(&serde_json::json!({
+                "schema": 1, "id": "session-hooks", "provider": "codex", "provider_path": "codex",
+                "provider_version": text, "workspace": root.path(), "title": "hooks fixture",
+                "yolo": false, "created_unix_ms": 1
+            }))
+            .unwrap();
+        let launched = recorded_surface_route(&directory, false)
+            .is_ok_and(|route| route == SurfaceRoute::LaunchArgument { no_daemon: true });
+        assert_eq!(
+            launched,
+            surface_route(false, TerminalKind::Herdr, Some(text)).is_ok(),
+            "{text:?}"
+        );
+        launched
+    };
+    // Recorded by 0.4.48, whose wrapper admitted them: this build's wrapper launches the
+    // first group and refuses the second (a labelled field that is not SemVer as written,
+    // a label preceded by another version, unlabelled text with several versions).
+    for (text, launched) in [
+        ("(0.170.0)", true),
+        ("0.170.0+", true),
+        ("OpenAI Codex (v0.170.0)", true),
+        ("codex-cli 0.170.0", true),
+        ("codex-cli 0.170.0+", false),
+        ("node v22.0.0\ncodex-cli 0.168.0", false),
+        ("node v22.0.0\nOpenAI Codex (v0.170.0)", false),
+    ] {
+        assert!(released::v0_4_48(text), "{text:?}");
+        assert_eq!(launches(text), launched, "{text:?}");
+    }
+    // Recorded and admitted by this build: a 0.4.49 wrapper launches labelled text and a
+    // single SemVer word, and refuses other unlabelled text.
+    for (text, by_0_4_49) in [
+        ("codex-cli 0.170.0", true),
+        ("0.170.0", true),
+        ("plugin 0.160.0\ncodex-cli 0.170.0", true),
+        ("OpenAI Codex (v0.170.0)", false),
+        ("(0.170.0)", false),
+        ("0.170.0+", false),
+        ("codex 0.170.0", false),
+    ] {
+        assert!(launches(text), "{text:?}");
+        assert_eq!(released::v0_4_49(text), by_0_4_49, "{text:?}");
+    }
+    // Refused by every release.
+    for text in ["codex-cli 0.168.0", "OpenAI Codex (v0.168.0)", "unknown"] {
+        assert!(!launches(text), "{text:?}");
+        assert!(
+            !released::v0_4_48(text) && !released::v0_4_49(text),
+            "{text:?}"
+        );
+    }
 }
 
 // Each refusal of the grammar names what refused: the field's own parse error, a missing
@@ -689,7 +811,6 @@ fn herdr_version_refusals_name_the_rule_that_refused() {
             "2026-11-25T10:00:00Z codex-cli 0.170.0. (runtime 22.0.0)",
             "0.170.0.",
         ),
-        ("unknown", "unknown"),
     ] {
         let error = refusal(text);
         assert!(
@@ -699,17 +820,29 @@ fn herdr_version_refusals_name_the_rule_that_refused() {
             "{text:?}: {error}"
         );
     }
-    // Unlabelled text of more than one word is read as 0.4.48 read it, and refused only when
-    // none of its words parses; an empty text has no word to read.
+    // Unlabelled text, one word or more, names a version when exactly one word reads as one
+    // the way 0.4.48 read words; with none it is refused, with several it is ambiguous.
+    for text in ["OpenAI Codex (v0.170.0)", "(0.170.0)", "0.170.0+"] {
+        assert_eq!(
+            herdr_codex_version(text).unwrap(),
+            Version::new(0, 170, 0),
+            "{text}"
+        );
+    }
+    for text in ["OpenAI Codex (unknown)", "unknown", ""] {
+        assert_eq!(
+            refusal(text),
+            format!("found no `codex-cli` label and no version in {text:?}")
+        );
+    }
     assert_eq!(
-        herdr_codex_version("OpenAI Codex (v0.170.0)").unwrap(),
-        Version::new(0, 170, 0)
+        refusal("node v22.0.0\nOpenAI Codex (v0.170.0)"),
+        "found no `codex-cli` label and 2 versions (22.0.0, 0.170.0) in \"node v22.0.0\\nOpenAI Codex (v0.170.0)\"; TAB does not guess which one is Codex's"
     );
     assert_eq!(
-        refusal("OpenAI Codex (unknown)"),
-        "could not parse a semantic Codex version from \"OpenAI Codex (unknown)\""
+        refusal("codex 0.170.0 (v0.170.0)"),
+        "found no `codex-cli` label and 2 versions (0.170.0, 0.170.0) in \"codex 0.170.0 (v0.170.0)\"; TAB does not guess which one is Codex's"
     );
-    assert_eq!(refusal(""), "found no `codex-cli` version label in \"\"");
     assert_eq!(
         refusal("codex-cli\n0.170.0"),
         "the `codex-cli` label has no version after it on its line in \"codex-cli\\n0.170.0\""

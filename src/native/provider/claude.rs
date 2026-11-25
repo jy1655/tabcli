@@ -277,6 +277,14 @@ impl NativeProviderAdapter for ClaudeAdapter {
     ) -> super::SurfaceSupport {
         Ok(Box::new(ClaudeMessage))
     }
+
+    // Claude runs on every surface at every supported version.
+    fn surface_version_requirement(
+        &self,
+        _surface: crate::native::terminal::TerminalKind,
+    ) -> Option<String> {
+        None
+    }
 }
 
 struct ClaudeReopen;

@@ -1,9 +1,9 @@
 # Current Linux Surface Boundary
 
 - Linux supports tmux and a running local [Herdr Core](herdr.md). Inside an hc terminal,
-  automatic selection verifies the caller on that core and chooses Herdr, or tmux where the
-  provider's version is not admitted on Herdr (the rule every OS shares). Elsewhere it
-  defaults to tmux.
+  automatic selection chooses Herdr, after verifying the caller on that core, where the
+  provider's version is admitted on Herdr, and tmux otherwise (the rule every OS shares).
+  Elsewhere it defaults to tmux.
   tmux requires version 3.2+ on an absolute PATH entry and uses its canonical path.
   WSL is not verified. The tmux server rules below apply only to tmux.
 - One server belongs to one managed session (owner's decision). Keep its socket at

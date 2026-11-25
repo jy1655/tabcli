@@ -560,6 +560,7 @@ mod resolution {
                             terminal::Selection::Kind(SELECTED),
                         ),
                         probe,
+                        explicit_caller,
                     )
                 }
                 Self::Reopen => {
@@ -583,6 +584,7 @@ mod resolution {
                             terminal::Selection::Kind(SELECTED),
                         ),
                         probe,
+                        explicit_caller,
                     )
                 }
             }
@@ -1229,6 +1231,7 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
                     Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
                     None => panic!("probe must not run before early refusal"),
                 },
+                explicit_caller,
             )
         };
     let assert_no_sessions = || {
@@ -1364,9 +1367,12 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
     // probed version, the same way on every platform: Herdr where the adapter admits it, and
     // otherwise the Surface this platform chooses outside Herdr, with that Surface's own
     // initial Transport. Neither admission refuses it: the workspace is still the first error.
+    // The caller is checked after the versioned admission and only for a launch on Herdr; its
+    // refusal ends the resolution before the title.
     let fallback = platform_fallback();
-    let automatic = |provider, workspace: &Path, version: Option<&str>| {
-        let ask = request(provider, workspace, None);
+    let checks = std::cell::Cell::new(0);
+    let automatic = |provider, workspace: &Path, version: Option<&str>, caller_ok: bool| {
+        let ask = request(provider, workspace, Some("   "));
         resolve_with(
             fresh_resolution(
                 &ask,
@@ -1377,24 +1383,67 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
                 Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
                 None => panic!("the probe must not run before the workspace is resolved"),
             },
+            |selection| {
+                assert_eq!(selection, terminal::Selection::Herdr { fallback });
+                checks.set(checks.get() + 1);
+                if caller_ok {
+                    Ok(())
+                } else {
+                    bail!("the caller check refused")
+                }
+            },
         )
     };
-    let error = automatic(FirstPartyCli::Codex, &missing, None)
+    let error = automatic(FirstPartyCli::Codex, &missing, None, false)
         .err()
         .expect("a missing workspace refuses");
     assert!(
         error.to_string().contains("workspace does not exist"),
         "{error:#}"
     );
-    for (version, herdr) in [
-        ("codex-cli 0.169.0", !cfg!(windows)),
-        ("OpenAI Codex (v0.170.0)", !cfg!(windows)),
-        ("codex-cli 0.168.0", false),
-        ("codex-cli 0.170.0-alpha.1", false),
-        ("codex-cli 0.170.0+", false),
+    assert_eq!(checks.get(), 0);
+    for (provider, version, herdr) in [
+        (FirstPartyCli::Codex, "codex-cli 0.169.0", !cfg!(windows)),
+        (
+            FirstPartyCli::Codex,
+            "OpenAI Codex (v0.170.0)",
+            !cfg!(windows),
+        ),
+        (FirstPartyCli::Codex, "codex-cli 0.168.0", false),
+        (FirstPartyCli::Codex, "codex-cli 0.170.0-alpha.1", false),
+        (FirstPartyCli::Codex, "codex-cli 0.170.0+", false),
+        (FirstPartyCli::Claude, "2.1.302", true),
+        (FirstPartyCli::Agy, "fixture", true),
+        (FirstPartyCli::Pi, "fixture", true),
     ] {
-        let resolved = automatic(FirstPartyCli::Codex, &project, Some(version))
-            .unwrap_or_else(|error| panic!("{version}: {error:#}"));
+        let case = format!("{provider:?} {version}");
+        // A caller that fails the check refuses only a launch on Herdr.
+        let before = checks.get();
+        let refused = automatic(provider, &project, Some(version), false)
+            .err()
+            .expect("the blank title or the caller check refuses");
+        assert_eq!(checks.get(), before + usize::from(herdr), "{case}");
+        assert_eq!(
+            refused.to_string(),
+            if herdr {
+                "the caller check refused"
+            } else {
+                "--title cannot be empty"
+            },
+            "{case}"
+        );
+        // A verified caller: the Surface and its initial Transport.
+        let ask = request(provider, &project, None);
+        let resolved = resolve_with(
+            fresh_resolution(
+                &ask,
+                context::resolve(&[]).unwrap(),
+                terminal::Selection::Herdr { fallback },
+            ),
+            |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+            |_| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("{case}: {error:#}"));
         assert_eq!(
             resolved.terminal_kind,
             if herdr {
@@ -1402,28 +1451,26 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             } else {
                 fallback
             },
-            "{version}"
+            "{case}"
         );
-        assert_eq!(
-            resolved.initial_transport.facts().name,
-            if cfg!(windows) {
-                "terminal-paste-fallback"
-            } else {
-                "launch-argument"
-            },
-            "{version}"
-        );
-    }
-    for provider in [FirstPartyCli::Claude, FirstPartyCli::Agy, FirstPartyCli::Pi] {
-        assert_eq!(
-            automatic(provider, &project, Some("fixture"))
-                .unwrap()
-                .terminal_kind,
-            terminal::TerminalKind::Herdr,
-            "{provider:?}"
-        );
+        if provider == FirstPartyCli::Codex {
+            assert_eq!(
+                resolved.initial_transport.facts().name,
+                if cfg!(windows) {
+                    "terminal-paste-fallback"
+                } else {
+                    "launch-argument"
+                },
+                "{case}"
+            );
+        }
     }
     assert_no_sessions();
+}
+
+// An explicit choice, or an automatic one outside hc, is never checked against the caller.
+fn explicit_caller(selection: terminal::Selection) -> Result<()> {
+    panic!("{selection:?} is not checked against the caller")
 }
 
 // The Surface this platform chooses outside Herdr, the fallback of an automatic Herdr choice
@@ -1558,6 +1605,7 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
                 terminal::Selection::Kind(surface),
             ),
             |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+            explicit_caller,
         )
         .unwrap()
     };

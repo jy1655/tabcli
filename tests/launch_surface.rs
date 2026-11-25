@@ -1,12 +1,13 @@
 //! The Surface a launch starts on, through the public commands, the same on every OS. `ask`
-//! selects it and checks an automatic Herdr choice against its caller before it resolves the
-//! workspace, and `reopen` before it looks up its source; the provider, with its probed
-//! version, then decides between Herdr and the OS's own choice. `doctor` reports that decision
-//! without the caller check. Most cases run the built binary as if inside a Herdr terminal (hc
-//! gives every program `HC_TERMINAL_ID` and `TERM_PROGRAM=ghostty`) whose core is absent, so
-//! the caller check fails; on macOS and Linux others answer it from a scripted core in this
-//! process and run a provider stub that only prints a version. No real Herdr Core, state root,
-//! provider or terminal is touched, and no test changes this process's environment.
+//! and `reopen` select it from the request and the caller's environment; the provider, with
+//! its probed version, then decides between Herdr and the OS's own choice, and only a launch
+//! that will use Herdr checks its caller, after the workspace, the source and the probe.
+//! `doctor` reports that decision without the caller check. Most cases run the built binary as
+//! if inside a Herdr terminal (hc gives every program `HC_TERMINAL_ID` and
+//! `TERM_PROGRAM=ghostty`) whose core is absent, so a caller check fails; some run a provider
+//! stub that only prints a version, and on macOS and Linux others answer the caller check from
+//! a scripted core in this process. No real Herdr Core, state root, provider or terminal is
+//! touched, and no test changes this process's environment.
 #![cfg(any(target_os = "macos", target_os = "linux", windows))]
 use serde_json::Value;
 use std::{
@@ -104,10 +105,21 @@ impl Fixture {
 
     // `environment` adds to, or replaces, what every case sets.
     fn run_with(&self, args: &[&str], caller: Caller, environment: &[(&str, &OsStr)]) -> Output {
+        self.run_from(&self.base, args, caller, environment)
+    }
+
+    // As `run_with`, invoked from `directory`.
+    fn run_from(
+        &self,
+        directory: &std::path::Path,
+        args: &[&str],
+        caller: Caller,
+        environment: &[(&str, &OsStr)],
+    ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
         command
             .args(args)
-            .current_dir(&self.base)
+            .current_dir(directory)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.state_root())
             .env("XDG_STATE_HOME", &self.base)
             .env("ZDOTDIR", &self.base)
@@ -176,13 +188,6 @@ fn error(reply: &Value) -> &str {
     reply["error"].as_str().unwrap()
 }
 
-// Inside hc an automatic Herdr choice is checked against the caller on every OS, a provider
-// not known yet (a reopen) included, except for a provider whose adapter refuses Herdr on
-// this OS for every version (Codex on Windows): that one takes the OS's own choice at once.
-fn caller_checked(provider: Option<&str>) -> bool {
-    !(cfg!(windows) && provider == Some("codex"))
-}
-
 // The Surface each OS chooses outside Herdr, which an automatic choice inside hc falls back to
 // where the provider is not admitted on Herdr: Ghostty on macOS (hc names it in
 // `TERM_PROGRAM`), tmux on Linux and the managed console on Windows.
@@ -194,6 +199,8 @@ const FALLBACK: &str = if cfg!(target_os = "macos") {
     "tmux"
 };
 
+const BLANK_TITLE: &str = "--title cannot be empty";
+
 fn assert_workspace_refused(reply: &Value, case: &str) {
     assert!(error(reply).starts_with(NO_WORKSPACE), "{case}: {reply}");
 }
@@ -204,123 +211,129 @@ fn assert_caller_refused(reply: &Value, case: &str) {
     assert!(reply.get("failure_kind").is_none(), "{case}: {reply}");
 }
 
-#[test]
-fn ask_admits_its_selected_surface_before_it_resolves_the_workspace() {
-    let fixture = Fixture::new();
-    for provider in PROVIDERS {
-        // The automatic choice: an automatic Herdr is checked against the caller's terminal,
-        // before the workspace (absent here) is resolved.
-        let reply = fixture.ask(provider, None, Caller::Herdr);
-        if caller_checked(Some(provider)) {
-            assert_caller_refused(&reply, provider);
-        } else {
-            assert_workspace_refused(&reply, provider);
-        }
-        // An explicit Herdr is not verified against the caller; the provider's own admission
-        // comes next, then the workspace.
-        let reply = fixture.ask(provider, Some("herdr"), Caller::Herdr);
-        if cfg!(windows) && provider == "codex" {
-            assert!(
-                error(&reply).starts_with("codex on Herdr is unsupported on this platform: "),
-                "{reply}"
-            );
-            assert_eq!(reply["failure_kind"], "unsupported", "{reply}");
-        } else {
-            assert_workspace_refused(&reply, provider);
-        }
-        // A marker inherited into another terminal selects that terminal, not Herdr.
-        let reply = fixture.ask(provider, None, Caller::InheritedMarker);
-        assert_workspace_refused(&reply, provider);
-    }
-}
-
-#[test]
-fn reopen_selects_and_admits_its_surface_before_it_reads_its_source() {
-    let fixture = Fixture::new();
-    // The source, and so its provider, is not known at selection: the caller is checked, on
-    // Windows as on macOS and Linux.
-    let reply = fixture.reopen(None);
-    assert!(caller_checked(None));
-    assert_caller_refused(&reply, "reopen");
-    assert!(reply["gate"].is_null(), "{reply}");
-    let reply = fixture.reopen(Some("herdr"));
-    assert!(error(&reply).starts_with(NO_SOURCE), "{reply}");
-}
-
-// Without --probe, doctor reports what `ask` chooses before the version is known, and the
-// fallback a version Herdr does not admit would get; it never runs the caller check.
-#[test]
-fn doctor_reports_the_selected_surface_without_the_caller_check() {
-    let fixture = Fixture::new();
-    for provider in PROVIDERS {
-        let output = fixture.run(&["doctor", "--provider", provider, "--json"], Caller::Herdr);
-        assert!(output.status.success(), "{output:?}");
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let selection = terminal_selection(&report);
-        // The core is absent, so a caller check would have refused the automatic Herdr.
-        assert_eq!(selection["availability"], "available", "{selection}");
-        assert_eq!(selection["reason_code"], "terminal_selected", "{selection}");
-        // Only Codex on Windows is refused on Herdr for every version.
-        assert_eq!(
-            selection["evidence"]["terminal"],
-            if caller_checked(Some(provider)) {
-                "herdr"
-            } else {
-                FALLBACK
-            },
-            "{provider}: {selection}"
-        );
-        assert_eq!(
-            selection["evidence"]["fallback"], FALLBACK,
-            "{provider}: {selection}"
-        );
-        // Outside hc there is no automatic Herdr choice, and so no fallback.
-        let output = fixture.run(
-            &["doctor", "--provider", provider, "--json"],
-            Caller::InheritedMarker,
-        );
-        assert!(output.status.success(), "{output:?}");
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let selection = terminal_selection(&report);
-        assert_ne!(selection["evidence"]["terminal"], "herdr", "{selection}");
-        assert!(
-            selection["evidence"].get("fallback").is_none(),
-            "{selection}"
-        );
-    }
-}
-
-#[cfg(unix)]
-const CODEX_HERDR_FLOOR: &str = "codex on Herdr is unsupported: Herdr requires stable Codex 0.169.0 or newer with --no-daemon; version: ";
-
-#[cfg(unix)]
 impl Fixture {
-    // A provider executable that prints `version` for any arguments, alone in its own
-    // directory: the PATH of a case that runs it, with only the system directories after it.
-    fn provider_path(&self, command: &str, version: &str) -> std::ffi::OsString {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = self.base.join(format!(
-            "bin-{}",
-            version.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
-        ));
+    // A provider executable with `body`, a POSIX shell script or, on Windows, a batch file,
+    // alone in its own directory. Returns the PATH of a case that runs it: that directory,
+    // then the system's own.
+    fn provider_path(&self, name: &str, command: &str, body: &str) -> std::ffi::OsString {
+        let directory = self.base.join(format!("bin-{name}"));
         std::fs::create_dir_all(&directory).unwrap();
-        let executable = directory.join(command);
-        std::fs::write(&executable, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::join_paths([
-            directory.as_path(),
-            std::path::Path::new("/usr/bin"),
-            std::path::Path::new("/bin"),
-        ])
-        .unwrap()
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = directory.join(command);
+            std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::env::join_paths([
+                directory.as_path(),
+                std::path::Path::new("/usr/bin"),
+                std::path::Path::new("/bin"),
+            ])
+            .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            std::fs::write(
+                directory.join(format!("{command}.cmd")),
+                format!("@echo off\r\n{body}\r\n"),
+            )
+            .unwrap();
+            let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+            std::env::join_paths([directory, system]).unwrap()
+        }
     }
 
-    // A home and a Codex home of this case's own, so that no real provider store is read.
-    fn homes(&self) -> (PathBuf, PathBuf) {
+    // A provider that prints `version` (plain words only, as both shells echo them).
+    fn printing(&self, command: &str, version: &str) -> std::ffi::OsString {
+        let name = format!(
+            "{command}-{}",
+            version.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+        );
+        if cfg!(windows) {
+            self.provider_path(&name, command, &format!("echo {version}"))
+        } else {
+            self.provider_path(&name, command, &format!("echo '{version}'"))
+        }
+    }
+
+    // A home, and the provider homes under it, of this case's own, so that no real provider
+    // store is read.
+    fn homes(&self) -> Vec<(&'static str, PathBuf)> {
         let home = self.base.join("home");
-        let codex_home = home.join("codex");
-        std::fs::create_dir_all(&codex_home).unwrap();
-        (home, codex_home)
+        let homes = vec![
+            ("CODEX_HOME", home.join("codex")),
+            ("CLAUDE_CONFIG_DIR", home.join("claude")),
+            ("PI_CODING_AGENT_DIR", home.join("pi")),
+        ];
+        for (_, directory) in &homes {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let mut all = vec![("HOME", home.clone()), ("USERPROFILE", home)];
+        all.extend(homes);
+        all
+    }
+
+    // `ask` in an existing workspace with a blank title: a launch that passes its Surface
+    // decision is refused right after it, before anything exists.
+    fn ask_blank_title(
+        &self,
+        provider: &str,
+        terminal: Option<&str>,
+        path: &OsStr,
+        socket: Option<&OsStr>,
+    ) -> Value {
+        let project = self.base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut args = vec![
+            "ask",
+            provider,
+            "--workspace",
+            project.to_str().unwrap(),
+            "--title",
+            "   ",
+            "--prompt",
+            "must not be delivered",
+            "--json",
+        ];
+        if let Some(terminal) = terminal {
+            args.extend(["--terminal", terminal]);
+        }
+        let homes = self.homes();
+        let mut environment: Vec<(&str, &OsStr)> = homes
+            .iter()
+            .map(|(name, path)| (*name, path.as_os_str()))
+            .collect();
+        environment.push(("PATH", path));
+        if let Some(socket) = socket {
+            environment.push(("HC_SOCKET", socket));
+        }
+        refusal(self.run_with(&args, Caller::Herdr, &environment))
+    }
+
+    // `doctor --provider` from `directory` with the provider on `path`.
+    fn doctor_from(
+        &self,
+        directory: &std::path::Path,
+        provider: &str,
+        probe: bool,
+        caller: Caller,
+        path: Option<&OsStr>,
+    ) -> Value {
+        let mut args = vec!["doctor", "--provider", provider, "--json"];
+        if probe {
+            args.push("--probe");
+        }
+        let homes = self.homes();
+        let mut environment: Vec<(&str, &OsStr)> = homes
+            .iter()
+            .map(|(name, path)| (*name, path.as_os_str()))
+            .collect();
+        if let Some(path) = path {
+            environment.push(("PATH", path));
+        }
+        let output = self.run_from(directory, &args, caller, &environment);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 }
 
@@ -333,41 +346,288 @@ fn terminal_selection(report: &Value) -> &Value {
         .unwrap_or_else(|| panic!("{report}"))
 }
 
-// With --probe, doctor reports the Surface `ask` would choose with the version it read:
-// inside hc a Codex that Herdr does not admit gets this OS's fallback, as `ask` gives it.
+// `ask` resolves the workspace before any caller check: the automatic choice inside hc is
+// decided with the provider's probed version, and only a launch that will use Herdr checks the
+// caller. An explicit Herdr is never checked against the caller.
+#[test]
+fn ask_resolves_the_workspace_before_it_checks_a_caller() {
+    let fixture = Fixture::new();
+    for provider in PROVIDERS {
+        for caller in [Caller::Herdr, Caller::InheritedMarker] {
+            let reply = fixture.ask(provider, None, caller);
+            assert_workspace_refused(&reply, provider);
+        }
+        let reply = fixture.ask(provider, Some("herdr"), Caller::Herdr);
+        if cfg!(windows) && provider == "codex" {
+            assert!(
+                error(&reply).starts_with("codex on Herdr is unsupported on this platform: "),
+                "{reply}"
+            );
+            assert_eq!(reply["failure_kind"], "unsupported", "{reply}");
+        } else {
+            assert_workspace_refused(&reply, provider);
+        }
+    }
+}
+
+// A caller that cannot be verified (the core is absent) refuses a launch that would use Herdr,
+// and nothing else: on every OS a provider version Herdr does not admit takes the OS's own
+// terminal without the check, as Codex on Windows does for every version.
+#[test]
+fn a_stale_caller_refuses_only_a_launch_that_uses_herdr() {
+    let fixture = Fixture::new();
+    // Pi runs on Herdr at every version on every OS.
+    let pi = fixture.printing("pi", "1.5.0");
+    assert_caller_refused(&fixture.ask_blank_title("pi", None, &pi, None), "pi");
+    let reply = fixture.ask_blank_title("pi", Some("herdr"), &pi, None);
+    assert_eq!(error(&reply), BLANK_TITLE, "{reply}");
+    // Codex on both sides of the Herdr floor.
+    for (version, herdr) in [
+        ("codex-cli 0.168.0", false),
+        ("codex-cli 0.170.0", !cfg!(windows)),
+    ] {
+        let codex = fixture.printing("codex", version);
+        let reply = fixture.ask_blank_title("codex", None, &codex, None);
+        if herdr {
+            assert_caller_refused(&reply, version);
+        } else {
+            assert_eq!(error(&reply), BLANK_TITLE, "{version}: {reply}");
+        }
+    }
+}
+
+// A reopen reads its source and its provider's reopen support before any caller check: an
+// absent source is reported as such inside a Herdr terminal whose caller cannot be verified.
+#[test]
+fn reopen_reports_its_source_before_any_caller_check() {
+    let fixture = Fixture::new();
+    for terminal in [None, Some("herdr")] {
+        let reply = fixture.reopen(terminal);
+        assert!(
+            error(&reply).starts_with(NO_SOURCE),
+            "{terminal:?}: {reply}"
+        );
+        assert!(reply["gate"].is_null(), "{reply}");
+    }
+}
+
+// Without --probe, doctor reports the choice where the version does not decide it, with no
+// word about a version: Claude, Agy and Pi on Herdr, Codex on Windows on the managed console.
+// Where the version decides (Codex on macOS and Linux) it names no terminal, says the version
+// was not read, and gives Herdr's requirement and the fallback. It never checks the caller.
+#[test]
+fn doctor_reports_the_selected_surface_without_the_caller_check() {
+    let fixture = Fixture::new();
+    for provider in PROVIDERS {
+        let report = fixture.doctor_from(&fixture.base, provider, false, Caller::Herdr, None);
+        let selection = terminal_selection(&report);
+        assert_eq!(
+            selection["evidence"]["fallback"], FALLBACK,
+            "{provider}: {selection}"
+        );
+        if provider == "codex" && !cfg!(windows) {
+            assert_eq!(selection["availability"], "unknown", "{selection}");
+            assert_eq!(
+                selection["reason_code"], "probe_not_requested",
+                "{selection}"
+            );
+            assert!(selection["evidence"]["terminal"].is_null(), "{selection}");
+            assert_eq!(
+                selection["evidence"]["herdr_requires"], "stable Codex 0.169.0 or newer",
+                "{selection}"
+            );
+            assert!(
+                selection["next_action"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--probe"),
+                "{selection}"
+            );
+        } else {
+            assert_eq!(selection["availability"], "available", "{selection}");
+            assert_eq!(selection["reason_code"], "terminal_selected", "{selection}");
+            assert_eq!(
+                selection["evidence"]["terminal"],
+                if provider == "codex" {
+                    FALLBACK
+                } else {
+                    "herdr"
+                },
+                "{provider}: {selection}"
+            );
+            assert!(
+                selection["evidence"].get("herdr_requires").is_none(),
+                "{selection}"
+            );
+            for text in ["detail", "next_action"] {
+                assert!(
+                    !selection[text].as_str().unwrap().contains("version"),
+                    "{provider} {text}: {selection}"
+                );
+            }
+        }
+        // Outside hc there is no automatic Herdr choice, and so no fallback.
+        let report = fixture.doctor_from(
+            &fixture.base,
+            provider,
+            false,
+            Caller::InheritedMarker,
+            None,
+        );
+        let selection = terminal_selection(&report);
+        assert_eq!(selection["reason_code"], "terminal_selected", "{selection}");
+        assert_ne!(selection["evidence"]["terminal"], "herdr", "{selection}");
+        assert!(
+            selection["evidence"].get("fallback").is_none(),
+            "{selection}"
+        );
+    }
+}
+
+// With --probe, where the version decides, doctor reports the outcome of the version check as
+// `ask` reaches it: the Surface for an admitted version, and no Surface where the probe failed
+// or the general minimum refuses the launch before any terminal is chosen.
 #[cfg(unix)]
 #[test]
 fn doctor_reports_the_surface_ask_chooses_for_the_probed_version() {
     let fixture = Fixture::new();
-    let (home, codex_home) = fixture.homes();
-    for (version, expected) in [
-        ("codex-cli 0.168.0", FALLBACK),
-        ("codex-cli 0.170.0", "herdr"),
-        ("OpenAI Codex (v0.170.0)", "herdr"),
+    for (version, availability, reason, terminal) in [
+        (
+            "codex-cli 0.168.0",
+            "available",
+            "terminal_selected",
+            Some(FALLBACK),
+        ),
+        (
+            "codex-cli 0.170.0",
+            "available",
+            "terminal_selected",
+            Some("herdr"),
+        ),
+        (
+            "OpenAI Codex (v0.170.0)",
+            "available",
+            "terminal_selected",
+            Some("herdr"),
+        ),
+        (
+            "codex-cli 0.146.0",
+            "unavailable",
+            "version_unsupported",
+            None,
+        ),
+        ("codex-cli unknown", "unknown", "version_unrecognized", None),
     ] {
-        let path = fixture.provider_path("codex", version);
-        let output = fixture.run_with(
-            &["doctor", "--provider", "codex", "--probe", "--json"],
-            Caller::Herdr,
-            &[
-                ("PATH", path.as_os_str()),
-                ("HOME", home.as_os_str()),
-                ("CODEX_HOME", codex_home.as_os_str()),
-            ],
-        );
-        assert!(output.status.success(), "{output:?}");
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let path = fixture.printing("codex", version);
+        let report = fixture.doctor_from(&fixture.base, "codex", true, Caller::Herdr, Some(&path));
         assert_eq!(report["scope"]["current_version"], version, "{report}");
         let selection = terminal_selection(&report);
-        assert_eq!(selection["reason_code"], "terminal_selected", "{selection}");
         assert_eq!(
-            selection["evidence"]["terminal"], expected,
+            selection["availability"], availability,
             "{version}: {selection}"
         );
+        assert_eq!(selection["reason_code"], reason, "{version}: {selection}");
         assert_eq!(
-            selection["evidence"]["fallback"], FALLBACK,
+            selection["evidence"]["terminal"].as_str(),
+            terminal,
             "{version}: {selection}"
         );
+        assert_eq!(selection["evidence"]["fallback"], FALLBACK, "{selection}");
+    }
+    // A probe that runs but exits unsuccessfully decides nothing, and --probe was given.
+    let path = fixture.provider_path("codex-exit", "codex", "exit 3");
+    let report = fixture.doctor_from(&fixture.base, "codex", true, Caller::Herdr, Some(&path));
+    let selection = terminal_selection(&report);
+    assert_eq!(selection["availability"], "unknown", "{selection}");
+    assert_eq!(
+        selection["reason_code"], "version_probe_failed",
+        "{selection}"
+    );
+    assert!(selection["evidence"]["terminal"].is_null(), "{selection}");
+    assert!(
+        !selection["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("Add --probe"),
+        "{selection}"
+    );
+}
+
+// The probe that decides the reported Surface runs where `ask`'s does: in the directory doctor
+// is invoked from. A shim that reports another version inside a project shows it.
+#[cfg(unix)]
+#[test]
+fn doctor_reads_the_deciding_version_from_the_invoking_directory() {
+    let fixture = Fixture::new();
+    let project = fixture.base.join("pinned-project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join(".codex-pin"), b"0.168.0").unwrap();
+    let path = fixture.provider_path(
+        "codex-pinned",
+        "codex",
+        "if [ -f .codex-pin ]; then echo 'codex-cli 0.168.0'; else echo 'codex-cli 0.170.0'; fi",
+    );
+    for (directory, terminal) in [(&project, FALLBACK), (&fixture.base, "herdr")] {
+        let report = fixture.doctor_from(directory, "codex", true, Caller::Herdr, Some(&path));
+        let selection = terminal_selection(&report);
+        assert_eq!(
+            selection["evidence"]["terminal"],
+            terminal,
+            "{}: {selection}",
+            directory.display()
+        );
+    }
+    // And `ask` from that project takes the same fallback.
+    let reply = refusal(
+        fixture.run_from(
+            &project,
+            &[
+                "ask",
+                "codex",
+                "--title",
+                "   ",
+                "--prompt",
+                "must not be delivered",
+                "--json",
+            ],
+            Caller::Herdr,
+            &fixture
+                .homes()
+                .iter()
+                .map(|(name, home)| (*name, home.as_os_str()))
+                .chain([("PATH", path.as_os_str())])
+                .collect::<Vec<_>>(),
+        ),
+    );
+    assert_eq!(error(&reply), BLANK_TITLE, "{reply}");
+}
+
+// Outside hc the tmux row is probed before the provider's version, as in 0.4.49; inside hc,
+// where the provider's version decides whether tmux is chosen, the version is read first.
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_probes_the_provider_first_only_where_its_version_chooses_tmux() {
+    let fixture = Fixture::new();
+    let log = fixture.base.join("probes.log");
+    let body = |line: &str, reply: &str| {
+        format!("echo \"{line} $*\" >> '{}'\necho '{reply}'", log.display())
+    };
+    let path = fixture.provider_path("probe-order", "codex", &body("codex", "codex-cli 0.168.0"));
+    fixture.provider_path("probe-order", "tmux", &body("tmux", "tmux 3.6"));
+    for (caller, first) in [
+        (Caller::InheritedMarker, "tmux -V"),
+        (Caller::Herdr, "codex --version"),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let report = fixture.doctor_from(&fixture.base, "codex", true, caller, Some(&path));
+        assert_eq!(terminal_selection(&report)["evidence"]["terminal"], "tmux");
+        let order = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<_> = order
+            .lines()
+            .filter(|line| *line == "tmux -V" || *line == "codex --version")
+            .collect();
+        assert_eq!(lines.first(), Some(&first), "{caller:?}: {order}");
+        assert!(lines.contains(&"tmux -V"), "{order}");
     }
 }
 
@@ -480,69 +740,37 @@ impl Drop for ScriptedCore {
     }
 }
 
+#[cfg(unix)]
+const CODEX_HERDR_FLOOR: &str = "codex on Herdr is unsupported: Herdr requires stable Codex 0.169.0 or newer with --no-daemon; version: ";
+
 // Inside a verified hc terminal the automatic choice is Herdr where the provider, with its
-// probed version, is admitted there, and this OS's fallback otherwise; an explicit
-// `--terminal herdr` is refused as before. A blank title, refused right after the Surface is
-// admitted and before anything exists, ends each case.
+// probed version, is admitted there, and this OS's fallback otherwise; only a launch that will
+// use Herdr asks the core about its caller. An explicit `--terminal herdr` is refused as before.
+// A blank title, refused right after the Surface is admitted and before anything exists, ends
+// each case.
 #[cfg(unix)]
 #[test]
 fn an_automatic_herdr_gives_way_to_the_fallback_where_the_provider_version_is_not_admitted() {
     let fixture = Fixture::new();
     let core = ScriptedCore::start();
-    let (home, codex_home) = fixture.homes();
-    let project = fixture.base.join("project");
-    std::fs::create_dir(&project).unwrap();
-    let ask = |terminal: Option<&str>, path: &OsStr| {
-        let mut args = vec![
-            "ask",
-            "codex",
-            "--workspace",
-            project.to_str().unwrap(),
-            "--title",
-            "   ",
-            "--prompt",
-            "must not be delivered",
-            "--json",
-        ];
-        if let Some(terminal) = terminal {
-            args.extend(["--terminal", terminal]);
-        }
-        refusal(fixture.run_with(
-            &args,
-            Caller::Herdr,
-            &[
-                ("PATH", path),
-                ("HOME", home.as_os_str()),
-                ("CODEX_HOME", codex_home.as_os_str()),
-                ("HC_SOCKET", core.socket.as_os_str()),
-            ],
-        ))
-    };
     for (version, admitted) in [
         ("codex-cli 0.170.0", true),
         ("codex-cli 0.168.0", false),
         ("codex-cli 0.170.0-alpha.1", false),
     ] {
-        let path = fixture.provider_path("codex", version);
+        let path = fixture.printing("codex", version);
+        let socket = Some(core.socket.as_os_str());
         let before = core.connections();
-        let reply = ask(None, &path);
-        assert_eq!(
-            error(&reply),
-            "--title cannot be empty",
-            "{version}: {reply}"
-        );
+        let reply = fixture.ask_blank_title("codex", None, &path, socket);
+        assert_eq!(error(&reply), BLANK_TITLE, "{version}: {reply}");
         assert_eq!(
             core.connections(),
-            before + 1,
-            "the caller was verified once"
+            before + usize::from(admitted),
+            "{version}: the caller is verified only for a launch on Herdr"
         );
-        let reply = ask(Some("herdr"), &path);
+        let reply = fixture.ask_blank_title("codex", Some("herdr"), &path, socket);
         if admitted {
-            assert_eq!(
-                error(&reply),
-                "--title cannot be empty",
-                "{version}: {reply}"
-            );
+            assert_eq!(error(&reply), BLANK_TITLE, "{version}: {reply}");
         } else {
             assert_eq!(
                 error(&reply),

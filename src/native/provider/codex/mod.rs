@@ -77,26 +77,25 @@ fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
     Ok(codex_version(output)? >= Version::new(0, 149, 0))
 }
 
-// The general probe's reading, which every earlier release also used here: the first token
-// that parses once its surrounding punctuation and one leading `v` are removed. The queue
-// floor, hook eligibility and the diagnostics keep it, because launch records were written
-// and admitted under it; the Herdr gate reads labelled and one-word text more strictly
-// (`herdr_codex_version`) and longer unlabelled text this way.
+// One word read as the general probe, and every earlier release here, reads words: its
+// surrounding punctuation and one leading `v` removed, then SemVer.
+fn word_version(word: &str) -> Option<Version> {
+    let trimmed = word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    Version::parse(trimmed.strip_prefix('v').unwrap_or(trimmed)).ok()
+}
+
+// The general probe's reading, which every earlier release also used here: the first word
+// that reads as a version (`word_version`). The queue floor, hook eligibility and the
+// diagnostics keep it, because launch records were written and admitted under it; the Herdr
+// gate reads differently (`herdr_codex_version`).
 fn codex_version(output: &str) -> Result<Version> {
     output
         .split_whitespace()
-        .filter_map(|token| {
-            let candidate = token
-                .trim_matches(|character: char| !character.is_ascii_alphanumeric())
-                .strip_prefix('v')
-                .unwrap_or(
-                    token.trim_matches(|character: char| !character.is_ascii_alphanumeric()),
-                );
-            Version::parse(candidate).ok()
-        })
-        .next()
+        .find_map(word_version)
         .ok_or_else(|| anyhow::anyhow!("could not parse a semantic Codex version from {output:?}"))
 }
+
+const HERDR_VERSION_LABEL: &str = "codex-cli";
 
 // The Herdr gate's reading of a `--version` text, as a grammar. A word is a run of
 // non-whitespace characters, and a line is the text between line feeds.
@@ -109,16 +108,8 @@ fn codex_version(output: &str) -> Result<Version> {
 //   error included, is the answer. Words before the label (a warning line, a timestamp,
 //   another program's version) and words after the field (`(runtime 22.0.0)`, more lines) are
 //   never read as the version; they are only scanned for a second label.
-// - Unlabelled text of one word: read as `version`.
-// - Unlabelled text of more than one word: read as the launch check of 0.4.48 read it
-//   (`codex_version`: the first word that parses once its surrounding punctuation and one
-//   leading `v` are removed), so `OpenAI Codex (v0.170.0)` reads 0.170.0. That word can
-//   belong to another program (`node v22.0.0` on a line before Codex's own). The owner chose
-//   this reading over refusing such text (2026-11-26): a misread version can only let a Codex
-//   below the floor start on Herdr with `--no-daemon`, which a Codex without that option
-//   refuses when it starts.
-// - Everything else is refused: a second label, a label without a field on its line, an
-//   empty text, and unlabelled text in which no word parses.
+// - Unlabelled text, one word or more: `unlabelled_codex_version`.
+// - A second label, or a label without a field on its line, is refused.
 //
 // `codex-cli X.Y.Z` is the only `--version` output this repository records for Codex (the
 // fixtures in tests/doctor.rs, tests/context_result.rs and tests/native_policy.rs, and
@@ -126,7 +117,7 @@ fn codex_version(output: &str) -> Result<Version> {
 // only as the TUI's header in screen captures (launch/tests.rs, launch/paste/fixtures), so it
 // is not a label.
 fn herdr_codex_version(output: &str) -> Result<Version> {
-    const LABEL: &str = "codex-cli";
+    const LABEL: &str = HERDR_VERSION_LABEL;
     let lines = output
         .lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
@@ -144,15 +135,40 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
     let field = match labels.as_slice() {
         [Some(field)] => *field,
         [None] => bail!("the `{LABEL}` label has no version after it on its line in {output:?}"),
-        [] => match lines.concat().as_slice() {
-            [] => bail!("found no `{LABEL}` version label in {output:?}"),
-            [word] => *word,
-            _ => return codex_version(output),
-        },
+        [] => return unlabelled_codex_version(output),
         _ => bail!("found the `{LABEL}` label more than once in {output:?}"),
     };
     Version::parse(field.strip_prefix('v').unwrap_or(field))
         .with_context(|| format!("Codex version {field:?} is not a semantic version"))
+}
+
+// The Herdr gate's reading of text without the label, one word or more (owner's decisions
+// 4B and B2, 2026-11-26), and the one place of that rule. Every word is read as 0.4.48 read
+// words (`word_version`: `OpenAI Codex (v0.170.0)` and `(0.170.0)` are 0.170.0), and the text
+// names a version only when exactly one word reads as one. With none it is refused; with two
+// or more it is refused as ambiguous, because another program's version can come first
+// (`node v22.0.0` on a line before Codex's own) and a misread version could let a Codex that
+// lacks `--no-daemon` start on Herdr, where a detached `ask` can already have reported the
+// request accepted. Words are counted, not versions: the owner's rule accepts one
+// version-shaped word, so the same version printed twice is refused too.
+fn unlabelled_codex_version(output: &str) -> Result<Version> {
+    let versions = output
+        .split_whitespace()
+        .filter_map(word_version)
+        .collect::<Vec<_>>();
+    match versions.as_slice() {
+        [version] => Ok(version.clone()),
+        [] => bail!("found no `{HERDR_VERSION_LABEL}` label and no version in {output:?}"),
+        _ => bail!(
+            "found no `{HERDR_VERSION_LABEL}` label and {} versions ({}) in {output:?}; TAB does not guess which one is Codex's",
+            versions.len(),
+            versions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.
@@ -456,6 +472,10 @@ impl NativeProviderAdapter for CodexAdapter {
     ) -> super::SurfaceSupport {
         surface_route(cfg!(windows), surface, version).map(SurfaceRoute::initial_transport)
     }
+
+    fn surface_version_requirement(&self, surface: terminal::TerminalKind) -> Option<String> {
+        surface_version_requirement(cfg!(windows), surface)
+    }
 }
 
 #[cfg(test)]
@@ -525,6 +545,13 @@ fn surface_route(
         Ok::<_, std::convert::Infallible>(version.map(|text| ("version", text.to_owned())))
     });
     decision
+}
+
+// The version requirement `surface_route` applies once a version is known: only Herdr off
+// Windows has one; Windows Herdr is refused, and every other surface admitted, at every version.
+fn surface_version_requirement(windows: bool, surface: terminal::TerminalKind) -> Option<String> {
+    (surface == terminal::TerminalKind::Herdr && !windows)
+        .then(|| format!("stable Codex {HERDR_MINIMUM_VERSION} or newer"))
 }
 
 fn surface_route_with<E>(

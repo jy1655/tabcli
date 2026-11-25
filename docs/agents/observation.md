@@ -10,12 +10,18 @@
   summaries are what `result` reports at the time of the query and carry `derived_from`.
   Do not add an entry for something no record holds.
 - Doctor's `terminal_selection` row reports the Surface `ask` would choose
-  (`session_start::automatic_surface`), with the version doctor read under `--probe` and,
-  inside hc, the fallback as `evidence.fallback`. It opens no connection, so it never runs the
-  caller check of an automatic Herdr choice; without a read version it reports Herdr, unless
-  the provider is refused there for every version, and says which fallback a refused version
-  would get. In provider-only mode the executable and
-  version are therefore observed before that row; the report keeps its row order.
+  (`session_start::automatic_surface`), with the fallback as `evidence.fallback` inside hc. It
+  opens no connection, so it never runs the caller check of an automatic Herdr choice. Where
+  the provider's adapter declares that the choice depends on the version
+  (`surface_version_requirement`; Codex on Herdr off Windows), the row carries the outcome of
+  the version check: the Surface for a version the launch admits, and otherwise no Surface
+  (`terminal: null`, with `herdr_requires`) and the reason of the version row
+  (`probe_not_requested`, `executable_unavailable`, `version_probe_failed`,
+  `version_unsupported`, `version_unrecognized`). Only there is the version probed before that
+  row, from the directory doctor runs in, as `ask` probes it; elsewhere, outside hc included,
+  the probe keeps its 0.4.49 place after the terminal rows and its scratch directory. A
+  provider whose choice does not depend on the version gets no version wording. The report
+  keeps its row order.
 - Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,
   its `launch_stage` row keeps `launch_host_failed` and directs the caller to the launch
   log for an input-flush or shell-start error. The shell-environment probe guidance applies
