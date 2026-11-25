@@ -60,7 +60,8 @@ pub(super) use tab::run_host as run_console_host;
 
 /// The managed console: a Windows Terminal tab or a console window of its own, opened here
 /// and reached afterwards through the console control helper, with one client for each
-/// operation.
+/// operation. The lookup also hands it any handle of a kind that Windows does not run, as
+/// before the lookup existed: its open refuses such a kind and its helper refuses the handle.
 pub(in crate::native::terminal) struct ManagedConsole;
 
 /// The installed Windows lookup. Its type fixes which adapter serves which kind.
@@ -70,13 +71,14 @@ pub(super) static INSTALLED: Dispatch<ManagedConsole, super::herdr::InstalledAda
 impl WindowsTerminalAdapter for ManagedConsole {
     fn open_bound_tab(
         &self,
+        kind: TerminalKind,
         command: &str,
         directory: &Path,
         deadline: Instant,
         bind: BindSurface<'_>,
         unbind: UnbindSurface<'_>,
     ) -> Result<TerminalSession> {
-        open_bound_tab(command, directory, deadline, bind, unbind)
+        open_bound_tab(kind, command, directory, deadline, bind, unbind)
     }
 
     fn send_file(
@@ -190,6 +192,7 @@ pub(super) fn select_from(
 }
 
 fn open_bound_tab(
+    kind: TerminalKind,
     command: &str,
     directory: &Path,
     deadline: Instant,
@@ -200,6 +203,13 @@ fn open_bound_tab(
         .checked_sub(STARTUP_CLEANUP_RESERVE)
         .filter(|candidate| *candidate > Instant::now())
         .context("Windows console startup timeout leaves no room for exact process cleanup")?;
+    // The Windows lookup gives this adapter every kind but Herdr.
+    if kind != TerminalKind::WindowsConsole {
+        bail!(Unsupported::new(format!(
+            "{} is not available on Windows",
+            kind.display_name()
+        )));
+    }
     // Both surfaces pass this path as CreateProcessW's application name, which
     // PowerShell uses for PSHOME independently of the command line.
     let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(
@@ -254,7 +264,7 @@ fn open_bound_tab(
             Surface::Window(ConsoleWindow::create(&powershell, &command_line, deadline)?)
         }
     };
-    let mut session = TerminalSession::new(TerminalKind::WindowsConsole, surface.pid().to_string())
+    let mut session = TerminalSession::new(kind, surface.pid().to_string())
         .with_windows_identity(Some(surface.identity().clone()));
     let launch = super::bind_surface_before_start(
         &mut session,

@@ -2,12 +2,17 @@
 
 - Codex owns injected paste evidence and guarded submission; see Current Codex Boundary (#124).
 
-- Every surface operation on Windows reads the kind's declared refusals and then resolves its
-  adapter through one lookup (`windows/dispatch.rs`), as `posix.rs` does on macOS and Linux:
-  `ManagedConsole` (`windows/mod.rs`) for a managed console, the Herdr adapter for a Herdr
-  terminal, and a refusal for any other kind. Give a new Windows surface its own adapter in
-  that lookup; do not branch an operation on the kind. The lookup's portable tests run on
-  every CI target; the installed lookup, over the console helper and the core's pipe, is
+- The seven surface operations on Windows (open, send, screen, guarded key, verify, close and
+  presence) resolve their adapter through one lookup (`windows/dispatch.rs`), as `posix.rs`
+  does on macOS and Linux: the Herdr adapter for a Herdr terminal, and `ManagedConsole`
+  (`windows/mod.rs`) for every other kind. Screen and guarded key first answer with the kind's
+  declared refusal, if it has one. A handle of a kind Windows does not run stays with the
+  managed console, whose open refuses the kind and whose helper refuses the handle; refusing
+  it in the lookup would change what such a handle reports and is not decided. Give a new
+  Windows surface its own adapter in that lookup; do not branch one of these operations on the
+  kind. Kind checks outside them remain (`attach_command`, `admit_selection` and the
+  dead-owner gates in `ownership.rs` and `session/close.rs`). The lookup's portable tests run
+  on every CI target; the installed lookup, over the console helper and the core's pipe, is
   tested on the Windows runner only.
 - A Herdr terminal is not a managed console: its handle never reaches the console control
   helper, the tab host or the focus guard (see Current Herdr Surface Boundary). Its launch

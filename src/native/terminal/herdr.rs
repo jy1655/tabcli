@@ -1278,7 +1278,9 @@ mod windows_adapter {
     use crate::native::terminal::windows_dispatch::{
         BindSurface, UnbindSurface, WindowsTerminalAdapter,
     };
-    use crate::native::terminal::{CloseOutcome, TerminalSendResult, TerminalSession};
+    use crate::native::terminal::{
+        CloseOutcome, TerminalKind, TerminalSendResult, TerminalSession,
+    };
     use anyhow::Result;
     use std::{
         path::Path,
@@ -1286,8 +1288,10 @@ mod windows_adapter {
     };
 
     impl<C: Core> WindowsTerminalAdapter for Adapter<C> {
+        // The lookup hands this adapter Herdr handles only.
         fn open_bound_tab(
             &self,
+            _kind: TerminalKind,
             command: &str,
             directory: &Path,
             deadline: Instant,

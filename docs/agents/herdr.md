@@ -157,10 +157,11 @@
   surface behind its log readiness and receipt) and Pi run there. Inside an hc terminal the
   automatic choice is Herdr when the provider's adapter runs there and the managed console
   otherwise; a reopen, whose provider is unknown at selection, keeps the console.
-- A Herdr handle on Windows never reaches the console control helper: every surface operation
-  resolves its adapter through the one Windows lookup (`windows/dispatch.rs`) after the kind's
-  declared refusals, so guarded dialog input is refused as on the other platforms. Pi and
-  Agy keep their Windows framing, readiness and receipts; only the transport is `terminal.send`.
+- A Herdr handle on Windows never reaches the console control helper: the seven surface
+  operations resolve its adapter through the one Windows lookup (`windows/dispatch.rs`), and
+  guarded dialog input answers with Herdr's declared refusal first, as on the other platforms.
+  Pi and Agy keep their Windows framing, readiness and receipts; only the transport is
+  `terminal.send`.
   Agy's Windows readiness also needs `Full redraw completed`, measured on the console only;
   without it the paste is withheld and reported not sent.
 - The Windows ownership proof checks the Herdr terminal on its core, then the owner's process
