@@ -17,20 +17,11 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-herdr-host",
-    #[cfg(target_os = "linux")]
-    launch_host: Some(LaunchHost::BoundBash(
-        crate::native::terminal::herdr::binding_names_this_host,
+    launch_host: Some(LaunchHost::new(
+        !cfg!(any(target_os = "linux", windows)),
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        Some(crate::native::terminal::herdr::binding_names_this_host),
     )),
-    #[cfg(windows)]
-    launch_host: Some(LaunchHost::BoundPowerShell(
-        crate::native::terminal::herdr::binding_names_this_host,
-        &WINDOWS_BINDING,
-    )),
-    #[cfg(not(any(target_os = "linux", windows)))]
-    launch_host: Some(LaunchHost::ShellCapture {
-        #[cfg(target_os = "macos")]
-        binding_names_host: crate::native::terminal::herdr::binding_names_this_host,
-    }),
     // A terminal that ended outside TAB (its tab closed, `hc kill`, or its program
     // exited) stays on the core, finished, until something calls `terminal.rm`.
     close_evidence: CloseEvidenceChoice::PresenceWithEndedSurface,
@@ -39,18 +30,10 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     guarded_input_refusal: Some(
         "Herdr cannot compare the screen and send a key in one call; answer the dialog in its terminal",
     ),
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     binding: Some(BindingFacts {
         host: "Herdr",
         cancelled: "Herdr launch was cancelled or timed out before surface binding",
         budget: BindingBudget::RemainingReceiptCapped,
     }),
-};
-
-/// The binding the Windows launch host waits for.
-#[cfg(windows)]
-const WINDOWS_BINDING: BindingFacts = BindingFacts {
-    host: "Herdr",
-    cancelled: "Herdr launch was cancelled or timed out before surface binding",
-    budget: BindingBudget::RemainingReceiptCapped,
 };

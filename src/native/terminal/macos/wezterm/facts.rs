@@ -13,17 +13,20 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: false,
     },
     host_command: "native-wezterm-host",
-    launch_host: Some(LaunchHost::ShellCapture {
+    launch_host: Some(LaunchHost::new(
+        true,
         #[cfg(target_os = "macos")]
-        binding_names_host: crate::native::terminal::macos::wezterm::binding_names_this_host,
-    }),
+        Some(crate::native::terminal::macos::wezterm::binding_names_this_host),
+        #[cfg(any(target_os = "linux", windows))]
+        None,
+    )),
     close_evidence: CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext,
     // WezTerm reads its screen through `get-text`; only the one-call dialog answer is missing.
     screen_read_refusal: None,
     guarded_input_refusal: Some(
         "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane",
     ),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     binding: None,
     #[cfg(target_os = "macos")]
     binding: Some(BindingFacts {

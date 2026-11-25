@@ -3,7 +3,9 @@
 //! `run` performs the OS acts (identity, the capture thread, the input flush and the exec);
 //! `await_handoff` decides, on the clock and two ports (the capture result and the binding
 //! observation), whether the host keeps waiting, refuses or hands off.
-use super::bound_host::{BoundHostSpec, run_bound_host};
+use super::bound_host::{
+    BoundHostSpec, flush_startup_input, log_refusal, run_bound_host, while_capture_eligible,
+};
 use super::shell_environment::{self, CaptureFailure, Captured};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::Store;
@@ -72,10 +74,7 @@ pub(in crate::native::terminal) fn run(
         }
         if host::admit(&store, token, identity).is_err() {
             // A refused duplicate must not publish failure for the admitted incarnation.
-            launch::log(
-                &store,
-                &format!("{prefix}_host_refused reason=binding_mismatch"),
-            );
+            log_refusal(&store, kind, &" reason=binding_mismatch");
             bail!("{name} launch host admission refused");
         }
         launch::log(&store, &format!("{prefix}_host_started"));
@@ -134,12 +133,9 @@ pub(in crate::native::terminal) fn run(
             &mut |captured, now| recorder.ready(identity, captured, now),
         )?
         .map_err(|refusal| recorder.refuse(refusal, clock.now()))?;
-        let flushed = {
-            let _lock = store.lock()?;
-            host::eligible_incarnation(&store, token, identity)?;
-            unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) == 0 }
-        };
-        if !flushed {
+        let flushed =
+            while_capture_eligible(&store, token, identity, || Ok(flush_startup_input(name)))?;
+        if flushed.is_err() {
             return Err(recorder.refuse(
                 Refusal::host(host::FailureReason::InputFlushFailed),
                 clock.now(),
@@ -153,9 +149,7 @@ pub(in crate::native::terminal) fn run(
             progress(recorder.elapsed(clock.now()), &captured),
         )?;
         launch::log(&store, &format!("{prefix}_host_launch_shell"));
-        let error = {
-            let _lock = store.lock()?;
-            host::eligible_incarnation(&store, token, identity)?;
+        let error = while_capture_eligible(&store, token, identity, || {
             let mut shell = crate::native::process_env::helper_command("/bin/zsh");
             shell
                 .args(["-f", "-i", "-c", command])
@@ -179,8 +173,8 @@ pub(in crate::native::terminal) fn run(
                     Ok(())
                 });
             }
-            shell.exec()
-        };
+            Ok(shell.exec())
+        })?;
         let _ = error; // Never log free-form child/startup errors.
         Err(recorder.refuse(
             Refusal::host(host::FailureReason::LaunchShellExecFailed),
@@ -274,13 +268,10 @@ impl Recorder<'_> {
                 ),
             );
         }
-        launch::log(
+        log_refusal(
             self.store,
-            &format!(
-                "{}_host_refused reason={}",
-                self.kind.as_str(),
-                reason.word()
-            ),
+            self.kind,
+            &format_args!(" reason={}", reason.word()),
         );
         anyhow::anyhow!(
             "{} launch host refused: {}",
@@ -368,16 +359,14 @@ struct LockedBinding<'a> {
 
 impl BindingObservation for LockedBinding<'_> {
     fn observe(&mut self) -> Binding {
-        let binding = (|| -> Result<Option<bool>> {
-            let _lock = self.store.lock()?;
-            host::eligible_incarnation(self.store, self.token, self.identity)?;
+        let binding = while_capture_eligible(self.store, self.token, self.identity, || {
             Ok(launch::pending::bound_surface(
                 self.store,
                 self.session_id,
                 || "invalid host surface binding",
             )?
             .map(|surface| matches_surface(&surface, self.kind)))
-        })();
+        });
         match binding {
             Ok(None) => Binding::Absent,
             Ok(Some(true)) => Binding::Host,
@@ -470,8 +459,12 @@ fn await_handoff(
 // Whether the bound surface of this Session names this host's own terminal surface, by the
 // check that the kind registers for its launch host.
 fn matches_surface(surface: &TerminalSession, kind: TerminalKind) -> bool {
-    matches!(kind.registration().launch_host, Some(super::super::facts::LaunchHost::ShellCapture { binding_names_host: check })
-        if surface.kind == kind && check(surface))
+    surface.kind == kind
+        && kind
+            .registration()
+            .launch_host
+            .and_then(|host| host.names_binding)
+            .is_some_and(|check| check(surface))
 }
 
 #[cfg(test)]

@@ -1291,19 +1291,23 @@ Session reports append a `hold` check after the other record checks: `available`
 names `hold SESSION --release` only when it is known not to be closed; a closed session retains
 its hold as a record and cannot release it.
 
-Session reports add a `launch_stage` check for an iTerm2 or WezTerm launch. It reads the
-launch-owned host record (`launch-host.json`) of the session's launch receipt and reports the
-last stage that record holds: `awaiting_host`, `host_started`, `environment_preparing`,
-`environment_ready` or `launch_shell_starting`, and, when the host failed, its reason (for
-example `capture_timeout` when the shell startup files did not finish in time; see
-[terminals](terminals.md#shell-startup-files-iterm2-and-wezterm)). Reasons:
+Session reports include a `launch_stage` check that reads the host record (`launch-host.json`)
+for the session's launch receipt. On macOS, iTerm2, WezTerm and Herdr record capture stages
+(`awaiting_host`, `host_started`, `environment_preparing`, `environment_ready` and
+`launch_shell_starting`) and failures such as `capture_timeout`. See
+[shell startup files](terminals.md#shell-startup-files-iterm2-and-wezterm).
+On Linux and Windows, Herdr can record `input_flush_failed` or `launch_shell_exec_failed`
+after the bound host verifies its process birth. The failure-only record uses `awaiting_host`
+as its last recorded stage. Use `inspect SESSION --timeline` for the underlying error. With
+no such record on these platforms, Herdr reports `unavailable` / `launch_stage_not_applicable`.
+The check reports one of the following reason codes:
 `launch_stage_observed`, `launch_host_failed`, `launch_host_not_recorded` (no record: a session
 from an earlier release, another terminal, or a launch that did not reach surface creation;
 absence is not evidence that the host never started), `launch_host_identity_mismatch`,
 `launch_host_record_unreadable`, `launch_host_schema_unsupported` and
 `launch_stage_not_applicable`. Owner and provider records can show that the launch went further.
 
-With `--probe`, on macOS for iTerm2 or WezTerm, a `shell_environment` check runs the shell
+With `--probe`, on macOS for iTerm2, WezTerm or Herdr, a `shell_environment` check runs the shell
 environment preparation of a launch once, in the caller's current environment, within the
 remaining shared probe budget. It reports the outcome (`shell_environment_ready`,
 `shell_environment_failed`, `shell_environment_probe_budget_exhausted`), elapsed milliseconds,

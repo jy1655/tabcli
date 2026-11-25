@@ -10,7 +10,7 @@ mod startup_absence_tests;
 use super::process;
 use super::process::macos_process_start;
 use crate::native::session::owner::OwnerRecord;
-use crate::native::session::{Reader, RecordStore, Store};
+use crate::native::session::{Reader, RecordStore};
 use crate::native::terminal;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
@@ -30,10 +30,8 @@ use super::{
 };
 
 use crate::native::clock::{Clock, SystemClock};
-use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;
-const BINDING: &BindingFacts = TerminalKind::AppleTerminal.registration().binding();
 
 // Bind only one new window with the returned tty; restore only visible windows.
 // Start with line-kill plus the whole bootstrap; see docs/verification/2026-10-03-v0.1.0-focus.md.
@@ -288,10 +286,10 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
 // The typed start precedes tty discovery; wait for restored focus and the exact tty binding.
 // A failed, closed or timed-out launch must start nothing.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    use super::bound_host::{BoundHostSpec, run_tty_bound_host};
+    use super::bound_host::run_tty_bound_host;
     run_tty_bound_host(
         directory,
-        &BoundHostSpec { name: BINDING.host },
+        TerminalKind::AppleTerminal,
         || {
             let tty = process::current_terminal_tty()?;
             let live = process::live_native_process_identity(std::process::id())?;
@@ -301,33 +299,30 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
             Ok(tty)
         },
         |directory, id, tty| wait_for_binding(directory, id, tty, &mut SystemClock),
-        |released| {
-            crate::native::session::launch::log(
-                &Store::open_unchecked(directory),
-                &match released {
-                    Ok(tty) => format!("terminal_host_released tty={tty}"),
-                    Err(error) => format!("terminal_host_refused: {error:#}"),
-                },
-            );
-        },
+        Some(|tty| format!("terminal_host_released tty={tty}")),
     )
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str, clock: &mut dyn Clock) -> Result<()> {
-    use crate::native::session::launch::wait_for_binding;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    super::bound_host::binding_names_host(
-        &surface,
+    super::bound_host::wait_for_host_binding(
+        &Reader::open_unchecked(directory),
+        id,
         TerminalKind::AppleTerminal,
+        clock,
         |surface| {
-            surface.id == tty
-                && surface
-                    .window_id
-                    .as_deref()
-                    .is_some_and(|id| !id.is_empty())
+            anyhow::ensure!(
+                surface.kind == TerminalKind::AppleTerminal
+                    && surface.id == tty
+                    && surface
+                        .window_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty()),
+                "Terminal.app surface binding does not name the tty of this launch host"
+            );
+            Ok(())
         },
-        "Terminal.app surface binding does not name the tty of this launch host",
     )
+    .map(|_| ())
 }
 
 fn send_file(

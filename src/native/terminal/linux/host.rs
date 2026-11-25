@@ -1,8 +1,6 @@
-use super::super::bound_host::{BoundHostSpec, prepare_bound_launch};
+use super::super::bound_host::run_handoff;
 use super::super::{TerminalKind, TerminalSession};
-use crate::native::clock::SystemClock;
-use crate::native::session::Store;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{ffi::OsStr, os::unix::process::CommandExt, path::Path};
 
 /// What bash runs. A non-interactive bash runs the file named by `BASH_ENV` before its
@@ -36,23 +34,11 @@ pub(in crate::native::terminal) fn run(
     kind: TerminalKind,
     validate_binding: impl FnOnce(&TerminalSession) -> Result<()>,
 ) -> Result<()> {
-    let binding = kind.registration().binding();
+    run_handoff(directory, kind, validate_binding, || handoff(command, kind))
+}
+
+pub(in crate::native::terminal) fn handoff(command: &str, kind: TerminalKind) -> Result<()> {
     let name = kind.as_str();
-    let prepared = prepare_bound_launch(
-        directory,
-        &BoundHostSpec { name: binding.host },
-        binding,
-        &mut SystemClock,
-        validate_binding,
-    );
-    if let Err(error) = prepared {
-        // The pane ends with this process and takes the message with it.
-        crate::native::session::launch::log(
-            &Store::open_unchecked(directory),
-            &format!("{name}_host_refused: {error:#}"),
-        );
-        return Err(error);
-    }
     // The surface may inherit provider caller markers from its server.
     let mut bash = crate::native::process_env::helper_command("/bin/bash");
     bash.arg0("bash");
@@ -66,13 +52,7 @@ pub(in crate::native::terminal) fn run(
     let error = bash
         .args(["--noprofile", "--norc", "-m", "-c", &script])
         .exec();
-    let error =
-        anyhow::Error::new(error).context(format!("could not start bash for the {name} launch"));
-    crate::native::session::launch::log(
-        &Store::open_unchecked(directory),
-        &format!("{name}_host_refused: {error:#}"),
-    );
-    Err(error)
+    Err(error).with_context(|| format!("could not start bash for the {name} launch"))
 }
 
 #[cfg(test)]

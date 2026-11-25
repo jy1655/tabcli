@@ -64,7 +64,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   records and their rules (receipt, phases, failure handoff, repair, wait, spawn, finalize);
   the launcher's wait reads time through the `Clock` and the surface through a presence port.
   `pending.rs` holds the one Pending launch judgment that every launch admission check uses
-  (the macOS binding wait, the launch hosts, the wrapper's admission and the spawn fence),
+  (the binding waits, the launch hosts, the wrapper's admission and the spawn fence),
   and reads the bound surface of a Session for the hosts. It takes no lock: each caller reads
   the receipt first, keeps its own locks, deadline policy and error text, and the judgment
   reads in one order (status, close tombstone, the receipt's Claim, phase and deadline, then
@@ -72,7 +72,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   decoder (whose `terminal` is a `TerminalKind` that uses the launch host) and identity
   judgment, which the timeline and doctor share, and the forward-only, lock-held writers
   through which the macOS launch host records its stages and failure, with the check that the
-  admitted host incarnation may still act for the pending launch. It also owns what the
+  admitted host incarnation may still act for the pending launch. A bound Linux or Windows
+  Herdr host can write a failure for its input flush or shell start. The write checks the same
+  pending Claim and exact Surface under the lock and preserves any existing host record.
+  It also owns what the
   renderers share about the record: the words of its stages and failure reasons, the one
   responsibility class of each reason (startup files, deadline, surface identity or TAB's
   host step), which status.error and doctor's action each map to their own words, the
@@ -250,11 +253,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supplies control proof or ordinary dead-owner Surface authority.
   Each terminal kind is registered once: its portable `facts.rs` declares its surface facts,
   host command, whether its launch runs the launch host, close-evidence choice, refusal
-  messages for screen reads and guarded dialog input and, on macOS, its binding facts, and the
+  messages for screen reads and guarded dialog input and, where used, its binding facts. The
   shared lookups (`facts`, `close_evidence`, `host`, the command table) read that registration.
   Command parsing and historical `launch-host.json` reads use the portable launch-host form.
-  Dispatch, stage initialization and the doctor probe use its local handoff: Herdr uses bound
-  bash on Linux and shell environment capture on macOS. The installed
+  The local handoff uses bash for Linux Herdr, PowerShell for Windows Herdr, and shell
+  environment capture for iTerm2, WezTerm and macOS Herdr. The installed
   macOS dispatch is a value built from each adapter's injectable dependency (the AppleScript
   automation, the Ghostty and Warp runners, the WezTerm host); a test builds one with a
   recording automation or a fake runner. The shared macOS operations refuse an operation the kind declares unsupported from
@@ -262,13 +265,17 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
-  Shared macOS procedures admit every host in one order (absolute path, session-id file
-  name, existing real directory, private to the current user) with one refusal vocabulary
-  and run close re-probes with adapter-owned actions, budgets and inspection-error policies.
+  `terminal/bound_host.rs` admits a bound host's directory in one order (absolute path,
+  session-id file name, existing real directory, private to the current user). It owns the
+  registered launch-host dispatch, the shared binding wait, startup input flush and refusal
+  log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
+  before flushing input. The Windows Terminal tab host uses its own offer protocol.
+  Shared macOS procedures run close re-probes with adapter-owned actions, budgets and
+  inspection-error policies.
   Each adapter owns the rule by which a binding names its host. Terminal.app passes its rule to
   the shared check; iTerm2 (its `ITERM_SESSION_ID` session) and WezTerm (its pane and GUI
   socket) apply theirs in the adapter, where both the legacy host and the launch host use it.
-  The launches of a kind whose registration declares a launch host (iTerm2 and WezTerm) run
+  The macOS command form for iTerm2, WezTerm and Herdr runs
   `terminal/macos/launch_host.rs` as the surface program (#376): it admits itself into the
   launch-owned host record, prepares the shell environment without a terminal while it waits
   for the binding, recognizes its surface by the check the kind registers, and then replaces
@@ -526,7 +533,7 @@ before deciding that the operation never happened.
 | `native-session.json` | Recorded owner identity used for attestation |
 | `provider-process.json` | Spawned provider identity, including refused-reopen checks |
 | `launch.json` | Launch claim, deadline, and spawn phase |
-| `launch-host.json` | macOS iTerm2/WezTerm launch host for the launch receipt's Claim: admitted incarnation, forward-only stage, capture counts, and final failure. `capture_budget_ms` is the host's estimate while `environment_preparing` (made before the capture starts) and the budget the capture enforced from `environment_ready` on and in a capture's failure |
+| `launch-host.json` | Host evidence for the launch receipt's Claim. On macOS iTerm2, WezTerm and Herdr, it records admission, capture stages and final failure. `capture_budget_ms` is the estimate at `environment_preparing` and the enforced budget from `environment_ready` on and in a capture failure. Linux and Windows Herdr can write a failure-only record after binding, using `awaiting_host` with no separate host admission, as the incarnation is in the Surface record. |
 | `turn.claim` | Current exclusive right to deliver a turn |
 | `turn.claim.lock` | Synchronizes claim, completion, exit, and close transitions |
 | `status.lock` | Synchronizes status updates |
@@ -715,7 +722,7 @@ repair settles the records without resending a prompt or guessing ownership of a
   paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, whether its
   launch uses the portable launch-host form and its local `LaunchHost` handoff (including
   the adapter's binding check), the close-evidence choice, the refusal message for each operation
-  the kind does not support and, on macOS, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
+  the kind does not support and, where used, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
   exhaustive lookup on every build target; the shared lookups and the declared screen and
   guarded-key refusals of the POSIX and Windows dispatches read it, so the surface operations
   need no per-kind match of their own. A few kind checks remain outside them

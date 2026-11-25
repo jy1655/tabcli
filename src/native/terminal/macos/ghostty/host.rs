@@ -108,10 +108,7 @@ pub(in crate::native::terminal) fn run_host() -> Result<()> {
         let Frame { token, directory } = read_frame(Instant::now() + HOST_WAIT)?;
         let start = verify_launch(&directory, &token)?;
         // Only this terminal's queue: keys typed while Ghostty showed the surface.
-        if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot discard Ghostty startup input");
-        }
+        super::super::bound_host::flush_startup_input("Ghostty")?;
         start
     };
     let mut out = std::io::stdout().lock();
