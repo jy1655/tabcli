@@ -336,15 +336,12 @@ impl TerminalSendFailure {
 
 pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
 
-pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
-    select_for(preferred, None)
-}
-
 /// The terminal for a launch whose provider runs on Herdr here (`herdr_runs_provider`, its
 /// adapter's answer) or whose provider is not known yet (`None`, a reopen before it reads
 /// its source). Only on Windows does it change the automatic choice: inside an hc terminal
 /// it is Herdr when the provider runs there, and the managed console otherwise, as before
 /// Herdr reached Windows. An explicit choice wins; admission then asks the provider.
+/// Launches reach it through `session_start::launch_surface`, which supplies the answer.
 pub(super) fn select_for(
     preferred: Option<TerminalKind>,
     herdr_runs_provider: Option<bool>,
@@ -363,9 +360,10 @@ fn herdr_environment(marker: bool, term_program: Option<&str>) -> bool {
 }
 
 /// The launch admission of a selected surface, before any session is created. A kind that
-/// `select` chose from the caller's environment proves that environment here: inside Herdr
-/// the caller's `HC_TERMINAL_ID` must name a live terminal of the running core that this
-/// process runs in. Selection itself reads only the environment and opens nothing.
+/// `select_for` chose from the caller's environment (`preferred` is the same request) proves
+/// that environment here: inside Herdr the caller's `HC_TERMINAL_ID` must name a live terminal
+/// of the running core that this process runs in. Selection itself reads only the
+/// environment and opens nothing.
 pub(super) fn admit_selection(
     preferred: Option<TerminalKind>,
     selected: TerminalKind,
@@ -961,10 +959,10 @@ mod tests {
             TerminalKind::WindowsConsole
         );
         assert_eq!(
-            super::select(Some(TerminalKind::WindowsConsole)).unwrap(),
+            super::select_for(Some(TerminalKind::WindowsConsole), None).unwrap(),
             TerminalKind::WindowsConsole
         );
-        assert!(super::select(Some(TerminalKind::Iterm2)).is_err());
+        assert!(super::select_for(Some(TerminalKind::Iterm2), None).is_err());
     }
 
     #[test]

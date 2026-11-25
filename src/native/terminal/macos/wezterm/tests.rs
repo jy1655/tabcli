@@ -1164,7 +1164,7 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
         }
         return;
     }
-    let selected = crate::native::terminal::select(Some(TerminalKind::WezTerm)).unwrap();
+    let selected = crate::native::terminal::select_for(Some(TerminalKind::WezTerm), None).unwrap();
     let host = fake();
     let handle = match selected {
         TerminalKind::WezTerm => create_tab(&host, soon()).unwrap(),
