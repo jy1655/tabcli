@@ -4,6 +4,10 @@
   automatic selection verifies the caller on that core. Elsewhere it defaults to tmux.
   tmux requires version 3.2+ on an absolute PATH entry and uses its canonical path.
   WSL is not verified. The tmux server rules below apply only to tmux.
+- The installed lookup (`linux/mod.rs`) refuses every other kind, in selection and for a stored
+  handle, with `OsTerminals::unavailable`, the refusal macOS and Windows give a kind they do
+  not run: `<Name> is not available on Linux; use tmux or herdr`, unsupported. List a new
+  Linux kind in `OsTerminals::LINUX` with its adapter.
 - One server belongs to one managed session (owner's decision). Keep its socket at
   `<session directory>/tmux.sock`; refuse an existing path or a path of 108 bytes or more
   before running tmux, suggesting a shorter state directory. No GUI opens in this release.

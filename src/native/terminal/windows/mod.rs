@@ -2,7 +2,6 @@ pub(in crate::native) mod ownership;
 
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::console_control::{self, ResolvedAction, WindowLookup};
-use crate::native::failure_kind::Unsupported;
 use crate::native::session::Store;
 use std::{
     ffi::OsStr,
@@ -60,8 +59,8 @@ pub(super) use tab::run_host as run_console_host;
 
 /// The managed console: a Windows Terminal tab or a console window of its own, opened here
 /// and reached afterwards through the console control helper, with one client for each
-/// operation. The lookup also hands it any handle of a kind that Windows does not run, as
-/// before the lookup existed: its open refuses such a kind and its helper refuses the handle.
+/// operation. The lookup hands it only a managed console handle; a kind that Windows does
+/// not run is refused there, and the helper still refuses any handle but a managed console.
 pub(in crate::native::terminal) struct ManagedConsole;
 
 /// The installed Windows lookup. Its type fixes which adapter serves which kind.
@@ -184,10 +183,8 @@ pub(super) fn select_from(
         }
         None | Some(TerminalKind::WindowsConsole) => Ok(TerminalKind::WindowsConsole),
         Some(TerminalKind::Herdr) => Ok(TerminalKind::Herdr),
-        Some(kind) => bail!(Unsupported::new(format!(
-            "{} is not available on Windows; use windows-console or herdr",
-            kind.display_name()
-        ))),
+        // The lookup's own refusal, as macOS and Linux select.
+        Some(kind) => Err(super::OsTerminals::WINDOWS.unavailable(kind)),
     }
 }
 
@@ -199,17 +196,18 @@ fn open_bound_tab(
     bind: BindSurface<'_>,
     unbind: UnbindSurface<'_>,
 ) -> Result<TerminalSession> {
+    // The Windows lookup gives this adapter only a managed console; it refuses every kind
+    // Windows does not run.
+    if kind != TerminalKind::WindowsConsole {
+        bail!(
+            "the Windows console adapter cannot open {}",
+            kind.display_name()
+        );
+    }
     let startup_deadline = deadline
         .checked_sub(STARTUP_CLEANUP_RESERVE)
         .filter(|candidate| *candidate > Instant::now())
         .context("Windows console startup timeout leaves no room for exact process cleanup")?;
-    // The Windows lookup gives this adapter every kind but Herdr.
-    if kind != TerminalKind::WindowsConsole {
-        bail!(Unsupported::new(format!(
-            "{} is not available on Windows",
-            kind.display_name()
-        )));
-    }
     // Both surfaces pass this path as CreateProcessW's application name, which
     // PowerShell uses for PSHOME independently of the command line.
     let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(

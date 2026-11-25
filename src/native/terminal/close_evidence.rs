@@ -19,8 +19,13 @@ pub(in crate::native::terminal) fn created_host_incarnation(
     session.verify_managed_session(expected_session_id)?;
     #[cfg(target_os = "linux")]
     return super::linux::tmux::created_host_incarnation(session).map(Some);
+    // The host is this close's first look at the surface. A kind this OS does not run gets
+    // the refusal its lookup gives every such kind, as a close of any other such handle does.
     #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("TAB-created host evidence is unsupported on this platform")
+    match super::OsTerminals::CURRENT {
+        Some(os) if !os.runs(session.kind) => Err(os.unavailable(session.kind)),
+        _ => anyhow::bail!("TAB-created host evidence is unsupported on this platform"),
+    }
 }
 
 pub(in crate::native) enum ResumableAuthority {
@@ -126,6 +131,35 @@ pub(in crate::native) fn for_kind(kind: super::TerminalKind) -> &'static dyn Clo
         CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext => {
             &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT
         }
+    }
+}
+
+// Only Linux runs tmux, the one kind whose close begins with its created host. Elsewhere a
+// stored tmux handle gets the refusal that the OS's lookup gives every kind it does not run,
+// after the binding check, so that a close of it reads as a close of any other such handle.
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod foreign_host_tests {
+    use super::*;
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::terminal::{TerminalKind, TerminalSession};
+
+    #[test]
+    fn a_created_host_kind_this_os_does_not_run_gets_the_lookup_refusal() {
+        let unbound = TerminalSession::new(TerminalKind::Tmux, "%0".into());
+        let error = created_host_incarnation("session-tmux", &unbound).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing its managed session binding"),
+            "{error:#}"
+        );
+        let bound = unbound.with_binding(Some("session-tmux".into()));
+        let error = created_host_incarnation("session-tmux", &bound).unwrap_err();
+        let expected = if cfg!(windows) {
+            "tmux is not available on Windows; use windows-console or herdr"
+        } else {
+            "tmux is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"
+        };
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(classify(&error), Some(FailureKind::Unsupported));
     }
 }
 

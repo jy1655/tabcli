@@ -643,7 +643,7 @@ fn prepare_attachment(fixture: &Fixture, mode: Option<&str>) -> (String, Value, 
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("Windows Console is only available on Windows"),
+        stderr(&output).contains("Windows Console is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"),
         "{}",
         stderr(&output)
     );

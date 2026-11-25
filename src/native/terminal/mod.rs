@@ -142,14 +142,11 @@ impl TerminalKind {
         Self::Herdr,
     ];
 
+    /// Whether this OS runs the kind: the one list in `OsTerminals::CURRENT`.
     pub(super) const fn supported_on_this_platform(self) -> bool {
-        match self {
-            Self::Iterm2 | Self::AppleTerminal | Self::Ghostty | Self::Warp | Self::WezTerm => {
-                cfg!(target_os = "macos")
-            }
-            Self::Herdr => cfg!(any(target_os = "macos", target_os = "linux", windows)),
-            Self::WindowsConsole => cfg!(windows),
-            Self::Tmux => cfg!(target_os = "linux"),
+        match OsTerminals::CURRENT {
+            Some(os) => os.runs(self),
+            None => false,
         }
     }
 
@@ -199,6 +196,78 @@ impl FromStr for TerminalKind {
                 "unsupported terminal {value:?}; expected ghostty, herdr, iterm2, terminal, tmux, warp, wezterm, or windows-console"
             )),
         }
+    }
+}
+
+/// The kinds one OS runs, and its one refusal of every other kind. A record can name a
+/// terminal of another OS (a state directory moved between machines), so each OS's adapter
+/// lookup answers such a handle with `unavailable` before any adapter is reached:
+/// `<Name> is not available on <OS>; use <its kinds>`, an unsupported failure, the same on
+/// macOS, Linux and Windows. Only a kind's declared screen or guarded-input refusal answers
+/// before it, on every OS alike. Linux and Windows selection refuse an explicit such kind
+/// with it too; macOS selection still passes it to the launch, whose open refuses it.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::native::terminal) struct OsTerminals {
+    os: &'static str,
+    /// In `TerminalKind::ALL` order; the refusal names them as `--terminal` accepts them.
+    kinds: &'static [TerminalKind],
+}
+
+impl OsTerminals {
+    pub(in crate::native::terminal) const MACOS: Self = Self {
+        os: "macOS",
+        kinds: &[
+            TerminalKind::Iterm2,
+            TerminalKind::AppleTerminal,
+            TerminalKind::Ghostty,
+            TerminalKind::Warp,
+            TerminalKind::WezTerm,
+            TerminalKind::Herdr,
+        ],
+    };
+    pub(in crate::native::terminal) const LINUX: Self = Self {
+        os: "Linux",
+        kinds: &[TerminalKind::Tmux, TerminalKind::Herdr],
+    };
+    pub(in crate::native::terminal) const WINDOWS: Self = Self {
+        os: "Windows",
+        kinds: &[TerminalKind::WindowsConsole, TerminalKind::Herdr],
+    };
+    /// This OS; `None` where TAB runs no terminal.
+    pub(in crate::native::terminal) const CURRENT: Option<Self> = if cfg!(target_os = "macos") {
+        Some(Self::MACOS)
+    } else if cfg!(target_os = "linux") {
+        Some(Self::LINUX)
+    } else if cfg!(windows) {
+        Some(Self::WINDOWS)
+    } else {
+        None
+    };
+
+    pub(in crate::native::terminal) const fn runs(self, kind: TerminalKind) -> bool {
+        let mut index = 0;
+        while index < self.kinds.len() {
+            if self.kinds[index] as u8 == kind as u8 {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// The refusal of a kind this OS does not run. Callers ask it only for such a kind.
+    pub(in crate::native::terminal) fn unavailable(self, kind: TerminalKind) -> anyhow::Error {
+        debug_assert!(!self.runs(kind), "{} runs {kind:?}", self.os);
+        let names: Vec<_> = self.kinds.iter().map(|kind| kind.as_str()).collect();
+        let alternatives = match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => names.join(""),
+        };
+        anyhow::Error::new(crate::native::failure_kind::Unsupported::new(format!(
+            "{} is not available on {}; use {alternatives}",
+            kind.display_name(),
+            self.os
+        )))
     }
 }
 
@@ -638,7 +707,8 @@ pub(super) fn verify_posix_surface(
 }
 
 /// The surface part of the ownership proof on Windows, as `verify_posix_surface` is
-/// elsewhere: a Herdr terminal live on its recorded core; a managed console has none.
+/// elsewhere: a Herdr terminal live on its recorded core; a managed console has none; any
+/// other kind is refused by the lookup.
 #[cfg(windows)]
 pub(super) fn verify_windows_surface(
     session: &TerminalSession,
@@ -892,6 +962,138 @@ mod tests {
             format!("{error:#}").contains("no Herdr Core is running"),
             "{error:#}"
         );
+    }
+
+    // One refusal form on every OS for a kind it does not run: the kind's name, the OS, and
+    // the kinds it runs as `--terminal` accepts them; an unsupported failure. The literals
+    // are written out here, independent of the lists.
+    #[test]
+    fn each_os_refuses_every_kind_it_does_not_run_in_one_form() {
+        use super::OsTerminals;
+        use crate::native::failure_kind::{FailureKind, classify};
+        use TerminalKind::*;
+        let runs = |os: OsTerminals| {
+            TerminalKind::ALL
+                .into_iter()
+                .filter(|kind| os.runs(*kind))
+                .collect::<Vec<_>>()
+        };
+        for (os, name, kinds, alternatives) in [
+            (
+                OsTerminals::MACOS,
+                "macOS",
+                vec![Iterm2, AppleTerminal, Ghostty, Warp, WezTerm, Herdr],
+                "iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+            ),
+            (
+                OsTerminals::LINUX,
+                "Linux",
+                vec![Tmux, Herdr],
+                "tmux or herdr",
+            ),
+            (
+                OsTerminals::WINDOWS,
+                "Windows",
+                vec![WindowsConsole, Herdr],
+                "windows-console or herdr",
+            ),
+        ] {
+            assert_eq!(runs(os), kinds, "{name}");
+            for kind in &kinds {
+                assert_eq!(TerminalKind::from_str(kind.as_str()), Ok(*kind), "{name}");
+            }
+            for kind in TerminalKind::ALL.into_iter().filter(|kind| !os.runs(*kind)) {
+                let error = os.unavailable(kind);
+                assert_eq!(
+                    format!("{error:#}"),
+                    format!(
+                        "{} is not available on {name}; use {alternatives}",
+                        kind.display_name()
+                    )
+                );
+                assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{name}");
+            }
+        }
+        // This OS's list is what `supported_on_this_platform` reads, with the answers it gave
+        // before the list existed.
+        for kind in TerminalKind::ALL {
+            let before = match kind {
+                Iterm2 | AppleTerminal | Ghostty | Warp | WezTerm => cfg!(target_os = "macos"),
+                Herdr => cfg!(any(target_os = "macos", target_os = "linux", windows)),
+                WindowsConsole => cfg!(windows),
+                Tmux => cfg!(target_os = "linux"),
+            };
+            assert_eq!(kind.supported_on_this_platform(), before, "{kind:?}");
+            assert_eq!(
+                OsTerminals::CURRENT.is_some_and(|os| os.runs(kind)),
+                before,
+                "{kind:?}"
+            );
+        }
+    }
+
+    // An explicit close of a failed launch whose stored handle names a kind this OS does not
+    // run reaches the surface (the failed-start close of a bound handle) and gets this OS's
+    // lookup refusal, the same on every OS; the handle, the state and the absent tombstone
+    // stay as they were, so the close can be retried where the terminal runs. On macOS and
+    // Windows a tmux handle is refused the same way at its created-host evidence.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn explicit_close_of_another_oss_handle_gets_the_lookup_refusal_and_keeps_it() {
+        use crate::native::failure_kind::{FailureKind, classify};
+        use crate::native::session::{CoreRecord, SessionState, Store, update_status};
+        let (os, alternatives) = if cfg!(target_os = "macos") {
+            (
+                "macOS",
+                "iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+            )
+        } else if cfg!(target_os = "linux") {
+            ("Linux", "tmux or herdr")
+        } else {
+            ("Windows", "windows-console or herdr")
+        };
+        let mut kinds = vec![if cfg!(target_os = "macos") {
+            TerminalKind::WindowsConsole
+        } else {
+            TerminalKind::Iterm2
+        }];
+        if !cfg!(target_os = "linux") {
+            kinds.push(TerminalKind::Tmux);
+        }
+        for kind in kinds {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("session-foreign");
+            std::fs::create_dir_all(directory.join("events")).unwrap();
+            update_status(&directory, SessionState::Failed, None, None).unwrap();
+            let store = Store::open_unchecked(&directory);
+            store
+                .write_terminal(
+                    &TerminalSession::new(kind, "surface".into())
+                        .with_binding(Some("session-foreign".into())),
+                )
+                .unwrap();
+            let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
+            let error = crate::native::close::close_session_surface(
+                &directory,
+                "session-foreign",
+                None,
+                crate::native::session::close::budget::close_deadline(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "{} is not available on {os}; use {alternatives}",
+                    kind.display_name()
+                ),
+                "{kind:?}"
+            );
+            assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+            assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
+            assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+            assert_eq!(store.status().unwrap().state, SessionState::Failed);
+            assert!(store.closed_if_present().unwrap().is_none());
+        }
     }
 
     #[test]

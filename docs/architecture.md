@@ -244,9 +244,20 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   The seven Windows surface operations (open, send, screen, guarded key, verify, close and
   presence) resolve their adapter through one lookup (`windows/dispatch.rs`), as the shared
   POSIX dispatch does on macOS and Linux: the Herdr adapter, or `ManagedConsole` in
-  `windows/mod.rs` for every other kind; screen and guarded key first answer with the kind's
+  `windows/mod.rs` for a managed console; screen and guarded key first answer with the kind's
   declared refusal. That module is compiled into every test build, so a test builds the lookup
   over recording adapters on every target.
+  `OsTerminals` (`terminal/mod.rs`) lists the kinds each OS runs. Each OS's lookup refuses
+  every other kind with `OsTerminals::unavailable` before any adapter is reached:
+  `<Name> is not available on <OS>; use <its kinds>`, unsupported, the same on macOS, Linux
+  and Windows. Linux and Windows selection refuse an explicit such kind with the same text
+  before a session exists; macOS selection passes it on, and the launch's open refuses it
+  after the session is created. A stored handle can name another OS's terminal (a moved
+  state directory); its records stay readable, and every surface operation, including a close
+  that reaches the surface, gets this refusal (after the kind's declared screen or
+  guarded-input refusal) and keeps the handle. On macOS and Windows a tmux handle gets it at
+  its created-host close evidence. Dead-owner Repair of such a handle is decided in
+  `owner_exit`, not by this refusal. `supported_on_this_platform` reads the same list.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types with the
@@ -756,7 +767,8 @@ The platform differences carry forward 0.4.48 behavior and still await owner con
   need no per-kind match of their own. `attach_command` and `admit_selection` check kinds outside
   those operations. For Windows dead-owner Repair, read `close_authority/owner_exit.rs` and the
   kind's registration. For a Windows surface, implement `WindowsTerminalAdapter` and add it
-  to the lookup in `windows/dispatch.rs`.
+  to the lookup in `windows/dispatch.rs`. On every OS, list a new kind in that OS's
+  `OsTerminals` with its adapter; the lookup tests check that they agree.
   For macOS operations, implement the
   `MacTerminalAdapter` methods for the operations the kind supports, behind an injectable
   dependency, and add the adapter to the `Dispatch` in `macos/mod.rs`; an operation the

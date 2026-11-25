@@ -12,12 +12,13 @@ use std::{env, time::Instant};
 #[cfg(test)]
 use std::{path::Path, time::Duration};
 
-use crate::native::failure_kind::Unsupported;
 use crate::native::settings::MacosOpenMode;
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::bail;
 
 use super::{
-    CloseOutcome, DialogKey, GuardedDialogInput, TerminalKind, TerminalSendFailure,
+    CloseOutcome, DialogKey, GuardedDialogInput, OsTerminals, TerminalKind, TerminalSendFailure,
     TerminalSendResult, TerminalSession, macos_selection::select_macos_host,
 };
 
@@ -116,10 +117,10 @@ where
             TerminalKind::WezTerm => Ok(&self.wezterm),
             TerminalKind::Warp => Ok(&self.warp),
             TerminalKind::Herdr => Ok(&self.herdr),
-            TerminalKind::WindowsConsole => bail!(Unsupported::new(
-                "Windows Console is only available on Windows"
-            )),
-            TerminalKind::Tmux => bail!(Unsupported::new("tmux is only available on Linux")),
+            // A kind macOS does not run gets the refusal every OS gives such a kind.
+            TerminalKind::WindowsConsole | TerminalKind::Tmux => {
+                Err(OsTerminals::MACOS.unavailable(kind))
+            }
         }
     }
 }
@@ -497,36 +498,37 @@ mod adapter_tests {
                 );
             }
         }
-        // Windows Console has no adapter on macOS.
-        assert_eq!(
-            dispatch
-                .adapter(TerminalKind::WindowsConsole)
-                .err()
-                .expect("unsupported kind")
-                .to_string(),
-            "Windows Console is only available on Windows"
-        );
-        assert_eq!(
-            read(TerminalKind::WindowsConsole),
-            "Windows Console is only available on Windows"
-        );
-        let failure = send_file(
-            &dispatch,
-            &handle(TerminalKind::WindowsConsole),
-            Path::new("unused"),
-            Instant::now(),
-        )
-        .unwrap_err();
-        assert!(!failure.delivery_may_have_occurred());
-        assert_eq!(
-            failure.error().to_string(),
-            "Windows Console is only available on Windows"
-        );
-        // A real platform gate: the error carries the unsupported hint.
-        assert_eq!(
-            crate::native::failure_kind::classify(failure.error()),
-            Some(crate::native::failure_kind::FailureKind::Unsupported)
-        );
+        // A kind macOS does not run has no adapter here: the lookup refuses it as Linux and
+        // Windows refuse theirs, naming macOS and the kinds it runs.
+        for kind in [TerminalKind::WindowsConsole, TerminalKind::Tmux] {
+            let refusal = format!(
+                "{} is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+                kind.display_name()
+            );
+            assert_eq!(
+                dispatch
+                    .adapter(kind)
+                    .err()
+                    .expect("unsupported kind")
+                    .to_string(),
+                refusal
+            );
+            assert_eq!(read(kind), refusal);
+            let failure = send_file(
+                &dispatch,
+                &handle(kind),
+                Path::new("unused"),
+                Instant::now(),
+            )
+            .unwrap_err();
+            assert!(!failure.delivery_may_have_occurred());
+            assert_eq!(failure.error().to_string(), refusal);
+            // A real platform gate: the error carries the unsupported hint.
+            assert_eq!(
+                crate::native::failure_kind::classify(failure.error()),
+                Some(crate::native::failure_kind::FailureKind::Unsupported)
+            );
+        }
         // Warp's send refusal is the adapter's own and separate from its declared ones.
         let failure = send_file(
             &dispatch,
@@ -542,6 +544,85 @@ mod adapter_tests {
             failure.error().to_string(),
             "Warp Control input.insert/input.replace only stage text and cannot submit it; managed Warp terminal input is unsupported"
         );
+    }
+
+    // Every surface operation on a stored handle of a kind macOS does not run gets the
+    // installed lookup's refusal, before the open reads the creation setting and before any
+    // adapter is reached; only tmux's declared guarded-input refusal answers first, as on
+    // Linux and Windows.
+    #[test]
+    fn the_installed_lookup_refuses_kinds_macos_does_not_run() {
+        use crate::native::failure_kind::{FailureKind, classify};
+        let root = tempfile::tempdir().unwrap();
+        // An unreadable creation setting: the lookup answers before it is read.
+        std::fs::write(root.path().join("settings.json"), "{broken").unwrap();
+        let directory = root.path().join("session-foreign");
+        std::fs::create_dir(&directory).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let input = GuardedDialogInput {
+            expected_claim: None,
+            expires_unix_ms: None,
+            screen: "screen".into(),
+            key: DialogKey::Enter,
+        };
+        for kind in [TerminalKind::WindowsConsole, TerminalKind::Tmux] {
+            let refusal = format!(
+                "{} is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+                kind.display_name()
+            );
+            let session = handle(kind).with_binding(Some("session-foreign".into()));
+            let failure =
+                send_file(INSTALLED, &session, Path::new("unused"), deadline).unwrap_err();
+            assert!(!failure.delivery_may_have_occurred(), "{kind:?}");
+            let errors = [
+                open_bound_tab(
+                    INSTALLED,
+                    kind,
+                    "command",
+                    &directory,
+                    deadline,
+                    |_| panic!("a refused kind is never bound"),
+                    || panic!("a refused kind is never unbound"),
+                )
+                .unwrap_err(),
+                failure.into_error(),
+                read_screen(INSTALLED, &session, deadline).unwrap_err(),
+                verify_surface(INSTALLED, &directory, &session, None).unwrap_err(),
+                close_owned_session(
+                    INSTALLED,
+                    &directory,
+                    "session-foreign",
+                    &session,
+                    OwnedSurfaceClose::SurfaceOnly,
+                    deadline,
+                )
+                .unwrap_err(),
+                surface_present(INSTALLED, &directory, &session, Duration::from_secs(1))
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(format!("{error:#}"), refusal, "{kind:?}");
+                assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+            }
+            let guarded = guarded_dialog_input(INSTALLED, &session, &input, deadline)
+                .unwrap_err()
+                .to_string();
+            let declared = kind.registration().guarded_input_refusal;
+            assert_eq!(guarded, declared.map_or(refusal, str::to_owned), "{kind:?}");
+        }
+    }
+
+    // The installed lookup serves exactly the kinds the macOS list names, which is what the
+    // refusal offers and what `supported_on_this_platform` reads on macOS.
+    #[test]
+    fn the_installed_lookup_serves_exactly_the_kinds_macos_runs() {
+        for kind in TerminalKind::ALL {
+            assert_eq!(
+                INSTALLED.adapter(kind).is_ok(),
+                OsTerminals::MACOS.runs(kind),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

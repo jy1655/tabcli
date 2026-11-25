@@ -18,6 +18,16 @@ The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmu
 `apple-terminal`, `apple_terminal`, `default`, `terminal.app`, `warpterminal`, `windows`, and
 `console`, and `hc` or `herdr-core` (Herdr). Structured output names Terminal.app `apple-terminal`.
 
+Each operating system runs only its own terminals: macOS iTerm2, Terminal.app, Ghostty, Warp,
+WezTerm and Herdr; Linux tmux and Herdr; Windows its managed console and Herdr. Another terminal
+is refused the same way on all three: `<Name> is not available on <system>; use <the terminals
+it runs>`. Linux and Windows refuse such a `--terminal` before any session exists; macOS
+creates the session and refuses it when the launch opens the terminal, so the session ends
+`failed`. A session record can also name such a terminal, for example in a state directory
+copied from another operating system. Its records stay readable, `screen` and `doctor` report
+the terminal as unsupported, and a `tell` or `close-session` that reaches the terminal gets that
+same refusal; nothing is sent and the terminal handle is kept.
+
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Automatic selection verifies a Herdr caller when both
 `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID` are present. Failed verification
