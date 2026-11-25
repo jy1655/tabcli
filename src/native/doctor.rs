@@ -6,7 +6,7 @@ use super::query::observation::judgment::{
     Surface, SurfacePresence, SurfaceSource, Turn,
 };
 use super::query::observation::{Observation, PartialObservation, SessionEvidence};
-use super::{NativeCommand, consent, provider, query, reopen, terminal};
+use super::{NativeCommand, consent, provider, query, reopen, session_start, terminal};
 use crate::native::clock::SystemClock;
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::process_env::{PROBE_TIMEOUT, probe};
@@ -199,12 +199,8 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     let mut observations = json!({});
     let mut selected_terminal = None;
     if request.provider.is_some() {
-        let selected = terminal::select_for(
-            None,
-            request.provider.map(|provider| {
-                provider::surface_support(provider, terminal::TerminalKind::Herdr).is_ok()
-            }),
-        );
+        // Selection only: an automatic Herdr choice is not admitted here.
+        let selected = session_start::select_surface(None, request.provider);
         selected_terminal = selected.as_ref().ok().copied();
         let (availability, reason, evidence) = match selected {
             Ok(kind) if kind.supported_on_this_platform() => (

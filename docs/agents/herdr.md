@@ -109,7 +109,13 @@
   the environment and, on Windows, the requested provider. Launch admission
   (`terminal::admit_selection`) then requires the caller's terminal to be live on the
   addressed core with this process among its program's descendants, and refuses otherwise
-  without opening another terminal. An explicit `--terminal herdr` can launch outside Herdr.
+  without opening another terminal. `ask` and `reopen` choose through one entry,
+  `session_start::choose_launch_surface`: selection with the provider's pre-probe answer, then
+  this admission; a reopen passes no provider, as it selects before reading its source. The
+  provider's own admission follows in `resolve`. `doctor` reports `select_surface`, the
+  selection without any admission, so it can name an automatic Herdr that `ask` then refuses
+  (no verified caller, or a provider version below the Herdr floor).
+  An explicit `--terminal herdr` can launch outside Herdr.
   On macOS and Linux both selection modes check the caller on the connection that creates the child before
   naming a parent.
 - OSC 7501 status words, `hc wait` and templates are never request, completion or close

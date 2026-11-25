@@ -2089,7 +2089,7 @@ fn bundled_discovery_and_dispatch_ignore_invoking_terminal() {
         *expected_term
     );
     assert_eq!(
-        crate::native::terminal::select(Some(TerminalKind::Warp)).unwrap(),
+        crate::native::terminal::select_for(Some(TerminalKind::Warp), None).unwrap(),
         TerminalKind::Warp
     );
 
