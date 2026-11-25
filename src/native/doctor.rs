@@ -1658,7 +1658,7 @@ mod launch_host_tests {
         let none = if cfg!(target_os = "macos") {
             r#"["unknown","launch_host_not_recorded","No launch host record is retained. A session from an earlier release, another terminal, or a launch that did not reach surface creation has none; absence is not evidence that the host never started.",null]"#
         } else {
-            r#"["unavailable","launch_stage_not_applicable","Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",null]"#
+            r#"["unavailable","launch_stage_not_applicable","macOS iTerm2, WezTerm and Herdr record capture stages. Linux and Windows Herdr record bound startup failures.",null]"#
         };
         let expected = [
             format!(
@@ -1668,7 +1668,7 @@ mod launch_host_tests {
                 r#"wezterm: ["unknown","launch_stage_observed","The last recorded stage of the WezTerm launch host is awaiting_host. {EARLIER}","wezterm"] Some(WezTerm)"#
             ),
             format!("none: {none} None"),
-            r#"ghostty surface: ["unavailable","launch_stage_not_applicable","Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.","ghostty"] Some(Ghostty)"#.to_owned(),
+            r#"ghostty surface: ["unavailable","launch_stage_not_applicable","macOS iTerm2, WezTerm and Herdr record capture stages. Linux and Windows Herdr record bound startup failures.","ghostty"] Some(Ghostty)"#.to_owned(),
             format!(
                 r#"iterm2 with ghostty surface: ["unknown","launch_stage_observed","The last recorded stage of the iTerm2 launch host is awaiting_host. {EARLIER}","iterm2"] Some(Iterm2)"#
             ),

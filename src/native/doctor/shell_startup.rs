@@ -19,6 +19,8 @@ pub(super) struct LaterEvidence {
     pub(super) owner_recorded: bool,
 }
 
+const LAUNCH_STAGE_NOT_APPLICABLE_DETAIL: &str = "macOS iTerm2, WezTerm and Herdr record capture stages. Linux and Windows Herdr record bound startup failures.";
+
 pub(super) fn launch_stage_check(
     observation: &HostObservation,
     known_terminal: Option<TerminalKind>,
@@ -91,15 +93,6 @@ pub(super) fn launch_stage_check(
         }
         HostObservation::NotRecorded => match known_terminal {
             Some(kind) if !kind.has_launch_host_form() => not_applicable(kind),
-            Some(TerminalKind::Herdr) if cfg!(any(target_os = "linux", windows)) => Check::new(
-                CheckId::LAUNCH_STAGE,
-                Unknown,
-                Reason::LAUNCH_HOST_NOT_RECORDED,
-                "No Herdr launch host record is retained.",
-                format!(
-                    "Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline`."
-                ),
-            ),
             _ if !known_terminal.map_or(
                 cfg!(target_os = "macos"),
                 TerminalKind::captures_shell_environment,
@@ -109,7 +102,7 @@ pub(super) fn launch_stage_check(
                     CheckId::LAUNCH_STAGE,
                     Unavailable,
                     Reason::LAUNCH_STAGE_NOT_APPLICABLE,
-                    "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",
+                    LAUNCH_STAGE_NOT_APPLICABLE_DETAIL,
                     "No action is needed.",
                 )
             }
@@ -152,7 +145,7 @@ fn not_applicable(kind: TerminalKind) -> Check {
         CheckId::LAUNCH_STAGE,
         Availability::Unavailable,
         Reason::LAUNCH_STAGE_NOT_APPLICABLE,
-        "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.",
+        LAUNCH_STAGE_NOT_APPLICABLE_DETAIL,
         "No action is needed.",
     )
     .evidence(json!({"terminal": kind}))
@@ -897,6 +890,10 @@ mod tests {
         let mut actual = Vec::new();
         for kind in TerminalKind::ALL {
             let stage = check(HostObservation::NotRecorded, Some(kind), false);
+            if stage["reason_code"] == "launch_stage_not_applicable" {
+                assert_eq!(stage["availability"], "unavailable");
+                assert_eq!(stage["next_action"], "No action is needed.");
+            }
             let probe = probe(
                 ProbeContext::Terminal(kind),
                 Some((
@@ -920,8 +917,7 @@ mod tests {
             ));
         }
         const NOT_RECORDED: &str = "No launch host record is retained. A session from an earlier release, another terminal, or a launch that did not reach surface creation has none; absence is not evidence that the host never started.";
-        const NO_RECORDS: &str =
-            "Launch host records exist only for macOS iTerm2, WezTerm and Herdr launches.";
+        const NO_RECORDS: &str = "macOS iTerm2, WezTerm and Herdr record capture stages. Linux and Windows Herdr record bound startup failures.";
         const NO_PROBE: &str =
             "Only macOS iTerm2, WezTerm and Herdr launches prepare the shell environment this way.";
         let host = |kind: &str| {
@@ -948,13 +944,7 @@ mod tests {
             host("WezTerm"),
             other("WindowsConsole", "windows-console"),
             other("Tmux", "tmux"),
-            if cfg!(any(target_os = "linux", windows)) {
-                format!(
-                    "Herdr: true | launch_host_not_recorded | No Herdr launch host record is retained. | null | probe ran false shell_environment_probe_not_applicable | {NO_PROBE}"
-                )
-            } else {
-                host("Herdr")
-            },
+            host("Herdr"),
         ];
         assert_eq!(actual, expected);
     }

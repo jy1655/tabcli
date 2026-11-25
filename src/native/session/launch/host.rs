@@ -355,8 +355,9 @@ fn unrecorded_host(store: &Store, token: &str, terminal: TerminalKind) -> Result
     })
 }
 
-/// Publish a failure after the Herdr host proved its binding. Its incarnation is in
-/// that surface record, so schema 1 carries no separate host admission or capture stages.
+/// Publish a failure after the Herdr host proved its address, PID and birth against the
+/// binding. The Surface record holds its incarnation, so schema 1 carries no separate
+/// host admission or capture stages.
 /// A later Claim, close, wrapper spawn or binding change wins over this diagnosis.
 #[cfg(any(target_os = "linux", windows, all(unix, test)))]
 pub(in crate::native) fn fail_bound_herdr(

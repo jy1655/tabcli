@@ -1,20 +1,47 @@
+use super::super::HerdrSurface;
 use super::*;
 use crate::native::{
     clock::SystemClock,
     session::{CoreRecord, SessionState, update_status},
 };
+use std::fs;
 use std::time::Duration;
-use std::{cell::Cell, fs, os::unix::fs::PermissionsExt};
+#[cfg(unix)]
+use std::{cell::Cell, os::unix::fs::PermissionsExt};
 
-fn bound_herdr() -> (tempfile::TempDir, Store, TerminalSession) {
+const HOST_BIRTH: HerdrHostBirth = HerdrHostBirth::Macos {
+    host_start_seconds: 1,
+    host_start_microseconds: 0,
+};
+
+fn refusal_log(store: &Store) -> String {
+    fs::read_to_string(store.directory().join(launch::LOG)).unwrap()
+}
+
+fn bound_fixture(kind: TerminalKind) -> (tempfile::TempDir, Store, TerminalSession) {
     let (root, store, _) = launch::test_support::pending_launch(
         "session-host-",
         &std::env::temp_dir(),
         Duration::from_secs(30),
     );
     let id = store.directory().file_name().unwrap().to_str().unwrap();
-    let mut surface = TerminalSession::new(TerminalKind::Herdr, "t7".into());
+    let mut surface = TerminalSession::new(kind, "t7".into());
+    if kind == TerminalKind::Herdr {
+        surface = surface.with_herdr_core(
+            HerdrSurface {
+                socket: "test-endpoint".into(),
+                core_id: "test-core".into(),
+                created_ms: 1,
+                host_pid: std::process::id(),
+                birth: HOST_BIRTH,
+            },
+            "test-launch",
+        );
+    }
     surface.managed_session_id = Some(id.into());
+    #[cfg(windows)]
+    crate::native::session::primitives::set_private_directory_permissions(store.directory())
+        .unwrap();
     store
         .record(CoreRecord::Terminal)
         .write_json(&surface)
@@ -23,8 +50,83 @@ fn bound_herdr() -> (tempfile::TempDir, Store, TerminalSession) {
 }
 
 #[test]
+fn a_reused_herdr_host_pid_cannot_record_a_failure() {
+    for birth in [
+        Some(HerdrHostBirth::Macos {
+            host_start_seconds: 2,
+            host_start_microseconds: 0,
+        }),
+        None,
+    ] {
+        let (_root, store, surface) = bound_fixture(TerminalKind::Herdr);
+        let error = run_handoff_with(
+            store.directory(),
+            TerminalKind::Herdr,
+            &mut SystemClock,
+            |bound| {
+                assert_eq!(bound, &surface);
+                assert_eq!(bound.herdr_core().unwrap().host_pid, std::process::id());
+                Ok(())
+            },
+            || bail!("fixture could not flush startup input"),
+            || -> Result<()> { panic!("failed input flush allowed handoff") },
+            || birth,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "fixture could not flush startup input");
+        assert!(
+            refusal_log(&store)
+                .contains("herdr_host_refused: fixture could not flush startup input")
+        );
+        assert!(
+            store
+                .record(CoreRecord::LaunchHost)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_handoff_logs_a_directory_admission_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    for kind in [TerminalKind::Herdr, TerminalKind::Tmux] {
+        let directory = root.path().join(format!("session-{}", kind.as_str()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+        let error = run_handoff_with(
+            &directory,
+            kind,
+            &mut SystemClock,
+            |_| panic!("admission refused"),
+            || panic!("admission refused"),
+            || -> Result<()> { panic!("admission refused") },
+            || panic!("admission refused"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} launch directory is not private to the current user",
+                kind.display_name()
+            )
+        );
+        let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
+        assert!(log.ends_with(&format!(" {}_host_refused: {error:#}\n", kind.as_str())));
+        assert!(
+            !Store::open_unchecked(&directory)
+                .record(CoreRecord::LaunchHost)
+                .path()
+                .exists()
+        );
+    }
+}
+
+#[test]
 fn a_bound_herdr_input_failure_settles_while_the_launch_is_still_pending() {
-    let (_root, store, surface) = bound_herdr();
+    let (_root, store, surface) = bound_fixture(TerminalKind::Herdr);
     let error = run_handoff_with(
         store.directory(),
         TerminalKind::Herdr,
@@ -35,6 +137,20 @@ fn a_bound_herdr_input_failure_settles_while_the_launch_is_still_pending() {
         },
         || bail!("fixture could not flush startup input"),
         || -> Result<()> { panic!("failed input flush allowed handoff") },
+        || {
+            assert!(
+                refusal_log(&store)
+                    .contains("herdr_host_refused: fixture could not flush startup input")
+            );
+            assert!(
+                store
+                    .record(CoreRecord::LaunchHost)
+                    .bytes()
+                    .unwrap()
+                    .is_none()
+            );
+            Some(HOST_BIRTH)
+        },
     )
     .unwrap_err();
     assert_eq!(error.to_string(), "fixture could not flush startup input");
@@ -57,7 +173,7 @@ fn a_late_herdr_handoff_failure_cannot_retire_a_changed_launch() {
         "binding",
         "already recorded",
     ] {
-        let (_root, store, surface) = bound_herdr();
+        let (_root, store, surface) = bound_fixture(TerminalKind::Herdr);
         let receipt = launch::read(&store).unwrap().unwrap();
         let fail = || {
             run_handoff_with(
@@ -80,6 +196,7 @@ fn a_late_herdr_handoff_failure_cannot_retire_a_changed_launch() {
                     }
                     bail!("fixture could not start shell")
                 },
+                || Some(HOST_BIRTH),
             )
             .unwrap_err()
         };
@@ -95,6 +212,9 @@ fn a_late_herdr_handoff_failure_cannot_retire_a_changed_launch() {
             "{change}"
         );
         if change == "none" {
+            assert!(
+                refusal_log(&store).contains("herdr_host_refused: fixture could not start shell")
+            );
             assert!(matches!(launch::host::observe(&store, Some(&receipt)),
                 launch::host::HostObservation::Recorded(host)
                 if host.failure.as_ref().is_some_and(|failure| failure.reason == FailureReason::LaunchShellExecFailed)));
@@ -107,6 +227,7 @@ fn a_late_herdr_handoff_failure_cannot_retire_a_changed_launch() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn admission_refuses_relative_link_shared_and_invalid_before_callback() {
     let temp = tempfile::tempdir().unwrap();
@@ -136,8 +257,15 @@ fn admission_refuses_relative_link_shared_and_invalid_before_callback() {
 
 #[test]
 fn handoff_rechecks_pending_claim_and_exact_binding_before_input_flush() {
-    for change in ["none", "closed", "claim", "binding", "environment"] {
-        let (_root, store, surface) = bound_herdr();
+    for change in [
+        "none",
+        "closed",
+        "claim",
+        "binding",
+        "environment",
+        "expired",
+    ] {
+        let (_root, store, surface) = bound_fixture(TerminalKind::Herdr);
         let steps = std::cell::RefCell::new(Vec::new());
         let result = run_handoff_with(
             store.directory(),
@@ -160,6 +288,10 @@ fn handoff_rechecks_pending_claim_and_exact_binding_before_input_flush() {
                         store.record(CoreRecord::Terminal).write_json(&changed)?;
                     }
                     "environment" => bail!("wrong host environment"),
+                    "expired" => launch::test_support::apply(
+                        &store,
+                        &[launch::test_support::Change::ReceiptExpired],
+                    ),
                     _ => {}
                 }
                 Ok(())
@@ -172,6 +304,7 @@ fn handoff_rechecks_pending_claim_and_exact_binding_before_input_flush() {
                 steps.borrow_mut().push("handoff");
                 Ok(())
             },
+            || panic!("no recorded failure after validation"),
         );
         assert_eq!(result.is_ok(), change == "none", "{change}: {result:?}");
         assert!(
@@ -191,4 +324,29 @@ fn handoff_rechecks_pending_claim_and_exact_binding_before_input_flush() {
             }
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tmux_handoff_failure_is_logged_without_a_host_record() {
+    let (_root, store, _) = bound_fixture(TerminalKind::Tmux);
+    let error = run_handoff_with(
+        store.directory(),
+        TerminalKind::Tmux,
+        &mut SystemClock,
+        |_| Ok(()),
+        || Ok(()),
+        || -> Result<()> { bail!("fixture could not start bash") },
+        || panic!("tmux does not look up a Herdr process birth"),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "fixture could not start bash");
+    assert!(refusal_log(&store).contains("tmux_host_refused: fixture could not start bash"));
+    assert!(
+        store
+            .record(CoreRecord::LaunchHost)
+            .bytes()
+            .unwrap()
+            .is_none()
+    );
 }

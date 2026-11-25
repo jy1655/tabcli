@@ -268,13 +268,16 @@ pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
     }
 }
 
+pub(super) const UNSUPPORTED_LAUNCH_HOST: &str =
+    "this native launch host is unavailable on this platform";
+
 fn run_launch_host(directory: PathBuf, command: String, kind: TerminalKind) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     return super::bound_host::run_launch_host(&directory, &command, kind);
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (directory, command, kind);
-        bail!("native launch hosts are only available on macOS")
+        bail!("{UNSUPPORTED_LAUNCH_HOST}")
     }
 }
 
@@ -491,7 +494,7 @@ mod tests {
             #[cfg(not(target_os = "macos"))]
             (
                 vec![ITERM2_HOST_COMMAND, directory, "--launch-command", "script"],
-                "native launch hosts are only available on macOS",
+                "this native launch host is unavailable on this platform",
             ),
             #[cfg(not(target_os = "macos"))]
             (
@@ -501,7 +504,7 @@ mod tests {
                     "--launch-command",
                     "script",
                 ],
-                "native launch hosts are only available on macOS",
+                "this native launch host is unavailable on this platform",
             ),
             #[cfg(not(target_os = "macos"))]
             (

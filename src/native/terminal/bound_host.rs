@@ -1,11 +1,13 @@
 //! Bound hosts share private-directory admission, binding observation and refusal reporting.
 //! The direct handoffs also recheck the pending Claim and exact binding under the lifecycle
 //! lock before flushing input. The wrapper owns final spawn admission in every mode.
+#[cfg(any(target_os = "linux", windows, test))]
+use super::record::HerdrHostBirth;
 use super::{TerminalKind, TerminalSession};
 use crate::native::clock::Clock;
 #[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
-#[cfg(any(target_os = "linux", windows, all(unix, test)))]
+#[cfg(any(target_os = "linux", windows, test))]
 use crate::native::session::launch::host::FailureReason;
 use crate::native::session::{Reader, Store, launch};
 use std::path::Path;
@@ -56,7 +58,7 @@ pub(super) fn run_launch_host(directory: &Path, command: &str, kind: TerminalKin
             );
         });
     }
-    bail!("native launch hosts are only available on macOS")
+    bail!("{}", super::host::UNSUPPORTED_LAUNCH_HOST)
 }
 
 #[cfg(target_os = "macos")]
@@ -96,7 +98,7 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     )
 }
 
-/// Log only after directory admission. Keep the legacy log prefix for Terminal.app.
+/// Keep the legacy log prefix for Terminal.app.
 pub(super) fn log_refusal(store: &Store, kind: TerminalKind, detail: &impl std::fmt::Display) {
     let name = if kind == TerminalKind::AppleTerminal {
         "terminal"
@@ -210,7 +212,7 @@ fn windows_private_directory(directory: &Path, name: &str) -> Result<()> {
         .with_context(|| format!("{name} launch directory is not private to the current user"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests;
 #[cfg(all(test, windows))]
 mod windows_tests;
@@ -256,6 +258,10 @@ pub(super) fn run_handoff<T>(
         validate,
         || flush_startup_input(kind.display_name()),
         handoff,
+        || {
+            use super::herdr::{Core, Installed};
+            Installed.process_start(std::process::id()).ok().flatten()
+        },
     )
 }
 
@@ -263,7 +269,7 @@ pub(super) fn run_handoff<T>(
 /// starts the shell outside that lock. Windows waits for the root only after it has started.
 /// Only an attested Herdr host's flush or handoff failure is durable. An unbound or
 /// mismatched process has no authority to make the launch fail.
-#[cfg(any(target_os = "linux", windows, all(unix, test)))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn run_handoff_with<T>(
     directory: &Path,
     kind: TerminalKind,
@@ -271,50 +277,55 @@ fn run_handoff_with<T>(
     validate: impl FnOnce(&TerminalSession) -> Result<()>,
     flush: impl FnOnce() -> Result<()>,
     handoff: impl FnOnce() -> Result<T>,
+    current_host_birth: impl FnOnce() -> Option<HerdrHostBirth>,
 ) -> Result<T> {
     use launch::pending::{self, Expiry};
 
     let name = kind.display_name();
-    run_bound_host(directory, &BoundHostSpec { name }, |id| {
-        let store = Store::open_unchecked(directory);
-        let start = clock.now();
-        let outcome = (|| {
-            let initial =
-                launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-            let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
-            let flushed = {
-                let _lock = store.lock()?;
-                let current = launch::read(&store)?
-                    .with_context(|| format!("missing {name} launch receipt"))?;
-                anyhow::ensure!(
-                    pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?
-                        .is_ok(),
-                    "{name} launch is no longer pending"
-                );
-                anyhow::ensure!(
-                    pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
-                        == Some(&surface),
-                    "{name} binding changed"
-                );
-                flush()
-            };
-            let mut record_failure = |reason| {
-                if kind == TerminalKind::Herdr {
-                    let _ = launch::host::fail_bound_herdr(
-                        &store,
-                        &initial.claim_token,
-                        &surface,
-                        reason,
-                        clock.now().saturating_duration_since(start).as_millis() as u64,
-                    );
-                }
-            };
-            flushed.inspect_err(|_| record_failure(FailureReason::InputFlushFailed))?;
-            handoff().inspect_err(|_| record_failure(FailureReason::LaunchShellExecFailed))
-        })();
-        if let Err(error) = &outcome {
-            log_refusal(&store, kind, &format_args!(": {error:#}"));
+    let store = Store::open_unchecked(directory);
+    let start = clock.now();
+    // Direct hosts have always logged admission refusals as well as later errors.
+    let refused = |error: &anyhow::Error| log_refusal(&store, kind, &format_args!(": {error:#}"));
+    let (initial, surface, flushed) = run_bound_host(directory, &BoundHostSpec { name }, |id| {
+        let initial =
+            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+        let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
+        let _lock = store.lock()?;
+        let current =
+            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+        anyhow::ensure!(
+            pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?.is_ok(),
+            "{name} launch is no longer pending"
+        );
+        anyhow::ensure!(
+            pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
+                == Some(&surface),
+            "{name} binding changed"
+        );
+        Ok((initial, surface, flush()))
+    })
+    .inspect_err(refused)?;
+
+    let (reason, outcome) = match flushed {
+        Ok(()) => (FailureReason::LaunchShellExecFailed, handoff()),
+        Err(error) => (FailureReason::InputFlushFailed, Err(error)),
+    };
+    outcome.inspect_err(|error| {
+        // The launcher can return as soon as the Record appears. Attempt the log first
+        // so the details are available to that caller.
+        refused(error);
+        if kind == TerminalKind::Herdr
+            && surface.herdr_core().is_some_and(|core| {
+                core.host_pid == std::process::id() && current_host_birth() == Some(core.birth)
+            })
+        {
+            let _ = launch::host::fail_bound_herdr(
+                &store,
+                &initial.claim_token,
+                &surface,
+                reason,
+                clock.now().saturating_duration_since(start).as_millis() as u64,
+            );
         }
-        outcome
     })
 }

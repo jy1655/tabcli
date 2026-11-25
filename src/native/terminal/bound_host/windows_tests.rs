@@ -44,6 +44,26 @@ fn a_private_session_directory_is_admitted_from_its_handle() {
     );
 }
 
+#[test]
+fn native_herdr_host_dispatch_reaches_the_launch_receipt_check() {
+    use super::super::host;
+    let root = tempfile::tempdir().unwrap();
+    let directory = private_session(root.path(), "session-herdr-host");
+    let command = host::parse(
+        host::HERDR_HOST_COMMAND,
+        &[
+            directory.to_str().unwrap().to_owned(),
+            host::LAUNCH_COMMAND_FLAG.to_owned(),
+            "must not run".to_owned(),
+        ],
+    )
+    .unwrap();
+    let error = host::run(command).unwrap_err();
+    assert_eq!(error.to_string(), "missing Herdr launch receipt");
+    let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
+    assert!(log.ends_with(" herdr_host_refused: missing Herdr launch receipt\n"));
+}
+
 // Everyone (S-1-1-0) gains a right that changes the directory: writing an entry, or only
 // deleting entries, which the trust store's own rule does not count for a file.
 #[test]
