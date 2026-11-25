@@ -37,7 +37,11 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity};
+use super::windows_dispatch::{BindSurface, Dispatch, UnbindSurface, WindowsTerminalAdapter};
+use super::{
+    CloseOutcome, ConsoleNewline, GuardedDialogInput, STARTUP_CLEANUP_RESERVE, TerminalKind,
+    TerminalSendResult, TerminalSession, WindowsProcessIdentity,
+};
 
 mod focus;
 pub(in crate::native::terminal) mod launch_host;
@@ -54,11 +58,79 @@ use process::{
 pub(in crate::native) use security::{process_user_sid, set_private_permissions};
 pub(super) use tab::run_host as run_console_host;
 
-pub(super) fn surface_present(
-    directory: &Path,
-    session: &TerminalSession,
-    timeout: Duration,
-) -> Result<bool> {
+/// The managed console: a Windows Terminal tab or a console window of its own, opened here
+/// and reached afterwards through the console control helper, with one client for each
+/// operation. The lookup also hands it any handle of a kind that Windows does not run, as
+/// before the lookup existed: its open refuses such a kind and its helper refuses the handle.
+pub(in crate::native::terminal) struct ManagedConsole;
+
+/// The installed Windows lookup. Its type fixes which adapter serves which kind.
+pub(super) static INSTALLED: Dispatch<ManagedConsole, super::herdr::InstalledAdapter> =
+    Dispatch::new(ManagedConsole, super::herdr::Adapter::installed());
+
+impl WindowsTerminalAdapter for ManagedConsole {
+    fn open_bound_tab(
+        &self,
+        kind: TerminalKind,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: BindSurface<'_>,
+        unbind: UnbindSurface<'_>,
+    ) -> Result<TerminalSession> {
+        open_bound_tab(kind, command, directory, deadline, bind, unbind)
+    }
+
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        console_control::installed().send_file(session, prompt_path, deadline)
+    }
+
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+        console_control::installed().read_screen(session, deadline)
+    }
+
+    fn guarded_dialog_input(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        input: &GuardedDialogInput,
+        deadline: Instant,
+    ) -> Result<bool> {
+        console_control::installed().guarded_dialog_input(directory, session, input, deadline)
+    }
+
+    // A managed console has no surface proof of its own: the ownership proof verifies the
+    // owner's process identity.
+    fn verify_surface(&self, session: &TerminalSession, timeout: Option<Duration>) -> Result<()> {
+        let _ = (session, timeout);
+        Ok(())
+    }
+
+    fn close_session_until(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        console_control::installed().close_session_until(directory, session, deadline)
+    }
+
+    fn surface_present(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool> {
+        surface_present(directory, session, timeout)
+    }
+}
+
+fn surface_present(directory: &Path, session: &TerminalSession, timeout: Duration) -> Result<bool> {
     let _ = (directory, timeout);
     let pid: u32 = session.id.parse().context("invalid Windows console pid")?;
     if !agent_bridge::process_is_alive(pid) {
@@ -70,7 +142,6 @@ pub(super) fn surface_present(
     Ok(query_process_identity(pid)? == *identity)
 }
 
-const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 // A window that this launch brought to the front can take the foreground again while it
 // starts (measured 2026-10-01, Windows Terminal 1.24: 54 ms after the first time), so the
 // launch keeps answering for this long after the surface has started.
@@ -120,22 +191,19 @@ pub(super) fn select_from(
     }
 }
 
-pub(super) fn open_bound_tab<F, U>(
+fn open_bound_tab(
     kind: TerminalKind,
     command: &str,
     directory: &Path,
     deadline: Instant,
-    bind: F,
-    unbind: U,
-) -> Result<TerminalSession>
-where
-    F: FnOnce(&mut TerminalSession) -> Result<()>,
-    U: FnOnce() -> Result<()>,
-{
+    bind: BindSurface<'_>,
+    unbind: UnbindSurface<'_>,
+) -> Result<TerminalSession> {
     let startup_deadline = deadline
         .checked_sub(STARTUP_CLEANUP_RESERVE)
         .filter(|candidate| *candidate > Instant::now())
         .context("Windows console startup timeout leaves no room for exact process cleanup")?;
+    // The Windows lookup gives this adapter every kind but Herdr.
     if kind != TerminalKind::WindowsConsole {
         bail!(Unsupported::new(format!(
             "{} is not available on Windows",

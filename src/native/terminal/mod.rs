@@ -90,6 +90,15 @@ mod macos_selection;
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[path = "windows/budget.rs"]
 pub(in crate::native) mod windows_budget;
+#[cfg(any(windows, test))]
+#[path = "windows/dispatch.rs"]
+mod windows_dispatch;
+
+/// The installed Windows lookup: the managed console and Herdr.
+#[cfg(windows)]
+fn windows_installed() -> &'static dyn windows_dispatch::Adapters {
+    &windows::INSTALLED
+}
 
 /// A guarded dialog response was refused before any input was dispatched.
 #[derive(Debug)]
@@ -406,12 +415,15 @@ where
     }
     #[cfg(windows)]
     {
-        // A Herdr terminal is created by its core and runs TAB's launch host; nothing of
-        // the managed console is involved.
-        if kind == TerminalKind::Herdr {
-            return herdr::Adapter::installed().open(command, directory, deadline, bind, unbind);
-        }
-        windows::open_bound_tab(kind, command, directory, deadline, bind, unbind)
+        windows_dispatch::open_bound_tab(
+            windows_installed(),
+            kind,
+            command,
+            directory,
+            deadline,
+            bind,
+            unbind,
+        )
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -544,10 +556,7 @@ pub(super) fn send_file(
 ) -> TerminalSendResult {
     #[cfg(windows)]
     {
-        if session.kind == TerminalKind::Herdr {
-            return herdr::Adapter::installed().send(session, prompt_path, deadline);
-        }
-        crate::native::console_control::installed().send_file(session, prompt_path, deadline)
+        windows_dispatch::send_file(windows_installed(), session, prompt_path, deadline)
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -583,10 +592,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
     return posix::read_screen(posix_installed(), session, deadline);
     #[cfg(windows)]
     {
-        if session.kind == TerminalKind::Herdr {
-            return herdr::Adapter::installed().screen(session, deadline);
-        }
-        crate::native::console_control::installed().read_screen(session, deadline)
+        windows_dispatch::read_screen(windows_installed(), session, deadline)
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
@@ -613,14 +619,13 @@ pub(super) fn guarded_dialog_input(
     }
     #[cfg(windows)]
     {
-        // Herdr declares the refusal; it is answered before any console helper runs.
-        if session.kind == TerminalKind::Herdr
-            && let Some(refusal) = session.kind.registration().guarded_input_refusal
-        {
-            return Err(anyhow::anyhow!(refusal));
-        }
-        crate::native::console_control::installed()
-            .guarded_dialog_input(directory, session, input, deadline)
+        windows_dispatch::guarded_dialog_input(
+            windows_installed(),
+            directory,
+            session,
+            input,
+            deadline,
+        )
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
@@ -638,14 +643,14 @@ pub(super) fn verify_posix_surface(
     posix::verify_surface(posix_installed(), directory, session, timeout)
 }
 
-/// The live Herdr terminal of a Windows handle on its recorded core: the surface part of
-/// the ownership proof, as `verify_posix_surface` is elsewhere.
+/// The surface part of the ownership proof on Windows, as `verify_posix_surface` is
+/// elsewhere: a Herdr terminal live on its recorded core; a managed console has none.
 #[cfg(windows)]
-pub(super) fn verify_windows_herdr_surface(
+pub(super) fn verify_windows_surface(
     session: &TerminalSession,
     timeout: Option<std::time::Duration>,
 ) -> Result<()> {
-    herdr::Adapter::installed().verify(session, timeout)
+    windows_dispatch::verify_surface(windows_installed(), session, timeout)
 }
 
 pub(super) fn close_session_until(
@@ -660,11 +665,7 @@ pub(super) fn close_session_until(
     }
     #[cfg(windows)]
     {
-        if session.kind == TerminalKind::Herdr {
-            return herdr::Adapter::installed().close(directory, session, deadline);
-        }
-        crate::native::console_control::installed()
-            .close_session_until(directory, session, deadline)
+        windows_dispatch::close_session_until(windows_installed(), directory, session, deadline)
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
@@ -685,10 +686,7 @@ pub(super) fn surface_present(
     }
     #[cfg(windows)]
     {
-        if session.kind == TerminalKind::Herdr {
-            return herdr::Adapter::installed().present(directory, session, timeout);
-        }
-        windows::surface_present(directory, session, timeout)
+        windows_dispatch::surface_present(windows_installed(), directory, session, timeout)
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {

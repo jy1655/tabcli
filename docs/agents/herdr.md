@@ -157,9 +157,11 @@
   surface behind its log readiness and receipt) and Pi run there. Inside an hc terminal the
   automatic choice is Herdr when the provider's adapter runs there and the managed console
   otherwise; a reopen, whose provider is unknown at selection, keeps the console.
-- A Herdr handle on Windows never reaches the console control helper: every surface operation
-  is dispatched by kind, and guarded dialog input is refused as on the other platforms. Pi and
-  Agy keep their Windows framing, readiness and receipts; only the transport is `terminal.send`.
+- A Herdr handle on Windows never reaches the console control helper: the seven surface
+  operations resolve its adapter through the one Windows lookup (`windows/dispatch.rs`), and
+  guarded dialog input answers with Herdr's declared refusal first, as on the other platforms.
+  Pi and Agy keep their Windows framing, readiness and receipts; only the transport is
+  `terminal.send`.
   Agy's Windows readiness also needs `Full redraw completed`, measured on the console only;
   without it the paste is withheld and reported not sent.
 - The Windows ownership proof checks the Herdr terminal on its core, then the owner's process
@@ -170,10 +172,13 @@
   `not_found` proves the terminal gone. A console's ended session still settles from its records.
 - The PowerShell `attach_command` sets `HC_SOCKET` in its own script block and restores the
   earlier value (or its absence) in `finally`, so later commands keep their own core.
-- Windows tests: endpoint resolution, the shared framing and the adapters' surface answers run
-  on every platform; the pipe transport (a real pipe of this user), process births, parents,
-  tokens, the dispatch by kind, the directory admission, the dead-owner repair, the attach line
-  under PowerShell 7 and the binding wait run on the Windows CI runner. Live (reported by the
+- Windows tests: endpoint resolution, the shared framing, the adapters' surface answers and the
+  Windows lookup's routing and declared refusals over recording adapters run on every
+  platform; the lookup over the Herdr adapter on a scripted core runs on macOS, Linux and
+  Windows; the pipe transport (a real pipe of
+  this user), process births, parents, tokens, the installed lookup against an absent pipe,
+  the directory admission, the dead-owner repair, the attach line under PowerShell 7 and the
+  binding wait run on the Windows CI runner. Live (reported by the
   verification session, 2026-11-18): the Windows PR head (505f0e7) passed the five native
   Windows self-test steps with Pi 1.5.0 on hc 0.1.21, Windows 11 x64, as a standard desktop
   user, with distinct turns and no terminal left after close; the release before it refused.
