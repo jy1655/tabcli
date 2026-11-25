@@ -17,8 +17,12 @@
 - Existing Windows Repair treats Gone from exit or reuse the same, even for an unbound or
   foreign owner record. The surface adapter supplies independent proof over the claimed handle
   before Close. The ordinary macOS and Linux dead-owner Close requires an exited, bound owner
-  with complete recorded control. The platform differences carry forward 0.4.48 behavior and
-  still await owner confirmation (architecture round 17, card 01).
+  with complete recorded control. Only the form of that identity is a platform fact (controlling
+  TTY and process groups on macOS and Linux, the recorded process identity on Windows). The
+  owner's rule is one behavior on every OS, with a difference only where it is unavoidable
+  (2026-11-26). The outcomes above are not such a difference: they carry forward 0.4.48
+  behavior only until the owner decides whether Repair or only an explicit Close ends a
+  Surface whose Owner is verified gone (os-parity).
 - Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner

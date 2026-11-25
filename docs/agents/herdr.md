@@ -192,8 +192,10 @@
   that fails (no core, another core, a changed terminal)
   restores the handle and leaves state and claim for the next close. Only the core's
   `not_found` proves the terminal gone. A console's ended session still settles from its records.
-  The differences from macOS and Linux carry forward 0.4.48 behavior and still await owner
-  confirmation (architecture round 17, card 01).
+  The owner's rule is one behavior on every OS, with a difference only where it is unavoidable
+  (2026-11-26). The differences from macOS and Linux are not unavoidable: they carry forward
+  0.4.48 behavior only until the owner decides whether Repair or only an explicit Close ends
+  a Surface whose Owner is verified gone (os-parity).
 - The PowerShell `attach_command` sets `HC_SOCKET` in its own script block and restores the
   earlier value (or its absence) in `finally`, so later commands keep their own core.
 - Windows tests: endpoint resolution, the shared framing, the adapters' surface answers and the

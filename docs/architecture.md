@@ -725,8 +725,10 @@ that it has finished. Windows Repair closes a core-retained terminal through the
 lookup, even for an exited or failed session. This uses the adapter's proof and ordinary
 close of a live or finished terminal. An exited or failed console session settles from its
 Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
-The platform differences carry forward 0.4.48 behavior and still await owner confirmation
-(architecture round 17, card 01).
+The owner's rule is one behavior on every OS, with a difference only where it is unavoidable
+(2026-11-26). These platform differences are not unavoidable: they carry forward 0.4.48 behavior
+only until the owner decides whether Repair or only an explicit Close ends a Surface whose
+Owner is verified gone (os-parity).
 
 ## Where to add things
 
