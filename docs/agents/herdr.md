@@ -56,9 +56,13 @@
   child-session and messaging variables. Every launch host removes the adapters' caller markers
   before starting the provider. The macOS host also removes them around shell capture. Do not ask users to restart their
   core for this.
-- Every later operation requires the recorded address, core id and `created_ms`, an argv
-  naming this session's directory, the recorded program PID, `keep` false and, while live,
-  the recorded birth. A terminal set to keep (`hc keep`) can run a replacement program and
+- `terminal/herdr/identity.rs` owns the operation requirements for a bound handle. It opens the
+  recorded core and checks the local address, `created_ms`, host invocation and directory in
+  argv, recorded program PID and `keep: false`. For a live terminal, a readable birth must
+  match. Send, screen and verification also require a live terminal and an observable program,
+  and match the last directory component to the managed Session id. Presence and ordinary
+  close use the exact directory path and accept either terminal state.
+  A terminal set to keep (`hc keep`) can run a replacement program and
   is refused until keep is off. For a temporary pane, the user can adopt the terminal with
   `herdr-app do terminal.keep` and release it with `terminal.park`, which disables core keep.
   TAB never adds a space label or changes keep to counter the app. If the pane ends
@@ -86,11 +90,12 @@
   absence on that core. It never sends `terminal.kill` on this path. Handles created by
   0.4.45 and 0.4.46 omit the nonce; for those, the original identity checks also require the
   launch label to agree with the terminal's generated name. A failed read or removal keeps
-  the handle for retry. The same rule for rechecking identity applies when a launch removes a
-  terminal it created but could not use. The core has no conditional kill or remove, so
-  another client of the same user can still change the terminal between TAB's last read
-  and its action; TAB does not claim more. hc does not sweep detached processes. TAB
-  touches no other terminal and calls no core operation.
+  the handle for retry. Cleanup after binding fails uses the ordinary close proof. Cleanup
+  before confirmation checks the full launch argv, label and name, plus the creation
+  time and PID from its first read at that address. It refuses a terminal set to keep. A birth
+  is needed to retain a handle for retry. The core has no conditional kill or remove, so another
+  client of the same user can still change the terminal between TAB's last read and its action.
+  hc does not sweep detached processes. TAB touches no other terminal and calls no core operation.
 - An explicit `--terminal` wins. Otherwise `HC_TERMINAL_ID` with `TERM_PROGRAM=ghostty` (the
   identity hc gives every program) selects Herdr, on Windows only for a provider whose adapter
   runs there;

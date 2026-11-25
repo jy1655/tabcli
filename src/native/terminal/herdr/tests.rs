@@ -55,11 +55,10 @@ struct FakeState {
     current_pid: u32,
     /// Terminals of configured remote machines, which hc's list also returns.
     remote: Vec<Value>,
-    /// Changes the terminals before the n-th later `terminal.get` (1 = the next one).
-    on_get: Option<(usize, Mutation)>,
+    after_call: Option<(&'static str, Mutation)>,
 }
 
-type Mutation = Box<dyn FnMut(&mut BTreeMap<String, Value>)>;
+type Mutation = Box<dyn FnOnce(&mut BTreeMap<String, Value>)>;
 
 #[derive(Clone)]
 struct FakeCore(Rc<RefCell<FakeState>>);
@@ -108,9 +107,13 @@ impl FakeCore {
     fn set(&self, address: &str, field: &str, value: Value) {
         self.0.borrow_mut().terminals.get_mut(address).unwrap()[field] = value;
     }
-    /// Another same-user client changes the terminals just before the n-th later read.
-    fn on_get(&self, nth: usize, change: impl FnMut(&mut BTreeMap<String, Value>) + 'static) {
-        self.0.borrow_mut().on_get = Some((nth, Box::new(change)));
+    /// Another same-user client changes the registry after the next named call takes effect.
+    fn after_call(
+        &self,
+        method: &'static str,
+        change: impl FnOnce(&mut BTreeMap<String, Value>) + 'static,
+    ) {
+        self.0.borrow_mut().after_call = Some((method, Box::new(change)));
     }
 }
 
@@ -149,13 +152,6 @@ impl FakeConnection {
                 Ok(json!({"address": address, "state": "live"}))
             }
             "terminal.get" => {
-                if let Some((nth, _)) = state.on_get.as_mut() {
-                    *nth -= 1;
-                    if *nth == 0 {
-                        let (_, mut change) = state.on_get.take().unwrap();
-                        change(&mut state.terminals);
-                    }
-                }
                 // An id names that terminal forever; a name names the live terminal that
                 // holds it, else the latest finished one (herdr-core `Registry::resolve`).
                 let by_name = |live: bool| {
@@ -226,13 +222,26 @@ impl Connection for FakeConnection {
             .inject
             .get_mut(method)
             .and_then(VecDeque::pop_front);
-        match injected {
-            Some(Injected::Instead(error)) => Err(error),
-            Some(Injected::After(error)) => {
-                let _ = self.act(method, &params);
-                Err(error)
+        let unanswered = match injected {
+            Some(Injected::Instead(error)) => return Err(error),
+            Some(Injected::After(error)) => Some(error),
+            None => None,
+        };
+        let result = self.act(method, &params);
+        if result.is_ok() {
+            let mut state = self.0.borrow_mut();
+            if state
+                .after_call
+                .as_ref()
+                .is_some_and(|(after, _)| *after == method)
+            {
+                let (_, change) = state.after_call.take().unwrap();
+                change(&mut state.terminals);
             }
-            None => self.act(method, &params),
+        }
+        match unanswered {
+            Some(error) => Err(error),
+            None => result,
         }
     }
 }
@@ -280,17 +289,25 @@ fn later() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-fn created(core: &FakeCore) -> TerminalSession {
-    let mut session = create(
-        core,
-        ". '/state/launch.sh'",
-        Path::new(DIRECTORY),
+fn try_open(core: impl Core, command: &str, directory: &Path) -> Result<TerminalSession> {
+    Adapter::with_core(core).open(
+        command,
+        directory,
         later(),
-        later(),
+        |session| {
+            session.managed_session_id = Some(SESSION.into());
+            Ok(())
+        },
+        || panic!("no unbind on success"),
     )
-    .unwrap();
-    session.managed_session_id = Some(SESSION.into());
-    session
+}
+
+fn opened(core: &FakeCore, directory: &Path) -> TerminalSession {
+    try_open(core.clone(), ". '/state/launch.sh'", directory).unwrap()
+}
+
+fn created(core: &FakeCore) -> TerminalSession {
+    opened(core, Path::new(DIRECTORY))
 }
 
 fn error_text(error: &anyhow::Error) -> String {
@@ -640,8 +657,7 @@ fn creation_outside_herdr_runs_the_launch_host_without_a_parent() {
 fn creation_needs_a_running_core_and_never_starts_one() {
     let core = FakeCore::new();
     core.0.borrow_mut().running = false;
-    let error =
-        error_text(&create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err());
+    let error = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
     assert!(error.contains("no Herdr Core is running"), "{error}");
     assert!(
         error.contains("does not start or restart a core"),
@@ -654,8 +670,7 @@ fn creation_needs_a_running_core_and_never_starts_one() {
 fn a_refused_run_creates_nothing_and_is_not_recovered() {
     let core = FakeCore::new();
     core.inject("terminal.run", Injected::Instead(refused("spawn_failed")));
-    let error =
-        error_text(&create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err());
+    let error = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
     assert!(error.contains("was not created"), "{error}");
     assert!(error.contains("spawn_failed"), "{error}");
     assert!(!core.methods().contains(&"terminal.list".to_owned()));
@@ -681,7 +696,7 @@ fn a_lost_run_reply_removes_only_the_exact_labelled_terminal() {
         "terminal.run",
         Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
-    let error = create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err();
+    let error = try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err();
     assert!(error.downcast_ref::<RetainedLaunchSurface>().is_none());
     let text = error_text(&error);
     assert!(
@@ -708,8 +723,7 @@ fn a_lost_run_reply_without_its_terminal_reports_nothing_created() {
             "the Herdr Core closed the connection"
         ))),
     );
-    let text =
-        error_text(&create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err());
+    let text = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
     assert!(
         text.contains("none was created or it is already gone"),
         "{text}"
@@ -728,8 +742,7 @@ fn a_lost_run_reply_that_cannot_be_looked_up_keeps_the_fence_in_its_report() {
         "terminal.get",
         Injected::Instead(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
-    let text =
-        error_text(&create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err());
+    let text = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
     assert!(text.contains("creation is uncertain"), "{text}");
     assert!(text.contains("starts nothing without a binding"), "{text}");
     assert!(
@@ -750,7 +763,7 @@ fn a_found_terminal_that_cannot_be_removed_is_retained_with_its_identity() {
         Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
     core.inject("terminal.kill", Injected::Instead(refused("internal")));
-    let error = create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err();
+    let error = try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err();
     let retained = error
         .downcast_ref::<RetainedLaunchSurface>()
         .expect("retained handle");
@@ -765,7 +778,9 @@ fn a_found_terminal_that_cannot_be_removed_is_retained_with_its_identity() {
     let mut handle = retained.surface.clone();
     handle.managed_session_id = Some(SESSION.into());
     assert_eq!(
-        close_until(&core, &handle, Some(Path::new(DIRECTORY)), later()).unwrap(),
+        Adapter::with_core(core.clone())
+            .close(Path::new(DIRECTORY), &handle, later())
+            .unwrap(),
         CloseOutcome::Closed
     );
     assert!(core.terminal("t7").is_none());
@@ -777,7 +792,7 @@ fn a_found_terminal_that_cannot_be_removed_is_retained_with_its_identity() {
 fn an_unconfirmed_creation_is_removed_by_its_address() {
     let core = FakeCore::new();
     core.inject("terminal.get", Injected::Instead(refused("internal")));
-    let error = create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err();
+    let error = try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err();
     let text = error_text(&error);
     assert!(
         text.contains("t7 this launch created was removed"),
@@ -817,14 +832,7 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
         }
         fn pause(&self, _: Instant) {}
     }
-    let error = create(
-        &Forgetful(FakeCore(state)),
-        "launch",
-        Path::new(DIRECTORY),
-        later(),
-        later(),
-    )
-    .unwrap_err();
+    let error = try_open(Forgetful(FakeCore(state)), "launch", Path::new(DIRECTORY)).unwrap_err();
     assert!(error.downcast_ref::<RetainedLaunchSurface>().is_none());
     assert!(error_text(&error).contains("already ended"));
     assert!(core.terminal("t7").is_none());
@@ -834,14 +842,17 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
 fn a_changed_or_unreachable_core_is_unknown_never_absent() {
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     let directory = Path::new(DIRECTORY);
     core.0.borrow_mut().core_id = "core-b".into();
     core.clear_calls();
     for error in [
-        surface_present(&core, &session, directory, Duration::from_secs(1)).unwrap_err(),
-        close_until(&core, &session, Some(directory), later()).unwrap_err(),
-        verify_surface(&core, &session, None).unwrap_err(),
-        read_screen(&core, &session, later()).unwrap_err(),
+        adapter
+            .present(directory, &session, Duration::from_secs(1))
+            .unwrap_err(),
+        adapter.close(directory, &session, later()).unwrap_err(),
+        adapter.verify(&session, None).unwrap_err(),
+        adapter.screen(&session, later()).unwrap_err(),
     ] {
         let text = error_text(&error);
         assert!(
@@ -859,7 +870,9 @@ fn a_changed_or_unreachable_core_is_unknown_never_absent() {
     core.0.borrow_mut().core_id = "core-a".into();
     core.0.borrow_mut().running = false;
     let text = error_text(
-        &surface_present(&core, &session, directory, Duration::from_secs(1)).unwrap_err(),
+        &adapter
+            .present(directory, &session, Duration::from_secs(1))
+            .unwrap_err(),
     );
     assert!(text.contains("no Herdr Core is running"), "{text}");
 }
@@ -868,25 +881,35 @@ fn a_changed_or_unreachable_core_is_unknown_never_absent() {
 fn a_removed_terminal_on_its_own_core_is_absent() {
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     let directory = Path::new(DIRECTORY);
     core.0.borrow_mut().terminals.remove("t7");
-    assert!(!surface_present(&core, &session, directory, Duration::from_secs(1)).unwrap());
+    assert!(
+        !adapter
+            .present(directory, &session, Duration::from_secs(1))
+            .unwrap()
+    );
     assert_eq!(
-        close_until(&core, &session, Some(directory), later()).unwrap(),
+        adapter.close(directory, &session, later()).unwrap(),
         CloseOutcome::Missing
     );
-    assert!(verify_surface(&core, &session, None).is_err());
+    assert!(adapter.verify(&session, None).is_err());
 }
 
 #[test]
 fn close_kills_then_removes_and_repeats_idempotently() {
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     let directory = Path::new(DIRECTORY);
-    assert!(surface_present(&core, &session, directory, Duration::from_secs(1)).unwrap());
+    assert!(
+        adapter
+            .present(directory, &session, Duration::from_secs(1))
+            .unwrap()
+    );
     core.clear_calls();
     assert_eq!(
-        close_until(&core, &session, Some(directory), later()).unwrap(),
+        adapter.close(directory, &session, later()).unwrap(),
         CloseOutcome::Closed
     );
     assert_eq!(core.params("terminal.kill"), [json!({"terminal": "t7"})]);
@@ -894,10 +917,31 @@ fn close_kills_then_removes_and_repeats_idempotently() {
     assert!(core.terminal("t7").is_none());
     core.clear_calls();
     assert_eq!(
-        close_until(&core, &session, Some(directory), later()).unwrap(),
+        adapter.close(directory, &session, later()).unwrap(),
         CloseOutcome::Missing
     );
     assert!(core.params("terminal.kill").is_empty());
+}
+
+#[test]
+fn ordinary_close_removes_a_finished_terminal_with_a_changed_launch_label() {
+    let core = FakeCore::new();
+    let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
+    core.set("t7", "state", json!("finished"));
+    let mut labels = core.terminal("t7").unwrap()["labels"].clone();
+    labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
+    core.set("t7", "labels", labels);
+    core.clear_calls();
+    assert_eq!(
+        adapter
+            .close(Path::new(DIRECTORY), &session, later())
+            .unwrap(),
+        CloseOutcome::Closed
+    );
+    assert_eq!(core.params("terminal.rm"), [json!({"terminal": "t7"})]);
+    assert!(core.params("terminal.kill").is_empty());
+    assert!(core.terminal("t7").is_none());
 }
 
 // A close that ended the program but failed to remove the terminal is finished by the next
@@ -906,13 +950,14 @@ fn close_kills_then_removes_and_repeats_idempotently() {
 fn an_interrupted_close_is_finished_by_the_next_one() {
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     let directory = Path::new(DIRECTORY);
     core.inject("terminal.rm", Injected::Instead(refused("internal")));
-    assert!(close_until(&core, &session, Some(directory), later()).is_err());
+    assert!(adapter.close(directory, &session, later()).is_err());
     assert_eq!(core.terminal("t7").unwrap()["state"], "finished");
     core.clear_calls();
     assert_eq!(
-        close_until(&core, &session, Some(directory), later()).unwrap(),
+        adapter.close(directory, &session, later()).unwrap(),
         CloseOutcome::Closed
     );
     assert!(core.params("terminal.kill").is_empty());
@@ -920,14 +965,15 @@ fn an_interrupted_close_is_finished_by_the_next_one() {
 
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     core.inject(
         "terminal.kill",
         Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
-    let text = error_text(&close_until(&core, &session, Some(directory), later()).unwrap_err());
+    let text = error_text(&adapter.close(directory, &session, later()).unwrap_err());
     assert!(text.contains("sent but not answered"), "{text}");
     assert_eq!(
-        close_until(&core, &session, Some(directory), later()).unwrap(),
+        adapter.close(directory, &session, later()).unwrap(),
         CloseOutcome::Closed
     );
     assert_eq!(core.params("terminal.kill").len(), 1);
@@ -951,10 +997,13 @@ fn a_terminal_that_is_no_longer_the_created_one_is_never_closed() {
     ] {
         let core = FakeCore::new();
         let session = created(&core);
+        let adapter = Adapter::with_core(core.clone());
         core.set("t7", field, value);
         core.clear_calls();
         let text = error_text(
-            &close_until(&core, &session, Some(Path::new(DIRECTORY)), later()).unwrap_err(),
+            &adapter
+                .close(Path::new(DIRECTORY), &session, later())
+                .unwrap_err(),
         );
         assert!(text.contains(expected), "{field}: {text}");
         assert!(core.params("terminal.kill").is_empty(), "{field}");
@@ -963,35 +1012,72 @@ fn a_terminal_that_is_no_longer_the_created_one_is_never_closed() {
     // A program whose birth changed is another incarnation behind the recorded PID.
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     let pid = session.herdr_core().unwrap().host_pid;
     core.0.borrow_mut().births.insert(pid, test_birth(1));
-    let text = error_text(&read_screen(&core, &session, later()).unwrap_err());
+    let text = error_text(&adapter.screen(&session, later()).unwrap_err());
     assert!(text.contains("another process"), "{text}");
     // Another session's directory in the argv is another session's terminal.
     let core = FakeCore::new();
     let mut session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
+    let mut remote = session.clone();
     session.managed_session_id = Some("session-other".into());
-    assert!(read_screen(&core, &session, later()).is_err());
-    let mut remote = created(&FakeCore::new());
+    assert!(adapter.screen(&session, later()).is_err());
     remote.id = "vps/t7".into();
-    assert!(target(&remote).is_err());
+    assert!(attach_command(&remote).is_none());
+    core.clear_calls();
+    assert!(
+        adapter
+            .close(Path::new(DIRECTORY), &remote, later())
+            .is_err()
+    );
+    assert!(core.methods().is_empty());
+}
+
+#[test]
+fn recorded_operations_require_their_own_directory_and_process_evidence() {
+    let core = FakeCore::new();
+    let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
+    let directory = Path::new(DIRECTORY);
+    let timeout = Duration::from_secs(1);
+
+    // Live operations have the managed Session id. Presence and close have the full path.
+    let mut argv = core.terminal("t7").unwrap()["argv"].clone();
+    argv[2] = json!("/another-root/session-herdr1");
+    core.set("t7", "argv", argv.clone());
+    assert!(adapter.verify(&session, None).is_ok());
+    assert!(adapter.present(directory, &session, timeout).is_err());
+    assert!(adapter.close(directory, &session, later()).is_err());
+    assert!(core.params("terminal.kill").is_empty());
+    assert!(core.params("terminal.rm").is_empty());
+
+    argv[2] = json!(DIRECTORY);
+    core.set("t7", "argv", argv);
+    core.0.borrow_mut().births.clear();
+    assert!(adapter.present(directory, &session, timeout).unwrap());
+    let error = adapter.verify(&session, None).unwrap_err();
+    assert!(error_text(&error).contains("program of Herdr terminal t7 has ended"));
+    core.set("t7", "state", json!("finished"));
+    assert!(adapter.present(directory, &session, timeout).unwrap());
+    let error = adapter.verify(&session, None).unwrap_err();
+    assert!(error_text(&error).contains("Herdr terminal t7 has finished"));
 }
 
 #[test]
 fn screen_reads_ask_for_the_visible_screen_only() {
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     core.clear_calls();
-    assert_eq!(
-        read_screen(&core, &session, later()).unwrap(),
-        "fake screen"
-    );
+    assert_eq!(adapter.screen(&session, later()).unwrap(), "fake screen");
     assert_eq!(
         core.params("terminal.read"),
         [json!({"terminal": "t7", "lines": 0})]
     );
     core.set("t7", "state", json!("finished"));
-    assert!(read_screen(&core, &session, later()).is_err());
+    assert!(adapter.screen(&session, later()).is_err());
 }
 
 #[test]
@@ -1001,8 +1087,9 @@ fn sends_classify_refusals_before_input_apart_from_uncertain_delivery() {
     fs::write(&prompt, "line one\nline two").unwrap();
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     core.clear_calls();
-    send_file(&core, &session, &prompt, later()).unwrap();
+    adapter.send(&session, &prompt, later()).unwrap();
     assert_eq!(
         core.params("terminal.send"),
         [json!({"terminal": "t7", "text": "line one\nline two"})]
@@ -1023,7 +1110,7 @@ fn sends_classify_refusals_before_input_apart_from_uncertain_delivery() {
         ),
     ] {
         core.inject("terminal.send", injected);
-        let failure = send_file(&core, &session, &prompt, later()).unwrap_err();
+        let failure = adapter.send(&session, &prompt, later()).unwrap_err();
         assert_eq!(
             failure.delivery_may_have_occurred(),
             uncertain,
@@ -1034,17 +1121,18 @@ fn sends_classify_refusals_before_input_apart_from_uncertain_delivery() {
     // Nothing is sent to a terminal that is no longer the session's, or that has ended.
     core.set("t7", "state", json!("finished"));
     core.clear_calls();
-    let failure = send_file(&core, &session, &prompt, later()).unwrap_err();
+    let failure = adapter.send(&session, &prompt, later()).unwrap_err();
     assert!(!failure.delivery_may_have_occurred());
     assert!(core.params("terminal.send").is_empty());
     let large = directory.path().join("large");
     fs::write(&large, vec![b'a'; MAX_SEND_TEXT + 1]).unwrap();
-    let failure = send_file(&core, &session, &large, later()).unwrap_err();
+    let failure = adapter.send(&session, &large, later()).unwrap_err();
     assert!(!failure.delivery_may_have_occurred());
     let invalid = directory.path().join("invalid");
     fs::write(&invalid, [0xff, 0xfe]).unwrap();
     assert!(
-        !send_file(&core, &session, &invalid, later())
+        !adapter
+            .send(&session, &invalid, later())
             .unwrap_err()
             .delivery_may_have_occurred()
     );
@@ -1054,16 +1142,13 @@ fn sends_classify_refusals_before_input_apart_from_uncertain_delivery() {
 fn a_finished_kept_terminal_reports_the_recovery_its_core_accepts() {
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     core.set("t7", "state", json!("finished"));
     core.set("t7", "keep", json!(true));
     core.clear_calls();
-    let error = surface_present(
-        &core,
-        &session,
-        Path::new(DIRECTORY),
-        Duration::from_secs(1),
-    )
-    .unwrap_err();
+    let error = adapter
+        .present(Path::new(DIRECTORY), &session, Duration::from_secs(1))
+        .unwrap_err();
     let message = error_text(&error);
     for command in ["get", "rm"] {
         let expected = if cfg!(windows) {
@@ -1241,7 +1326,7 @@ fn failed_binding_and_removal_preserve_the_herdr_surface_for_close() {
     assert_eq!(handle.id, "t7");
     assert_eq!(handle.herdr_core().unwrap().core_id, "core-a");
     assert_eq!(
-        close_until(&core, &handle, Some(directory.path()), later()).unwrap(),
+        adapter.close(directory.path(), &handle, later()).unwrap(),
         CloseOutcome::Closed
     );
     assert_eq!(core.params("terminal.kill").len(), 1);
@@ -1323,9 +1408,7 @@ fn a_run_error_after_creation_is_reconciled_on_the_pinned_core() {
     for kind in ["internal", "unavailable"] {
         let core = FakeCore::new();
         core.inject("terminal.run", Injected::After(refused(kind)));
-        let text = error_text(
-            &create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err(),
-        );
+        let text = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
         assert!(
             text.contains("t7 this launch created was removed"),
             "{kind}: {text}"
@@ -1337,9 +1420,7 @@ fn a_run_error_after_creation_is_reconciled_on_the_pinned_core() {
     for kind in ["invalid_params", "name_taken", "config", "spawn_failed"] {
         let core = FakeCore::new();
         core.inject("terminal.run", Injected::Instead(refused(kind)));
-        let text = error_text(
-            &create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err(),
-        );
+        let text = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
         assert!(text.contains("was not created"), "{kind}: {text}");
         assert_eq!(
             core.methods(),
@@ -1361,15 +1442,16 @@ fn close_refuses_when_a_later_observation_changes_the_terminal() {
     ] {
         let core = FakeCore::new();
         let session = created(&core);
+        let adapter = Adapter::with_core(core.clone());
         core.clear_calls();
-        core.on_get(2, move |terminals| {
+        core.after_call("terminal.get", move |terminals| {
             let terminal = terminals.get_mut("t7").unwrap();
             terminal["keep"] = json!(true);
             if change == "replacement" {
                 terminal["pid"] = json!(4242);
             }
         });
-        let text = error_text(&close_until(&core, &session, Some(directory), later()).unwrap_err());
+        let text = error_text(&adapter.close(directory, &session, later()).unwrap_err());
         assert!(text.contains(expected), "{change}: {text}");
         assert!(core.params("terminal.kill").is_empty(), "{change}");
         assert!(core.params("terminal.rm").is_empty(), "{change}");
@@ -1377,14 +1459,15 @@ fn close_refuses_when_a_later_observation_changes_the_terminal() {
     // After the kill: a program that replaced the ended one is not removed.
     let core = FakeCore::new();
     let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
     core.clear_calls();
-    core.on_get(3, |terminals| {
+    core.after_call("terminal.kill", |terminals| {
         let terminal = terminals.get_mut("t7").unwrap();
         terminal["keep"] = json!(true);
         terminal["state"] = json!("live");
         terminal["pid"] = json!(4242);
     });
-    assert!(close_until(&core, &session, Some(directory), later()).is_err());
+    assert!(adapter.close(directory, &session, later()).is_err());
     assert_eq!(core.params("terminal.kill").len(), 1);
     assert!(core.params("terminal.rm").is_empty());
     assert!(core.terminal("t7").is_some());
@@ -1399,10 +1482,10 @@ fn removing_a_partially_created_terminal_stops_when_it_changes() {
         Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
     // The first read finds the terminal; before the next one it is set to keep.
-    core.on_get(2, |terminals| {
+    core.after_call("terminal.get", |terminals| {
         terminals.get_mut("t7").unwrap()["keep"] = json!(true);
     });
-    let error = create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err();
+    let error = try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err();
     assert!(error.downcast_ref::<RetainedLaunchSurface>().is_none());
     assert!(core.params("terminal.kill").is_empty());
     assert!(core.terminal("t7").is_some());
@@ -1421,8 +1504,7 @@ fn a_lost_run_reply_is_found_by_its_local_name_without_listing() {
         "terminal.run",
         Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
-    let text =
-        error_text(&create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err());
+    let text = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
     assert!(
         text.contains("t7 this launch created was removed"),
         "{text}"
@@ -1452,11 +1534,10 @@ fn a_name_that_resolves_to_another_terminal_fails_closed() {
         "terminal.run",
         Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
     );
-    core.on_get(1, |terminals| {
+    core.after_call("terminal.run", |terminals| {
         terminals.get_mut("t7").unwrap()["labels"][LAUNCH_LABEL] = json!("another launch");
     });
-    let text =
-        error_text(&create(&core, "launch", Path::new(DIRECTORY), later(), later()).unwrap_err());
+    let text = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
     assert!(text.contains("creation is uncertain"), "{text}");
     assert!(core.params("terminal.kill").is_empty());
     assert_eq!(core.params("terminal.run").len(), 1);

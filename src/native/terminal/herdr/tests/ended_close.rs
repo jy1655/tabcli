@@ -57,9 +57,7 @@ impl Fixture {
         let directory = root.path().join(SESSION);
         fs::create_dir(&directory).unwrap();
         let core = FakeCore::new();
-        let mut surface =
-            create(&core, ". '/state/launch.sh'", &directory, later(), later()).unwrap();
-        surface.managed_session_id = Some(SESSION.into());
+        let surface = opened(&core, &directory);
         let store = Store::open_unchecked(&directory);
         session::update_status(&directory, SessionState::Ready, None, None).unwrap();
         store
@@ -99,10 +97,9 @@ impl Fixture {
                 let observation =
                     TestObservation::on_records(&self.directory, SESSION, surface, deadline)
                         .with_presence(|| {
-                            surface_present(
-                                &self.core,
-                                surface,
+                            Adapter::with_core(self.core.clone()).present(
                                 &self.directory,
+                                surface,
                                 Duration::from_secs(1),
                             )
                         })
@@ -176,16 +173,20 @@ fn a_terminal_finished_outside_bridge_is_removed_by_an_explicit_close() {
     // The generic probes stay read-only: presence finds the finished terminal, the live
     // operations refuse it, and none of them ends or removes anything.
     assert!(
-        surface_present(
-            &fixture.core,
-            &fixture.store().terminal().unwrap(),
-            &fixture.directory,
-            Duration::from_secs(1),
-        )
-        .unwrap()
+        Adapter::with_core(fixture.core.clone())
+            .present(
+                &fixture.directory,
+                &fixture.store().terminal().unwrap(),
+                Duration::from_secs(1),
+            )
+            .unwrap()
     );
     let handle = fixture.store().terminal().unwrap();
-    let text = error_text(&verify_surface(&fixture.core, &handle, None).unwrap_err());
+    let text = error_text(
+        &Adapter::with_core(fixture.core.clone())
+            .verify(&handle, None)
+            .unwrap_err(),
+    );
     assert!(text.contains("has finished"), "{text}");
     assert_eq!(fixture.mutations(), (0, 0));
     assert!(fixture.core.terminal("t7").is_some());
@@ -383,7 +384,7 @@ fn an_ended_terminal_that_changes_before_its_removal_is_left_alone() {
         let fixture = Fixture::new();
         fixture.finish();
         // The decision reads the terminal once; the change lands before the next read.
-        fixture.core.on_get(2, change);
+        fixture.core.after_call("terminal.get", change);
         let result = fixture.close_dead();
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
         match expected {

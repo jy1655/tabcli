@@ -658,6 +658,13 @@ Windows guarded input
 receives the directory and requires it to match the helper
 child's state-root lookup; the child still resolves the session by id under its own root.
 
+Herdr's launch identity and recorded identity live in `terminal/herdr/identity.rs`. Before
+confirmation, the launch request identifies the terminal by its argv, label and name. With a
+handle, the operation supplies its requirement and the module connects to the recorded Core
+and verifies the addressed terminal. Ordinary close applies that proof to fresh observations
+on the same connection.
+The socket, named pipe and scripted test Core use the existing `Core` and `Connection` seams.
+
 Identity stays with each adapter, and each terminal kind selects its close evidence in
 `close_evidence::for_kind`: Terminal.app's evidence is its own (app incarnation), and the
 presence-only kinds share one adapter whose only declared variation is the ownerless-startup

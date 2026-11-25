@@ -22,10 +22,11 @@
 use super::record::HerdrHostBirth;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::terminal::{
-    CloseOutcome, HerdrSurface, RetainedLaunchSurface, TerminalKind, TerminalSendFailure,
-    TerminalSendResult, TerminalSession,
+    CloseOutcome, RetainedLaunchSurface, TerminalKind, TerminalSendFailure, TerminalSendResult,
+    TerminalSession,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use identity::{CLOSE_STOPPED, Launch, Recorded, Requirement, binding_names_host, target};
 use serde_json::{Value, json};
 use std::{
     ffi::OsStr,
@@ -35,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod identity;
 #[cfg(windows)]
 mod pipe;
 #[cfg(unix)]
@@ -61,12 +63,6 @@ const REQUIRED_METHODS: [&str; 6] = [
 /// The labels TAB gives its terminals: the session, and the launch attempt.
 const SESSION_LABEL: &str = "tabcli-session";
 const LAUNCH_LABEL: &str = "tabcli-launch";
-/// Every terminal also gets a random local name, `tabcli-` and 24 hexadecimal digits (31 of
-/// the 32 characters hc allows): a terminal whose creation was not confirmed is read by that
-/// name on its own core. `terminal.list` is not used for it, because hc's list also asks
-/// every configured remote machine.
-const NAME_PREFIX: &str = "tabcli-";
-const NAME_ENTROPY: usize = 24;
 /// Refusals that herdr-core's `terminal_run` gives before the terminal exists. Anything
 /// else (`unavailable`, `internal`, an unknown kind) can come after creation, for example
 /// when saving the registry times out or fails.
@@ -568,132 +564,15 @@ pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -
     ]
 }
 
-/// The recorded identity of a Herdr handle.
-fn target(session: &TerminalSession) -> Result<&HerdrSurface> {
-    if session.kind != TerminalKind::Herdr || !valid_address(&session.id) {
-        bail!("Herdr handle has no local terminal address");
-    }
-    let core = session
-        .herdr_core()
-        .context("Herdr handle has no recorded core")?;
-    if core.core_id.is_empty() || !usable_endpoint(&core.socket) {
-        bail!("Herdr handle records no usable core");
-    }
-    Ok(core)
-}
-
-/// A recorded endpoint this platform can address: an absolute socket path, or on Windows a
-/// local named pipe. A handle written on another platform names no endpoint here.
-fn usable_endpoint(endpoint: &str) -> bool {
-    #[cfg(windows)]
-    return windows_endpoint::local_pipe_name(Path::new(endpoint)).is_ok();
-    #[cfg(unix)]
-    return Path::new(endpoint).is_absolute();
-}
-
-/// Whether the reported terminal is still the one this handle created. The argv names the
-/// launch host of this session; while it runs, the program is the recorded incarnation. A
-/// terminal set to keep could run a replacement program and is refused.
-fn require_identity(
-    core: &dyn Core,
-    observed: &Observed,
-    session: &TerminalSession,
-    directory: Option<&Path>,
-) -> Result<()> {
-    let recorded = target(session)?;
-    let address = &observed.address;
-    let session_directory = match directory {
-        Some(directory) => {
-            observed.argv.get(2).map(String::as_str) == Some(&*directory.to_string_lossy())
-        }
-        None => session.managed_session_id.as_deref().is_some_and(|id| {
-            observed
-                .argv
-                .get(2)
-                .and_then(|path| Path::new(path).file_name())
-                == Some(OsStr::new(id))
-        }),
-    };
-    if observed.argv.len() != 5
-        || observed.argv[1] != HOST_COMMAND
-        || observed.argv[3] != crate::native::terminal::host::LAUNCH_COMMAND_FLAG
-        || !session_directory
-        || observed.created_ms != recorded.created_ms
-        || observed.pid != Some(recorded.host_pid)
-    {
-        bail!("Herdr terminal {address} is not the terminal this session created");
-    }
-    if observed.keep {
-        if observed.state == State::Finished {
-            let get = hc_command(&recorded.socket, "get", address, cfg!(windows));
-            let remove = hc_command(&recorded.socket, "rm", address, cfg!(windows));
-            bail!(
-                "finished Herdr terminal {address} is set to keep; verify it with `{get}`, run `{remove}`, then retry close-session"
-            );
-        }
-        bail!(
-            "Herdr terminal {address} is set to keep, so a replacement program can run in it; run `hc keep {address} --off` first"
-        );
-    }
-    if observed.state == State::Live
-        && let Some(birth) = core.process_start(recorded.host_pid)?
-        && birth != recorded.birth
-    {
-        bail!("the program of Herdr terminal {address} is another process than the one recorded");
-    }
-    Ok(())
-}
-
 /// The live terminal of this handle on its recorded core, on a connection that proved it.
 fn live_target<'a>(
     core: &'a dyn Core,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<Linked<'a>> {
-    let recorded = target(session)?;
-    let mut linked = link(
-        core,
-        Path::new(&recorded.socket),
-        Some(&recorded.core_id),
-        deadline,
-    )?;
-    let observed = get(&mut linked, &session.id, deadline)?
-        .with_context(|| format!("Herdr terminal {} no longer exists", session.id))?;
-    require_identity(core, &observed, session, None)?;
-    if observed.state != State::Live {
-        bail!("Herdr terminal {} has finished", session.id);
-    }
-    if core.process_start(recorded.host_pid)?.is_none() {
-        bail!("the program of Herdr terminal {} has ended", session.id);
-    }
-    Ok(linked)
-}
-
-fn created_handle(address: &str, core: HerdrSurface, nonce: &str) -> TerminalSession {
-    TerminalSession::new(TerminalKind::Herdr, address.to_owned()).with_herdr_core(core, nonce)
-}
-
-/// What this launch asked the core to create: its program, its launch label and its local
-/// name. A terminal matches only when all three are this launch's.
-struct Launch<'a> {
-    argv: &'a [String],
-    nonce: &'a str,
-    name: &'a str,
-}
-
-impl Launch<'_> {
-    fn matches(&self, observed: &Observed) -> bool {
-        observed.argv == self.argv
-            && observed.launch.as_deref() == Some(self.nonce)
-            && observed.name.as_deref() == Some(self.name)
-    }
-}
-
-fn launch_name(nonce: &str) -> Result<String> {
-    if nonce.len() < NAME_ENTROPY || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("the Herdr launch token is not hexadecimal");
-    }
-    Ok(format!("{NAME_PREFIX}{}", &nonce[..NAME_ENTROPY]))
+    Recorded::open(core, session, Requirement::Live, deadline)?
+        .map(|(_, linked)| linked)
+        .with_context(|| format!("Herdr terminal {} no longer exists", session.id))
 }
 
 /// Creates the terminal whose program is the launch host. When the core may have created
@@ -717,16 +596,11 @@ fn create(
         .and_then(OsStr::to_str)
         .context("session directory has no session id")?;
     let nonce = core.launch_nonce()?;
-    let name = launch_name(&nonce)?;
-    let launch = Launch {
-        argv: &argv,
-        nonce: &nonce,
-        name: &name,
-    };
+    let launch = Launch::new(&argv, &nonce)?;
     let mut params = json!({
         "argv": argv,
-        "name": name,
-        "labels": {SESSION_LABEL: session_id, LAUNCH_LABEL: nonce},
+        "name": launch.name,
+        "labels": {SESSION_LABEL: session_id, LAUNCH_LABEL: launch.nonce},
         "no_notify": true,
         "keep": false,
         "rm": false,
@@ -788,57 +662,19 @@ fn create(
             "terminal.run answered without a local address"
         )));
     };
-    match confirm_created(core, &mut linked, &address, &launch, startup_deadline) {
-        Ok(surface) => Ok(created_handle(&address, surface, launch.nonce)),
-        Err(error) => Err(remove_created(
-            core,
-            &socket,
-            &core_id,
-            &address,
-            &launch,
-            cleanup_deadline,
-            error,
-        )),
-    }
-}
-
-/// The created terminal, read back on the creating connection: this launch's argv, label
-/// and name, live, not kept, and a program whose birth is read while the core still
-/// reports it.
-fn confirm_created(
-    core: &dyn Core,
-    linked: &mut Linked<'_>,
-    address: &str,
-    launch: &Launch<'_>,
-    deadline: Instant,
-) -> Result<HerdrSurface> {
-    let observed = get(linked, address, deadline)?
-        .with_context(|| format!("created Herdr terminal {address} is not listed"))?;
-    if !launch.matches(&observed) {
-        bail!("created Herdr terminal {address} does not carry this launch's program and label");
-    }
-    if observed.keep || observed.state != State::Live {
-        bail!("created Herdr terminal {address} is not a live terminal without keep");
-    }
-    let pid = observed
-        .pid
-        .with_context(|| format!("created Herdr terminal {address} reports no program yet"))?;
-    let birth = core
-        .process_start(pid)?
-        .with_context(|| format!("the program of Herdr terminal {address} already ended"))?;
-    let again = get(linked, address, deadline)?
-        .with_context(|| format!("created Herdr terminal {address} disappeared"))?;
-    if !launch.matches(&again) || again.keep || again.state != State::Live || again.pid != Some(pid)
-    {
-        bail!("created Herdr terminal {address} changed while it was read");
-    }
-    Ok(HerdrSurface {
-        socket: linked.socket.to_string_lossy().into_owned(),
-        core_id: linked.core_id.clone(),
-        created_ms: observed.created_ms,
-        host_pid: pid,
-        birth,
-    })
+    launch
+        .confirm(core, &mut linked, &address, startup_deadline)
+        .map_err(|error| {
+            remove_created(
+                core,
+                &socket,
+                &core_id,
+                &address,
+                &launch,
+                cleanup_deadline,
+                error,
+            )
+        })
 }
 
 /// After `terminal.run` may have created the terminal without a usable reply: read this
@@ -859,7 +695,7 @@ fn reconcile(
         socket.display()
     );
     let found = link(core, socket, Some(core_id), deadline)
-        .and_then(|mut linked| get(&mut linked, launch.name, deadline));
+        .and_then(|mut linked| get(&mut linked, &launch.name, deadline));
     match found {
         Err(error) => anyhow!(
             "Herdr terminal creation is uncertain: {cause:#}; looking for it failed: {error:#}; {fence}"
@@ -868,7 +704,7 @@ fn reconcile(
             "Herdr terminal creation is uncertain: {cause:#}; no terminal is named {} on core {core_id}, so none was created or it is already gone; nothing was started",
             launch.name
         ),
-        Ok(Some(observed)) if !launch.matches(&observed) || observed.keep => anyhow!(
+        Ok(Some(observed)) if !launch.matches_unkept(&observed) => anyhow!(
             "Herdr terminal creation is uncertain: {cause:#}; the name {} resolves to {}, which is not this launch's terminal, so nothing was removed; {fence}",
             launch.name,
             observed.address
@@ -899,46 +735,23 @@ fn remove_created(
     deadline: Instant,
     cause: anyhow::Error,
 ) -> anyhow::Error {
-    let mut identity = None;
+    let mut handle = None;
     let removed = (|| -> Result<()> {
         let mut linked = link(core, socket, Some(core_id), deadline)?;
         let Some(first) = get(&mut linked, address, deadline)? else {
             return Ok(());
         };
-        let same = |observed: &Observed| -> Result<()> {
-            if !launch.matches(observed)
-                || observed.created_ms != first.created_ms
-                || observed.pid != first.pid
-            {
-                bail!("Herdr terminal {address} is no longer this launch's terminal");
-            }
-            if observed.keep {
-                bail!(
-                    "Herdr terminal {address} is set to keep, so a replacement program can run in it"
-                );
-            }
-            Ok(())
-        };
+        let same = |observed: &Observed| launch.check_cleanup(&first, observed);
         same(&first)?;
-        if let Some(pid) = first.pid
-            && let Ok(Some(birth)) = core.process_start(pid)
-        {
-            identity = Some(HerdrSurface {
-                socket: socket.to_string_lossy().into_owned(),
-                core_id: core_id.to_owned(),
-                created_ms: first.created_ms,
-                host_pid: pid,
-                birth,
-            });
-        }
+        handle = launch.recover_handle(core, &linked, &first);
         end_and_remove(core, &mut linked, address, deadline, &same).map(|_| ())
     })();
-    match (removed, identity) {
+    match (removed, handle) {
         (Ok(()), _) => cause.context(format!(
             "the Herdr terminal {address} this launch created was removed; nothing was started"
         )),
-        (Err(error), Some(identity)) => retain_unremoved(
-            created_handle(address, identity, launch.nonce),
+        (Err(error), Some(handle)) => retain_unremoved(
+            handle,
             format!("{cause:#}; Herdr terminal {address} could not be removed: {error:#}"),
         ),
         (Err(error), None) => anyhow!(
@@ -980,7 +793,7 @@ fn end_and_remove(
         let Some(observed) = get(linked, address, deadline)? else {
             return Ok(outcome);
         };
-        same(&observed).context("the close was stopped and the handle retained")?;
+        same(&observed).context(CLOSE_STOPPED)?;
         match observed.state {
             State::Live if !killed => {
                 match linked.connection.call(
@@ -1021,18 +834,12 @@ fn close_until(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     close_remaining(deadline)?;
-    let recorded = target(session)?;
-    let mut linked = link(
-        core,
-        Path::new(&recorded.socket),
-        Some(&recorded.core_id),
-        deadline,
-    )?;
-    let same = |observed: &Observed| require_identity(core, observed, session, directory);
-    match get(&mut linked, &session.id, deadline)? {
-        None => return Ok(CloseOutcome::Missing),
-        Some(observed) => same(&observed)?,
-    }
+    let Some((recorded, mut linked)) =
+        Recorded::open(core, session, Requirement::Bound(directory), deadline)?
+    else {
+        return Ok(CloseOutcome::Missing);
+    };
+    let same = |observed: &Observed| recorded.check(core, observed);
     close_remaining(deadline)?;
     end_and_remove(core, &mut linked, &session.id, deadline, &same)
 }
@@ -1050,39 +857,12 @@ fn remove_ended(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     close_remaining(deadline)?;
-    let recorded = target(session)?;
-    let mut linked = link(
-        core,
-        Path::new(&recorded.socket),
-        Some(&recorded.core_id),
-        deadline,
-    )?;
-    let address = &session.id;
-    let Some(observed) = get(&mut linked, address, deadline)? else {
+    let Some((_, mut linked)) =
+        Recorded::open(core, session, Requirement::Finished(directory), deadline)?
+    else {
         return Ok(CloseOutcome::Missing);
     };
-    require_identity(core, &observed, session, Some(directory))
-        .context("the close was stopped and the handle retained")?;
-    if observed.state != State::Finished {
-        bail!(
-            "Herdr terminal {address} is still running although its native-session owner is no longer live; TAB does not end it without that owner, so no close was sent and the handle is retained"
-        );
-    }
-    let nonce = observed
-        .launch
-        .as_deref()
-        .context("finished Herdr terminal is missing its launch label")?;
-    let matches_launch = match session.herdr_launch_nonce() {
-        Some(expected) => nonce == expected,
-        // Old records pin the core, immutable address, creation time, argv and PID. Also
-        // require the observed launch label to agree with the name confirmed at creation.
-        None => observed.name.as_deref() == Some(launch_name(nonce)?.as_str()),
-    };
-    if !matches_launch {
-        bail!(
-            "finished Herdr terminal {address} has a different launch label; the handle is retained"
-        );
-    }
+    let address = &session.id;
     close_remaining(deadline)?;
     match linked
         .connection
@@ -1109,20 +889,7 @@ fn surface_present(
     timeout: Duration,
 ) -> Result<bool> {
     let deadline = deadline_after(timeout)?;
-    let recorded = target(session)?;
-    let mut linked = link(
-        core,
-        Path::new(&recorded.socket),
-        Some(&recorded.core_id),
-        deadline,
-    )?;
-    match get(&mut linked, &session.id, deadline)? {
-        None => Ok(false),
-        Some(observed) => {
-            require_identity(core, &observed, session, Some(directory))?;
-            Ok(true)
-        }
-    }
+    Ok(Recorded::open(core, session, Requirement::Bound(Some(directory)), deadline)?.is_some())
 }
 
 fn verify_surface(
@@ -1251,20 +1018,6 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
 
 pub(in crate::native::terminal) fn verify_caller_terminal() -> Result<()> {
     verify_caller(&Installed, deadline_after(CALLER_TIMEOUT)?)
-}
-
-/// Whether `surface` names the Herdr terminal `terminal` whose program is `pid`: the one
-/// rule by which the launch host recognizes its own surface.
-pub(super) fn binding_names_host(
-    surface: &TerminalSession,
-    terminal: Option<&str>,
-    pid: u32,
-) -> bool {
-    surface.kind == TerminalKind::Herdr
-        && terminal == Some(surface.id.as_str())
-        && surface
-            .herdr_core()
-            .is_some_and(|core| core.host_pid == pid)
 }
 
 /// The launch host's check, registered for Herdr: the bound surface names the terminal that
