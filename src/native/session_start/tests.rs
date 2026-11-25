@@ -500,10 +500,8 @@ fn unwritable_consent_record_fails_create_and_marks_the_session_failed() {
 }
 
 // Both starts resolve through one step; a row is what each command supplies to it, the
-// terminal kind it selected included. The rows are platform-neutral; the table is kept to
-// the platforms where the whole start path, terminal selection included, runs, and it has
-// not run on Linux.
-#[cfg(any(target_os = "macos", windows))]
+// terminal kind it selected included. The rows are platform-neutral, so the table runs on
+// macOS, Linux, and Windows.
 mod resolution {
     use super::*;
     use crate::native::reopen::{self, ReopenGate, ReopenRequest, reopen_refusal_gate};
@@ -591,33 +589,60 @@ mod resolution {
         panic!("the provider is probed only after admission")
     }
 
+    // Resolve symlink/junction ancestors (such as macOS `/var` -> `/private/var`) so the
+    // non-alias workspace assertions do not see an alias in the temp root. On Windows, drop
+    // the verbatim `\\?\` prefix that `canonicalize()` adds so `cmd /C mklink /J` accepts
+    // paths under this directory.
+    fn canonical_temp_root(path: &Path) -> PathBuf {
+        let canonical = path.canonicalize().unwrap();
+        #[cfg(windows)]
+        if let Some(text) = canonical.to_str() {
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            if let Some(ordinary) = text.strip_prefix(r"\\?\") {
+                return PathBuf::from(ordinary);
+            }
+        }
+        canonical
+    }
+
     // The child has its own state root and Codex home, so the admission row refuses and the
     // consent assessment reads no real provider store.
     #[test]
     fn fresh_and_reopen_rows_resolve_through_one_step() {
         if std::env::var_os(CHILD).is_none() {
             let base = tempfile::tempdir().unwrap();
-            let codex_home = base.path().join("codex");
+            let base_path = canonical_temp_root(base.path());
+            let codex_home = base_path.join("codex");
             fs::create_dir_all(codex_home.join("memories")).unwrap();
-            let root = base.path().join("state");
+            let root = base_path.join("state");
             fs::create_dir(&root).unwrap();
+            let test_name = format!(
+                "{}::fresh_and_reopen_rows_resolve_through_one_step",
+                module_path!()
+                    .split_once("::")
+                    .map_or(module_path!(), |(_, rest)| rest)
+            );
             let out = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    concat!(
-                        module_path!(),
-                        "::fresh_and_reopen_rows_resolve_through_one_step"
-                    ),
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
+                .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
                 .env(CHILD, "1")
                 .env(STATE_DIR_ENV, &root)
-                .env("HOME", base.path())
+                .env("HOME", &base_path)
+                .env("USERPROFILE", &base_path)
                 .env("CODEX_HOME", &codex_home)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("PI_CODING_AGENT_DIR")
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success()
+                    && stdout.contains("running 1 test")
+                    && stdout.contains("1 passed"),
+                "stdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             return;
         }
         let root = Reader::state_root().unwrap();
@@ -725,7 +750,7 @@ mod resolution {
         // start's assessment records one.
         let alias = work.join("alias");
         assert!(
-            link_directory(&canonical, &alias),
+            link_directory(&project, &alias),
             "an alias of the workspace is needed to tell the two consent paths apart"
         );
         let fresh = Row::Fresh.resolve(&alias, None, fixture_probe).unwrap();
