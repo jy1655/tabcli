@@ -25,8 +25,7 @@ fn session_owner(directory: &Path, pid: u32) -> NativeSessionOwner {
     }
 }
 
-// Repair attests the owner it reads; the injected liveness answers live, so Repair leaves an
-// attested owner's session untouched.
+// A damaged Owner Record must be refused before Repair asks for an OS observation.
 #[test]
 fn repair_owner_read_answers_for_each_damaged_shape() {
     for &damaged in DAMAGED {
@@ -49,6 +48,37 @@ fn repair_owner_read_answers_for_each_damaged_shape() {
         // Repair reads the record under the one read policy: it no longer follows a link.
         let expected = (format!("error {}", read_error(&path, damaged)), 0);
         assert_eq!((observed, attested.get()), expected, "{damaged:?}");
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn repair_parity_helper_refuses_a_surface_after_the_owner_exits() {
+    use crate::native::process_identity::Gone;
+    use crate::native::session::owner::ControlAttestation;
+
+    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), "working", std::process::id());
+        let store = Store::open_unchecked(directory.path());
+        if matches!(record, CoreRecord::TerminalClosing) {
+            store.claim_terminal_handle().unwrap().unwrap();
+        }
+        let before = store.record(record).bytes().unwrap();
+        let error = repair_dead_owner_attested_with(&store, |_| OwnerAttestation {
+            process: ProcessObservation::Gone(Gone::Exited),
+            control: ControlAttestation::NotRecorded,
+            pid_alive: Some(false),
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a parity row records no surface")
+        );
+        assert_eq!(store.record(record).bytes().unwrap(), before);
+        assert_eq!(store.status().unwrap().state, SessionState::Working);
+        assert!(store.closed_if_present().unwrap().is_none());
     }
 }
 

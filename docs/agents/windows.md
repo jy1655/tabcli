@@ -10,7 +10,8 @@
   managed console, whose open refuses the kind and whose helper refuses the handle; refusing
   it in the lookup would change what such a handle reports and is not decided. Give a new
   Windows surface its own adapter in that lookup; do not branch one of these operations on the
-  kind. Dead-owner Repair decides whether it needs a close transaction in
+  kind. `attach_command` and `admit_selection` still check kinds outside those operations.
+  Dead-owner Repair decides whether it needs a close transaction in
   `terminal::close_authority::owner_exit`. Only a managed console or a registration whose core
   keeps a finished terminal can reach the Windows close adapter from that transaction. The
   claimed handle is checked independently of the retained-handle scan. The lookup's portable tests run

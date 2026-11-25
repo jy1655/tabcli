@@ -725,6 +725,8 @@ that it has finished. Windows Repair closes a core-retained terminal through the
 lookup, even for an exited or failed session. This uses the adapter's proof and ordinary
 close of a live or finished terminal. An exited or failed console session settles from its
 Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
+The platform differences carry forward 0.4.48 behavior and still await owner confirmation
+(architecture round 17, card 01).
 
 ## Where to add things
 
@@ -751,9 +753,9 @@ Records. Repair uses the same handle claim as explicit Close when it must call a
   the kind does not support and, where used, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
   exhaustive lookup on every build target; the shared lookups and the declared screen and
   guarded-key refusals of the POSIX and Windows dispatches read it, so the surface operations
-  need no per-kind match of their own. A few kind checks remain outside them
-  (`attach_command`, `admit_selection`, and on Windows the dead-owner gates in `ownership.rs`
-  and `session/close.rs`). For a Windows surface, implement `WindowsTerminalAdapter` and add it
+  need no per-kind match of their own. `attach_command` and `admit_selection` check kinds outside
+  those operations. For Windows dead-owner Repair, read `close_authority/owner_exit.rs` and the
+  kind's registration. For a Windows surface, implement `WindowsTerminalAdapter` and add it
   to the lookup in `windows/dispatch.rs`.
   For macOS operations, implement the
   `MacTerminalAdapter` methods for the operations the kind supports, behind an injectable

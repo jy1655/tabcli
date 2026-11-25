@@ -803,43 +803,56 @@ fn repair_dead_owner_attested_until(
     deadline: Instant,
 ) -> Result<bool> {
     #[cfg(windows)]
-    let mut close_surface = |surface: &terminal::TerminalSession| {
-        terminal::close_session_until(store.directory(), surface, deadline)
-    };
-    #[cfg(windows)]
-    let surfaces = RepairSurfaces::Windows(&mut close_surface);
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let surfaces = RepairSurfaces::Posix;
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    let surfaces = RepairSurfaces::Unsupported;
-    repair_dead_owner_with(
-        store,
-        |owner| repair_owner_is_live(&attest(owner)),
-        surfaces,
-        deadline,
-    )
+    return repair_dead_owner_windows_with(store, attest, terminal::windows_installed(), deadline);
+
+    #[cfg(not(windows))]
+    {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let surfaces = RepairSurfaces::Posix;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let surfaces = RepairSurfaces::Unsupported;
+        repair_dead_owner_with(
+            store,
+            |owner| repair_owner_is_live(&attest(owner)),
+            surfaces,
+            deadline,
+        )
+    }
 }
 
-/// Repair with the installed surface policy and an injected owner observation.
+/// Repair parity for fixtures that record no surface. A surface at settlement is an error.
 #[cfg(test)]
 pub(in crate::native) fn repair_dead_owner_attested_with(
     store: &Store,
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
 ) -> Result<bool> {
-    repair_dead_owner_attested_until(store, attest, budget::close_deadline())
-}
-
-#[cfg(test)]
-pub(in crate::native) fn repair_dead_owner_windows_with(
-    store: &Store,
-    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
-    close: &mut dyn FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-    deadline: Instant,
-) -> Result<bool> {
     repair_dead_owner_with(
         store,
         |owner| repair_owner_is_live(&attest(owner)),
-        RepairSurfaces::Windows(close),
+        RepairSurfaces::WithoutSurface,
+        budget::close_deadline(),
+    )
+}
+
+#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+pub(in crate::native) fn repair_dead_owner_windows_with(
+    store: &Store,
+    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    adapters: &dyn terminal::windows_dispatch::Adapters,
+    deadline: Instant,
+) -> Result<bool> {
+    let mut close = |surface: &terminal::TerminalSession| {
+        terminal::windows_dispatch::close_session_until(
+            adapters,
+            store.directory(),
+            surface,
+            deadline,
+        )
+    };
+    repair_dead_owner_with(
+        store,
+        |owner| repair_owner_is_live(&attest(owner)),
+        RepairSurfaces::Windows(&mut close),
         deadline,
     )
 }

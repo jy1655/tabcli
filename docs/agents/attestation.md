@@ -10,14 +10,15 @@
   exact-intent close resume refuses. A dead owner must reach Gone through the observer, or every
   command on that session fails: "every unverified open failure is Unknown" would have made every
   dead Windows owner Unknown (plan defect found in review, 2026-10-15, #190).
-- A reused pid is the verified death of the recorded incarnation. Surface authority still
-  requires its own proof. In Windows Repair, Gone with an exited or reused PID starts the
-  same repair, even for an unbound or foreign owner record. The claimed Surface is checked by
-  its own adapter before close. The ordinary macOS and Linux dead-owner Close requires an
-  exited, bound owner with complete recorded control. A changed control identity (controlling
-  TTY, process groups) of a live incarnation is not a death. A second observation of the same
-  pid is checked against the attested incarnation before its control fields are compared; a
-  later snapshot with another birth is reuse (#190).
+- A reused pid is the verified death of the recorded incarnation and grants no authority over its
+  surface. A changed control identity (controlling TTY, process groups) of a live incarnation is
+  not a death. A second observation of the same pid is checked against the attested incarnation
+  before its control fields are compared; a later snapshot with another birth is reuse (#190).
+- Existing Windows Repair treats Gone from exit or reuse the same, even for an unbound or
+  foreign owner record. The surface adapter supplies independent proof over the claimed handle
+  before Close. The ordinary macOS and Linux dead-owner Close requires an exited, bound owner
+  with complete recorded control. The platform differences carry forward 0.4.48 behavior and
+  still await owner confirmation (architecture round 17, card 01).
 - Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner

@@ -1005,7 +1005,7 @@ fn windows_repair_closes_through_the_core_and_resumes_after_removal_fails() {
     use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
     use crate::native::session::test_support::lifecycle::write_owned_terminal_state;
     use crate::native::session::{CoreRecord, SessionState, Store};
-    use crate::native::terminal::windows_dispatch::{Dispatch, close_session_until};
+    use crate::native::terminal::windows_dispatch::Dispatch;
 
     for (state, binding, initially_finished) in [
         ("working", Some(SESSION), false),
@@ -1042,7 +1042,22 @@ fn windows_repair_closes_through_the_core_and_resumes_after_removal_fails() {
             Adapter::with_core(core.clone()),
         );
         let repair = || {
-            let deadline = later();
+            let claimed_directory = directory.clone();
+            let expected_handle = handle.clone();
+            core.after_call("hello", move |_| {
+                let store = Store::open_unchecked(&claimed_directory);
+                assert_eq!(
+                    store.record(CoreRecord::TerminalClosing).bytes().unwrap(),
+                    expected_handle
+                );
+                assert!(
+                    store
+                        .record(CoreRecord::Terminal)
+                        .bytes()
+                        .unwrap()
+                        .is_none()
+                );
+            });
             repair_dead_owner_windows_with(
                 &store,
                 |recorded| {
@@ -1057,22 +1072,8 @@ fn windows_repair_closes_through_the_core_and_resumes_after_removal_fails() {
                         pid_alive: Some(initially_finished),
                     }
                 },
-                &mut |claimed| {
-                    assert_eq!(*claimed, surface);
-                    assert_eq!(
-                        store.record(CoreRecord::TerminalClosing).bytes().unwrap(),
-                        handle
-                    );
-                    assert!(
-                        store
-                            .record(CoreRecord::Terminal)
-                            .bytes()
-                            .unwrap()
-                            .is_none()
-                    );
-                    close_session_until(&adapters, &directory, claimed, deadline)
-                },
-                deadline,
+                &adapters,
+                later(),
             )
         };
 

@@ -17,10 +17,10 @@ pub(in crate::native) struct SurfaceFacts {
     pub(in crate::native) guards_dialog_input: bool,
 }
 
-/// What may remain of the surface when its owner exits.
+/// Whether a surface must be retained for further close work after its owner exits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native::terminal) enum OwnerSurvival {
-    EndsWithOwner,
+    NoRetention,
     SurfaceCanRemain,
     /// The core keeps a finished terminal until it is explicitly removed.
     CoreRetainsFinished,

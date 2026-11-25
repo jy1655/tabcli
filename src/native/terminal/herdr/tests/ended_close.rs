@@ -7,9 +7,7 @@ use crate::native::process_identity::{Gone, ProcessObservation};
 use crate::native::session::Store;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 use crate::native::session::{self, CoreRecord, SessionState};
-use crate::native::terminal::close_authority::{
-    close_owned_surface_with, test_support::TestObservation,
-};
+use crate::native::terminal::close_authority::Production;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::terminal::posix::{self, PosixTerminalAdapter};
 
@@ -94,42 +92,15 @@ impl Fixture {
 
     /// `tabcli close-session --explicit` with the dead owner observed as `owner`.
     fn close(&self, owner: fn() -> OwnerAttestation, pid_alive: bool) -> Result<CloseOutcome> {
-        session::close::close_with_attestation(
-            &self.store(),
-            None,
-            session::close::budget::close_deadline(),
-            |_| owner(),
-            |surface| {
-                let deadline = session::close::budget::close_deadline();
-                let observation =
-                    TestObservation::on_records(&self.directory, SESSION, surface, deadline)
-                        .with_presence(|| {
-                            posix::surface_present(
-                                &Adapter::with_core(self.core.clone()),
-                                &self.directory,
-                                surface,
-                                Duration::from_secs(1),
-                            )
-                        })
-                        .with_pid_alive(|_| pid_alive)
-                        .with_posix_owner_live(|_| owner());
-                close_owned_surface_with(
-                    || observation.decide(SESSION, surface, deadline),
-                    || panic!("a dead owner is never torn down"),
-                    |close| {
-                        posix::close_owned_session(
-                            &Adapter::with_core(self.core.clone()),
-                            &self.directory,
-                            SESSION,
-                            surface,
-                            close,
-                            deadline,
-                        )
-                    },
-                    deadline,
-                )
-            },
-        )
+        let deadline = session::close::budget::close_deadline();
+        let observe = |_: &NativeSessionOwner| owner();
+        let pid_is_alive = |_| pid_alive;
+        let adapters = Adapter::with_core(self.core.clone());
+        session::close::close_with_attestation(&self.store(), None, deadline, observe, |surface| {
+            Production::new(&self.directory, SESSION, surface, deadline)
+                .with_posix_dead_owner_observations(&adapters, &observe, &pid_is_alive)
+                .close_posix_surface()
+        })
     }
 
     fn close_dead(&self) -> Result<CloseOutcome> {

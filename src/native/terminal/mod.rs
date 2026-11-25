@@ -87,11 +87,11 @@ mod macos_selection;
 pub(in crate::native) mod windows_budget;
 #[cfg(any(windows, test))]
 #[path = "windows/dispatch.rs"]
-mod windows_dispatch;
+pub(in crate::native) mod windows_dispatch;
 
 /// The installed Windows lookup: the managed console and Herdr.
 #[cfg(windows)]
-fn windows_installed() -> &'static dyn windows_dispatch::Adapters {
+pub(super) fn windows_installed() -> &'static dyn windows_dispatch::Adapters {
     &windows::INSTALLED
 }
 
@@ -656,6 +656,7 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    #[cfg(not(windows))]
     crate::native::session::close::budget::close_remaining(deadline)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {

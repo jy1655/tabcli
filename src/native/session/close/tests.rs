@@ -1345,6 +1345,7 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn windows_repair_retains_unreadable_surface_identity() {
     for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
@@ -1371,6 +1372,7 @@ fn windows_repair_retains_unreadable_surface_identity() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
     let root = tempfile::tempdir().unwrap();

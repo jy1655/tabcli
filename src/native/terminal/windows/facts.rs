@@ -4,7 +4,9 @@ use crate::native::terminal::facts::{
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
     facts: SurfaceFacts {
-        owner_survival: OwnerSurvival::EndsWithOwner,
+        // Repair settles an exited or failed console from its Records. A console root
+        // can survive the owner of an active session, so Repair still closes it there.
+        owner_survival: OwnerSurvival::NoRetention,
         failed_start_identity: true,
         // Console key events would expose bracketed-paste escapes as literal text.
         paste_envelope: PasteEnvelope::Raw,

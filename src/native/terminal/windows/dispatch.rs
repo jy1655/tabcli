@@ -16,9 +16,8 @@ pub(in crate::native::terminal) type BindSurface<'a> =
     Box<dyn FnOnce(&mut TerminalSession) -> Result<()> + 'a>;
 pub(in crate::native::terminal) type UnbindSurface<'a> = Box<dyn FnOnce() -> Result<()> + 'a>;
 
-pub(in crate::native::terminal) trait WindowsTerminalAdapter {
-    /// `kind` is the kind the launch asked for: the lookup hands the managed console every
-    /// kind but Herdr, and only its open can refuse one it does not create.
+pub(in crate::native) trait WindowsTerminalAdapter {
+    /// `kind` is the requested launch kind. Each adapter refuses kinds it does not create.
     fn open_bound_tab(
         &self,
         kind: TerminalKind,
@@ -69,7 +68,7 @@ pub(in crate::native::terminal) trait WindowsTerminalAdapter {
 
 /// The adapter of a kind. Every operation resolves its adapter here and nowhere else;
 /// production passes the installed `Dispatch`, a test one over its own adapters.
-pub(in crate::native::terminal) trait Adapters {
+pub(in crate::native) trait Adapters {
     fn adapter(&self, kind: TerminalKind) -> &dyn WindowsTerminalAdapter;
 }
 
@@ -177,12 +176,13 @@ pub(in crate::native::terminal) fn verify_surface(
         .verify_surface(session, timeout)
 }
 
-pub(in crate::native::terminal) fn close_session_until(
+pub(in crate::native) fn close_session_until(
     adapters: &dyn Adapters,
     directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    crate::native::session::close::budget::close_remaining(deadline)?;
     adapters
         .adapter(session.kind)
         .close_session_until(directory, session, deadline)

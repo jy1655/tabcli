@@ -7,7 +7,7 @@ use crate::native::session::launch::{BindingBudget, BindingFacts};
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
     facts: SurfaceFacts {
-        owner_survival: OwnerSurvival::EndsWithOwner,
+        owner_survival: OwnerSurvival::NoRetention,
         failed_start_identity: true,
         paste_envelope: PasteEnvelope::Bracketed,
         guards_dialog_input: true,

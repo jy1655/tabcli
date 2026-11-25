@@ -1,5 +1,6 @@
-//! Surface decisions after the recorded owner has gone. Repair retains POSIX surfaces for
-//! explicit close. Windows Repair can close through the surface adapter's independent proof.
+//! Surface decisions after the recorded owner has gone. POSIX Repair retains handles of kinds
+//! that can outlive the owner, as well as close intents. Windows Repair can close through the
+//! surface adapter's independent proof.
 use super::super::{self as terminal, CloseOutcome, TerminalKind, TerminalSession};
 use crate::native::process_identity::ProcessObservation;
 use crate::native::session::close::budget::close_remaining;
@@ -19,7 +20,7 @@ pub(in crate::native) fn repair_owner_is_live(attestation: &OwnerAttestation) ->
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native::terminal) fn outlives_owner(kind: TerminalKind) -> bool {
-    terminal::facts(kind).owner_survival != OwnerSurvival::EndsWithOwner
+    terminal::facts(kind).owner_survival != OwnerSurvival::NoRetention
 }
 
 pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> bool {
@@ -82,8 +83,13 @@ type CloseSurface<'a> = &'a mut dyn FnMut(&TerminalSession) -> Result<CloseOutco
 pub(in crate::native) enum RepairSurfaces<'a> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     Posix,
-    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(windows, all(test, any(target_os = "macos", target_os = "linux")))),
+        allow(dead_code)
+    )]
     Windows(CloseSurface<'a>),
+    #[cfg(test)]
+    WithoutSurface,
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     Unsupported,
 }
@@ -100,7 +106,6 @@ pub(in crate::native) enum RepairSurface<'a> {
 }
 
 impl<'a> RepairSurfaces<'a> {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn decide(
         self,
         reader: &Reader,
@@ -108,6 +113,16 @@ impl<'a> RepairSurfaces<'a> {
         deadline: Instant,
     ) -> Result<RepairSurface<'a>> {
         match self {
+            #[cfg(test)]
+            Self::WithoutSurface => {
+                use crate::native::session::CoreRecord;
+                for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
+                    if reader.record(record).present()? {
+                        bail!("a parity row records no surface");
+                    }
+                }
+                Ok(RepairSurface::Settle)
+            }
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             Self::Posix => {
                 // Even an invalid intent is evidence of possible interrupted teardown.
@@ -125,6 +140,7 @@ impl<'a> RepairSurfaces<'a> {
                 }
                 Ok(RepairSurface::Settle)
             }
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             Self::Windows(close) => {
                 let core_retains_finished = has_retained_handle(
                     reader,
@@ -142,17 +158,12 @@ impl<'a> RepairSurfaces<'a> {
                     core_retains_finished,
                 }))
             }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            Self::Unsupported | Self::Windows(_) => {
+                let _ = (reader, state, deadline);
+                Ok(RepairSurface::Settle)
+            }
         }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    pub(in crate::native) fn decide(
-        self,
-        _reader: &Reader,
-        _state: &SessionState,
-        _deadline: Instant,
-    ) -> Result<RepairSurface<'a>> {
-        Ok(RepairSurface::Settle)
     }
 }
 

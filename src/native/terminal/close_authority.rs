@@ -111,6 +111,12 @@ pub(in crate::native) struct Production<'a> {
     expected_session_id: &'a str,
     session: &'a TerminalSession,
     deadline: Instant,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    posix_adapters: &'a dyn terminal::posix::Adapters,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    observe_owner: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pid_is_alive: &'a dyn Fn(u32) -> bool,
 }
 
 impl<'a> Production<'a> {
@@ -125,7 +131,26 @@ impl<'a> Production<'a> {
             expected_session_id,
             session,
             deadline,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            posix_adapters: terminal::posix_installed(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            observe_owner: &attest_owner,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            pid_is_alive: &process_is_alive,
         }
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(in crate::native::terminal) fn with_posix_dead_owner_observations(
+        mut self,
+        adapters: &'a dyn terminal::posix::Adapters,
+        observe: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
+        pid_is_alive: &'a dyn Fn(u32) -> bool,
+    ) -> Self {
+        self.posix_adapters = adapters;
+        self.observe_owner = observe;
+        self.pid_is_alive = pid_is_alive;
+        self
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -183,11 +208,16 @@ impl CloseObservation for Production<'_> {
     }
 
     fn surface_present(&self) -> Result<bool> {
-        terminal::surface_present(
+        let remaining = close_remaining(self.deadline)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return terminal::posix::surface_present(
+            self.posix_adapters,
             self.directory,
             self.session,
-            close_remaining(self.deadline)?,
-        )
+            remaining,
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        terminal::surface_present(self.directory, self.session, remaining)
     }
 
     fn ownership_proof(&self) -> Result<()> {
@@ -201,17 +231,20 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return (self.observe_owner)(owner);
+        #[cfg(windows)]
         attest_owner(owner)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool {
-        process_is_alive(pid)
+        (self.pid_is_alive)(pid)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn posix_owner_live(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
-        attest_owner(owner)
+        (self.observe_owner)(owner)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -434,9 +467,29 @@ pub(in crate::native) fn close_owned_surface(
 ) -> Result<terminal::CloseResult> {
     let observation = Production::new(directory, id, session, deadline);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return observation.close_posix_surface();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let authority = decide(&observation, id, session, deadline)?;
+        if authority == TerminalCloseAuthority::Absent {
+            return Ok(terminal::CloseOutcome::Missing.into());
+        }
+        terminal::close_session_until(directory, session, deadline).map(Into::into)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Production<'_> {
+    pub(in crate::native::terminal) fn close_posix_surface(&self) -> Result<terminal::CloseResult> {
+        let Self {
+            directory,
+            expected_session_id: id,
+            session,
+            deadline,
+            ..
+        } = *self;
         close_owned_surface_with(
-            || decide(&observation, id, session, deadline),
+            || decide(self, id, session, deadline),
             || {
                 teardown_absent_owner_with(
                     &Store::open_unchecked(directory),
@@ -453,7 +506,7 @@ pub(in crate::native) fn close_owned_surface(
             },
             |close| {
                 terminal::posix::close_owned_session(
-                    terminal::posix_installed(),
+                    self.posix_adapters,
                     directory,
                     id,
                     session,
@@ -463,14 +516,6 @@ pub(in crate::native) fn close_owned_surface(
             },
             deadline,
         )
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let authority = decide(&observation, id, session, deadline)?;
-        if authority == TerminalCloseAuthority::Absent {
-            return Ok(terminal::CloseOutcome::Missing.into());
-        }
-        terminal::close_session_until(directory, session, deadline).map(Into::into)
     }
 }
 
