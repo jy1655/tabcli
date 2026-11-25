@@ -109,7 +109,7 @@ impl RequestObservation<'_> {
         if owner.gone() {
             self.state = RequestState::Unresolved;
             self.error = Some(
-                "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request".to_owned()
+                "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request; close-session --explicit closes a terminal that outlived its owner".to_owned()
             );
         } else if session_ended {
             self.state = RequestState::Unresolved;
@@ -588,13 +588,13 @@ mod owner_tests {
                 &gone,
                 false,
                 RequestState::Unresolved,
-                "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request",
+                "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request; close-session --explicit closes a terminal that outlived its owner",
             ),
             (
                 &gone,
                 true,
                 RequestState::Unresolved,
-                "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request",
+                "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request; close-session --explicit closes a terminal that outlived its owner",
             ),
             (&unknown, false, RequestState::Pending, "existing error"),
             (&changed, false, RequestState::Pending, "existing error"),

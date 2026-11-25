@@ -710,9 +710,10 @@ The recovery close in #87 is not implemented. Its authority decision waits for W
 evidence from a `warp_control_cli` build or an upstream change.
 
 `terminal::close_authority` decides explicit Close over its observation seam. Close can act
-with a live attested owner, act on a proven Surface alone, end and remove a Surface that its
-creation record proves after its owner is gone, end a live attested owner whose Surface is
-proven absent, or settle a proven absence or
+with a live attested owner, act on a proven Surface alone, remove a Surface that its creation
+record proves when no live owner is left (and end it only when this session's owner is
+positively gone), end a live attested owner whose Surface is proven absent, or settle a proven
+absence or
 completed teardown. An ambiguous identity retains the handle. The platform adapters perform
 surface close, and `terminal::ownership` performs owner teardown. `session::close` claims the
 handle, records the transition and tombstones, and converges interrupted Close.
@@ -720,15 +721,19 @@ handle, records the transition and tombstones, and converges interrupted Close.
 `terminal::close_authority::owner_exit` owns the dead-owner Close decision and the dead-owner
 Surface decision in Repair. The owner's rule is one behavior on every OS, with a difference
 only where it is unavoidable (2026-11-26, os-parity). Repair scans active then claimed handles
-through the same reader and retains damaged evidence. On every OS, Repair leaves a
-registered core-retained terminal (Herdr) for explicit Close, and that Close
-(`CreatedSurface`) ends and removes it after the adapter proves it by the creation record in
-the handle, whatever the owner record says; the owner PID never proves it. On macOS and Linux,
-Repair also preserves an intent or another Surface that can outlive its owner, whose
-dead-owner Close keeps requiring an exited, bound owner. The managed Windows console, a
-Windows-only Surface, is closed by Repair through its root identity in an active session and
-settles from its Records once the session has ended. Repair uses the same handle claim as
-explicit Close when it must call an adapter.
+through the same reader and retains damaged evidence, and scans again under the lifecycle
+lock before it settles a session. On every OS, Repair leaves a registered core-retained
+terminal (Herdr) for explicit Close. Only a close whose `CloseCause` is `Explicit` acts on it:
+`CreatedSurface` removes it after the adapter proves it by the creation record in the handle,
+whatever the owner record says. It ends a running one (`Running::End`) only when this session's
+owner is positively gone and the program is observed with its recorded birth. On macOS and
+Linux, Repair also preserves an intent or another Surface that can outlive its owner. Their
+ordinary dead-owner branch keeps requiring an exited, bound owner with complete control,
+apart from two earlier routes. A Linux tmux server is closed by its creation-time incarnation
+before the owner is read. An exact close intent resumes under its own rule once its owner's
+incarnation is gone. The managed Windows console, a Windows-only Surface, is closed by Repair
+through its root identity in an active session and settles from its Records once the session
+has ended. Repair uses the same handle claim as explicit Close when it must call an adapter.
 
 ## Where to add things
 

@@ -17,12 +17,16 @@
 - The owner's rule is one behavior on every OS, with a difference only where it is unavoidable
   (2026-11-26). Repair treats Gone from exit or reuse the same, whatever the owner record's
   binding, and never ends a terminal whose core keeps it (Herdr): only `close-session
-  --explicit` does, on every OS, and it proves that terminal by its own creation record, so a
-  reused PID, an unbound or foreign record or an incomplete one neither grants nor blocks it
-  (os-parity). The ordinary macOS and Linux dead-owner Close of the other kinds still requires
-  an exited, bound owner with complete recorded control. Only the form of that identity is a
-  platform fact (controlling TTY and process groups on macOS and Linux, the recorded process
-  identity on Windows).
+  --explicit` does, on every OS (os-parity). That close proves the terminal by its own creation
+  record, so a reused PID or an unbound, foreign or incomplete record neither grants nor blocks
+  the removal of a finished terminal. A Gone answer about another session's owner, an unbound
+  owner or a PID-only record does not show that this session has ended. Ending a running
+  terminal therefore also needs this session's owner positively gone: a bound record naming an
+  incarnation that the platform observer saw exit or be reused (`records_incarnation`). A
+  PID-only Gone rests on the liveness bool and never ends one. The ordinary macOS and Linux
+  dead-owner Close of the other kinds still requires an exited, bound owner with complete
+  recorded control. Only the form of that identity is a platform fact (controlling TTY, process
+  groups and birth on macOS and Linux, the recorded process identity on Windows).
 - Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner
