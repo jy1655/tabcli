@@ -1300,7 +1300,7 @@ On Linux and Windows, Herdr can record `input_flush_failed` or `launch_shell_exe
 after the bound host verifies its process birth. The failure-only record uses `awaiting_host`
 as its last recorded stage. Use `inspect SESSION --timeline` for the underlying error. With
 no such record on these platforms, Herdr reports `unavailable` / `launch_stage_not_applicable`.
-The check reports one of the following reason codes.
+The check reports one of the following reason codes:
 `launch_stage_observed`, `launch_host_failed`, `launch_host_not_recorded` (no record: a session
 from an earlier release, another terminal, or a launch that did not reach surface creation;
 absence is not evidence that the host never started), `launch_host_identity_mismatch`,
