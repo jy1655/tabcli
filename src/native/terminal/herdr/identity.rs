@@ -39,12 +39,13 @@ fn usable_endpoint(endpoint: &str) -> bool {
 /// | Operations | Directory | State | Additional evidence |
 /// | --- | --- | --- | --- |
 /// | Send, screen, verify | Managed Session id | Live | Program still exists |
-/// | Presence, close, cleanup after binding fails | Exact path | Either | |
-/// | Close after the owner is gone | Exact path | Either | Launch label |
+/// | Presence, every close, cleanup after binding fails | Exact path | Either | Launch label |
+///
+/// A close with no live owner left also observes a running terminal's program with its
+/// recorded birth before it ends it (`program_observed`).
 pub(super) enum Requirement<'a> {
     Live,
     Bound(&'a Path),
-    Created(&'a Path),
 }
 
 pub(super) struct Recorded<'a> {
@@ -85,7 +86,10 @@ impl<'a> Recorded<'a> {
     pub(super) fn check(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
         let identity = self.check_identity(core, observed);
         match self.requirement {
-            Requirement::Bound(_) => identity,
+            Requirement::Bound(_) => {
+                identity?;
+                self.check_launch(observed)
+            }
             Requirement::Live => {
                 identity?;
                 let address = &observed.address;
@@ -97,10 +101,22 @@ impl<'a> Recorded<'a> {
                 }
                 Ok(())
             }
-            Requirement::Created(_) => {
-                identity.context(CLOSE_STOPPED)?;
-                self.check_launch(observed)
-            }
+        }
+    }
+
+    /// A close with no live owner left ends a running terminal only after observing its
+    /// program with the recorded birth: a program the OS no longer reports may be one the
+    /// core still lists while it winds down, and proves nothing about what would be ended.
+    pub(super) fn program_observed(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
+        let address = &observed.address;
+        match core.process_start(self.surface.host_pid)? {
+            Some(birth) if birth == self.surface.birth => Ok(()),
+            Some(_) => bail!(
+                "the program of Herdr terminal {address} is another process than the one recorded"
+            ),
+            None => bail!(
+                "the program of Herdr terminal {address} cannot be observed although its core reports it running; nothing was ended and the handle is retained"
+            ),
         }
     }
 
@@ -109,7 +125,7 @@ impl<'a> Recorded<'a> {
         let address = &observed.address;
         let directory = match self.requirement {
             Requirement::Live => None,
-            Requirement::Bound(directory) | Requirement::Created(directory) => Some(directory),
+            Requirement::Bound(directory) => Some(directory),
         };
         let argv_directory = observed.argv.get(2);
         let session_directory = match directory {
@@ -158,8 +174,8 @@ impl<'a> Recorded<'a> {
         Ok(())
     }
 
-    /// The launch label TAB set at creation, part of the creation record a gone owner's close
-    /// relies on in either terminal state.
+    /// The launch label TAB set at creation, part of the creation record every close checks in
+    /// either terminal state.
     fn check_launch(&self, observed: &Observed) -> Result<()> {
         let address = &observed.address;
         let nonce = observed
@@ -168,8 +184,14 @@ impl<'a> Recorded<'a> {
             .with_context(|| format!("Herdr terminal {address} is missing its launch label"))?;
         let matches_launch = match self.session.herdr_launch_nonce() {
             Some(expected) => nonce == expected,
-            // Records from 0.4.45 and 0.4.46 omitted the nonce.
+            // Records from 0.4.45 and 0.4.46, on macOS and Linux only, omitted the nonce. Every
+            // Windows writer (0.4.47 on) saved it, so a Windows handle without one is not TAB's.
+            #[cfg(unix)]
             None => observed.name.as_deref() == Some(launch_name(nonce)?.as_str()),
+            #[cfg(windows)]
+            None => bail!(
+                "Herdr handle for terminal {address} records no launch label, which every Windows Herdr handle TAB wrote has; the handle is retained"
+            ),
         };
         if !matches_launch {
             bail!("Herdr terminal {address} has a different launch label; the handle is retained");

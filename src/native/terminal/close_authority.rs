@@ -52,19 +52,49 @@ pub(in crate::native) enum TerminalCloseAuthority {
     TeardownComplete(String),
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     SurfaceOnly,
-    /// The owner is verified gone (exited or reused, whatever its record says) and the kind's
-    /// core keeps its terminals: the adapter ends and removes the terminal only after proving
-    /// from the creation record in the handle that it is the one this session created. The
-    /// owner record grants nothing here.
+    /// The kind's core keeps its terminals and no live owner remains to close with: its owner
+    /// is verified gone (exited or reused, whatever its record says) or, for a failed start,
+    /// was never recorded. The adapter removes the terminal only after proving from the
+    /// creation record in the handle that it is the one this session created, and ends a
+    /// running one only as `Running` allows. The owner record grants nothing here.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    CreatedSurface,
+    CreatedSurface(Running),
     Absent,
+}
+
+/// Whether a close on a terminal's creation record may end it while it runs. `End` holds only
+/// when this session's owner is positively gone (a record bound to this session, naming an
+/// incarnation that was observed exited or reused) or a failed start recorded no owner; even
+/// then the adapter ends the terminal only after observing its program with the recorded
+/// birth. `Keep` removes a finished terminal and settles an absent one, and retains a running
+/// one: the owner record cannot show that this session has ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
+pub(in crate::native) enum Running {
+    End,
+    Keep,
+}
+
+/// Why a close runs. Only `close-session --explicit` (and the sessions it lists with
+/// `--with-started-from`) may act on a gone owner's terminal by its creation record; a close
+/// that cleans up after another command keeps the earlier authorities only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum CloseCause {
+    Explicit,
+    Cleanup,
 }
 
 // Everything the decision consults. The Record accessors read when they are called, so
 // the decision's call order is the Record-read order; the observations are the distinct
 // OS and surface proofs that the production adapter keeps apart.
 pub(in crate::native) trait CloseObservation {
+    /// Why the close runs, as its caller states it.
+    fn cause(&self) -> CloseCause {
+        CloseCause::Explicit
+    }
     /// Some only for a kind declaring BridgeCreatedHost: this observation proves the
     /// whole recorded host incarnation, independent of owner or intent. Unknown refuses.
     /// It never treats a missing endpoint or pane as an absent host.
@@ -112,6 +142,7 @@ pub(in crate::native) struct Production<'a> {
     expected_session_id: &'a str,
     session: &'a TerminalSession,
     deadline: Instant,
+    cause: CloseCause,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     posix_adapters: &'a dyn terminal::posix::Adapters,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -134,6 +165,7 @@ impl<'a> Production<'a> {
             expected_session_id,
             session,
             deadline,
+            cause: CloseCause::Explicit,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             posix_adapters: terminal::posix_installed(),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -143,6 +175,11 @@ impl<'a> Production<'a> {
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             scripted_dead_owner: false,
         }
+    }
+
+    pub(in crate::native) fn for_cause(mut self, cause: CloseCause) -> Self {
+        self.cause = cause;
+        self
     }
 
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
@@ -176,6 +213,10 @@ impl<'a> Production<'a> {
 }
 
 impl CloseObservation for Production<'_> {
+    fn cause(&self) -> CloseCause {
+        self.cause
+    }
+
     fn created_host_incarnation(
         &self,
     ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {
@@ -368,7 +409,14 @@ pub(in crate::native) fn decide(
                     && matches!(observed.process, ProcessObservation::Gone(_))
                 {
                     session.verify_managed_session(expected_session_id)?;
-                    return Ok(TerminalCloseAuthority::SurfaceOnly);
+                    return Ok(owner_exit::startup_surface(
+                        session,
+                        owner_exit::this_sessions_owner_gone(
+                            &owner,
+                            expected_session_id,
+                            &observed.process,
+                        ),
+                    ));
                 }
             }
             // The close that recorded the intent may finish without signalling anything
@@ -483,7 +531,8 @@ pub(in crate::native) fn decide(
         if !terminal::facts(session.kind).failed_start_identity {
             bail!("startup surface has no supported native close identity; its handle is retained");
         }
-        Ok(TerminalCloseAuthority::SurfaceOnly)
+        // No wrapper recorded an owner, so none can be live to close with.
+        Ok(owner_exit::startup_surface(session, true))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     refuse_without_transport(ownership_proof)
@@ -505,9 +554,10 @@ pub(in crate::native) fn close_owned_surface(
     directory: &Path,
     id: &str,
     session: &TerminalSession,
+    cause: CloseCause,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
-    let observation = Production::new(directory, id, session, deadline);
+    let observation = Production::new(directory, id, session, deadline).for_cause(cause);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return observation.close_posix_surface();
     #[cfg(windows)]
@@ -528,9 +578,10 @@ pub(in crate::native) fn close_owned_surface(
     }
 }
 
-/// Windows: the authority's action through the one Windows lookup. Compiled into every test
-/// build, so that the mapping runs over scripted adapters on every CI target.
-#[cfg(any(windows, test))]
+/// Windows: the authority's action through the one Windows lookup. Compiled into the test
+/// builds of macOS and Linux as well, so that the mapping runs over scripted adapters on every
+/// CI target; the targets without a terminal transport have no `CreatedSurface` to map.
+#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
 pub(in crate::native) fn close_windows_owned_surface_with(
     authority: impl FnOnce() -> Result<TerminalCloseAuthority>,
     adapters: &dyn terminal::windows_dispatch::Adapters,
@@ -544,8 +595,8 @@ pub(in crate::native) fn close_windows_owned_surface_with(
     close_remaining(deadline)?;
     match authority {
         TerminalCloseAuthority::Absent => Ok(terminal::CloseOutcome::Missing.into()),
-        TerminalCloseAuthority::CreatedSurface => {
-            windows_dispatch::close_created_surface(adapters, directory, session, deadline)
+        TerminalCloseAuthority::CreatedSurface(running) => {
+            windows_dispatch::close_created_surface(adapters, directory, session, running, deadline)
                 .map(Into::into)
         }
         _ => windows_dispatch::close_session_until(adapters, directory, session, deadline)
@@ -621,8 +672,8 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
         TerminalCloseAuthority::SurfaceOnly => {
             close_surface(OwnedSurfaceClose::SurfaceOnly).map(Into::into)
         }
-        TerminalCloseAuthority::CreatedSurface => {
-            close_surface(OwnedSurfaceClose::CreatedSurface).map(Into::into)
+        TerminalCloseAuthority::CreatedSurface(running) => {
+            close_surface(OwnedSurfaceClose::CreatedSurface(running)).map(Into::into)
         }
     }
 }
@@ -781,10 +832,35 @@ mod projected_authority_tests {
 
     // os-parity: once the owner is observed gone, a Herdr handle is closed on its creation
     // record on every OS, whatever the owner record says, without the ownership proof or a
-    // presence query. Each OS reaches that answer through its own owner observation. An owner
-    // that cannot be inspected is not gone and keeps the live-owner rules.
+    // presence query. Each OS reaches that answer through its own owner observation. Only a
+    // record bound to this session that names an incarnation lets the close end a running
+    // terminal. An owner that cannot be inspected is not gone and keeps the live-owner rules,
+    // and a close that cleans up after another command never acts on a gone owner's terminal.
     #[test]
     fn a_gone_owner_hands_a_herdr_close_to_its_creation_record_on_every_os() {
+        fn incarnation(mut owner: NativeSessionOwner) -> NativeSessionOwner {
+            #[cfg(target_os = "macos")]
+            {
+                owner.process_start_seconds = Some(1_790_000_000);
+                owner.process_start_microseconds = Some(42);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                owner.linux_birth = Some(crate::native::terminal::LinuxBirth {
+                    boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
+                    starttime_ticks: 42,
+                });
+            }
+            #[cfg(windows)]
+            {
+                owner.windows_process_identity =
+                    Some(crate::native::terminal::WindowsProcessIdentity {
+                        creation_time: 42,
+                        executable_path: r"C:\tabcli\tabcli.exe".into(),
+                    });
+            }
+            owner
+        }
         fn gone(process: Gone) -> OwnerAttestation {
             OwnerAttestation {
                 process: ProcessObservation::Gone(process),
@@ -798,14 +874,20 @@ mod projected_authority_tests {
         ];
         let surface = TerminalSession::new(terminal::TerminalKind::Herdr, "t7".into())
             .with_binding(Some("session-test".into()));
-        for binding in [Some("session-test"), None, Some("session-foreign")] {
+        for (binding, recorded, running) in [
+            (Some("session-test"), true, Running::End),
+            (Some("session-test"), false, Running::Keep),
+            (None, true, Running::Keep),
+            (Some("session-foreign"), true, Running::Keep),
+        ] {
             for observe in gone_ways {
+                let owner = NativeSessionOwner {
+                    pid: 4242,
+                    managed_session_id: binding.map(str::to_owned),
+                    ..Default::default()
+                };
                 let observation = TestObservation::from_values(RecordValues {
-                    owner: Some(NativeSessionOwner {
-                        pid: 4242,
-                        managed_session_id: binding.map(str::to_owned),
-                        ..Default::default()
-                    }),
+                    owner: Some(if recorded { incarnation(owner) } else { owner }),
                     state: SessionState::Ready,
                     launch: None,
                 })
@@ -826,8 +908,8 @@ mod projected_authority_tests {
                     .unwrap();
                 assert_eq!(
                     authority,
-                    TerminalCloseAuthority::CreatedSurface,
-                    "{binding:?}"
+                    TerminalCloseAuthority::CreatedSurface(running),
+                    "{binding:?}, incarnation {recorded}"
                 );
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 let calls = [
@@ -905,6 +987,40 @@ mod projected_authority_tests {
                     crate::native::session::close::budget::close_deadline(),
                 )
                 .is_err()
+        );
+
+        // A cleanup after another command (a refused reopen) gains no authority over a gone
+        // owner's terminal, even when its record would let an explicit close end it.
+        let observation = TestObservation::from_values(RecordValues {
+            owner: Some(incarnation(NativeSessionOwner {
+                pid: 4242,
+                managed_session_id: Some("session-test".into()),
+                ..Default::default()
+            })),
+            state: SessionState::Ready,
+            launch: None,
+        })
+        .with_cause(CloseCause::Cleanup)
+        .with_owner_record(|_| gone(Gone::Exited))
+        .with_presence(|| panic!("a cleanup asks no presence"))
+        .with_proof(|| panic!("a cleanup of a gone owner asks no ownership proof"));
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let observation = observation
+            .with_evidence(terminal::close_evidence(terminal::TerminalKind::Herdr))
+            .with_posix_owner_live(|_| gone(Gone::Exited))
+            .with_pid_alive(|_| false);
+        let error = observation
+            .decide(
+                "session-test",
+                &surface,
+                crate::native::session::close::budget::close_deadline(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only close-session --explicit ends or removes its Herdr terminal"),
+            "{error:#}"
         );
     }
 

@@ -363,7 +363,7 @@ pub(in crate::native) fn close_with_attestation(
     close_with_repair(
         store,
         reason,
-        || repair_dead_owner_attested_until(store, observe, deadline),
+        || dead_owner_repair(store, observe, deadline),
         closer,
         deadline,
     )
@@ -386,15 +386,23 @@ pub(in crate::native) fn close_with_attestation(
 fn close_with_repair(
     store: &Store,
     reason: Option<String>,
-    repair: impl FnOnce() -> Result<bool>,
+    repair: impl FnOnce() -> Result<DeadOwnerRepair>,
     mut close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
     let _budget = budget::Scope::enter(deadline);
     crate::native::session::close::budget::close_remaining(deadline)?;
-    let repair_error = repair()
-        .err()
-        .map(|error| format!("pre-close session repair failed: {error:#}"));
+    // A surface that Repair left for this close keeps the session's diagnosis: the close
+    // records it, as Repair records it when it settles the session itself.
+    let (repair_error, diagnosis) = match repair() {
+        Ok(DeadOwnerRepair::Retained { diagnosis }) => (None, Some(diagnosis)),
+        Ok(DeadOwnerRepair::Untouched | DeadOwnerRepair::Closed) => (None, None),
+        Err(error) => (
+            Some(format!("pre-close session repair failed: {error:#}")),
+            None,
+        ),
+    };
+    let reason = merge_close_reason(diagnosis, reason);
     if let Err(expired) = budget::check() {
         return Err(match repair_error {
             Some(error) => anyhow::anyhow!(error).context(expired),
@@ -714,6 +722,8 @@ fn set_aside_unverified_completion_event_for_close(store: &Store) -> Result<()> 
     Ok(())
 }
 
+// Repair settles under the lock it already holds; the tests settle a session directly.
+#[cfg(test)]
 fn mark_session_closed(store: &Store, error: Option<String>) -> Result<()> {
     let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let _lock = store.lock()?;
@@ -797,6 +807,24 @@ pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instan
     repair_dead_owner_attested_until(store, attest_owner, deadline)
 }
 
+/// What a dead owner's Repair did to the session.
+#[derive(Debug)]
+pub(in crate::native) enum DeadOwnerRepair {
+    /// Nothing changed.
+    Untouched,
+    /// The session was settled or its surface closed.
+    Closed,
+    /// The owner is gone and its surface is kept for an explicit close, which records this
+    /// diagnosis: the stored error, or that the owner's process is no longer running.
+    Retained { diagnosis: String },
+}
+
+impl DeadOwnerRepair {
+    fn changed(&self) -> bool {
+        matches!(self, Self::Closed)
+    }
+}
+
 /// Dead-owner Repair with the owner's OS observation supplied by the caller, under this
 /// platform's surface policy.
 pub(in crate::native) fn repair_dead_owner_attested_until(
@@ -804,8 +832,16 @@ pub(in crate::native) fn repair_dead_owner_attested_until(
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
     deadline: Instant,
 ) -> Result<bool> {
+    dead_owner_repair(store, attest, deadline).map(|repair| repair.changed())
+}
+
+fn dead_owner_repair(
+    store: &Store,
+    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    deadline: Instant,
+) -> Result<DeadOwnerRepair> {
     #[cfg(windows)]
-    return repair_dead_owner_windows_with(store, attest, terminal::windows_installed(), deadline);
+    return dead_owner_repair_windows(store, attest, terminal::windows_installed(), deadline);
 
     #[cfg(not(windows))]
     {
@@ -813,7 +849,7 @@ pub(in crate::native) fn repair_dead_owner_attested_until(
         let surfaces = RepairSurfaces::Posix;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let surfaces = RepairSurfaces::Unsupported;
-        repair_dead_owner_with(
+        dead_owner_repair_with(
             store,
             |owner| repair_owner_is_live(&attest(owner)),
             surfaces,
@@ -837,13 +873,23 @@ pub(in crate::native) fn repair_dead_owner_attested_with(
     )
 }
 
-#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) fn repair_dead_owner_windows_with(
     store: &Store,
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
     adapters: &dyn terminal::windows_dispatch::Adapters,
     deadline: Instant,
 ) -> Result<bool> {
+    dead_owner_repair_windows(store, attest, adapters, deadline).map(|repair| repair.changed())
+}
+
+#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+fn dead_owner_repair_windows(
+    store: &Store,
+    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    adapters: &dyn terminal::windows_dispatch::Adapters,
+    deadline: Instant,
+) -> Result<DeadOwnerRepair> {
     let mut close = |surface: &terminal::TerminalSession| {
         terminal::windows_dispatch::close_session_until(
             adapters,
@@ -852,7 +898,7 @@ pub(in crate::native) fn repair_dead_owner_windows_with(
             deadline,
         )
     };
-    repair_dead_owner_with(
+    dead_owner_repair_with(
         store,
         |owner| repair_owner_is_live(&attest(owner)),
         RepairSurfaces::Windows(&mut close),
@@ -860,12 +906,23 @@ pub(in crate::native) fn repair_dead_owner_windows_with(
     )
 }
 
+/// Whether the dead owner's Repair changed the session.
+#[cfg(test)]
 fn repair_dead_owner_with(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
     surfaces: RepairSurfaces<'_>,
     deadline: Instant,
 ) -> Result<bool> {
+    dead_owner_repair_with(store, owner_is_live, surfaces, deadline).map(|repair| repair.changed())
+}
+
+fn dead_owner_repair_with(
+    store: &Store,
+    owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
+    surfaces: RepairSurfaces<'_>,
+    deadline: Instant,
+) -> Result<DeadOwnerRepair> {
     let directory = store.directory();
     // Completion recovery runs first so a live owner's finished turn is published before
     // anything else is decided. Its failure is damage (a missing `events/`, a journal
@@ -881,7 +938,7 @@ fn repair_dead_owner_with(
     }
     let untouched = |damage: Option<anyhow::Error>| match damage {
         Some(error) => Err(error),
-        None => Ok(false),
+        None => Ok(DeadOwnerRepair::Untouched),
     };
     if launch::repair(store)? {
         return untouched(recovery_damage);
@@ -906,24 +963,40 @@ fn repair_dead_owner_with(
     if let Some(damage) = &recovery_damage {
         repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
     }
-    let repair_error = Some(repair_error);
+    let retained = |damage: Option<anyhow::Error>, diagnosis: String| match damage {
+        Some(error) => Err(error),
+        None => Ok(DeadOwnerRepair::Retained { diagnosis }),
+    };
     match surfaces.decide(store, &status.state, deadline)? {
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-        RepairSurface::Retain => return untouched(recovery_damage),
-        RepairSurface::Settle => mark_session_closed(store, repair_error)?,
+        RepairSurface::Retain => return retained(recovery_damage, repair_error),
+        RepairSurface::Settle(retention) => {
+            // The scan ran without the lifecycle lock; an explicit close that holds it can
+            // have restored its claimed handle meanwhile. Look again under the lock, so that
+            // a restored handle is never consumed by this settlement.
+            let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
+            let _lock = store.lock()?;
+            if !repair_examines_owner(&store.status()?.state) {
+                return untouched(recovery_damage);
+            }
+            if retention.retains(store)? {
+                return retained(recovery_damage, repair_error);
+            }
+            mark_session_closed_locked(store, &claim_path, Some(repair_error))?;
+        }
         RepairSurface::CloseOnWindows(mut close) => {
             // Reuse the explicit-close claim so an interrupted attempt can be resumed
             // and concurrent repair cannot close the same surface twice.
             close_session_state_with_error(
                 store,
-                repair_error,
+                Some(repair_error),
                 |surface| close.close(surface, deadline).map(Into::into),
                 deadline,
             )
             .context(close.failure_context())?;
         }
     }
-    Ok(true)
+    Ok(DeadOwnerRepair::Closed)
 }
 
 #[cfg(test)]

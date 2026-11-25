@@ -1,10 +1,14 @@
 //! A Herdr terminal whose native-session owner is verified gone (os-parity, the owner's
 //! decision of 2026-11-26): on every OS, Repair leaves it for an explicit close, and the
-//! explicit close ends and removes it on the terminal's own creation record, whatever the
-//! owner record says (exited, PID reused, unbound, another session's, incomplete). These
-//! tests run the session's real Records, Repair and close transaction over the scripted
-//! core; only the OS observation of the owner is injected. One expected table holds on
-//! every OS; each OS runs its own close wiring.
+//! explicit close proves it by its own creation record, whatever the owner record says. The
+//! record neither grants nor blocks that close, and it cannot make a live session look ended:
+//! a running terminal is ended only when this session's owner is positively gone (a record
+//! bound to this session, naming an incarnation that was observed exited or reused) and the
+//! terminal's program is observed with its recorded birth. Otherwise a running terminal is
+//! retained, and a finished or absent one is still removed or settled. These tests run the
+//! session's real Records, Repair and close transaction over the scripted core; only the OS
+//! observation of the owner is injected. One expected table holds on every OS; each OS runs
+//! its own close wiring.
 use super::*;
 use crate::native::process_identity::{Gone, ProcessObservation};
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
@@ -44,25 +48,30 @@ fn complete_owner() -> NativeSessionOwner {
     }
 }
 
-/// Every owner record a gone owner can leave. None of them may decide the close.
-fn owner_records() -> Vec<(&'static str, NativeSessionOwner)> {
+/// Every owner record a gone owner can leave, and whether its death is this session's owner
+/// positively gone: only a record bound to this session that names an incarnation is. None of
+/// them blocks the close of a finished or absent terminal.
+fn owner_records() -> Vec<(&'static str, NativeSessionOwner, bool)> {
     let bound = complete_owner();
     let mut unbound = complete_owner();
     unbound.managed_session_id = None;
     let mut foreign = complete_owner();
     foreign.managed_session_id = Some("session-foreign".into());
-    let incomplete = NativeSessionOwner {
+    let pid_only = NativeSessionOwner {
         pid: 4242,
         managed_session_id: Some(SESSION.into()),
         ..NativeSessionOwner::default()
     };
     vec![
-        ("bound", bound),
-        ("unbound", unbound),
-        ("another session's", foreign),
-        ("incomplete identity", incomplete),
+        ("bound", bound, true),
+        ("unbound", unbound, false),
+        ("another session's", foreign, false),
+        ("PID-only", pid_only, false),
     ]
 }
+
+/// The refusal for a running terminal whose session's owner is not positively gone.
+const OWNER_NOT_PROVEN: &str = "does not show that this session's owner is gone";
 
 fn gone(gone: Gone) -> OwnerAttestation {
     OwnerAttestation {
@@ -134,8 +143,79 @@ impl Fixture {
         }
     }
 
+    /// A session whose owner record is the one `write_owned_terminal_state` writes for `pid`,
+    /// so that the OS observes it for real, with the Herdr terminal as its handle.
+    fn observed(state: &str, pid: u32) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(SESSION);
+        fs::create_dir(&directory).unwrap();
+        write_owned_terminal_state(&directory, state, pid);
+        let core = FakeCore::new();
+        let surface = opened(&core, &directory);
+        Store::open_unchecked(&directory)
+            .record(CoreRecord::Terminal)
+            .write_json(&surface)
+            .unwrap();
+        core.clear_calls();
+        Self {
+            _root: root,
+            directory,
+            core,
+            console: FakeCore::new(),
+        }
+    }
+
     fn store(&self) -> Store {
         Store::open_unchecked(&self.directory)
+    }
+
+    /// The stored state keeps a diagnosis, as a provider failure or a launch failure leaves.
+    fn diagnose(&self, state: SessionState, error: &str) {
+        self.store()
+            .write_status(&crate::native::session::SessionStatus {
+                state,
+                generation: 7,
+                updated_unix_ms: 1,
+                exit_code: Some(1),
+                error: Some(error.into()),
+                residual_surface: None,
+            })
+            .unwrap();
+    }
+
+    /// A launch that failed before its provider was confirmed: status `failed` and a launch
+    /// receipt that never reached `spawned`.
+    fn failed_start(&self) {
+        let store = self.store();
+        self.diagnose(SessionState::Failed, "provider launch timed out");
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&crate::native::session::launch::Record {
+                schema: 1,
+                claim_token: "claim-test".into(),
+                deadline_unix_ms: 1,
+                phase: crate::native::session::launch::Phase::Spawning,
+            })
+            .unwrap();
+    }
+
+    fn relabel(&self) {
+        let mut labels = self.core.terminal("t7").unwrap()["labels"].clone();
+        labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
+        self.core.set("t7", "labels", labels);
+    }
+
+    /// The OS no longer reports the terminal's program, although the core still lists the
+    /// terminal as running: its birth cannot be observed.
+    fn lose_program(&self) {
+        let pid = self
+            .store()
+            .terminal()
+            .unwrap()
+            .herdr_core()
+            .unwrap()
+            .host_pid;
+        self.core.0.borrow_mut().births.remove(&pid);
     }
 
     fn finish(&self) {
@@ -300,13 +380,14 @@ impl Fixture {
     }
 }
 
-// Repair never ends, removes or even observes the terminal of a gone owner, on any OS and in
-// any repairable state, whatever the owner record says and whether the handle is active or
-// claimed by an interrupted close. It leaves every Record as it found it.
+// The dead-owner decision in Repair never ends, removes or even observes the terminal of a
+// gone owner, on any OS and in any repairable state, whatever the owner record says and
+// whether the handle is active or claimed by an interrupted close. With no completion to
+// publish and no launch to settle, Repair leaves every Record as it found it.
 #[test]
 fn repair_leaves_a_gone_owners_terminal_for_an_explicit_close() {
     for state in ["ready", "working", "exited", "failed"] {
-        for (record, owner) in owner_records() {
+        for (record, owner, _) in owner_records() {
             for claimed in [false, true] {
                 for (how, observe, _) in GONE {
                     let label = format!("{state}, {record} owner {how}, claimed {claimed}");
@@ -335,9 +416,12 @@ fn repair_leaves_a_gone_owners_terminal_for_an_explicit_close() {
     }
 }
 
-// Nothing is stranded: for every gone owner, whatever its record, the explicit close ends a
-// running terminal once, removes a finished one, settles an absent one, and closes the
-// session; a repeated close asks the core nothing.
+// Nothing is stranded. For every gone owner, whatever its record, the explicit close removes a
+// finished terminal, settles an absent one and closes the session; a repeated close asks the
+// core nothing. A running terminal is ended once when this session's owner is positively
+// gone. When the record cannot show that (unbound, another session's, PID-only), the running
+// terminal is retained and nothing is sent; once the user has ended it on its recorded core,
+// the same command removes it.
 #[test]
 fn an_explicit_close_ends_the_terminal_its_session_created_whatever_the_owner_record_says() {
     type Terminal = fn(&Fixture);
@@ -357,7 +441,7 @@ fn an_explicit_close_ends_the_terminal_its_session_created_whatever_the_owner_re
         ),
     ];
     for state in ["ready", "exited"] {
-        for (record, owner) in owner_records() {
+        for (record, owner, proven) in owner_records() {
             for (how, observe, pid_alive) in GONE {
                 for (terminal, change, outcome, mutations) in terminals {
                     for claimed in [false, true] {
@@ -370,6 +454,25 @@ fn an_explicit_close_ends_the_terminal_its_session_created_whatever_the_owner_re
                             fixture.claim();
                         }
                         let result = fixture.close(observe, pid_alive);
+                        if terminal == "running" && !proven {
+                            let text = error_text(result.as_ref().unwrap_err());
+                            assert!(text.contains(OWNER_NOT_PROVEN), "{label}: {text}");
+                            assert_eq!(fixture.mutations(), (0, 0), "{label}");
+                            fixture.assert_retained(&label, state.parse().unwrap());
+                            // The user ends it on its recorded core; the next close removes it.
+                            fixture.finish();
+                            fixture.core.clear_calls();
+                            assert_eq!(
+                                fixture
+                                    .close(observe, pid_alive)
+                                    .map_err(|e| error_text(&e)),
+                                Ok(CloseOutcome::Closed),
+                                "{label}"
+                            );
+                            assert_eq!(fixture.mutations(), (0, 1), "{label}");
+                            fixture.assert_closed(&label);
+                            continue;
+                        }
                         assert_eq!(
                             result.as_ref().ok(),
                             outcome.as_ref(),
@@ -534,18 +637,83 @@ fn an_explicit_close_leaves_anything_but_its_created_terminal_alone() {
             again: exited,
             closed: CloseOutcome::Closed,
         },
+        // A running terminal is ended only after its program is observed with its recorded
+        // birth; once its core reports it finished, the next close removes it.
+        Refusal {
+            label: "program not observable",
+            change: Fixture::lose_program,
+            observe: reused,
+            refusal: "cannot be observed",
+            recover: Fixture::finish,
+            again: reused,
+            closed: CloseOutcome::Closed,
+        },
+        // A failed start whose owner is gone, and one that never recorded an owner, close on
+        // the same creation record, launch label included.
+        Refusal {
+            label: "failed start, another launch label, running",
+            change: |f| {
+                f.failed_start();
+                f.relabel();
+            },
+            observe: exited,
+            refusal: "different launch label",
+            recover: Fixture::remove,
+            again: exited,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "failed start, another launch label, finished",
+            change: |f| {
+                f.failed_start();
+                f.finish();
+                f.relabel();
+            },
+            observe: reused,
+            refusal: "different launch label",
+            recover: Fixture::remove,
+            again: reused,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "failed start without an owner, another launch label",
+            change: |f| {
+                f.failed_start();
+                f.finish();
+                f.relabel();
+                fs::remove_file(f.store().record(CoreRecord::Owner).path()).unwrap();
+            },
+            observe: exited,
+            refusal: "different launch label",
+            recover: Fixture::remove,
+            again: exited,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "failed start, program not observable",
+            change: |f| {
+                f.failed_start();
+                f.lose_program();
+            },
+            observe: exited,
+            refusal: "cannot be observed",
+            recover: Fixture::finish,
+            again: exited,
+            closed: CloseOutcome::Closed,
+        },
     ];
     for row in rows {
         let label = row.label;
         let fixture = Fixture::new("ready", &complete_owner());
         (row.change)(&fixture);
+        let state = fixture.store().status().unwrap().state;
         let before = fixture.core.terminal("t7");
         fixture.core.clear_calls();
         let text = error_text(&fixture.close(row.observe, false).unwrap_err());
         assert!(text.contains(row.refusal), "{label}: {text}");
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
         assert_eq!(fixture.core.terminal("t7"), before, "{label}");
-        fixture.assert_retained(label, SessionState::Ready);
+        fixture.assert_retained(label, state);
 
         (row.recover)(&fixture);
         let result = fixture.close(row.again, false);
@@ -667,6 +835,229 @@ fn a_failed_or_unanswered_removal_is_finished_by_the_next_close() {
     // The finished terminal is only removed: the kill is never sent twice.
     assert_eq!(fixture.mutations(), (0, 1));
     fixture.assert_closed("close after an unanswered kill");
+
+    // A removal whose reply was lost: the core removed the terminal, the close cannot know it
+    // and keeps the handle; the next close finds it absent and sends nothing.
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    fixture.core.inject(
+        "terminal.rm",
+        Injected::After(CallError::Unanswered(anyhow!("Herdr reply timed out"))),
+    );
+    let text = error_text(&fixture.close(reused, false).unwrap_err());
+    assert!(text.contains("sent but not answered"), "{text}");
+    assert!(fixture.core.terminal("t7").is_none());
+    assert_eq!(fixture.mutations(), (0, 1));
+    fixture.assert_retained("unanswered removal", SessionState::Ready);
+    fixture.core.clear_calls();
+    assert!(matches!(
+        fixture.close(reused, false),
+        Ok(CloseOutcome::Missing)
+    ));
+    assert_eq!(fixture.mutations(), (0, 0));
+    fixture.assert_closed("close after an unanswered removal");
+}
+
+// Every Windows Herdr handle TAB has written (0.4.47 on) records its launch label, so one
+// without it cannot be proven TAB's and is never ended or removed (review finding 4). The
+// name fallback stays for the macOS and Linux handles of 0.4.45 and 0.4.46. Runs on the
+// Windows runner only.
+#[cfg(windows)]
+#[test]
+fn a_windows_handle_without_its_launch_label_is_refused() {
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let store = fixture.store();
+    let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
+    assert!(
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("herdr_launch_nonce")
+            .is_some()
+    );
+    store
+        .record(CoreRecord::Terminal)
+        .write_json(&value)
+        .unwrap();
+    let text = error_text(&fixture.close(exited, false).unwrap_err());
+    assert!(text.contains("records no launch label"), "{text}");
+    assert_eq!(fixture.mutations(), (0, 0));
+    fixture.assert_retained("Windows handle without a launch label", SessionState::Ready);
+}
+
+// One removal and one confirmation (review finding 7). `not_found` from the recorded core
+// answers the removal itself: the terminal is absent and the close asks nothing more. A
+// removal the core acknowledged while the next read still lists the terminal is not sent
+// again: the handle is kept for the next close.
+#[test]
+fn a_removal_is_sent_once_and_confirmed_once() {
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    fixture
+        .core
+        .inject("terminal.rm", Injected::Instead(refused("not_found")));
+    fixture.core.clear_calls();
+    assert_eq!(
+        fixture.close(reused, false).map_err(|e| error_text(&e)),
+        Ok(CloseOutcome::Missing)
+    );
+    assert_eq!(fixture.mutations(), (0, 1));
+    assert_eq!(
+        fixture.core.methods().last().map(String::as_str),
+        Some("terminal.rm"),
+        "{:?}",
+        fixture.core.methods()
+    );
+    let store = fixture.store();
+    assert!(store.record(CoreRecord::TerminalClosed).present().unwrap());
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let held = fixture.core.terminal("t7").unwrap();
+    fixture.core.after_call("terminal.rm", move |terminals| {
+        terminals.insert("t7".into(), held);
+    });
+    let text = error_text(&fixture.close(exited, false).unwrap_err());
+    assert!(text.contains("still held by its core"), "{text}");
+    assert_eq!(fixture.mutations(), (0, 1));
+    fixture.assert_retained("acknowledged removal still listed", SessionState::Ready);
+}
+
+// A close keeps the diagnosis the session already holds (review finding 8): the closed record
+// carries the stored failure, or, without one, that the owner is gone, as 0.4.49's Windows
+// Repair recorded when it closed the terminal itself.
+#[test]
+fn an_explicit_close_keeps_the_sessions_diagnosis() {
+    let fixture = Fixture::new("exited", &complete_owner());
+    fixture.finish();
+    fixture.diagnose(SessionState::Exited, "provider exited with status 7");
+    fixture.close(exited, false).unwrap();
+    let closed = fixture.store().closed_if_present().unwrap().unwrap();
+    assert_eq!(
+        closed.error.as_deref(),
+        Some("provider exited with status 7")
+    );
+
+    let fixture = Fixture::new("working", &complete_owner());
+    fixture.close(reused, false).unwrap();
+    let closed = fixture.store().closed_if_present().unwrap().unwrap();
+    assert_eq!(
+        closed.error.as_deref(),
+        Some("native session process 4242 is no longer running")
+    );
+}
+
+// Repair scans the active and the claimed handle without the lifecycle lock, while an explicit
+// close holds that lock from its claim to its restore. A close that refuses and restores its
+// handle between the scan's two reads leaves both reads empty; Repair must then find the
+// handle again under the lock before it settles the session, or the restored handle is
+// consumed and the terminal is stranded (review finding 1; 0.4.49 had the same interleaving on
+// macOS and Linux, and on Windows in exited and failed sessions). Repair takes the lifecycle
+// lock first to recover a pending completion, then scans; the hook restores the handle at the
+// next lifecycle lock, the first one after the scan.
+#[test]
+fn repair_finds_a_restored_handle_again_under_the_lifecycle_lock() {
+    use crate::native::session::primitives::close_io_test::{self, Point};
+    use std::{cell::Cell, rc::Rc};
+    type Repair = fn(&Fixture) -> Result<bool>;
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut policies: Vec<(&str, Repair)> = vec![("windows", |f| {
+        let dispatch = crate::native::terminal::windows_dispatch::Dispatch::new(
+            Adapter::with_core(f.console.clone()),
+            Adapter::with_core(f.core.clone()),
+        );
+        session::close::repair_dead_owner_windows_with(&f.store(), |_| exited(), &dispatch, later())
+    })];
+    #[cfg(unix)]
+    policies.push(("posix", |f| {
+        session::close::repair_dead_owner_attested_until(&f.store(), |_| exited(), later())
+    }));
+    for (policy, repair) in policies {
+        for state in ["exited", "failed"] {
+            let label = format!("{policy}, {state}");
+            let fixture = Fixture::new(state, &complete_owner());
+            let handle = fixture
+                .store()
+                .record(CoreRecord::Terminal)
+                .path()
+                .to_owned();
+            let held = fixture.directory.with_file_name("held-by-a-close.json");
+            fs::rename(&handle, &held).unwrap();
+            let locks = Rc::new(Cell::new(0));
+            let seen = locks.clone();
+            let (from, to) = (held.clone(), handle.clone());
+            let result = close_io_test::during(
+                move |point| {
+                    if point == Point::BeforeLock("turn claim lifecycle") {
+                        seen.set(seen.get() + 1);
+                        if seen.get() == 2 {
+                            fs::rename(&from, &to).unwrap();
+                        }
+                    }
+                },
+                || repair(&fixture),
+            );
+            assert!(
+                locks.get() >= 2,
+                "{label}: no lifecycle lock after the scan ({} in all)",
+                locks.get()
+            );
+            assert!(
+                !result.unwrap_or_else(|error| panic!("{label}: {error:#}")),
+                "{label}"
+            );
+            fixture.assert_retained(&label, state.parse().unwrap());
+            assert!(fixture.core.methods().is_empty(), "{label}");
+        }
+    }
+}
+
+// An attached `ask` or `tell` returns as soon as the owner is gone, on every OS, without
+// changing a Record (review finding 6): Repair now leaves the terminal on Windows too, so the
+// wait no longer learns of the owner's death from a closed session. The owner is a reaped
+// process that the OS observes for real.
+#[test]
+fn an_attached_wait_returns_once_the_owner_is_gone_on_every_os() {
+    let fixture = Fixture::observed(
+        "working",
+        crate::native::session::test_support::lifecycle::reaped_child_pid(),
+    );
+    let before = fixture.records();
+    let requested = Duration::from_secs(20);
+    let started = std::time::Instant::now();
+    let error = session::turn::wait(
+        &fixture.store(),
+        0,
+        None,
+        None,
+        started + requested,
+        requested,
+    )
+    .unwrap_err();
+    assert!(
+        error_text(&error).contains("native session process"),
+        "{error:#}"
+    );
+    let error = session::turn::wait_for_status(
+        &fixture.directory,
+        SessionState::Ready,
+        std::time::Instant::now() + requested,
+        requested,
+    )
+    .unwrap_err();
+    assert!(
+        error_text(&error).contains("native session process"),
+        "{error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(fixture.records(), before);
+    assert!(fixture.core.methods().is_empty());
 }
 
 // The Windows lookup, compiled on every OS: a gone owner's authority reaches the Herdr
@@ -675,7 +1066,7 @@ fn a_failed_or_unanswered_removal_is_finished_by_the_next_close() {
 #[test]
 fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
     use crate::native::terminal::close_authority::{
-        TerminalCloseAuthority, close_windows_owned_surface_with,
+        Running, TerminalCloseAuthority, close_windows_owned_surface_with,
     };
     use crate::native::terminal::windows_dispatch::Dispatch;
     type Terminal = fn(&Fixture);
@@ -708,7 +1099,7 @@ fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
             Adapter::with_core(fixture.core.clone()),
         );
         let result = close_windows_owned_surface_with(
-            || Ok(TerminalCloseAuthority::CreatedSurface),
+            || Ok(TerminalCloseAuthority::CreatedSurface(Running::End)),
             &dispatch,
             &fixture.directory,
             &surface,
@@ -733,7 +1124,7 @@ fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
     let mut console = fixture.store().terminal().unwrap();
     console.kind = TerminalKind::WindowsConsole;
     let error = close_windows_owned_surface_with(
-        || Ok(TerminalCloseAuthority::CreatedSurface),
+        || Ok(TerminalCloseAuthority::CreatedSurface(Running::End)),
         &dispatch,
         &fixture.directory,
         &console,

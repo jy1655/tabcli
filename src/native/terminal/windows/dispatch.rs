@@ -59,17 +59,18 @@ pub(in crate::native) trait WindowsTerminalAdapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome>;
-    /// Ends and removes the surface after its owner is verified gone, proving it by the
-    /// creation record in the handle. Only a kind whose core keeps its terminals has one, and
-    /// the dispatch refuses every other kind before its adapter, so the default is an
-    /// invariant failure and never an ordinary answer.
+    /// Removes the surface with no live owner left, proving it by the creation record in the
+    /// handle, and ends a running one only as `running` allows. Only a kind whose core keeps
+    /// its terminals has such a record, and the dispatch refuses every other kind before its
+    /// adapter, so the default is an invariant failure and never an ordinary answer.
     fn close_created_surface(
         &self,
         directory: &Path,
         session: &TerminalSession,
+        running: super::close_authority::Running,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        let _ = (directory, deadline);
+        let _ = (directory, running, deadline);
         bail!(
             "{} keeps no creation record; the shared dispatch must refuse before its adapter",
             session.kind.display_name()
@@ -211,6 +212,7 @@ pub(in crate::native) fn close_created_surface(
     adapters: &dyn Adapters,
     directory: &Path,
     session: &TerminalSession,
+    running: super::close_authority::Running,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     crate::native::session::close::budget::close_remaining(deadline)?;
@@ -222,7 +224,7 @@ pub(in crate::native) fn close_created_surface(
     }
     adapters
         .adapter(session.kind)
-        .close_created_surface(directory, session, deadline)
+        .close_created_surface(directory, session, running, deadline)
 }
 
 pub(in crate::native::terminal) fn surface_present(

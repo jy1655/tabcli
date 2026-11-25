@@ -184,6 +184,7 @@ pub(in crate::native) struct TestObservation<'a> {
     group_gone: Member<'a, dyn FnMut(u32) -> Result<bool> + 'a>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     evidence: Option<&'a dyn crate::native::terminal::close_evidence::CloseEvidence>,
+    cause: super::CloseCause,
 }
 
 impl<'a> TestObservation<'a> {
@@ -218,6 +219,7 @@ impl<'a> TestObservation<'a> {
             group_gone: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             evidence: None,
+            cause: super::CloseCause::Explicit,
         }
     }
 
@@ -429,6 +431,12 @@ impl<'a> TestObservation<'a> {
         self
     }
 
+    /// The close runs for `cause` instead of an explicit close.
+    pub(in crate::native) fn with_cause(mut self, cause: super::CloseCause) -> Self {
+        self.cause = cause;
+        self
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_evidence(
         mut self,
@@ -440,6 +448,10 @@ impl<'a> TestObservation<'a> {
 }
 
 impl CloseObservation for TestObservation<'_> {
+    fn cause(&self) -> super::CloseCause {
+        self.cause
+    }
+
     fn created_host_incarnation(
         &self,
     ) -> Result<Option<crate::native::process_identity::ProcessObservation>> {

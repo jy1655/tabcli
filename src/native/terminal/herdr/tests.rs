@@ -940,25 +940,30 @@ fn close_kills_then_removes_and_repeats_idempotently() {
     assert!(core.params("terminal.kill").is_empty());
 }
 
+// Every close that ends or removes a terminal checks the launch label TAB recorded at its
+// creation (review finding 4), the ordinary close under a live owner included, in either
+// terminal state.
 #[test]
-fn ordinary_close_removes_a_finished_terminal_with_a_changed_launch_label() {
-    let core = FakeCore::new();
-    let session = created(&core);
-    let adapter = Adapter::with_core(core.clone());
-    core.set("t7", "state", json!("finished"));
-    let mut labels = core.terminal("t7").unwrap()["labels"].clone();
-    labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
-    core.set("t7", "labels", labels);
-    core.clear_calls();
-    assert_eq!(
-        adapter
-            .close(Path::new(DIRECTORY), &session, later())
-            .unwrap(),
-        CloseOutcome::Closed
-    );
-    assert_eq!(core.params("terminal.rm"), [json!({"terminal": "t7"})]);
-    assert!(core.params("terminal.kill").is_empty());
-    assert!(core.terminal("t7").is_none());
+fn ordinary_close_refuses_a_terminal_with_a_changed_launch_label() {
+    for state in ["live", "finished"] {
+        let core = FakeCore::new();
+        let session = created(&core);
+        let adapter = Adapter::with_core(core.clone());
+        core.set("t7", "state", json!(state));
+        let mut labels = core.terminal("t7").unwrap()["labels"].clone();
+        labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
+        core.set("t7", "labels", labels);
+        core.clear_calls();
+        let text = error_text(
+            &adapter
+                .close(Path::new(DIRECTORY), &session, later())
+                .unwrap_err(),
+        );
+        assert!(text.contains("different launch label"), "{state}: {text}");
+        assert!(core.params("terminal.rm").is_empty(), "{state}");
+        assert!(core.params("terminal.kill").is_empty(), "{state}");
+        assert!(core.terminal("t7").is_some(), "{state}");
+    }
 }
 
 // A close that ended the program but failed to remove the terminal is finished by the next

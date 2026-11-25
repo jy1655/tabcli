@@ -579,7 +579,7 @@ fn close_deadline_preclose_repair_does_not_get_another_budget() {
             std::thread::sleep(
                 deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
             );
-            Ok(false)
+            Ok(DeadOwnerRepair::Untouched)
         },
         |_| panic!("repair spent the close deadline"),
         deadline,

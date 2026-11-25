@@ -152,10 +152,12 @@ pub(super) fn close_surface_after_reopen_verification_failure(
     deadline: std::time::Instant,
 ) -> anyhow::Error {
     close_surface_after_reopen_verification_failure_with(id, error, |detected| {
+        // A cleanup, not an explicit close: it never acts on a gone owner's terminal.
         close_session_surface(
             directory,
             id,
             Some(format!("{detected:#}")),
+            crate::native::terminal::close_authority::CloseCause::Cleanup,
             deadline.min(crate::native::session::close::budget::close_deadline()),
         )
     })

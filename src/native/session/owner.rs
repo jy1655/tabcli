@@ -187,6 +187,18 @@ pub(in crate::native) struct OwnerObservers<'a> {
         &'a dyn Fn(u32) -> Result<Option<crate::native::terminal::WindowsProcessIdentity>>,
 }
 
+/// Whether this platform's attestation of `owner` compares a recorded incarnation (a birth on
+/// macOS and Linux, the process identity on Windows) rather than the PID alone. Only then is
+/// its Gone the OS's positive answer about that incarnation: a PID-only Gone rests on the
+/// liveness probe, which on Windows also answers `false` for an inspection failure.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(in crate::native) fn records_incarnation(owner: &NativeSessionOwner) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return matches!(recorded_birth(owner), Ok(Some(_)));
+    #[cfg(windows)]
+    return owner.linux_birth.is_none() && owner.windows_process_identity.is_some();
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) use crate::native::terminal::ownership::ProcessBirth;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
