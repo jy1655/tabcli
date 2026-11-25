@@ -350,3 +350,153 @@ fn a_tmux_handoff_failure_is_logged_without_a_host_record() {
             .is_none()
     );
 }
+
+// Every kind whose host runs the admission, and the Windows console, whose host does not.
+#[cfg(unix)]
+const KINDS: [TerminalKind; 8] = [
+    TerminalKind::Herdr,
+    TerminalKind::Tmux,
+    TerminalKind::Iterm2,
+    TerminalKind::WezTerm,
+    TerminalKind::AppleTerminal,
+    TerminalKind::Ghostty,
+    TerminalKind::Warp,
+    TerminalKind::WindowsConsole,
+];
+
+// The launcher's check is the host's own admission, for the same account: it refuses exactly
+// the directories that admission refuses, with the host's reason, and never a directory of a
+// kind whose host does not run it.
+#[cfg(unix)]
+#[test]
+fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
+    let temp = tempfile::tempdir().unwrap();
+    let private = temp.path().join("session-private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let shared = temp.path().join("session-shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o750)).unwrap();
+    let link = temp.path().join("session-link");
+    std::os::unix::fs::symlink(&private, &link).unwrap();
+    let invalid = temp.path().join("invalid id");
+    fs::create_dir(&invalid).unwrap();
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).unwrap();
+    let missing = temp.path().join("session-missing");
+    for directory in [
+        private.as_path(),
+        &shared,
+        &link,
+        &invalid,
+        &missing,
+        Path::new("session-relative"),
+    ] {
+        for kind in KINDS {
+            let spec = BoundHostSpec {
+                name: kind.display_name(),
+            };
+            let host = run_bound_host(directory, &spec, |_| Ok(()));
+            let launcher = refuse_before_launch(directory, kind);
+            if kind == TerminalKind::WindowsConsole {
+                launcher.unwrap();
+                continue;
+            }
+            match host {
+                Ok(()) => launcher.unwrap(),
+                Err(refusal) => assert_eq!(
+                    format!("{:#}", launcher.unwrap_err()),
+                    format!(
+                        "the {} launch host would refuse the session directory {}: {refusal:#}",
+                        kind.display_name(),
+                        directory.display()
+                    ),
+                    "{kind:?} {}",
+                    directory.display()
+                ),
+            }
+        }
+    }
+    assert!(refuse_before_launch(&private, TerminalKind::Herdr).is_ok());
+    assert_eq!(
+        format!(
+            "{:#}",
+            refuse_before_launch(&shared, TerminalKind::Herdr).unwrap_err()
+        ),
+        format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
+            shared.display()
+        )
+    );
+}
+
+// A host that a core starts runs as the core: the check is made for the core's account, and
+// when this process's own account would be admitted the refusal names both accounts.
+#[cfg(unix)]
+#[test]
+fn a_core_started_host_is_judged_for_the_cores_account() {
+    let temp = tempfile::tempdir().unwrap();
+    let private = temp.path().join("session-core");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let own = unsafe { libc::geteuid() };
+    let this = HostAccount::of_uid(own);
+    refuse_before_core_launch(&private, TerminalKind::Herdr, &this).unwrap();
+    let other = HostAccount::of_uid(own.wrapping_add(1));
+    assert_eq!(
+        format!(
+            "{:#}",
+            refuse_before_core_launch(&private, TerminalKind::Herdr, &other).unwrap_err()
+        ),
+        format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user; TAB runs as uid {own} and the Herdr Core as uid {}; run TAB as the core's user",
+            private.display(),
+            own.wrapping_add(1)
+        )
+    );
+    // A directory neither account would admit is refused for its own reason alone.
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o770)).unwrap();
+    let text = format!(
+        "{:#}",
+        refuse_before_core_launch(&private, TerminalKind::Herdr, &other).unwrap_err()
+    );
+    assert!(text.ends_with("not private to the current user"), "{text}");
+}
+
+// What the refusal tells a user whose TAB and core give their files different owners on
+// Windows: the observed case (TAB elevated, the core not) names elevation and what to do.
+#[test]
+fn the_elevation_advice_names_the_observed_case() {
+    let observed = elevation_advice("Herdr", Some(true), Some(false));
+    assert!(
+        observed.starts_with("TAB is running elevated and the Herdr Core is not:"),
+        "{observed}"
+    );
+    assert!(
+        observed.contains("Run TAB without elevation, as the core runs"),
+        "{observed}"
+    );
+    for (tab, core, words) in [
+        (
+            Some(false),
+            Some(true),
+            "TAB (not elevated) and the Herdr Core (elevated)",
+        ),
+        (
+            Some(true),
+            Some(true),
+            "TAB (elevated) and the Herdr Core (elevated)",
+        ),
+        (
+            None,
+            Some(false),
+            "TAB (elevation unknown) and the Herdr Core (not elevated)",
+        ),
+    ] {
+        let advice = elevation_advice("Herdr", tab, core);
+        assert!(advice.starts_with(words), "{advice}");
+        assert!(
+            advice.ends_with("run TAB with the core's account and elevation"),
+            "{advice}"
+        );
+    }
+}

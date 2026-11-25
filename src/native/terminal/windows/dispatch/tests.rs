@@ -319,6 +319,13 @@ mod herdr_core {
         fn launch_nonce(&self) -> Result<String> {
             unreachable!("nothing is created without a core")
         }
+        fn admit_launch_directory(
+            &self,
+            _: &Path,
+            _: &crate::native::terminal::bound_host::HostAccount,
+        ) -> Result<()> {
+            unreachable!("nothing is created without a core")
+        }
     }
 
     // An endpoint this platform's Herdr adapter can address: a local named pipe on Windows,

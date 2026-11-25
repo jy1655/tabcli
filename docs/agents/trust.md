@@ -8,6 +8,12 @@
   may let another account write, append, or change the access list or the owner. The
   system, the Administrators group and `OWNER RIGHTS` may. A missing access list and a
   rule that is neither a plain allow nor a plain deny are refused.
+- A bound launch host's session directory follows the same rule with the directory-changing
+  rights added (`windows_directory_is_private`). The rule can be judged for another process's
+  owners (`windows_directory_is_private_to`): the launcher judges a Herdr session directory for
+  the core's token user and default owner before it creates the terminal. An elevated process's
+  default owner is the Administrators group, so a directory that an elevated TAB creates is not
+  private to the user of a core that is not elevated. The rule itself is unchanged.
 - The check describes the store at the time of the read. It cannot tell who wrote the
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: TAB polls Agy's store every

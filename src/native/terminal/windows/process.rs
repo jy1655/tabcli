@@ -65,6 +65,20 @@ pub(in crate::native) fn process_user_sid_of(pid: u32) -> Result<String> {
     super::security::process_handle_user_sid(&handle)
 }
 
+/// The account of the process holding `pid` (`consent::windows_process_account`): the owners
+/// its new files can have and whether it runs elevated. It is opened for limited query only.
+pub(in crate::native) fn process_account_of(
+    pid: u32,
+) -> Result<crate::native::consent::WindowsAccount> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open Windows process {pid}"));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    crate::native::consent::windows_process_account(&handle)
+}
+
 pub(in crate::native) fn query_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {

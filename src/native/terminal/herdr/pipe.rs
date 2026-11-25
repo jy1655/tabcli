@@ -11,6 +11,8 @@
 //! out of time is cancelled and its completion collected before its buffer is released.
 use super::windows_endpoint::{WindowsEndpointInputs, local_pipe_name, resolve_pipe};
 use super::{Connection, Core, Framed, Stream, not_running};
+use crate::native::terminal::TerminalKind;
+use crate::native::terminal::bound_host::HostAccount;
 use crate::native::terminal::record::HerdrHostBirth;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -99,6 +101,14 @@ impl Core for Installed {
             bail!("Windows could not generate a Herdr launch token (status {status:#x})");
         }
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn admit_launch_directory(&self, directory: &Path, account: &HostAccount) -> Result<()> {
+        crate::native::terminal::bound_host::refuse_before_core_launch(
+            directory,
+            TerminalKind::Herdr,
+            account,
+        )
     }
 }
 
@@ -238,7 +248,7 @@ pub(super) fn open(pipe: &Path, deadline: Instant) -> Result<Framed<Pipe>> {
     if Instant::now() >= deadline {
         bail!("Herdr connection timed out");
     }
-    Ok(Framed::new(Pipe::new(handle)?))
+    Ok(Framed::new(Pipe::new(handle, server)?))
 }
 
 /// Whether two string SIDs name one account: SIDs compare without regard to case.
@@ -246,14 +256,16 @@ pub(super) fn same_user(own: &str, other: &str) -> bool {
     own.eq_ignore_ascii_case(other)
 }
 
-/// The client end of the core's pipe, with the event its overlapped operations signal.
+/// The client end of the core's pipe, with the event its overlapped operations signal and the
+/// process that serves it.
 pub(super) struct Pipe {
     handle: OwnedHandle,
     event: OwnedHandle,
+    server: u32,
 }
 
 impl Pipe {
-    pub(super) fn new(handle: OwnedHandle) -> Result<Self> {
+    pub(super) fn new(handle: OwnedHandle, server: u32) -> Result<Self> {
         let raw = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if raw.is_null() {
             return Err(std::io::Error::last_os_error()).context("cannot create a pipe event");
@@ -261,6 +273,7 @@ impl Pipe {
         Ok(Self {
             handle,
             event: unsafe { OwnedHandle::from_raw_handle(raw) },
+            server,
         })
     }
 
@@ -337,5 +350,16 @@ impl Stream for Pipe {
                 overlapped,
             )
         })
+    }
+
+    /// The account of the process serving the pipe, whose user `open` already required to be
+    /// this process's. Its default owner and elevation can differ: an elevated TAB can use the
+    /// pipe of a core that is not elevated. The PID names the server while it serves this
+    /// connection; a server that has ended fails the connection's next call.
+    fn peer_account(&self) -> Result<HostAccount> {
+        Ok(HostAccount::of_windows(
+            crate::native::terminal::windows::process_account_of(self.server)
+                .context("cannot read the account of the Herdr Core")?,
+        ))
     }
 }

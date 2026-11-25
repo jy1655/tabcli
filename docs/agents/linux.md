@@ -17,6 +17,9 @@
   just before `new-session`, with exactly one session and pane. Before every later operation,
   verify that recorded incarnation through a pidfd. Absence comes only from that incarnation
   being gone (exit, PID reuse, another boot); a live server whose socket refuses is an error.
+- Before tmux or Herdr creates anything, the launcher runs the host's session-directory
+  admission (`bound_host::refuse_before_launch`, and for Herdr the core's account) and fails
+  with the host's reason. Only a refusal the host alone can know reaches the host's log.
 - The pane host waits for its exact binding, discards startup input, then runs
   `bash --noprofile --norc -m -c`. Keep job control and the wrapper's foreground process group.
   The same Linux bash handoff serves Herdr after checking its terminal address and host PID.

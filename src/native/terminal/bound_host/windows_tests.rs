@@ -109,3 +109,71 @@ fn a_junction_or_a_file_is_never_a_session_directory() {
         "{text}"
     );
 }
+
+// The launcher's check is the host's own admission: a directory that another account can
+// change is refused before any surface, for every kind whose host admits it, and the console,
+// whose host does not, is left to its own checks.
+#[test]
+fn the_launcher_refuses_a_directory_the_launch_host_would_refuse() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = private_session(root.path(), "session-launcher");
+    refuse_before_launch(&directory, TerminalKind::Herdr).unwrap();
+    icacls(&directory, "*S-1-1-0:(W)");
+    let text = format!(
+        "{:#}",
+        refuse_before_launch(&directory, TerminalKind::Herdr).unwrap_err()
+    );
+    assert!(
+        text.starts_with(&format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
+            directory.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("session directory can be changed by another account (S-1-1-0)"),
+        "{text}"
+    );
+    refuse_before_launch(&directory, TerminalKind::WindowsConsole).unwrap();
+}
+
+// The case observed on 2026-11-26: an elevated TAB creates the session directory, so its owner
+// is the default owner of TAB's token (the Administrators group), while a core that is not
+// elevated accepts only its user as owner. The Windows CI runner is elevated, so there this
+// is that case; a TAB that is not elevated owns the directory as its user, which the core's
+// launch host admits.
+#[test]
+fn an_elevated_tab_is_refused_for_a_core_that_is_not_elevated() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = private_session(root.path(), "session-elevation");
+    let own = HostAccount::current().unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, &own).unwrap();
+    let user = own.windows.owners[0].clone();
+    let core = HostAccount::of_windows(crate::native::consent::WindowsAccount {
+        owners: vec![user],
+        elevated: Some(false),
+    });
+    let result = refuse_before_core_launch(&directory, TerminalKind::Herdr, &core);
+    if own.windows.owners.len() == 1 {
+        result.unwrap();
+        return;
+    }
+    let text = format!("{:#}", result.unwrap_err());
+    assert!(
+        text.contains("session directory owner differs from current user"),
+        "{text}"
+    );
+    if own.windows.elevated == Some(true) {
+        assert!(
+            text.contains("TAB is running elevated and the Herdr Core is not"),
+            "{text}"
+        );
+    }
+    // A directory TAB's own account would refuse as well is refused for its reason alone.
+    icacls(&directory, "*S-1-1-0:(W)");
+    let text = format!(
+        "{:#}",
+        refuse_before_core_launch(&directory, TerminalKind::Herdr, &core).unwrap_err()
+    );
+    assert!(!text.contains("elevat"), "{text}");
+}

@@ -176,6 +176,12 @@ remain nonempty. They are record labels; a terminal can also use its own ownersh
 `--terminal` defaults to platform detection (Herdr inside an hc terminal on Linux, otherwise tmux on Linux; on Windows, Herdr inside an hc terminal for a provider that runs there, otherwise the managed console). Documented values are `ghostty`, `herdr` (aliases `hc` and `herdr-core`; macOS, Linux, and Windows except Codex), `iterm2`, `terminal`,
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
+Before it creates the surface, TAB checks the new session directory as the terminal's launch
+host will (a real directory that only its account can change; for Herdr, the core's account;
+the Windows console's host makes no such check).
+A directory the host would refuse fails the start at once with the host's reason, recorded as
+`terminal launch failed: ...; no surface handle was recorded and no prompt was sent`; the
+failed session can be closed and pruned like any other.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

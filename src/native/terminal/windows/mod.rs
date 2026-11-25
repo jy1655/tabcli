@@ -46,7 +46,9 @@ use super::{
 mod focus;
 pub(in crate::native::terminal) mod launch_host;
 mod process;
-pub(in crate::native) use process::{observe_process_identity, process_user_sid_of};
+pub(in crate::native) use process::{
+    observe_process_identity, process_account_of, process_user_sid_of,
+};
 mod security;
 mod tab;
 pub(in crate::native) use process::query_process_identity;

@@ -48,21 +48,27 @@ pub(in crate::native) fn start(
     let bridge_command =
         launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
     initial_claim.fence_launch();
-    let terminal_session = match terminal::open_bound_tab(
-        terminal_kind,
-        &bridge_command,
-        &created.directory,
-        launch_deadline,
-        |session| {
-            session.managed_session_id = Some(created.id.clone());
-            Store::open_unchecked(&created.directory).write_terminal(session)
-        },
-        || {
-            Store::open_unchecked(&created.directory)
-                .record(CoreRecord::Terminal)
-                .remove()
-        },
-    ) {
+    // A session directory the launch host would refuse fails here, as a surface that cannot
+    // be opened does: the host could report it only in the launch log, once its surface ran,
+    // and the launch would then wait for its deadline.
+    let opened = terminal::refuse_before_launch(terminal_kind, &created.directory).and_then(|()| {
+        terminal::open_bound_tab(
+            terminal_kind,
+            &bridge_command,
+            &created.directory,
+            launch_deadline,
+            |session| {
+                session.managed_session_id = Some(created.id.clone());
+                Store::open_unchecked(&created.directory).write_terminal(session)
+            },
+            || {
+                Store::open_unchecked(&created.directory)
+                    .record(CoreRecord::Terminal)
+                    .remove()
+            },
+        )
+    });
+    let terminal_session = match opened {
         Ok(session) => session,
         Err(error) => {
             let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);

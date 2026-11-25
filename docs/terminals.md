@@ -194,7 +194,11 @@ local named pipe, the one `hc` uses (`HC_SOCKET`, the `socket` setting, or
 `\\.\pipe\herdr-core-<user>-<session>.sock`), and only when the process serving it runs as
 your Windows user. An elevated core refuses an unelevated TAB. The session directory must
 be a real, private directory: a junction, or an access list that lets another account change
-its entries, refuses the launch.
+its entries, refuses the launch. The launch host runs as the core, so TAB checks the
+directory for the core's account before it creates the terminal and fails at once with the
+reason. An elevated TAB, such as an administrator's SSH session, gives the directory the
+Administrators group as owner, which the host of a core that is not elevated refuses: run TAB
+without elevation, as the core runs.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."

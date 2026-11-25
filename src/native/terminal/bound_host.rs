@@ -141,6 +141,166 @@ pub(super) fn run_bound_host<T>(
     run(admit(directory, spec)?)
 }
 
+/// The account a launch host runs as, for the private-directory step of its admission: an
+/// effective uid on macOS and Linux; on Windows the owners its token gives new files and,
+/// only to explain a refusal, whether it is elevated.
+#[derive(Clone, Debug)]
+pub(in crate::native::terminal) struct HostAccount {
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(windows)]
+    windows: crate::native::consent::WindowsAccount,
+}
+
+impl HostAccount {
+    /// This process's account.
+    pub(in crate::native::terminal) fn current() -> Result<Self> {
+        #[cfg(unix)]
+        return Ok(Self {
+            uid: unsafe { libc::geteuid() },
+        });
+        #[cfg(windows)]
+        return Ok(Self {
+            windows: crate::native::consent::windows_current_account()?,
+        });
+    }
+
+    #[cfg(unix)]
+    pub(in crate::native::terminal) fn of_uid(uid: u32) -> Self {
+        Self { uid }
+    }
+
+    #[cfg(windows)]
+    pub(in crate::native::terminal) fn of_windows(
+        windows: crate::native::consent::WindowsAccount,
+    ) -> Self {
+        Self { windows }
+    }
+
+    /// Whether the two accounts give their files the same owners.
+    pub(in crate::native::terminal) fn same(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        return self.uid == other.uid;
+        #[cfg(windows)]
+        return self.windows.same_owners(&other.windows);
+    }
+}
+
+/// Whether the kind's launch host admits its session directory with `admit` before it
+/// trusts it: every bound host does. The Windows console host is no bound host; it only
+/// checks that its path is a real directory.
+const fn runs_directory_admission(kind: TerminalKind) -> bool {
+    match kind {
+        TerminalKind::Herdr
+        | TerminalKind::Tmux
+        | TerminalKind::Iterm2
+        | TerminalKind::WezTerm
+        | TerminalKind::AppleTerminal
+        | TerminalKind::Ghostty
+        | TerminalKind::Warp => true,
+        TerminalKind::WindowsConsole => false,
+    }
+}
+
+/// The launcher's check before it creates a surface whose launch host runs `admit`: the
+/// same admission, for this process's account, which is the host's own wherever this
+/// process or the terminal it starts runs the host. A refusal here means that host would
+/// refuse the directory, so nothing is created; an account this process cannot read leaves
+/// the decision to the host. A Herdr host runs as its core instead, which the Herdr adapter
+/// checks on the connection that will create the terminal (`refuse_before_core_launch`).
+pub(in crate::native::terminal) fn refuse_before_launch(
+    directory: &Path,
+    kind: TerminalKind,
+) -> Result<()> {
+    if !runs_directory_admission(kind) {
+        return Ok(());
+    }
+    let Ok(account) = HostAccount::current() else {
+        return Ok(());
+    };
+    let spec = BoundHostSpec {
+        name: kind.display_name(),
+    };
+    match admit_as(directory, &spec, Some(&account)) {
+        Ok(_) => Ok(()),
+        Err(refusal) => Err(would_refuse(directory, &spec, &refusal, None)),
+    }
+}
+
+/// The same check for a host that a running core starts as its own program, for `core`,
+/// the account of the process its connection proved to serve it. When this process's own
+/// account would be admitted, the refusal also says how the two accounts differ: on Windows
+/// an elevated TAB gives its files the Administrators group as owner, which the launch host
+/// of a core that is not elevated refuses (observed 2026-11-26, hc 0.1.21).
+pub(in crate::native::terminal) fn refuse_before_core_launch(
+    directory: &Path,
+    kind: TerminalKind,
+    core: &HostAccount,
+) -> Result<()> {
+    let spec = BoundHostSpec {
+        name: kind.display_name(),
+    };
+    let Err(refusal) = admit_as(directory, &spec, Some(core)) else {
+        return Ok(());
+    };
+    let advice = HostAccount::current()
+        .ok()
+        .filter(|own| !own.same(core) && admit_as(directory, &spec, Some(own)).is_ok())
+        .map(|own| account_advice(spec.name, &own, core));
+    Err(would_refuse(directory, &spec, &refusal, advice))
+}
+
+fn would_refuse(
+    directory: &Path,
+    spec: &BoundHostSpec,
+    refusal: &anyhow::Error,
+    advice: Option<String>,
+) -> anyhow::Error {
+    let mut message = format!(
+        "the {} launch host would refuse the session directory {}: {refusal:#}",
+        spec.name,
+        directory.display()
+    );
+    if let Some(advice) = advice {
+        message.push_str("; ");
+        message.push_str(&advice);
+    }
+    anyhow::anyhow!(message)
+}
+
+#[cfg(unix)]
+fn account_advice(name: &str, own: &HostAccount, core: &HostAccount) -> String {
+    format!(
+        "TAB runs as uid {} and the {name} Core as uid {}; run TAB as the core's user",
+        own.uid, core.uid
+    )
+}
+
+#[cfg(windows)]
+fn account_advice(name: &str, own: &HostAccount, core: &HostAccount) -> String {
+    elevation_advice(name, own.windows.elevated, core.windows.elevated)
+}
+
+/// What a user can do when TAB and the core give their files different owners on Windows.
+#[cfg(any(windows, test))]
+fn elevation_advice(name: &str, tab: Option<bool>, core: Option<bool>) -> String {
+    if (tab, core) == (Some(true), Some(false)) {
+        return format!(
+            "TAB is running elevated and the {name} Core is not: an elevated process gives its files the default owner of its token (normally the Administrators group), which the core's launch host does not accept as its user's. Run TAB without elevation, as the core runs (an administrator's SSH session is elevated)"
+        );
+    }
+    let word = |elevated: Option<bool>| match elevated {
+        Some(true) => "elevated",
+        Some(false) => "not elevated",
+        None => "elevation unknown",
+    };
+    format!(
+        "TAB ({}) and the {name} Core ({}) give their files different owners; run TAB with the core's account and elevation",
+        word(tab),
+        word(core)
+    )
+}
+
 /// One admission for every bound host, in one order: an absolute path, a session-id file
 /// name, an existing path, a real directory (never a symlink), private to the current user.
 /// On Windows the last two are read again from a handle opened on the directory itself, not
@@ -149,6 +309,16 @@ pub(super) fn run_bound_host<T>(
 /// Decided 2026-10-30: the per-host orders and refusal texts this replaces changed which
 /// refusal a defective directory reported; the refusal vocabulary is now one template.
 fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
+    admit_as(directory, spec, None)
+}
+
+/// `admit` for the account the host runs as. `None` is this process's own, read only at the
+/// step that needs it, as the host itself reads it.
+fn admit_as<'a>(
+    directory: &'a Path,
+    spec: &BoundHostSpec,
+    account: Option<&HostAccount>,
+) -> Result<&'a str> {
     let name = spec.name;
     if !directory.is_absolute() {
         bail!("{name} launch directory must be absolute");
@@ -167,11 +337,14 @@ fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
         );
     }
     #[cfg(unix)]
-    if !owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }) {
+    if !owned_and_not_accessible_by_others(
+        &metadata,
+        account.map_or_else(|| unsafe { libc::geteuid() }, |account| account.uid),
+    ) {
         bail!("{name} launch directory is not private to the current user");
     }
     #[cfg(windows)]
-    windows_private_directory(directory, name)?;
+    windows_private_directory(directory, name, account)?;
     Ok(id)
 }
 
@@ -179,7 +352,11 @@ fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
 // directory replaced after the path was read is seen. A failure to open it or to read its
 // access list refuses the launch.
 #[cfg(windows)]
-fn windows_private_directory(directory: &Path, name: &str) -> Result<()> {
+fn windows_private_directory(
+    directory: &Path,
+    name: &str,
+    account: Option<&HostAccount>,
+) -> Result<()> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -208,8 +385,13 @@ fn windows_private_directory(directory: &Path, name: &str) -> Result<()> {
             directory.display()
         );
     }
-    crate::native::consent::windows_directory_is_private(&opened)
-        .with_context(|| format!("{name} launch directory is not private to the current user"))
+    match account {
+        None => crate::native::consent::windows_directory_is_private(&opened),
+        Some(account) => crate::native::consent::windows_directory_is_private_to(&opened, || {
+            Ok(account.windows.owners.clone())
+        }),
+    }
+    .with_context(|| format!("{name} launch directory is not private to the current user"))
 }
 
 #[cfg(test)]

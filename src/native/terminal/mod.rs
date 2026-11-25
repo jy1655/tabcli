@@ -389,6 +389,19 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
     }
 }
 
+/// The launcher's check before `open_bound_tab`: a session directory that the kind's launch
+/// host would refuse is refused with the host's own reason before any surface exists, instead
+/// of by the host once its surface runs (`bound_host::refuse_before_launch`).
+pub(in crate::native) fn refuse_before_launch(kind: TerminalKind, directory: &Path) -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    return bound_host::refuse_before_launch(directory, kind);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (kind, directory);
+        Ok(())
+    }
+}
+
 // `directory` is the private directory of the managed session. Windows and Warp use it
 // for a one-writer host offer/start decision before the provider process can run.
 pub(super) fn open_bound_tab<F, U>(

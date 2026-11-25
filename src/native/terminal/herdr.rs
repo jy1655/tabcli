@@ -19,6 +19,7 @@
 //! Status words (OSC 7501) are never request evidence. The endpoint is the one `hc` uses:
 //! `HC_SOCKET`, else `socket` in the config, else the platform default for `HC_SESSION`
 //! (herdr-core 0.1.21 `paths.rs`).
+use super::bound_host::HostAccount;
 use super::record::HerdrHostBirth;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::terminal::{
@@ -127,6 +128,10 @@ impl CallError {
 /// One connection to a core: one request, then its one reply line.
 pub(in crate::native::terminal) trait Connection {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError>;
+    /// The account of the process that serves this connection, as its transport identified
+    /// that process: the core, whose terminals' programs, the launch host among them, run as
+    /// it.
+    fn core_account(&self) -> Result<HostAccount>;
 }
 
 /// What the adapter reads from this process and the system.
@@ -144,6 +149,9 @@ pub(in crate::native::terminal) trait Core {
     /// The birth of a live process; `None` when there is no such process.
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>>;
     fn launch_nonce(&self) -> Result<String>;
+    /// Refuses a session directory that the launch host this core would start must refuse,
+    /// judged for `account`, the core's own (`bound_host::refuse_before_core_launch`).
+    fn admit_launch_directory(&self, directory: &Path, account: &HostAccount) -> Result<()>;
     fn pause(&self, deadline: Instant) {
         thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
@@ -231,6 +239,8 @@ fn not_running(endpoint: &Path) -> anyhow::Error {
 pub(super) trait Stream {
     fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize>;
     fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize>;
+    /// The account of the process at the other end (`Connection::core_account`).
+    fn peer_account(&self) -> Result<HostAccount>;
 }
 
 /// The time left before `deadline`, or a timeout once none is left.
@@ -328,6 +338,10 @@ impl<S: Stream> Connection for Framed<S> {
         }
         let line = self.read_line(deadline).map_err(CallError::Unanswered)?;
         parse_reply(&line, id)
+    }
+
+    fn core_account(&self) -> Result<HostAccount> {
+        self.stream.peer_account()
     }
 }
 
@@ -590,6 +604,13 @@ fn create(
     let socket = core.endpoint()?;
     let mut linked = link(core, &socket, None, startup_deadline)
         .context("the Herdr terminal was not created")?;
+    // The launch host is the core's program and runs as the core's account: a session
+    // directory that its admission would refuse is refused here, before anything exists. An
+    // account the connection cannot name leaves the decision to the host.
+    if let Ok(account) = linked.connection.core_account() {
+        core.admit_launch_directory(directory, &account)
+            .context("the Herdr terminal was not created")?;
+    }
     let argv = host_program(&core.executable()?, directory, command);
     let session_id = directory
         .file_name()

@@ -1114,7 +1114,7 @@ fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
     let mut fixture = Fixture::new();
     fixture.receipt_directory = false;
     fixture.terminal_kind = if cfg!(target_os = "linux") {
-        terminal::TerminalKind::Iterm2
+        terminal::TerminalKind::AppleTerminal
     } else {
         terminal::TerminalKind::Tmux
     };
@@ -1151,7 +1151,6 @@ fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
         )),
         "{cause}"
     );
-    assert!(cause.ends_with("; no terminal was opened"), "{cause}");
     let store = Store::open_unchecked(directory);
     assert_eq!(
         launch::read(&store).unwrap().unwrap().phase,
@@ -1166,7 +1165,26 @@ fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
             .as_str()
         )
     );
+    // The launch log keeps the reason, after the pending launch it began.
+    assert!(
+        fs::read_to_string(directory.join(launch::LOG))
+            .unwrap()
+            .contains(&format!("terminal launch failed: {cause}")),
+    );
+    for record in [CoreRecord::ProviderProcess, CoreRecord::LaunchHost] {
+        assert!(
+            store.record(record).bytes().unwrap().is_none(),
+            "{}",
+            record.name()
+        );
+    }
     assert_settled_before_fence(&fixture, &prepared, &report);
+    // Closed like any session, it is pruned like one.
+    assert_eq!(
+        crate::native::prune::prune_closed_sessions(fixture.root.path(), u128::MAX).unwrap(),
+        std::slice::from_ref(&prepared.created.id)
+    );
+    assert!(!directory.exists());
 }
 
 // A launch failure whose Claim the launcher already fenced belongs to the launcher's own
