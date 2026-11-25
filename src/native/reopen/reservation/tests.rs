@@ -4088,9 +4088,10 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
 // Inside a Herdr terminal whose caller cannot be verified (no core answers), a reopen of an
 // eligible closed Claude source reaches the Surface decision only after its source and its
 // provider's reopen support: on macOS and Linux Claude cannot reopen, and that is the refusal.
-// On Windows the source is eligible, the version is probed, and only then is the caller
-// checked, because the automatic choice is Herdr; an explicit managed console goes on to the
-// title. Nothing is created and the source is untouched.
+// On Windows the source is eligible, and Claude's choice needs no version, so the caller is
+// checked before Claude is probed: the probe of this Claude fails, and the caller refusal
+// comes first. An explicit managed console needs no caller and reaches that probe. Nothing is
+// created and the source is untouched.
 #[test]
 fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
     const CHILD: &str = "TABCLI_REOPEN_SURFACE_CHILD";
@@ -4100,14 +4101,14 @@ fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
         fs::create_dir_all(&root).unwrap();
         let bin = base.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        // A Claude that only answers `--version`.
+        // A Claude whose `--version` fails.
         #[cfg(windows)]
-        fs::write(bin.join("claude.cmd"), "@echo off\r\necho 2.1.302\r\n").unwrap();
+        fs::write(bin.join("claude.cmd"), "@echo off\r\nexit /b 3\r\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let claude = bin.join("claude");
-            fs::write(&claude, "#!/bin/sh\necho 2.1.302\n").unwrap();
+            fs::write(&claude, "#!/bin/sh\nexit 3\n").unwrap();
             fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut path = vec![bin];
@@ -4177,7 +4178,8 @@ fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
             "{text}"
         );
         assert_eq!(reopen_refusal_gate(&automatic), None);
-        assert_eq!(format!("{:#}", console.unwrap()), "--title cannot be empty");
+        let console = format!("{:#}", console.unwrap());
+        assert!(console.contains("--version exited with"), "{console}");
     } else {
         assert_eq!(
             reopen_refusal_gate(&automatic),

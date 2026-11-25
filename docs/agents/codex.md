@@ -12,8 +12,9 @@
   session or terminal exists: an explicit `--terminal herdr` fails with that refusal, and an
   automatic Herdr choice inside hc takes the OS's own terminal instead, without the caller
   check (`session_start::admit_choice`). `surface_version_requirement` declares that this
-  choice depends on the version (stable 0.169.0 or newer), so `doctor` reports it from a probe
-  of the invoking directory only. `prepare_launch` applies the same decision from the recorded
+  choice depends on the version (stable 0.169.0 or newer), so `doctor` decides it with the
+  launch's own probe (`provider_installation::read_installed_version`). `prepare_launch`
+  applies the same decision from the recorded
   surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. That gate reads
   the version text by one grammar (`herdr_codex_version`). The label is the word
   `codex-cli`, the start of every Codex `--version` output this repository records
@@ -23,11 +24,15 @@
   before the label (a warning, a timestamp, another program's version) and after the field
   are never read as the version and are only scanned for a second label, so `0.170.0--` is a
   prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
-  refused. Without a label (`unlabelled_codex_version`, the one place of that rule), each word,
-  one or more, is read as 0.4.48 read words, its surrounding punctuation and one leading `v`
-  removed, and the text names a version only when exactly one word reads as one:
-  `OpenAI Codex (v0.170.0)`, `(0.170.0)` and `0.170.0+` are 0.170.0 (owner's decisions 4B and
-  B2, 2026-11-26). With no such word it is refused; with two or more it is refused as
+  refused. Without a label (`unlabelled_codex_version`, the one place of that rule), the text
+  names a version only when exactly one of its words reads as one (owner's decisions 4B and
+  B2, 2026-11-26). A word reads, after one leading `v`, as SemVer once the surrounding
+  characters no SemVer has are removed, which keeps a prerelease (`0.170.0--` and
+  `(0.170.0--)` are the prerelease `-`, refused as after the label); otherwise as 0.4.48 read
+  it, all surrounding punctuation removed (`OpenAI Codex (v0.170.0)`, `(0.170.0)` and
+  `0.170.0+` are 0.170.0), unless that removes a `-` after the version, which would turn a
+  prerelease into a release (`0.170.0-` reads as none). With no such word it is refused; with
+  two or more it is refused as
   ambiguous, because another program's version can come first (`node v22.0.0` before a Codex
   banner) and a misread version could let a Codex that lacks `--no-daemon` start on Herdr,
   where a detached `ask` can already have reported the request accepted when Codex refuses the
@@ -40,12 +45,16 @@
   (below the floor or a prerelease).
   The wrapper reads the recorded version by the same rule, so a pending launch that another
   release's binary starts (the executable at its path replaced in between) can be refused
-  there, after its Session and terminal exist: this build refuses a 0.4.48 record that 0.4.48
-  admitted when its text is labelled with a field that is not SemVer as written
-  (`codex-cli 0.170.0+`), has a lower version before the label, or holds several unlabelled
-  versions; a 0.4.49 wrapper refuses a record this build admitted when its unlabelled text is
-  not a single SemVer word (`OpenAI Codex (v0.170.0)`, `(0.170.0)`). Do not replace the binary
-  while a Herdr launch is pending (`pending_herdr_launches_across_the_wrapper_handoff`).
+  there, after its Session and terminal exist. This build refuses a 0.4.48 record that 0.4.48
+  admitted when its labelled field is not SemVer as written (`codex-cli 0.170.0+`), when
+  0.4.48 read a higher version before a labelled field below the floor (`node v22.0.0` before
+  `codex-cli 0.168.0`), when its unlabelled text holds several versions, or when 0.4.48's
+  trimming read a prerelease as a release (`0.170.0--`, `0.170.0-`); it launches a record
+  0.4.48 refused because 0.4.48 read a lower version before a labelled field at the floor
+  (`plugin 0.160.0` before `codex-cli 0.170.0`). A 0.4.49 wrapper refuses a record this build
+  admitted when its unlabelled text is not a single SemVer word (`OpenAI Codex (v0.170.0)`,
+  `(0.170.0)`, `0.170.0+`). Do not replace the binary while a Herdr launch is pending
+  (`pending_herdr_launches_across_the_wrapper_handoff`).
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases
   wrote and admitted launch records.

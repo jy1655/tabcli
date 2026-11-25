@@ -282,35 +282,41 @@ impl Fixture {
         path: &OsStr,
         socket: Option<&OsStr>,
     ) -> Value {
+        let mut args = vec!["--title", "   "];
+        if let Some(terminal) = terminal {
+            args.extend(["--terminal", terminal]);
+        }
+        let mut environment = vec![("PATH", path)];
+        if let Some(socket) = socket {
+            environment.push(("HC_SOCKET", socket));
+        }
+        refusal(self.ask_with(provider, &args, &environment))
+    }
+
+    // `ask` from inside hc in an existing workspace with `args` and `environment` added.
+    fn ask_with(&self, provider: &str, args: &[&str], environment: &[(&str, &OsStr)]) -> Output {
         let project = self.base.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let mut args = vec![
+        let mut all = vec![
             "ask",
             provider,
             "--workspace",
             project.to_str().unwrap(),
-            "--title",
-            "   ",
             "--prompt",
             "must not be delivered",
             "--json",
         ];
-        if let Some(terminal) = terminal {
-            args.extend(["--terminal", terminal]);
-        }
+        all.extend(args);
         let homes = self.homes();
-        let mut environment: Vec<(&str, &OsStr)> = homes
+        let mut full: Vec<(&str, &OsStr)> = homes
             .iter()
             .map(|(name, path)| (*name, path.as_os_str()))
             .collect();
-        environment.push(("PATH", path));
-        if let Some(socket) = socket {
-            environment.push(("HC_SOCKET", socket));
-        }
-        refusal(self.run_with(&args, Caller::Herdr, &environment))
+        full.extend(environment);
+        self.run_with(&all, Caller::Herdr, &full)
     }
 
-    // `doctor --provider` from `directory` with the provider on `path`.
+    // `doctor --provider` from `directory` with the provider on `path` and `environment` added.
     fn doctor_from(
         &self,
         directory: &std::path::Path,
@@ -318,22 +324,30 @@ impl Fixture {
         probe: bool,
         caller: Caller,
         path: Option<&OsStr>,
+        environment: &[(&str, &OsStr)],
     ) -> Value {
         let mut args = vec!["doctor", "--provider", provider, "--json"];
         if probe {
             args.push("--probe");
         }
         let homes = self.homes();
-        let mut environment: Vec<(&str, &OsStr)> = homes
+        let mut full: Vec<(&str, &OsStr)> = homes
             .iter()
             .map(|(name, path)| (*name, path.as_os_str()))
             .collect();
         if let Some(path) = path {
-            environment.push(("PATH", path));
+            full.push(("PATH", path));
         }
-        let output = self.run_from(directory, &args, caller, &environment);
+        full.extend(environment);
+        let output = self.run_from(directory, &args, caller, &full);
         assert!(output.status.success(), "{output:?}");
         serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    // A provider whose `--version` exits unsuccessfully.
+    fn failing(&self, command: &str) -> std::ffi::OsString {
+        let body = if cfg!(windows) { "exit /b 3" } else { "exit 3" };
+        self.provider_path(&format!("{command}-failing"), command, body)
     }
 }
 
@@ -346,17 +360,23 @@ fn terminal_selection(report: &Value) -> &Value {
         .unwrap_or_else(|| panic!("{report}"))
 }
 
-// `ask` resolves the workspace before any caller check: the automatic choice inside hc is
-// decided with the provider's probed version, and only a launch that will use Herdr checks the
-// caller. An explicit Herdr is never checked against the caller.
+// One rule places the caller check of an automatic Herdr choice. Where the adapter's answer
+// does not depend on the version (Claude, Agy, Pi), Herdr is the choice before anything is
+// resolved and the caller is checked first, before the workspace and the provider's probe, as
+// in 0.4.49. Where it does (Codex), the caller is checked after the probe and only for a
+// choice that ends on Herdr. An explicit Herdr is never checked against the caller.
 #[test]
-fn ask_resolves_the_workspace_before_it_checks_a_caller() {
+fn ask_checks_the_caller_first_where_no_version_can_change_the_choice() {
     let fixture = Fixture::new();
     for provider in PROVIDERS {
-        for caller in [Caller::Herdr, Caller::InheritedMarker] {
-            let reply = fixture.ask(provider, None, caller);
+        let reply = fixture.ask(provider, None, Caller::Herdr);
+        if provider == "codex" {
             assert_workspace_refused(&reply, provider);
+        } else {
+            assert_caller_refused(&reply, provider);
         }
+        let reply = fixture.ask(provider, None, Caller::InheritedMarker);
+        assert_workspace_refused(&reply, provider);
         let reply = fixture.ask(provider, Some("herdr"), Caller::Herdr);
         if cfg!(windows) && provider == "codex" {
             assert!(
@@ -368,6 +388,14 @@ fn ask_resolves_the_workspace_before_it_checks_a_caller() {
             assert_workspace_refused(&reply, provider);
         }
     }
+    // A provider whose probe fails: Pi's choice needs no version, so the caller refusal comes
+    // first and Pi is never run; Codex's needs its version, so its probe's failure comes first.
+    let pi = fixture.failing("pi");
+    let reply = refusal(fixture.ask_with("pi", &[], &[("PATH", pi.as_os_str())]));
+    assert_caller_refused(&reply, "failing pi");
+    let codex = fixture.failing("codex");
+    let reply = refusal(fixture.ask_with("codex", &[], &[("PATH", codex.as_os_str())]));
+    assert!(error(&reply).contains("--version exited with"), "{reply}");
 }
 
 // A caller that cannot be verified (the core is absent) refuses a launch that would use Herdr,
@@ -419,7 +447,7 @@ fn reopen_reports_its_source_before_any_caller_check() {
 fn doctor_reports_the_selected_surface_without_the_caller_check() {
     let fixture = Fixture::new();
     for provider in PROVIDERS {
-        let report = fixture.doctor_from(&fixture.base, provider, false, Caller::Herdr, None);
+        let report = fixture.doctor_from(&fixture.base, provider, false, Caller::Herdr, None, &[]);
         let selection = terminal_selection(&report);
         assert_eq!(
             selection["evidence"]["fallback"], FALLBACK,
@@ -473,6 +501,7 @@ fn doctor_reports_the_selected_surface_without_the_caller_check() {
             false,
             Caller::InheritedMarker,
             None,
+            &[],
         );
         let selection = terminal_selection(&report);
         assert_eq!(selection["reason_code"], "terminal_selected", "{selection}");
@@ -519,7 +548,14 @@ fn doctor_reports_the_surface_ask_chooses_for_the_probed_version() {
         ("codex-cli unknown", "unknown", "version_unrecognized", None),
     ] {
         let path = fixture.printing("codex", version);
-        let report = fixture.doctor_from(&fixture.base, "codex", true, Caller::Herdr, Some(&path));
+        let report = fixture.doctor_from(
+            &fixture.base,
+            "codex",
+            true,
+            Caller::Herdr,
+            Some(&path),
+            &[],
+        );
         assert_eq!(report["scope"]["current_version"], version, "{report}");
         let selection = terminal_selection(&report);
         assert_eq!(
@@ -536,7 +572,14 @@ fn doctor_reports_the_surface_ask_chooses_for_the_probed_version() {
     }
     // A probe that runs but exits unsuccessfully decides nothing, and --probe was given.
     let path = fixture.provider_path("codex-exit", "codex", "exit 3");
-    let report = fixture.doctor_from(&fixture.base, "codex", true, Caller::Herdr, Some(&path));
+    let report = fixture.doctor_from(
+        &fixture.base,
+        "codex",
+        true,
+        Caller::Herdr,
+        Some(&path),
+        &[],
+    );
     let selection = terminal_selection(&report);
     assert_eq!(selection["availability"], "unknown", "{selection}");
     assert_eq!(
@@ -568,7 +611,7 @@ fn doctor_reads_the_deciding_version_from_the_invoking_directory() {
         "if [ -f .codex-pin ]; then echo 'codex-cli 0.168.0'; else echo 'codex-cli 0.170.0'; fi",
     );
     for (directory, terminal) in [(&project, FALLBACK), (&fixture.base, "herdr")] {
-        let report = fixture.doctor_from(directory, "codex", true, Caller::Herdr, Some(&path));
+        let report = fixture.doctor_from(directory, "codex", true, Caller::Herdr, Some(&path), &[]);
         let selection = terminal_selection(&report);
         assert_eq!(
             selection["evidence"]["terminal"],
@@ -577,6 +620,33 @@ fn doctor_reads_the_deciding_version_from_the_invoking_directory() {
             directory.display()
         );
     }
+    // The same for the environment: a shim that answers otherwise inside a managed session.
+    let session_path = fixture.provider_path(
+        "codex-session",
+        "codex",
+        "if [ -n \"$AGENT_BRIDGE_NATIVE_SESSION_DIR\" ]; then echo 'codex-cli 0.168.0'; else echo 'codex-cli 0.170.0'; fi",
+    );
+    let session = fixture.base.join("managed-session");
+    let inside = [("AGENT_BRIDGE_NATIVE_SESSION_DIR", session.as_os_str())];
+    let report = fixture.doctor_from(
+        &fixture.base,
+        "codex",
+        true,
+        Caller::Herdr,
+        Some(&session_path),
+        &inside,
+    );
+    assert_eq!(
+        terminal_selection(&report)["evidence"]["terminal"],
+        FALLBACK,
+        "{report}"
+    );
+    let reply = refusal(fixture.ask_with(
+        "codex",
+        &["--title", "   "],
+        &[inside[0], ("PATH", session_path.as_os_str())],
+    ));
+    assert_eq!(error(&reply), BLANK_TITLE, "{reply}");
     // And `ask` from that project takes the same fallback.
     let reply = refusal(
         fixture.run_from(
@@ -610,7 +680,7 @@ fn doctor_probes_the_provider_first_only_where_its_version_chooses_tmux() {
     let fixture = Fixture::new();
     let log = fixture.base.join("probes.log");
     let body = |line: &str, reply: &str| {
-        format!("echo \"{line} $*\" >> '{}'\necho '{reply}'", log.display())
+        format!("echo \"{line} $*\" >> \"$TABCLI_TEST_PROBE_LOG\"\necho '{reply}'")
     };
     let path = fixture.provider_path("probe-order", "codex", &body("codex", "codex-cli 0.168.0"));
     fixture.provider_path("probe-order", "tmux", &body("tmux", "tmux 3.6"));
@@ -619,7 +689,14 @@ fn doctor_probes_the_provider_first_only_where_its_version_chooses_tmux() {
         (Caller::Herdr, "codex --version"),
     ] {
         let _ = std::fs::remove_file(&log);
-        let report = fixture.doctor_from(&fixture.base, "codex", true, caller, Some(&path));
+        let report = fixture.doctor_from(
+            &fixture.base,
+            "codex",
+            true,
+            caller,
+            Some(&path),
+            &[("TABCLI_TEST_PROBE_LOG", log.as_os_str())],
+        );
         assert_eq!(terminal_selection(&report)["evidence"]["terminal"], "tmux");
         let order = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<_> = order
@@ -646,6 +723,11 @@ struct ScriptedCore {
 #[cfg(unix)]
 impl ScriptedCore {
     fn start() -> Self {
+        Self::start_with(std::time::Duration::ZERO)
+    }
+
+    // A core that waits `delay` before it answers `terminal.get`.
+    fn start_with(delay: std::time::Duration) -> Self {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let directory = private_directory()
@@ -665,7 +747,7 @@ impl ScriptedCore {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             connections.fetch_add(1, Ordering::SeqCst);
-                            Self::serve(stream, program);
+                            Self::serve(stream, program, delay);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -684,7 +766,7 @@ impl ScriptedCore {
         }
     }
 
-    fn serve(stream: std::os::unix::net::UnixStream, program: u32) {
+    fn serve(stream: std::os::unix::net::UnixStream, program: u32, delay: std::time::Duration) {
         use std::io::{BufRead, Write};
         // An accepted socket can inherit the listener's non-blocking mode.
         stream.set_nonblocking(false).unwrap();
@@ -703,14 +785,17 @@ impl ScriptedCore {
                         "terminal.send", "terminal.read"],
                     "core": {"id": "core-launch-surface-test"},
                 }}),
-                (Some("terminal.get"), Some("t7")) => serde_json::json!({"result": {
-                    "address": "t7",
-                    "state": "live",
-                    "pid": program,
-                    "argv": ["sh"],
-                    "keep": false,
-                    "created_ms": 1,
-                }}),
+                (Some("terminal.get"), Some("t7")) => {
+                    std::thread::sleep(delay);
+                    serde_json::json!({"result": {
+                        "address": "t7",
+                        "state": "live",
+                        "pid": program,
+                        "argv": ["sh"],
+                        "keep": false,
+                        "created_ms": 1,
+                    }})
+                }
                 (method, _) => serde_json::json!({"error": {
                     "code": -32601,
                     "message": format!("the test core does not answer {method:?}"),
@@ -738,6 +823,32 @@ impl Drop for ScriptedCore {
             let _ = server.join();
         }
     }
+}
+
+// The caller check runs within the request's deadline: a core that answers after the deadline
+// has passed refuses the launch as timed out, and nothing is created.
+#[cfg(unix)]
+#[test]
+fn the_caller_check_ends_at_the_request_deadline() {
+    let fixture = Fixture::new();
+    let core = ScriptedCore::start_with(std::time::Duration::from_secs(3));
+    let pi = fixture.printing("pi", "1.5.0");
+    let started = std::time::Instant::now();
+    let reply = refusal(fixture.ask_with(
+        "pi",
+        &["--timeout-secs", "1"],
+        &[
+            ("PATH", pi.as_os_str()),
+            ("HC_SOCKET", core.socket.as_os_str()),
+        ],
+    ));
+    assert!(error(&reply).ends_with(CALLER_REFUSAL), "{reply}");
+    assert_eq!(reply["failure_kind"], "timed_out", "{reply}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[cfg(unix)]

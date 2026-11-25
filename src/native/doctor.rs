@@ -10,7 +10,9 @@ use super::{NativeCommand, consent, provider, query, reopen, session_start, term
 use crate::native::clock::SystemClock;
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::process_env::{PROBE_TIMEOUT, probe};
-use crate::native::provider_installation::{Executable, read_version_probe, resolve_provider};
+use crate::native::provider_installation::{
+    Executable, read_installed_version, read_version_probe, resolve_provider,
+};
 use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
 use crate::native::session::launch;
@@ -161,14 +163,24 @@ struct Installation {
     outcome: VersionOutcome,
 }
 
+// How doctor runs a provider's `--version` probe.
+#[derive(Clone, Copy)]
+enum VersionRun {
+    // Isolated like doctor's other probes: a scratch directory, without TAB's session
+    // variables.
+    Isolated,
+    // As the launch runs it, because its version decides the Surface `ask` would choose: the
+    // launch's own probe (`read_installed_version`), in the invoking directory and environment.
+    Launch,
+}
+
 // The executable is the manifest's in session mode and a PATH lookup otherwise; its version
-// is read only with --probe, within the shared deadline, in a scratch directory unless
-// `directory` names the one to run it in.
+// is read only with --probe, within the shared deadline, as `run` says.
 fn observe_installation(
     provider: FirstPartyCli,
     manifest: Option<&SessionManifest>,
     probe_requested: bool,
-    directory: Option<&std::path::Path>,
+    run: VersionRun,
     deadline: Instant,
 ) -> Installation {
     let resolved = match manifest {
@@ -179,14 +191,19 @@ fn observe_installation(
     let version_probe = if !probe_requested {
         VersionProbe::NotRequested
     } else if let Some(path) = &executable {
-        match probe(
-            path,
-            &["--version"],
-            directory,
-            provider::probe_environment_removals(provider),
-            deadline,
-        ) {
-            Ok(output) => VersionProbe::Completed(read_version_probe(provider, &output)),
+        let report = match run {
+            VersionRun::Isolated => probe(
+                path,
+                &["--version"],
+                None,
+                provider::probe_environment_removals(provider),
+                deadline,
+            )
+            .map(|output| read_version_probe(provider, &output)),
+            VersionRun::Launch => read_installed_version(provider, path, Some(deadline)),
+        };
+        match report {
+            Ok(report) => VersionProbe::Completed(report),
             Err(error) => VersionProbe::Failed(error),
         }
     } else {
@@ -203,17 +220,18 @@ fn observe_installation(
     }
 }
 
-// The Surface `ask` would start `provider` on without `--terminal`, decided as `ask` decides
-// it, and that Surface when one is known. Where the provider's version decides it, `version`
-// is the outcome of the version probe, which `ask` would run from the same directory. The
-// caller check of an automatic Herdr choice is not run: doctor opens no connection to a core.
+// The Surface `ask` would start `provider` on without `--terminal`, decided by the decision
+// `ask` makes (`session_start::automatic_surface`, then `admit_choice` with the version), and
+// that Surface when one is known. Where the provider's version decides it, `version` is the
+// outcome of the launch's own version probe. The caller check of an automatic Herdr choice is
+// not run: doctor opens no connection to a core.
 fn terminal_selection_check(
     provider: FirstPartyCli,
-    chosen: Result<session_start::AutomaticSurface>,
+    chosen: Result<(terminal::Selection, session_start::EarlyChoice)>,
     version: Option<&VersionOutcome>,
 ) -> (Check, Option<terminal::TerminalKind>) {
     use Availability::*;
-    use session_start::AutomaticSurface;
+    use session_start::EarlyChoice;
     const DEFAULT: &str =
         "Default terminal selection from the launch adapter; no app was opened or controlled.";
     const NEXT: &str = "An explicit ask --terminal can select another supported host; live surface availability has not been tested.";
@@ -234,15 +252,14 @@ fn terminal_selection_check(
     };
     let (selection, admitted, by_version) = match chosen {
         Err(error) => return failed(error),
-        Ok(AutomaticSurface::Known {
+        Ok((selection, EarlyChoice::Known(admitted))) => (selection, admitted, false),
+        Ok((
             selection,
-            admitted,
-        }) => (selection, admitted, false),
-        Ok(AutomaticSurface::ByVersion {
-            fallback,
-            requirement,
-        }) => {
-            let selection = terminal::Selection::Herdr { fallback };
+            EarlyChoice::ByVersion {
+                fallback,
+                requirement,
+            },
+        )) => {
             let undecided = |availability, reason, why: &str, next: String| {
                 (
                     Check::new(
@@ -276,7 +293,7 @@ fn terminal_selection_check(
                         Reason::PROBE_NOT_REQUESTED,
                         "the version was not read",
                         format!(
-                            "Add --probe to read the provider version from this directory, as ask does. {NEXT}"
+                            "Add --probe to read the provider version as ask reads it, from the directory you launch from. {NEXT}"
                         ),
                     );
                 }
@@ -402,19 +419,18 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     if let Some(provider) = request.provider {
         let chosen = session_start::automatic_surface(provider);
         // Where the provider's version decides the Surface (inside hc), provider-only mode
-        // observes the executable and, with --probe, reads its version first, from the
-        // directory doctor runs in, as `ask` reads it. Everywhere else the probe keeps its
-        // place and its scratch directory. The rows keep their places in the report.
+        // observes the executable and, with --probe, reads its version first, through the
+        // launch's own probe. Everywhere else the probe keeps its place and its isolation. The
+        // rows keep their places in the report.
         if matches!(
             chosen,
-            Ok(session_start::AutomaticSurface::ByVersion { .. })
+            Ok((_, session_start::EarlyChoice::ByVersion { .. }))
         ) {
-            let invoked = std::env::current_dir().ok();
             installation = Some(observe_installation(
                 provider,
                 None,
                 request.probe,
-                invoked.as_deref(),
+                VersionRun::Launch,
                 deadline,
             ));
         }
@@ -500,9 +516,13 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     if let Some(provider) = provider {
         let observed = match installation.take() {
             Some(observed) => observed,
-            None => {
-                observe_installation(provider, manifest.as_ref(), request.probe, None, deadline)
-            }
+            None => observe_installation(
+                provider,
+                manifest.as_ref(),
+                request.probe,
+                VersionRun::Isolated,
+                deadline,
+            ),
         };
         checks.push(observed.executable_row);
         executable = observed.executable;

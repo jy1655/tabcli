@@ -115,15 +115,23 @@
   before the workspace and again with the probed version: an automatic choice is Herdr where
   the adapter admits it and its fallback otherwise (Codex below stable 0.169.0 off Windows,
   any Codex on Windows), and an explicit `--terminal herdr` it does not admit is refused with
-  the adapter's text. Only an automatic choice that is then Herdr is admitted against its
-  caller (`terminal::admit_selection`), still before title, consent, reservation or Session:
-  the caller's terminal must be live on the addressed core with this process among its
-  program's descendants, compared up to 64 parent links (reaching that bound is reported
-  apart from a chain that ends), or the launch is refused without opening another terminal.
-  So a caller that cannot be verified never refuses a launch on the fallback, on any OS, and a
-  `reopen` reports a missing source or a provider that cannot reopen first. `doctor` reports
-  the same decision (`session_start::automatic_surface`) without the caller check: see
-  Observation and Self-Test Boundary.
+  the adapter's text. An automatic choice that is Herdr is admitted against its caller
+  (`terminal::admit_selection`) by one rule (`session_start::resolve_with`): once, as soon as
+  the choice is known to be Herdr. Where the adapter's answer does not depend on the version
+  (Claude, Agy, Pi), that is before the workspace and the probe, as in 0.4.49 for `ask` and
+  right after the source and its provider's reopen support for `reopen`; where it does (Codex
+  off Windows), after the probe, and only for a choice that ends on Herdr. The check ends by
+  the request's deadline (one that fails after it is reported as timed out), and nothing is
+  created once that deadline has passed. The caller's terminal must be live on the addressed
+  core with this process among its program's descendants, or the launch is refused without
+  opening another terminal. Up to 64 parent links are compared; only a chain that ends at a
+  root (no parent, or init) proves the command is outside, while reaching that bound or a
+  parent that cannot be established (on Windows: it ended, its PID was reused, or it may not
+  be inspected) is reported as unverified, and both refuse. So a caller that cannot be
+  verified never refuses a launch on the fallback, on any OS, and a `reopen` reports a missing
+  source or a provider that cannot reopen first. `doctor` reports the same decision
+  (`session_start::automatic_surface`) without the caller check: see Observation and Self-Test
+  Boundary.
   The fallback is not checked for presence before a session exists, as with any other
   terminal: a Mac without Ghostty, Linux without tmux 3.2 or Windows without PowerShell 7
   fails at that terminal's open with its own refusal.

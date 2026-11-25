@@ -18,8 +18,11 @@
   (`terminal: null`, with `herdr_requires`) and the reason of the version row
   (`probe_not_requested`, `executable_unavailable`, `version_probe_failed`,
   `version_unsupported`, `version_unrecognized`). Only there is the version probed before that
-  row, from the directory doctor runs in, as `ask` probes it; elsewhere, outside hc included,
-  the probe keeps its 0.4.49 place after the terminal rows and its scratch directory. A
+  row, and through the launch's own probe (`provider_installation::read_installed_version`:
+  the invoking directory and environment, less the adapter's removals, read as `ask` reads
+  it), so the report cannot drift from the launch's decision; elsewhere, outside hc included,
+  the probe keeps its 0.4.49 place after the terminal rows and its isolation (a scratch
+  directory, without TAB's session variables), as doctor's other probes do. A
   provider whose choice does not depend on the version gets no version wording. The report
   keeps its row order.
 - Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,

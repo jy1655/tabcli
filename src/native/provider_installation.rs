@@ -175,14 +175,17 @@ pub(in crate::native) fn check_provider_version(
     check_provider_version_until(provider, executable, None)
 }
 
-// The launch gate: a supported version returns its text; anything else refuses, and only a
-// version below the minimum is `Unsupported`. With a deadline the probe runs through the
-// bounded executor; without one it runs unbounded.
-pub(in crate::native) fn check_provider_version_until(
+// The launch's `--version` probe of an installed executable and its reading: the command of
+// `version_probe_command`, run in the invoking directory and environment less the adapter's
+// removals, and read by `read_version_probe`. `ask` and `reopen` decide with it, and `doctor`
+// reads through it the version that decides a launch's Surface, so that report sees what the
+// launch sees; doctor's other probes keep their own isolation. With a deadline the probe runs
+// through the bounded executor; without one it runs unbounded.
+pub(in crate::native) fn read_installed_version(
     provider: FirstPartyCli,
     executable: &Path,
     deadline: Option<Instant>,
-) -> Result<String> {
+) -> Result<VersionReport> {
     let mut command = version_probe_command(provider, executable)?;
     let label = format!("{} --version", executable.display());
     let output = match deadline {
@@ -191,7 +194,17 @@ pub(in crate::native) fn check_provider_version_until(
             .output()
             .with_context(|| format!("failed to query {label}")),
     }?;
-    match read_version_probe(provider, &output) {
+    Ok(read_version_probe(provider, &output))
+}
+
+// The launch gate: a supported version returns its text; anything else refuses, and only a
+// version below the minimum is `Unsupported`.
+pub(in crate::native) fn check_provider_version_until(
+    provider: FirstPartyCli,
+    executable: &Path,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    match read_installed_version(provider, executable, deadline)? {
         VersionReport::Exited(status) => {
             bail!("{} --version exited with {}", executable.display(), status)
         }

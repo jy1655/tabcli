@@ -51,6 +51,7 @@ struct FakeState {
     births: BTreeMap<u32, HerdrHostBirth>,
     parents: BTreeMap<u32, u32>,
     unreadable_parent: Option<u32>,
+    unknown_parent: Option<u32>,
     caller: Option<String>,
     current_pid: u32,
     /// Terminals of configured remote machines, which hc's list also returns.
@@ -269,12 +270,20 @@ impl Core for FakeCore {
     fn current_pid(&self) -> u32 {
         self.0.borrow().current_pid
     }
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    fn parent_pid(&self, pid: u32) -> Result<Parent> {
         let state = self.0.borrow();
         if state.unreadable_parent == Some(pid) {
             bail!("process {pid} is unreadable");
         }
-        Ok(state.parents.get(&pid).copied())
+        if state.unknown_parent == Some(pid) {
+            return Ok(Parent::Unknown(format!(
+                "the parent of process {pid} ended"
+            )));
+        }
+        Ok(state
+            .parents
+            .get(&pid)
+            .map_or(Parent::Root, |parent| Parent::Process(*parent)))
     }
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
         Ok(self.0.borrow().births.get(&pid).copied())
@@ -838,8 +847,8 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
         fn current_pid(&self) -> u32 {
             1
         }
-        fn parent_pid(&self, _: u32) -> Result<Option<u32>> {
-            Ok(None)
+        fn parent_pid(&self, _: u32) -> Result<Parent> {
+            Ok(Parent::Root)
         }
         fn process_start(&self, _: u32) -> Result<Option<HerdrHostBirth>> {
             Ok(None)
@@ -1410,9 +1419,18 @@ fn the_caller_check_compares_the_last_ancestor_and_reports_its_bound_apart() {
         text.contains(&format!("within {MAX_ANCESTRY} parent processes")),
         "{text}"
     );
+    assert!(text.contains("could not verify"), "{text}");
     assert!(!text.contains("does not run inside its program"), "{text}");
     assert!(text.contains("no other terminal was opened"), "{text}");
-    // A chain that ends before the bound proves the command is outside.
+    // A parent that could not be established (on Windows: it ended, its PID was reused, or it
+    // may not be inspected) is not the end of the chain: the check is unverified.
+    core.0.borrow_mut().unknown_parent = Some(1002);
+    let text = error_text(&verify_caller(&core, later()).unwrap_err());
+    assert!(text.contains("could not verify"), "{text}");
+    assert!(text.contains("the parent of process 1002 ended"), "{text}");
+    assert!(!text.contains("does not run inside its program"), "{text}");
+    core.0.borrow_mut().unknown_parent = None;
+    // A chain that ends at a root before the bound proves the command is outside.
     core.0.borrow_mut().parents = chain(3);
     let text = error_text(&verify_caller(&core, later()).unwrap_err());
     assert!(text.contains("does not run inside its program"), "{text}");
@@ -2124,14 +2142,17 @@ fn the_windows_core_reads_births_parents_and_random_tokens() {
         .args(["/C", "ping -n 3 127.0.0.1 >NUL"])
         .spawn()
         .unwrap();
-    assert_eq!(core.parent_pid(child.id()).unwrap(), Some(pid));
-    let parent = core.parent_pid(pid).unwrap();
-    if let Some(parent) = parent {
+    assert_eq!(core.parent_pid(child.id()).unwrap(), Parent::Process(pid));
+    if let Parent::Process(parent) = core.parent_pid(pid).unwrap() {
         assert!(super::pipe::creation_time(parent).unwrap().unwrap() <= created);
     }
     child.kill().unwrap();
     child.wait().unwrap();
-    assert_eq!(core.parent_pid(child.id()).unwrap(), None);
+    // An ended process's parent is unknown, never a root.
+    assert!(matches!(
+        core.parent_pid(child.id()).unwrap(),
+        Parent::Unknown(_)
+    ));
     let token = core.launch_nonce().unwrap();
     assert_eq!(token.len(), 32);
     assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));

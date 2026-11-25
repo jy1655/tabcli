@@ -152,10 +152,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   terminal, else the caller's environment (`terminal::select_for`: inside hc Herdr, with the
   platform's own choice as its fallback). `resolve` decides that choice with the provider and
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
-  explicit choice is refused; only an automatic choice that is then Herdr gets the caller
-  check (`terminal::admit_selection`), before title and consent. `doctor` reports the same
-  decision without the caller check (`automatic_surface`), from the adapters'
-  `surface_version_requirement` and the version it read. The common option
+  explicit choice is refused. An automatic choice gets the caller check
+  (`terminal::admit_selection`) once, as soon as it is known to be Herdr, by the rule stated at
+  `resolve_with`, within the request's deadline; nothing is created after that deadline.
+  `doctor` reports the same decision without the caller check (`automatic_surface` and
+  `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
+  (`read_installed_version`). The common option
   validation they share lives in `args.rs`, and `tell` parses through the same option helper
   with the follow-up option set.
 - `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's
