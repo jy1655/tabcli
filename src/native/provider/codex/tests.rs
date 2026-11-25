@@ -554,7 +554,9 @@ fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
 //   warning line, a timestamp on the label's line, a timestamped warning line, another
 //   program's version or a prerelease on its own line) and whatever follows the field
 //   (nothing, another version on its line, another version line);
-// - label absent: one bare word is read as the field; anything longer refuses;
+// - label absent: one bare word is read as the field; a longer text is read as the launch
+//   check of 0.4.48 read it (the first word that parses once its surrounding punctuation and
+//   one leading `v` are removed), whatever program that word belongs to;
 // - label layout: a second label, or a label without a field on its line, refuses.
 #[test]
 fn herdr_version_grammar_reads_only_the_labelled_field() {
@@ -608,20 +610,22 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         }
     };
 
-    // The field, and whether Herdr admits it.
+    // The field; whether Herdr admits it read whole (labelled, or alone); and how the
+    // reading of 0.4.48, which removes surrounding punctuation, takes it in a longer
+    // unlabelled text: admitted, refused, or not a version at all (`None`).
     let fields = [
-        ("0.169.0", true),          // stable, at the floor
-        ("0.170.0", true),          // stable, above the floor
-        ("v0.170.0", true),         // with the optional `v`
-        ("0.170.0+build.1", true),  // build metadata is not a prerelease
-        ("0.168.0", false),         // below the floor
-        ("0.170.0-alpha.1", false), // prerelease
-        ("0.170.0--", false),       // prerelease whose identifier is `-`
-        ("0.170.0+", false),        // malformed: empty build metadata
-        ("0.170.0.", false),        // malformed: trailing punctuation is not removed
-        ("0.170.0-01", false),      // malformed: leading zero in a numeric prerelease
-        ("(0.170.0)", false),       // malformed: brackets are not removed
-        ("unknown", false),         // not a version
+        ("0.169.0", true, Some(true)),           // stable, at the floor
+        ("0.170.0", true, Some(true)),           // stable, above the floor
+        ("v0.170.0", true, Some(true)),          // with the optional `v`
+        ("0.170.0+build.1", true, Some(true)),   // build metadata is not a prerelease
+        ("0.168.0", false, Some(false)),         // below the floor
+        ("0.170.0-alpha.1", false, Some(false)), // prerelease
+        ("0.170.0--", false, Some(true)),        // prerelease `-`; 0.4.48 trims it to 0.170.0
+        ("0.170.0+", false, Some(true)),         // malformed: empty build metadata
+        ("0.170.0.", false, Some(true)),         // malformed: trailing punctuation is kept
+        ("0.170.0-01", false, None),             // malformed: leading zero in a prerelease
+        ("(0.170.0)", false, Some(true)),        // malformed: brackets are kept
+        ("unknown", false, None),                // not a version
     ];
     let before = [
         "",
@@ -637,23 +641,29 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         " (protocol 0.1.0)",
         "\nnode v22.0.0",
     ];
-    for (field, admitted) in fields {
+    for (field, admitted, legacy) in fields {
         for prefix in before {
             for suffix in after {
                 let text = format!("{prefix}codex-cli {field}{suffix}");
                 assert_eq!(admits(&text), admitted, "{text:?}");
             }
         }
-        // Without the label only a text of one word is read.
+        // Without the label one word is read whole, as the field.
         assert_eq!(admits(field), admitted, "{field:?}");
         assert_eq!(admits(&format!("\n{field}\n")), admitted, "{field:?}");
-        for unlabelled in [
-            format!("codex {field}"),
-            format!("OpenAI Codex ({field})"),
-            format!("{field} (runtime 22.0.0)"),
-            format!("node v22.0.0\n{field}"),
+        // A longer unlabelled text is read as 0.4.48 read it: its first word that parses
+        // once trimmed decides, even another program's version (owner's decision,
+        // 2026-11-26).
+        let legacy_admitted = legacy == Some(true);
+        for (unlabelled, expected) in [
+            (format!("codex {field}"), legacy_admitted),
+            (format!("OpenAI Codex ({field})"), legacy_admitted),
+            // Where the field does not parse, `22.0.0` is the first version.
+            (format!("{field} (runtime 22.0.0)"), legacy.unwrap_or(true)),
+            // `v22.0.0` comes first and is read, whatever the field says.
+            (format!("node v22.0.0\n{field}"), true),
         ] {
-            assert!(!admits(&unlabelled), "{unlabelled:?}");
+            assert_eq!(admits(&unlabelled), expected, "{unlabelled:?}");
         }
         // A second label, or a label whose field is on another line, refuses.
         for layout in [
@@ -689,10 +699,17 @@ fn herdr_version_refusals_name_the_rule_that_refused() {
             "{text:?}: {error}"
         );
     }
+    // Unlabelled text of more than one word is read as 0.4.48 read it, and refused only when
+    // none of its words parses; an empty text has no word to read.
     assert_eq!(
-        refusal("OpenAI Codex (v0.170.0)"),
-        "found no `codex-cli` version label in \"OpenAI Codex (v0.170.0)\""
+        herdr_codex_version("OpenAI Codex (v0.170.0)").unwrap(),
+        Version::new(0, 170, 0)
     );
+    assert_eq!(
+        refusal("OpenAI Codex (unknown)"),
+        "could not parse a semantic Codex version from \"OpenAI Codex (unknown)\""
+    );
+    assert_eq!(refusal(""), "found no `codex-cli` version label in \"\"");
     assert_eq!(
         refusal("codex-cli\n0.170.0"),
         "the `codex-cli` label has no version after it on its line in \"codex-cli\\n0.170.0\""

@@ -19,12 +19,18 @@
   before the label (a warning, a timestamp, another program's version) and after the field
   are never read as the version and are only scanned for a second label, so `0.170.0--` is a
   prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
-  refused. Without a label, only a text of one word is read as the field. A second label, a
-  label without a field on its line and longer unlabelled text are refused. Compared with the
-  launch-time check of 0.4.48, which took the first token that parsed once punctuation was
-  trimmed, each rule only refuses more except one: a labelled stable field at or above the
-  floor is admitted even when noise before the label held a version that check would have
-  read first (below the floor or a prerelease).
+  refused. Without a label, a text of one word is read whole as the field, and a longer text
+  as the launch-time check of 0.4.48 read it: the first token that parses once surrounding
+  punctuation and one leading `v` are removed (`codex_version`), so `OpenAI Codex (v0.170.0)`
+  is 0.170.0 and a `node v22.0.0` line before Codex's own is read as 22.0.0. The owner chose
+  that reading over refusing such text (2026-11-26; asked again only if a reason for the strict
+  rule appears): a misread version can only let a Codex below the floor start on Herdr with
+  `--no-daemon`, which a Codex without that option refuses when it starts. A second label, a
+  label without a field on its line, an empty text and unlabelled text in which no token parses
+  are refused. Compared with that 0.4.48 check, labelled text and a one-word text only refuse
+  more (punctuation is not trimmed), except one case: a labelled stable field at or above the
+  floor is admitted even when noise before the label held a version that check would have read
+  first (below the floor or a prerelease).
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases
   wrote and admitted launch records.

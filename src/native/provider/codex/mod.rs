@@ -80,7 +80,8 @@ fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
 // The general probe's reading, which every earlier release also used here: the first token
 // that parses once its surrounding punctuation and one leading `v` are removed. The queue
 // floor, hook eligibility and the diagnostics keep it, because launch records were written
-// and admitted under it; only the Herdr gate reads more strictly (`herdr_codex_version`).
+// and admitted under it; the Herdr gate reads labelled and one-word text more strictly
+// (`herdr_codex_version`) and longer unlabelled text this way.
 fn codex_version(output: &str) -> Result<Version> {
     output
         .split_whitespace()
@@ -108,9 +109,16 @@ fn codex_version(output: &str) -> Result<Version> {
 //   error included, is the answer. Words before the label (a warning line, a timestamp,
 //   another program's version) and words after the field (`(runtime 22.0.0)`, more lines) are
 //   never read as the version; they are only scanned for a second label.
-// - Unlabelled text: read as `version` only when the whole text is one word.
-// - Everything else is refused: a second label, a label without a field on its line, and
-//   unlabelled text of more than one word.
+// - Unlabelled text of one word: read as `version`.
+// - Unlabelled text of more than one word: read as the launch check of 0.4.48 read it
+//   (`codex_version`: the first word that parses once its surrounding punctuation and one
+//   leading `v` are removed), so `OpenAI Codex (v0.170.0)` reads 0.170.0. That word can
+//   belong to another program (`node v22.0.0` on a line before Codex's own). The owner chose
+//   this reading over refusing such text (2026-11-26): a misread version can only let a Codex
+//   below the floor start on Herdr with `--no-daemon`, which a Codex without that option
+//   refuses when it starts.
+// - Everything else is refused: a second label, a label without a field on its line, an
+//   empty text, and unlabelled text in which no word parses.
 //
 // `codex-cli X.Y.Z` is the only `--version` output this repository records for Codex (the
 // fixtures in tests/doctor.rs, tests/context_result.rs and tests/native_policy.rs, and
@@ -137,8 +145,9 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
         [Some(field)] => *field,
         [None] => bail!("the `{LABEL}` label has no version after it on its line in {output:?}"),
         [] => match lines.concat().as_slice() {
+            [] => bail!("found no `{LABEL}` version label in {output:?}"),
             [word] => *word,
-            _ => bail!("found no `{LABEL}` version label in {output:?}"),
+            _ => return codex_version(output),
         },
         _ => bail!("found the `{LABEL}` label more than once in {output:?}"),
     };

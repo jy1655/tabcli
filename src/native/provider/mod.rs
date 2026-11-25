@@ -571,6 +571,9 @@ mod tests {
                     ("codex-cli 0.168.0- (protocol 1.0.0)", false),
                     ("codex-cli 0.169.0", true),
                     ("codex-cli 0.170.0", true),
+                    // Unlabelled text of several words is read as 0.4.48 read it.
+                    ("OpenAI Codex (v0.170.0)", true),
+                    ("OpenAI Codex (v0.168.0)", false),
                     ("unknown", false),
                 ] {
                     let version_refused = !cfg!(windows)
