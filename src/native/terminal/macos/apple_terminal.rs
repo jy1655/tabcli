@@ -398,6 +398,7 @@ fn close_owned_session(
     )
 }
 
+#[cfg(test)]
 fn close_session_until(
     automation: &dyn Automation,
     session: &TerminalSession,
@@ -406,6 +407,7 @@ fn close_session_until(
     close_session_with(session, automation, Some(deadline))
 }
 
+#[cfg(test)]
 fn close_session_with(
     session: &TerminalSession,
     automation: &dyn Automation,
@@ -835,6 +837,7 @@ where
         )?;
         applescript::guarded_answer(&answer)
     }
+    #[cfg(test)]
     fn close_session_until(
         &self,
         _directory: &Path,

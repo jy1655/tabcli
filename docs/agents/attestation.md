@@ -14,6 +14,11 @@
   surface. A changed control identity (controlling TTY, process groups) of a live incarnation is
   not a death. A second observation of the same pid is checked against the attested incarnation
   before its control fields are compared; a later snapshot with another birth is reuse (#190).
+- Existing Windows Repair treats Gone from exit or reuse the same, even for an unbound or
+  foreign owner record. The surface adapter supplies independent proof over the claimed handle
+  before Close. The ordinary macOS and Linux dead-owner Close requires an exited, bound owner
+  with complete recorded control. The platform differences carry forward 0.4.48 behavior and
+  still await owner confirmation (architecture round 17, card 01).
 - Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner

@@ -560,8 +560,7 @@ fn close_deadline_repair_after_slow_owner_observation_does_not_settle() {
             );
             Ok(false)
         },
-        |_| false,
-        |_| panic!("expired repair must not close"),
+        RepairSurfaces::Windows(&mut |_| panic!("expired repair must not close")),
         deadline,
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
@@ -1103,22 +1102,16 @@ fn attestation_unknown_preserves_completion_damage_and_claim_without_closing() {
         .unwrap();
     let before = store.record(CoreRecord::Status).bytes().unwrap();
     let observed = std::cell::Cell::new(false);
-    let error = repair_dead_owner_with(
-        &store,
-        |_| {
-            observed.set(true);
-            // Recovery has already tried publication and retained the damaged journal.
-            assert!(store.record(CoreRecord::Completion).path().exists());
-            repair_owner_is_live(&OwnerAttestation {
-                process: ProcessObservation::Unknown("inspection denied".into()),
-                control: super::super::owner::ControlAttestation::NotRecorded,
-                pid_alive: Some(true),
-            })
-        },
-        |_| false,
-        |_| panic!("unknown grants no close authority"),
-        budget::close_deadline(),
-    )
+    let error = repair_dead_owner_attested_with(&store, |_| {
+        observed.set(true);
+        // Recovery has already tried publication and retained the damaged journal.
+        assert!(store.record(CoreRecord::Completion).path().exists());
+        OwnerAttestation {
+            process: ProcessObservation::Unknown("inspection denied".into()),
+            control: super::super::owner::ControlAttestation::NotRecorded,
+            pid_alive: Some(true),
+        }
+    })
     .unwrap_err();
     assert!(observed.get());
     assert!(error.to_string().contains("inspection denied"));
@@ -1320,15 +1313,10 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
             repair_dead_owner_with(
                 &Store::open_unchecked(directory.path()),
                 |owner| repair_owner_is_live(&attest_owner(owner)),
-                terminal::surface_outlives_owner,
-                |surface| terminal::ownership::close_dead_owner_surface_with(
-                    surface,
-                    &mut (|session: &terminal::TerminalSession| {
-                        assert_eq!(session.kind, terminal::TerminalKind::WindowsConsole);
-                        Ok(terminal::CloseOutcome::Missing)
-                    }),
-                    budget::close_deadline()
-                ),
+                RepairSurfaces::Windows(&mut |surface| {
+                    assert_eq!(surface.kind, terminal::TerminalKind::WindowsConsole);
+                    Ok(terminal::CloseOutcome::Missing)
+                }),
                 budget::close_deadline()
             )
             .unwrap()
@@ -1357,9 +1345,9 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
-fn dead_owner_repair_retains_unreadable_surface_identity() {
+fn windows_repair_retains_unreadable_surface_identity() {
     for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-damaged");
@@ -1372,8 +1360,9 @@ fn dead_owner_repair_retains_unreadable_surface_identity() {
         let result = repair_dead_owner_with(
             &store,
             |_| Ok(false),
-            terminal::surface_outlives_owner,
-            |_| panic!("an unreadable handle grants no close authority"),
+            RepairSurfaces::Windows(&mut |_| {
+                panic!("an unreadable handle grants no close authority")
+            }),
             budget::close_deadline(),
         );
         assert!(result.is_err(), "repair accepted a damaged {name}");
@@ -1381,6 +1370,34 @@ fn dead_owner_repair_retains_unreadable_surface_identity() {
         assert_eq!(store.status().unwrap().state, SessionState::Exited);
         assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists());
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-foreign-surface");
+    fs::create_dir(&directory).unwrap();
+    write_owned_terminal_state(&directory, "working", std::process::id());
+    let store = Store::open_unchecked(&directory);
+    let surface = terminal::TerminalSession::new(terminal::TerminalKind::Iterm2, "foreign".into());
+    let record = store.record(CoreRecord::Terminal);
+    record.write_json(&surface).unwrap();
+    let before = record.bytes().unwrap();
+    let error = repair_dead_owner_with(
+        &store,
+        |_| Ok(false),
+        RepairSurfaces::Windows(&mut |_| panic!("a foreign surface must never reach an adapter")),
+        budget::close_deadline(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("dead Windows native owner has a non-Windows terminal handle")
+    );
+    assert_eq!(record.bytes().unwrap(), before);
+    assert_eq!(store.status().unwrap().state, SessionState::Working);
+    assert!(store.closed_if_present().unwrap().is_none());
 }
 
 // A Windows Herdr terminal outlives its native owner. A dead owner's repair never takes the
@@ -1410,19 +1427,12 @@ fn a_dead_owners_windows_herdr_terminal_is_retained_until_its_core_closes_it() {
             repair_dead_owner_with(
                 &store,
                 |_| Ok(false),
-                terminal::surface_outlives_owner,
-                |surface| {
-                    terminal::ownership::close_dead_owner_surface_with(
-                        surface,
-                        |session: &terminal::TerminalSession| {
-                            assert_eq!(session.kind, terminal::TerminalKind::Herdr);
-                            assert_eq!(session.id, "t7");
-                            calls.set(calls.get() + 1);
-                            close()
-                        },
-                        budget::close_deadline(),
-                    )
-                },
+                RepairSurfaces::Windows(&mut |surface| {
+                    assert_eq!(surface.kind, terminal::TerminalKind::Herdr);
+                    assert_eq!(surface.id, "t7");
+                    calls.set(calls.get() + 1);
+                    close()
+                }),
                 budget::close_deadline(),
             )
         };
@@ -1466,8 +1476,9 @@ fn a_dead_owners_windows_herdr_terminal_is_retained_until_its_core_closes_it() {
             repair_dead_owner_with(
                 &store,
                 |_| Ok(false),
-                terminal::surface_outlives_owner,
-                |_| panic!("an ended console session needs no helper"),
+                RepairSurfaces::Windows(&mut |_| panic!(
+                    "an ended console session needs no helper"
+                )),
                 budget::close_deadline(),
             )
             .unwrap()
@@ -1503,20 +1514,16 @@ fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
         // Repair does not stop at that damage: the owner is dead, so the session is
         // closed, which settles the journal the way every close settles a journal with
         // no event to verify, and the damage is reported in the close error.
-        if state == "working" && cfg!(windows) {
+        #[cfg(windows)]
+        if state == "working" {
             assert!(
                 repair_dead_owner_with(
                     &Store::open_unchecked(&directory),
                     |owner| repair_owner_is_live(&attest_owner(owner)),
-                    terminal::surface_outlives_owner,
-                    |surface| terminal::ownership::close_dead_owner_surface_with(
-                        surface,
-                        &mut (|session: &terminal::TerminalSession| {
-                            assert_eq!(session.kind, terminal::TerminalKind::WindowsConsole);
-                            Ok(terminal::CloseOutcome::Missing)
-                        }),
-                        budget::close_deadline()
-                    ),
+                    RepairSurfaces::Windows(&mut |surface| {
+                        assert_eq!(surface.kind, terminal::TerminalKind::WindowsConsole);
+                        Ok(terminal::CloseOutcome::Missing)
+                    }),
                     budget::close_deadline()
                 )
                 .unwrap(),
@@ -2551,17 +2558,18 @@ fn repair_attests_an_owner_record_whatever_session_it_names() {
         )
         .unwrap();
         let attested = std::cell::RefCell::new(Vec::new());
-        let repaired = repair_dead_owner_with(
-            &Store::open_unchecked(directory.path()),
-            |owner| {
+        let repaired =
+            repair_dead_owner_attested_with(&Store::open_unchecked(directory.path()), |owner| {
                 attested.borrow_mut().push(owner.managed_session_id.clone());
-                Ok(true)
-            },
-            |_| panic!("a live owner retains nothing"),
-            |_| panic!("a live owner's surface is not closed"),
-            budget::close_deadline(),
-        )
-        .unwrap();
+                OwnerAttestation {
+                    process: ProcessObservation::Live(
+                        crate::native::process_identity::Attested::PidOnly,
+                    ),
+                    control: super::super::owner::ControlAttestation::NotRecorded,
+                    pid_alive: Some(true),
+                }
+            })
+            .unwrap();
         assert!(!repaired, "{binding:?}");
         assert_eq!(attested.into_inner(), [binding.map(str::to_owned)]);
     }
@@ -2656,14 +2664,7 @@ fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_ow
             !repair_dead_owner_with(
                 &Store::open_unchecked(directory.path()),
                 |owner| repair_owner_is_live(&attest_owner(owner)),
-                terminal::surface_outlives_owner,
-                |surface| terminal::ownership::close_dead_owner_surface_with(
-                    surface,
-                    &mut (|_: &terminal::TerminalSession| {
-                        panic!("{case}: absent or invalid intent grants no adapter authority")
-                    }),
-                    budget::close_deadline()
-                ),
+                RepairSurfaces::Posix,
                 budget::close_deadline()
             )
             .unwrap(),

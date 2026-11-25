@@ -2005,6 +2005,7 @@ impl<R: WarpRunner> MacTerminalAdapter for Adapter<R> {
         surface_present(&mut *self.runner(), directory, session, timeout)
     }
     // Screen reads and guarded dialog input are declared unsupported in the registration.
+    #[cfg(test)]
     fn close_session_until(
         &self,
         directory: &Path,

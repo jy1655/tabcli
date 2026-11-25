@@ -7,11 +7,9 @@ use crate::native::process_identity::{Gone, ProcessObservation};
 use crate::native::session::Store;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 use crate::native::session::{self, CoreRecord, SessionState};
-use crate::native::terminal::close_authority::{
-    close_owned_surface_with, test_support::TestObservation,
-};
+use crate::native::terminal::close_authority::{CloseObservation, Production};
 use crate::native::terminal::ownership::NativeSessionOwner;
-use crate::native::terminal::posix::PosixTerminalAdapter;
+use crate::native::terminal::posix::{self, PosixTerminalAdapter};
 
 fn gone(gone: Gone) -> OwnerAttestation {
     OwnerAttestation {
@@ -44,10 +42,33 @@ fn dead_owner() -> NativeSessionOwner {
     }
 }
 
+impl posix::Adapters for Adapter<FakeCore> {
+    fn adapter(&self, kind: TerminalKind) -> Result<&dyn PosixTerminalAdapter> {
+        assert_eq!(kind, TerminalKind::Herdr);
+        Ok(self)
+    }
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     directory: PathBuf,
     core: FakeCore,
+}
+
+#[test]
+#[should_panic(expected = "scripted Herdr dead-owner Close cannot verify live ownership")]
+fn scripted_dead_owner_close_refuses_the_installed_ownership_probe() {
+    let fixture = Fixture::new();
+    // A foreign binding makes the old ownership probe return before contacting any core.
+    let surface = fixture
+        .store()
+        .terminal()
+        .unwrap()
+        .with_binding(Some("session-foreign".into()));
+    let adapters = Adapter::with_core(fixture.core.clone());
+    let observation = Production::new(&fixture.directory, SESSION, &surface, later())
+        .with_posix_dead_owner_observations(&adapters, &|_| gone(Gone::Exited), &|_| false);
+    let _ = observation.ownership_proof();
 }
 
 impl Fixture {
@@ -87,40 +108,15 @@ impl Fixture {
 
     /// `tabcli close-session --explicit` with the dead owner observed as `owner`.
     fn close(&self, owner: fn() -> OwnerAttestation, pid_alive: bool) -> Result<CloseOutcome> {
-        session::close::close_with_attestation(
-            &self.store(),
-            None,
-            session::close::budget::close_deadline(),
-            |_| owner(),
-            |surface| {
-                let deadline = session::close::budget::close_deadline();
-                let observation =
-                    TestObservation::on_records(&self.directory, SESSION, surface, deadline)
-                        .with_presence(|| {
-                            Adapter::with_core(self.core.clone()).present(
-                                &self.directory,
-                                surface,
-                                Duration::from_secs(1),
-                            )
-                        })
-                        .with_pid_alive(|_| pid_alive)
-                        .with_posix_owner_live(|_| owner());
-                close_owned_surface_with(
-                    || observation.decide(SESSION, surface, deadline),
-                    || panic!("a dead owner is never torn down"),
-                    |close| {
-                        Adapter::with_core(self.core.clone()).close_owned_session(
-                            &self.directory,
-                            SESSION,
-                            surface,
-                            close,
-                            deadline,
-                        )
-                    },
-                    deadline,
-                )
-            },
-        )
+        let deadline = session::close::budget::close_deadline();
+        let observe = |_: &NativeSessionOwner| owner();
+        let pid_is_alive = |_| pid_alive;
+        let adapters = Adapter::with_core(self.core.clone());
+        session::close::close_with_attestation(&self.store(), None, deadline, observe, |surface| {
+            Production::new(&self.directory, SESSION, surface, deadline)
+                .with_posix_dead_owner_observations(&adapters, &observe, &pid_is_alive)
+                .close_posix_surface()
+        })
     }
 
     fn close_dead(&self) -> Result<CloseOutcome> {

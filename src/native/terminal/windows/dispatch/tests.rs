@@ -167,6 +167,17 @@ fn each_windows_kind_reaches_only_its_own_adapter() {
     );
 }
 
+#[test]
+fn expired_close_reaches_no_windows_adapter() {
+    let dispatch = recording_dispatch();
+    let session = TerminalSession::new(TerminalKind::Herdr, "t7".into());
+    let error =
+        close_session_until(&dispatch, Path::new("unused"), &session, Instant::now()).unwrap_err();
+    assert!(error.to_string().contains("close deadline expired"));
+    assert!(dispatch.console.calls().is_empty());
+    assert!(dispatch.herdr.calls().is_empty());
+}
+
 // A handle of a kind that Windows does not run (a record can name another platform) stays
 // with the managed console, as before the lookup: the console's open gets the asked kind and
 // refuses it (a Windows test pins that refusal), and its helper refuses the handle (no test

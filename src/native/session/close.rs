@@ -15,6 +15,8 @@ use crate::native::session::turn::{
 };
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
+pub(in crate::native) use crate::native::terminal::close_authority::owner_exit::repair_owner_is_live;
+use crate::native::terminal::close_authority::owner_exit::{RepairSurface, RepairSurfaces};
 use crate::native::terminal::ownership::NativeSessionOwner;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::OwnerBinding;
@@ -30,14 +32,6 @@ use std::{
 
 pub(in crate::native) fn prune_blocked_by(a: &OwnerAttestation) -> bool {
     !matches!(a.process, ProcessObservation::Gone(_))
-}
-
-pub(in crate::native) fn repair_owner_is_live(a: &OwnerAttestation) -> Result<bool> {
-    match &a.process {
-        ProcessObservation::Live(_) => Ok(true),
-        ProcessObservation::Gone(_) => Ok(false),
-        ProcessObservation::Unknown(reason) => bail!("{reason}"),
-    }
 }
 
 /// The stored states in which dead-owner repair examines the owner record; in any other
@@ -369,21 +363,7 @@ pub(in crate::native) fn close_with_attestation(
     close_with_repair(
         store,
         reason,
-        || {
-            repair_dead_owner_with(
-                store,
-                |owner| repair_owner_is_live(&observe(owner)),
-                terminal::surface_outlives_owner,
-                |surface| {
-                    terminal::ownership::close_dead_owner_surface_until(
-                        store.directory(),
-                        surface,
-                        deadline,
-                    )
-                },
-                deadline,
-            )
-        },
+        || repair_dead_owner_attested_until(store, observe, deadline),
         closer,
         deadline,
     )
@@ -814,23 +794,34 @@ pub(in crate::native) fn repair_dead_owner(store: &Store) -> Result<bool> {
 }
 
 pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instant) -> Result<bool> {
-    repair_dead_owner_with(
-        store,
-        |owner| repair_owner_is_live(&attest_owner(owner)),
-        terminal::surface_outlives_owner,
-        |surface| {
-            terminal::ownership::close_dead_owner_surface_until(
-                store.directory(),
-                surface,
-                deadline,
-            )
-        },
-        deadline,
-    )
+    repair_dead_owner_attested_until(store, attest_owner, deadline)
 }
 
-/// Repair's decision over the session's records with the owner attested by `attest`: what a
-/// prediction of Repair is compared with. A dead owner's surface is never closed here.
+fn repair_dead_owner_attested_until(
+    store: &Store,
+    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    deadline: Instant,
+) -> Result<bool> {
+    #[cfg(windows)]
+    return repair_dead_owner_windows_with(store, attest, terminal::windows_installed(), deadline);
+
+    #[cfg(not(windows))]
+    {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let surfaces = RepairSurfaces::Posix;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let surfaces = RepairSurfaces::Unsupported;
+        repair_dead_owner_with(
+            store,
+            |owner| repair_owner_is_live(&attest(owner)),
+            surfaces,
+            deadline,
+        )
+    }
+}
+
+/// Repair parity for fixtures that record no surface. POSIX close intents are retained,
+/// and a surface at settlement is an error.
 #[cfg(test)]
 pub(in crate::native) fn repair_dead_owner_attested_with(
     store: &Store,
@@ -839,27 +830,41 @@ pub(in crate::native) fn repair_dead_owner_attested_with(
     repair_dead_owner_with(
         store,
         |owner| repair_owner_is_live(&attest(owner)),
-        |_| false,
-        |_| bail!("a parity row records no surface"),
+        RepairSurfaces::WithoutSurface,
         budget::close_deadline(),
     )
 }
 
-fn repair_dead_owner_with<F>(
+#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+pub(in crate::native) fn repair_dead_owner_windows_with(
+    store: &Store,
+    attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    adapters: &dyn terminal::windows_dispatch::Adapters,
+    deadline: Instant,
+) -> Result<bool> {
+    let mut close = |surface: &terminal::TerminalSession| {
+        terminal::windows_dispatch::close_session_until(
+            adapters,
+            store.directory(),
+            surface,
+            deadline,
+        )
+    };
+    repair_dead_owner_with(
+        store,
+        |owner| repair_owner_is_live(&attest(owner)),
+        RepairSurfaces::Windows(&mut close),
+        deadline,
+    )
+}
+
+fn repair_dead_owner_with(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
-    retain_surface: impl Fn(&terminal::TerminalSession) -> bool,
-    mut close_terminal: F,
-    deadline: std::time::Instant,
-) -> Result<bool>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-{
+    surfaces: RepairSurfaces<'_>,
+    deadline: Instant,
+) -> Result<bool> {
     let directory = store.directory();
-    #[cfg(not(windows))]
-    let _ = (&mut close_terminal, deadline);
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = &retain_surface;
     // Completion recovery runs first so a live owner's finished turn is published before
     // anything else is decided. Its failure is damage (a missing `events/`, a journal
     // whose event cannot be compared), not a reason to leave a dead owner's session
@@ -900,88 +905,23 @@ where
         repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
     }
     let repair_error = Some(repair_error);
-    #[cfg(windows)]
-    {
-        // A Herdr terminal outlives its owner: the core keeps it, finished, until it is
-        // removed, and the owner's death proves nothing about it. Its handle is closed
-        // through the verified core, as a running console is, and retained when that close
-        // fails. A console ends with its root, so an ended session needs no helper.
-        let herdr = retains_windows_herdr_handle(store)?;
-        if matches!(status.state, SessionState::Exited | SessionState::Failed) && !herdr {
-            crate::native::session::close::budget::close_remaining(deadline)?;
-            mark_session_closed(store, repair_error)?;
-            return Ok(true);
-        }
-        // The visible console root can outlive a failed native-session owner. Reuse the same
-        // atomic terminal-handle claim as explicit close so concurrent repair callers cannot
-        // perform the external close side effect twice.
-        close_session_state_with_error(
-            store,
-            repair_error,
-            |surface| close_terminal(surface).map(Into::into),
-            deadline,
-        )
-        .context(if herdr {
-            "failed to close a Herdr terminal whose native owner exited; its handle is retained"
-        } else {
-            "failed to close a Windows console whose native owner exited"
-        })?;
-        Ok(true)
-    }
-    #[cfg(not(windows))]
-    {
-        // An explicit close that began its teardown still has to close the surface or
-        // prove it absent. Even a damaged/mismatched intent must preserve that pending
-        // cleanup: it grants no authority, but is not evidence of a vanished surface.
-        // The explicit close validates the full intent before using it as authority.
+    match surfaces.decide(store, &status.state, deadline)? {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if store
-            .record(CoreRecord::TerminalCloseIntent)
-            .bytes()?
-            .is_some()
-        {
-            return untouched(recovery_damage);
-        }
-        // A native owner ending on its own does not prove that a terminal window
-        // disappeared. Keep the exact handle for the affected macOS adapters even
-        // before a first explicit close. This gives no authority to send a close:
-        // the normal live-owner/previous-intent checks must still pass.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-            if let Some(bytes) = store.record(record).bytes()? {
-                let surface: terminal::TerminalSession = super::record::terminal_bytes(&bytes)
-                    .with_context(|| {
-                        format!("invalid retained terminal handle {}", record.name())
-                    })?;
-                if retain_surface(&surface) {
-                    return untouched(recovery_damage);
-                }
-            }
-        }
-        mark_session_closed(store, repair_error)?;
-        Ok(true)
-    }
-}
-
-// Whether the session still holds a Herdr handle, active or claimed by an interrupted close.
-// A damaged handle might name a Herdr terminal. Keep the records until the surface can
-// be identified; an exited owner does not prove that the terminal is gone.
-#[cfg(windows)]
-fn retains_windows_herdr_handle(store: &Store) -> Result<bool> {
-    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-        if let Some(bytes) = store.record(record).bytes()? {
-            let surface = super::record::terminal_bytes(&bytes).with_context(|| {
-                format!(
-                    "cannot identify the retained terminal handle {}",
-                    record.name()
-                )
-            })?;
-            if surface.kind == terminal::TerminalKind::Herdr {
-                return Ok(true);
-            }
+        RepairSurface::Retain => return untouched(recovery_damage),
+        RepairSurface::Settle => mark_session_closed(store, repair_error)?,
+        RepairSurface::CloseOnWindows(mut close) => {
+            // Reuse the explicit-close claim so an interrupted attempt can be resumed
+            // and concurrent repair cannot close the same surface twice.
+            close_session_state_with_error(
+                store,
+                repair_error,
+                |surface| close.close(surface, deadline).map(Into::into),
+                deadline,
+            )
+            .context(close.failure_context())?;
         }
     }
-    Ok(false)
+    Ok(true)
 }
 
 #[cfg(test)]

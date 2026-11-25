@@ -830,7 +830,7 @@ fn end_and_remove(
 fn close_until(
     core: &dyn Core,
     session: &TerminalSession,
-    directory: Option<&Path>,
+    directory: &Path,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     close_remaining(deadline)?;
@@ -889,7 +889,7 @@ fn surface_present(
     timeout: Duration,
 ) -> Result<bool> {
     let deadline = deadline_after(timeout)?;
-    Ok(Recorded::open(core, session, Requirement::Bound(Some(directory)), deadline)?.is_some())
+    Ok(Recorded::open(core, session, Requirement::Bound(directory), deadline)?.is_some())
 }
 
 fn verify_surface(
@@ -1095,7 +1095,7 @@ impl<C: Core> Adapter<C> {
             |startup_deadline| create(&self.core, command, directory, startup_deadline, deadline),
             |_, _| Ok(()),
             |session, deadline| {
-                close_until(&self.core, session, Some(directory), deadline)
+                close_until(&self.core, session, directory, deadline)
                     .map(|_| ())
                     .map_err(|error| {
                         retain_unremoved(
@@ -1153,7 +1153,7 @@ impl<C: Core> Adapter<C> {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_until(&self.core, session, Some(directory), deadline)
+        close_until(&self.core, session, directory, deadline)
     }
 }
 
@@ -1218,6 +1218,7 @@ mod posix_adapter {
             self.screen(session, deadline)
         }
         // Guarded dialog input is declared unsupported in the registration.
+        #[cfg(test)]
         fn close_session_until(
             &self,
             directory: &Path,
@@ -1288,16 +1289,21 @@ mod windows_adapter {
     };
 
     impl<C: Core> WindowsTerminalAdapter for Adapter<C> {
-        // The lookup hands this adapter Herdr handles only.
         fn open_bound_tab(
             &self,
-            _kind: TerminalKind,
+            kind: TerminalKind,
             command: &str,
             directory: &Path,
             deadline: Instant,
             bind: BindSurface<'_>,
             unbind: UnbindSurface<'_>,
         ) -> Result<TerminalSession> {
+            if kind != TerminalKind::Herdr {
+                anyhow::bail!(
+                    "the Windows Herdr adapter cannot open {}",
+                    kind.display_name()
+                );
+            }
             self.open(command, directory, deadline, bind, unbind)
         }
         fn send_file(

@@ -90,8 +90,10 @@
   checked against the recorded creation and program again, so a terminal set to keep or
   running a replacement in between is left alone and its handle retained. A close whose kill
   reply was lost fails instead of repeating it, and the next close finishes from what it
-  reads (a finished terminal is only removed). On macOS and Linux, when the owner has already exited without a
-  close intent, explicit close verifies its bound identity and reads the exact finished,
+  reads (a finished terminal is only removed). Herdr's registration declares that its core
+  retains a finished terminal. `terminal::close_authority::owner_exit` uses that fact for
+  both platform policies. On macOS and Linux, Repair preserves the handle. For the ordinary
+  explicit close after the owner has exited, TAB verifies its bound identity and reads the exact finished,
   unkept terminal again. It checks the launch label, sends one `terminal.rm`, and confirms
   absence on that core. It never sends `terminal.kill` on this path. Handles created by
   0.4.45 and 0.4.46 omit the nonce; for those, the original identity checks also require the
@@ -185,17 +187,22 @@
 - The Windows ownership proof checks the Herdr terminal on its core, then the owner's process
   identity. The owner's death proves nothing about the terminal: a dead owner's repair, in any
   repairable state, closes the exact Herdr handle through the verified core under the close
-  transaction's claim. It may end a live, identity-verified launch host. A close that fails (no core, another core, a changed terminal)
+  transaction's claim. It uses ordinary Herdr close, which may end a live, identity-verified
+  launch host and can remove a finished terminal without a launch-label comparison. A close
+  that fails (no core, another core, a changed terminal)
   restores the handle and leaves state and claim for the next close. Only the core's
   `not_found` proves the terminal gone. A console's ended session still settles from its records.
+  The differences from macOS and Linux carry forward 0.4.48 behavior and still await owner
+  confirmation (architecture round 17, card 01).
 - The PowerShell `attach_command` sets `HC_SOCKET` in its own script block and restores the
   earlier value (or its absence) in `finally`, so later commands keep their own core.
 - Windows tests: endpoint resolution, the shared framing, the adapters' surface answers and the
   Windows lookup's routing and declared refusals over recording adapters run on every
   platform; the lookup over the Herdr adapter on a scripted core runs on macOS, Linux and
-  Windows; the pipe transport (a real pipe of
-  this user), process births, parents, tokens, the installed lookup against an absent pipe,
-  the directory admission, the dead-owner repair, the attach line under PowerShell 7 and the
+  Windows, including Repair with a scripted owner observation and the real close transaction.
+  The pipe transport (a real pipe of this user), process births, parents, tokens, the installed
+  lookup against an absent pipe, the directory admission, the Windows-only Repair tests,
+  the attach line under PowerShell 7 and the
   binding wait run on the Windows CI runner. Live (reported by the
   verification session, 2026-11-18): the Windows PR head (505f0e7) passed the five native
   Windows self-test steps with Pi 1.5.0 on hc 0.1.21, Windows 11 x64, as a standard desktop

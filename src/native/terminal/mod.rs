@@ -18,14 +18,9 @@ pub(super) const fn facts(kind: TerminalKind) -> facts::SurfaceFacts {
     kind.registration().facts
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    return facts(session.kind).outlives_owner;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = session;
-        false
-    }
+    close_authority::owner_exit::outlives_owner(session.kind)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -92,11 +87,11 @@ mod macos_selection;
 pub(in crate::native) mod windows_budget;
 #[cfg(any(windows, test))]
 #[path = "windows/dispatch.rs"]
-mod windows_dispatch;
+pub(in crate::native) mod windows_dispatch;
 
 /// The installed Windows lookup: the managed console and Herdr.
 #[cfg(windows)]
-fn windows_installed() -> &'static dyn windows_dispatch::Adapters {
+pub(super) fn windows_installed() -> &'static dyn windows_dispatch::Adapters {
     &windows::INSTALLED
 }
 
@@ -652,11 +647,16 @@ pub(super) fn verify_windows_surface(
     windows_dispatch::verify_surface(windows_installed(), session, timeout)
 }
 
+#[cfg(any(
+    all(test, target_os = "macos"),
+    not(any(target_os = "macos", target_os = "linux"))
+))]
 pub(super) fn close_session_until(
     directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    #[cfg(not(windows))]
     crate::native::session::close::budget::close_remaining(deadline)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -873,11 +873,10 @@ mod tests {
         );
     }
 
-    // The Windows ownership proof checks a Herdr terminal on its core before the owner, as
-    // macOS and Linux do; a dead owner's Herdr handle may be closed like a console's.
+    // The Windows ownership proof checks a Herdr terminal on its core before the owner.
     #[cfg(windows)]
     #[test]
-    fn windows_herdr_ownership_proves_the_terminal_and_allows_a_dead_owner_close() {
+    fn windows_herdr_ownership_proves_the_terminal_before_the_owner() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-herdr");
         std::fs::create_dir(&directory).unwrap();
@@ -892,25 +891,6 @@ mod tests {
         assert!(
             format!("{error:#}").contains("no Herdr Core is running"),
             "{error:#}"
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        assert_eq!(
-            super::ownership::close_dead_owner_surface_with(
-                &handle,
-                |_| Ok(super::CloseOutcome::Closed),
-                deadline,
-            )
-            .unwrap(),
-            super::CloseOutcome::Closed
-        );
-        let foreign = TerminalSession::new(TerminalKind::Iterm2, "x".into());
-        assert!(
-            super::ownership::close_dead_owner_surface_with(
-                &foreign,
-                |_| panic!("a foreign handle is never closed"),
-                deadline,
-            )
-            .is_err()
         );
     }
 

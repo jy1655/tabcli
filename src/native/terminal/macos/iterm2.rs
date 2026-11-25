@@ -630,6 +630,7 @@ impl<R: Automation> MacTerminalAdapter for Adapter<R> {
         )?;
         applescript::guarded_answer(&answer)
     }
+    #[cfg(test)]
     fn close_session_until(
         &self,
         _directory: &Path,

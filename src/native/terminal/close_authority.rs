@@ -20,8 +20,6 @@ use super::ownership::{
 use super::posix::OwnedSurfaceClose;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::posix_ownership::verified_posix_terminal_owner;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::native::process_identity::Gone;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::process_identity::ProcessObservation;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -40,6 +38,7 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 use std::{path::Path, time::Instant};
 
+pub(in crate::native) mod owner_exit;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
 
@@ -112,6 +111,14 @@ pub(in crate::native) struct Production<'a> {
     expected_session_id: &'a str,
     session: &'a TerminalSession,
     deadline: Instant,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    posix_adapters: &'a dyn terminal::posix::Adapters,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    observe_owner: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pid_is_alive: &'a dyn Fn(u32) -> bool,
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    scripted_dead_owner: bool,
 }
 
 impl<'a> Production<'a> {
@@ -126,7 +133,39 @@ impl<'a> Production<'a> {
             expected_session_id,
             session,
             deadline,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            posix_adapters: terminal::posix_installed(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            observe_owner: &attest_owner,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            pid_is_alive: &process_is_alive,
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            scripted_dead_owner: false,
         }
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(in crate::native::terminal) fn with_posix_dead_owner_observations(
+        mut self,
+        adapters: &'a dyn terminal::posix::Adapters,
+        observe: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
+        pid_is_alive: &'a dyn Fn(u32) -> bool,
+    ) -> Self {
+        // Herdr's presence evidence does not probe an app or host incarnation.
+        assert_eq!(self.session.kind, terminal::TerminalKind::Herdr);
+        self.posix_adapters = adapters;
+        self.observe_owner = observe;
+        self.pid_is_alive = pid_is_alive;
+        self.scripted_dead_owner = true;
+        self
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    fn require_installed_observation(&self, operation: &str) {
+        assert!(
+            !self.scripted_dead_owner,
+            "scripted Herdr dead-owner Close cannot {operation}"
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -176,6 +215,16 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn resumable(&self) -> Result<bool> {
+        #[cfg(test)]
+        if self.scripted_dead_owner {
+            // Keep the Record reads. Refuse before an exact intent can inspect a real owner.
+            return session::close::terminal_close_resumable_with(
+                &self.reader(),
+                self.session,
+                terminal::surface_outlives_owner(self.session),
+                |_| panic!("scripted Herdr dead-owner Close cannot attest a resumable Close"),
+            );
+        }
         session::close::terminal_close_resumable(
             &self.reader(),
             self.session,
@@ -184,14 +233,21 @@ impl CloseObservation for Production<'_> {
     }
 
     fn surface_present(&self) -> Result<bool> {
-        terminal::surface_present(
+        let remaining = close_remaining(self.deadline)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return terminal::posix::surface_present(
+            self.posix_adapters,
             self.directory,
             self.session,
-            close_remaining(self.deadline)?,
-        )
+            remaining,
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        terminal::surface_present(self.directory, self.session, remaining)
     }
 
     fn ownership_proof(&self) -> Result<()> {
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        self.require_installed_observation("verify live ownership");
         verify_terminal_surface_ownership_with_timeout(
             self.directory,
             self.expected_session_id,
@@ -202,27 +258,34 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return (self.observe_owner)(owner);
+        #[cfg(windows)]
         attest_owner(owner)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool {
-        process_is_alive(pid)
+        (self.pid_is_alive)(pid)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn posix_owner_live(&self, owner: &NativeSessionOwner) -> OwnerAttestation {
-        attest_owner(owner)
+        (self.observe_owner)(owner)
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn attest_owner(&self) -> Result<()> {
+        #[cfg(test)]
+        self.require_installed_observation("verify the live owner");
         verified_posix_terminal_owner(self.directory, self.expected_session_id, self.session, None)
             .map(|_| ())
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn group_gone(&self, group: u32) -> Result<bool> {
+        #[cfg(test)]
+        self.require_installed_observation("probe the owner's process group");
         owner_group_gone(group)
     }
 
@@ -343,42 +406,14 @@ pub(in crate::native) fn decide(
                     _ => {}
                 }
                 if matches!(attestation.process, ProcessObservation::Gone(_)) {
-                    session.verify_managed_session(expected_session_id)?;
-                    // A reused PID grants neither mutation nor absence authority. The
-                    // original owner's complete binding is required even for a query.
-                    if matches!(
+                    return owner_exit::explicit_close(
+                        observation,
+                        expected_session_id,
+                        session,
+                        &owner,
                         attestation.process,
-                        ProcessObservation::Gone(Gone::Reused(_))
-                    ) || observation.pid_alive(owner.pid)
-                        || owner.binding(expected_session_id) != OwnerBinding::Bound
-                        || !owner.control_record().is_complete()
-                        || owner.terminal_tty.as_deref().is_none_or(str::is_empty)
-                    {
-                        bail!(
-                            "dead native-session owner identity is incomplete, foreign, or its PID is reused; no terminal observation or close was sent"
-                        );
-                    }
-                    if let Some(intent) = teardown_intent {
-                        if !observation.group_gone(intent.process_group)? {
-                            bail!(
-                                "the teardown owner's process group is not proven gone; no signal was sent and the handle is retained"
-                            );
-                        }
-                        return Ok(TerminalCloseAuthority::TeardownComplete(intent.reason));
-                    }
-                    let absent = observation.evidence().surface_absent(Some(&owner), Box::new(surface_present))
-                    .context("could not prove absence of the dead owner's exact terminal surface; no close was sent")?;
-                    if absent {
-                        return Ok(TerminalCloseAuthority::Absent);
-                    }
-                    // The owner ran inside a surface that outlives its program (a finished
-                    // Herdr terminal): it may be all that is left after the user closed the
-                    // tab. The adapter removes it only if it reads it ended.
-                    if observation.evidence().removes_ended_surface() {
-                        return Ok(TerminalCloseAuthority::RemoveEnded);
-                    }
-                    bail!(
-                        "the recorded native-session owner is no longer live; visible terminal cleanup is unverified and no close was sent"
+                        teardown_intent,
+                        surface_present,
                     );
                 }
                 // Keep the existing app-incarnation guard as part of the live proof.
@@ -463,10 +498,32 @@ pub(in crate::native) fn close_owned_surface(
 ) -> Result<terminal::CloseResult> {
     let observation = Production::new(directory, id, session, deadline);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return observation.close_posix_surface();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let authority = decide(&observation, id, session, deadline)?;
+        if authority == TerminalCloseAuthority::Absent {
+            return Ok(terminal::CloseOutcome::Missing.into());
+        }
+        terminal::close_session_until(directory, session, deadline).map(Into::into)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Production<'_> {
+    pub(in crate::native::terminal) fn close_posix_surface(&self) -> Result<terminal::CloseResult> {
+        let Self {
+            directory,
+            expected_session_id: id,
+            session,
+            deadline,
+            ..
+        } = *self;
         close_owned_surface_with(
-            || decide(&observation, id, session, deadline),
+            || decide(self, id, session, deadline),
             || {
+                #[cfg(test)]
+                self.require_installed_observation("tear down the owner");
                 teardown_absent_owner_with(
                     &Store::open_unchecked(directory),
                     id,
@@ -482,7 +539,7 @@ pub(in crate::native) fn close_owned_surface(
             },
             |close| {
                 terminal::posix::close_owned_session(
-                    terminal::posix_installed(),
+                    self.posix_adapters,
                     directory,
                     id,
                     session,
@@ -492,14 +549,6 @@ pub(in crate::native) fn close_owned_surface(
             },
             deadline,
         )
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let authority = decide(&observation, id, session, deadline)?;
-        if authority == TerminalCloseAuthority::Absent {
-            return Ok(terminal::CloseOutcome::Missing.into());
-        }
-        terminal::close_session_until(directory, session, deadline).map(Into::into)
     }
 }
 

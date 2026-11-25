@@ -1323,6 +1323,7 @@ impl<H: Host> MacTerminalAdapter for Adapter<H> {
         read_screen(&self.host, session, deadline)
     }
     // Guarded dialog input is declared unsupported in the registration.
+    #[cfg(test)]
     fn close_session_until(
         &self,
         _directory: &Path,

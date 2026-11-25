@@ -314,6 +314,23 @@ fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+#[test]
+fn windows_herdr_open_refuses_a_foreign_kind_without_contacting_the_core() {
+    use crate::native::terminal::windows_dispatch::WindowsTerminalAdapter;
+
+    let core = FakeCore::new();
+    let result = Adapter::with_core(core.clone()).open_bound_tab(
+        TerminalKind::WindowsConsole,
+        "launch",
+        Path::new(DIRECTORY),
+        later(),
+        Box::new(|_| Ok(())),
+        Box::new(|| Ok(())),
+    );
+    assert!(result.is_err(), "the adapter accepted a foreign kind");
+    assert!(core.methods().is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn endpoint_follows_hc_and_refuses_what_hc_would_refuse() {
@@ -977,6 +994,135 @@ fn an_interrupted_close_is_finished_by_the_next_one() {
         CloseOutcome::Closed
     );
     assert_eq!(core.params("terminal.kill").len(), 1);
+}
+
+// The Windows Repair policy and adapter lookup are portable. Only the owner's OS
+// observation and the core connection are scripted here.
+#[test]
+fn windows_repair_closes_through_the_core_and_resumes_after_removal_fails() {
+    use crate::native::process_identity::{Gone, ProcessObservation};
+    use crate::native::session::close::repair_dead_owner_windows_with;
+    use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
+    use crate::native::session::test_support::lifecycle::write_owned_terminal_state;
+    use crate::native::session::{CoreRecord, SessionState, Store};
+    use crate::native::terminal::windows_dispatch::Dispatch;
+
+    for (state, binding, initially_finished) in [
+        ("working", Some(SESSION), false),
+        ("exited", Some("session-foreign"), true),
+        ("failed", None, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(SESSION);
+        fs::create_dir(&directory).unwrap();
+        write_owned_terminal_state(&directory, state, std::process::id());
+        let store = Store::open_unchecked(&directory);
+        let mut owner = store.owner().unwrap();
+        owner.managed_session_id = binding.map(str::to_owned);
+        store.write_owner(&owner).unwrap();
+        let core = FakeCore::new();
+        let surface = opened(&core, &directory);
+        store
+            .record(CoreRecord::Terminal)
+            .write_json(&surface)
+            .unwrap();
+        let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
+        let claim = store.record(CoreRecord::TurnClaim).bytes().unwrap();
+        if initially_finished {
+            core.set("t7", "state", json!("finished"));
+            core.set("t7", "labels", json!({}));
+            // Start with a handle claimed by an interrupted Close.
+            store.claim_terminal_handle().unwrap().unwrap();
+        }
+        core.clear_calls();
+        core.inject("terminal.rm", Injected::Instead(refused("internal")));
+        let console = FakeCore::new();
+        let adapters = Dispatch::new(
+            Adapter::with_core(console.clone()),
+            Adapter::with_core(core.clone()),
+        );
+        let repair = || {
+            let claimed_directory = directory.clone();
+            let expected_handle = handle.clone();
+            core.after_call("hello", move |_| {
+                let store = Store::open_unchecked(&claimed_directory);
+                assert_eq!(
+                    store.record(CoreRecord::TerminalClosing).bytes().unwrap(),
+                    expected_handle
+                );
+                assert!(
+                    store
+                        .record(CoreRecord::Terminal)
+                        .bytes()
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            repair_dead_owner_windows_with(
+                &store,
+                |recorded| {
+                    assert_eq!(recorded.managed_session_id.as_deref(), binding);
+                    OwnerAttestation {
+                        process: ProcessObservation::Gone(if initially_finished {
+                            Gone::Reused("different birth".into())
+                        } else {
+                            Gone::Exited
+                        }),
+                        control: ControlAttestation::NotRecorded,
+                        pid_alive: Some(initially_finished),
+                    }
+                },
+                &adapters,
+                later(),
+            )
+        };
+
+        let text = error_text(&repair().unwrap_err());
+        assert!(text.contains("its handle is retained"), "{text}");
+        assert_eq!(core.terminal("t7").unwrap()["state"], "finished");
+        assert_eq!(store.status().unwrap().state.as_str(), state);
+        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
+        assert_eq!(store.record(CoreRecord::TurnClaim).bytes().unwrap(), claim);
+        assert!(store.closed_if_present().unwrap().is_none());
+
+        assert!(repair().unwrap());
+        assert_eq!(
+            core.params("terminal.kill").len(),
+            usize::from(!initially_finished)
+        );
+        assert_eq!(
+            core.params("terminal.rm"),
+            [json!({"terminal": "t7"}), json!({"terminal": "t7"})]
+        );
+        assert!(core.terminal("t7").is_none());
+        assert!(console.methods().is_empty());
+        assert!(
+            store
+                .record(CoreRecord::Terminal)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .record(CoreRecord::TerminalClosing)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.record(CoreRecord::TerminalClosed).present().unwrap());
+        assert!(
+            store
+                .record(CoreRecord::TurnClaim)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        core.clear_calls();
+        assert!(!repair().unwrap());
+        assert!(core.methods().is_empty());
+    }
 }
 
 #[test]

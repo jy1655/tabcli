@@ -20,7 +20,7 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 
 /// Which authority the owned close runs under: the attested owner is live, or only the
 /// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
-/// work for a live owner only. `RemoveEnded` reaches only a kind whose close evidence keeps
+/// work for a live owner only. `RemoveEnded` reaches only a kind whose core keeps
 /// a surface whose program ended: the owner died with it, and the adapter removes that
 /// surface only when it reads it ended, never ending a running program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +80,8 @@ pub(in crate::native::terminal) trait PosixTerminalAdapter {
             session.kind.display_name()
         )
     }
+    // Raw adapter close is exercised by tests. Installed POSIX Close uses owned authority.
+    #[cfg(test)]
     fn close_session_until(
         &self,
         directory: &Path,
@@ -196,6 +198,7 @@ pub(in crate::native::terminal) fn guarded_dialog_input(
         .guarded_dialog_input(session, input, deadline)
 }
 
+#[cfg(test)]
 pub(in crate::native::terminal) fn close_session_until(
     adapters: &dyn Adapters,
     directory: &Path,
@@ -217,7 +220,7 @@ pub(in crate::native::terminal) fn close_owned_session(
 ) -> Result<CloseOutcome> {
     // Every other adapter would close its surface under this authority; refuse it first.
     if close == OwnedSurfaceClose::RemoveEnded
-        && !super::close_evidence(session.kind).removes_ended_surface()
+        && !super::close_authority::owner_exit::core_retains_finished(session.kind)
     {
         bail!(
             "{} keeps no surface after its program ends; no close was sent and the handle is retained",

@@ -25,8 +25,7 @@ fn session_owner(directory: &Path, pid: u32) -> NativeSessionOwner {
     }
 }
 
-// Repair attests the owner it reads; the injected liveness answers live, so Repair leaves an
-// attested owner's session untouched.
+// A damaged Owner Record must be refused before Repair asks for an OS observation.
 #[test]
 fn repair_owner_read_answers_for_each_damaged_shape() {
     for &damaged in DAMAGED {
@@ -39,20 +38,81 @@ fn repair_owner_read_answers_for_each_damaged_shape() {
             damaged,
         );
         let attested = std::cell::Cell::new(0);
-        let observed = outcome(repair_dead_owner_with(
+        let observed = outcome(repair_dead_owner_attested_with(
             &Store::open_unchecked(directory.path()),
-            |_| {
+            |owner| {
                 attested.set(attested.get() + 1);
-                Ok(true)
+                attest_owner(owner)
             },
-            |_| panic!("a live owner retains nothing"),
-            |_| panic!("a live owner's surface is not closed"),
-            budget::close_deadline(),
         ));
         // Repair reads the record under the one read policy: it no longer follows a link.
         let expected = (format!("error {}", read_error(&path, damaged)), 0);
         assert_eq!((observed, attested.get()), expected, "{damaged:?}");
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn repair_parity_helper_refuses_a_surface_after_the_owner_exits() {
+    use crate::native::process_identity::Gone;
+    use crate::native::session::owner::ControlAttestation;
+
+    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), "working", std::process::id());
+        let store = Store::open_unchecked(directory.path());
+        if matches!(record, CoreRecord::TerminalClosing) {
+            store.claim_terminal_handle().unwrap().unwrap();
+        }
+        let before = store.record(record).bytes().unwrap();
+        let error = repair_dead_owner_attested_with(&store, |_| OwnerAttestation {
+            process: ProcessObservation::Gone(Gone::Exited),
+            control: ControlAttestation::NotRecorded,
+            pid_alive: Some(false),
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a parity row records no surface")
+        );
+        assert_eq!(store.record(record).bytes().unwrap(), before);
+        assert_eq!(store.status().unwrap().state, SessionState::Working);
+        assert!(store.closed_if_present().unwrap().is_none());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn repair_parity_helper_retains_a_close_intent_without_a_surface() {
+    use crate::native::process_identity::Gone;
+    use crate::native::session::owner::ControlAttestation;
+
+    let directory = tempfile::tempdir().unwrap();
+    write_owned_terminal_state(directory.path(), "working", std::process::id());
+    let store = Store::open_unchecked(directory.path());
+    let owner = store.owner().unwrap();
+    record_terminal_close_intent(
+        &store,
+        owner.managed_session_id.as_deref().unwrap(),
+        &store.terminal().unwrap(),
+        &owner,
+    )
+    .unwrap();
+    store.record(CoreRecord::Terminal).remove().unwrap();
+    let intent = store.record(CoreRecord::TerminalCloseIntent);
+    let before = intent.bytes().unwrap();
+    assert!(before.is_some());
+    let repaired = repair_dead_owner_attested_with(&store, |_| OwnerAttestation {
+        process: ProcessObservation::Gone(Gone::Exited),
+        control: ControlAttestation::NotRecorded,
+        pid_alive: Some(false),
+    })
+    .unwrap();
+    assert!(!repaired);
+    assert_eq!(intent.bytes().unwrap(), before);
+    assert_eq!(store.status().unwrap().state, SessionState::Working);
+    assert!(store.closed_if_present().unwrap().is_none());
 }
 
 // Prune is blocked by any owner it cannot show gone: an unreadable record blocks it.
