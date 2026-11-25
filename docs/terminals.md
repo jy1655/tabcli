@@ -170,7 +170,12 @@ A parented session counts in the caller's `hc wait --children`. The core does no
 notifications into the caller, and the session continues when the caller ends.
 If the original program ends outside TAB with keep off, run
 `tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
-finished terminal and closes the session record.
+finished terminal and closes the session record. When the session's owner process is gone
+but its terminal still runs, the same command ends it once TAB has proved from its own
+recorded creation (core, address, creation time, program, session directory and launch
+label) that it is this session's terminal. This works whatever the owner record says,
+including an owner whose process ID now belongs to another process. Listing sessions,
+`tell` and `wait` never close a Herdr terminal on their own.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
@@ -208,9 +213,11 @@ receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. 
 its Windows initial prompt is pasted and then submitted against the exact console screen, which
 Herdr cannot do, so use `--terminal windows-console` for it. The returned `attach_command` is a
 PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close ends the
-whole terminal. When a provider ends on its own, the next close or repair removes its finished
-terminal through the core; if the core cannot be reached, the session keeps its handle and a
-later close finishes it. Only Pi has been run live on Windows Herdr.
+whole terminal. Closing follows the rules for macOS and Linux above: when a provider ends on
+its own, run `tabcli close-session <session> --explicit` to remove its finished terminal (up
+to 0.4.49 on Windows, listing sessions, `tell` or `wait` removed it, and ended a still running
+terminal of a session whose owner was gone). If the core cannot be reached, the session keeps
+its handle and a later close finishes it. Only Pi has been run live on Windows Herdr.
 
 ## Linux / tmux
 
@@ -479,7 +486,10 @@ prune them.
 A dead owner does not prove that its surface closed (#69). Inspect the session and use `tabcli
 close-session SESSION --explicit` to close a retained surface. Repair first checks whether a
 completed result needs publication. On macOS, Terminal.app, Ghostty, WezTerm, and Warp keep handles
-for surfaces that can outlive their owner. Terminal.app, WezTerm, and Warp record a close intent
+for surfaces that can outlive their owner, as tmux does on Linux and Herdr does on macOS, Linux
+and Windows. A Herdr terminal is then closed by its own recorded creation and a tmux server by
+its recorded birth (see their sections above); the macOS surfaces follow the rules below.
+Terminal.app, WezTerm, and Warp record a close intent
 before their live-owner close operation. An interrupted close can resume only when the intent
 matches the same session, surface, and owner record, and that owner's recorded incarnation is
 proven gone. Those records do not grant permission to signal another process.
@@ -489,6 +499,7 @@ retry after the owner ends. Without separate failed-start close authority or pro
 is absent, TAB refuses the close and retains the handle. Check the named surface in Ghostty.
 
 Windows repair can close the managed console whose owner exited, using the same close checks.
+It leaves a Herdr terminal for `close-session --explicit`, as on macOS and Linux.
 Missing or unreadable evidence can stop repair. Run
 `sessions` to attempt repair. Use `inspect`, timeline, `result`, `search`, or `doctor` when you want
 to read the records without changing them.

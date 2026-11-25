@@ -91,14 +91,19 @@
   running a replacement in between is left alone and its handle retained. A close whose kill
   reply was lost fails instead of repeating it, and the next close finishes from what it
   reads (a finished terminal is only removed). Herdr's registration declares that its core
-  retains a finished terminal. `terminal::close_authority::owner_exit` uses that fact for
-  both platform policies. On macOS and Linux, Repair preserves the handle. For the ordinary
-  explicit close after the owner has exited, TAB verifies its bound identity and reads the exact finished,
-  unkept terminal again. It checks the launch label, sends one `terminal.rm`, and confirms
-  absence on that core. It never sends `terminal.kill` on this path. Handles created by
-  0.4.45 and 0.4.46 omit the nonce; for those, the original identity checks also require the
-  launch label to agree with the terminal's generated name. A failed read or removal keeps
-  the handle for retry. Cleanup after binding fails uses the ordinary close proof. Cleanup
+  retains a finished terminal, and `terminal::close_authority::owner_exit` applies one rule to
+  it on every OS (the owner's decision, 2026-11-26, os-parity). Repair, in any repairable
+  state, never ends, removes or even reads the terminal of a gone owner: it leaves the handle,
+  the state and the claim for `close-session --explicit`. Once the owner is verified gone
+  (exited or PID reused, whatever its record says: bound, unbound, another session's,
+  complete or not), that close proves the terminal by its own creation record and nothing
+  else: the recorded core, address, creation time, program PID, the exact session directory
+  in the argv, the launch label and, while it runs, the program's birth. It then ends a
+  running terminal (one `terminal.kill`), removes the finished one and confirms absence on
+  that core; the owner PID never proves anything here. An owner that cannot be inspected is
+  not gone and keeps the live-owner rules. Handles created by 0.4.45 and 0.4.46 omit the
+  nonce; for those, the launch label must agree with the terminal's generated name. A failed
+  read, kill or removal keeps the handle for retry. Cleanup after binding fails uses the ordinary close proof. Cleanup
   before confirmation checks the full launch argv, label and name, plus the creation
   time and PID from its first read at that address. It refuses a terminal set to keep. A birth
   is needed to retain a handle for retry. The core has no conditional kill or remove, so another
@@ -185,23 +190,25 @@
   Agy's Windows readiness also needs `Full redraw completed`, measured on the console only;
   without it the paste is withheld and reported not sent.
 - The Windows ownership proof checks the Herdr terminal on its core, then the owner's process
-  identity. The owner's death proves nothing about the terminal: a dead owner's repair, in any
-  repairable state, closes the exact Herdr handle through the verified core under the close
-  transaction's claim. It uses ordinary Herdr close, which may end a live, identity-verified
-  launch host and can remove a finished terminal without a launch-label comparison. A close
-  that fails (no core, another core, a changed terminal)
-  restores the handle and leaves state and claim for the next close. Only the core's
-  `not_found` proves the terminal gone. A console's ended session still settles from its records.
-  The owner's rule is one behavior on every OS, with a difference only where it is unavoidable
-  (2026-11-26). The differences from macOS and Linux are not unavoidable: they carry forward
-  0.4.48 behavior only until the owner decides whether Repair or only an explicit Close ends
-  a Surface whose Owner is verified gone (os-parity).
+  identity. The owner's death proves nothing about the terminal, and Windows follows the
+  macOS and Linux rule above: Repair leaves a gone owner's Herdr terminal for
+  `close-session --explicit` (0.4.49 and earlier closed it during Repair, including a running
+  one, without the launch-label check). The explicit close observes the owner before the
+  ownership proof, which a gone owner never passes, and closes by the creation record through
+  the Windows lookup (`close_created_surface`). A close that fails (no core, another core, a
+  changed terminal) restores the handle and leaves state and claim for the next close. Only
+  the core's `not_found` proves the terminal gone. The managed console keeps its own Repair: an
+  active session's console is closed through its root identity, an ended one settles from its
+  records. Only the owner's identity differs in form by platform (TTY and process groups on
+  macOS and Linux, the recorded process identity on Windows), and this rule does not read it.
 - The PowerShell `attach_command` sets `HC_SOCKET` in its own script block and restores the
   earlier value (or its absence) in `finally`, so later commands keep their own core.
 - Windows tests: endpoint resolution, the shared framing, the adapters' surface answers and the
   Windows lookup's routing and declared refusals over recording adapters run on every
   platform; the lookup over the Herdr adapter on a scripted core runs on macOS, Linux and
   Windows, including Repair with a scripted owner observation and the real close transaction.
+  The gone-owner table (`herdr/tests/owner_gone.rs`) runs on every OS with that OS's close
+  wiring; on Windows it drives the Windows decision, which only the Windows runner compiles.
   The pipe transport (a real pipe of this user), process births, parents, tokens, the installed
   lookup against an absent pipe, the directory admission, the Windows-only Repair tests,
   the attach line under PowerShell 7 and the

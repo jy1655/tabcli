@@ -14,15 +14,15 @@
   surface. A changed control identity (controlling TTY, process groups) of a live incarnation is
   not a death. A second observation of the same pid is checked against the attested incarnation
   before its control fields are compared; a later snapshot with another birth is reuse (#190).
-- Existing Windows Repair treats Gone from exit or reuse the same, even for an unbound or
-  foreign owner record. The surface adapter supplies independent proof over the claimed handle
-  before Close. The ordinary macOS and Linux dead-owner Close requires an exited, bound owner
-  with complete recorded control. Only the form of that identity is a platform fact (controlling
-  TTY and process groups on macOS and Linux, the recorded process identity on Windows). The
-  owner's rule is one behavior on every OS, with a difference only where it is unavoidable
-  (2026-11-26). The outcomes above are not such a difference: they carry forward 0.4.48
-  behavior only until the owner decides whether Repair or only an explicit Close ends a
-  Surface whose Owner is verified gone (os-parity).
+- The owner's rule is one behavior on every OS, with a difference only where it is unavoidable
+  (2026-11-26). Repair treats Gone from exit or reuse the same, whatever the owner record's
+  binding, and never ends a terminal whose core keeps it (Herdr): only `close-session
+  --explicit` does, on every OS, and it proves that terminal by its own creation record, so a
+  reused PID, an unbound or foreign record or an incomplete one neither grants nor blocks it
+  (os-parity). The ordinary macOS and Linux dead-owner Close of the other kinds still requires
+  an exited, bound owner with complete recorded control. Only the form of that identity is a
+  platform fact (controlling TTY and process groups on macOS and Linux, the recorded process
+  identity on Windows).
 - Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner

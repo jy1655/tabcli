@@ -2,8 +2,9 @@
 
 - Codex owns injected paste evidence and guarded submission; see Current Codex Boundary (#124).
 
-- The seven surface operations on Windows (open, send, screen, guarded key, verify, close and
-  presence) resolve their adapter through one lookup (`windows/dispatch.rs`), as `posix.rs`
+- The seven surface operations on Windows (open, send, screen, guarded key, verify, close, in
+  its ordinary form or by creation record once the owner is gone, and presence) resolve their
+  adapter through one lookup (`windows/dispatch.rs`), as `posix.rs`
   does on macOS and Linux: the Herdr adapter for a Herdr terminal, and `ManagedConsole`
   (`windows/mod.rs`) for every other kind. Screen and guarded key first answer with the kind's
   declared refusal, if it has one. A handle of a kind Windows does not run stays with the
@@ -12,9 +13,12 @@
   Windows surface its own adapter in that lookup; do not branch one of these operations on the
   kind. `attach_command` and `admit_selection` still check kinds outside those operations.
   Dead-owner Repair decides whether it needs a close transaction in
-  `terminal::close_authority::owner_exit`. Only a managed console or a registration whose core
-  keeps a finished terminal can reach the Windows close adapter from that transaction. The
-  claimed handle is checked independently of the retained-handle scan. The lookup's portable tests run
+  `terminal::close_authority::owner_exit`. Only a managed console reaches the Windows close
+  adapter from that transaction: a registration whose core keeps a finished terminal (Herdr)
+  is left for `close-session --explicit` on every OS (os-parity, 2026-11-26). The claimed
+  handle is checked independently of the retained-handle scan. The explicit close of a gone
+  owner's Herdr terminal goes through the lookup's close by creation record, which refuses
+  every kind whose core keeps no terminals before its adapter. The lookup's portable tests run
   on every CI target; the installed lookup, over the console helper and the core's pipe, is
   tested on the Windows runner only.
 - A Herdr terminal is not a managed console: its handle never reaches the console control
