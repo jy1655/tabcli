@@ -79,7 +79,11 @@ impl Core for Installed {
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    fn admit_launch_directory(&self, directory: &Path, account: &HostAccount) -> Result<()> {
+    fn admit_launch_directory(
+        &self,
+        directory: &Path,
+        account: Option<&HostAccount>,
+    ) -> Result<()> {
         crate::native::terminal::bound_host::refuse_before_core_launch(
             directory,
             TerminalKind::Herdr,

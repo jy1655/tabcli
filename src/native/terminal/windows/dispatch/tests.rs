@@ -322,7 +322,7 @@ mod herdr_core {
         fn admit_launch_directory(
             &self,
             _: &Path,
-            _: &crate::native::terminal::bound_host::HostAccount,
+            _: Option<&crate::native::terminal::bound_host::HostAccount>,
         ) -> Result<()> {
             unreachable!("nothing is created without a core")
         }

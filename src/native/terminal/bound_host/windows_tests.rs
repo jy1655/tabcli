@@ -110,31 +110,58 @@ fn a_junction_or_a_file_is_never_a_session_directory() {
     );
 }
 
-// The launcher's check is the host's own admission: a directory that another account can
-// change is refused before any surface, for every kind whose host admits it, and the console,
-// whose host does not, is left to its own checks.
+// Windows runs one bound host, Herdr's, which runs as its core: the launcher judges no kind
+// itself, and the Herdr adapter judges a directory that another account can change for the
+// core's account. Without that account only the path is judged: a real directory, never a
+// junction; who may change it is left to the host.
 #[test]
-fn the_launcher_refuses_a_directory_the_launch_host_would_refuse() {
+fn the_herdr_check_refuses_a_directory_the_launch_host_would_refuse() {
     let root = tempfile::tempdir().unwrap();
     let directory = private_session(root.path(), "session-launcher");
-    refuse_before_launch(&directory, TerminalKind::Herdr).unwrap();
+    let own = HostAccount::current().unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap();
     icacls(&directory, "*S-1-1-0:(W)");
+    let refusal =
+        refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap_err();
+    assert!(
+        refusal
+            .downcast_ref::<super::super::RefusedDirectory>()
+            .is_some()
+    );
+    let text = format!("{refusal:#}");
+    assert_eq!(
+        text,
+        format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user: session directory can be changed by another account (S-1-1-0)",
+            directory.display()
+        )
+    );
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, None).unwrap();
+    for kind in [
+        TerminalKind::Herdr,
+        TerminalKind::WindowsConsole,
+        TerminalKind::Tmux,
+        TerminalKind::Iterm2,
+    ] {
+        refuse_before_launch(&directory, kind).unwrap();
+    }
+    let target = private_session(root.path(), "session-target");
+    let junction = root.path().join("session-junction");
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J");
     let text = format!(
         "{:#}",
-        refuse_before_launch(&directory, TerminalKind::Herdr).unwrap_err()
+        refuse_before_core_launch(&junction, TerminalKind::Herdr, None).unwrap_err()
     );
     assert!(
-        text.starts_with(&format!(
-            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
-            directory.display()
-        )),
+        text.contains("refusing non-directory Herdr launch path"),
         "{text}"
     );
-    assert!(
-        text.contains("session directory can be changed by another account (S-1-1-0)"),
-        "{text}"
-    );
-    refuse_before_launch(&directory, TerminalKind::WindowsConsole).unwrap();
 }
 
 // The case observed on 2026-11-26: an elevated TAB creates the session directory, so its owner
@@ -147,13 +174,13 @@ fn an_elevated_tab_is_refused_for_a_core_that_is_not_elevated() {
     let root = tempfile::tempdir().unwrap();
     let directory = private_session(root.path(), "session-elevation");
     let own = HostAccount::current().unwrap();
-    refuse_before_core_launch(&directory, TerminalKind::Herdr, &own).unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap();
     let user = own.windows.owners[0].clone();
     let core = HostAccount::of_windows(crate::native::consent::WindowsAccount {
         owners: vec![user],
         elevated: Some(false),
     });
-    let result = refuse_before_core_launch(&directory, TerminalKind::Herdr, &core);
+    let result = refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&core));
     if own.windows.owners.len() == 1 {
         result.unwrap();
         return;
@@ -175,7 +202,7 @@ fn an_elevated_tab_is_refused_for_a_core_that_is_not_elevated() {
     icacls(&directory, "*S-1-1-0:(W)");
     let text = format!(
         "{:#}",
-        refuse_before_core_launch(&directory, TerminalKind::Herdr, &core).unwrap_err()
+        refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&core)).unwrap_err()
     );
     assert!(
         text.ends_with("session directory owner differs from current user"),

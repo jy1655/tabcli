@@ -69,33 +69,27 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     bind: impl FnOnce(&Path, &str, &I) -> Result<()>,
     release_message: Option<fn(&I) -> String>,
 ) -> Result<()> {
-    run_bound_host(
-        directory,
-        &BoundHostSpec {
-            name: kind.display_name(),
-        },
-        |id| {
-            let outcome = (|| {
-                let identity = identity()?;
-                bind(directory, id, &identity)?;
-                flush_startup_input(kind.display_name())?;
-                Ok(identity)
-            })();
-            let store = Store::open_unchecked(directory);
-            match outcome {
-                Ok(identity) => {
-                    if let Some(message) = release_message {
-                        launch::log(&store, &message(&identity));
-                    }
-                    Ok(())
+    run_logged_bound_host(directory, kind, |id| {
+        let outcome = (|| {
+            let identity = identity()?;
+            bind(directory, id, &identity)?;
+            flush_startup_input(kind.display_name())?;
+            Ok(identity)
+        })();
+        let store = Store::open_unchecked(directory);
+        match outcome {
+            Ok(identity) => {
+                if let Some(message) = release_message {
+                    launch::log(&store, &message(&identity));
                 }
-                Err(error) => {
-                    log_refusal(&store, kind, &format_args!(": {error:#}"));
-                    Err(error)
-                }
+                Ok(())
             }
-        },
-    )
+            Err(error) => {
+                log_refusal(&store, kind, &format_args!(": {error:#}"));
+                Err(error)
+            }
+        }
+    })
 }
 
 /// Keep the legacy log prefix for Terminal.app.
@@ -133,12 +127,42 @@ pub(super) fn while_capture_eligible<T>(
     act()
 }
 
+// The Ghostty and Warp hosts, which report their own refusals.
+#[cfg(any(target_os = "macos", test))]
 pub(super) fn run_bound_host<T>(
     directory: &Path,
     spec: &BoundHostSpec,
     run: impl FnOnce(&str) -> Result<T>,
 ) -> Result<T> {
     run(admit(directory, spec)?)
+}
+
+/// `run_bound_host` for a launch host whose admission refusal goes to the launch log, on
+/// every platform: the Linux and Windows handoffs, the macOS capture host and the tty-bound
+/// hosts. The line is a diagnostic, never a launch Record. It is written only into a real
+/// directory at an absolute path: a link or anything else at that path can name another
+/// session, and a refusal never writes through what it refused.
+pub(super) fn run_logged_bound_host<T>(
+    directory: &Path,
+    kind: TerminalKind,
+    run: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
+    let spec = BoundHostSpec {
+        name: kind.display_name(),
+    };
+    let id = admit(directory, &spec).inspect_err(|error| {
+        let real_directory = directory.is_absolute()
+            && std::fs::symlink_metadata(directory)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+        if real_directory {
+            log_refusal(
+                &Store::open_unchecked(directory),
+                kind,
+                &format_args!(": {error:#}"),
+            );
+        }
+    })?;
+    run(id)
 }
 
 /// The account a launch host runs as, for the private-directory step of its admission: an
@@ -186,67 +210,81 @@ impl HostAccount {
     }
 }
 
-/// Whether the kind's launch host admits its session directory with `admit` before it
-/// trusts it: every bound host does. The Windows console host is no bound host; it only
-/// checks that its path is a real directory.
-const fn runs_directory_admission(kind: TerminalKind) -> bool {
+/// Whose account a session directory is judged for: the host's own (this process, as the
+/// host itself reads it), a given one, or none known. Without a known account only what does
+/// not depend on one is judged (the path, a real directory, and on macOS and Linux the
+/// permission bits that let any other account in); the owner is left to the host.
+#[derive(Clone, Copy)]
+enum Judged<'a> {
+    Own,
+    For(&'a HostAccount),
+    AccountUnknown,
+}
+
+/// How the launcher judges the session directory of a kind's launch host before it opens a
+/// surface, on this platform. A host this platform does not run judges nothing here, so an
+/// unsupported surface keeps its own refusal. tmux runs its host in a server this process
+/// starts, so as this process's account; TAB does not attest the account of a macOS terminal
+/// application, so only what needs no account is judged; Herdr's host runs as its core,
+/// which the adapter judges on the connection that creates the terminal
+/// (`refuse_before_core_launch`); the Windows console host is no bound host.
+fn judged_by_the_launcher(kind: TerminalKind) -> Option<Judged<'static>> {
     match kind {
-        TerminalKind::Herdr
-        | TerminalKind::Tmux
-        | TerminalKind::Iterm2
+        TerminalKind::Tmux => cfg!(target_os = "linux").then_some(Judged::Own),
+        TerminalKind::Iterm2
         | TerminalKind::WezTerm
         | TerminalKind::AppleTerminal
         | TerminalKind::Ghostty
-        | TerminalKind::Warp => true,
-        TerminalKind::WindowsConsole => false,
+        | TerminalKind::Warp => cfg!(target_os = "macos").then_some(Judged::AccountUnknown),
+        TerminalKind::Herdr | TerminalKind::WindowsConsole => None,
     }
 }
 
 /// The launcher's check before it creates a surface whose launch host runs `admit`: the
-/// same admission, for this process's account, which is the host's own wherever this
-/// process or the terminal it starts runs the host. A refusal here means that host would
-/// refuse the directory, so nothing is created; an account this process cannot read leaves
-/// the decision to the host. A Herdr host runs as its core instead, which the Herdr adapter
-/// checks on the connection that will create the terminal (`refuse_before_core_launch`).
+/// same admission, as far as the launcher can establish the host's account
+/// (`judged_by_the_launcher`). A refusal here is one the host would make, so nothing is
+/// created; it is a `RefusedDirectory`.
 pub(in crate::native::terminal) fn refuse_before_launch(
     directory: &Path,
     kind: TerminalKind,
 ) -> Result<()> {
-    if !runs_directory_admission(kind) {
-        return Ok(());
-    }
-    let Ok(account) = HostAccount::current() else {
+    let Some(judged) = judged_by_the_launcher(kind) else {
         return Ok(());
     };
     let spec = BoundHostSpec {
         name: kind.display_name(),
     };
-    match admit_as(directory, &spec, Some(&account)) {
+    match admit_as(directory, &spec, judged) {
         Ok(_) => Ok(()),
         Err(refusal) => Err(would_refuse(directory, &spec, &refusal, None)),
     }
 }
 
-/// The same check for a host that a running core starts as its own program, for `core`,
-/// the account of the process its connection proved to serve it. When this process's own
-/// account would be admitted, the refusal also says how the two accounts differ: on Windows
-/// an elevated TAB gives its files the Administrators group as owner, which the launch host
-/// of a core that is not elevated refuses (observed 2026-11-26, hc 0.1.21).
+/// The same check for a host that a running core starts as its own program, judged for
+/// `core`, the account of the process serving the connection that will create the terminal,
+/// or, when that connection could not name it, only for what needs no account. When this
+/// process's own account would be admitted, the refusal also says how the two accounts
+/// differ: on Windows an elevated TAB normally gives its files the Administrators group as
+/// owner, which the launch host of a core that is not elevated refuses (observed 2026-11-26,
+/// hc 0.1.21).
 pub(in crate::native::terminal) fn refuse_before_core_launch(
     directory: &Path,
     kind: TerminalKind,
-    core: &HostAccount,
+    core: Option<&HostAccount>,
 ) -> Result<()> {
     let spec = BoundHostSpec {
         name: kind.display_name(),
     };
-    let Err(refusal) = admit_as(directory, &spec, Some(core)) else {
+    let judged = core.map_or(Judged::AccountUnknown, Judged::For);
+    let Err(refusal) = admit_as(directory, &spec, judged) else {
         return Ok(());
     };
-    let advice = HostAccount::current()
-        .ok()
-        .filter(|own| !own.same(core) && admit_as(directory, &spec, Some(own)).is_ok())
-        .map(|own| account_advice(spec.name, &own, core));
+    let advice = core.and_then(|core| {
+        HostAccount::current()
+            .ok()
+            .filter(|own| !own.same(core) && admit_as(directory, &spec, Judged::For(own)).is_ok())
+            .map(|own| account_advice(spec.name, &own, core))
+    });
     Err(would_refuse(directory, &spec, &refusal, advice))
 }
 
@@ -265,7 +303,7 @@ fn would_refuse(
         message.push_str("; ");
         message.push_str(&advice);
     }
-    anyhow::anyhow!(message)
+    super::RefusedDirectory::new(message).into()
 }
 
 #[cfg(unix)]
@@ -309,16 +347,11 @@ fn elevation_advice(name: &str, tab: Option<bool>, core: Option<bool>) -> String
 /// Decided 2026-10-30: the per-host orders and refusal texts this replaces changed which
 /// refusal a defective directory reported; the refusal vocabulary is now one template.
 fn admit<'a>(directory: &'a Path, spec: &BoundHostSpec) -> Result<&'a str> {
-    admit_as(directory, spec, None)
+    admit_as(directory, spec, Judged::Own)
 }
 
-/// `admit` for the account the host runs as. `None` is this process's own, read only at the
-/// step that needs it, as the host itself reads it.
-fn admit_as<'a>(
-    directory: &'a Path,
-    spec: &BoundHostSpec,
-    account: Option<&HostAccount>,
-) -> Result<&'a str> {
+/// `admit` for the account the host runs as (`Judged`).
+fn admit_as<'a>(directory: &'a Path, spec: &BoundHostSpec, judged: Judged<'_>) -> Result<&'a str> {
     let name = spec.name;
     if !directory.is_absolute() {
         bail!("{name} launch directory must be absolute");
@@ -337,14 +370,21 @@ fn admit_as<'a>(
         );
     }
     #[cfg(unix)]
-    if !owned_and_not_accessible_by_others(
-        &metadata,
-        account.map_or_else(|| unsafe { libc::geteuid() }, |account| account.uid),
-    ) {
-        bail!("{name} launch directory is not private to the current user");
+    {
+        use std::os::unix::fs::MetadataExt;
+        let private = match judged {
+            Judged::Own => {
+                owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() })
+            }
+            Judged::For(account) => owned_and_not_accessible_by_others(&metadata, account.uid),
+            Judged::AccountUnknown => metadata.mode() & 0o077 == 0,
+        };
+        if !private {
+            bail!("{name} launch directory is not private to the current user");
+        }
     }
     #[cfg(windows)]
-    windows_private_directory(directory, name, account)?;
+    windows_private_directory(directory, name, judged)?;
     Ok(id)
 }
 
@@ -352,11 +392,7 @@ fn admit_as<'a>(
 // directory replaced after the path was read is seen. A failure to open it or to read its
 // access list refuses the launch.
 #[cfg(windows)]
-fn windows_private_directory(
-    directory: &Path,
-    name: &str,
-    account: Option<&HostAccount>,
-) -> Result<()> {
+fn windows_private_directory(directory: &Path, name: &str, judged: Judged<'_>) -> Result<()> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -385,11 +421,16 @@ fn windows_private_directory(
             directory.display()
         );
     }
-    match account {
-        None => crate::native::consent::windows_directory_is_private(&opened),
-        Some(account) => crate::native::consent::windows_directory_is_private_to(&opened, || {
-            Ok(account.windows.owners.clone())
-        }),
+    match judged {
+        Judged::Own => crate::native::consent::windows_directory_is_private(&opened),
+        Judged::For(account) => {
+            crate::native::consent::windows_directory_is_private_to(&opened, || {
+                Ok(account.windows.owners.clone())
+            })
+        }
+        // Who may change a directory is judged against the owners of the account that trusts
+        // it; without them the host decides.
+        Judged::AccountUnknown => Ok(()),
     }
     .with_context(|| format!("{name} launch directory is not private to the current user"))
 }
@@ -466,27 +507,30 @@ fn run_handoff_with<T>(
     let name = kind.display_name();
     let store = Store::open_unchecked(directory);
     let start = clock.now();
-    // Direct hosts have always logged admission refusals as well as later errors.
+    // Direct hosts have always logged admission refusals as well as later errors; the
+    // admission's own refusal only into a real directory (`run_logged_bound_host`).
     let refused = |error: &anyhow::Error| log_refusal(&store, kind, &format_args!(": {error:#}"));
-    let (initial, surface, flushed) = run_bound_host(directory, &BoundHostSpec { name }, |id| {
-        let initial =
-            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-        let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
-        let _lock = store.lock()?;
-        let current =
-            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-        anyhow::ensure!(
-            pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?.is_ok(),
-            "{name} launch is no longer pending"
-        );
-        anyhow::ensure!(
-            pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
-                == Some(&surface),
-            "{name} binding changed"
-        );
-        Ok((initial, surface, flush()))
-    })
-    .inspect_err(refused)?;
+    let (initial, surface, flushed) = run_logged_bound_host(directory, kind, |id| {
+        (|| {
+            let initial =
+                launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+            let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
+            let _lock = store.lock()?;
+            let current =
+                launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+            anyhow::ensure!(
+                pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?.is_ok(),
+                "{name} launch is no longer pending"
+            );
+            anyhow::ensure!(
+                pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
+                    == Some(&surface),
+                "{name} binding changed"
+            );
+            Ok((initial, surface, flush()))
+        })()
+        .inspect_err(refused)
+    })?;
 
     let (reason, outcome) = match flushed {
         Ok(()) => (FailureReason::LaunchShellExecFailed, handoff()),

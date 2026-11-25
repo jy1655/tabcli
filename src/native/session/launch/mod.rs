@@ -463,6 +463,51 @@ fn fail_deciding(
     Ok(())
 }
 
+/// Settles a fenced launch whose session directory was refused before any surface was
+/// created for it (`terminal::RefusedDirectory`). Nothing was created, so no wrapper can hold
+/// the lifecycle lock: the settlement waits for it, and a reader holding it cannot leave the
+/// launch pending. It writes only into a real directory at the refused path whose current
+/// Claim and pending launch receipt are this launch's: a link there, or another session's
+/// directory, can name a launch this one does not own, and a refusal never writes through
+/// what it refused. Returns the refusal, with the settlement's own failure when it did not
+/// complete.
+pub(in crate::native) fn refused_before_surface(
+    store: &Store,
+    expected_token: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let directory = store.directory();
+    let ours = |reader: &Reader| -> Result<Option<Record>> {
+        let record = read(reader)?.filter(|record| {
+            record.claim_token == expected_token && record.phase == Phase::Pending
+        });
+        Ok(record.filter(|_| {
+            turn::current_claim_token(reader)
+                .is_ok_and(|token| token.as_deref() == Some(expected_token))
+        }))
+    };
+    let real_directory = std::fs::symlink_metadata(directory)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    if !real_directory || !matches!(ours(store), Ok(Some(_))) {
+        return error.context(
+            "nothing was recorded: the session directory's path no longer names this launch",
+        );
+    }
+    let reason = format!(
+        "terminal launch failed: {error:#}; no surface handle was recorded and no prompt was sent"
+    );
+    let settled = store.lock().and_then(|_lock| match ours(store)? {
+        Some(record) => fail_locked(store, &record, &reason),
+        None => Ok(()),
+    });
+    match settled {
+        Ok(()) => error,
+        Err(settlement) => {
+            error.context(format!("the refusal could not be recorded: {settlement:#}"))
+        }
+    }
+}
+
 // The error returned by ask, including its JSON error rendering.
 pub(in crate::native) fn terminal_failure(store: &Store, error: anyhow::Error) -> anyhow::Error {
     let retained = error.downcast_ref::<terminal::RetainedLaunchSurface>();

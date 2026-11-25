@@ -90,13 +90,18 @@ pub(in crate::native) fn start(
 }
 
 // The settlement of a fenced launch whose surface could not be opened, or whose session
-// directory was refused before one was.
+// directory was refused before one was: a known refusal settles only this launch's Claim, and
+// waits for a reader of the lifecycle lock (`launch::refused_before_surface`).
 pub(in crate::native) fn settle_open_failure(
     directory: &Path,
-    _expected_claim_token: &str,
+    expected_claim_token: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    launch::terminal_failure(&Store::open_unchecked(directory), error)
+    let store = Store::open_unchecked(directory);
+    if error.downcast_ref::<terminal::RefusedDirectory>().is_some() {
+        return launch::refused_before_surface(&store, expected_claim_token, error);
+    }
+    launch::terminal_failure(&store, error)
 }
 
 #[cfg(unix)]
@@ -163,15 +168,19 @@ pub(in crate::native) fn bridge_shell_command(
     ))
 }
 
+// The launch command, and every launch host's arguments built from the same session
+// directory and executable (Herdr's JSON argv, the iTerm2 and WezTerm command lines), carry
+// these values as text. A value that is not Unicode would reach them changed, so the host would
+// look for another directory than the one created and checked; it is refused here, before
+// anything is created.
 pub(in crate::native) fn validate_shell_command_component(
     value: &std::ffi::OsStr,
     field: &str,
 ) -> Result<()> {
-    if let Some(character) = value
-        .to_string_lossy()
-        .chars()
-        .find(|value| value.is_control())
-    {
+    let Some(text) = value.to_str() else {
+        bail!("{field} is not Unicode text");
+    };
+    if let Some(character) = text.chars().find(|value| value.is_control()) {
         bail!(
             "{field} contains terminal control U+{:04X}",
             u32::from(character)

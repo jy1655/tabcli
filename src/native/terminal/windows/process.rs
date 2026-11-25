@@ -52,31 +52,32 @@ pub(super) fn open_verified_control_process(
     Ok(handle)
 }
 
-/// The user SID of the process holding `pid`: whose process it is. It is opened for limited
-/// query only, and its token is read through the security module, which opens no process.
-/// A process this one may not inspect is an error, never another user.
-pub(in crate::native) fn process_user_sid_of(pid: u32) -> Result<String> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to open Windows process {pid}"));
-    }
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    super::security::process_handle_user_sid(&handle)
-}
+/// A process held open for limited query, so that every read of its token is of the process
+/// first opened: Windows reuses no PID while a handle to its process is open. Its token is
+/// read through the security and trust-store modules, which open no process.
+pub(in crate::native) struct QueriedProcess(OwnedHandle);
 
-/// The account of the process holding `pid` (`consent::windows_process_account`): the owners
-/// its new files can have and whether it runs elevated. It is opened for limited query only.
-pub(in crate::native) fn process_account_of(
-    pid: u32,
-) -> Result<crate::native::consent::WindowsAccount> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to open Windows process {pid}"));
+impl QueriedProcess {
+    pub(in crate::native) fn open(pid: u32) -> Result<Self> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open Windows process {pid}"));
+        }
+        Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    crate::native::consent::windows_process_account(&handle)
+
+    /// The user SID in its primary token: whose process it is. A process this one may not
+    /// inspect is an error, never another user.
+    pub(in crate::native) fn user_sid(&self) -> Result<String> {
+        super::security::process_handle_user_sid(&self.0)
+    }
+
+    /// Its account (`consent::windows_process_account`): the owners its new files can have
+    /// and whether it runs elevated.
+    pub(in crate::native) fn account(&self) -> Result<crate::native::consent::WindowsAccount> {
+        crate::native::consent::windows_process_account(&self.0)
+    }
 }
 
 pub(in crate::native) fn query_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {

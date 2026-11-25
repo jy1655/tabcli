@@ -150,8 +150,10 @@ pub(in crate::native::terminal) trait Core {
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>>;
     fn launch_nonce(&self) -> Result<String>;
     /// Refuses a session directory that the launch host this core would start must refuse,
-    /// judged for `account`, the core's own (`bound_host::refuse_before_core_launch`).
-    fn admit_launch_directory(&self, directory: &Path, account: &HostAccount) -> Result<()>;
+    /// judged for `account`, the core's own, or only for what needs no account when it is
+    /// unknown (`bound_host::refuse_before_core_launch`).
+    fn admit_launch_directory(&self, directory: &Path, account: Option<&HostAccount>)
+    -> Result<()>;
     fn pause(&self, deadline: Instant) {
         thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
@@ -604,13 +606,6 @@ fn create(
     let socket = core.endpoint()?;
     let mut linked = link(core, &socket, None, startup_deadline)
         .context("the Herdr terminal was not created")?;
-    // The launch host is the core's program and runs as the core's account: a session
-    // directory that its admission would refuse is refused here, before anything exists. An
-    // account the connection cannot name leaves the decision to the host.
-    if let Ok(account) = linked.connection.core_account() {
-        core.admit_launch_directory(directory, &account)
-            .context("the Herdr terminal was not created")?;
-    }
     let argv = host_program(&core.executable()?, directory, command);
     let session_id = directory
         .file_name()
@@ -651,6 +646,13 @@ fn create(
     } else {
         params["no_parent"] = json!(true);
     }
+    // The launch host is the core's program and runs as the core's account: on the connection
+    // that sends `terminal.run`, right before it, a session directory that the host's
+    // admission would refuse is refused, and nothing exists yet. A connection that cannot
+    // name its server's account leaves the owner to the host.
+    let account = linked.connection.core_account().ok();
+    core.admit_launch_directory(directory, account.as_ref())
+        .context("the Herdr terminal was not created")?;
     let core_id = linked.core_id.clone();
     let reconcile =
         |cause: anyhow::Error| reconcile(core, &socket, &core_id, &launch, cleanup_deadline, cause);

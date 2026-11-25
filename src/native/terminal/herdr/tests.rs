@@ -290,7 +290,7 @@ impl Core for FakeCore {
     fn launch_nonce(&self) -> Result<String> {
         Ok("0123456789abcdef0123456789abcdef".into())
     }
-    fn admit_launch_directory(&self, directory: &Path, _: &HostAccount) -> Result<()> {
+    fn admit_launch_directory(&self, directory: &Path, _: Option<&HostAccount>) -> Result<()> {
         let mut state = self.0.borrow_mut();
         let made = state.calls.len();
         state.admitted.push((directory.to_owned(), made));
@@ -913,7 +913,11 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
         fn launch_nonce(&self) -> Result<String> {
             self.0.launch_nonce()
         }
-        fn admit_launch_directory(&self, directory: &Path, account: &HostAccount) -> Result<()> {
+        fn admit_launch_directory(
+            &self,
+            directory: &Path,
+            account: Option<&HostAccount>,
+        ) -> Result<()> {
             self.0.admit_launch_directory(directory, account)
         }
         fn pause(&self, _: Instant) {}

@@ -451,7 +451,9 @@ fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
 }
 
 // A host that a core starts runs as the core: the check is made for the core's account, and
-// when this process's own account would be admitted the refusal names both accounts.
+// when this process's own account would be admitted the refusal names both accounts. When the
+// connection could not name the core's account, the owner is left to the host and only what
+// needs no account is judged. Each refusal is a `RefusedDirectory`.
 #[cfg(unix)]
 #[test]
 fn a_core_started_host_is_judged_for_the_cores_account() {
@@ -461,26 +463,44 @@ fn a_core_started_host_is_judged_for_the_cores_account() {
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
     let own = unsafe { libc::geteuid() };
     let this = HostAccount::of_uid(own);
-    refuse_before_core_launch(&private, TerminalKind::Herdr, &this).unwrap();
+    refuse_before_core_launch(&private, TerminalKind::Herdr, Some(&this)).unwrap();
+    refuse_before_core_launch(&private, TerminalKind::Herdr, None).unwrap();
     let other = HostAccount::of_uid(own.wrapping_add(1));
+    let refusal =
+        refuse_before_core_launch(&private, TerminalKind::Herdr, Some(&other)).unwrap_err();
+    assert!(
+        refusal
+            .downcast_ref::<super::super::RefusedDirectory>()
+            .is_some()
+    );
     assert_eq!(
-        format!(
-            "{:#}",
-            refuse_before_core_launch(&private, TerminalKind::Herdr, &other).unwrap_err()
-        ),
+        format!("{refusal:#}"),
         format!(
             "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user; TAB runs as uid {own} and the Herdr Core as uid {}; run TAB as the core's user",
             private.display(),
             own.wrapping_add(1)
         )
     );
-    // A directory neither account would admit is refused for its own reason alone.
+    // A directory neither account would admit is refused for its own reason alone, and with
+    // no account known as well.
     fs::set_permissions(&private, fs::Permissions::from_mode(0o770)).unwrap();
+    for core in [Some(&other), None] {
+        let text = format!(
+            "{:#}",
+            refuse_before_core_launch(&private, TerminalKind::Herdr, core).unwrap_err()
+        );
+        assert!(text.ends_with("not private to the current user"), "{text}");
+    }
+    let link = temp.path().join("session-link");
+    std::os::unix::fs::symlink(&private, &link).unwrap();
     let text = format!(
         "{:#}",
-        refuse_before_core_launch(&private, TerminalKind::Herdr, &other).unwrap_err()
+        refuse_before_core_launch(&link, TerminalKind::Herdr, None).unwrap_err()
     );
-    assert!(text.ends_with("not private to the current user"), "{text}");
+    assert!(
+        text.contains("refusing non-directory Herdr launch path"),
+        "{text}"
+    );
 }
 
 // What the refusal tells a user whose TAB and core give their files different owners on
