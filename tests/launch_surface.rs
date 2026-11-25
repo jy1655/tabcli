@@ -35,16 +35,32 @@ struct Fixture {
     absent_core: String,
 }
 
+// A temporary directory only this user can change. Without explicit permissions tempfile
+// creates it with the umask's mode (0o775 under umask 002), and in a shared directory (/tmp,
+// or a TMPDIR shared by several users) another user could then create an entry that the
+// cases need to be absent: the socket, the state root or the workspace. On Windows the
+// directory keeps the access list of the user's temporary directory.
+fn private_directory() -> tempfile::Builder<'static, 'static> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
+}
+
 impl Fixture {
     fn new() -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_directory().tempdir().unwrap();
         let base = directory.path().canonicalize().unwrap();
         // An endpoint where no core runs. On macOS and Linux it is a socket path, which the
         // adapter refuses by its length (above 103 bytes on macOS, 107 on Linux) before it
         // looks for a core, so it is not placed under the caller's temporary directory, whose
         // length the test does not control. On Windows it is a local pipe name nothing serves.
         #[cfg(unix)]
-        let socket_directory = tempfile::Builder::new()
+        let socket_directory = private_directory()
             .prefix("tls")
             .tempdir_in("/tmp")
             .unwrap();
@@ -60,6 +76,12 @@ impl Fixture {
             std::process::id(),
             base.file_name().unwrap().to_string_lossy()
         );
+        #[cfg(unix)]
+        for path in [directory.path(), socket_directory.path()] {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is not private", path.display());
+        }
         Self {
             base,
             _directory: directory,
