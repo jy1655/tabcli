@@ -256,3 +256,55 @@ fn doctor_reports_the_selected_surface_without_admitting_it() {
         );
     }
 }
+
+// An explicit terminal this OS does not run is refused at selection, before the provider's
+// admission, the workspace or the source is read and before anything is created, with the
+// same refusal on macOS, Linux and Windows. macOS used to pass it on to the launch.
+#[test]
+fn an_explicit_terminal_this_os_does_not_run_is_refused_before_anything_exists() {
+    let fixture = Fixture::new();
+    let (os, alternatives, foreign): (&str, &str, &[(&str, &str)]) = if cfg!(target_os = "macos") {
+        (
+            "macOS",
+            "iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+            &[("windows-console", "Windows Console"), ("tmux", "tmux")],
+        )
+    } else if cfg!(target_os = "linux") {
+        (
+            "Linux",
+            "tmux or herdr",
+            &[
+                ("iterm2", "iTerm2"),
+                ("terminal", "Terminal.app"),
+                ("ghostty", "Ghostty"),
+                ("warp", "Warp"),
+                ("wezterm", "WezTerm"),
+                ("windows-console", "Windows Console"),
+            ],
+        )
+    } else {
+        (
+            "Windows",
+            "windows-console or herdr",
+            &[
+                ("iterm2", "iTerm2"),
+                ("terminal", "Terminal.app"),
+                ("ghostty", "Ghostty"),
+                ("warp", "Warp"),
+                ("wezterm", "WezTerm"),
+                ("tmux", "tmux"),
+            ],
+        )
+    };
+    for (option, name) in foreign {
+        let expected = format!("{name} is not available on {os}; use {alternatives}");
+        for provider in PROVIDERS {
+            let reply = fixture.ask(provider, Some(option), Caller::InheritedMarker);
+            assert_eq!(error(&reply), expected, "{provider} {option}: {reply}");
+            assert_eq!(reply["failure_kind"], "unsupported", "{reply}");
+        }
+        let reply = fixture.reopen(Some(option));
+        assert_eq!(error(&reply), expected, "reopen {option}: {reply}");
+        assert_eq!(reply["failure_kind"], "unsupported", "{reply}");
+    }
+}

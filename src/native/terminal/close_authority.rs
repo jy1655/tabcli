@@ -496,6 +496,18 @@ pub(in crate::native) fn close_owned_surface(
     session: &TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
+    // A kind this OS does not run gets the refusal its lookup gives every such kind, after the
+    // budget and the binding and before any record or observation is read, so that no OS's own
+    // close rules (an owner's attestation, a startup rule) answer for it first. This OS's
+    // processes say nothing about another OS's terminal, so no authority could come from them.
+    // The close's Repair has already run and can still settle such a handle from its records.
+    if let Some(os) = terminal::OsTerminals::CURRENT
+        && !os.runs(session.kind)
+    {
+        close_remaining(deadline)?;
+        session.verify_managed_session(id)?;
+        return Err(os.unavailable(session.kind));
+    }
     let observation = Production::new(directory, id, session, deadline);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return observation.close_posix_surface();

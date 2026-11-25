@@ -250,14 +250,17 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `OsTerminals` (`terminal/mod.rs`) lists the kinds each OS runs. Each OS's lookup refuses
   every other kind with `OsTerminals::unavailable` before any adapter is reached:
   `<Name> is not available on <OS>; use <its kinds>`, unsupported, the same on macOS, Linux
-  and Windows. Linux and Windows selection refuse an explicit such kind with the same text
-  before a session exists; macOS selection passes it on, and the launch's open refuses it
-  after the session is created. A stored handle can name another OS's terminal (a moved
-  state directory); its records stay readable, and every surface operation, including a close
-  that reaches the surface, gets this refusal (after the kind's declared screen or
-  guarded-input refusal) and keeps the handle. On macOS and Windows a tmux handle gets it at
-  its created-host close evidence. Dead-owner Repair of such a handle is decided in
-  `owner_exit`, not by this refusal. `supported_on_this_platform` reads the same list.
+  and Windows. Each OS's selection refuses an explicit such kind with the same text before a
+  session exists. A stored handle can name another OS's terminal (a moved state directory);
+  its records stay readable, and every surface operation gets this refusal (after the kind's
+  declared screen or guarded-input refusal) and keeps the handle. The entry points answer
+  with it before their own OS's rules: guarded input before the macOS and Linux claim check,
+  and the explicit close (`close_authority::close_owned_surface`) after the binding check and
+  before any owner, intent or launch record is read, since this OS's processes are no
+  evidence about another OS's terminal. The close's Repair runs before it and still settles
+  some such handles from their records; that decision is `owner_exit`'s and differs by OS.
+  On macOS and Windows a tmux handle also gets the refusal at its created-host close
+  evidence. `supported_on_this_platform` reads the same list.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types with the

@@ -12,9 +12,11 @@
   a difference is unavoidable): `<Name> is not available on Windows; use windows-console or
   herdr`, unsupported, a send known unsent. Selection refuses an explicit such kind with the
   same text. Such a handle never reaches the console helper, which still refuses anything but
-  a managed console. Releases up to 0.4.49 sent it to the managed console: the helper refused
-  it (a send as delivery uncertain), the surface proof passed it to the owner check, and
-  doctor's probe could read a pane id as a dead process and report the surface missing. Give a new
+  a managed console. Releases up to 0.4.49 sent it to the managed console: a started helper
+  refused it, and a send refused there was classified as delivery uncertain (a handle without
+  its session binding was refused before the helper started, as not sent); the surface proof
+  passed it to the owner check; and doctor's probe could read a pane id as a dead process and
+  report the surface missing. Give a new
   Windows surface its own adapter in that lookup and list its kind in `OsTerminals::WINDOWS`;
   do not branch one of these operations on the kind. `attach_command` and `admit_selection`
   still check kinds outside those operations.

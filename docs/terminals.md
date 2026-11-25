@@ -20,13 +20,13 @@ The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmu
 
 Each operating system runs only its own terminals: macOS iTerm2, Terminal.app, Ghostty, Warp,
 WezTerm and Herdr; Linux tmux and Herdr; Windows its managed console and Herdr. Another terminal
-is refused the same way on all three: `<Name> is not available on <system>; use <the terminals
-it runs>`. Linux and Windows refuse such a `--terminal` before any session exists; macOS
-creates the session and refuses it when the launch opens the terminal, so the session ends
-`failed`. A session record can also name such a terminal, for example in a state directory
-copied from another operating system. Its records stay readable, `screen` and `doctor` report
-the terminal as unsupported, and a `tell` or `close-session` that reaches the terminal gets that
-same refusal; nothing is sent and the terminal handle is kept.
+is refused the same way on all three, before any session exists: `<Name> is not available on
+<system>; use <the terminals it runs>`. A session record can also name such a terminal, for
+example in a state directory copied from another operating system. Its records stay readable
+and `screen` and `doctor` report the terminal as unsupported. A `tell` that reaches the
+terminal gets that same refusal and sends nothing. `close-session` first repairs a session
+whose owner has ended, which can close it from its records alone; otherwise it gets that same
+refusal and keeps the terminal handle, so the session can be closed where its terminal runs.
 
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Automatic selection verifies a Herdr caller when both
