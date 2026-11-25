@@ -196,9 +196,10 @@ your Windows user. An elevated core refuses an unelevated TAB. The session direc
 be a real, private directory: a junction, or an access list that lets another account change
 its entries, refuses the launch. The launch host runs as the core, so TAB checks the
 directory for the core's account before it creates the terminal and fails at once with the
-reason. An elevated TAB, such as an administrator's SSH session, gives the directory the
-Administrators group as owner, which the host of a core that is not elevated refuses: run TAB
-without elevation, as the core runs.
+reason. An elevated TAB, such as an administrator's SSH session, normally gives the directory
+the Administrators group as owner, which the host of a core that is not elevated refuses: run
+TAB without elevation, as the core runs. A refusal only the host can know, such as a directory
+changed after TAB's check, is written to the launch log and the start ends at its deadline.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."

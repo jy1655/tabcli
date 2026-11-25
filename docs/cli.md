@@ -177,11 +177,16 @@ remain nonempty. They are record labels; a terminal can also use its own ownersh
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
 Before it creates the surface, TAB checks the new session directory as the terminal's launch
-host will (a real directory that only its account can change; for Herdr, the core's account;
-the Windows console's host makes no such check).
-A directory the host would refuse fails the start at once with the host's reason, recorded as
-`terminal launch failed: ...; no surface handle was recorded and no prompt was sent`; the
-failed session can be closed and pruned like any other.
+host will, as far as TAB can establish that before creating anything: a real directory that no
+other account can change, for the account the host runs as when TAB knows it (TAB's own for
+tmux, the core's for Herdr; the account of a macOS terminal application is not checked, and
+the Windows console's host makes no such check). A directory the host would refuse fails the
+start at once with the host's reason, recorded as `terminal launch failed: ...; no surface
+handle was recorded and no prompt was sent`; the failed session can be closed and pruned like
+any other. A refusal only the host can know, such as a directory changed after TAB's check, is
+written to the launch log by the host, and the start ends at the launch deadline. A workspace,
+state directory or TAB executable path that is not Unicode text is refused before the launch,
+because the launch carries these paths as text.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

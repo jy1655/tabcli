@@ -51,22 +51,28 @@
   If saving the binding for a confirmed terminal fails and removal also fails, the adapter
   returns that same confirmed handle to the launcher. The launcher uses the current Claim
   and Close records to decide whether to save it. A later close checks its identity again.
-- The launch host is the core's program and runs as the core's account. On the connection
-  that will create the terminal, after `hello` and before `terminal.run`, the adapter runs the
-  host's own directory admission for that account (`Core::admit_launch_directory`,
+- The launch host is the core's program and runs as the core's account, so the launcher does
+  not judge a Herdr session directory itself. On the connection that sends `terminal.run`,
+  right before it (after the caller check, which can replace the connection), the adapter runs
+  the host's own directory admission for that account (`Core::admit_launch_directory`,
   `bound_host::refuse_before_core_launch`): on macOS and Linux the socket peer's uid, which
-  the connection already required to be TAB's; on Windows the token user and default owner of
-  the pipe's server process. A refusal creates nothing and names the host's reason; when TAB's
-  own account would be admitted it also says how the accounts differ. Observed 2026-11-26
-  (Windows 11, hc 0.1.21): an elevated TAB (an administrator's SSH session) gives the session
-  directory the Administrators group as owner, which the host of a core that is not elevated
-  refused only in the launch log, and the caller timed out after 31.7 s. A connection whose
-  account cannot be read leaves the decision to the host. What only the host can know (the
-  directory changed after this check, a program started under another token than the core's
-  own, an I/O failure the host alone meets) is reported as before: the Linux and Windows hosts
-  log it, the macOS capture host prints it in its terminal. The host has not verified that it
-  owns the launch, so it publishes no Record, and its finished terminal still reads as present
-  until the launch deadline.
+  the connection already required to be TAB's; on Windows the token user and default owner
+  read from the pipe server's process handle that the user check opened and the connection
+  keeps, so a reused PID cannot answer. A connection that cannot name the account leaves the
+  owner and, on Windows, the access list to the host; the path, a real directory and on macOS
+  and Linux the permission bits are still judged. A refusal (`terminal::RefusedDirectory`)
+  creates nothing and names the host's reason; when TAB's own account would be admitted it
+  also says how the accounts differ. Observed 2026-11-26 (Windows 11, hc 0.1.21): an elevated
+  TAB (an administrator's SSH session) gave the session directory the Administrators group as
+  owner, which the host of a core that is not elevated refused only in the launch log, and the
+  caller timed out after 31.7 s. The launcher settles such a refusal only for its own Claim
+  and pending receipt, only through a real directory, and after waiting for the lifecycle lock
+  (`launch::refused_before_surface`). What only the host can know (the directory changed after
+  this check, a program started under another token than the core's own, an I/O failure the
+  host alone meets) is still the host's: every Herdr host, on macOS too, writes its admission
+  refusal to the launch log, only into a real directory, as a diagnostic, not a Record. The
+  host has not verified that it owns the launch, so it publishes no Record, and its finished
+  terminal still reads as present until the launch deadline.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface
@@ -169,9 +175,9 @@
   read again from a handle opened on the directory itself (`FILE_FLAG_OPEN_REPARSE_POINT`): no
   reparse point, and the trust store's access-list rule, where `FILE_DELETE_CHILD` and `DELETE`
   also count as changing a directory (`consent::windows_directory_is_private`; the store's own
-  rule is unchanged). The launcher judges the same rule for the core's owners
-  (`consent::windows_directory_is_private_to`, `windows/process.rs` `process_account_of`); the
-  core's elevation is read only to explain a refusal. After the same binding wait, launch
+  rule is unchanged). The Herdr adapter judges the same rule for the core's owners
+  (`consent::windows_directory_is_private_to`, read through `windows/process.rs`
+  `QueriedProcess`); the core's elevation is read only to explain a refusal. After the same binding wait, launch
   judgment and locked re-check as the Linux host (`bound_host`), it flushes `CONIN$` (a
   console it cannot flush refuses the launch), keeps itself running through Ctrl+C and
   Ctrl+Break with a handler routine (not inherited, unlike ignoring them), and starts PowerShell

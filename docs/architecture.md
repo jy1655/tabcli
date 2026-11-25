@@ -283,12 +283,15 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
   `terminal/bound_host.rs` admits a bound host's directory in one order (absolute path,
-  session-id file name, existing real directory, private to the current user). The launcher
-  runs that admission before it creates a surface (`refuse_before_launch`, for this process's
-  account), and the Herdr adapter again on the connection that will create the terminal, for
-  the core's account (`refuse_before_core_launch`), so a directory the host would refuse fails
-  at once with the host's reason, as a surface that cannot open does. A refusal only the host
-  can know is reported as before (the direct handoffs log it). It owns the
+  session-id file name, existing real directory, private to the current user). Before a
+  surface exists, the launcher runs that admission for a host this platform runs, as far as it
+  can establish the host's account (`refuse_before_launch`: tmux as this process, the macOS
+  applications without an account, so not their owner), and the Herdr adapter runs it on the
+  connection that sends `terminal.run`, for the core's account (`refuse_before_core_launch`).
+  A directory the host would refuse fails at once with the host's reason; the launcher settles
+  that `RefusedDirectory` only for its own Claim, only through a real directory, after waiting
+  for the lifecycle lock. A refusal only the host can know goes to the launch log on every
+  platform (`run_logged_bound_host`), only into a real directory. It owns the
   registered launch-host dispatch, the shared binding wait, startup input flush and refusal
   log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
   before flushing input. The Windows Terminal tab host uses its own offer protocol.
