@@ -253,6 +253,34 @@ fn surface_probes_are_due_every_second_within_two_seconds_and_the_deadline() {
     assert_eq!(run.sleeps, [100; 35]);
 }
 
+// The case observed on 2026-11-26 (Windows, hc 0.1.21): a launch host that refuses its session
+// directory leaves only its line in the launch log, no Record, and its finished Herdr terminal
+// still reads as present, so the wait ends only at the launch deadline, with the generic
+// timeout. A refusal the launcher can know beforehand no longer reaches the wait; one that
+// only the host can know still ends this way.
+#[test]
+fn a_directory_refusal_in_the_log_alone_ends_the_wait_at_the_deadline() {
+    let (_dir, store, token) = fixture();
+    log(
+        &store,
+        "herdr_host_refused: Herdr launch directory is not private to the current user: session directory owner differs from current user",
+    );
+    let run = run(&store, START_TIMEOUT.as_millis() as u64, |_| Ok(true));
+    let error = run.result.unwrap_err();
+    assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
+    assert!(error.downcast_ref::<TimedOut>().is_some());
+    assert_eq!(
+        run.sleeps.iter().sum::<u64>(),
+        START_TIMEOUT.as_millis() as u64
+    );
+    assert_eq!(run.probes.len(), 29);
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(LAUNCH_DEADLINE)
+    );
+    assert!(!claim_is(&store, &token));
+}
+
 // A presence check that cannot inspect the surface does not prove its absence: the wait goes
 // on past its first probe, due one second after it starts, to its deadline.
 #[test]

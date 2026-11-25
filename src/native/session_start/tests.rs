@@ -1101,6 +1101,74 @@ fn a_surface_failure_after_the_fence_keeps_its_terminal_failure_settlement() {
     assert_eq!(result["error"], recorded.as_str(), "{result}");
 }
 
+// A session directory that the launch host would refuse (here: another account can change
+// it) is refused by the launcher with the host's own reason before any surface exists, not
+// by the host after the surface was created, when the launcher could learn it only at the
+// launch deadline (2026-11-26). The start settles as a refusal before a surface does: the
+// receipt stays pending, the failure is recorded with the released Claim and the failed
+// Request, no surface record exists, and close needs no terminal. The kind is one whose host
+// runs that admission but which this platform does not open, so the code before the check
+// opened no terminal either: it failed with the kind's refusal instead.
+#[test]
+fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
+    let mut fixture = Fixture::new();
+    fixture.receipt_directory = false;
+    fixture.terminal_kind = if cfg!(target_os = "linux") {
+        terminal::TerminalKind::Iterm2
+    } else {
+        terminal::TerminalKind::Tmux
+    };
+    let prepared = fixture.prepare().unwrap();
+    let directory = &prepared.created.directory;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o770)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let system = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let status = std::process::Command::new(PathBuf::from(system).join(r"System32\icacls.exe"))
+            .arg(directory)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls /grant");
+    }
+    let (error, report) = run(&prepared, &FreshSource);
+    let text = format!("{error:#}");
+    let name = fixture.terminal_kind.display_name();
+    let cause = text
+        .strip_prefix(&format!(
+            "failed to open {name} surface for session {}: ",
+            prepared.created.id
+        ))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        cause.starts_with(&format!(
+            "the {name} launch host would refuse the session directory {}: {name} launch directory is not private to the current user",
+            directory.display()
+        )),
+        "{cause}"
+    );
+    assert!(cause.ends_with("; no terminal was opened"), "{cause}");
+    let store = Store::open_unchecked(directory);
+    assert_eq!(
+        launch::read(&store).unwrap().unwrap().phase,
+        launch::Phase::Pending
+    );
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(
+            format!(
+                "terminal launch failed: {cause}; no surface handle was recorded and no prompt was sent"
+            )
+            .as_str()
+        )
+    );
+    assert_settled_before_fence(&fixture, &prepared, &report);
+}
+
 // A launch failure whose Claim the launcher already fenced belongs to the launcher's own
 // settlement (the terminal failure handoff or the startup wait); the fresh source adds none,
 // even while the Session is still launching.
