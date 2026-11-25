@@ -1062,7 +1062,6 @@ fn hc_command(endpoint: &str, command: &str, address: &str, powershell: bool) ->
 pub(in crate::native::terminal) struct Adapter<C: Core> {
     core: C,
 }
-#[cfg(unix)]
 pub(in crate::native::terminal) type InstalledAdapter = Adapter<Installed>;
 impl Adapter<Installed> {
     /// The adapter over the running Herdr Core's endpoint and this machine's processes.
@@ -1077,8 +1076,8 @@ impl<C: Core> Adapter<C> {
     }
 }
 
-/// The surface operations, the same on every platform; each platform's terminal dispatch
-/// reaches them (the POSIX adapter trait on macOS and Linux, the Windows dispatch by kind).
+/// The surface operations, the same on every platform; each platform's adapter trait reaches
+/// them (`PosixTerminalAdapter` on macOS and Linux, `WindowsTerminalAdapter` on Windows).
 impl<C: Core> Adapter<C> {
     /// Creates the terminal and binds it before its launch host starts anything. Herdr has
     /// no window to choose. The program of the terminal waits for the binding; nothing is
@@ -1268,6 +1267,70 @@ mod posix_adapter {
             },
             deadline,
         )
+    }
+}
+
+// Compiled into every test build with the Windows dispatch, so that its routing to this
+// adapter is tested on every CI target.
+#[cfg(any(windows, test))]
+mod windows_adapter {
+    use super::{Adapter, Core};
+    use crate::native::terminal::windows_dispatch::{
+        BindSurface, UnbindSurface, WindowsTerminalAdapter,
+    };
+    use crate::native::terminal::{CloseOutcome, TerminalSendResult, TerminalSession};
+    use anyhow::Result;
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    impl<C: Core> WindowsTerminalAdapter for Adapter<C> {
+        fn open_bound_tab(
+            &self,
+            command: &str,
+            directory: &Path,
+            deadline: Instant,
+            bind: BindSurface<'_>,
+            unbind: UnbindSurface<'_>,
+        ) -> Result<TerminalSession> {
+            self.open(command, directory, deadline, bind, unbind)
+        }
+        fn send_file(
+            &self,
+            session: &TerminalSession,
+            prompt_path: &Path,
+            deadline: Instant,
+        ) -> TerminalSendResult {
+            self.send(session, prompt_path, deadline)
+        }
+        fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+            self.screen(session, deadline)
+        }
+        // Guarded dialog input is declared unsupported in the registration.
+        fn verify_surface(
+            &self,
+            session: &TerminalSession,
+            timeout: Option<Duration>,
+        ) -> Result<()> {
+            self.verify(session, timeout)
+        }
+        fn close_session_until(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            deadline: Instant,
+        ) -> Result<CloseOutcome> {
+            self.close(directory, session, deadline)
+        }
+        fn surface_present(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            timeout: Duration,
+        ) -> Result<bool> {
+            self.present(directory, session, timeout)
+        }
     }
 }
 

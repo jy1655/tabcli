@@ -637,11 +637,9 @@ pub(in crate::native) fn verified_terminal_surface_owner(
     session.verify_managed_session(expected_session_id)?;
     #[cfg(windows)]
     let owner = {
-        // A Herdr terminal is proved on its recorded core, as on macOS and Linux, before
-        // its owner; a managed console is proved through its owner alone.
-        if session.kind == terminal::TerminalKind::Herdr {
-            terminal::verify_windows_herdr_surface(session, timeout)?;
-        }
+        // The kind's adapter proves its surface before the owner, as on macOS and Linux:
+        // a Herdr terminal on its recorded core; a managed console through its owner alone.
+        terminal::verify_windows_surface(session, timeout)?;
         Some(verified_windows_native_owner(
             directory,
             expected_session_id,

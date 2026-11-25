@@ -221,6 +221,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   in-process test adapter uses the same decoder, provider resolution, and reply interpretation.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Windows retains console attachment, Win32 effects, and lifecycle-locked input dispatch.
+  Each Windows surface operation reads the kind's declared refusals and then resolves its adapter
+  through one lookup (`windows/dispatch.rs`): `ManagedConsole` in `windows/mod.rs` or the Herdr
+  adapter, as the shared POSIX dispatch does on macOS and Linux. That module is compiled into
+  every test build, so a test builds the lookup over recording adapters on every target.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types with the
@@ -710,8 +714,10 @@ repair settles the records without resending a prompt or guessing ownership of a
   launch uses the portable launch-host form and its local `LaunchHost` handoff (including
   the adapter's binding check), the close-evidence choice, the refusal message for each operation
   the kind does not support and, on macOS, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
-  exhaustive lookup on every build target; the shared lookups and the shared macOS refusals read
-  it, so nothing else needs a per-kind match. For macOS operations, implement the
+  exhaustive lookup on every build target; the shared lookups and the declared refusals of the
+  POSIX and Windows dispatches read it, so nothing else needs a per-kind match. For a Windows
+  surface, implement `WindowsTerminalAdapter` and add it to the lookup in `windows/dispatch.rs`.
+  For macOS operations, implement the
   `MacTerminalAdapter` methods for the operations the kind supports, behind an injectable
   dependency, and add the adapter to the `Dispatch` in `macos/mod.rs`; an operation the
   registration declares unsupported is refused before the adapter is called. What an adapter

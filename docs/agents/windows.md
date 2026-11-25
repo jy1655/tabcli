@@ -2,11 +2,17 @@
 
 - Codex owns injected paste evidence and guarded submission; see Current Codex Boundary (#124).
 
-- A Herdr terminal is not a managed console: on Windows its handle is dispatched by kind to
-  the Herdr adapter and never reaches the console control helper, the tab host or the focus
-  guard (see Current Herdr Surface Boundary). Its launch host (`windows/launch_host.rs`)
-  starts the same PowerShell root through `console_root_arguments`; change that root in one
-  place for both surfaces.
+- Every surface operation on Windows reads the kind's declared refusals and then resolves its
+  adapter through one lookup (`windows/dispatch.rs`), as `posix.rs` does on macOS and Linux:
+  `ManagedConsole` (`windows/mod.rs`) for a managed console, the Herdr adapter for a Herdr
+  terminal, and a refusal for any other kind. Give a new Windows surface its own adapter in
+  that lookup; do not branch an operation on the kind. The lookup's portable tests run on
+  every CI target; the installed lookup, over the console helper and the core's pipe, is
+  tested on the Windows runner only.
+- A Herdr terminal is not a managed console: its handle never reaches the console control
+  helper, the tab host or the focus guard (see Current Herdr Surface Boundary). Its launch
+  host (`windows/launch_host.rs`) starts the same PowerShell root through
+  `console_root_arguments`; change that root in one place for both surfaces.
 
 - A managed console on native Windows is a tab of Windows Terminal, and a console window
   of its own only when no tab can be had: `wt.exe` is not on an absolute `PATH` entry, the

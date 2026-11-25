@@ -1245,8 +1245,8 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
         "iTerm2 is not available on Windows; use windows-console or herdr"
     );
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
-    // The open guard refuses before any process, binding or unbinding.
-    let refused = super::open_bound_tab(
+    // The installed Windows lookup refuses before any process, binding or unbinding.
+    let refused = terminal::open_bound_tab(
         terminal::TerminalKind::Iterm2,
         "command",
         Path::new("unused"),
