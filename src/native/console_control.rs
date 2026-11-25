@@ -249,12 +249,13 @@ fn resolve_action(
             .path()
             .to_owned()
     };
-    let (submit_count, newline) = provider::initial_transport(provider)
-        .facts()
-        .surface
-        .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
-            (surface.submit_count, surface.newline)
-        });
+    let (submit_count, newline) =
+        provider::admit_surface(provider, terminal::TerminalKind::WindowsConsole, None)
+            .ok()
+            .and_then(|transport| transport.facts().surface)
+            .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
+                (surface.submit_count, surface.newline)
+            });
     match request.operation {
         Operation::Screen => ResolvedAction::Screen,
         Operation::Send {

@@ -47,8 +47,8 @@ impl Fixture {
     }
 
     fn prepare(&self) -> Result<Prepared> {
-        let resolved = Resolved {
-            spec: SessionSpec {
+        let resolved = Resolved::from_parts(
+            SessionSpec {
                 provider: FirstPartyCli::Codex,
                 provider_path: PathBuf::from("codex"),
                 provider_version: "fixture".into(),
@@ -59,14 +59,13 @@ impl Fixture {
                 yolo: false,
                 prompt: "fixture".into(),
             },
-            terminal_kind: self.terminal_kind,
-            context_sources: context_sources(),
-            consent: self
-                .consent
+            self.terminal_kind,
+            context_sources(),
+            self.consent
                 .as_ref()
                 .map(|requested| consent::assess(self.root.path(), requested))
                 .transpose()?,
-        };
+        );
         let (prepared, ()) = resolved.create_with(|spec, consent| {
             let created =
                 create_session_within(self.root.path(), &[self.root.path().to_owned()], spec)?;
@@ -1239,12 +1238,20 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         .expect("missing workspace refuses before probing");
         assert!(error.to_string().contains("workspace does not exist"));
 
-        // Probed Codex versions below stable 0.169.0 refuse before title, consent, or creation.
-        for version in ["codex-cli 0.168.0", "codex-cli 0.169.0-alpha.1", "unknown"] {
+        // Probed Codex versions below stable 0.169.0 (including prereleases above the
+        // floor and malformed SemVer suffixes) refuse before creation with a valid title.
+        for version in [
+            "codex-cli 0.168.0",
+            "codex-cli 0.169.0-alpha.1",
+            "codex-cli 0.170.0-alpha.1",
+            "codex-cli 0.170.0--",
+            "codex-cli 0.170.0+",
+            "unknown",
+        ] {
             let error = resolve_surface(
                 FirstPartyCli::Codex,
                 &project,
-                Some("   "),
+                None,
                 terminal::TerminalKind::Herdr,
                 Some(version),
             )
@@ -1259,6 +1266,25 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
                 "{detail}"
             );
         }
+
+        // Precedence: post-probe surface admission runs before title validation.
+        let error = resolve_surface(
+            FirstPartyCli::Codex,
+            &project,
+            Some("   "),
+            terminal::TerminalKind::Herdr,
+            Some("codex-cli 0.168.0"),
+        )
+        .err()
+        .expect("Herdr version refusal must precede blank-title validation");
+        let detail = format!("{error:#}");
+        assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{detail}");
+        assert!(
+            detail.starts_with(
+                "codex on Herdr is unsupported: Herdr requires stable Codex 0.169.0 or newer with --no-daemon;"
+            ),
+            "{detail}"
+        );
 
         // Stable 0.169.0+ is admitted on Herdr; older Codex stays admitted on non-Herdr surfaces.
         resolve_surface(
@@ -1291,4 +1317,106 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         .unwrap();
     }
     assert_no_sessions();
+}
+
+// Post-probe surface admission hands its selected initial Transport straight into Resolved
+// and Prepared so initial delivery cannot re-select a transport independently.
+#[test]
+fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
+    use crate::native::delivery::Readiness;
+    use crate::native::session::primitives::STATE_DIR_ENV;
+    use std::process::Command;
+
+    const CHILD: &str = "TABCLI_START_ADMITTED_TRANSPORT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let codex_home = base.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let root = base.path().join("state");
+        fs::create_dir(&root).unwrap();
+        let test_name = format!(
+            "{}::resolve_with_carries_the_admitted_initial_transport_into_prepared",
+            module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, rest)| rest)
+        );
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("CODEX_HOME", &codex_home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let root = Reader::state_root().unwrap();
+    let project = root.parent().unwrap().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let resolve_case = |provider, surface, version: &str| {
+        let ask = AskRequest {
+            provider,
+            workspace: project.clone(),
+            prompt: "fixture prompt".into(),
+            title: None,
+            model: None,
+            effort: None,
+            terminal: None,
+            yolo: false,
+            timeout: Duration::from_secs(30),
+            detach: false,
+            json: false,
+            context_results: Vec::new(),
+        };
+        resolve_with(
+            fresh_resolution(&ask, context::resolve(&[]).unwrap(), surface),
+            |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+        )
+        .unwrap()
+    };
+
+    let surface = if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else {
+        terminal::TerminalKind::Herdr
+    };
+    let resolved = resolve_case(FirstPartyCli::Codex, surface, "codex-cli 0.169.0");
+    let expected_name = if cfg!(windows) {
+        "terminal-paste-fallback"
+    } else {
+        "launch-argument"
+    };
+    assert_eq!(resolved.initial_transport.facts().name, expected_name);
+    let (prepared, ()) = resolved
+        .create_with(|spec, consent| {
+            let created = create_session_within(&root, std::slice::from_ref(&root), spec)?;
+            record_consent(&created, consent)?;
+            Ok((created, ()))
+        })
+        .unwrap();
+    let facts = prepared.initial_transport.facts();
+    assert_eq!(facts.name, expected_name);
+    if cfg!(windows) {
+        assert!(facts.surface.is_some());
+    } else {
+        assert_eq!(facts.readiness, Readiness::LaunchArgument);
+        assert!(facts.surface.is_none());
+    }
+
+    let claude = resolve_case(
+        FirstPartyCli::Claude,
+        terminal::TerminalKind::Herdr,
+        "2.1.302",
+    );
+    assert_eq!(
+        claude.initial_transport.facts().name,
+        "provider-cross-session-message"
+    );
 }

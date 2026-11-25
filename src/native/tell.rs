@@ -124,10 +124,10 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
         &mut claim,
         &previous_state,
     )?;
-    turn_run::run(
+    turn_run::run_follow_up(
         report,
         claim,
-        delivery::Turn::FollowUp { prompt: &prompt },
+        &prompt,
         &turn_run::TurnRun {
             facts: turn_run::SessionFacts {
                 id: &request.id,

@@ -549,12 +549,45 @@ fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
 }
 
 #[test]
+fn codex_version_preserves_semver_punctuation() {
+    use super::launch_decision::Reason;
+    use crate::native::settings::CodexLifecycleHooks;
+
+    let pre = codex_version("codex-cli 0.170.0--").unwrap();
+    assert_eq!(pre.pre.as_str(), "-");
+    assert_eq!(
+        codex_version("OpenAI Codex (v0.170.0)").unwrap(),
+        Version::new(0, 170, 0)
+    );
+    let with_build = codex_version("codex-cli 0.170.0+build.1").unwrap();
+    assert!(with_build.pre.is_empty());
+    assert_eq!(with_build.build.as_str(), "build.1");
+    for malformed in [
+        "codex-cli 0.170.0+",
+        "codex-cli 0.170.0-",
+        "codex-cli 0.170.0.",
+    ] {
+        assert!(codex_version(malformed).is_err(), "{malformed}");
+    }
+    assert_eq!(
+        hooks::Eligibility::new(Some("codex-cli 0.170.0--"), CodexLifecycleHooks::On, true)
+            .lifecycle(),
+        Some(Reason::Prerelease)
+    );
+    assert_eq!(
+        hooks::Eligibility::new(Some("codex-cli 0.170.0+"), CodexLifecycleHooks::On, true)
+            .lifecycle(),
+        Some(Reason::VersionUnknown)
+    );
+}
+
+#[test]
 fn surface_route_unifies_admission_version_floor_and_initial_transport_across_platforms() {
     use crate::native::provider::SurfaceRefusal;
     use terminal::TerminalKind;
 
     for windows in [false, true] {
-        let default_transport = SurfaceRoute::for_platform_without_surface(windows)
+        let default_transport = SurfaceRoute::platform_default(windows)
             .initial_transport()
             .facts();
         for surface in TerminalKind::ALL {
@@ -563,8 +596,13 @@ fn surface_route_unifies_admission_version_floor_and_initial_transport_across_pl
                 (Some("codex-cli 0.147.0"), false),
                 (Some("codex-cli 0.168.0"), false),
                 (Some("codex-cli 0.169.0-alpha.1"), false),
+                (Some("codex-cli 0.170.0-alpha.1"), false),
+                (Some("codex-cli 0.170.0--"), false),
+                (Some("codex-cli 0.170.0+"), false),
+                (Some("codex-cli 0.170.0-"), false),
                 (Some("codex-cli 0.169.0"), true),
                 (Some("codex-cli 0.170.0"), true),
+                (Some("codex-cli 0.170.0+build.1"), true),
                 (Some("unknown"), false),
             ] {
                 let result = surface_route(windows, surface, version);
@@ -592,10 +630,11 @@ fn surface_route_unifies_admission_version_floor_and_initial_transport_across_pl
                                 "expected version refusal for non-Windows Herdr {version:?}: {result:?}"
                             );
                         };
+                        let version_text = version.unwrap();
                         assert!(
-                            detail.starts_with(
-                                "Herdr requires stable Codex 0.169.0 or newer with --no-daemon;"
-                            ),
+                            detail.starts_with(&format!(
+                                "Herdr requires stable Codex 0.169.0 or newer with --no-daemon; version: {version_text}"
+                            )),
                             "{detail}"
                         );
                     }
@@ -649,6 +688,9 @@ fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
     for (version, accepted) in [
         ("codex-cli 0.168.0", false),
         ("codex-cli 0.169.0-alpha.1", false),
+        ("codex-cli 0.170.0-alpha.1", false),
+        ("codex-cli 0.170.0--", false),
+        ("codex-cli 0.170.0+", false),
         ("codex-cli 0.169.0", true),
         ("codex-cli 0.170.0", true),
         ("unknown", false),
@@ -678,6 +720,13 @@ fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
             );
         } else {
             let error = herdr_plan.err().unwrap();
+            let detail = format!("{error:#}");
+            assert!(
+                detail.starts_with(&format!(
+                    "Herdr requires stable Codex 0.169.0 or newer with --no-daemon; recorded version: {version}"
+                )),
+                "{detail}"
+            );
             assert_eq!(
                 classify(&error),
                 Some(FailureKind::Unsupported),

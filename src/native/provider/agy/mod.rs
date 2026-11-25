@@ -326,9 +326,6 @@ impl NativeProviderAdapter for AgyAdapter {
         None
     }
 
-    fn initial_transport(&self) -> Box<dyn Transport> {
-        initial_transport_for_platform(cfg!(windows))
-    }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(AgyPaste::new())
     }
@@ -453,7 +450,7 @@ impl NativeProviderAdapter for AgyAdapter {
         _surface: terminal::TerminalKind,
         _version: Option<&str>,
     ) -> super::SurfaceSupport {
-        Ok(())
+        Ok(initial_transport_for_platform(cfg!(windows)))
     }
 }
 

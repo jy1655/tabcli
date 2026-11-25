@@ -34,6 +34,9 @@ pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
     spec: SessionSpec,
     terminal_kind: terminal::TerminalKind,
+    // The initial-prompt Transport selected by post-probe surface admission, carried
+    // straight into initial delivery so delivery cannot re-decide it independently.
+    initial_transport: Box<dyn delivery::Transport>,
     context_sources: Vec<requests::ContextSource>,
     // Assessed by resolve, from the path its Resolution names (ask: the requested path,
     // aliases included; reopen: the canonical one), before anything is created; recorded
@@ -52,9 +55,13 @@ impl Resolved {
         context_sources: Vec<requests::ContextSource>,
         consent: Option<consent::Assessment>,
     ) -> Self {
+        let initial_transport =
+            crate::native::provider::admit_surface(spec.provider, terminal_kind, None)
+                .expect("test fixture selects an admitted surface");
         Self {
             spec,
             terminal_kind,
+            initial_transport,
             context_sources,
             consent,
         }
@@ -77,6 +84,7 @@ impl Resolved {
                 created,
                 provider,
                 terminal_kind: self.terminal_kind,
+                initial_transport: self.initial_transport,
                 context_sources: self.context_sources,
             },
             source,
@@ -88,6 +96,7 @@ pub(super) struct Prepared {
     pub(super) created: CreatedSession,
     pub(super) provider: FirstPartyCli,
     pub(super) terminal_kind: terminal::TerminalKind,
+    pub(super) initial_transport: Box<dyn delivery::Transport>,
     pub(super) context_sources: Vec<requests::ContextSource>,
 }
 
@@ -233,7 +242,7 @@ pub(super) fn resolve_with(
     } = resolution;
     // A surface the provider's adapter cannot run on at all on this platform is refused
     // before anything is resolved or probed.
-    crate::native::provider::admit_surface(provider, terminal_kind, None)?;
+    let _ = crate::native::provider::admit_surface(provider, terminal_kind, None)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -252,8 +261,9 @@ pub(super) fn resolve_with(
     let (provider_path, provider_version) = probe(provider)?;
     // Once the installed CLI version is known, re-admit the surface with it so any
     // surface-specific version floor refuses before title, consent, session, or surface
-    // creation.
-    crate::native::provider::admit_surface(provider, terminal_kind, Some(&provider_version))?;
+    // creation, and keep the initial Transport this decision selected for delivery.
+    let initial_transport =
+        crate::native::provider::admit_surface(provider, terminal_kind, Some(&provider_version))?;
     let requested_title = title.unwrap_or_else(|| {
         let workspace_name = workspace
             .file_name()
@@ -282,6 +292,7 @@ pub(super) fn resolve_with(
             prompt,
         },
         terminal_kind,
+        initial_transport,
         context_sources,
         consent: Some(consent),
     })
@@ -448,10 +459,11 @@ impl Start {
         }
         initial_claim.startup_confirmed();
         let mut gate = |gate| source.gate(&created.directory, gate, deadline);
-        turn_run::run(
+        turn_run::run_initial(
             report,
             initial_claim,
-            delivery::Turn::Initial { gate: &mut gate },
+            &mut gate,
+            prepared.initial_transport.as_ref(),
             &turn_run::TurnRun {
                 facts: turn_run::SessionFacts {
                     id: &created.id,

@@ -47,22 +47,40 @@ pub(super) struct TurnRun<'a> {
     pub(super) baseline: usize,
 }
 
-/// Production run: the adapter's Transport for the Turn and the runtime checks.
-pub(super) fn run(
+/// Production initial-turn run: takes the initial Transport selected by surface admission
+/// (`provider::admit_surface`), so delivery uses that decision and cannot choose a second time.
+pub(super) fn run_initial(
     report: &mut TurnReport,
     claim: turn::Claim,
-    turn: Turn<'_>,
+    gate: &mut dyn FnMut(delivery::Gate) -> Result<()>,
+    transport: &dyn Transport,
     run: &TurnRun<'_>,
     on_delivery_error: impl FnOnce(delivery::Undelivered) -> anyhow::Error,
 ) -> Result<()> {
-    let transport = match turn {
-        Turn::Initial { .. } => provider::initial_transport(run.facts.provider),
-        Turn::FollowUp { .. } => provider::follow_up_transport(run.facts.provider),
-    };
     run_with(
         report,
         claim,
-        turn,
+        Turn::Initial { gate },
+        run,
+        on_delivery_error,
+        transport,
+        &RuntimeChecks,
+    )
+}
+
+/// Production follow-up run: the adapter's follow-up Transport and the runtime checks.
+pub(super) fn run_follow_up(
+    report: &mut TurnReport,
+    claim: turn::Claim,
+    prompt: &str,
+    run: &TurnRun<'_>,
+    on_delivery_error: impl FnOnce(delivery::Undelivered) -> anyhow::Error,
+) -> Result<()> {
+    let transport = provider::follow_up_transport(run.facts.provider);
+    run_with(
+        report,
+        claim,
+        Turn::FollowUp { prompt },
         run,
         on_delivery_error,
         transport.as_ref(),

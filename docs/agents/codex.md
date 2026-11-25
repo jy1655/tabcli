@@ -2,22 +2,27 @@
 
 - The Codex adapter decides surface eligibility, the Herdr version floor, `--no-daemon`,
   and the initial-prompt route in one place (`surface_route`), shared by `surface_support`
-  and `prepare_launch`.
+  and `prepare_launch`. `surface_support` returns the selected initial `Transport`, which
+  `session_start` carries directly into `turn_run::run_initial` so initial delivery never
+  re-selects a transport independently.
 - Off Windows, Herdr launches require stable Codex 0.169.0 or newer and explicitly pass
   `--no-daemon`, so tool processes retain the hc terminal identity instead of running
   in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
   Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
   session or terminal exists; `prepare_launch` applies the same decision from the recorded
-  surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. Other surfaces
-  retain their launch arguments and require no 0.169.0 floor.
+  surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. SemVer
+  punctuation (`-`, `+`, `.`) is preserved when parsing the version token so prereleases
+  such as `0.170.0--` and malformed suffixes such as `0.170.0+` are refused. Other
+  surfaces retain their launch arguments and require no 0.169.0 floor.
   The version floor is eligibility; ask, queue follow-up and completion need separate
   live verification. No Codex configuration file or daemon is changed.
-- On native Windows the adapter refuses a Herdr terminal (`surface_support`, and also in
-  `prepare_launch` through the same decision), before any resolution, probe, or session
-  exists: the initial prompt there is the injected console paste below (text without
-  Return, then one Return against the exact accepted screen), which `terminal.send` cannot
-  do, and the launch-argument route above would put the multi-line framed prompt on a Windows
-  command line (32,767 characters; 8,191 and no line break through an npm `codex.cmd`).
+- On native Windows the adapter refuses a Herdr terminal in `surface_support` before any
+  resolution, probe, or session exists, and `prepare_launch` applies the same decision to
+  a recorded handle as a backstop: the initial prompt there is the injected console paste
+  below (text without Return, then one Return against the exact accepted screen), which
+  `terminal.send` cannot do, and the launch-argument route above would put the multi-line
+  framed prompt on a Windows command line (32,767 characters; 8,191 and no line break
+  through an npm `codex.cmd`).
   Inside an hc terminal the automatic choice for Codex stays the managed console. Replace the
   refusal with a Windows Herdr route that keeps argument semantics and size, or a
   first-party addressed input.

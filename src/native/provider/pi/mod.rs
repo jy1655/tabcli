@@ -249,9 +249,6 @@ impl NativeProviderAdapter for PiAdapter {
         Some(APPLIED_MARKER)
     }
 
-    fn initial_transport(&self) -> Box<dyn Transport> {
-        initial_transport_for_platform(cfg!(windows))
-    }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(PiPaste::new())
     }
@@ -386,7 +383,7 @@ impl NativeProviderAdapter for PiAdapter {
         _surface: terminal::TerminalKind,
         _version: Option<&str>,
     ) -> super::SurfaceSupport {
-        Ok(())
+        Ok(initial_transport_for_platform(cfg!(windows)))
     }
 }
 

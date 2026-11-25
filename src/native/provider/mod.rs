@@ -301,7 +301,6 @@ trait NativeProviderAdapter: Sync {
         reader: &super::session::Reader,
         claim: &str,
     ) -> Option<serde_json::Value>;
-    fn initial_transport(&self) -> Box<dyn Transport>;
     fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
     // The follow-up gate this adapter evaluates for inspect from its own records, before any
@@ -339,11 +338,12 @@ trait NativeProviderAdapter: Sync {
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()>;
     fn run_control(&self, arguments: &[String]) -> Result<()>;
     // Whether this adapter's launch and turn transports can run on a surface of `surface`
-    // on this platform, decided before any session exists. `version` is `None` before the
-    // CLI version has been probed (such as during terminal selection or an unprobed doctor
-    // check) and `Some` once the installed version is known. `Err` names the capability or
-    // version requirement the surface lacks for this provider. No default: each adapter
-    // states its own answer. `Ok` is a code path, not live evidence.
+    // on this platform, decided before any session exists, and the initial-prompt Transport
+    // selected for it. `version` is `None` before the CLI version has been probed (such as
+    // during terminal selection, unprobed doctor checks, or early platform admission) and
+    // `Some` once the installed version is known. `Err` names the capability or version
+    // requirement the surface lacks for this provider. No default: each adapter states its
+    // own answer and initial Transport. `Ok` is a code path, not live evidence.
     fn surface_support(
         &self,
         surface: super::terminal::TerminalKind,
@@ -370,9 +370,9 @@ impl std::fmt::Display for SurfaceRefusal {
     }
 }
 
-/// An adapter's answer on a surface kind; the refusal names the missing capability or
-/// version requirement.
-pub(super) type SurfaceSupport = std::result::Result<(), SurfaceRefusal>;
+/// An adapter's answer on a surface kind: the initial-prompt Transport for that surface
+/// on this platform, or the missing capability or version requirement.
+pub(super) type SurfaceSupport = std::result::Result<Box<dyn Transport>, SurfaceRefusal>;
 
 fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
     match provider {
@@ -461,15 +461,16 @@ pub(super) fn surface_support(
     adapter(provider).surface_support(surface, None)
 }
 
-/// The admission of a selected surface for a provider, before any session exists: the
-/// provider adapter's own refusal, as an unsupported failure. Called with `None` before
-/// resolution to refuse unconditionally unsupported platform/surface pairs, and again
-/// with the probed version once the installed CLI version is known.
+/// The admission of a selected surface for a provider, before any session exists: returns
+/// the adapter's selected initial-prompt Transport on admission, or its refusal as an
+/// unsupported failure. Called with `None` before resolution to refuse unconditionally
+/// unsupported platform/surface pairs, and again with the probed version once the installed
+/// CLI version is known.
 pub(super) fn admit_surface(
     provider: FirstPartyCli,
     surface: super::terminal::TerminalKind,
     version: Option<&str>,
-) -> Result<()> {
+) -> Result<Box<dyn Transport>> {
     adapter(provider)
         .surface_support(surface, version)
         .map_err(|refusal| {
@@ -489,9 +490,6 @@ pub(super) fn admit_surface(
         })
 }
 
-pub(super) fn initial_transport(provider: FirstPartyCli) -> Box<dyn Transport> {
-    adapter(provider).initial_transport()
-}
 pub(super) fn follow_up_transport(provider: FirstPartyCli) -> Box<dyn Transport> {
     adapter(provider).follow_up_transport()
 }
@@ -521,8 +519,8 @@ mod tests {
 
     // Each adapter answers for itself. Pre-probe, only Codex on Windows Herdr refuses;
     // post-probe, Codex on non-Windows Herdr also enforces stable 0.169.0+. Claude, Agy,
-    // and Pi admit every surface and version unchanged. Every admitted combination matches
-    // the initial Transport that will run there.
+    // and Pi admit every surface and version unchanged. Every admitted answer carries the
+    // exact initial Transport that will run on that surface.
     #[test]
     fn adapters_declare_which_surfaces_their_transports_run_on() {
         use super::super::delivery::Readiness;
@@ -540,7 +538,7 @@ mod tests {
                     "{provider:?} on {surface:?}"
                 );
                 match (admit_surface(provider, surface, None), windows_codex_herdr) {
-                    (Ok(()), false) => {}
+                    (Ok(_), false) => {}
                     (Err(error), true) => {
                         let text = format!("{error:#}");
                         assert!(
@@ -557,7 +555,8 @@ mod tests {
                     }
                     (result, refused) => {
                         panic!(
-                            "{provider:?} on {surface:?} (unprobed): {result:?}, expected refused={refused}"
+                            "{provider:?} on {surface:?} (unprobed): ok={}, expected refused={refused}",
+                            result.is_ok()
                         )
                     }
                 }
@@ -565,6 +564,9 @@ mod tests {
                 for (version, codex_herdr_ok) in [
                     ("codex-cli 0.168.0", false),
                     ("codex-cli 0.169.0-alpha.1", false),
+                    ("codex-cli 0.170.0-alpha.1", false),
+                    ("codex-cli 0.170.0--", false),
+                    ("codex-cli 0.170.0+", false),
                     ("codex-cli 0.169.0", true),
                     ("codex-cli 0.170.0", true),
                     ("unknown", false),
@@ -575,7 +577,7 @@ mod tests {
                         && !codex_herdr_ok;
                     let result = admit_surface(provider, surface, Some(version));
                     match (result, windows_codex_herdr, version_refused) {
-                        (Ok(()), false, false) => {}
+                        (Ok(_), false, false) => {}
                         (Err(error), true, false) => {
                             let text = format!("{error:#}");
                             assert!(
@@ -598,16 +600,17 @@ mod tests {
                         }
                         (result, platform_refused, version_refused) => {
                             panic!(
-                                "{provider:?} on {surface:?} ({version}): {result:?}, expected platform_refused={platform_refused}, version_refused={version_refused}"
+                                "{provider:?} on {surface:?} ({version}): ok={}, expected platform_refused={platform_refused}, version_refused={version_refused}",
+                                result.is_ok()
                             )
                         }
                     }
                 }
 
-                // Pair every admitted (provider, surface) at a supported version with the
-                // initial Transport that will actually run there.
-                if admit_surface(provider, surface, Some("codex-cli 0.169.0")).is_ok() {
-                    let facts = initial_transport(provider).facts();
+                // Every admitted (provider, surface) at a supported version directly returns
+                // the initial Transport that delivery will use.
+                if let Ok(transport) = admit_surface(provider, surface, Some("codex-cli 0.169.0")) {
+                    let facts = transport.facts();
                     match (provider, cfg!(windows)) {
                         (FirstPartyCli::Codex, true) => {
                             assert_ne!(

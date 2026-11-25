@@ -454,11 +454,16 @@ fn unrelated_provider_routes_keep_send_file_and_single_return_facts() {
         assert_eq!(facts.newline, terminal::ConsoleNewline::LineFeed);
         #[cfg(windows)]
         assert_eq!(
-            crate::native::provider::initial_transport(provider)
-                .facts()
-                .surface
-                .unwrap()
-                .submit_count,
+            crate::native::provider::admit_surface(
+                provider,
+                terminal::TerminalKind::WindowsConsole,
+                None,
+            )
+            .unwrap()
+            .facts()
+            .surface
+            .unwrap()
+            .submit_count,
             1
         );
     }

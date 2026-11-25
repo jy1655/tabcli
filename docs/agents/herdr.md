@@ -153,10 +153,12 @@
   (`console_root_arguments`, which also removes `TERM`), through the helper command that drops
   caller markers. It exits with the root's code. The root shares the host's console and the
   core's job object, so `terminal.kill` (hc ends the job) ends the whole session.
-- Each provider adapter answers whether it runs on a surface (`surface_support`, required, no
-  default), before anything is created (`provider::admit_surface`): first without a version
+- Each provider adapter answers whether it runs on a surface and returns its selected
+  initial `Transport` (`surface_support`, required, no default), before anything is
+  created (`provider::admit_surface`): first without a version
   before resolution and probing (and for terminal selection via `provider::surface_support`),
-  and again with the probed version right after the CLI version probe. On Windows Herdr, Codex
+  and again with the probed version right after the CLI version probe, handing the
+  admitted `Transport` straight into initial delivery. On Windows Herdr, Codex
   refuses immediately: its initial prompt is the injected console paste (#124), text without Return and one
   Return against the exact accepted screen, which `terminal.send` cannot do, and the
   launch-argument route used elsewhere would put the multi-line prompt on a Windows command
