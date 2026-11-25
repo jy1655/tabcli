@@ -339,14 +339,40 @@ trait NativeProviderAdapter: Sync {
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()>;
     fn run_control(&self, arguments: &[String]) -> Result<()>;
     // Whether this adapter's launch and turn transports can run on a surface of `surface`
-    // on this platform, decided before any session exists. `Err` names the capability the
-    // surface lacks for this provider. No default: each adapter states its own answer.
-    // `Ok` is a code path, not live evidence.
-    fn surface_support(&self, surface: super::terminal::TerminalKind) -> SurfaceSupport;
+    // on this platform, decided before any session exists. `version` is `None` before the
+    // CLI version has been probed (such as during terminal selection or an unprobed doctor
+    // check) and `Some` once the installed version is known. `Err` names the capability or
+    // version requirement the surface lacks for this provider. No default: each adapter
+    // states its own answer. `Ok` is a code path, not live evidence.
+    fn surface_support(
+        &self,
+        surface: super::terminal::TerminalKind,
+        version: Option<&str>,
+    ) -> SurfaceSupport;
 }
 
-/// An adapter's answer on a surface kind; the refusal names the missing capability.
-pub(super) type SurfaceSupport = std::result::Result<(), &'static str>;
+/// Why an adapter refuses to run on a surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SurfaceRefusal {
+    /// The adapter cannot run on this surface on this platform at all, for any version.
+    Platform(&'static str),
+    /// The adapter can run on this surface on this platform, but not with the probed or
+    /// recorded provider version.
+    Version(String),
+}
+
+impl std::fmt::Display for SurfaceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Platform(reason) => f.write_str(reason),
+            Self::Version(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// An adapter's answer on a surface kind; the refusal names the missing capability or
+/// version requirement.
+pub(super) type SurfaceSupport = std::result::Result<(), SurfaceRefusal>;
 
 fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
     match provider {
@@ -426,27 +452,41 @@ pub(super) fn run_control(provider: FirstPartyCli, arguments: &[String]) -> Resu
     adapter(provider).run_control(arguments)
 }
 
+/// Whether `provider`'s adapter can run on `surface` on this platform before any CLI
+/// version probe. Terminal selection and unprobed diagnostics read this.
 pub(super) fn surface_support(
     provider: FirstPartyCli,
     surface: super::terminal::TerminalKind,
 ) -> SurfaceSupport {
-    adapter(provider).surface_support(surface)
+    adapter(provider).surface_support(surface, None)
 }
 
 /// The admission of a selected surface for a provider, before any session exists: the
-/// provider adapter's own refusal, as an unsupported failure.
+/// provider adapter's own refusal, as an unsupported failure. Called with `None` before
+/// resolution to refuse unconditionally unsupported platform/surface pairs, and again
+/// with the probed version once the installed CLI version is known.
 pub(super) fn admit_surface(
     provider: FirstPartyCli,
     surface: super::terminal::TerminalKind,
+    version: Option<&str>,
 ) -> Result<()> {
-    surface_support(provider, surface).map_err(|reason| {
-        super::failure_kind::Unsupported::new(format!(
-            "{} on {} is unsupported on this platform: {reason}",
-            provider.as_str(),
-            surface.display_name()
-        ))
-        .into()
-    })
+    adapter(provider)
+        .surface_support(surface, version)
+        .map_err(|refusal| {
+            let detail = match refusal {
+                SurfaceRefusal::Platform(reason) => format!(
+                    "{} on {} is unsupported on this platform: {reason}",
+                    provider.as_str(),
+                    surface.display_name()
+                ),
+                SurfaceRefusal::Version(reason) => format!(
+                    "{} on {} is unsupported: {reason}",
+                    provider.as_str(),
+                    surface.display_name()
+                ),
+            };
+            super::failure_kind::Unsupported::new(detail).into()
+        })
 }
 
 pub(super) fn initial_transport(provider: FirstPartyCli) -> Box<dyn Transport> {
@@ -479,19 +519,27 @@ fn transport_test_context<'a>(
 mod tests {
     use super::*;
 
-    // Each adapter answers for itself. Only Codex refuses a surface, and only Herdr on
-    // native Windows, naming the missing capability; the refusal is an unsupported
-    // failure, and the managed console and every other surface stay admitted.
+    // Each adapter answers for itself. Pre-probe, only Codex on Windows Herdr refuses;
+    // post-probe, Codex on non-Windows Herdr also enforces stable 0.169.0+. Claude, Agy,
+    // and Pi admit every surface and version unchanged. Every admitted combination matches
+    // the initial Transport that will run there.
     #[test]
     fn adapters_declare_which_surfaces_their_transports_run_on() {
+        use super::super::delivery::Readiness;
         use super::super::failure_kind::{FailureKind, classify};
-        use super::super::terminal::TerminalKind;
+        use super::super::terminal::{ConsoleNewline, TerminalKind};
+
         for provider in agent_bridge::supported_clis().iter().copied() {
             for surface in TerminalKind::ALL {
-                let refused = cfg!(windows)
+                let windows_codex_herdr = cfg!(windows)
                     && provider == FirstPartyCli::Codex
                     && surface == TerminalKind::Herdr;
-                match (admit_surface(provider, surface), refused) {
+                assert_eq!(
+                    surface_support(provider, surface).is_err(),
+                    windows_codex_herdr,
+                    "{provider:?} on {surface:?}"
+                );
+                match (admit_surface(provider, surface, None), windows_codex_herdr) {
                     (Ok(()), false) => {}
                     (Err(error), true) => {
                         let text = format!("{error:#}");
@@ -509,8 +557,89 @@ mod tests {
                     }
                     (result, refused) => {
                         panic!(
-                            "{provider:?} on {surface:?}: {result:?}, expected refused={refused}"
+                            "{provider:?} on {surface:?} (unprobed): {result:?}, expected refused={refused}"
                         )
+                    }
+                }
+
+                for (version, codex_herdr_ok) in [
+                    ("codex-cli 0.168.0", false),
+                    ("codex-cli 0.169.0-alpha.1", false),
+                    ("codex-cli 0.169.0", true),
+                    ("codex-cli 0.170.0", true),
+                    ("unknown", false),
+                ] {
+                    let version_refused = !cfg!(windows)
+                        && provider == FirstPartyCli::Codex
+                        && surface == TerminalKind::Herdr
+                        && !codex_herdr_ok;
+                    let result = admit_surface(provider, surface, Some(version));
+                    match (result, windows_codex_herdr, version_refused) {
+                        (Ok(()), false, false) => {}
+                        (Err(error), true, false) => {
+                            let text = format!("{error:#}");
+                            assert!(
+                                text.starts_with(
+                                    "codex on Herdr is unsupported on this platform: Codex's Windows initial prompt is the injected console paste (#124)"
+                                ),
+                                "{text}"
+                            );
+                            assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+                        }
+                        (Err(error), false, true) => {
+                            let text = format!("{error:#}");
+                            assert!(
+                                text.starts_with(
+                                    "codex on Herdr is unsupported: Herdr requires stable Codex 0.169.0 or newer with --no-daemon;"
+                                ),
+                                "{text}"
+                            );
+                            assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+                        }
+                        (result, platform_refused, version_refused) => {
+                            panic!(
+                                "{provider:?} on {surface:?} ({version}): {result:?}, expected platform_refused={platform_refused}, version_refused={version_refused}"
+                            )
+                        }
+                    }
+                }
+
+                // Pair every admitted (provider, surface) at a supported version with the
+                // initial Transport that will actually run there.
+                if admit_surface(provider, surface, Some("codex-cli 0.169.0")).is_ok() {
+                    let facts = initial_transport(provider).facts();
+                    match (provider, cfg!(windows)) {
+                        (FirstPartyCli::Codex, true) => {
+                            assert_ne!(
+                                surface,
+                                TerminalKind::Herdr,
+                                "Codex's console-only paste transport must never be paired with an admitted Herdr surface"
+                            );
+                            assert_eq!(facts.name, "terminal-paste-fallback");
+                            let input = facts.surface.expect("Windows Codex uses console paste");
+                            assert_eq!(input.submit_count, 2);
+                            assert_eq!(input.newline, ConsoleNewline::ShiftReturn);
+                        }
+                        (FirstPartyCli::Codex, false) => {
+                            assert_eq!(facts.name, "launch-argument");
+                            assert_eq!(facts.readiness, Readiness::LaunchArgument);
+                            assert!(facts.surface.is_none());
+                        }
+                        (FirstPartyCli::Claude, _) => {
+                            assert_eq!(facts.name, "provider-cross-session-message");
+                            assert!(facts.surface.is_none());
+                        }
+                        (FirstPartyCli::Agy | FirstPartyCli::Pi, true) => {
+                            assert_eq!(facts.name, "terminal-paste-fallback");
+                            let input = facts.surface.expect("Windows Agy/Pi uses surface paste");
+                            assert_eq!(input.submit_count, 1);
+                            assert_eq!(input.newline, ConsoleNewline::LineFeed);
+                        }
+                        (FirstPartyCli::Agy | FirstPartyCli::Pi, false) => {
+                            assert_eq!(facts.name, "launch-argument");
+                            assert_eq!(facts.readiness, Readiness::LaunchArgument);
+                            assert!(facts.surface.is_none());
+                        }
                     }
                 }
             }

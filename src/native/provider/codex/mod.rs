@@ -214,7 +214,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
-        initial_transport_for_platform(cfg!(windows))
+        SurfaceRoute::for_platform_without_surface(cfg!(windows)).initial_transport()
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(CodexQueue)
@@ -386,15 +386,15 @@ impl NativeProviderAdapter for CodexAdapter {
         bail!("Codex does not expose TAB provider controls")
     }
 
-    // Elsewhere Herdr takes Codex's initial prompt as a launch argument with `--no-daemon`
-    // (version-gated at launch from the recorded surface). Native Windows has neither route
-    // on Herdr; see the refusal. Replace it with a Windows Herdr route that keeps Codex's
-    // argument semantics and size, or a first-party addressed input.
-    fn surface_support(&self, surface: terminal::TerminalKind) -> super::SurfaceSupport {
-        if cfg!(windows) && surface == terminal::TerminalKind::Herdr {
-            return Err(CODEX_WINDOWS_HERDR_UNSUPPORTED);
-        }
-        Ok(())
+    // Single surface decision shared with launch planning: native Windows Herdr is refused
+    // before resolution, and off Windows Herdr requires stable Codex 0.169.0+ once the CLI
+    // version is known.
+    fn surface_support(
+        &self,
+        surface: terminal::TerminalKind,
+        version: Option<&str>,
+    ) -> super::SurfaceSupport {
+        surface_route(cfg!(windows), surface, version).map(|_| ())
     }
 }
 
@@ -403,7 +403,89 @@ pub(super) fn windows_herdr_refusal() -> &'static str {
     CODEX_WINDOWS_HERDR_UNSUPPORTED
 }
 
+// The one decision for whether Codex runs on a surface and how its initial prompt reaches
+// Codex:
+// - Native Windows Herdr is refused before any session exists: Codex's Windows initial
+//   prompt is the injected console paste (#124), which Herdr's `terminal.send` cannot do,
+//   and the launch-argument route would put the multi-line prompt on a Windows command
+//   line. Replace this refusal with a Windows Herdr route that keeps argument semantics
+//   and size, or a first-party addressed input.
+// - Off Windows, Herdr requires stable Codex 0.169.0 or newer and passes `--no-daemon`,
+//   so tool processes retain the hc terminal identity instead of running in the shared
+//   app-server. Before the CLI version is probed (`version: None`, e.g. terminal selection
+//   or an unprobed doctor check), Herdr is admitted on non-Windows platforms; once a
+//   version is known (post-probe admission and launch planning), the 0.169.0 stable floor
+//   is enforced.
+// - Every other admitted surface uses the platform's initial-prompt route: console paste
+//   on Windows, launch argument without `--no-daemon` elsewhere.
+const HERDR_MINIMUM_VERSION: Version = Version::new(0, 169, 0);
+
 const CODEX_WINDOWS_HERDR_UNSUPPORTED: &str = "Codex's Windows initial prompt is the injected console paste (#124), which writes the text without Return and then sends one Return only against the exact accepted screen; Herdr's terminal.send always submits with the text and compares no screen. The launch-argument route Herdr uses on macOS and Linux would put the framed multi-line prompt on a Windows command line, which holds at most 32,767 characters (8,191 and no line break through an npm codex.cmd), less than a prompt can be with context attached. Choose --terminal windows-console";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceRoute {
+    /// Initial prompt travels as a positional launch argument after `-C <workspace>`.
+    /// `no_daemon` adds `--no-daemon` on Herdr so tool commands run inside the hc terminal.
+    LaunchArgument { no_daemon: bool },
+    /// Initial prompt is delivered after launch through the Windows console paste transport.
+    ConsolePaste,
+}
+
+impl SurfaceRoute {
+    fn for_platform_without_surface(windows: bool) -> Self {
+        if windows {
+            Self::ConsolePaste
+        } else {
+            Self::LaunchArgument { no_daemon: false }
+        }
+    }
+
+    fn initial_transport(self) -> Box<dyn Transport> {
+        match self {
+            Self::LaunchArgument { .. } => Box::new(delivery::LAUNCH_ARGUMENT),
+            Self::ConsolePaste => Box::new(CodexInitialPaste),
+        }
+    }
+
+    fn no_daemon(self) -> bool {
+        matches!(self, Self::LaunchArgument { no_daemon: true })
+    }
+
+    fn passes_prompt_argument(self) -> bool {
+        matches!(self, Self::LaunchArgument { .. })
+    }
+}
+
+fn surface_route(
+    windows: bool,
+    surface: terminal::TerminalKind,
+    version: Option<&str>,
+) -> std::result::Result<SurfaceRoute, super::SurfaceRefusal> {
+    if windows && surface == terminal::TerminalKind::Herdr {
+        return Err(super::SurfaceRefusal::Platform(
+            CODEX_WINDOWS_HERDR_UNSUPPORTED,
+        ));
+    }
+    if windows {
+        return Ok(SurfaceRoute::ConsolePaste);
+    }
+    if surface == terminal::TerminalKind::Herdr {
+        if let Some(version_text) = version {
+            let parsed = codex_version(version_text).map_err(|error| {
+                super::SurfaceRefusal::Version(format!(
+                    "Herdr requires stable Codex {HERDR_MINIMUM_VERSION} or newer with --no-daemon; {error}"
+                ))
+            })?;
+            if parsed < HERDR_MINIMUM_VERSION || !parsed.pre.is_empty() {
+                return Err(super::SurfaceRefusal::Version(format!(
+                    "Herdr requires stable Codex {HERDR_MINIMUM_VERSION} or newer with --no-daemon; version: {version_text}"
+                )));
+            }
+        }
+        return Ok(SurfaceRoute::LaunchArgument { no_daemon: true });
+    }
+    Ok(SurfaceRoute::LaunchArgument { no_daemon: false })
+}
 
 // Codex's home: `config.toml` under `CODEX_HOME`, or under `.codex` in the user home. An
 // empty `CODEX_HOME` keeps the relative spelling, `config.toml` in the caller's working
@@ -446,25 +528,18 @@ pub(super) fn memory_workspace(
     Home::resolve(env)?.memory_workspace()
 }
 
-fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
-    if windows {
-        Box::new(CodexInitialPaste)
-    } else {
-        Box::new(delivery::LAUNCH_ARGUMENT)
-    }
-}
-
 // The complete launch command: the requested policy in Codex's flags (the bypass only when
-// requested, then effort, then model), then Codex's own arguments with the workspace trust
-// override at their start when consent authorizes it. `authorized` is the consent gate;
-// production passes `consent::authorized`, and the applied marker is recorded right after
-// a positive answer, before the plan exists.
+// requested, then `--no-daemon` when the decided surface route requires it, then effort,
+// then model), then Codex's own arguments with the workspace trust override at their start
+// when consent authorizes it. `authorized` is the consent gate; production passes
+// `consent::authorized`, and the applied marker is recorded right after a positive answer,
+// before the plan exists.
 fn prepare_launch_for_platform(
     context: LaunchContext<'_>,
     windows: bool,
     authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
 ) -> Result<LaunchPlan> {
-    let no_daemon = herdr_requires_local_runtime(context.directory)?;
+    let route = recorded_surface_route(context.directory, windows)?;
     let claim_token =
         session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Codex launch has no native turn claim")?;
@@ -473,7 +548,7 @@ fn prepare_launch_for_platform(
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
-    if no_daemon {
+    if route.no_daemon() {
         arguments.push(OsString::from("--no-daemon"));
     }
     if let Some(effort) = context.effort {
@@ -495,7 +570,7 @@ fn prepare_launch_for_platform(
         context.workspace,
         context.prompt,
         &pending,
-        windows,
+        route,
     )?;
     let hook_override = hooks::prepare(context.directory, context.bridge_executable)?;
     if let Some(value) = hook_override {
@@ -517,37 +592,30 @@ fn prepare_launch_for_platform(
     arguments.extend(own);
     Ok(LaunchPlan {
         arguments,
-        initial_prompt: InitialPromptDisposition::of(
-            initial_transport_for_platform(windows).as_ref(),
-        ),
+        initial_prompt: InitialPromptDisposition::of(route.initial_transport().as_ref()),
         watcher: Box::new(transcript::Watcher),
         environment_removals: launch_environment_removals(),
     })
 }
 
-// hc's terminal identity must reach Codex's tool processes. A shared app-server
-// would run them outside that terminal. This is Codex launch policy, selected from
-// the bound surface rather than an inherited HC_TERMINAL_ID (which can be stale).
-fn herdr_requires_local_runtime(directory: &Path) -> Result<bool> {
+// Decides the launch route from the bound surface record (never an inherited
+// `HC_TERMINAL_ID`, which can be stale) and, for Herdr off Windows, the manifest's
+// recorded provider version. Fixtures without a bound surface record use the platform's
+// non-Herdr route.
+fn recorded_surface_route(directory: &Path, windows: bool) -> Result<SurfaceRoute> {
     let reader = Reader::open_unchecked(directory);
     let Some(text) = reader
         .record(crate::native::session::CoreRecord::Terminal)
         .text()?
     else {
-        return Ok(false);
+        return Ok(SurfaceRoute::for_platform_without_surface(windows));
     };
     let surface = crate::native::session::record::terminal(&text)?;
-    if surface.kind != terminal::TerminalKind::Herdr {
-        return Ok(false);
-    }
-    let version_text = reader.manifest()?.provider_version;
-    let version = codex_version(&version_text)?;
-    if version < Version::new(0, 169, 0) || !version.pre.is_empty() {
-        bail!(
-            "Herdr requires stable Codex 0.169.0 or newer with --no-daemon; recorded version: {version_text}"
-        );
-    }
-    Ok(true)
+    let version = (!windows && surface.kind == terminal::TerminalKind::Herdr)
+        .then(|| reader.manifest().map(|manifest| manifest.provider_version))
+        .transpose()?;
+    surface_route(windows, surface.kind, version.as_deref())
+        .map_err(|refusal| super::super::failure_kind::Unsupported::new(refusal.to_string()).into())
 }
 
 // A record without prompt sizes, as a binary before them wrote it; the tests use it for

@@ -207,7 +207,7 @@ pub(super) fn codex_launch_arguments(
     workspace: &Path,
     prompt: &str,
     pending: &PendingCodexTurn,
-    windows: bool,
+    route: super::SurfaceRoute,
 ) -> Result<Vec<OsString>> {
     let notify = serde_json::to_string(&[
         bridge_executable.to_string_lossy().as_ref(),
@@ -218,7 +218,7 @@ pub(super) fn codex_launch_arguments(
         OsString::from("-c"),
         OsString::from(format!("notify={notify}")),
     ];
-    if !windows {
+    if route.passes_prompt_argument() {
         arguments.extend([
             OsString::from("-C"),
             workspace.as_os_str().to_owned(),

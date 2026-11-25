@@ -276,6 +276,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn surface_support(
         &self,
         _surface: crate::native::terminal::TerminalKind,
+        _version: Option<&str>,
     ) -> super::SurfaceSupport {
         Ok(())
     }

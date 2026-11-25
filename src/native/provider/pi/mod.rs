@@ -381,7 +381,11 @@ impl NativeProviderAdapter for PiAdapter {
     // Pi's turns go through the surface's own transport (a Herdr terminal's `terminal.send`)
     // with Pi-owned readiness and, on Windows, the per-turn input receipt; nothing needs the
     // managed console. The live record is in the Herdr boundary.
-    fn surface_support(&self, _surface: terminal::TerminalKind) -> super::SurfaceSupport {
+    fn surface_support(
+        &self,
+        _surface: terminal::TerminalKind,
+        _version: Option<&str>,
+    ) -> super::SurfaceSupport {
         Ok(())
     }
 }

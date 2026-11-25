@@ -446,7 +446,7 @@ fn windows_codex_inherits_the_exact_workspace_without_a_c_override() {
         workspace,
         "prompt",
         &pending,
-        true,
+        super::super::SurfaceRoute::ConsolePaste,
     )
     .unwrap();
     assert!(!windows.iter().any(|argument| argument == "-C"));
@@ -457,7 +457,7 @@ fn windows_codex_inherits_the_exact_workspace_without_a_c_override() {
         workspace,
         "prompt",
         &pending,
-        false,
+        super::super::SurfaceRoute::LaunchArgument { no_daemon: false },
     )
     .unwrap();
     assert_eq!(non_windows[2], OsString::from("-C"));

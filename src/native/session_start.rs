@@ -198,9 +198,9 @@ pub(super) struct Resolution<'a> {
 }
 
 // The launchable spec of a start, after the command selected its terminal, in this order:
-// the canonical workspace directory, state root and launch admission, provider executable
-// and version, title, and workspace consent. Nothing is created, so a failure changes
-// nothing.
+// platform surface admission, the canonical workspace directory, state root and launch
+// admission, provider executable and version, version-aware surface admission, title, and
+// workspace consent. Nothing is created, so a failure changes nothing.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
     resolve_with(resolution, |provider| {
         let provider_path = resolve_provider(provider)?;
@@ -231,8 +231,9 @@ pub(super) fn resolve_with(
         workspace_noun,
         admission_refusal,
     } = resolution;
-    // A surface the provider's adapter cannot run on is refused before anything is resolved.
-    crate::native::provider::admit_surface(provider, terminal_kind)?;
+    // A surface the provider's adapter cannot run on at all on this platform is refused
+    // before anything is resolved or probed.
+    crate::native::provider::admit_surface(provider, terminal_kind, None)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -249,6 +250,10 @@ pub(super) fn resolve_with(
         .and_then(|root| admission::check(&root, &workspace).map(|()| root))
         .map_err(admission_refusal)?;
     let (provider_path, provider_version) = probe(provider)?;
+    // Once the installed CLI version is known, re-admit the surface with it so any
+    // surface-specific version floor refuses before title, consent, session, or surface
+    // creation.
+    crate::native::provider::admit_surface(provider, terminal_kind, Some(&provider_version))?;
     let requested_title = title.unwrap_or_else(|| {
         let workspace_name = workspace
             .file_name()

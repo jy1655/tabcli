@@ -515,7 +515,137 @@ fn herdr_codex_launch_keeps_tools_in_the_terminal_process() {
 }
 
 #[test]
+fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
+    use crate::native::failure_kind::{FailureKind, classify};
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    Store::open_unchecked(&directory)
+        .private("terminal.json")
+        .write_json(&serde_json::json!({
+            "terminal": "herdr", "session_id": "t99",
+            "managed_session_id": "session-hooks"
+        }))
+        .unwrap();
+    let error = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new(r"C:\tabcli.exe"),
+            directory: &directory,
+            workspace: root.path(),
+            title: "Windows Herdr Codex",
+            prompt: "test task",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        true,
+        |_, _| Ok(false),
+    )
+    .err()
+    .expect("Windows Herdr launch plan must refuse Codex");
+    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+    assert_eq!(format!("{error:#}"), CODEX_WINDOWS_HERDR_UNSUPPORTED);
+    assert!(read_pending_turn(&directory).unwrap().is_none());
+}
+
+#[test]
+fn surface_route_unifies_admission_version_floor_and_initial_transport_across_platforms() {
+    use crate::native::provider::SurfaceRefusal;
+    use terminal::TerminalKind;
+
+    for windows in [false, true] {
+        let default_transport = SurfaceRoute::for_platform_without_surface(windows)
+            .initial_transport()
+            .facts();
+        for surface in TerminalKind::ALL {
+            for (version, herdr_version_ok) in [
+                (None, true),
+                (Some("codex-cli 0.147.0"), false),
+                (Some("codex-cli 0.168.0"), false),
+                (Some("codex-cli 0.169.0-alpha.1"), false),
+                (Some("codex-cli 0.169.0"), true),
+                (Some("codex-cli 0.170.0"), true),
+                (Some("unknown"), false),
+            ] {
+                let result = surface_route(windows, surface, version);
+                match (windows, surface) {
+                    (true, TerminalKind::Herdr) => {
+                        assert_eq!(
+                            result,
+                            Err(SurfaceRefusal::Platform(CODEX_WINDOWS_HERDR_UNSUPPORTED)),
+                            "windows={windows} surface={surface:?} version={version:?}"
+                        );
+                    }
+                    (true, _) => {
+                        let route = result.unwrap();
+                        assert_eq!(route, SurfaceRoute::ConsolePaste);
+                        assert!(!route.no_daemon());
+                        assert!(!route.passes_prompt_argument());
+                        let facts = route.initial_transport().facts();
+                        assert_eq!(facts.name, default_transport.name);
+                        assert_eq!(facts.readiness, default_transport.readiness);
+                        assert!(facts.surface.is_some());
+                    }
+                    (false, TerminalKind::Herdr) if !herdr_version_ok => {
+                        let Err(SurfaceRefusal::Version(detail)) = result else {
+                            panic!(
+                                "expected version refusal for non-Windows Herdr {version:?}: {result:?}"
+                            );
+                        };
+                        assert!(
+                            detail.starts_with(
+                                "Herdr requires stable Codex 0.169.0 or newer with --no-daemon;"
+                            ),
+                            "{detail}"
+                        );
+                    }
+                    (false, TerminalKind::Herdr) => {
+                        let route = result.unwrap();
+                        assert_eq!(route, SurfaceRoute::LaunchArgument { no_daemon: true });
+                        assert!(route.no_daemon());
+                        assert!(route.passes_prompt_argument());
+                        let facts = route.initial_transport().facts();
+                        assert_eq!(facts.name, default_transport.name);
+                        assert_eq!(facts.readiness, default_transport.readiness);
+                        assert!(facts.surface.is_none());
+                    }
+                    (false, _) => {
+                        let route = result.unwrap();
+                        assert_eq!(route, SurfaceRoute::LaunchArgument { no_daemon: false });
+                        assert!(!route.no_daemon());
+                        assert!(route.passes_prompt_argument());
+                        let facts = route.initial_transport().facts();
+                        assert_eq!(facts.name, default_transport.name);
+                        assert_eq!(facts.readiness, default_transport.readiness);
+                        assert!(facts.surface.is_none());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
+    use crate::native::failure_kind::{FailureKind, classify};
+
+    let prepare = |directory: &Path, workspace: &Path, windows: bool| {
+        prepare_launch_for_platform(
+            LaunchContext {
+                bridge_executable: Path::new("/opt/tabcli"),
+                directory,
+                workspace,
+                title: "Codex surface test",
+                prompt: "test task",
+                yolo: false,
+                model: None,
+                effort: None,
+            },
+            windows,
+            |_, _| Ok(false),
+        )
+    };
+
     for (version, accepted) in [
         ("codex-cli 0.168.0", false),
         ("codex-cli 0.169.0-alpha.1", false),
@@ -530,26 +660,95 @@ fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
             .private("terminal.json")
             .write_json(&serde_json::json!({"terminal":"herdr","session_id":"t1"}))
             .unwrap();
-        assert_eq!(
-            herdr_requires_local_runtime(&directory).is_ok(),
-            accepted,
-            "{version}"
-        );
-        assert!(read_pending_turn(&directory).unwrap().is_none());
-        // The same provider version on an existing surface has no new version gate.
+        let herdr_plan = prepare(&directory, root.path(), false);
+        assert_eq!(herdr_plan.is_ok(), accepted, "{version}");
+        if let Ok(plan) = herdr_plan {
+            assert_eq!(
+                plan.arguments
+                    .iter()
+                    .filter(|arg| *arg == "--no-daemon")
+                    .count(),
+                1,
+                "{version}"
+            );
+            assert_eq!(
+                plan.initial_prompt,
+                InitialPromptDisposition::AcceptedAtSpawn,
+                "{version}"
+            );
+        } else {
+            let error = herdr_plan.err().unwrap();
+            assert_eq!(
+                classify(&error),
+                Some(FailureKind::Unsupported),
+                "{version}"
+            );
+            assert!(
+                read_pending_turn(&directory).unwrap().is_none(),
+                "{version}"
+            );
+        }
+
+        // The same provider version on a non-Herdr surface has no 0.169.0 floor or --no-daemon.
         store
             .private("terminal.json")
             .write_json(&serde_json::json!({"terminal":"iterm2","session_id":"pane"}))
             .unwrap();
-        assert!(!herdr_requires_local_runtime(&directory).unwrap());
+        let non_herdr_plan = prepare(&directory, root.path(), false).unwrap();
+        assert!(
+            !non_herdr_plan
+                .arguments
+                .iter()
+                .any(|arg| arg == "--no-daemon"),
+            "{version}"
+        );
+        assert_eq!(
+            non_herdr_plan.initial_prompt,
+            InitialPromptDisposition::AcceptedAtSpawn,
+            "{version}"
+        );
+
+        // Native Windows managed console uses ConsolePaste for every supported version.
+        store
+            .private("terminal.json")
+            .write_json(&serde_json::json!({"terminal":"windows-console","session_id":"console"}))
+            .unwrap();
+        let console_plan = prepare(&directory, root.path(), true).unwrap();
+        assert!(
+            !console_plan
+                .arguments
+                .iter()
+                .any(|arg| arg == "--no-daemon" || arg == "-C"),
+            "{version}"
+        );
+        assert_eq!(
+            console_plan.initial_prompt,
+            InitialPromptDisposition::AwaitingDelivery,
+            "{version}"
+        );
     }
+
+    // Without a bound surface record, launch planning uses the platform's default route;
+    // a malformed terminal record fails closed without installing a pending turn.
     let root = tempfile::tempdir().unwrap();
-    assert!(!herdr_requires_local_runtime(root.path()).unwrap());
-    Store::open_unchecked(root.path())
+    assert_eq!(
+        recorded_surface_route(root.path(), false).unwrap(),
+        SurfaceRoute::LaunchArgument { no_daemon: false }
+    );
+    assert_eq!(
+        recorded_surface_route(root.path(), true).unwrap(),
+        SurfaceRoute::ConsolePaste
+    );
+    let broken_dir = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    Store::open_unchecked(&broken_dir)
         .private("terminal.json")
         .write_private(b"{broken")
         .unwrap();
-    assert!(herdr_requires_local_runtime(root.path()).is_err());
+    let error = prepare(&broken_dir, root.path(), false)
+        .err()
+        .expect("malformed terminal.json must fail closed");
+    assert_eq!(classify(&error), None);
+    assert!(read_pending_turn(&broken_dir).unwrap().is_none());
 }
 
 // Launches and probes drop both providers' caller identities while preserving configuration.

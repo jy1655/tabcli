@@ -1122,3 +1122,173 @@ fn a_fenced_launch_failure_is_left_to_the_launchers_settlement() {
     let result = query::request_result(&store, &request).unwrap();
     assert_eq!(result["request_state"], "pending", "{result}");
 }
+
+// Surface admission runs before workspace/probe for platform refusals (Windows Herdr) and
+// again right after the version probe so a surface version floor (Codex 0.169.0+ on Herdr)
+// refuses before title, consent, session creation, or terminal creation.
+#[test]
+fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::session::primitives::STATE_DIR_ENV;
+    use std::process::Command;
+
+    const CHILD: &str = "TABCLI_START_HERDR_SURFACE_ADMISSION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let codex_home = base.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let root = base.path().join("state");
+        fs::create_dir(&root).unwrap();
+        let test_name = format!(
+            "{}::resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation",
+            module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, rest)| rest)
+        );
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("CODEX_HOME", &codex_home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let root = Reader::state_root().unwrap();
+    let project = root.parent().unwrap().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let missing = root.parent().unwrap().join("missing");
+    let request = |provider, workspace: &Path, title: Option<&str>| AskRequest {
+        provider,
+        workspace: workspace.to_owned(),
+        prompt: "fixture prompt".into(),
+        title: title.map(str::to_owned),
+        model: None,
+        effort: None,
+        terminal: None,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+        context_results: Vec::new(),
+    };
+    let resolve_surface =
+        |provider, workspace: &Path, title: Option<&str>, surface, version: Option<&str>| {
+            let ask = request(provider, workspace, title);
+            resolve_with(
+                fresh_resolution(&ask, context::resolve(&[]).unwrap(), surface),
+                |_| match version {
+                    Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+                    None => panic!("probe must not run before early refusal"),
+                },
+            )
+        };
+    let assert_no_sessions = || {
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session-")
+        }));
+    };
+
+    if cfg!(windows) {
+        // Native Windows refuses Codex on Herdr before workspace resolution or probing.
+        let error = resolve_surface(
+            FirstPartyCli::Codex,
+            &missing,
+            None,
+            terminal::TerminalKind::Herdr,
+            None,
+        )
+        .err()
+        .expect("Windows Codex on Herdr must refuse before resolution");
+        assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+        assert!(
+            format!("{error:#}").starts_with("codex on Herdr is unsupported on this platform:"),
+            "{error:#}"
+        );
+        // Managed console still admits Codex below 0.169.0.
+        resolve_surface(
+            FirstPartyCli::Codex,
+            &project,
+            None,
+            terminal::TerminalKind::WindowsConsole,
+            Some("codex-cli 0.168.0"),
+        )
+        .unwrap();
+    } else {
+        // Workspace errors still precede probing on Herdr.
+        let error = resolve_surface(
+            FirstPartyCli::Codex,
+            &missing,
+            None,
+            terminal::TerminalKind::Herdr,
+            None,
+        )
+        .err()
+        .expect("missing workspace refuses before probing");
+        assert!(error.to_string().contains("workspace does not exist"));
+
+        // Probed Codex versions below stable 0.169.0 refuse before title, consent, or creation.
+        for version in ["codex-cli 0.168.0", "codex-cli 0.169.0-alpha.1", "unknown"] {
+            let error = resolve_surface(
+                FirstPartyCli::Codex,
+                &project,
+                Some("   "),
+                terminal::TerminalKind::Herdr,
+                Some(version),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("Herdr must refuse Codex {version} before creation"));
+            let detail = format!("{error:#}");
+            assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{detail}");
+            assert!(
+                detail.starts_with(
+                    "codex on Herdr is unsupported: Herdr requires stable Codex 0.169.0 or newer with --no-daemon;"
+                ),
+                "{detail}"
+            );
+        }
+
+        // Stable 0.169.0+ is admitted on Herdr; older Codex stays admitted on non-Herdr surfaces.
+        resolve_surface(
+            FirstPartyCli::Codex,
+            &project,
+            None,
+            terminal::TerminalKind::Herdr,
+            Some("codex-cli 0.169.0"),
+        )
+        .unwrap();
+        resolve_surface(
+            FirstPartyCli::Codex,
+            &project,
+            None,
+            terminal::TerminalKind::Iterm2,
+            Some("codex-cli 0.168.0"),
+        )
+        .unwrap();
+    }
+
+    // Other providers are unaffected by Codex's Herdr rules and admit Herdr for any version.
+    for provider in [FirstPartyCli::Claude, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        resolve_surface(
+            provider,
+            &project,
+            None,
+            terminal::TerminalKind::Herdr,
+            Some("fixture"),
+        )
+        .unwrap();
+    }
+    assert_no_sessions();
+}

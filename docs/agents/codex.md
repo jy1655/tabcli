@@ -1,13 +1,20 @@
 # Current Codex Boundary
 
-- Herdr launches require stable Codex 0.169.0 or newer and explicitly pass
+- The Codex adapter decides surface eligibility, the Herdr version floor, `--no-daemon`,
+  and the initial-prompt route in one place (`surface_route`), shared by `surface_support`
+  and `prepare_launch`.
+- Off Windows, Herdr launches require stable Codex 0.169.0 or newer and explicitly pass
   `--no-daemon`, so tool processes retain the hc terminal identity instead of running
-  in the shared app-server. The Codex adapter decides from the recorded surface,
-  never an inherited `HC_TERMINAL_ID`. Other surfaces retain their launch arguments.
+  in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
+  Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
+  session or terminal exists; `prepare_launch` applies the same decision from the recorded
+  surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. Other surfaces
+  retain their launch arguments and require no 0.169.0 floor.
   The version floor is eligibility; ask, queue follow-up and completion need separate
   live verification. No Codex configuration file or daemon is changed.
-- On native Windows the adapter refuses a Herdr terminal (`surface_support`), before any
-  session exists: the initial prompt there is the injected console paste below (text without
+- On native Windows the adapter refuses a Herdr terminal (`surface_support`, and also in
+  `prepare_launch` through the same decision), before any resolution, probe, or session
+  exists: the initial prompt there is the injected console paste below (text without
   Return, then one Return against the exact accepted screen), which `terminal.send` cannot
   do, and the launch-argument route above would put the multi-line framed prompt on a Windows
   command line (32,767 characters; 8,191 and no line break through an npm `codex.cmd`).
