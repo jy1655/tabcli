@@ -548,37 +548,77 @@ fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
     assert!(read_pending_turn(&directory).unwrap().is_none());
 }
 
+// Herdr reads the first token that looks like a version, and only that token, with SemVer
+// punctuation kept: its parse error is the answer, never a later token's version.
 #[test]
-fn codex_version_preserves_semver_punctuation() {
-    use super::launch_decision::Reason;
-    use crate::native::settings::CodexLifecycleHooks;
-
-    let pre = codex_version("codex-cli 0.170.0--").unwrap();
+fn herdr_reads_only_the_first_version_token_with_semver_punctuation() {
+    let pre = herdr_codex_version("codex-cli 0.170.0--").unwrap();
     assert_eq!(pre.pre.as_str(), "-");
-    assert_eq!(
-        codex_version("OpenAI Codex (v0.170.0)").unwrap(),
-        Version::new(0, 170, 0)
-    );
-    let with_build = codex_version("codex-cli 0.170.0+build.1").unwrap();
+    for (text, expected) in [
+        ("codex-cli 0.170.0", Version::new(0, 170, 0)),
+        ("OpenAI Codex (v0.170.0)", Version::new(0, 170, 0)),
+        (
+            "codex-cli 0.170.0 (runtime 22.0.0)",
+            Version::new(0, 170, 0),
+        ),
+        (
+            "codex-cli 0.168.0 (runtime 22.0.0)",
+            Version::new(0, 168, 0),
+        ),
+    ] {
+        assert_eq!(herdr_codex_version(text).unwrap(), expected, "{text}");
+    }
+    let with_build = herdr_codex_version("codex-cli 0.170.0+build.1").unwrap();
     assert!(with_build.pre.is_empty());
     assert_eq!(with_build.build.as_str(), "build.1");
-    for malformed in [
-        "codex-cli 0.170.0+",
-        "codex-cli 0.170.0-",
-        "codex-cli 0.170.0.",
+    for (text, token) in [
+        ("codex-cli 0.170.0+", "0.170.0+"),
+        ("codex-cli 0.170.0-", "0.170.0-"),
+        ("codex-cli 0.170.0.", "0.170.0."),
+        ("Codex version is 0.170.0.", "0.170.0."),
+        ("codex-cli 0.168.0+ (runtime 22.0.0)", "0.168.0+"),
+        ("codex-cli 0.168.0- (protocol 1.0.0)", "0.168.0-"),
+        ("codex-cli 0.170.0-01 (runtime 22.0.0)", "0.170.0-01"),
+        ("codex-cli -1.0.0 0.170.0", "-1.0.0"),
     ] {
-        assert!(codex_version(malformed).is_err(), "{malformed}");
+        let error = format!("{:#}", herdr_codex_version(text).unwrap_err());
+        assert!(
+            error.starts_with(&format!(
+                "Codex version {token:?} is not a semantic version: "
+            )),
+            "{text}: {error}"
+        );
     }
     assert_eq!(
-        hooks::Eligibility::new(Some("codex-cli 0.170.0--"), CodexLifecycleHooks::On, true)
-            .lifecycle(),
-        Some(Reason::Prerelease)
+        format!("{:#}", herdr_codex_version("codex unknown").unwrap_err()),
+        "found no Codex version in \"codex unknown\""
     );
-    assert_eq!(
-        hooks::Eligibility::new(Some("codex-cli 0.170.0+"), CodexLifecycleHooks::On, true)
-            .lifecycle(),
-        Some(Reason::VersionUnknown)
-    );
+}
+
+// The queue floor, hook eligibility and the diagnostics read a recorded or probed version as
+// the general probe and every earlier release did, so a launch record v0.4.48 admitted keeps
+// its meaning. Only the Herdr gate reads more strictly.
+#[test]
+fn recorded_versions_keep_the_reading_of_earlier_releases() {
+    for (text, expected) in [
+        ("codex-cli 0.170.0", Version::new(0, 170, 0)),
+        ("Codex version is 0.170.0.", Version::new(0, 170, 0)),
+        ("codex-cli 0.170.0+", Version::new(0, 170, 0)),
+        ("codex-cli 0.170.0-", Version::new(0, 170, 0)),
+        ("OpenAI Codex (v0.170.0).", Version::new(0, 170, 0)),
+        (
+            "codex-cli 0.168.0+ (runtime 22.0.0)",
+            Version::new(0, 168, 0),
+        ),
+        (
+            "codex-cli 0.168.0- (protocol 1.0.0)",
+            Version::new(0, 168, 0),
+        ),
+    ] {
+        assert_eq!(codex_version(text).unwrap(), expected, "{text}");
+        assert!(codex_version_supports_native_queue(text).unwrap(), "{text}");
+    }
+    assert!(!codex_version_supports_native_queue("Codex version is 0.148.9.").unwrap());
 }
 
 #[test]
@@ -600,9 +640,13 @@ fn surface_route_unifies_admission_version_floor_and_initial_transport_across_pl
                 (Some("codex-cli 0.170.0--"), false),
                 (Some("codex-cli 0.170.0+"), false),
                 (Some("codex-cli 0.170.0-"), false),
+                (Some("codex-cli 0.168.0+ (runtime 22.0.0)"), false),
+                (Some("codex-cli 0.168.0- (protocol 1.0.0)"), false),
+                (Some("codex-cli 0.170.0-01 (runtime 22.0.0)"), false),
                 (Some("codex-cli 0.169.0"), true),
                 (Some("codex-cli 0.170.0"), true),
                 (Some("codex-cli 0.170.0+build.1"), true),
+                (Some("codex-cli 0.170.0 (runtime 22.0.0)"), true),
                 (Some("unknown"), false),
             ] {
                 let result = surface_route(windows, surface, version);
@@ -691,6 +735,9 @@ fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
         ("codex-cli 0.170.0-alpha.1", false),
         ("codex-cli 0.170.0--", false),
         ("codex-cli 0.170.0+", false),
+        ("codex-cli 0.168.0+ (runtime 22.0.0)", false),
+        ("codex-cli 0.168.0- (protocol 1.0.0)", false),
+        ("codex-cli 0.170.0-01 (runtime 22.0.0)", false),
         ("codex-cli 0.169.0", true),
         ("codex-cli 0.170.0", true),
         ("unknown", false),

@@ -77,21 +77,46 @@ fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
     Ok(codex_version(output)? >= Version::new(0, 149, 0))
 }
 
+// The general probe's reading, which every earlier release also used here: the first token
+// that parses once its surrounding punctuation and one leading `v` are removed. The queue
+// floor, hook eligibility and the diagnostics keep it, because launch records were written
+// and admitted under it; only the Herdr gate reads more strictly (`herdr_codex_version`).
 fn codex_version(output: &str) -> Result<Version> {
     output
         .split_whitespace()
         .filter_map(|token| {
-            // Preserve SemVer punctuation (`-`, `+`, `.`) so prereleases like `0.170.0--`
-            // and malformed tokens like `0.170.0+` or `0.170.0-` are never trimmed into
-            // a stable version.
-            let trimmed = token.trim_matches(|character: char| {
-                !character.is_ascii_alphanumeric() && !matches!(character, '-' | '+' | '.')
-            });
-            let candidate = trimmed.strip_prefix('v').unwrap_or(trimmed);
+            let candidate = token
+                .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                .strip_prefix('v')
+                .unwrap_or(
+                    token.trim_matches(|character: char| !character.is_ascii_alphanumeric()),
+                );
             Version::parse(candidate).ok()
         })
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not parse a semantic Codex version from {output:?}"))
+}
+
+// Herdr's reading of the version text. The Codex version is the first token that looks like
+// one (a digit once its surrounding punctuation and one leading `v` are removed), and only
+// that token is parsed, with SemVer punctuation (`-`, `+`, `.`) kept: a prerelease such as
+// `0.170.0--` stays a prerelease, a malformed token such as `0.170.0+` is an error, and a
+// later token (`codex-cli 0.168.0+ (runtime 22.0.0)`) is never read in its place.
+fn herdr_codex_version(output: &str) -> Result<Version> {
+    let token = output
+        .split_whitespace()
+        .find(|token| {
+            let core = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+            core.strip_prefix('v')
+                .unwrap_or(core)
+                .starts_with(|character: char| character.is_ascii_digit())
+        })
+        .ok_or_else(|| anyhow::anyhow!("found no Codex version in {output:?}"))?;
+    let trimmed = token.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '+' | '.')
+    });
+    Version::parse(trimmed.strip_prefix('v').unwrap_or(trimmed))
+        .with_context(|| format!("Codex version {token:?} is not a semantic version"))
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.
@@ -452,7 +477,7 @@ impl SurfaceRoute {
 //   app-server. Before the CLI version is probed (`version: None`, e.g. terminal selection
 //   or an unprobed doctor check), Herdr is admitted on non-Windows platforms; once a
 //   version is known (post-probe admission and launch planning), the 0.169.0 stable floor
-//   is enforced.
+//   is enforced on the version `herdr_codex_version` reads.
 // - Every other admitted surface uses `SurfaceRoute::platform_default(windows)`: console
 //   paste on Windows, launch argument without `--no-daemon` elsewhere.
 fn surface_route(
@@ -478,11 +503,11 @@ fn surface_route_with<E>(
             )));
         }
         if let Some((label, version_text)) = read_version()? {
-            let parsed = match codex_version(&version_text) {
+            let parsed = match herdr_codex_version(&version_text) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     return Ok(Err(super::SurfaceRefusal::Version(format!(
-                        "Herdr requires stable Codex {HERDR_MINIMUM_VERSION} or newer with --no-daemon; {label}: {version_text} ({error})"
+                        "Herdr requires stable Codex {HERDR_MINIMUM_VERSION} or newer with --no-daemon; {label}: {version_text} ({error:#})"
                     ))));
                 }
             };

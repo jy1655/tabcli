@@ -10,10 +10,14 @@
   in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
   Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
   session or terminal exists; `prepare_launch` applies the same decision from the recorded
-  surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. SemVer
-  punctuation (`-`, `+`, `.`) is preserved when parsing the version token so prereleases
-  such as `0.170.0--` and malformed suffixes such as `0.170.0+` are refused. Other
-  surfaces retain their launch arguments and require no 0.169.0 floor.
+  surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. That gate reads
+  only the first token that looks like a version and keeps its SemVer punctuation (`-`, `+`,
+  `.`), so a prerelease such as `0.170.0--`, a malformed suffix such as `0.170.0+`, and a
+  malformed Codex token followed by another version (`codex-cli 0.168.0+ (runtime 22.0.0)`)
+  are refused, never read as a stable or later version. The queue floor, hook eligibility
+  and doctor keep the general probe's reading (the first token that parses once surrounding
+  punctuation is removed), under which earlier releases wrote and admitted launch records.
+  Other surfaces retain their launch arguments and require no 0.169.0 floor.
   The version floor is eligibility; ask, queue follow-up and completion need separate
   live verification. No Codex configuration file or daemon is changed.
 - On native Windows the adapter refuses a Herdr terminal in `surface_support` before any

@@ -1174,7 +1174,10 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, &root)
             .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
             .env("CODEX_HOME", &codex_home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1271,6 +1274,8 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             "codex-cli 0.170.0-alpha.1",
             "codex-cli 0.170.0--",
             "codex-cli 0.170.0+",
+            "codex-cli 0.168.0+ (runtime 22.0.0)",
+            "codex-cli 0.168.0- (protocol 1.0.0)",
             "unknown",
         ] {
             let error = resolve_surface(
@@ -1370,7 +1375,10 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, &root)
             .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
             .env("CODEX_HOME", &codex_home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);

@@ -567,6 +567,8 @@ mod tests {
                     ("codex-cli 0.170.0-alpha.1", false),
                     ("codex-cli 0.170.0--", false),
                     ("codex-cli 0.170.0+", false),
+                    ("codex-cli 0.168.0+ (runtime 22.0.0)", false),
+                    ("codex-cli 0.168.0- (protocol 1.0.0)", false),
                     ("codex-cli 0.169.0", true),
                     ("codex-cli 0.170.0", true),
                     ("unknown", false),

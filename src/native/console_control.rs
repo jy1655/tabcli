@@ -233,7 +233,7 @@ fn run_with(
         directory: &directory,
         root_never_ran: terminal::windows_console_root_never_ran(&directory),
     };
-    let action = resolve_action(request, &directory, provider);
+    let action = resolve_action(request, &directory, provider)?;
     execute(action, &session, &records)
 }
 
@@ -242,38 +242,44 @@ fn resolve_action(
     request: ConsoleControlRequest,
     directory: &Path,
     provider: agent_bridge::FirstPartyCli,
-) -> ResolvedAction {
+) -> Result<ResolvedAction> {
     let input_path = |name: &str| {
         Reader::open_unchecked(directory)
             .private(name)
             .path()
             .to_owned()
     };
-    let (submit_count, newline) =
-        provider::admit_surface(provider, terminal::TerminalKind::WindowsConsole, None)
-            .ok()
-            .and_then(|transport| transport.facts().surface)
-            .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
-                (surface.submit_count, surface.newline)
-            });
-    match request.operation {
+    Ok(match request.operation {
         Operation::Screen => ResolvedAction::Screen,
         Operation::Send {
             mode,
             input_name,
             timeout,
-        } => ResolvedAction::Send {
-            input: input_path(&input_name),
-            submit_count: mode.override_count().unwrap_or(submit_count),
-            newline,
-            timeout,
-        },
+        } => {
+            // The provider's initial Transport on the managed console states its surface
+            // input; an admitted Transport without one keeps one Return and a line feed. A
+            // refusal is an error, never that default. Only input asks: screen, window and
+            // close never depend on the provider's admission.
+            let (submit_count, newline) =
+                provider::admit_surface(provider, terminal::TerminalKind::WindowsConsole, None)?
+                    .facts()
+                    .surface
+                    .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
+                        (surface.submit_count, surface.newline)
+                    });
+            ResolvedAction::Send {
+                input: input_path(&input_name),
+                submit_count: mode.override_count().unwrap_or(submit_count),
+                newline,
+                timeout,
+            }
+        }
         Operation::Dialog { input_name, .. } => ResolvedAction::Dialog {
             input: input_path(&input_name),
         },
         Operation::Window { timeout } => ResolvedAction::Window { timeout },
         Operation::Close => ResolvedAction::Close,
-    }
+    })
 }
 
 pub(in crate::native) const SUBMIT_DELAYS_EXHAUSTED: &str =

@@ -453,6 +453,58 @@ fn only_the_queue_version_floor_carries_the_unsupported_hint() {
     }
 }
 
+// A launch record keeps the queue floor reading it was written under: v0.4.48's general
+// probe admits `Codex version is 0.170.0.` on any surface without the Herdr gate, and its
+// follow-up passes the floor and reaches the next gate instead of ending on a parse error.
+#[test]
+fn a_recorded_version_keeps_the_queue_floor_reading_of_earlier_releases() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    for (version, below_floor) in [
+        ("Codex version is 0.170.0.", false),
+        ("codex-cli 0.170.0+", false),
+        ("codex-cli 0.168.0+ (runtime 22.0.0)", false),
+        ("Codex version is 0.148.9.", true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        std::fs::create_dir(&directory).unwrap();
+        let provider = directory.join("provider-must-not-run");
+        write_queue_manifest(&directory, &provider, version);
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
+        let claim_token = claim.token().to_owned();
+        claim.retain();
+        let failure = send_native_queue_message(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("unused-agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                correlation_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(1),
+            },
+            &mut SystemClock,
+        )
+        .unwrap_err();
+        assert!(matches!(failure, Outcome::NotSent(_)), "{version}");
+        let error = outcome_error(&failure);
+        let cause = if below_floor {
+            format!("Codex {version} predates native queue support in 0.149.0")
+        } else {
+            "Codex session has no established provider thread id".to_owned()
+        };
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{}: {cause}", super::unaddressed_follow_up()),
+            "{version}"
+        );
+        assert_eq!(
+            classify(error),
+            below_floor.then_some(FailureKind::Unsupported),
+            "{version}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_queue_refuses_before_start_for_old_versions_or_missing_threads() {
