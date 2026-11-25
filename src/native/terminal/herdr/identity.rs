@@ -43,8 +43,7 @@ fn usable_endpoint(endpoint: &str) -> bool {
 /// | Remove after owner exits (Unix) | Exact path | Finished | Launch label |
 pub(super) enum Requirement<'a> {
     Live,
-    // The close entry supplies the path. Retain its optional-directory interface here.
-    Bound(Option<&'a Path>),
+    Bound(&'a Path),
     #[cfg(unix)]
     Finished(&'a Path),
 }
@@ -112,7 +111,7 @@ impl<'a> Recorded<'a> {
         let address = &observed.address;
         let directory = match self.requirement {
             Requirement::Live => None,
-            Requirement::Bound(directory) => directory,
+            Requirement::Bound(directory) => Some(directory),
             #[cfg(unix)]
             Requirement::Finished(directory) => Some(directory),
         };

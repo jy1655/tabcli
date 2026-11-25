@@ -1,5 +1,5 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, LaunchHost, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, LaunchHost, OwnerSurvival, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 #[cfg(target_os = "macos")]
@@ -7,7 +7,7 @@ use crate::native::session::launch::{BindingBudget, BindingFacts};
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
     facts: SurfaceFacts {
-        outlives_owner: false,
+        owner_survival: OwnerSurvival::EndsWithOwner,
         failed_start_identity: true,
         paste_envelope: PasteEnvelope::Bracketed,
         guards_dialog_input: true,

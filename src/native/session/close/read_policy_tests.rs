@@ -315,8 +315,7 @@ fn repair_refuses_a_retained_handle_whose_unknown_value_is_not_utf8() {
     let error = repair_dead_owner_with(
         &Store::open_unchecked(&directory),
         |_| Ok(false),
-        |_| true,
-        |_| panic!("a macOS repair closes no surface"),
+        RepairSurfaces::Posix,
         budget::close_deadline(),
     )
     .map_err(|error| format!("{error:#}"))

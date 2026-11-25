@@ -5,7 +5,7 @@
 // forwards the Record accessors to the real Reader and injects only the observations.
 use super::test_support::{Call, RecordValues, TestObservation};
 use super::*;
-use crate::native::process_identity::Attested;
+use crate::native::process_identity::{Attested, Gone};
 use crate::native::session::CoreRecord;
 use crate::native::session::owner::ControlAttestation;
 use crate::native::terminal::ownership::{MacTerminalAppIdentity, test_owner_attestation};

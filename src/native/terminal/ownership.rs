@@ -14,6 +14,7 @@ use crate::native::process_identity::Gone;
 use crate::native::process_identity::{Attested, ProcessObservation};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::Reader;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -21,7 +22,7 @@ use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -662,36 +663,6 @@ pub(in crate::native) fn verified_terminal_surface_owner(
         None
     };
     Ok(owner)
-}
-
-pub(in crate::native) fn close_dead_owner_surface_until(
-    directory: &Path,
-    session: &terminal::TerminalSession,
-    deadline: std::time::Instant,
-) -> Result<terminal::CloseOutcome> {
-    close_dead_owner_surface_with(
-        session,
-        |surface| terminal::close_session_until(directory, surface, deadline),
-        deadline,
-    )
-}
-
-pub(in crate::native) fn close_dead_owner_surface_with(
-    session: &terminal::TerminalSession,
-    mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-    deadline: std::time::Instant,
-) -> Result<terminal::CloseOutcome> {
-    #[cfg(windows)]
-    if !matches!(
-        session.kind,
-        terminal::TerminalKind::WindowsConsole | terminal::TerminalKind::Herdr
-    ) {
-        bail!("dead Windows native owner has a non-Windows terminal handle")
-    }
-    close_remaining(deadline)?;
-    let outcome = closer(session)?;
-    close_remaining(deadline)?;
-    Ok(outcome)
 }
 
 // The close decision and its dispatch live in `close_authority`; the production entry

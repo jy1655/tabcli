@@ -1,5 +1,5 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, OwnerSurvival, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -8,7 +8,7 @@ use crate::native::session::launch::{BindingBudget, BindingFacts};
 pub(in crate::native) const REGISTRATION: Registration = Registration {
     facts: SurfaceFacts {
         // The server is the surface: a user can keep it with windows of their own.
-        outlives_owner: true,
+        owner_survival: OwnerSurvival::SurfaceCanRemain,
         // The creation-proven server incarnation identifies a failed start's surface.
         failed_start_identity: true,
         // The prompt file carries the bracketed-paste markers; `paste-buffer -r` writes

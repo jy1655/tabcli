@@ -829,6 +829,7 @@ impl<R: Runner> MacTerminalAdapter for Adapter<R> {
         surface_present_with_runner(&mut *self.runner(), session, timeout)
     }
     // Screen reads and guarded dialog input are declared unsupported in the registration.
+    #[cfg(test)]
     fn close_session_until(
         &self,
         _directory: &Path,

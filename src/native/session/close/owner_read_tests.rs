@@ -39,15 +39,12 @@ fn repair_owner_read_answers_for_each_damaged_shape() {
             damaged,
         );
         let attested = std::cell::Cell::new(0);
-        let observed = outcome(repair_dead_owner_with(
+        let observed = outcome(repair_dead_owner_attested_with(
             &Store::open_unchecked(directory.path()),
-            |_| {
+            |owner| {
                 attested.set(attested.get() + 1);
-                Ok(true)
+                attest_owner(owner)
             },
-            |_| panic!("a live owner retains nothing"),
-            |_| panic!("a live owner's surface is not closed"),
-            budget::close_deadline(),
         ));
         // Repair reads the record under the one read policy: it no longer follows a link.
         let expected = (format!("error {}", read_error(&path, damaged)), 0);

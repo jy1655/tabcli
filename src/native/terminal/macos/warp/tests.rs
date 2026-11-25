@@ -731,11 +731,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
                 assert!(verified.is_err());
             }
         }
-        for close in [
-            terminal::close_session_until,
-            close_owned_surface_only,
-            ownership::close_dead_owner_surface_until,
-        ] {
+        for close in [terminal::close_session_until, close_owned_surface_only] {
             let result = close(
                 &directory,
                 &session(),
@@ -840,11 +836,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
             .to_string()
             .contains("host offer")
     );
-    for close in [
-        terminal::close_session_until,
-        close_owned_surface_only,
-        ownership::close_dead_owner_surface_until,
-    ] {
+    for close in [terminal::close_session_until, close_owned_surface_only] {
         assert!(
             close(&directory, &session(), Instant::now())
                 .unwrap_err()

@@ -105,11 +105,6 @@ where
     ) -> Result<Option<MacTerminalAppIdentity>> {
         terminal_app_process(owner).map(Some)
     }
-
-    // A Terminal.app window whose program ended is not a separate surface to remove.
-    fn removes_ended_surface(&self) -> bool {
-        false
-    }
 }
 
 // `automation` is the closing adapter's: the surface verification here is the second

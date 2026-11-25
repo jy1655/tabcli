@@ -281,7 +281,6 @@
     "builder.prefix(\"agent-bridge-self-test-\");": 1
   },
   "src/native/session/close.rs": {
-    "native-session": 1,
     "status.json": 1
   },
   "src/native/session/launch/mod.rs": {
@@ -433,8 +432,12 @@
     "crate::native::console_control::SUBMIT_DELAYS_EXHAUSTED": 1
   },
   "src/native/terminal/close_authority.rs": {
-    "native-session": 4,
+    "native-session": 2,
     "native-session.json": 1
+  },
+  "src/native/terminal/close_authority/owner_exit.rs": {
+    "dead native-session owner identity is incomplete, foreign, or its PID is reused; no terminal observation or close was sent": 1,
+    "the recorded native-session owner is no longer live; visible terminal cleanup is unverified and no close was sent": 1
   },
   "src/native/terminal/ownership.rs": {
     "native-session": 11

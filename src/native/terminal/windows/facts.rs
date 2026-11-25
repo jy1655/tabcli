@@ -1,10 +1,10 @@
 use crate::native::terminal::facts::{
-    CloseEvidenceChoice, PasteEnvelope, Registration, SurfaceFacts,
+    CloseEvidenceChoice, OwnerSurvival, PasteEnvelope, Registration, SurfaceFacts,
 };
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
     facts: SurfaceFacts {
-        outlives_owner: false,
+        owner_survival: OwnerSurvival::EndsWithOwner,
         failed_start_identity: true,
         // Console key events would expose bracketed-paste escapes as literal text.
         paste_envelope: PasteEnvelope::Raw,

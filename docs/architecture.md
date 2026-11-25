@@ -269,7 +269,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
   Each terminal kind is registered once: its portable `facts.rs` declares its surface facts,
-  host command, whether its launch runs the launch host, close-evidence choice, refusal
+  host command, whether its launch runs the launch host, owner survival, close-evidence choice, refusal
   messages for screen reads and guarded dialog input and, where used, its binding facts. The
   shared lookups (`facts`, `close_evidence`, `host`, the command table) read that registration.
   Command parsing and historical `launch-host.json` reads use the portable launch-host form.
@@ -709,13 +709,22 @@ diagnostics; adapters return the typed retained-surface handoff and its cleanup 
 The recovery close in #87 is not implemented. Its authority decision waits for Warp runtime
 evidence from a `warp_control_cli` build or an upstream change.
 
-Close authority selects one of four outcomes: close with an attested owner, close a proven
-owned surface, end a live attested owner whose surface is proven absent, or record that the
-surface is absent. An ambiguous identity refuses close and
-retains the handle. `session::close` records the transition and tombstones, and converges
-interrupted close. `terminal::close_authority` makes the decision over its observation seam;
-`terminal::ownership` performs the authorized surface/process action. Dead-owner
-repair settles the records without resending a prompt or guessing ownership of an unrelated surface.
+`terminal::close_authority` decides explicit Close over its observation seam. Close can act
+with a live attested owner, act on a proven Surface alone, remove a verified finished Surface,
+end a live attested owner whose Surface is proven absent, or settle a proven absence or
+completed teardown. An ambiguous identity retains the handle. The platform adapters perform
+surface close, and `terminal::ownership` performs owner teardown. `session::close` claims the
+handle, records the transition and tombstones, and converges interrupted Close.
+
+`terminal::close_authority::owner_exit` owns the ordinary dead-owner Close decision on macOS
+and Linux and the dead-owner Surface decision in Repair. Repair scans active then claimed
+handles through the same reader and retains damaged evidence. On macOS and Linux, Repair
+preserves an intent or a Surface that can outlive its owner for explicit Close. The ordinary
+dead-owner Close can remove a registered core-retained terminal after the adapter verifies
+that it has finished. Windows Repair closes a core-retained terminal through the Windows
+lookup, even for an exited or failed session. This uses the adapter's proof and ordinary
+close of a live or finished terminal. An exited or failed console session settles from its
+Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
 
 ## Where to add things
 

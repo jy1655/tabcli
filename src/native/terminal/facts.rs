@@ -11,22 +11,27 @@ use crate::native::session::launch::BindingFacts;
 #[derive(Clone, Copy)]
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) struct SurfaceFacts {
-    pub(in crate::native) outlives_owner: bool,
+    pub(in crate::native::terminal) owner_survival: OwnerSurvival,
     pub(in crate::native) failed_start_identity: bool,
     pub(in crate::native) paste_envelope: PasteEnvelope,
     pub(in crate::native) guards_dialog_input: bool,
 }
 
-/// The close evidence a kind selects; resolved to an implementation only on macOS.
+/// What may remain of the surface when its owner exits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native::terminal) enum OwnerSurvival {
+    EndsWithOwner,
+    SurfaceCanRemain,
+    /// The core keeps a finished terminal until it is explicitly removed.
+    CoreRetainsFinished,
+}
+
+/// The close evidence a kind selects on macOS and Linux, including creation-proven hosts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) enum CloseEvidenceChoice {
     PresenceOnly,
     PresenceOnlyWithOwnerlessContext,
-    /// Presence, and a surface whose program ended stays until it is removed (a finished
-    /// Herdr terminal): once its owner is verified dead, a close may remove that surface
-    /// but never end a running one.
-    PresenceWithEndedSurface,
     AppleTerminal,
     /// Whole host created exclusively by TAB and recorded by incarnation.
     BridgeCreatedHost,
@@ -154,6 +159,17 @@ mod tests {
         TerminalKind::Tmux,
         TerminalKind::Herdr,
     ];
+
+    #[test]
+    fn only_herdr_retains_finished_surfaces_on_its_core() {
+        for kind in KINDS {
+            assert_eq!(
+                kind.registration().facts.owner_survival == OwnerSurvival::CoreRetainsFinished,
+                kind == TerminalKind::Herdr,
+                "{kind:?}"
+            );
+        }
+    }
 
     // A kind that guards dialog input declares no refusal; a kind that refuses screen
     // reads cannot answer a dialog either. The messages themselves are asserted where

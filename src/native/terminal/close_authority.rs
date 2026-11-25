@@ -20,8 +20,6 @@ use super::ownership::{
 use super::posix::OwnedSurfaceClose;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::posix_ownership::verified_posix_terminal_owner;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::native::process_identity::Gone;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::process_identity::ProcessObservation;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -40,6 +38,7 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 use std::{path::Path, time::Instant};
 
+pub(in crate::native) mod owner_exit;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
 
@@ -343,42 +342,14 @@ pub(in crate::native) fn decide(
                     _ => {}
                 }
                 if matches!(attestation.process, ProcessObservation::Gone(_)) {
-                    session.verify_managed_session(expected_session_id)?;
-                    // A reused PID grants neither mutation nor absence authority. The
-                    // original owner's complete binding is required even for a query.
-                    if matches!(
+                    return owner_exit::explicit_close(
+                        observation,
+                        expected_session_id,
+                        session,
+                        &owner,
                         attestation.process,
-                        ProcessObservation::Gone(Gone::Reused(_))
-                    ) || observation.pid_alive(owner.pid)
-                        || owner.binding(expected_session_id) != OwnerBinding::Bound
-                        || !owner.control_record().is_complete()
-                        || owner.terminal_tty.as_deref().is_none_or(str::is_empty)
-                    {
-                        bail!(
-                            "dead native-session owner identity is incomplete, foreign, or its PID is reused; no terminal observation or close was sent"
-                        );
-                    }
-                    if let Some(intent) = teardown_intent {
-                        if !observation.group_gone(intent.process_group)? {
-                            bail!(
-                                "the teardown owner's process group is not proven gone; no signal was sent and the handle is retained"
-                            );
-                        }
-                        return Ok(TerminalCloseAuthority::TeardownComplete(intent.reason));
-                    }
-                    let absent = observation.evidence().surface_absent(Some(&owner), Box::new(surface_present))
-                    .context("could not prove absence of the dead owner's exact terminal surface; no close was sent")?;
-                    if absent {
-                        return Ok(TerminalCloseAuthority::Absent);
-                    }
-                    // The owner ran inside a surface that outlives its program (a finished
-                    // Herdr terminal): it may be all that is left after the user closed the
-                    // tab. The adapter removes it only if it reads it ended.
-                    if observation.evidence().removes_ended_surface() {
-                        return Ok(TerminalCloseAuthority::RemoveEnded);
-                    }
-                    bail!(
-                        "the recorded native-session owner is no longer live; visible terminal cleanup is unverified and no close was sent"
+                        teardown_intent,
+                        surface_present,
                     );
                 }
                 // Keep the existing app-incarnation guard as part of the live proof.

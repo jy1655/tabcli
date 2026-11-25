@@ -11,7 +11,7 @@ use crate::native::terminal::close_authority::{
     close_owned_surface_with, test_support::TestObservation,
 };
 use crate::native::terminal::ownership::NativeSessionOwner;
-use crate::native::terminal::posix::PosixTerminalAdapter;
+use crate::native::terminal::posix::{self, PosixTerminalAdapter};
 
 fn gone(gone: Gone) -> OwnerAttestation {
     OwnerAttestation {
@@ -41,6 +41,13 @@ fn dead_owner() -> NativeSessionOwner {
             starttime_ticks: 42,
         }),
         ..NativeSessionOwner::default()
+    }
+}
+
+impl posix::Adapters for Adapter<FakeCore> {
+    fn adapter(&self, kind: TerminalKind) -> Result<&dyn PosixTerminalAdapter> {
+        assert_eq!(kind, TerminalKind::Herdr);
+        Ok(self)
     }
 }
 
@@ -97,7 +104,8 @@ impl Fixture {
                 let observation =
                     TestObservation::on_records(&self.directory, SESSION, surface, deadline)
                         .with_presence(|| {
-                            Adapter::with_core(self.core.clone()).present(
+                            posix::surface_present(
+                                &Adapter::with_core(self.core.clone()),
                                 &self.directory,
                                 surface,
                                 Duration::from_secs(1),
@@ -109,7 +117,8 @@ impl Fixture {
                     || observation.decide(SESSION, surface, deadline),
                     || panic!("a dead owner is never torn down"),
                     |close| {
-                        Adapter::with_core(self.core.clone()).close_owned_session(
+                        posix::close_owned_session(
+                            &Adapter::with_core(self.core.clone()),
                             &self.directory,
                             SESSION,
                             surface,
