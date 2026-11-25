@@ -548,51 +548,164 @@ fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
     assert!(read_pending_turn(&directory).unwrap().is_none());
 }
 
-// Herdr reads the first token that looks like a version, and only that token, with SemVer
-// punctuation kept: its parse error is the answer, never a later token's version.
+// The Herdr gate's version grammar (`herdr_codex_version`) as a table over its dimensions,
+// each cell checked through pre-creation admission and the recorded-launch check:
+// - label present once: the verdict is the field's, whatever precedes the label (nothing, a
+//   warning line, a timestamp on the label's line, a timestamped warning line, another
+//   program's version or a prerelease on its own line) and whatever follows the field
+//   (nothing, another version on its line, another version line);
+// - label absent: one bare word is read as the field; anything longer refuses;
+// - label layout: a second label, or a label without a field on its line, refuses.
 #[test]
-fn herdr_reads_only_the_first_version_token_with_semver_punctuation() {
-    let pre = herdr_codex_version("codex-cli 0.170.0--").unwrap();
-    assert_eq!(pre.pre.as_str(), "-");
-    for (text, expected) in [
-        ("codex-cli 0.170.0", Version::new(0, 170, 0)),
-        ("OpenAI Codex (v0.170.0)", Version::new(0, 170, 0)),
-        (
-            "codex-cli 0.170.0 (runtime 22.0.0)",
-            Version::new(0, 170, 0),
-        ),
-        (
-            "codex-cli 0.168.0 (runtime 22.0.0)",
-            Version::new(0, 168, 0),
-        ),
-    ] {
-        assert_eq!(herdr_codex_version(text).unwrap(), expected, "{text}");
+fn herdr_version_grammar_reads_only_the_labelled_field() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::provider::SurfaceRefusal;
+    use terminal::TerminalKind;
+
+    const REFUSAL: &str = "Herdr requires stable Codex 0.169.0 or newer with --no-daemon;";
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("codex-cli 0.169.0"));
+    let store = Store::open_unchecked(&directory);
+    store
+        .private("terminal.json")
+        .write_json(&serde_json::json!({"terminal":"herdr","session_id":"t1"}))
+        .unwrap();
+    let admits = |text: &str| -> bool {
+        let admission = surface_route(false, TerminalKind::Herdr, Some(text));
+        // The fixture's manifest, with this cell's text as the recorded version.
+        store
+            .private("manifest.json")
+            .write_json(&serde_json::json!({
+                "schema": 1, "id": "session-hooks", "provider": "codex", "provider_path": "codex",
+                "provider_version": text, "workspace": root.path(), "title": "hooks fixture",
+                "yolo": false, "created_unix_ms": 1
+            }))
+            .unwrap();
+        let recorded = recorded_surface_route(&directory, false);
+        match (admission, recorded) {
+            (Ok(admitted), Ok(launched)) => {
+                assert_eq!(admitted, SurfaceRoute::LaunchArgument { no_daemon: true });
+                assert_eq!(launched, admitted, "{text:?}");
+                true
+            }
+            (Err(SurfaceRefusal::Version(detail)), Err(error)) => {
+                assert!(
+                    detail.starts_with(&format!("{REFUSAL} version: {text}")),
+                    "{detail}"
+                );
+                assert!(
+                    format!("{error:#}")
+                        .starts_with(&format!("{REFUSAL} recorded version: {text}")),
+                    "{error:#}"
+                );
+                assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{text:?}");
+                false
+            }
+            (admission, recorded) => panic!(
+                "admission and the recorded launch disagree on {text:?}: {admission:?} / {:?}",
+                recorded.map_err(|error| format!("{error:#}"))
+            ),
+        }
+    };
+
+    // The field, and whether Herdr admits it.
+    let fields = [
+        ("0.169.0", true),          // stable, at the floor
+        ("0.170.0", true),          // stable, above the floor
+        ("v0.170.0", true),         // with the optional `v`
+        ("0.170.0+build.1", true),  // build metadata is not a prerelease
+        ("0.168.0", false),         // below the floor
+        ("0.170.0-alpha.1", false), // prerelease
+        ("0.170.0--", false),       // prerelease whose identifier is `-`
+        ("0.170.0+", false),        // malformed: empty build metadata
+        ("0.170.0.", false),        // malformed: trailing punctuation is not removed
+        ("0.170.0-01", false),      // malformed: leading zero in a numeric prerelease
+        ("(0.170.0)", false),       // malformed: brackets are not removed
+        ("unknown", false),         // not a version
+    ];
+    let before = [
+        "",
+        "warning: config.toml is deprecated\n",
+        "2026-11-25T10:00:00Z ",
+        "2026-11-25T10:00:00Z WARN slow start after 1.0.0\n",
+        "node v22.0.0\n",
+        "plugin 0.160.0-beta.1\n",
+    ];
+    let after = [
+        "",
+        " (runtime 22.0.0)",
+        " (protocol 0.1.0)",
+        "\nnode v22.0.0",
+    ];
+    for (field, admitted) in fields {
+        for prefix in before {
+            for suffix in after {
+                let text = format!("{prefix}codex-cli {field}{suffix}");
+                assert_eq!(admits(&text), admitted, "{text:?}");
+            }
+        }
+        // Without the label only a text of one word is read.
+        assert_eq!(admits(field), admitted, "{field:?}");
+        assert_eq!(admits(&format!("\n{field}\n")), admitted, "{field:?}");
+        for unlabelled in [
+            format!("codex {field}"),
+            format!("OpenAI Codex ({field})"),
+            format!("{field} (runtime 22.0.0)"),
+            format!("node v22.0.0\n{field}"),
+        ] {
+            assert!(!admits(&unlabelled), "{unlabelled:?}");
+        }
+        // A second label, or a label whose field is on another line, refuses.
+        for layout in [
+            format!("codex-cli {field}\ncodex-cli {field}"),
+            format!("warning: codex-cli is outdated\ncodex-cli {field}"),
+            format!("codex-cli\n{field}"),
+        ] {
+            assert!(!admits(&layout), "{layout:?}");
+        }
     }
-    let with_build = herdr_codex_version("codex-cli 0.170.0+build.1").unwrap();
-    assert!(with_build.pre.is_empty());
-    assert_eq!(with_build.build.as_str(), "build.1");
-    for (text, token) in [
+    assert!(!admits("codex-cli"));
+}
+
+// Each refusal of the grammar names what refused: the field's own parse error, a missing
+// label, a label without a field, or a second label.
+#[test]
+fn herdr_version_refusals_name_the_rule_that_refused() {
+    let refusal = |text: &str| format!("{:#}", herdr_codex_version(text).unwrap_err());
+    for (text, field) in [
         ("codex-cli 0.170.0+", "0.170.0+"),
-        ("codex-cli 0.170.0-", "0.170.0-"),
-        ("codex-cli 0.170.0.", "0.170.0."),
-        ("Codex version is 0.170.0.", "0.170.0."),
-        ("codex-cli 0.168.0+ (runtime 22.0.0)", "0.168.0+"),
-        ("codex-cli 0.168.0- (protocol 1.0.0)", "0.168.0-"),
-        ("codex-cli 0.170.0-01 (runtime 22.0.0)", "0.170.0-01"),
-        ("codex-cli -1.0.0 0.170.0", "-1.0.0"),
+        ("codex-cli unknown (runtime 22.0.0)", "unknown"),
+        (
+            "2026-11-25T10:00:00Z codex-cli 0.170.0. (runtime 22.0.0)",
+            "0.170.0.",
+        ),
+        ("unknown", "unknown"),
     ] {
-        let error = format!("{:#}", herdr_codex_version(text).unwrap_err());
+        let error = refusal(text);
         assert!(
             error.starts_with(&format!(
-                "Codex version {token:?} is not a semantic version: "
+                "Codex version {field:?} is not a semantic version: "
             )),
-            "{text}: {error}"
+            "{text:?}: {error}"
         );
     }
     assert_eq!(
-        format!("{:#}", herdr_codex_version("codex unknown").unwrap_err()),
-        "found no Codex version in \"codex unknown\""
+        refusal("OpenAI Codex (v0.170.0)"),
+        "found no `codex-cli` version label in \"OpenAI Codex (v0.170.0)\""
     );
+    assert_eq!(
+        refusal("codex-cli\n0.170.0"),
+        "the `codex-cli` label has no version after it on its line in \"codex-cli\\n0.170.0\""
+    );
+    assert_eq!(
+        refusal("codex-cli 0.170.0\ncodex-cli 0.170.0"),
+        "found the `codex-cli` label more than once in \"codex-cli 0.170.0\\ncodex-cli 0.170.0\""
+    );
+    let prerelease = herdr_codex_version("codex-cli 0.170.0--").unwrap();
+    assert_eq!(prerelease.pre.as_str(), "-");
+    let build = herdr_codex_version("codex-cli 0.170.0+build.1").unwrap();
+    assert!(build.pre.is_empty());
+    assert_eq!(build.build.as_str(), "build.1");
 }
 
 // The queue floor, hook eligibility and the diagnostics read a recorded or probed version as

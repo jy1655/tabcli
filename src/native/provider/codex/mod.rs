@@ -97,26 +97,53 @@ fn codex_version(output: &str) -> Result<Version> {
         .ok_or_else(|| anyhow::anyhow!("could not parse a semantic Codex version from {output:?}"))
 }
 
-// Herdr's reading of the version text. The Codex version is the first token that looks like
-// one (a digit once its surrounding punctuation and one leading `v` are removed), and only
-// that token is parsed, with SemVer punctuation (`-`, `+`, `.`) kept: a prerelease such as
-// `0.170.0--` stays a prerelease, a malformed token such as `0.170.0+` is an error, and a
-// later token (`codex-cli 0.168.0+ (runtime 22.0.0)`) is never read in its place.
+// The Herdr gate's reading of a `--version` text, as a grammar. A word is a run of
+// non-whitespace characters, and a line is the text between line feeds.
+//
+//   label   = the word `codex-cli`
+//   field   = the word right after the label, on the label's line
+//   version = [ "v" ] SemVer 2.0.0, parsed whole: no punctuation is removed
+//
+// - Labelled text (the label occurs once): the field is read as `version`, and its result,
+//   error included, is the answer. Words before the label (a warning line, a timestamp,
+//   another program's version) and words after the field (`(runtime 22.0.0)`, more lines) are
+//   never read.
+// - Unlabelled text: read as `version` only when the whole text is one word.
+// - Everything else is refused: a second label, a label without a field on its line, and
+//   unlabelled text of more than one word.
+//
+// `codex-cli X.Y.Z` is the only `--version` output this repository records for Codex (the
+// fixtures in tests/doctor.rs, tests/context_result.rs and tests/native_policy.rs, and
+// scripts/share_diagnostics.py, which strips that prefix). `OpenAI Codex (vX.Y.Z)` appears
+// only as the TUI's header in screen captures (launch/tests.rs, launch/paste/fixtures), so it
+// is not a label.
 fn herdr_codex_version(output: &str) -> Result<Version> {
-    let token = output
-        .split_whitespace()
-        .find(|token| {
-            let core = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
-            core.strip_prefix('v')
-                .unwrap_or(core)
-                .starts_with(|character: char| character.is_ascii_digit())
+    const LABEL: &str = "codex-cli";
+    let lines = output
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let labels = lines
+        .iter()
+        .flat_map(|words| {
+            words
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| **word == LABEL)
+                .map(move |(index, _)| words.get(index + 1).copied())
         })
-        .ok_or_else(|| anyhow::anyhow!("found no Codex version in {output:?}"))?;
-    let trimmed = token.trim_matches(|character: char| {
-        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '+' | '.')
-    });
-    Version::parse(trimmed.strip_prefix('v').unwrap_or(trimmed))
-        .with_context(|| format!("Codex version {token:?} is not a semantic version"))
+        .collect::<Vec<_>>();
+    let field = match labels.as_slice() {
+        [Some(field)] => *field,
+        [None] => bail!("the `{LABEL}` label has no version after it on its line in {output:?}"),
+        [] => match lines.concat().as_slice() {
+            [word] => *word,
+            _ => bail!("found no `{LABEL}` version label in {output:?}"),
+        },
+        _ => bail!("found the `{LABEL}` label more than once in {output:?}"),
+    };
+    Version::parse(field.strip_prefix('v').unwrap_or(field))
+        .with_context(|| format!("Codex version {field:?} is not a semantic version"))
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.
