@@ -1,4 +1,5 @@
 use super::store::{Environment, Evidence, Trust, read_store, user_home};
+use super::worktree;
 use super::{Identity, identity};
 use crate::native::provider;
 use crate::native::session::{Reader, RecordReader, RecordStore, Store};
@@ -9,12 +10,19 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+// `repository_root` is the identity of the main working tree whose exact trust `source` names,
+// for a workspace that is a verified linked git worktree of that repository. It is absent for
+// exact consent and then not written, so such a record keeps the bytes of a binary before it;
+// that binary ignores the field and refuses an inherited source, whose key is not the
+// workspace's (see the stored-data note in AGENTS.md, Trust Store Boundary).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Record {
     schema: u32,
     identity: Identity,
     source: Option<Evidence>,
     pub(super) revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_root: Option<Identity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -25,7 +33,12 @@ pub(in crate::native) struct Assessment {
     pub(in crate::native) state: String,
     pub(in crate::native) detail: String,
     pub(in crate::native) applied: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) repository_root: Option<Identity>,
 }
+
+const EXACT_DETAIL: &str = "Exact provider trust and canonical directory identity verified. Tool permissions are unchanged.";
+const INHERITED_DETAIL: &str = "The workspace is a verified linked git worktree, and its repository's main working tree has exact provider trust; the canonical identities of both are verified. Tool permissions are unchanged.";
 
 pub(super) const SESSION_FILE: &str = "workspace-consent.json";
 
@@ -61,6 +74,13 @@ impl SessionConsentObservation {
         self.value.get("applied").and_then(|marker| marker.as_str())
     }
 
+    // Whether the recorded consent is inherited from a repository's main working tree.
+    pub(in crate::native) fn inherited(&self) -> bool {
+        self.value
+            .get("repository_root")
+            .is_some_and(|root| !root.is_null())
+    }
+
     pub(in crate::native) fn value(&self) -> &serde_json::Value {
         &self.value
     }
@@ -74,20 +94,37 @@ fn alias_free(requested: &Path, canonical: &Path) -> Result<bool> {
     let absolute = std::path::absolute(requested)?;
     // Inspect every component: canonicalizing first would erase a symlink alias.
     for ancestor in absolute.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)?;
-        if metadata.file_type().is_symlink() {
+        if worktree::is_link(&fs::symlink_metadata(ancestor)?) {
             return Ok(false);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Ok(false);
-            }
         }
     }
     Ok(absolute.canonicalize()? == canonical)
+}
+
+// The first provider, in the order Codex, Claude, Agy, Pi, whose own store trusts `path`
+// exactly. One provider's error does not stop the next from being asked.
+fn exact_source(path: &Path, env: &Environment) -> Option<Evidence> {
+    [
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Agy,
+        FirstPartyCli::Pi,
+    ]
+    .into_iter()
+    .find_map(
+        |cli| match provider::workspace_trust(cli, path, env, None) {
+            Ok(Trust::Trusted(source)) => Some(source),
+            _ => None,
+        },
+    )
+}
+
+// The identity of the main working tree of the repository that registered `workspace` as a
+// verified linked worktree. Any other workspace, and a registration or a main working tree
+// that does not verify now, has none.
+fn main_worktree_identity(workspace: &Path) -> Option<Identity> {
+    let root = worktree::main_worktree(workspace).ok()??;
+    identity(&root).ok()
 }
 
 fn record_path(root: &Path, workspace: &Path) -> PathBuf {
@@ -144,6 +181,7 @@ pub(super) fn assess_with(root: &Path, requested: &Path, env: &Environment) -> R
             "No exact provider workspace trust was verified; use the provider's own trust prompt."
                 .into(),
         applied: None,
+        repository_root: None,
     };
     if !alias_free(requested, &identity.path)? {
         assessment.state = "alias".into();
@@ -157,6 +195,7 @@ pub(super) fn assess_with(root: &Path, requested: &Path, env: &Environment) -> R
             identity: identity.clone(),
             source: None,
             revoked: false,
+            repository_root: None,
         });
         if record.schema != 1 || record.identity != identity {
             assessment.state = "identity-changed".into();
@@ -169,11 +208,23 @@ pub(super) fn assess_with(root: &Path, requested: &Path, env: &Environment) -> R
                 "Shared workspace consent is revoked; provider-owned trust is unchanged.".into();
         } else if let Some(source) = &record.source {
             let cli = FirstPartyCli::from_str(&source.provider).map_err(anyhow::Error::msg)?;
+            // An inherited source names the main working tree: this workspace must still be a
+            // verified linked worktree of that same directory, by identity, before its trust
+            // is read.
+            let trusted = match &record.repository_root {
+                None => Some(identity.path.clone()),
+                Some(root) => main_worktree_identity(&identity.path)
+                    .filter(|now| now == root)
+                    .map(|now| now.path),
+            };
             // The one provider the record names rechecks the store it was read from, never
             // the store its home resolves to now.
-            match provider::workspace_trust(cli, &identity.path, env, Some(&source.store)) {
-                Ok(Trust::Trusted(now)) if now == *source => {
+            match trusted
+                .map(|trusted| provider::workspace_trust(cli, &trusted, env, Some(&source.store)))
+            {
+                Some(Ok(Trust::Trusted(now))) if now == *source => {
                     assessment.source = Some(now);
+                    assessment.repository_root = record.repository_root.clone();
                 }
                 _ => {
                     assessment.state = "source-reset".into();
@@ -181,25 +232,31 @@ pub(super) fn assess_with(root: &Path, requested: &Path, env: &Environment) -> R
                 }
             }
         } else {
-            for cli in [
-                FirstPartyCli::Codex,
-                FirstPartyCli::Claude,
-                FirstPartyCli::Agy,
-                FirstPartyCli::Pi,
-            ] {
-                if let Ok(Trust::Trusted(source)) =
-                    provider::workspace_trust(cli, &identity.path, env, None)
-                {
-                    assessment.source = Some(source.clone());
-                    record.source = Some(source);
-                    break;
-                }
+            // Exact trust of the workspace first. Only a workspace that no provider trusts
+            // exactly inherits the exact trust of its repository's main working tree.
+            let found = exact_source(&identity.path, env)
+                .map(|source| (source, None))
+                .or_else(|| {
+                    let root = main_worktree_identity(&identity.path)?;
+                    exact_source(&root.path, env).map(|source| (source, Some(root)))
+                });
+            record.repository_root = None;
+            if let Some((source, root)) = found {
+                assessment.source = Some(source.clone());
+                assessment.repository_root = root.clone();
+                record.source = Some(source);
+                record.repository_root = root;
             }
             RecordStore::at(path).write_json(&record)?;
         }
         if assessment.source.is_some() {
             assessment.state = "verified".into();
-            assessment.detail = "Exact provider trust and canonical directory identity verified. Tool permissions are unchanged.".into();
+            assessment.detail = if assessment.repository_root.is_some() {
+                INHERITED_DETAIL
+            } else {
+                EXACT_DETAIL
+            }
+            .into();
         }
         Ok(assessment)
     })
@@ -226,6 +283,20 @@ pub(in crate::native) fn prepare(directory: &Path, requested: &Path) -> Result<(
     record(directory, &assess(root, requested)?)
 }
 
+// `prepare` for a caller whose only provider home is the fixture `home`, so that no test reads
+// the stores of the user running it.
+#[cfg(test)]
+pub(in crate::native) fn prepare_at_home(
+    directory: &Path,
+    requested: &Path,
+    home: &Path,
+) -> Result<Assessment> {
+    let root = directory.parent().context("session has no state root")?;
+    let assessment = assess_with(root, requested, &Environment::at_home(home))?;
+    record(directory, &assessment)?;
+    Ok(assessment)
+}
+
 pub(in crate::native) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool> {
     authorized_with(directory, target, &Environment::current())
 }
@@ -249,11 +320,16 @@ pub(super) fn authorized_with(
         return Ok(false);
     }
     user_home(env)?;
-    if matches!(
-        provider::workspace_trust(target, &assessment.identity.path, env, None),
-        Err(_) | Ok(Trust::Declined)
-    ) {
-        return Ok(false);
+    // The target's own store must not decline, or fail to read, the workspace, nor the main
+    // working tree that inherited consent comes from.
+    let inherited_from = assessment.repository_root.as_ref().map(|root| &root.path);
+    for path in std::iter::once(&assessment.identity.path).chain(inherited_from) {
+        if matches!(
+            provider::workspace_trust(target, path, env, None),
+            Err(_) | Ok(Trust::Declined)
+        ) {
+            return Ok(false);
+        }
     }
     // Re-read under the consent lock immediately before applying trust. A session file
     // is diagnostic history, never a capability that survives revoke or source reset.
@@ -264,7 +340,8 @@ pub(super) fn authorized_with(
     )?;
     Ok(now.state == "verified"
         && now.identity == assessment.identity
-        && now.source == assessment.source)
+        && now.source == assessment.source
+        && now.repository_root == assessment.repository_root)
 }
 
 pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
@@ -316,20 +393,32 @@ pub(in crate::native) fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
     with_record(&root, &identity.path.clone(), |path, existing| {
-        let source = existing
-            .filter(|r| r.identity == identity)
-            .and_then(|r| r.source);
-        let record = Record {
-            schema: 1,
-            identity,
-            source: if action == "reset" { None } else { source },
-            revoked: action == "revoke",
-        };
+        let record = changed(existing, identity, action == "revoke");
         RecordStore::at(path).write_json(&record)?;
         println!("{}", serde_json::to_string_pretty(&record)?);
         Ok(())
     })
 }
+
+// The record that `consent revoke` (`revoke`) or `consent reset` writes over `existing`. A
+// revoke keeps the source of a record for this identity, and with an inherited source the main
+// working tree it names; a reset clears both.
+fn changed(existing: Option<Record>, identity: Identity, revoke: bool) -> Record {
+    let (source, repository_root) = existing
+        .filter(|record| record.identity == identity && revoke)
+        .map(|record| (record.source, record.repository_root))
+        .unwrap_or_default();
+    Record {
+        schema: 1,
+        identity,
+        source,
+        revoked: revoke,
+        repository_root,
+    }
+}
+
+#[cfg(test)]
+mod inherited_tests;
 
 #[cfg(test)]
 mod tests {
@@ -404,7 +493,7 @@ mod tests {
     }
     // Writes the exact workspace as trusted into one provider's store, as that provider
     // writes it.
-    fn trust(fixture: &Fixture, provider: FirstPartyCli, workspace: &Path) {
+    pub(super) fn trust(fixture: &Fixture, provider: FirstPartyCli, workspace: &Path) {
         let key = native_key(workspace).unwrap();
         match provider {
             FirstPartyCli::Codex => {
@@ -447,13 +536,13 @@ mod tests {
         }
     }
     // Fixtures replace their own store, using the same private creation policy each time.
-    fn replace_store(path: &Path, bytes: &[u8]) -> Result<()> {
+    pub(super) fn replace_store(path: &Path, bytes: &[u8]) -> Result<()> {
         if path.exists() {
             fs::remove_file(path)?;
         }
         write_private(path, bytes)
     }
-    fn store_of(fixture: &Fixture, provider: FirstPartyCli) -> &Path {
+    pub(super) fn store_of(fixture: &Fixture, provider: FirstPartyCli) -> &Path {
         match provider {
             FirstPartyCli::Codex => &fixture.codex,
             FirstPartyCli::Claude => &fixture.claude,
@@ -461,7 +550,7 @@ mod tests {
             FirstPartyCli::Pi => &fixture.pi,
         }
     }
-    const PROVIDERS: [FirstPartyCli; 4] = [
+    pub(super) const PROVIDERS: [FirstPartyCli; 4] = [
         FirstPartyCli::Codex,
         FirstPartyCli::Claude,
         FirstPartyCli::Agy,

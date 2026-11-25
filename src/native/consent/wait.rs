@@ -196,7 +196,11 @@ mod tests {
     fn native_trust_cross_accepts_registered_markers_only_with_authorization() {
         let (_temp, workspace, fixture) = setup();
         let (_root, directory) = session(&workspace, "awaiting-initial-input");
-        for marker in ["codex-config-override", "pi-approve-once"] {
+        for marker in [
+            "codex-config-override",
+            "pi-approve-once",
+            "agy-settings-override",
+        ] {
             write_json_atomic(
                 &directory.join(SESSION_FILE),
                 &serde_json::json!({"applied": marker}),

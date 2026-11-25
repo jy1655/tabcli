@@ -14,14 +14,34 @@
   lost paste because the paste caused it, and it never comes in a workspace trusted before
   launch (reproduced on demand 2026-10-01, Agy 1.2.14, macOS; more than 100 logs, no
   counterexample).
-- Never paste without both trust facts: Agy's store lists the exact workspace, and this
-  session's own `agy.log` shows the workspace customization load, a `hooks_manager.go`
+- With verified consent (exact or inherited, see the Trust Store Boundary) and a recorded
+  Agy version of at least 1.5.17, the launch hands Agy the exact workspace through its own
+  `--settings` ("Settings for this session only, never saved"): a private
+  `agy-settings.json` in the session directory holding `{"trustedWorkspaces":[<native
+  key>]}`, then the applied marker `agy-settings-override`. A file, not inline JSON, so
+  that no quote reaches a Windows command shim; the argument is a path like `--log-file`.
+  No key is sent and no store is written, so every Surface on every OS takes it. Measured
+  on macOS with Agy 1.5.17 (2026-11-26, an empty folder no store lists): no dialog, the
+  prompt answered, a `hooks_manager.go` line off the main goroutine, and Agy's
+  `settings.json` byte-identical before and after, inline or as a file. The 1.5.8
+  changelog already names `--settings`, but older versions were not measured with
+  `trustedWorkspaces`, and an Agy without the option fails on it: below 1.5.17 the launch
+  is the earlier one, and exact consent is answered at the dialog as before. Not measured:
+  Windows, Linux, and whether a later settings write in the process (a `/model` change)
+  can save the setting. Delete the file when Agy offers a trust option of its own.
+- Never paste without both trust facts: Agy was told to trust the exact workspace (its
+  store lists it, or this session's consent record carries `agy-settings-override`), and
+  this session's own `agy.log` shows the workspace customization load, a `hooks_manager.go`
   line from a goroutine other than the main one. The store is shared by every Agy
   process, so a dialog approved in one session leaves another session's dialog open; the
   log line is per process and appears at startup in a workspace trusted before launch or
-  when the dialog is approved in that session. The macOS follow-up and the native Windows
-  initial paste wait for both and fail `not_sent` at the deadline. Do not put a time
-  window in their place, and do not answer the dialog without verified consent.
+  when the dialog is approved in that session. The setting is TAB's configuration, not
+  evidence: an Agy that ignores it logs no such line and gets no paste. The macOS
+  follow-up and the native Windows initial paste wait for both and fail `not_sent` at the
+  deadline. Do not put a time window in their place, and do not answer the dialog without
+  verified exact consent. An earlier binary (0.4.49) requires the store entry, so after a
+  downgrade a session launched with the setting refuses every paste; close it and start
+  a new one.
 - A log without that line withholds the paste but does not prove an open dialog: the log
   can be missing, or cut before the line, in a session that has none. Report what was
   read (the session's trust is unverified) and keep the recovery conditional on what the

@@ -44,16 +44,31 @@ owner, and provider that supplied the decision. Consent does not extend to paren
 directories, and a symlink alias cannot supply fresh consent. If the original provider removes
 its decision, TAB does not silently choose another provider as the source.
 
-With verified existing consent, TAB can answer Claude or Agy startup trust dialogs once in
-iTerm2, Terminal.app, and the native Windows console; see
+Git worktrees are the one exception, for every provider. When no provider trusts a directory
+exactly, and Git's own files prove that it is a linked worktree of a repository whose main
+working tree a provider trusts exactly, TAB reuses that decision for the worktree; Codex does the
+same by itself. TAB reads those files without running `git` and checks the registration in both
+directions. A path through a symbolic link, a submodule, a bare repository, a main working tree
+moved by `core.worktree`, and worktrees registered with relative paths do not count. The record
+then also names the main working tree (`repository_root`), and every later use checks its
+identity and the registration again. Anyone who can write that repository's `.git` directory can
+register a worktree, whose files are then trusted like any commit checked out in the main working
+tree. A cloned or fetched repository cannot register a worktree by itself.
+
+TAB never writes a provider trust store. With verified consent, Codex receives a process-local
+configuration override, Pi receives its one-run approval option, and Agy 1.5.17 or newer receives
+a settings file for that session only (`--settings`, never saved by Agy), so Agy shows no trust
+dialog in any terminal and no key is sent. Without such an option, and only with exact consent,
+TAB can answer Claude's startup trust dialog, or that of an Agy older than 1.5.17, once in
+iTerm2, Terminal.app, and the native Windows console; the provider saves the decision after the
+guarded response. See
 [terminal requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts)
 for the terminal-specific limits.
 
 Before responding, TAB checks that it owns the surface and checks the captured screen again.
-It then checks that the provider saved its decision. Without verified consent, the dialog stays
-for you to answer. TAB never writes a provider trust store directly; the provider saves the
-decision after the guarded response. Codex instead receives a process-local configuration
-override, and Pi receives its one-run approval option.
+It then checks that the provider saved its decision. TAB never answers a dialog for consent that
+a worktree inherits, because the provider would then save the worktree as trusted. Without
+verified consent, the dialog stays for you to answer.
 
 To see the recorded source for a workspace, run:
 
@@ -84,9 +99,11 @@ Some initial prompts wait rather than risk typing a submission key onto a trust 
 
 - Codex on native Windows waits for exact trust, verified shared consent, or its empty composer.
   An empty screen or missing dialog text is not enough.
-- Agy on native Windows waits for its exact trust entry and this session's customization-load
-  log entry, then startup readiness. On macOS its initial prompt is an argument and can run
-  behind the dialog; follow-ups wait for the trust and log evidence before input.
+- Agy on native Windows waits for its exact trust entry, or the session-only setting TAB passed
+  at launch, and this session's customization-load log entry, then startup readiness. On macOS
+  its initial prompt is an argument and can run behind the dialog; follow-ups wait for the same
+  trust and log evidence before input. The setting alone is not enough: if Agy ignored it, the
+  log entry is missing and nothing is pasted.
 - Pi on native Windows waits for the current turn's startup event after the trust procedure.
   That event can follow a decline; it is not shared consent.
 - Claude on native Windows delivers the initial prompt through official cross-session messaging
@@ -115,7 +132,7 @@ The code uses `HOME` first, then `USERPROFILE`, on both platforms. The override 
 entire root. `settings.json` in that root holds TAB's surface-creation preferences.
 
 Inside a session directory, these are the records most useful when checking a request. Some
-exist only during a turn or after close; `agy.log` is specific to Agy.
+exist only during a turn or after close; `agy.log` and `agy-settings.json` are specific to Agy.
 
 ```text
 session-example/
@@ -130,6 +147,7 @@ session-example/
 ├── requests/              Receipts connecting requests to results
 ├── events/                Recorded turn results
 ├── agy.log                Agy readiness, input receipts, and errors
+├── agy-settings.json      Agy's session-only trust of the workspace, when applied
 └── closed.json            Recorded closed status
 ```
 

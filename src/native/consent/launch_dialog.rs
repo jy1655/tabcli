@@ -1,4 +1,4 @@
-use super::record::{applied, authorized_with};
+use super::record::{applied, authorized_with, observe};
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
@@ -208,6 +208,19 @@ impl LaunchDialog<'_> {
         } = self;
         require_launch_dialog_live(directory, false)?;
         if !authorized_with(directory, target, env)? {
+            return Ok(());
+        }
+        // No key for consent that the launch already applied through the provider's own
+        // process-local option (its applied marker): the provider was told to trust the
+        // workspace, and the adapter's input gate still waits for the provider's own evidence.
+        // Nor for consent inherited from a repository's main working tree: "Yes" would have the
+        // provider save the worktree as exact trust, and TAB writes no provider store.
+        let consent = observe(directory);
+        if consent.inherited()
+            || consent
+                .applied_marker()
+                .is_some_and(|marker| provider::launch_trust_markers().any(|m| m == marker))
+        {
             return Ok(());
         }
         let manifest = Reader::open_unchecked(directory).manifest()?;

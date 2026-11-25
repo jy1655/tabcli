@@ -859,7 +859,12 @@ mod tests {
                 Some("codex-config-override"),
             ),
             (FirstPartyCli::Claude, true, !cfg!(windows), None),
-            (FirstPartyCli::Agy, true, false, None),
+            (
+                FirstPartyCli::Agy,
+                true,
+                false,
+                Some("agy-settings-override"),
+            ),
             (FirstPartyCli::Pi, false, false, Some("pi-approve-once")),
         ] {
             assert_eq!(adapter(provider).applied_marker(), marker, "{provider:?}");

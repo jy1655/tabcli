@@ -268,7 +268,9 @@ fn probes_drop_caller_identities_and_keep_configuration() {
 }
 
 // The complete launch command for every policy combination and both platform branches:
-// policy, the private log file, and off Windows the correlated interactive prompt.
+// policy, the private log file, and off Windows the correlated interactive prompt. Without
+// consent (the production gate, which finds no consent record) the command is the one every
+// earlier release built, and no settings file or applied marker is written.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
     for windows in [false, true] {
@@ -294,10 +296,18 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                             effort,
                         },
                         windows,
+                        crate::native::consent::authorized,
                     )
                     .unwrap();
                     let label =
                         format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
+                    assert!(!directory.join(SESSION_SETTINGS_FILE).exists(), "{label}");
+                    assert!(
+                        crate::native::consent::observe(&directory)
+                            .value()
+                            .is_null(),
+                        "{label}"
+                    );
                     let pending = read_pending_turn(&directory).unwrap().unwrap();
                     assert_eq!(
                         pending.claim_token,
@@ -374,6 +384,7 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
             effort: None,
         },
         false,
+        crate::native::consent::authorized,
     )
     .unwrap();
     assert_eq!(
@@ -397,4 +408,169 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
         )),
         "{error:#}"
     );
+}
+
+// A session directory with its manifest and claim, in a state root of its own, for a launch
+// in `workspace` by the recorded Agy `version`.
+fn consented_launch_session(root: &Path, workspace: &Path, version: &str) -> std::path::PathBuf {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "agy".to_owned(),
+            provider_path: "agy".into(),
+            provider_version: version.to_owned(),
+            workspace: workspace.to_owned(),
+            title: "Agy test".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    session_turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    directory
+}
+
+// With consent, an Agy that takes the session-only settings gets the exact workspace in a
+// private settings file of the session, named by `--settings` before the log file, on both
+// platforms and whatever the bypass; the applied marker follows the file. An older or
+// unreadable version, like no consent, launches as before and writes neither.
+#[test]
+fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
+    for (version, applies) in [
+        ("1.5.17", true),
+        ("1.6.0", true),
+        ("agy 2.0.1", true),
+        ("1.5.16", false),
+        ("1.5.17-rc.1", false),
+        ("unknown", false),
+    ] {
+        for windows in [false, true] {
+            for yolo in [false, true] {
+                let label = format!("version={version} windows={windows} yolo={yolo}");
+                let home = tempfile::tempdir().unwrap();
+                let root = home.path().canonicalize().unwrap();
+                // Characters that a command shim would interpret: none reaches an argument.
+                let workspace = root.join("work 'q' ü & %PATH% $HOME ^");
+                std::fs::create_dir(&workspace).unwrap();
+                let directory = consented_launch_session(&root, &workspace, version);
+                crate::native::consent::prepare_at_home(&directory, &workspace, &root).unwrap();
+                let plan = prepare_launch_for_platform(
+                    LaunchContext {
+                        bridge_executable: Path::new("/opt/agent-bridge"),
+                        directory: &directory,
+                        workspace: &workspace,
+                        title: "Agy test",
+                        prompt: "agy prompt",
+                        yolo,
+                        model: None,
+                        effort: None,
+                    },
+                    windows,
+                    |_, _| Ok(true),
+                )
+                .unwrap();
+                let settings = directory.join(SESSION_SETTINGS_FILE);
+                let mut expected = agy_policy(yolo, None, None);
+                if applies {
+                    expected.extend([
+                        OsString::from("--settings"),
+                        settings.clone().into_os_string(),
+                    ]);
+                }
+                expected.extend([
+                    OsString::from("--log-file"),
+                    directory.join(AGY_LOG_FILE).into_os_string(),
+                ]);
+                assert_eq!(plan.arguments[..expected.len()], expected[..], "{label}");
+                let observed = crate::native::consent::observe(&directory);
+                if applies {
+                    let written: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+                    assert_eq!(
+                        written,
+                        serde_json::json!({
+                            "trustedWorkspaces": [crate::native::consent::native_key(&workspace).unwrap()]
+                        }),
+                        "{label}"
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(
+                            std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+                            0o600,
+                            "{label}"
+                        );
+                    }
+                    assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
+                    assert!(session_settings_applied(&directory), "{label}");
+                } else {
+                    assert!(!settings.exists(), "{label}");
+                    assert_eq!(observed.applied_marker(), None, "{label}");
+                    assert!(!session_settings_applied(&directory), "{label}");
+                }
+                // No provider store was created or written under this home.
+                assert!(!root.join(".gemini").exists(), "{label}");
+            }
+        }
+    }
+    // A consent gate that refuses, or fails, writes nothing and adds no option.
+    for gate in [
+        (|_, _| Ok(false)) as fn(&Path, FirstPartyCli) -> Result<bool>,
+        |_, _| Err(anyhow::anyhow!("consent unreadable")),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let directory = consented_launch_session(&root, &root, "1.5.17");
+        crate::native::consent::prepare_at_home(&directory, &root, &root).unwrap();
+        let context = LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &root,
+            title: "Agy test",
+            prompt: "agy prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+        };
+        match prepare_launch_for_platform(context, false, gate) {
+            Ok(plan) => assert!(!plan.arguments.contains(&OsString::from("--settings"))),
+            Err(error) => assert_eq!(error.to_string(), "consent unreadable"),
+        }
+        assert!(!directory.join(SESSION_SETTINGS_FILE).exists());
+        assert_eq!(
+            crate::native::consent::observe(&directory).applied_marker(),
+            None
+        );
+    }
+}
+
+#[test]
+fn the_session_settings_floor_is_the_measured_version() {
+    assert_eq!(SESSION_SETTINGS_FLOOR, semver::Version::new(1, 5, 17));
+    assert_eq!(ADAPTER.applied_marker(), Some("agy-settings-override"));
+    for (version, supported) in [
+        ("1.5.17", true),
+        ("v1.5.17", true),
+        ("antigravity 1.5.18\n", true),
+        ("1.5.16", false),
+        ("1.1.12", false),
+        ("", false),
+    ] {
+        assert_eq!(
+            session_settings_supported(version),
+            supported,
+            "{version:?}"
+        );
+    }
 }

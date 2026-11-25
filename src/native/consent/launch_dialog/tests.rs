@@ -615,6 +615,90 @@ fn the_policy_settle_window_holds_the_response() {
     );
 }
 
+// A launching session whose consent is inherited: its workspace is a verified linked worktree
+// of a repository whose main working tree Pi trusts exactly.
+fn inherited(provider: FirstPartyCli, yolo: bool) -> Consented {
+    let (home, _, stores) = setup();
+    let fixture = super::super::worktree::tests::registered(&home.path().canonicalize().unwrap());
+    trust_pi(&stores, &fixture.repository);
+    let (root, directory) = session(&fixture.worktree, "launching");
+    let assessment = assess_with(root.path(), &fixture.worktree, &stores.env).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert!(assessment.repository_root.is_some());
+    record(&directory, &assessment).unwrap();
+    let mut manifest = Reader::open_unchecked(&directory).manifest().unwrap();
+    manifest.provider = provider.as_str().into();
+    manifest.yolo = yolo;
+    write_json_atomic(&directory.join("manifest.json"), &manifest).unwrap();
+    Consented {
+        _home: home,
+        _root: root,
+        directory,
+        workspace: fixture.worktree,
+        stores,
+    }
+}
+
+// Consent that the launch already applied through the provider's own option, and consent
+// inherited from a repository's main working tree, take no key on any surface: neither the
+// policy, the manifest, the store nor the surface is consulted. Before, a verified Agy launch
+// on a surface without a guarded key (Herdr, tmux, WezTerm) failed with the unguarded refusal,
+// and on one whose screen cannot be read (Ghostty, Warp) at the screen read.
+#[test]
+fn applied_or_inherited_consent_takes_no_key() {
+    for target in [FirstPartyCli::Claude, FirstPartyCli::Agy] {
+        for yolo in [false, true] {
+            let label = format!("{target:?} yolo={yolo}");
+            let c = consented(target, yolo);
+            super::super::record::applied(&c.directory, "agy-settings-override").unwrap();
+            replace_private(&c.directory.join("manifest.json"), b"{");
+            let policy = FakePolicy::with_start(&[Ok(ProviderStart::NotStarted)]);
+            let mut clock = FakeClock::new(Instant::now());
+            c.complete(
+                target,
+                LaunchDialogSupport::Answered(&policy),
+                &mut clock,
+                &mut Untouched,
+            )
+            .unwrap();
+            assert!(policy.received.borrow().is_empty(), "{label}");
+            assert_eq!(policy.start_reads.get(), 0, "{label}");
+            assert_eq!(clock.slept, Duration::ZERO, "{label}");
+            assert_eq!(
+                observe(&c.directory).applied_marker(),
+                Some("agy-settings-override"),
+                "{label}"
+            );
+
+            let c = inherited(target, yolo);
+            let consent = fs::read(c.directory.join(SESSION_FILE)).unwrap();
+            let store = fs::read(&c.stores.pi).unwrap();
+            for support in [
+                LaunchDialogSupport::Answered(&policy),
+                provider::launch_dialog(target),
+            ] {
+                c.complete(
+                    target,
+                    support,
+                    &mut FakeClock::new(Instant::now()),
+                    &mut Untouched,
+                )
+                .unwrap();
+            }
+            assert!(policy.received.borrow().is_empty(), "{label}");
+            assert_eq!(
+                fs::read(c.directory.join(SESSION_FILE)).unwrap(),
+                consent,
+                "{label}"
+            );
+            assert_eq!(fs::read(&c.stores.pi).unwrap(), store, "{label}");
+            for store in [&c.stores.codex, &c.stores.claude, &c.stores.agy] {
+                assert!(!store.exists(), "{label}: {}", store.display());
+            }
+        }
+    }
+}
+
 // Agy's own policy has no start signal: under `--yolo` its dialog is checked and answered
 // as without bypass, and a surface without a guarded key refuses it in the loop.
 #[test]

@@ -2,7 +2,7 @@ use super::delivery::read_log_bytes;
 use super::log::{complete_log_lines, glog_timestamp};
 use super::{
     ADAPTER, AGY_LOG_FILE, HOOKS_LOADED_SOURCE, STARTUP_POLL_INTERVAL, TRUST_RECOVERY,
-    TRUST_STORE_MISSING,
+    TRUST_STORE_MISSING, session_settings_applied,
 };
 use crate::native::clock::Clock;
 use crate::native::consent::{self, TrustReadiness};
@@ -12,10 +12,13 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::Instant;
 
-// Require exact stored trust and this process's non-main hooks load; shared trust alone is insufficient.
-// A missing line does not prove a dialog; see docs/verification/2026-10-01-bug-triage.md.
+// Require exact stored trust, or this session's own session-only setting, and this process's
+// non-main hooks load; shared trust alone is insufficient, and so is the setting alone. A
+// missing line does not prove a dialog; see docs/verification/2026-10-01-bug-triage.md.
 
 const TRUST_SESSION_UNVERIFIED: &str = "Agy's trust store lists the workspace, but this session's agy.log does not show that this session loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so its own trust dialog may still be open";
+
+pub(super) const TRUST_SETTING_UNVERIFIED: &str = "This session was launched with Agy's session-only setting that trusts the exact workspace, but its agy.log does not show that it loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so Agy may not have taken the setting and its trust dialog may be open";
 
 pub(super) fn workspace_customizations_loaded(log: &[u8]) -> bool {
     complete_log_lines(log).any(|line| {
@@ -72,22 +75,36 @@ fn wait_for_workspace_trust_evidence<C: Clock>(
     )
 }
 
+// The first trust fact is that Agy was told to trust the exact workspace: its own store lists
+// it, or this session's launch handed it over in Agy's session-only settings (then the shared
+// store is not read). The second is always this process's own log line.
 pub(super) fn workspace_trust_missing(
     workspace: &Path,
     env: &consent::Environment,
-    log_path: &Path,
+    directory: &Path,
 ) -> Result<Option<&'static str>> {
     use consent::Trust;
-    if !matches!(
-        ADAPTER.workspace_trust(workspace, env, None)?,
-        Trust::Trusted(_)
-    ) {
+    let configured = session_settings_applied(directory);
+    if !configured
+        && !matches!(
+            ADAPTER.workspace_trust(workspace, env, None)?,
+            Trust::Trusted(_)
+        )
+    {
         return Ok(Some(TRUST_STORE_MISSING));
     }
-    let loaded = read_log_bytes(log_path)?
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
+    let loaded = read_log_bytes(&log_path)?
         .as_deref()
         .is_some_and(workspace_customizations_loaded);
-    Ok((!loaded).then_some(TRUST_SESSION_UNVERIFIED))
+    Ok((!loaded).then_some(if configured {
+        TRUST_SETTING_UNVERIFIED
+    } else {
+        TRUST_SESSION_UNVERIFIED
+    }))
 }
 
 // The gate takes the caller's environment once per delivery; the user home is required
@@ -100,12 +117,8 @@ pub(super) fn wait_for_workspace_trust<C: Clock>(
 ) -> Result<()> {
     let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
     consent::user_home(env)?;
-    let log_path = Reader::open_unchecked(directory)
-        .private(AGY_LOG_FILE)
-        .path()
-        .to_owned();
     wait_for_workspace_trust_evidence(directory, deadline, clock, &mut || {
-        workspace_trust_missing(&workspace, env, &log_path)
+        workspace_trust_missing(&workspace, env, directory)
     })
 }
 

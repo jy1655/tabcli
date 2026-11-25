@@ -4,17 +4,18 @@ mod launch_dialog;
 mod record;
 mod store;
 mod wait;
+mod worktree;
 
 pub(in crate::native) use launch_dialog::{
     Bypass, BypassStart, LaunchDialogAnswerer, LaunchDialogPolicy, LaunchDialogSupport,
     LaunchFacts, ProviderStart, complete_launch,
 };
-#[cfg(test)]
-pub(in crate::native) use record::prepare;
 pub(in crate::native) use record::{
     Assessment, ConsentState, SessionConsentObservation, applied, assess, authorized, observe,
     record, run,
 };
+#[cfg(test)]
+pub(in crate::native) use record::{prepare, prepare_at_home};
 #[cfg(windows)]
 pub(in crate::native) use store::windows_directory_is_private;
 pub(in crate::native) use store::{

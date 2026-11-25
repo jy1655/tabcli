@@ -540,7 +540,12 @@ Support needs an official way to interrupt this running interactive session from
 Agy's submission evidence is its receipt; it does not use Codex's composer protocol.
 
 Install and sign in to `agy` (Antigravity CLI) 1.1.12 or newer. Trust the exact project directory
-in Agy before launching it through TAB.
+in Agy before launching it through TAB, or rely on
+[shared workspace consent](security-and-data.md#workspace-trust-and-consent): with Agy 1.5.17 or
+newer, a directory another provider trusts exactly, or a git worktree of a repository whose main
+working tree a provider trusts, is handed to Agy in a settings file for that session only
+(`--settings`). Agy then shows no trust dialog in any terminal, and its own trust store is left
+unchanged. Older versions launch without it and keep the dialog.
 
 On macOS and Linux, TAB passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
 behind its workspace-trust dialog, so receiving the first result does not prove it is ready for
@@ -553,8 +558,10 @@ follow-ups take a fresh log offset before delivery rather than repeating those r
 Every paste requires a matching input receipt afterward.
 
 The Windows initial paste and macOS follow-ups also require Agy's trust entry for the exact
-workspace and a log entry showing that this session loaded the workspace customizations.
-Trusting the directory in another Agy session does not establish that this session is ready.
+workspace, or the session-only setting above, and a log entry showing that this session loaded
+the workspace customizations. Trusting the directory in another Agy session does not establish
+that this session is ready, and neither does the setting alone: an Agy that ignored it shows its
+dialog and logs no such entry.
 
 If TAB says the session's trust is unverified, no prompt was pasted. Look at the managed
 surface: approve a trust dialog if one is there and you trust the directory. After resolving it,

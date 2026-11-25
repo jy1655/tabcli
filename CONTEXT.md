@@ -305,9 +305,17 @@ A provider's own recorded consent to work in an exact workspace, read from a sto
 user can change.
 _Avoid_: approval, permission (TAB's own permission mode is a different axis)
 
+**Inherited consent**:
+Consent for a linked git worktree that no provider trusts exactly, taken from the exact
+Workspace trust of its repository's main working tree once Git's own files prove the
+registration in both directions. It is rechecked like any consent and never answered with a
+dialog key.
+_Avoid_: parent trust, repository trust (a parent directory never supplies consent)
+
 **Launch dialog**:
 The dialog a provider shows at startup, asking whether to trust the workspace. TAB answers
-it at most once with a guarded key, and only for a launch whose Workspace trust consent is
-verified; which screens count and what the provider's bypass option changes is each provider
-adapter's own policy.
+it at most once with a guarded key, and only for a launch whose consent is verified exact
+Workspace trust that the launch did not already apply through the provider's own
+process-local option; which screens count and what the provider's bypass option changes is
+each provider adapter's own policy.
 _Avoid_: trust prompt, popup, permission dialog (a tool-permission dialog is never answered)
