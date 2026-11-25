@@ -7,7 +7,7 @@ use crate::native::process_identity::{Gone, ProcessObservation};
 use crate::native::session::Store;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 use crate::native::session::{self, CoreRecord, SessionState};
-use crate::native::terminal::close_authority::Production;
+use crate::native::terminal::close_authority::{CloseObservation, Production};
 use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::terminal::posix::{self, PosixTerminalAdapter};
 
@@ -53,6 +53,22 @@ struct Fixture {
     _root: tempfile::TempDir,
     directory: PathBuf,
     core: FakeCore,
+}
+
+#[test]
+#[should_panic(expected = "scripted Herdr dead-owner Close cannot verify live ownership")]
+fn scripted_dead_owner_close_refuses_the_installed_ownership_probe() {
+    let fixture = Fixture::new();
+    // A foreign binding makes the old ownership probe return before contacting any core.
+    let surface = fixture
+        .store()
+        .terminal()
+        .unwrap()
+        .with_binding(Some("session-foreign".into()));
+    let adapters = Adapter::with_core(fixture.core.clone());
+    let observation = Production::new(&fixture.directory, SESSION, &surface, later())
+        .with_posix_dead_owner_observations(&adapters, &|_| gone(Gone::Exited), &|_| false);
+    let _ = observation.ownership_proof();
 }
 
 impl Fixture {

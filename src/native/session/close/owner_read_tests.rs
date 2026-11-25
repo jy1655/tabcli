@@ -82,6 +82,39 @@ fn repair_parity_helper_refuses_a_surface_after_the_owner_exits() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn repair_parity_helper_retains_a_close_intent_without_a_surface() {
+    use crate::native::process_identity::Gone;
+    use crate::native::session::owner::ControlAttestation;
+
+    let directory = tempfile::tempdir().unwrap();
+    write_owned_terminal_state(directory.path(), "working", std::process::id());
+    let store = Store::open_unchecked(directory.path());
+    let owner = store.owner().unwrap();
+    record_terminal_close_intent(
+        &store,
+        owner.managed_session_id.as_deref().unwrap(),
+        &store.terminal().unwrap(),
+        &owner,
+    )
+    .unwrap();
+    store.record(CoreRecord::Terminal).remove().unwrap();
+    let intent = store.record(CoreRecord::TerminalCloseIntent);
+    let before = intent.bytes().unwrap();
+    assert!(before.is_some());
+    let repaired = repair_dead_owner_attested_with(&store, |_| OwnerAttestation {
+        process: ProcessObservation::Gone(Gone::Exited),
+        control: ControlAttestation::NotRecorded,
+        pid_alive: Some(false),
+    })
+    .unwrap();
+    assert!(!repaired);
+    assert_eq!(intent.bytes().unwrap(), before);
+    assert_eq!(store.status().unwrap().state, SessionState::Working);
+    assert!(store.closed_if_present().unwrap().is_none());
+}
+
 // Prune is blocked by any owner it cannot show gone: an unreadable record blocks it.
 #[test]
 fn prune_owner_read_answers_for_each_damaged_shape() {

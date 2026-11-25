@@ -116,6 +116,14 @@ impl<'a> RepairSurfaces<'a> {
             #[cfg(test)]
             Self::WithoutSurface => {
                 use crate::native::session::CoreRecord;
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if reader
+                    .record(CoreRecord::TerminalCloseIntent)
+                    .bytes()?
+                    .is_some()
+                {
+                    return Ok(RepairSurface::Retain);
+                }
                 for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
                     if reader.record(record).present()? {
                         bail!("a parity row records no surface");

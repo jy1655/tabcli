@@ -820,7 +820,8 @@ fn repair_dead_owner_attested_until(
     }
 }
 
-/// Repair parity for fixtures that record no surface. A surface at settlement is an error.
+/// Repair parity for fixtures that record no surface. POSIX close intents are retained,
+/// and a surface at settlement is an error.
 #[cfg(test)]
 pub(in crate::native) fn repair_dead_owner_attested_with(
     store: &Store,

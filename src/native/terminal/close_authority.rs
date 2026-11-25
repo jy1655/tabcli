@@ -117,6 +117,8 @@ pub(in crate::native) struct Production<'a> {
     observe_owner: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pid_is_alive: &'a dyn Fn(u32) -> bool,
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    scripted_dead_owner: bool,
 }
 
 impl<'a> Production<'a> {
@@ -137,6 +139,8 @@ impl<'a> Production<'a> {
             observe_owner: &attest_owner,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             pid_is_alive: &process_is_alive,
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            scripted_dead_owner: false,
         }
     }
 
@@ -147,10 +151,21 @@ impl<'a> Production<'a> {
         observe: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
         pid_is_alive: &'a dyn Fn(u32) -> bool,
     ) -> Self {
+        // Herdr's presence evidence does not probe an app or host incarnation.
+        assert_eq!(self.session.kind, terminal::TerminalKind::Herdr);
         self.posix_adapters = adapters;
         self.observe_owner = observe;
         self.pid_is_alive = pid_is_alive;
+        self.scripted_dead_owner = true;
         self
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    fn require_installed_observation(&self, operation: &str) {
+        assert!(
+            !self.scripted_dead_owner,
+            "scripted Herdr dead-owner Close cannot {operation}"
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -200,6 +215,16 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn resumable(&self) -> Result<bool> {
+        #[cfg(test)]
+        if self.scripted_dead_owner {
+            // Keep the Record reads. Refuse before an exact intent can inspect a real owner.
+            return session::close::terminal_close_resumable_with(
+                &self.reader(),
+                self.session,
+                terminal::surface_outlives_owner(self.session),
+                |_| panic!("scripted Herdr dead-owner Close cannot attest a resumable Close"),
+            );
+        }
         session::close::terminal_close_resumable(
             &self.reader(),
             self.session,
@@ -221,6 +246,8 @@ impl CloseObservation for Production<'_> {
     }
 
     fn ownership_proof(&self) -> Result<()> {
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        self.require_installed_observation("verify live ownership");
         verify_terminal_surface_ownership_with_timeout(
             self.directory,
             self.expected_session_id,
@@ -249,12 +276,16 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn attest_owner(&self) -> Result<()> {
+        #[cfg(test)]
+        self.require_installed_observation("verify the live owner");
         verified_posix_terminal_owner(self.directory, self.expected_session_id, self.session, None)
             .map(|_| ())
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn group_gone(&self, group: u32) -> Result<bool> {
+        #[cfg(test)]
+        self.require_installed_observation("probe the owner's process group");
         owner_group_gone(group)
     }
 
@@ -491,6 +522,8 @@ impl Production<'_> {
         close_owned_surface_with(
             || decide(self, id, session, deadline),
             || {
+                #[cfg(test)]
+                self.require_installed_observation("tear down the owner");
                 teardown_absent_owner_with(
                     &Store::open_unchecked(directory),
                     id,
