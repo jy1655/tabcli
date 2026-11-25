@@ -143,18 +143,17 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
 }
 
 // The Herdr gate's reading of text without the label, one word or more (owner's decisions
-// 4B and B2, 2026-11-26), and the one place of that rule. Every word is read as 0.4.48 read
-// words (`word_version`: `OpenAI Codex (v0.170.0)` and `(0.170.0)` are 0.170.0), and the text
-// names a version only when exactly one word reads as one. With none it is refused; with two
-// or more it is refused as ambiguous, because another program's version can come first
-// (`node v22.0.0` on a line before Codex's own) and a misread version could let a Codex that
-// lacks `--no-daemon` start on Herdr, where a detached `ask` can already have reported the
-// request accepted. Words are counted, not versions: the owner's rule accepts one
-// version-shaped word, so the same version printed twice is refused too.
+// 4B and B2, 2026-11-26), and the one place of that rule. Every word is read by
+// `herdr_word_version`, and the text names a version only when exactly one word reads as one.
+// With none it is refused; with two or more it is refused as ambiguous, because another
+// program's version can come first (`node v22.0.0` on a line before Codex's own) and a misread
+// version could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
+// already have reported the request accepted. Words are counted, not versions: the owner's
+// rule accepts one version-shaped word, so the same version printed twice is refused too.
 fn unlabelled_codex_version(output: &str) -> Result<Version> {
     let versions = output
         .split_whitespace()
-        .filter_map(word_version)
+        .filter_map(herdr_word_version)
         .collect::<Vec<_>>();
     match versions.as_slice() {
         [version] => Ok(version.clone()),
@@ -169,6 +168,26 @@ fn unlabelled_codex_version(output: &str) -> Result<Version> {
                 .join(", ")
         ),
     }
+}
+
+// One unlabelled word as a version, the first of three readings that parses (each after one
+// leading `v`): the word without the surrounding characters that no SemVer contains (anything
+// but letters, digits, `.`, `-` and `+`), which keeps a prerelease (`0.170.0--` and
+// `(0.170.0--)` are the prerelease `-`); then the word as 0.4.48 read it, with all surrounding
+// punctuation removed (`0.170.0+` and `0.170.0.` are 0.170.0), unless that removes a `-` after
+// the version, which would turn a prerelease into a release (`0.170.0-` reads as none).
+fn herdr_word_version(word: &str) -> Option<Version> {
+    let parse = |text: &str| Version::parse(text.strip_prefix('v').unwrap_or(text)).ok();
+    let semver = word.trim_matches(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
+    });
+    parse(semver).or_else(|| {
+        let kept = semver.trim_end_matches(|character: char| !character.is_ascii_alphanumeric());
+        if semver[kept.len()..].contains('-') {
+            return None;
+        }
+        word_version(word)
+    })
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.

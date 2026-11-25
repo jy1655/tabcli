@@ -604,10 +604,12 @@ mod released {
 //   warning line, a timestamp on the label's line, a timestamped warning line, another
 //   program's version or a prerelease on its own line) and whatever follows the field
 //   (nothing, another version on its line, another version line);
-// - label absent: each word is read as the launch check of 0.4.48 read it (surrounding
-//   punctuation and one leading `v` removed), and the text names a version only when exactly
-//   one of its words reads as one; two or more such words, the same version twice included,
-//   are refused as ambiguous, and none is refused (owner's decisions 4B and B2, 2026-11-26);
+// - label absent: each word is read by `herdr_word_version` (SemVer once surrounding
+//   characters no SemVer has are removed, which keeps a prerelease; otherwise as the launch
+//   check of 0.4.48 read it, unless that drops a prerelease's `-`), and the text names a
+//   version only when exactly one of its words reads as one; two or more such words, the same
+//   version twice included, are refused as ambiguous, and none is refused (owner's decisions
+//   4B and B2, 2026-11-26);
 // - label layout: a second label, or a label without a field on its line, refuses.
 #[test]
 fn herdr_version_grammar_reads_only_the_labelled_field() {
@@ -661,22 +663,25 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         }
     };
 
-    // The field; whether Herdr admits it read whole after the label; and how the word reading
-    // of 0.4.48, which removes surrounding punctuation, takes it: a version Herdr admits, one
-    // it refuses, or not a version at all (`None`).
+    // The field; whether Herdr admits it read whole after the label; and how the unlabelled
+    // word reading takes it (as written, then without surrounding characters no SemVer has,
+    // then as 0.4.48 trimmed it unless that drops the `-` of a prerelease): a version Herdr
+    // admits, one it refuses, or not a version at all (`None`).
     let fields = [
-        ("0.169.0", true, Some(true)),           // stable, at the floor
-        ("0.170.0", true, Some(true)),           // stable, above the floor
-        ("v0.170.0", true, Some(true)),          // with the optional `v`
-        ("0.170.0+build.1", true, Some(true)),   // build metadata is not a prerelease
-        ("0.168.0", false, Some(false)),         // below the floor
-        ("0.170.0-alpha.1", false, Some(false)), // prerelease
-        ("0.170.0--", false, Some(true)),        // prerelease `-`; 0.4.48 trims it to 0.170.0
-        ("0.170.0+", false, Some(true)),         // malformed: empty build metadata
-        ("0.170.0.", false, Some(true)),         // malformed: trailing punctuation is kept
-        ("0.170.0-01", false, None),             // malformed: leading zero in a prerelease
-        ("(0.170.0)", false, Some(true)),        // malformed: brackets are kept
-        ("unknown", false, None),                // not a version
+        ("0.169.0", true, Some(true)),            // stable, at the floor
+        ("0.170.0", true, Some(true)),            // stable, above the floor
+        ("v0.170.0", true, Some(true)),           // with the optional `v`
+        ("0.170.0+build.1", true, Some(true)),    // build metadata is not a prerelease
+        ("0.168.0", false, Some(false)),          // below the floor
+        ("0.170.0-alpha.1", false, Some(false)),  // prerelease
+        ("0.170.0--", false, Some(false)),        // prerelease `-`, kept as written
+        ("0.170.0-", false, None),                // malformed: its `-` names no prerelease
+        ("0.170.0-alpha.1.", false, Some(false)), // malformed: trimmed, still a prerelease
+        ("0.170.0+", false, Some(true)),          // malformed: empty build metadata
+        ("0.170.0.", false, Some(true)),          // malformed: trailing punctuation is kept
+        ("0.170.0-01", false, None),              // malformed: leading zero in a prerelease
+        ("(0.170.0)", false, Some(true)),         // malformed: brackets are kept
+        ("unknown", false, None),                 // not a version
     ];
     let before = [
         "",
@@ -761,8 +766,9 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         launched
     };
     // Recorded by 0.4.48, whose wrapper admitted them: this build's wrapper launches the
-    // first group and refuses the second (a labelled field that is not SemVer as written,
-    // a label preceded by another version, unlabelled text with several versions).
+    // first group and refuses the second (a labelled field that is not SemVer as written, a
+    // label preceded by a higher version 0.4.48 read instead, unlabelled text with several
+    // versions, and a prerelease that 0.4.48's trimming read as a release).
     for (text, launched) in [
         ("(0.170.0)", true),
         ("0.170.0+", true),
@@ -771,6 +777,9 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         ("codex-cli 0.170.0+", false),
         ("node v22.0.0\ncodex-cli 0.168.0", false),
         ("node v22.0.0\nOpenAI Codex (v0.170.0)", false),
+        ("0.170.0--", false),
+        ("(0.170.0--)", false),
+        ("0.170.0-", false),
     ] {
         assert!(released::v0_4_48(text), "{text:?}");
         assert_eq!(launches(text), launched, "{text:?}");
@@ -789,6 +798,10 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         assert!(launches(text), "{text:?}");
         assert_eq!(released::v0_4_49(text), by_0_4_49, "{text:?}");
     }
+    // Refused by 0.4.48 and admitted by this build: a lower version before the label, which
+    // 0.4.48 read instead of the labelled one.
+    let text = "plugin 0.160.0\ncodex-cli 0.170.0";
+    assert!(!released::v0_4_48(text) && launches(text), "{text:?}");
     // Refused by every release.
     for text in ["codex-cli 0.168.0", "OpenAI Codex (v0.168.0)", "unknown"] {
         assert!(!launches(text), "{text:?}");
@@ -820,12 +833,20 @@ fn herdr_version_refusals_name_the_rule_that_refused() {
             "{text:?}: {error}"
         );
     }
-    // Unlabelled text, one word or more, names a version when exactly one word reads as one
-    // the way 0.4.48 read words; with none it is refused, with several it is ambiguous.
+    // Unlabelled text, one word or more, names a version when exactly one word reads as one;
+    // with none it is refused, with several it is ambiguous. A word that is SemVer as written,
+    // or once surrounding characters no SemVer has are removed, keeps its prerelease.
     for text in ["OpenAI Codex (v0.170.0)", "(0.170.0)", "0.170.0+"] {
         assert_eq!(
             herdr_codex_version(text).unwrap(),
             Version::new(0, 170, 0),
+            "{text}"
+        );
+    }
+    for text in ["0.170.0--", "(0.170.0--)", "OpenAI Codex (v0.170.0--)"] {
+        assert_eq!(
+            herdr_codex_version(text).unwrap().pre.as_str(),
+            "-",
             "{text}"
         );
     }
