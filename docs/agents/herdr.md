@@ -173,8 +173,9 @@
 - The PowerShell `attach_command` sets `HC_SOCKET` in its own script block and restores the
   earlier value (or its absence) in `finally`, so later commands keep their own core.
 - Windows tests: endpoint resolution, the shared framing, the adapters' surface answers and the
-  Windows lookup (its routing and declared refusals, over a recording console adapter and the
-  Herdr adapter on a scripted core) run on every platform; the pipe transport (a real pipe of
+  Windows lookup's routing and declared refusals over recording adapters run on every
+  platform; the lookup over the Herdr adapter on a scripted core runs on macOS, Linux and
+  Windows; the pipe transport (a real pipe of
   this user), process births, parents, tokens, the installed lookup against an absent pipe,
   the directory admission, the dead-owner repair, the attach line under PowerShell 7 and the
   binding wait run on the Windows CI runner. Live (reported by the

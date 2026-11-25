@@ -168,9 +168,10 @@ fn each_windows_kind_reaches_only_its_own_adapter() {
 }
 
 // A handle of a kind that Windows does not run (a record can name another platform) stays
-// with the managed console, as before the lookup: the console's open gets the asked kind to
-// refuse, and its helper refuses the handle (both pinned by the Windows tests). Only the
-// kind's declared screen and guarded-input refusals answer before it.
+// with the managed console, as before the lookup: the console's open gets the asked kind and
+// refuses it (a Windows test pins that refusal), and its helper refuses the handle (no test
+// runs the helper on such a handle). Only the kind's declared screen and guarded-input
+// refusals answer before it.
 #[test]
 fn every_other_kind_stays_with_the_managed_console() {
     for kind in TerminalKind::ALL {
