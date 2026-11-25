@@ -826,17 +826,16 @@ fn end_and_remove(
     }
 }
 
-/// Closes exactly the recorded terminal: absent only when its own core no longer holds it.
+/// Closes exactly the recorded terminal, proven by `requirement` at every read: absent only
+/// when its own core no longer holds it.
 fn close_until(
     core: &dyn Core,
     session: &TerminalSession,
-    directory: &Path,
+    requirement: Requirement<'_>,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     close_remaining(deadline)?;
-    let Some((recorded, mut linked)) =
-        Recorded::open(core, session, Requirement::Bound(directory), deadline)?
-    else {
+    let Some((recorded, mut linked)) = Recorded::open(core, session, requirement, deadline)? else {
         return Ok(CloseOutcome::Missing);
     };
     let same = |observed: &Observed| recorded.check(core, observed);
@@ -844,42 +843,19 @@ fn close_until(
     end_and_remove(core, &mut linked, &session.id, deadline, &same)
 }
 
-/// After the native-session owner's verified death: removes the recorded terminal only when
-/// its program has ended (the user closed its tab or pane, ran `hc kill`, or the program
-/// exited), with one `terminal.rm`. A running terminal is never ended here, and one that is
-/// kept or is not the terminal this session created is left alone with its handle retained.
-/// The core holding the address no more confirms the removal (addresses are not reused).
-#[cfg(unix)]
-fn remove_ended(
+/// After the native-session owner is verified gone, on every OS: ends the recorded terminal
+/// if it still runs (at most one `terminal.kill`) and removes it, once its creation record
+/// proves it is the terminal this session created: its core, address, creation time,
+/// program and launch label, and while it runs the program's birth. The owner record plays
+/// no part. A terminal set to keep, or one that is not this session's, is left alone with its
+/// handle retained; only `not_found` from its own core proves it gone.
+fn close_created(
     core: &dyn Core,
     session: &TerminalSession,
     directory: &Path,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    close_remaining(deadline)?;
-    let Some((_, mut linked)) =
-        Recorded::open(core, session, Requirement::Finished(directory), deadline)?
-    else {
-        return Ok(CloseOutcome::Missing);
-    };
-    let address = &session.id;
-    close_remaining(deadline)?;
-    match linked
-        .connection
-        .call("terminal.rm", json!({"terminal": address}), deadline)
-    {
-        Ok(_) => {}
-        Err(CallError::Refused { kind, .. }) if kind == "not_found" => {
-            return Ok(CloseOutcome::Missing);
-        }
-        Err(error) => return Err(error.into_error("terminal.rm")),
-    }
-    if get(&mut linked, address, deadline)?.is_some() {
-        bail!(
-            "Herdr terminal {address} is still held by its core after terminal.rm; the handle is retained"
-        );
-    }
-    Ok(CloseOutcome::Closed)
+    close_until(core, session, Requirement::Created(directory), deadline)
 }
 
 fn surface_present(
@@ -1095,7 +1071,7 @@ impl<C: Core> Adapter<C> {
             |startup_deadline| create(&self.core, command, directory, startup_deadline, deadline),
             |_, _| Ok(()),
             |session, deadline| {
-                close_until(&self.core, session, directory, deadline)
+                close_until(&self.core, session, Requirement::Bound(directory), deadline)
                     .map(|_| ())
                     .map_err(|error| {
                         retain_unremoved(
@@ -1153,7 +1129,16 @@ impl<C: Core> Adapter<C> {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_until(&self.core, session, directory, deadline)
+        close_until(&self.core, session, Requirement::Bound(directory), deadline)
+    }
+
+    pub(in crate::native::terminal) fn close_created(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_created(&self.core, session, directory, deadline)
     }
 }
 
@@ -1235,8 +1220,8 @@ mod posix_adapter {
             close: OwnedSurfaceClose,
             deadline: Instant,
         ) -> Result<CloseOutcome> {
-            if close == OwnedSurfaceClose::RemoveEnded {
-                return super::remove_ended(&self.core, session, directory, deadline);
+            if close == OwnedSurfaceClose::CreatedSurface {
+                return self.close_created(directory, session, deadline);
             }
             if close == OwnedSurfaceClose::LiveOwner {
                 record_live_owner_intent(directory, id, session, deadline)?;
@@ -1332,6 +1317,14 @@ mod windows_adapter {
             deadline: Instant,
         ) -> Result<CloseOutcome> {
             self.close(directory, session, deadline)
+        }
+        fn close_created_surface(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            deadline: Instant,
+        ) -> Result<CloseOutcome> {
+            self.close_created(directory, session, deadline)
         }
         fn surface_present(
             &self,

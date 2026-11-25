@@ -1,5 +1,6 @@
-//! The seven Windows surface operations (open, send, screen, guarded key, verify, close and
-//! presence). Screen and guarded key first read the kind's declared refusal; then every
+//! The seven Windows surface operations (open, send, screen, guarded key, verify, close, in
+//! its ordinary form or by creation record once the owner is gone, and presence). Screen and
+//! guarded key first read the kind's declared refusal; then every
 //! operation resolves its adapter through one lookup (`Adapters::adapter`): Herdr, or the
 //! managed console for every other kind. macOS and Linux do the same through `posix.rs`.
 //! Compiled into every test build, so that the lookup and the refusals are tested on every
@@ -58,6 +59,22 @@ pub(in crate::native) trait WindowsTerminalAdapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome>;
+    /// Ends and removes the surface after its owner is verified gone, proving it by the
+    /// creation record in the handle. Only a kind whose core keeps its terminals has one, and
+    /// the dispatch refuses every other kind before its adapter, so the default is an
+    /// invariant failure and never an ordinary answer.
+    fn close_created_surface(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        let _ = (directory, deadline);
+        bail!(
+            "{} keeps no creation record; the shared dispatch must refuse before its adapter",
+            session.kind.display_name()
+        )
+    }
     fn surface_present(
         &self,
         directory: &Path,
@@ -186,6 +203,26 @@ pub(in crate::native) fn close_session_until(
     adapters
         .adapter(session.kind)
         .close_session_until(directory, session, deadline)
+}
+
+/// The close of a gone owner's surface, on its creation record. As on macOS and Linux, a kind
+/// whose core keeps no terminals is refused before its adapter.
+pub(in crate::native) fn close_created_surface(
+    adapters: &dyn Adapters,
+    directory: &Path,
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    crate::native::session::close::budget::close_remaining(deadline)?;
+    if !super::close_authority::owner_exit::core_retains_finished(session.kind) {
+        bail!(
+            "{} keeps no creation record that proves its surface without the owner; no close was sent and the handle is retained",
+            session.kind.display_name()
+        );
+    }
+    adapters
+        .adapter(session.kind)
+        .close_created_surface(directory, session, deadline)
 }
 
 pub(in crate::native::terminal) fn surface_present(

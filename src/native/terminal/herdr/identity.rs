@@ -40,12 +40,11 @@ fn usable_endpoint(endpoint: &str) -> bool {
 /// | --- | --- | --- | --- |
 /// | Send, screen, verify | Managed Session id | Live | Program still exists |
 /// | Presence, close, cleanup after binding fails | Exact path | Either | |
-/// | Remove after owner exits (Unix) | Exact path | Finished | Launch label |
+/// | Close after the owner is gone | Exact path | Either | Launch label |
 pub(super) enum Requirement<'a> {
     Live,
     Bound(&'a Path),
-    #[cfg(unix)]
-    Finished(&'a Path),
+    Created(&'a Path),
 }
 
 pub(super) struct Recorded<'a> {
@@ -98,10 +97,9 @@ impl<'a> Recorded<'a> {
                 }
                 Ok(())
             }
-            #[cfg(unix)]
-            Requirement::Finished(_) => {
+            Requirement::Created(_) => {
                 identity.context(CLOSE_STOPPED)?;
-                self.check_finished(observed)
+                self.check_launch(observed)
             }
         }
     }
@@ -111,9 +109,7 @@ impl<'a> Recorded<'a> {
         let address = &observed.address;
         let directory = match self.requirement {
             Requirement::Live => None,
-            Requirement::Bound(directory) => Some(directory),
-            #[cfg(unix)]
-            Requirement::Finished(directory) => Some(directory),
+            Requirement::Bound(directory) | Requirement::Created(directory) => Some(directory),
         };
         let argv_directory = observed.argv.get(2);
         let session_directory = match directory {
@@ -162,27 +158,21 @@ impl<'a> Recorded<'a> {
         Ok(())
     }
 
-    #[cfg(unix)]
-    fn check_finished(&self, observed: &Observed) -> Result<()> {
+    /// The launch label TAB set at creation, part of the creation record a gone owner's close
+    /// relies on in either terminal state.
+    fn check_launch(&self, observed: &Observed) -> Result<()> {
         let address = &observed.address;
-        if observed.state != State::Finished {
-            bail!(
-                "Herdr terminal {address} is still running although its native-session owner is no longer live; TAB does not end it without that owner, so no close was sent and the handle is retained"
-            );
-        }
         let nonce = observed
             .launch
             .as_deref()
-            .context("finished Herdr terminal is missing its launch label")?;
+            .with_context(|| format!("Herdr terminal {address} is missing its launch label"))?;
         let matches_launch = match self.session.herdr_launch_nonce() {
             Some(expected) => nonce == expected,
             // Records from 0.4.45 and 0.4.46 omitted the nonce.
             None => observed.name.as_deref() == Some(launch_name(nonce)?.as_str()),
         };
         if !matches_launch {
-            bail!(
-                "finished Herdr terminal {address} has a different launch label; the handle is retained"
-            );
+            bail!("Herdr terminal {address} has a different launch label; the handle is retained");
         }
         Ok(())
     }

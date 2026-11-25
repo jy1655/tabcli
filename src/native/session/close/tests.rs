@@ -1400,70 +1400,51 @@ fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
     assert!(store.closed_if_present().unwrap().is_none());
 }
 
-// A Windows Herdr terminal outlives its native owner. A dead owner's repair never takes the
-// owner's death for the terminal's absence: it closes the exact handle through the core, and
-// a close that fails (no core, a core that refuses) leaves the handle, the state and the
-// claim untouched for the next attempt. Repeated repairs then close it once and do nothing
-// more. A managed console's ended session keeps settling from its records alone.
+// A Windows Herdr terminal outlives its native owner. As on macOS and Linux, a dead owner's
+// repair never reaches its core in any repairable state: it leaves the handle, the state and
+// the claim for `close-session --explicit` (os-parity). A managed console's ended session
+// keeps settling from its records alone.
 #[cfg(windows)]
 #[test]
-fn a_dead_owners_windows_herdr_terminal_is_retained_until_its_core_closes_it() {
-    use std::cell::Cell;
+fn a_dead_owners_windows_herdr_terminal_is_left_for_an_explicit_close() {
     for state in ["exited", "failed", "working"] {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("session-herdrclose");
-        std::fs::create_dir(&directory).unwrap();
-        write_owned_terminal_state(&directory, state, reaped_child_pid());
-        let handle = json!({
-            "terminal": "herdr", "session_id": "t7", "managed_session_id": "session-herdrclose",
-            "herdr_core": {"socket": r"\\.\pipe\herdr-core-tester-default.sock",
-                "core_id": "core-a", "created_ms": 1, "host_pid": 4, "host_creation_time": 1},
-        });
-        write_json_atomic(&directory.join(TERMINAL_HANDLE_FILE), &handle).unwrap();
-        let before = std::fs::read(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
-        let store = Store::open_unchecked(&directory);
-        let calls = Cell::new(0);
-        let repair = |close: &dyn Fn() -> anyhow::Result<terminal::CloseOutcome>| {
-            repair_dead_owner_with(
-                &store,
-                |_| Ok(false),
-                RepairSurfaces::Windows(&mut |surface| {
-                    assert_eq!(surface.kind, terminal::TerminalKind::Herdr);
-                    assert_eq!(surface.id, "t7");
-                    calls.set(calls.get() + 1);
-                    close()
-                }),
-                budget::close_deadline(),
-            )
-        };
-        for refusal in [
-            "no Herdr Core is running at the recorded pipe",
-            "a different Herdr Core answers; the state of this terminal is unknown",
-        ] {
-            let error = repair(&|| Err(anyhow::anyhow!(refusal))).unwrap_err();
-            let text = format!("{error:#}");
-            assert!(text.contains("its handle is retained"), "{state}: {text}");
-            assert!(text.contains(refusal), "{state}: {text}");
-            assert_eq!(
-                std::fs::read(directory.join(TERMINAL_HANDLE_FILE)).unwrap(),
-                before,
-                "{state}"
-            );
-            assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists(), "{state}");
-            assert_eq!(store.status().unwrap().state.as_str(), state);
-            assert!(directory.join(TURN_CLAIM_FILE).exists(), "{state}");
+        for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("session-herdrclose");
+            std::fs::create_dir(&directory).unwrap();
+            write_owned_terminal_state(&directory, state, reaped_child_pid());
+            std::fs::remove_file(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+            let handle = json!({
+                "terminal": "herdr", "session_id": "t7", "managed_session_id": "session-herdrclose",
+                "herdr_core": {"socket": r"\\.\pipe\herdr-core-tester-default.sock",
+                    "core_id": "core-a", "created_ms": 1, "host_pid": 4, "host_creation_time": 1},
+            });
+            write_json_atomic(&directory.join(name), &handle).unwrap();
+            let before = std::fs::read(directory.join(name)).unwrap();
+            let store = Store::open_unchecked(&directory);
+            for _ in 0..2 {
+                assert!(
+                    !repair_dead_owner_with(
+                        &store,
+                        |_| Ok(false),
+                        RepairSurfaces::Windows(&mut |_| panic!(
+                            "Repair never closes a terminal its core keeps"
+                        )),
+                        budget::close_deadline(),
+                    )
+                    .unwrap(),
+                    "{state}, {name}"
+                );
+                assert_eq!(
+                    std::fs::read(directory.join(name)).unwrap(),
+                    before,
+                    "{state}, {name}"
+                );
+                assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists(), "{state}");
+                assert_eq!(store.status().unwrap().state.as_str(), state);
+                assert!(directory.join(TURN_CLAIM_FILE).exists(), "{state}");
+            }
         }
-        assert!(
-            repair(&|| Ok(terminal::CloseOutcome::Closed)).unwrap(),
-            "{state}"
-        );
-        assert_eq!(calls.get(), 3, "{state}");
-        assert_eq!(store.status().unwrap().state, SessionState::Closed);
-        assert!(!directory.join(TERMINAL_HANDLE_FILE).exists(), "{state}");
-        assert!(directory.join(TERMINAL_TOMBSTONE_FILE).exists(), "{state}");
-        // Closed: a repeated repair reaches no core.
-        assert!(!repair(&|| panic!("a closed session reaches no core")).unwrap());
-        assert_eq!(calls.get(), 3, "{state}");
     }
     // A console's ended session is still settled from its records, without a helper.
     for state in ["exited", "failed"] {

@@ -20,14 +20,14 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 
 /// Which authority the owned close runs under: the attested owner is live, or only the
 /// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
-/// work for a live owner only. `RemoveEnded` reaches only a kind whose core keeps
-/// a surface whose program ended: the owner died with it, and the adapter removes that
-/// surface only when it reads it ended, never ending a running program.
+/// work for a live owner only. `CreatedSurface` reaches only a kind whose core keeps its
+/// terminals, after the owner is verified gone: the adapter ends and removes the terminal
+/// only once the creation record in the handle proves it is this session's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum OwnedSurfaceClose {
     LiveOwner,
     SurfaceOnly,
-    RemoveEnded,
+    CreatedSurface,
 }
 
 pub(in crate::native::terminal) trait PosixTerminalAdapter {
@@ -219,11 +219,11 @@ pub(in crate::native::terminal) fn close_owned_session(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     // Every other adapter would close its surface under this authority; refuse it first.
-    if close == OwnedSurfaceClose::RemoveEnded
+    if close == OwnedSurfaceClose::CreatedSurface
         && !super::close_authority::owner_exit::core_retains_finished(session.kind)
     {
         bail!(
-            "{} keeps no surface after its program ends; no close was sent and the handle is retained",
+            "{} keeps no creation record that proves its surface without the owner; no close was sent and the handle is retained",
             session.kind.display_name()
         );
     }
@@ -486,10 +486,10 @@ mod tests {
         assert!(guarded_dialog_input(&Fake, &refused, &input, deadline).is_err());
     }
 
-    // The fake would close its surface under any authority. A kind whose close evidence keeps
-    // no ended surface is refused the remove-only close before its adapter is reached.
+    // The fake would close its surface under any authority. A kind whose core keeps no
+    // terminals has no creation record to close by and is refused before its adapter.
     #[test]
-    fn remove_ended_is_refused_before_an_adapter_that_keeps_no_ended_surface() {
+    fn a_gone_owners_close_is_refused_before_an_adapter_without_a_creation_record() {
         let deadline = Instant::now() + Duration::from_secs(5);
         for kind in [
             TerminalKind::Iterm2,
@@ -507,14 +507,14 @@ mod tests {
                 Path::new("/unused"),
                 "session-fake",
                 &surface,
-                OwnedSurfaceClose::RemoveEnded,
+                OwnedSurfaceClose::CreatedSurface,
                 deadline,
             )
             .unwrap_err();
             assert!(
                 error
                     .to_string()
-                    .contains("keeps no surface after its program ends; no close was sent"),
+                    .contains("keeps no creation record that proves its surface without the owner; no close was sent"),
                 "{kind:?}: {error:#}"
             );
         }

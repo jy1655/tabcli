@@ -797,7 +797,9 @@ pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instan
     repair_dead_owner_attested_until(store, attest_owner, deadline)
 }
 
-fn repair_dead_owner_attested_until(
+/// Dead-owner Repair with the owner's OS observation supplied by the caller, under this
+/// platform's surface policy.
+pub(in crate::native) fn repair_dead_owner_attested_until(
     store: &Store,
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
     deadline: Instant,
@@ -906,7 +908,7 @@ fn repair_dead_owner_with(
     }
     let repair_error = Some(repair_error);
     match surfaces.decide(store, &status.state, deadline)? {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         RepairSurface::Retain => return untouched(recovery_damage),
         RepairSurface::Settle => mark_session_closed(store, repair_error)?,
         RepairSurface::CloseOnWindows(mut close) => {

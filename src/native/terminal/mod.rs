@@ -647,9 +647,10 @@ pub(super) fn verify_windows_surface(
     windows_dispatch::verify_surface(windows_installed(), session, timeout)
 }
 
+// Windows production closes through the authority's own mapping in `close_authority`.
 #[cfg(any(
-    all(test, target_os = "macos"),
-    not(any(target_os = "macos", target_os = "linux"))
+    all(test, any(target_os = "macos", windows)),
+    not(any(target_os = "macos", target_os = "linux", windows))
 ))]
 pub(super) fn close_session_until(
     directory: &Path,
