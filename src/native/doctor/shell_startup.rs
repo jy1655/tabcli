@@ -34,19 +34,33 @@ pub(super) fn launch_stage_check(
             let evidence =
                 json!({"record": record_evidence(host), "owner_recorded": later.owner_recorded});
             match &host.failure {
-                Some(failure) => Check::new(
-                    CheckId::LAUNCH_STAGE,
-                    Unavailable,
-                    Reason::LAUNCH_HOST_FAILED,
-                    format!(
-                        "The {} launch host failed after stage {}: {}.",
-                        host.terminal.display_name(),
-                        host.stage.word(),
-                        failure_text(failure, host)
-                    ),
-                    failure_action(failure.reason, &probe),
-                )
-                .evidence(evidence),
+                Some(failure) => {
+                    let text = failure_text(failure, host);
+                    let (detail, action) = if let Some(step) = bound_herdr_step(host, failure.reason)
+                    {
+                        (
+                            format!("The bound Herdr launch host failed while {step} ({text})."),
+                            format!("Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline` for the error. Close this session before starting a new one."),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "The {} launch host failed after stage {}: {text}.",
+                                host.terminal.display_name(),
+                                host.stage.word()
+                            ),
+                            failure_action(failure.reason, &probe),
+                        )
+                    };
+                    Check::new(
+                        CheckId::LAUNCH_STAGE,
+                        Unavailable,
+                        Reason::LAUNCH_HOST_FAILED,
+                        detail,
+                        action,
+                    )
+                    .evidence(evidence)
+                }
                 None if host.stage == Stage::LaunchShellStarting || later.owner_recorded => {
                     Check::new(
                         CheckId::LAUNCH_STAGE,
@@ -77,6 +91,15 @@ pub(super) fn launch_stage_check(
         }
         HostObservation::NotRecorded => match known_terminal {
             Some(kind) if !kind.has_launch_host_form() => not_applicable(kind),
+            Some(TerminalKind::Herdr) if cfg!(any(target_os = "linux", windows)) => Check::new(
+                CheckId::LAUNCH_STAGE,
+                Unknown,
+                Reason::LAUNCH_HOST_NOT_RECORDED,
+                "No Herdr launch host record is retained.",
+                format!(
+                    "Inspect the launch log with `{PUBLIC_COMMAND} inspect {session} --timeline`."
+                ),
+            ),
             _ if !known_terminal.map_or(
                 cfg!(target_os = "macos"),
                 TerminalKind::captures_shell_environment,
@@ -147,6 +170,19 @@ fn failure_text(failure: &Failure, host: &HostRecord) -> String {
         text.push_str(&format!(", the {detail}"));
     }
     text
+}
+
+// A verified Linux or Windows Herdr host records these failures without a capture host
+// admission. The macOS host reports the same reasons only after recording its admission.
+fn bound_herdr_step(host: &HostRecord, reason: FailureReason) -> Option<&'static str> {
+    if host.terminal != TerminalKind::Herdr || host.stage != Stage::AwaitingHost {
+        return None;
+    }
+    match reason {
+        FailureReason::InputFlushFailed => Some("discarding startup input"),
+        FailureReason::LaunchShellExecFailed => Some("starting the launch shell"),
+        _ => None,
+    }
 }
 
 fn failure_action(reason: FailureReason, probe: &str) -> String {
@@ -361,6 +397,61 @@ mod tests {
             "session-abc",
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn bound_herdr_failure_points_to_the_launch_log() {
+        for (reason, detail) in [
+            (FailureReason::InputFlushFailed, "discarding startup input"),
+            (
+                FailureReason::LaunchShellExecFailed,
+                "starting the launch shell",
+            ),
+        ] {
+            let mut direct = host(
+                Stage::AwaitingHost,
+                Some(Failure {
+                    reason,
+                    exit_code: None,
+                    signal: None,
+                }),
+            );
+            direct.terminal = TerminalKind::Herdr;
+            direct.capture_budget_ms = 0;
+            direct.capture_elapsed_ms = None;
+            let row = check(HostObservation::Recorded(direct), None, false);
+            assert_eq!(row["reason_code"], "launch_host_failed");
+            assert_eq!(row["availability"], "unavailable");
+            assert_eq!(
+                row["evidence"]["record"]["failure"]["reason"],
+                reason.word()
+            );
+            assert!(row["detail"].as_str().unwrap().contains(detail), "{row}");
+            let action = row["next_action"].as_str().unwrap();
+            assert!(
+                action.contains("inspect session-abc --timeline"),
+                "{action}"
+            );
+            assert!(!action.contains("--probe"), "{action}");
+
+            let mut capture = host(
+                Stage::EnvironmentReady,
+                Some(Failure {
+                    reason,
+                    exit_code: None,
+                    signal: None,
+                }),
+            );
+            capture.terminal = TerminalKind::Herdr;
+            let row = check(HostObservation::Recorded(capture), None, false);
+            assert!(
+                row["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("environment_ready")
+            );
+            assert!(row["next_action"].as_str().unwrap().contains("--probe"));
+        }
     }
 
     #[test]
@@ -857,7 +948,13 @@ mod tests {
             host("WezTerm"),
             other("WindowsConsole", "windows-console"),
             other("Tmux", "tmux"),
-            host("Herdr"),
+            if cfg!(any(target_os = "linux", windows)) {
+                format!(
+                    "Herdr: true | launch_host_not_recorded | No Herdr launch host record is retained. | null | probe ran false shell_environment_probe_not_applicable | {NO_PROBE}"
+                )
+            } else {
+                host("Herdr")
+            },
         ];
         assert_eq!(actual, expected);
     }

@@ -269,37 +269,12 @@ pub(in crate::native) fn run(command: HostCommand) -> Result<()> {
 }
 
 fn run_launch_host(directory: PathBuf, command: String, kind: TerminalKind) -> Result<()> {
-    match kind.registration().launch_host {
-        #[cfg(target_os = "macos")]
-        Some(super::facts::LaunchHost::ShellCapture { .. }) => {
-            super::macos::launch_host::run(&directory, &command, kind)
-        }
-        #[cfg(target_os = "linux")]
-        Some(super::facts::LaunchHost::BoundBash(matches)) => {
-            super::linux::host::run(&directory, &command, kind, |surface| {
-                anyhow::ensure!(
-                    matches(surface),
-                    "{} surface binding does not name this launch host",
-                    kind.display_name()
-                );
-                Ok(())
-            })
-        }
-        #[cfg(windows)]
-        Some(super::facts::LaunchHost::BoundPowerShell(matches, binding)) => {
-            super::windows::launch_host::run(&directory, &command, kind, binding, |surface| {
-                anyhow::ensure!(
-                    matches(surface),
-                    "{} surface binding does not name this launch host",
-                    kind.display_name()
-                );
-                Ok(())
-            })
-        }
-        _ => {
-            let _ = (directory, command);
-            bail!("native launch hosts are only available on macOS")
-        }
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    return super::bound_host::run_launch_host(&directory, &command, kind);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (directory, command, kind);
+        bail!("native launch hosts are only available on macOS")
     }
 }
 

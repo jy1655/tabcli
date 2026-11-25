@@ -51,6 +51,12 @@
   If saving the binding for a confirmed terminal fails and removal also fails, the adapter
   returns that same confirmed handle to the launcher. The launcher uses the current Claim
   and Close records to decide whether to save it. A later close checks its identity again.
+- On Linux and Windows, `bound_host` can record a startup-input flush or launch-shell start
+  failure after the host proves its exact binding. The record is best effort and tied to
+  the same pending Claim and Surface under the lifecycle lock. Launch wait and repair read
+  it through the same settlement as the macOS host. An attempt without a proven binding
+  cannot publish this failure. A PowerShell wait error after successful spawn only reaches
+  the launch log.
 - The core gives programs its own environment, not the caller's, and it can carry another
   session's markers: the core on the owner's Mac on 2026-11-18 carried Claude Code's
   child-session and messaging variables. Every launch host removes the adapters' caller markers
@@ -140,7 +146,7 @@
   reparse point, and the trust store's access-list rule, where `FILE_DELETE_CHILD` and `DELETE`
   also count as changing a directory (`consent::windows_directory_is_private`; the store's own
   rule is unchanged). After the same binding wait, launch judgment and locked
-  re-check as the Linux host (`bound_host::prepare_bound_launch_with`), it flushes `CONIN$` (a
+  re-check as the Linux host (`bound_host`), it flushes `CONIN$` (a
   console it cannot flush refuses the launch), keeps itself running through Ctrl+C and
   Ctrl+Break with a handler routine (not inherited, unlike ignoring them), and starts PowerShell
   7 from the core's `PATH` with the managed console root's exact arguments

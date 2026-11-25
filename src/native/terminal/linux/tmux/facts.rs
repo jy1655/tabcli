@@ -25,6 +25,8 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     guarded_input_refusal: Some(
         "tmux cannot compare the screen and send a key in one call; answer the dialog in its pane",
     ),
+    #[cfg(windows)]
+    binding: None,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     binding: Some(BindingFacts {
         host: "tmux",

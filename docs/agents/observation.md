@@ -9,6 +9,10 @@
   fails when a record changed while it read. What it derives is marked: the request
   summaries are what `result` reports at the time of the query and carry `derived_from`.
   Do not add an entry for something no record holds.
+- Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,
+  its `launch_stage` row keeps `launch_host_failed` and directs the caller to the launch
+  log for an input-flush or shell-start error. The shell-environment probe guidance applies
+  to the macOS capture host.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared

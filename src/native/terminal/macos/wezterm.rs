@@ -64,10 +64,8 @@ use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult,
 use crate::native::process_env::CommandOutputFailure;
 
 use crate::native::clock::{Clock, SystemClock};
-use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;
-const BINDING: &BindingFacts = TerminalKind::WezTerm.registration().binding();
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
@@ -1028,23 +1026,14 @@ pub(in crate::native::terminal) fn binding_names_this_host(surface: &TerminalSes
 // Wait for the receipt/claim/status to bind the pane and socket supplied by the mux itself.
 // Failure or timeout never falls back to typed input; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    use super::bound_host::{BoundHostSpec, run_tty_bound_host};
-    run_tty_bound_host(
+    super::bound_host::run_tty_bound_host(
         directory,
-        &BoundHostSpec { name: BINDING.host },
+        TerminalKind::WezTerm,
         this_host_pane,
         |directory, id, (pane, socket)| {
             wait_for_binding(directory, id, pane, Path::new(socket), &mut SystemClock)
         },
-        |started| {
-            // The pane ends with this process and takes the message with it.
-            if let Err(error) = started {
-                crate::native::session::launch::log(
-                    &Store::open_unchecked(directory),
-                    &format!("wezterm_host_refused: {error:#}"),
-                );
-            }
-        },
+        None,
     )
 }
 
@@ -1055,12 +1044,20 @@ fn wait_for_binding(
     socket: &Path,
     clock: &mut dyn Clock,
 ) -> Result<()> {
-    use crate::native::session::launch::wait_for_binding;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    if !binding_names_host(&surface, pane, socket) {
-        bail!("WezTerm surface binding does not name the pane of this launch host");
-    }
-    Ok(())
+    super::bound_host::wait_for_host_binding(
+        &Reader::open_unchecked(directory),
+        id,
+        TerminalKind::WezTerm,
+        clock,
+        |surface| {
+            anyhow::ensure!(
+                binding_names_host(surface, pane, socket),
+                "WezTerm surface binding does not name the pane of this launch host"
+            );
+            Ok(())
+        },
+    )
+    .map(|_| ())
 }
 
 // The prompt and its Enter are one write to the pty. Only a call that never started is

@@ -1,5 +1,13 @@
+//! Bound hosts share private-directory admission, binding observation and refusal reporting.
+//! The direct handoffs also recheck the pending Claim and exact binding under the lifecycle
+//! lock before flushing input. The wrapper owns final spawn admission in every mode.
+use super::{TerminalKind, TerminalSession};
+use crate::native::clock::Clock;
 #[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
+#[cfg(any(target_os = "linux", windows, all(unix, test)))]
+use crate::native::session::launch::host::FailureReason;
+use crate::native::session::{Reader, Store, launch};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -8,28 +16,119 @@ pub(in crate::native::terminal) struct BoundHostSpec {
     pub(in crate::native::terminal) name: &'static str,
 }
 
+/// Dispatch the command form through the kind's registered binding proof and local handoff.
+pub(super) fn run_launch_host(directory: &Path, command: &str, kind: TerminalKind) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if kind.captures_shell_environment() {
+        return super::macos::launch_host::run(directory, command, kind);
+    }
+    #[cfg(any(target_os = "linux", windows))]
+    if let Some(names_binding) = kind
+        .registration()
+        .launch_host
+        .and_then(|host| host.names_binding)
+    {
+        #[cfg(target_os = "linux")]
+        let handoff = super::linux::host::handoff;
+        #[cfg(windows)]
+        let handoff = super::windows::launch_host::start_root;
+        let result = run_handoff(
+            directory,
+            kind,
+            |surface| {
+                anyhow::ensure!(
+                    surface.kind == kind && names_binding(surface),
+                    "{} surface binding does not name this launch host",
+                    kind.display_name()
+                );
+                Ok(())
+            },
+            || handoff(command, kind),
+        );
+        #[cfg(target_os = "linux")]
+        return result;
+        #[cfg(windows)]
+        return super::windows::launch_host::wait_for_root(result?).inspect_err(|error| {
+            log_refusal(
+                &Store::open_unchecked(directory),
+                kind,
+                &format_args!(": {error:#}"),
+            );
+        });
+    }
+    bail!("native launch hosts are only available on macOS")
+}
+
 #[cfg(target_os = "macos")]
 pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     directory: &Path,
-    spec: &BoundHostSpec,
+    kind: TerminalKind,
     identity: impl FnOnce() -> Result<I>,
     bind: impl FnOnce(&Path, &str, &I) -> Result<()>,
-    record_outcome: impl FnOnce(&Result<I>),
+    release_message: Option<fn(&I) -> String>,
 ) -> Result<()> {
-    run_bound_host(directory, spec, |id| {
-        let outcome = (|| {
-            let identity = identity()?;
-            bind(directory, id, &identity)?;
-            // Discard only this host's input after its exact surface has been bound.
-            if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("cannot discard {} startup input", spec.name));
+    run_bound_host(
+        directory,
+        &BoundHostSpec {
+            name: kind.display_name(),
+        },
+        |id| {
+            let outcome = (|| {
+                let identity = identity()?;
+                bind(directory, id, &identity)?;
+                flush_startup_input(kind.display_name())?;
+                Ok(identity)
+            })();
+            let store = Store::open_unchecked(directory);
+            match outcome {
+                Ok(identity) => {
+                    if let Some(message) = release_message {
+                        launch::log(&store, &message(&identity));
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    log_refusal(&store, kind, &format_args!(": {error:#}"));
+                    Err(error)
+                }
             }
-            Ok(identity)
-        })();
-        record_outcome(&outcome);
-        outcome.map(|_| ())
-    })
+        },
+    )
+}
+
+/// Log only after directory admission. Keep the legacy log prefix for Terminal.app.
+pub(super) fn log_refusal(store: &Store, kind: TerminalKind, detail: &impl std::fmt::Display) {
+    let name = if kind == TerminalKind::AppleTerminal {
+        "terminal"
+    } else {
+        kind.as_str()
+    };
+    launch::log(store, &format!("{name}_host_refused{detail}"));
+}
+
+/// The receipt observes the binding; the adapter proves that it names this host.
+pub(super) fn wait_for_host_binding(
+    reader: &Reader,
+    id: &str,
+    kind: TerminalKind,
+    clock: &mut dyn Clock,
+    validate: impl FnOnce(&TerminalSession) -> Result<()>,
+) -> Result<TerminalSession> {
+    let surface = launch::wait_for_binding(reader, id, kind.registration().binding(), clock)?;
+    validate(&surface)?;
+    Ok(surface)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn while_capture_eligible<T>(
+    store: &Store,
+    token: &str,
+    identity: launch::host::HostIdentity,
+    act: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _lock = store.lock()?;
+    launch::host::eligible_incarnation(store, token, identity)?;
+    act()
 }
 
 pub(super) fn run_bound_host<T>(
@@ -111,112 +210,111 @@ fn windows_private_directory(directory: &Path, name: &str) -> Result<()> {
         .with_context(|| format!("{name} launch directory is not private to the current user"))
 }
 
-#[cfg(target_os = "macos")]
-pub(super) fn binding_names_host(
-    surface: &super::TerminalSession,
-    kind: super::TerminalKind,
-    names_host: impl FnOnce(&super::TerminalSession) -> bool,
-    refusal: &'static str,
-) -> Result<()> {
-    if surface.kind != kind || !names_host(surface) {
-        bail!("{refusal}");
-    }
-    Ok(())
-}
-
 #[cfg(all(test, unix))]
 mod tests;
 #[cfg(all(test, windows))]
 mod windows_tests;
 
-/// The tmux host's handoff (no exec here): admit the private directory, wait for the
-/// pending launch's binding, validate this host's adapter-owned environment against
-/// it, then recheck the SAME pending Claim and exact binding under the lifecycle
-/// lock before flushing startup input. The host is given its launch command through
-/// --launch-command and execs bash only after this returns.
-/// The wrapper's spawn fence still owns final launch admission; this is no reservation.
-#[cfg(target_os = "linux")]
-pub(in crate::native::terminal) fn prepare_bound_launch(
-    directory: &Path,
-    spec: &BoundHostSpec,
-    facts: &crate::native::session::launch::BindingFacts,
-    clock: &mut dyn crate::native::clock::Clock,
-    validate_binding: impl FnOnce(&super::TerminalSession) -> Result<()>,
-) -> Result<super::TerminalSession> {
-    prepare_bound_launch_with(directory, spec, facts, clock, validate_binding, || {
-        if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("cannot discard {} startup input", spec.name));
-        }
-        Ok(())
-    })
-}
-/// The Windows Herdr host's handoff, in the same order: after its exact binding, the
-/// console input typed into the new terminal is discarded, so that an Enter cannot answer
-/// the first dialog the provider shows. A console that cannot be flushed refuses the launch.
-#[cfg(windows)]
-pub(in crate::native::terminal) fn prepare_bound_launch(
-    directory: &Path,
-    spec: &BoundHostSpec,
-    facts: &crate::native::session::launch::BindingFacts,
-    clock: &mut dyn crate::native::clock::Clock,
-    validate_binding: impl FnOnce(&super::TerminalSession) -> Result<()>,
-) -> Result<super::TerminalSession> {
-    use std::os::windows::io::AsRawHandle;
-    prepare_bound_launch_with(directory, spec, facts, clock, validate_binding, || {
-        let input = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("CONIN$")
-            .with_context(|| format!("cannot open the {} console input", spec.name))?;
-        if unsafe {
-            windows_sys::Win32::System::Console::FlushConsoleInputBuffer(input.as_raw_handle())
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("cannot discard {} startup input", spec.name));
-        }
-        Ok(())
-    })
+#[cfg(unix)]
+pub(super) fn flush_startup_input(name: &str) -> Result<()> {
+    if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot discard {name} startup input"));
+    }
+    Ok(())
 }
 
-// Compiled into every test build, so that macOS runs the handoff tests too.
-#[cfg(any(target_os = "linux", windows, test))]
-fn prepare_bound_launch_with(
+#[cfg(windows)]
+fn flush_startup_input(name: &str) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let input = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONIN$")
+        .with_context(|| format!("cannot open the {name} console input"))?;
+    if unsafe {
+        windows_sys::Win32::System::Console::FlushConsoleInputBuffer(input.as_raw_handle())
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot discard {name} startup input"));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", windows))]
+pub(super) fn run_handoff<T>(
     directory: &Path,
-    spec: &BoundHostSpec,
-    facts: &crate::native::session::launch::BindingFacts,
-    clock: &mut dyn crate::native::clock::Clock,
-    validate_binding: impl FnOnce(&super::TerminalSession) -> Result<()>,
+    kind: TerminalKind,
+    validate: impl FnOnce(&TerminalSession) -> Result<()>,
+    handoff: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    run_handoff_with(
+        directory,
+        kind,
+        &mut crate::native::clock::SystemClock,
+        validate,
+        || flush_startup_input(kind.display_name()),
+        handoff,
+    )
+}
+
+/// Admit, wait, validate and recheck before touching the startup input queue. The handoff
+/// starts the shell outside that lock. Windows waits for the root only after it has started.
+/// Only an attested Herdr host's flush or handoff failure is durable. An unbound or
+/// mismatched process has no authority to make the launch fail.
+#[cfg(any(target_os = "linux", windows, all(unix, test)))]
+fn run_handoff_with<T>(
+    directory: &Path,
+    kind: TerminalKind,
+    clock: &mut dyn Clock,
+    validate: impl FnOnce(&TerminalSession) -> Result<()>,
     flush: impl FnOnce() -> Result<()>,
-) -> Result<super::TerminalSession> {
-    use crate::native::session::{Store, launch};
-    run_bound_host(directory, spec, |id| {
+    handoff: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use launch::pending::{self, Expiry};
+
+    let name = kind.display_name();
+    run_bound_host(directory, &BoundHostSpec { name }, |id| {
         let store = Store::open_unchecked(directory);
-        let name = spec.name;
-        let initial =
-            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-        let surface = launch::wait_for_binding(&store, id, facts, clock)?;
-        validate_binding(&surface)?;
-        let _lock = store.lock()?;
-        let current =
-            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-        anyhow::ensure!(
-            launch::pending::judge(
-                &store,
-                &current,
-                &initial.claim_token,
-                launch::pending::Expiry::Receipt
-            )?
-            .is_ok(),
-            "{name} launch is no longer pending"
-        );
-        anyhow::ensure!(
-            launch::pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
-                == Some(&surface),
-            "{name} binding changed"
-        );
-        flush()?;
-        Ok(surface)
+        let start = clock.now();
+        let outcome = (|| {
+            let initial =
+                launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+            let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
+            let flushed = {
+                let _lock = store.lock()?;
+                let current = launch::read(&store)?
+                    .with_context(|| format!("missing {name} launch receipt"))?;
+                anyhow::ensure!(
+                    pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?
+                        .is_ok(),
+                    "{name} launch is no longer pending"
+                );
+                anyhow::ensure!(
+                    pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
+                        == Some(&surface),
+                    "{name} binding changed"
+                );
+                flush()
+            };
+            let mut record_failure = |reason| {
+                if kind == TerminalKind::Herdr {
+                    let _ = launch::host::fail_bound_herdr(
+                        &store,
+                        &initial.claim_token,
+                        &surface,
+                        reason,
+                        clock.now().saturating_duration_since(start).as_millis() as u64,
+                    );
+                }
+            };
+            flushed.inspect_err(|_| record_failure(FailureReason::InputFlushFailed))?;
+            handoff().inspect_err(|_| record_failure(FailureReason::LaunchShellExecFailed))
+        })();
+        if let Err(error) = &outcome {
+            log_refusal(&store, kind, &format_args!(": {error:#}"));
+        }
+        outcome
     })
 }

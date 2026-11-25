@@ -18,10 +18,8 @@ use super::{
 };
 
 use crate::native::clock::{Clock, SystemClock};
-use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;
-const BINDING: &BindingFacts = TerminalKind::Iterm2.registration().binding();
 
 // Restore a new tab's prior selection, or a new window's foreground after asynchronous activation.
 // Never override user selection; see docs/verification/2026-10-03-v0.1.0-focus.md.
@@ -398,20 +396,12 @@ pub(in crate::native::terminal) fn binding_names_this_host(surface: &TerminalSes
 // Wait for restored selection and the exact returned UUID in the receipt and surface binding.
 // Failure or timeout never falls back to typed shell input.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    use super::bound_host::{BoundHostSpec, run_tty_bound_host};
-    run_tty_bound_host(
+    super::bound_host::run_tty_bound_host(
         directory,
-        &BoundHostSpec { name: BINDING.host },
+        TerminalKind::Iterm2,
         this_host_session,
         |directory, id, iterm_id| wait_for_binding(directory, id, iterm_id, &mut SystemClock),
-        |outcome| {
-            if let Err(error) = outcome {
-                crate::native::session::launch::log(
-                    &crate::native::session::Store::open_unchecked(directory),
-                    &format!("iterm2_host_refused: {error:#}"),
-                );
-            }
-        },
+        None,
     )
 }
 
@@ -421,12 +411,20 @@ fn wait_for_binding(
     iterm_id: &str,
     clock: &mut dyn Clock,
 ) -> Result<()> {
-    use crate::native::session::launch::wait_for_binding;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
-    if !binding_names_host(&surface, iterm_id) {
-        bail!("iTerm2 surface binding does not match this launch host");
-    }
-    Ok(())
+    super::bound_host::wait_for_host_binding(
+        &Reader::open_unchecked(directory),
+        id,
+        TerminalKind::Iterm2,
+        clock,
+        |surface| {
+            anyhow::ensure!(
+                binding_names_host(surface, iterm_id),
+                "iTerm2 surface binding does not match this launch host"
+            );
+            Ok(())
+        },
+    )
+    .map(|_| ())
 }
 
 fn send_file(

@@ -322,6 +322,10 @@ pub(in crate::native) fn initialize(
 ) -> Result<()> {
     let _lock = store.lock()?;
     eligible(store, token, true)?;
+    write(store, &unrecorded_host(store, token, terminal)?)
+}
+
+fn unrecorded_host(store: &Store, token: &str, terminal: TerminalKind) -> Result<HostRecord> {
     if store
         .record(CoreRecord::LaunchHost)
         .timeline(LIMIT)?
@@ -329,32 +333,59 @@ pub(in crate::native) fn initialize(
     {
         bail!("launch host is already recorded");
     }
-    write(
-        store,
-        &HostRecord {
-            schema: 1,
-            managed_session_id: store
-                .directory()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .context("session directory has no id")?
-                .into(),
-            claim_token: token.into(),
-            terminal,
-            stage: Stage::AwaitingHost,
-            host: None,
-            updated_unix_ms: unix_ms(),
-            elapsed_ms: 0,
-            capture_budget_ms: 0,
-            capture_elapsed_ms: None,
-            variables: None,
-            background_children_stopped: None,
-            failure: None,
-        },
-    )
+    Ok(HostRecord {
+        schema: 1,
+        managed_session_id: store
+            .directory()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("session directory has no id")?
+            .into(),
+        claim_token: token.into(),
+        terminal,
+        stage: Stage::AwaitingHost,
+        host: None,
+        updated_unix_ms: unix_ms(),
+        elapsed_ms: 0,
+        capture_budget_ms: 0,
+        capture_elapsed_ms: None,
+        variables: None,
+        background_children_stopped: None,
+        failure: None,
+    })
 }
 
-// `current` and the writers below serve the macOS launch host; no other platform has one.
+/// Publish a failure after the Herdr host proved its binding. Its incarnation is in
+/// that surface record, so schema 1 carries no separate host admission or capture stages.
+/// A later Claim, close, wrapper spawn or binding change wins over this diagnosis.
+#[cfg(any(target_os = "linux", windows, all(unix, test)))]
+pub(in crate::native) fn fail_bound_herdr(
+    store: &Store,
+    token: &str,
+    surface: &crate::native::terminal::TerminalSession,
+    reason: FailureReason,
+    elapsed_ms: u64,
+) -> Result<()> {
+    let _lock = store.lock()?;
+    eligible(store, token, false)?;
+    let mut host = unrecorded_host(store, token, TerminalKind::Herdr)?;
+    anyhow::ensure!(
+        surface.kind == TerminalKind::Herdr
+            && pending::bound_surface(store, &host.managed_session_id, || "invalid host binding")?
+                .as_ref()
+                == Some(surface),
+        "Herdr binding changed"
+    );
+    host.failure = Some(Failure {
+        reason,
+        exit_code: None,
+        signal: None,
+    });
+    host.elapsed_ms = elapsed_ms;
+    write(store, &host)
+}
+
+// `current` and the stage writers below serve the macOS capture host.
 #[cfg(any(target_os = "macos", test))]
 fn current(store: &Store, token: &str, require_time: bool) -> Result<HostRecord> {
     let receipt = eligible(store, token, require_time)?;

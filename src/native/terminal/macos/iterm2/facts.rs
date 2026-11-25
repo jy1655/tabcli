@@ -13,14 +13,17 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
         guards_dialog_input: true,
     },
     host_command: "native-iterm2-host",
-    launch_host: Some(LaunchHost::ShellCapture {
+    launch_host: Some(LaunchHost::new(
+        true,
         #[cfg(target_os = "macos")]
-        binding_names_host: crate::native::terminal::macos::iterm2::binding_names_this_host,
-    }),
+        Some(crate::native::terminal::macos::iterm2::binding_names_this_host),
+        #[cfg(any(target_os = "linux", windows))]
+        None,
+    )),
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     screen_read_refusal: None,
     guarded_input_refusal: None,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     binding: None,
     #[cfg(target_os = "macos")]
     binding: Some(BindingFacts {

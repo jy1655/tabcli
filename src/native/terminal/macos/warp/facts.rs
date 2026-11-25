@@ -18,8 +18,6 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     guarded_input_refusal: Some(
         "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
     ),
-    #[cfg(target_os = "linux")]
-    binding: None,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     binding: None,
 };

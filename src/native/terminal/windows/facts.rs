@@ -15,8 +15,6 @@ pub(in crate::native) const REGISTRATION: Registration = Registration {
     close_evidence: CloseEvidenceChoice::PresenceOnly,
     screen_read_refusal: None,
     guarded_input_refusal: None,
-    #[cfg(target_os = "linux")]
-    binding: None,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     binding: None,
 };

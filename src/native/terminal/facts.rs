@@ -1,7 +1,7 @@
 //! Adapter declarations are portable: a persisted handle can name another platform.
 //! Each terminal kind is registered once, in its own `facts.rs`, and every shared
 //! lookup (surface facts, host command, launch host, close evidence, declared refusals
-//! and the macOS binding facts) reads that registration.
+//! and binding facts) reads that registration.
 use super::TerminalKind;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use super::TerminalSession;
@@ -35,23 +35,29 @@ pub(in crate::native) enum CloseEvidenceChoice {
 /// The local program behind a registered launch-host command. The command form
 /// and historical stage records remain readable on every platform.
 #[derive(Clone, Copy)]
-pub(in crate::native) enum LaunchHost {
-    ShellCapture {
-        #[cfg(target_os = "macos")]
-        binding_names_host: fn(&TerminalSession) -> bool,
-    },
-    #[cfg(target_os = "linux")]
-    BoundBash(fn(&TerminalSession) -> bool),
-    /// Windows has no exec: the host waits for its binding, then starts the console root's
-    /// PowerShell in its own console and ends with it. `Registration::binding` serves the
-    /// macOS and Linux dispatch, so this host carries the binding it waits for.
-    #[cfg(windows)]
-    BoundPowerShell(fn(&TerminalSession) -> bool, &'static BindingFacts),
+pub(in crate::native) struct LaunchHost {
+    records_capture_stages: bool,
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(super) names_binding: Option<fn(&TerminalSession) -> bool>,
 }
 
-/// One kind's registration. A refusal of `None` means the kind supports the
-/// operation; `Some` is the exact message the shared macOS dispatch answers with
-/// before any adapter is reached.
+impl LaunchHost {
+    pub(super) const fn new(
+        records_capture_stages: bool,
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))] names_binding: Option<
+            fn(&TerminalSession) -> bool,
+        >,
+    ) -> Self {
+        Self {
+            records_capture_stages,
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            names_binding,
+        }
+    }
+}
+
+/// One kind's registration. A refusal of `None` means the kind supports the operation.
+/// Dispatch code that reads a declared refusal returns its exact message before calling an adapter.
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(in crate::native) struct Registration {
     pub(in crate::native) facts: SurfaceFacts,
@@ -61,14 +67,14 @@ pub(in crate::native) struct Registration {
     pub(in crate::native) close_evidence: CloseEvidenceChoice,
     pub(in crate::native) screen_read_refusal: Option<&'static str>,
     pub(in crate::native) guarded_input_refusal: Option<&'static str>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) binding: Option<BindingFacts>,
 }
 
 impl Registration {
     /// The binding facts of a kind whose launch host waits for a surface binding.
     /// Evaluated at compile time by the adapters that have one.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) const fn binding(&'static self) -> &'static BindingFacts {
         match &self.binding {
             Some(binding) => binding,
@@ -99,10 +105,10 @@ impl TerminalKind {
 
     /// The launcher initializes stages before the spawn fence for capture hosts.
     pub(in crate::native) const fn records_launch_stages(self) -> bool {
-        matches!(
-            self.registration().launch_host,
-            Some(LaunchHost::ShellCapture { .. })
-        )
+        match self.registration().launch_host {
+            Some(host) => host.records_capture_stages,
+            None => false,
+        }
     }
 
     /// Whether this machine can run the registered capture or its doctor probe.
