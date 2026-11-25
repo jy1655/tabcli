@@ -987,13 +987,25 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
             "HC_TERMINAL_ID names {address}, which is no longer running"
         )));
     };
+    // This process and up to MAX_ANCESTRY parent links above it are compared, the last one
+    // obtained included. A chain that ends first proves the command is outside the program;
+    // reaching the bound proves nothing, and both refuse.
     let mut pid = core.current_pid();
-    for _ in 0..MAX_ANCESTRY {
+    let mut links = 0;
+    loop {
         if pid == program {
             return Ok(Caller::Verified(address));
         }
+        if links == MAX_ANCESTRY {
+            return Ok(Caller::Outside(format!(
+                "HC_TERMINAL_ID names Herdr terminal {address}, but its program was not found within {MAX_ANCESTRY} parent processes of this command, so TAB cannot confirm that this command runs inside it"
+            )));
+        }
         match core.parent_pid(pid)? {
-            Some(parent) if parent > 1 && parent != pid => pid = parent,
+            Some(parent) if parent > 1 && parent != pid => {
+                pid = parent;
+                links += 1;
+            }
             _ => break,
         }
     }

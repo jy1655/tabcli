@@ -1370,6 +1370,54 @@ fn an_automatic_choice_proves_the_caller_runs_inside_its_terminal() {
     );
 }
 
+// The ancestry walk compares every process it reaches, the last one within its bound
+// included, and tells a bound it reached from a chain that ended: the first is inconclusive,
+// the second proves the command is outside the terminal's program. Both refuse the choice.
+#[test]
+fn the_caller_check_compares_the_last_ancestor_and_reports_its_bound_apart() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().caller = Some("t3".into());
+    // This process is 900; its ancestors are 1000, 1001, ...: `links` parent links up to
+    // the terminal's program, which is then the last process the walk reaches.
+    let chain = |links: u32| -> BTreeMap<u32, u32> {
+        let mut parents = BTreeMap::from([(900, 1000)]);
+        for pid in 1000..1000 + links {
+            parents.insert(pid, pid + 1);
+        }
+        parents
+    };
+    let program_at = |links: u32| 999 + links;
+    let limit = u32::try_from(MAX_ANCESTRY).unwrap();
+    for links in [1, limit - 1, limit] {
+        core.0.borrow_mut().terminals.insert(
+            "t3".into(),
+            json!({"address": "t3", "state": "live", "pid": program_at(links),
+                   "argv": ["sh"], "created_ms": 1, "labels": {}}),
+        );
+        core.0.borrow_mut().parents = chain(limit + 5);
+        verify_caller(&core, later()).unwrap_or_else(|error| {
+            panic!("a program {links} links above is the caller's: {error:#}")
+        });
+    }
+    // One link beyond the bound: not found within it, which proves nothing about the chain.
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": program_at(limit + 1),
+               "argv": ["sh"], "created_ms": 1, "labels": {}}),
+    );
+    let text = error_text(&verify_caller(&core, later()).unwrap_err());
+    assert!(
+        text.contains(&format!("within {MAX_ANCESTRY} parent processes")),
+        "{text}"
+    );
+    assert!(!text.contains("does not run inside its program"), "{text}");
+    assert!(text.contains("no other terminal was opened"), "{text}");
+    // A chain that ends before the bound proves the command is outside.
+    core.0.borrow_mut().parents = chain(3);
+    let text = error_text(&verify_caller(&core, later()).unwrap_err());
+    assert!(text.contains("does not run inside its program"), "{text}");
+}
+
 #[test]
 fn the_attach_command_names_the_recorded_socket() {
     let core = FakeCore::new();
