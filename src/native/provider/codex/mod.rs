@@ -107,7 +107,7 @@ fn codex_version(output: &str) -> Result<Version> {
 // - Labelled text (the label occurs once): the field is read as `version`, and its result,
 //   error included, is the answer. Words before the label (a warning line, a timestamp,
 //   another program's version) and words after the field (`(runtime 22.0.0)`, more lines) are
-//   never read.
+//   never read as the version; they are only scanned for a second label.
 // - Unlabelled text: read as `version` only when the whole text is one word.
 // - Everything else is refused: a second label, a label without a field on its line, and
 //   unlabelled text of more than one word.

@@ -17,13 +17,14 @@
   word on the label's line, read whole as an optional `v` and SemVer with no punctuation
   removed. With exactly one label, the field's result is the answer, error included: words
   before the label (a warning, a timestamp, another program's version) and after the field
-  are never read, so `0.170.0--` is a prerelease and `0.170.0+`, `0.170.0.` and
-  `codex-cli unknown (runtime 22.0.0)` are refused. Without a label, only a text of one word
-  is read as the field. A second label, a label without a field on its line and longer
-  unlabelled text are refused. Compared with the launch-time check of 0.4.48, which took the
-  first token that parsed once punctuation was trimmed, each rule only refuses more except
-  one: a labelled stable field at or above the floor is admitted even when noise before the
-  label held a version that check would have read first (below the floor or a prerelease).
+  are never read as the version and are only scanned for a second label, so `0.170.0--` is a
+  prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
+  refused. Without a label, only a text of one word is read as the field. A second label, a
+  label without a field on its line and longer unlabelled text are refused. Compared with the
+  launch-time check of 0.4.48, which took the first token that parsed once punctuation was
+  trimmed, each rule only refuses more except one: a labelled stable field at or above the
+  floor is admitted even when noise before the label held a version that check would have
+  read first (below the floor or a prerelease).
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases
   wrote and admitted launch records.
