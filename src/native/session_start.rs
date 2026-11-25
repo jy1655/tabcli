@@ -195,8 +195,8 @@ pub(super) struct Resolution<'a> {
     pub(super) effort: Option<String>,
     pub(super) yolo: bool,
     pub(super) prompt: String,
-    // Chosen by `launch_surface` at the command's own place in its order: `ask` after its
-    // context resolution, `reopen` before it inspects the source.
+    // Chosen by `choose_launch_surface` at the command's own place in its order: `ask` after
+    // its context resolution, `reopen` before it inspects the source.
     pub(super) terminal_kind: terminal::TerminalKind,
     pub(super) context_sources: Vec<requests::ContextSource>,
     // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
@@ -302,25 +302,26 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
-    let terminal_kind = launch_surface(request.terminal, Some(request.provider))?;
+    let terminal_kind = choose_launch_surface(request.terminal, Some(request.provider))?;
     resolve(fresh_resolution(request, attached, terminal_kind), deadline)
 }
 
-// The Surface a launch starts on, the one entry of `ask` and `reopen`, each at its own place
-// in its order (`Resolution::terminal_kind`). An explicit `--terminal` (`requested`) wins;
-// otherwise `select_surface` chooses from the caller's environment, and an automatic Herdr
-// choice must then prove that this process runs in the caller's Herdr terminal on the running
-// core (`terminal::admit_selection`). An explicit choice is not checked against the caller.
+// The kind of Surface a launch will start on, the one entry of `ask` and `reopen`, each at
+// its own place in its order (`Resolution::terminal_kind`). It creates nothing. An explicit
+// `--terminal` (`requested`) wins; otherwise `select_surface` chooses from the caller's
+// environment, and an automatic Herdr choice must then prove that this process runs in the
+// caller's Herdr terminal on the running core (`terminal::admit_selection`, the only step
+// that opens a connection). An explicit choice is not checked against the caller.
 // `provider` is `None` while it is not known: a reopen selects before it reads its source,
 // so on Windows its automatic choice is the managed console.
 //
 // The provider's own admission of the Surface follows in `resolve`, once the provider is
 // known: before the workspace, and again with the probed version. On Windows an automatic
 // Herdr choice is made only where that same pre-probe answer accepts it, so the first
-// admission cannot refuse it there. On macOS and Linux selection does not ask the provider,
-// and the versioned admission can refuse an automatic Herdr choice that passed the caller
-// check (Codex below 0.169.0).
-pub(super) fn launch_surface(
+// admission cannot refuse it there. On macOS and Linux the automatic choice does not depend
+// on the provider's answer, and the versioned admission can refuse an automatic Herdr choice
+// that passed the caller check (Codex below 0.169.0).
+pub(super) fn choose_launch_surface(
     requested: Option<terminal::TerminalKind>,
     provider: Option<FirstPartyCli>,
 ) -> Result<terminal::TerminalKind> {
@@ -330,10 +331,10 @@ pub(super) fn launch_surface(
 }
 
 // The selection alone, without any admission; `doctor` reports it. It reads the environment
-// and, where the automatic choice depends on the provider (Herdr inside hc on Windows), the
-// adapter's answer before any version probe, and it opens nothing. So it can name a Surface
-// that `ask` then refuses: an automatic Herdr whose caller check fails, or a provider version
-// below the Surface's floor.
+// and, for a known provider, the adapter's Herdr answer before any version probe, which only
+// Windows uses to choose (Herdr inside hc only where the provider runs there); it opens
+// nothing. So it can name a Surface that `ask` then refuses: an automatic Herdr whose caller
+// check fails, or a provider version below the Surface's floor.
 pub(super) fn select_surface(
     requested: Option<terminal::TerminalKind>,
     provider: Option<FirstPartyCli>,

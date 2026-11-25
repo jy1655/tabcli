@@ -148,11 +148,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   after the provider version probe (refusing surface-specific version requirements before title,
   consent, session, or terminal creation) and carries the admitted initial `Transport` into
   `Start::run` and `turn_run::run_initial`. The surface it admits comes from one entry,
-  `launch_surface`: the requested terminal, else the caller's environment with the provider's
-  pre-probe answer for the one provider-dependent automatic choice (Herdr on Windows; a reopen
-  passes no provider, as it selects before reading its source), then the caller check of an
-  automatic Herdr choice (`terminal::admit_selection`). `doctor` reports the same selection
-  without admission (`select_surface`). The common option
+  `choose_launch_surface`, which creates nothing: the requested terminal, else the caller's
+  environment with the provider's pre-probe answer for the one provider-dependent automatic
+  choice (Herdr on Windows; a reopen passes no provider, as it selects before reading its
+  source), then the caller check of an automatic Herdr choice (`terminal::admit_selection`).
+  `doctor` reports the same selection without admission (`select_surface`). The common option
   validation they share lives in `args.rs`, and `tell` parses through the same option helper
   with the follow-up option set.
 - `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's

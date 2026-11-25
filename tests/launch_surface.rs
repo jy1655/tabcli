@@ -1,10 +1,10 @@
-//! The Surface a launch starts on, through the public commands. `ask` and `reopen` select it
-//! and admit an automatic choice before anything else they check; `doctor` reports the
-//! selection without admitting it. Each case runs the built binary as if inside a Herdr
-//! terminal (hc gives every program `HC_TERMINAL_ID` and `TERM_PROGRAM=ghostty`) whose core
-//! is absent, so admitting an automatic Herdr choice fails caller verification. No Herdr
-//! Core, state root, provider or terminal is touched, and no test changes this process's
-//! environment.
+//! The Surface a launch starts on, through the public commands. `ask` selects it and admits
+//! an automatic choice before it resolves the workspace, and `reopen` before it looks up its
+//! source; `doctor` reports the selection without admitting it. Each case runs the built
+//! binary as if inside a Herdr terminal (hc gives every program `HC_TERMINAL_ID` and
+//! `TERM_PROGRAM=ghostty`) whose core is absent, so admitting an automatic Herdr choice fails
+//! caller verification. No Herdr Core, state root, provider or terminal is touched, and no
+//! test changes this process's environment.
 #![cfg(any(target_os = "macos", target_os = "linux", windows))]
 use serde_json::Value;
 use std::{
@@ -29,15 +29,43 @@ enum Caller {
 struct Fixture {
     _directory: tempfile::TempDir,
     base: PathBuf,
+    // The socket's own short private directory under /tmp (macOS and Linux).
+    #[cfg(unix)]
+    _socket_directory: tempfile::TempDir,
+    absent_core: String,
 }
 
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let base = directory.path().canonicalize().unwrap();
+        // An endpoint where no core runs. On macOS and Linux it is a socket path, which the
+        // adapter refuses by its length (above 103 bytes on macOS, 107 on Linux) before it
+        // looks for a core, so it is not placed under the caller's temporary directory, whose
+        // length the test does not control. On Windows it is a local pipe name nothing serves.
+        #[cfg(unix)]
+        let socket_directory = tempfile::Builder::new()
+            .prefix("tls")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let absent_core = socket_directory
+            .path()
+            .join("absent.sock")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let absent_core = format!(
+            r"\\.\pipe\tabcli-launch-surface-test-{}-{}",
+            std::process::id(),
+            base.file_name().unwrap().to_string_lossy()
+        );
         Self {
             base,
             _directory: directory,
+            #[cfg(unix)]
+            _socket_directory: socket_directory,
+            absent_core,
         }
     }
 
@@ -53,7 +81,7 @@ impl Fixture {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.state_root())
             .env("XDG_STATE_HOME", &self.base)
             .env("ZDOTDIR", &self.base)
-            .env("HC_SOCKET", self.absent_core())
+            .env("HC_SOCKET", &self.absent_core)
             .env("HC_TERMINAL_ID", "t7")
             .env(
                 "TERM_PROGRAM",
@@ -74,20 +102,6 @@ impl Fixture {
             "{args:?}: a state root was created"
         );
         output
-    }
-
-    // An endpoint where no core runs: a socket path in this test's own private directory, or
-    // on Windows a local pipe name that nothing serves.
-    fn absent_core(&self) -> String {
-        if cfg!(windows) {
-            format!(
-                r"\\.\pipe\tabcli-launch-surface-test-{}-{}",
-                std::process::id(),
-                self.base.file_name().unwrap().to_string_lossy()
-            )
-        } else {
-            self.base.join("absent.sock").to_string_lossy().into_owned()
-        }
     }
 
     fn ask(&self, provider: &str, terminal: Option<&str>, caller: Caller) -> Value {

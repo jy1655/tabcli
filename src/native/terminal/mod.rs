@@ -341,7 +341,8 @@ pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure
 /// its source). Only on Windows does it change the automatic choice: inside an hc terminal
 /// it is Herdr when the provider runs there, and the managed console otherwise, as before
 /// Herdr reached Windows. An explicit choice wins; admission then asks the provider.
-/// Launches reach it through `session_start::launch_surface`, which supplies the answer.
+/// Launches reach it through `session_start::choose_launch_surface`, which supplies the
+/// answer.
 pub(super) fn select_for(
     preferred: Option<TerminalKind>,
     herdr_runs_provider: Option<bool>,
