@@ -71,7 +71,7 @@ pub(in crate::native) fn start(
     let terminal_session = match opened {
         Ok(session) => session,
         Err(error) => {
-            let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
+            let error = settle_open_failure(&created.directory, expected_claim_token, error);
             return Err(error).with_context(|| {
                 format!(
                     "failed to open {} surface for session {}",
@@ -87,6 +87,16 @@ pub(in crate::native) fn start(
         launch_deadline,
     )?;
     Ok(terminal_session)
+}
+
+// The settlement of a fenced launch whose surface could not be opened, or whose session
+// directory was refused before one was.
+pub(in crate::native) fn settle_open_failure(
+    directory: &Path,
+    _expected_claim_token: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    launch::terminal_failure(&Store::open_unchecked(directory), error)
 }
 
 #[cfg(unix)]

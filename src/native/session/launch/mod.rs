@@ -40,6 +40,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 mod admission_tests;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) mod binding_tests;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod refusal_tests;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
 #[cfg(test)]

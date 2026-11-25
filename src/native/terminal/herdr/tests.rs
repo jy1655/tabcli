@@ -56,9 +56,9 @@ struct FakeState {
     /// Terminals of configured remote machines, which hc's list also returns.
     remote: Vec<Value>,
     after_call: Option<(&'static str, Mutation)>,
-    /// Each session directory the launch host's admission was asked about, and the refusal
-    /// that admission gives, if any.
-    admitted: Vec<PathBuf>,
+    /// Each session directory the launch host's admission was asked about, with the number
+    /// of calls made before it, and the refusal that admission gives, if any.
+    admitted: Vec<(PathBuf, usize)>,
     refused_directory: Option<String>,
 }
 
@@ -292,7 +292,8 @@ impl Core for FakeCore {
     }
     fn admit_launch_directory(&self, directory: &Path, _: &HostAccount) -> Result<()> {
         let mut state = self.0.borrow_mut();
-        state.admitted.push(directory.to_owned());
+        let made = state.calls.len();
+        state.admitted.push((directory.to_owned(), made));
         match &state.refused_directory {
             Some(reason) => bail!("{reason}"),
             None => Ok(()),
@@ -714,12 +715,38 @@ fn creation_refuses_a_directory_the_cores_launch_host_would_refuse() {
         "the Herdr terminal was not created: the Herdr launch host would refuse the session directory /state/session-herdr1: Herdr launch directory is not private to the current user"
     );
     assert_eq!(core.methods(), ["connect", "hello"]);
-    assert_eq!(core.0.borrow().admitted, [PathBuf::from(DIRECTORY)]);
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), 2)]);
     assert!(core.0.borrow().terminals.is_empty());
     let core = FakeCore::new();
     created(&core);
-    assert_eq!(core.0.borrow().admitted, [PathBuf::from(DIRECTORY)]);
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), 2)]);
     assert_eq!(core.methods()[..3], ["connect", "hello", "terminal.run"]);
+}
+
+// When the caller check fails on the first connection, the terminal is created on a new one.
+// The directory is admitted on that connection, for the account that serves it, right before
+// `terminal.run`, not on the connection that was given up.
+#[cfg(unix)]
+#[test]
+fn creation_admits_the_directory_on_the_connection_that_runs_the_terminal() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().caller = Some("t3".into());
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": 300, "argv": ["shell"], "created_ms": 1}),
+    );
+    core.inject("terminal.get", Injected::Instead(refused("unavailable")));
+    created(&core);
+    let methods = core.methods();
+    let run = methods
+        .iter()
+        .position(|method| method == "terminal.run")
+        .unwrap();
+    assert_eq!(
+        methods[..run],
+        ["connect", "hello", "terminal.get", "connect", "hello"]
+    );
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), run)]);
 }
 
 #[test]

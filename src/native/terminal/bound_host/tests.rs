@@ -364,9 +364,27 @@ const KINDS: [TerminalKind; 8] = [
     TerminalKind::WindowsConsole,
 ];
 
-// The launcher's check is the host's own admission, for the same account: it refuses exactly
-// the directories that admission refuses, with the host's reason, and never a directory of a
-// kind whose host does not run it.
+// The launch hosts whose admission the launcher runs before it opens a surface: the hosts
+// this platform runs, which run as this process's account (tmux) or an account TAB does not
+// attest (the macOS applications). Herdr's host runs as its core, which the adapter judges on
+// the connection that creates the terminal; a host this platform cannot run judges nothing,
+// so an unsupported surface keeps its own refusal.
+#[cfg(unix)]
+fn judged_by_the_launcher(kind: TerminalKind) -> bool {
+    match kind {
+        TerminalKind::Tmux => cfg!(target_os = "linux"),
+        TerminalKind::Iterm2
+        | TerminalKind::WezTerm
+        | TerminalKind::AppleTerminal
+        | TerminalKind::Ghostty
+        | TerminalKind::Warp => cfg!(target_os = "macos"),
+        TerminalKind::Herdr | TerminalKind::WindowsConsole => false,
+    }
+}
+
+// The launcher's check is the host's own admission: it refuses exactly the directories that
+// admission refuses, with the host's reason, for a host this platform runs and whose account
+// is not another process's; any other kind is not judged here.
 #[cfg(unix)]
 #[test]
 fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
@@ -397,7 +415,7 @@ fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
             };
             let host = run_bound_host(directory, &spec, |_| Ok(()));
             let launcher = refuse_before_launch(directory, kind);
-            if kind == TerminalKind::WindowsConsole {
+            if !judged_by_the_launcher(kind) {
                 launcher.unwrap();
                 continue;
             }
@@ -416,15 +434,18 @@ fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
             }
         }
     }
-    assert!(refuse_before_launch(&private, TerminalKind::Herdr).is_ok());
+    let judged = if cfg!(target_os = "linux") {
+        TerminalKind::Tmux
+    } else {
+        TerminalKind::Iterm2
+    };
+    assert!(refuse_before_launch(&private, judged).is_ok());
     assert_eq!(
+        format!("{:#}", refuse_before_launch(&shared, judged).unwrap_err()),
         format!(
-            "{:#}",
-            refuse_before_launch(&shared, TerminalKind::Herdr).unwrap_err()
-        ),
-        format!(
-            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
-            shared.display()
+            "the {name} launch host would refuse the session directory {}: {name} launch directory is not private to the current user",
+            shared.display(),
+            name = judged.display_name()
         )
     );
 }
@@ -499,4 +520,83 @@ fn the_elevation_advice_names_the_observed_case() {
             "{advice}"
         );
     }
+}
+
+// A refusal only the host can know is in the launch log on every OS: the macOS hosts log
+// their admission refusal as the Linux and Windows hosts do. The line is a diagnostic, not a
+// launch Record.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_macos_hosts_log_their_admission_refusal() {
+    let temp = tempfile::tempdir().unwrap();
+    for kind in [
+        TerminalKind::Herdr,
+        TerminalKind::Iterm2,
+        TerminalKind::WezTerm,
+    ] {
+        let directory = temp.path().join(format!("session-{}", kind.as_str()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+        let error =
+            super::super::macos::launch_host::run(&directory, "never run", kind).unwrap_err();
+        let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
+        assert!(
+            log.ends_with(&format!(" {}_host_refused: {error:#}\n", kind.as_str())),
+            "{kind:?}: {log}"
+        );
+        assert!(
+            !Store::open_unchecked(&directory)
+                .record(CoreRecord::LaunchHost)
+                .path()
+                .exists()
+        );
+    }
+    let directory = temp.path().join("session-terminal");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+    let error = run_tty_bound_host(
+        &directory,
+        TerminalKind::AppleTerminal,
+        || -> Result<()> { panic!("admission refused") },
+        |_, _, _| panic!("admission refused"),
+        None,
+    )
+    .unwrap_err();
+    let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
+    assert!(
+        log.ends_with(&format!(" terminal_host_refused: {error:#}\n")),
+        "{log}"
+    );
+}
+
+// A host refuses a link at its session directory's path and writes nothing through it: the
+// link can name another session, whose launch log stays as it was.
+#[cfg(unix)]
+#[test]
+fn a_refused_link_is_never_written_through() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("session-target");
+    fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let link = temp.path().join("session-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    for kind in [TerminalKind::Herdr, TerminalKind::Tmux] {
+        let error = run_handoff_with(
+            &link,
+            kind,
+            &mut SystemClock,
+            |_| panic!("admission refused"),
+            || panic!("admission refused"),
+            || -> Result<()> { panic!("admission refused") },
+            || panic!("admission refused"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().starts_with("refusing non-directory"),
+            "{error:#}"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    super::super::macos::launch_host::run(&link, "never run", TerminalKind::Herdr).unwrap_err();
+    assert!(!target.join(launch::LOG).exists());
 }

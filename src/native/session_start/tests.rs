@@ -11,6 +11,7 @@ struct Fixture {
     unwritable_consent: bool,
     unwritable_claim: bool,
     terminal_kind: terminal::TerminalKind,
+    provider: FirstPartyCli,
     // A directory at the launch receipt's path: `launch::begin` fails and the receipt stays
     // unreadable. Without it the launch can reach the terminal, so a test that clears it
     // must stop the launch another way.
@@ -30,6 +31,7 @@ impl Fixture {
             unwritable_consent: false,
             unwritable_claim: false,
             terminal_kind: terminal::TerminalKind::WindowsConsole,
+            provider: FirstPartyCli::Codex,
             receipt_directory: true,
             recorded_launch_host: false,
             status_lock_directory: false,
@@ -49,8 +51,8 @@ impl Fixture {
     fn prepare(&self) -> Result<Prepared> {
         let resolved = Resolved::from_parts(
             SessionSpec {
-                provider: FirstPartyCli::Codex,
-                provider_path: PathBuf::from("codex"),
+                provider: self.provider,
+                provider_path: PathBuf::from(self.provider.as_str()),
                 provider_version: "fixture".into(),
                 workspace: self.root.path().canonicalize()?,
                 title: "fixture".into(),
@@ -1101,23 +1103,22 @@ fn a_surface_failure_after_the_fence_keeps_its_terminal_failure_settlement() {
     assert_eq!(result["error"], recorded.as_str(), "{result}");
 }
 
-// A session directory that the launch host would refuse (here: another account can change
-// it) is refused by the launcher with the host's own reason before any surface exists, not
-// by the host after the surface was created, when the launcher could learn it only at the
-// launch deadline (2026-11-26). The start settles as a refusal before a surface does: the
-// receipt stays pending, the failure is recorded with the released Claim and the failed
-// Request, no surface record exists, and close needs no terminal. The kind is one whose host
-// runs that admission but which this platform does not open, so the code before the check
-// opened no terminal either: it failed with the kind's refusal instead.
+// The case of 2026-11-26 on a supported route: a Herdr start whose session directory the
+// core's launch host would refuse (here: another account can change it). Before, the
+// terminal was created and its host refused the directory in the launch log only, so the
+// start waited for its deadline. Now the adapter judges the directory for the core's account
+// on the connection that would create the terminal, and `terminal.run` is never sent. The
+// scripted core refuses every `terminal.run`, so the code before this check failed at once
+// too, after sending it. The start settles as a refusal before a surface: the receipt stays
+// pending, the failure is recorded with the released Claim and the failed Request, the
+// launch log keeps the reason, and the session closes without a terminal and is pruned.
 #[test]
-fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
+fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
+    let core = scripted_core::Core::start();
     let mut fixture = Fixture::new();
     fixture.receipt_directory = false;
-    fixture.terminal_kind = if cfg!(target_os = "linux") {
-        terminal::TerminalKind::AppleTerminal
-    } else {
-        terminal::TerminalKind::Tmux
-    };
+    fixture.terminal_kind = terminal::TerminalKind::Herdr;
+    fixture.provider = FirstPartyCli::Pi;
     let prepared = fixture.prepare().unwrap();
     let directory = &prepared.created.directory;
     #[cfg(unix)]
@@ -1135,18 +1136,18 @@ fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
             .unwrap();
         assert!(status.success(), "icacls /grant");
     }
-    let (error, report) = run(&prepared, &FreshSource);
+    let (error, report) = core.reached_by(|| run(&prepared, &FreshSource));
     let text = format!("{error:#}");
-    let name = fixture.terminal_kind.display_name();
+    assert_eq!(core.runs(), 0, "{text}");
     let cause = text
         .strip_prefix(&format!(
-            "failed to open {name} surface for session {}: ",
+            "failed to open Herdr surface for session {}: ",
             prepared.created.id
         ))
         .unwrap_or_else(|| panic!("{text}"));
     assert!(
         cause.starts_with(&format!(
-            "the {name} launch host would refuse the session directory {}: {name} launch directory is not private to the current user",
+            "the Herdr terminal was not created: the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
             directory.display()
         )),
         "{cause}"
@@ -1156,35 +1157,272 @@ fn a_session_directory_the_launch_host_would_refuse_fails_before_any_surface() {
         launch::read(&store).unwrap().unwrap().phase,
         launch::Phase::Pending
     );
-    assert_eq!(
-        store.status().unwrap().error.as_deref(),
-        Some(
-            format!(
-                "terminal launch failed: {cause}; no surface handle was recorded and no prompt was sent"
-            )
-            .as_str()
-        )
+    let recorded = format!(
+        "terminal launch failed: {cause}; no surface handle was recorded and no prompt was sent"
     );
-    // The launch log keeps the reason, after the pending launch it began.
+    assert_eq!(store.status().unwrap().error, Some(recorded.clone()));
     assert!(
         fs::read_to_string(directory.join(launch::LOG))
             .unwrap()
-            .contains(&format!("terminal launch failed: {cause}")),
+            .contains(&recorded)
     );
-    for record in [CoreRecord::ProviderProcess, CoreRecord::LaunchHost] {
-        assert!(
-            store.record(record).bytes().unwrap().is_none(),
-            "{}",
-            record.name()
-        );
-    }
+    assert!(
+        store
+            .record(CoreRecord::ProviderProcess)
+            .bytes()
+            .unwrap()
+            .is_none()
+    );
+    // Only the macOS capture host's stage is recorded before the surface opens.
+    assert_eq!(
+        store
+            .record(CoreRecord::LaunchHost)
+            .bytes()
+            .unwrap()
+            .is_some(),
+        cfg!(target_os = "macos")
+    );
     assert_settled_before_fence(&fixture, &prepared, &report);
-    // Closed like any session, it is pruned like one.
     assert_eq!(
         crate::native::prune::prune_closed_sessions(fixture.root.path(), u128::MAX).unwrap(),
         std::slice::from_ref(&prepared.created.id)
     );
     assert!(!directory.exists());
+}
+
+/// A running Herdr Core at its own endpoint, served by this process: it answers `hello`, says
+/// that no terminal exists, and refuses every `terminal.run` before creating anything,
+/// counting those requests. `reached_by` points `HC_SOCKET` at it for one call.
+mod scripted_core {
+    use serde_json::{Value, json};
+    use std::{
+        io::{Read, Write},
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+    };
+
+    const METHODS: [&str; 6] = [
+        "terminal.run",
+        "terminal.get",
+        "terminal.kill",
+        "terminal.rm",
+        "terminal.send",
+        "terminal.read",
+    ];
+
+    pub(super) struct Core {
+        endpoint: PathBuf,
+        runs: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+        #[cfg(unix)]
+        _directory: tempfile::TempDir,
+    }
+
+    impl Core {
+        pub(super) fn runs(&self) -> usize {
+            self.runs.load(Ordering::SeqCst)
+        }
+
+        /// Runs `call` with `HC_SOCKET` naming this core and without a caller terminal, and
+        /// restores both variables.
+        pub(super) fn reached_by<T>(&self, call: impl FnOnce() -> T) -> T {
+            let saved = ["HC_SOCKET", "HC_TERMINAL_ID"].map(|name| (name, std::env::var_os(name)));
+            // SAFETY: the test harness runs serially (`--test-threads=1`); the values are set
+            // for this call only and restored before the test goes on.
+            unsafe {
+                std::env::set_var("HC_SOCKET", &self.endpoint);
+                std::env::remove_var("HC_TERMINAL_ID");
+            }
+            let result = call();
+            for (name, value) in saved {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+            result
+        }
+    }
+
+    fn error(id: Value, kind: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "error": {
+            "code": -32000,
+            "message": format!("{kind} by the scripted core"),
+            "data": {"kind": kind},
+        }})
+    }
+
+    // One request line, or `None` at the end of the connection.
+    fn request(stream: &mut impl Read) -> Option<Value> {
+        let mut line = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(1) if byte[0] == b'\n' => break,
+                Ok(1) => line.push(byte[0]),
+                _ => return None,
+            }
+        }
+        serde_json::from_slice(&line).ok()
+    }
+
+    fn serve(mut stream: impl Read + Write, runs: &AtomicUsize) {
+        while let Some(request) = request(&mut stream) {
+            let id = request["id"].clone();
+            let reply = match request["method"].as_str() {
+                Some("hello") => json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "generation": 1, "version": "0.1.21", "methods": METHODS,
+                    "core": {"id": "core-scripted", "name": "scripted"},
+                }}),
+                Some("terminal.run") => {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    error(id, "spawn_failed")
+                }
+                _ => error(id, "not_found"),
+            };
+            if stream
+                .write_all(format!("{reply}\n").as_bytes())
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Core {
+        pub(super) fn start() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint = directory.path().join("core.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = thread::spawn({
+                let (runs, stop) = (Arc::clone(&runs), Arc::clone(&stop));
+                move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false).unwrap();
+                                serve(stream, &runs);
+                            }
+                            Err(_) => thread::sleep(std::time::Duration::from_millis(5)),
+                        }
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                runs,
+                stop,
+                server: Some(server),
+                _directory: directory,
+            }
+        }
+
+        fn wake(_: &Path) {}
+    }
+
+    // One listening instance at a time, created before the last one is served, as hc does:
+    // a client always finds the pipe.
+    #[cfg(windows)]
+    impl Core {
+        pub(super) fn start() -> Self {
+            use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+            use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+            let endpoint = PathBuf::from(format!(
+                r"\\.\pipe\tabcli-start-test-{}",
+                std::process::id()
+            ));
+            let wide: Vec<u16> = endpoint
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let first = instance(&wide);
+            let runs = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = thread::spawn({
+                let (runs, stop) = (Arc::clone(&runs), Arc::clone(&stop));
+                move || {
+                    let mut current = first;
+                    loop {
+                        let raw = current as windows_sys::Win32::Foundation::HANDLE;
+                        // A client that connected before this call is connected as well.
+                        unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) };
+                        let stream = unsafe { std::fs::File::from_raw_handle(raw) };
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        current = instance(&wide);
+                        serve(stream, &runs);
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                runs,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        // A client connection ends the server's wait for one.
+        fn wake(endpoint: &Path) {
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(endpoint);
+        }
+    }
+
+    #[cfg(windows)]
+    fn instance(wide: &[u16]) -> usize {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+            System::Pipes::{
+                CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+                PIPE_WAIT,
+            },
+        };
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                4,
+                65536,
+                65536,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(
+            raw,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        raw as usize
+    }
+
+    impl Drop for Core {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            Self::wake(&self.endpoint);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
 }
 
 // A launch failure whose Claim the launcher already fenced belongs to the launcher's own

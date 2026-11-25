@@ -103,6 +103,45 @@ fn bridge_shell_command_rejects_controls_in_dynamic_components() {
     }
 }
 
+// The launch command and every launch host's arguments carry these paths as text. A path
+// that is not Unicode would reach them changed (a replacement character in its place), so a
+// host would look for another session directory than the one created and checked; the start
+// refuses it before anything is created.
+#[test]
+fn bridge_shell_command_refuses_a_path_it_cannot_carry_as_exact_text() {
+    #[cfg(unix)]
+    let inexact = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(b"/tmp/state-\xff").to_owned()
+    };
+    #[cfg(windows)]
+    let inexact = {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = r"C:\state-".encode_utf16().collect();
+        wide.push(0xD800);
+        std::ffi::OsString::from_wide(&wide)
+    };
+    let inexact = Path::new(&inexact);
+    let normal = Path::new("/tmp/normal");
+    for (field, result) in [
+        (
+            "workspace",
+            bridge_shell_command(inexact, normal, normal, "session-safe123"),
+        ),
+        (
+            "state root",
+            bridge_shell_command(normal, inexact, normal, "session-safe123"),
+        ),
+        (
+            "TAB executable",
+            bridge_shell_command(normal, normal, inexact, "session-safe123"),
+        ),
+    ] {
+        let error = format!("{:#}", result.unwrap_err());
+        assert_eq!(error, format!("{field} is not Unicode text"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn provider_resolution_rejects_relative_path_entries() {

@@ -169,11 +169,21 @@ fn an_elevated_tab_is_refused_for_a_core_that_is_not_elevated() {
             "{text}"
         );
     }
-    // A directory TAB's own account would refuse as well is refused for its reason alone.
+    // A directory TAB's own account would refuse as well is refused for its reason alone: no
+    // advice about the accounts follows the host's reason. (The fixture's own name contains
+    // "elevation", so only the advice clauses are looked for.)
     icacls(&directory, "*S-1-1-0:(W)");
     let text = format!(
         "{:#}",
         refuse_before_core_launch(&directory, TerminalKind::Herdr, &core).unwrap_err()
     );
-    assert!(!text.contains("elevat"), "{text}");
+    assert!(
+        text.ends_with("session directory owner differs from current user"),
+        "{text}"
+    );
+    assert!(!text.contains("TAB is running elevated"), "{text}");
+    assert!(
+        !text.contains("give their files different owners"),
+        "{text}"
+    );
 }
