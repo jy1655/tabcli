@@ -392,113 +392,170 @@ fn an_explicit_close_ends_the_terminal_its_session_created_whatever_the_owner_re
     }
 }
 
+/// One refusal of a gone owner's close, and what the user does about it before closing again.
+struct Refusal {
+    label: &'static str,
+    change: fn(&Fixture),
+    observe: Observe,
+    refusal: &'static str,
+    /// What the user does after reading the refusal: remove a terminal they have checked with
+    /// `hc rm`, turn keep off, or bring the recorded core back.
+    recover: fn(&Fixture),
+    /// How the owner is observed at the next close.
+    again: Observe,
+    closed: CloseOutcome,
+}
+
+fn another_label(f: &Fixture) {
+    let mut labels = f.core.terminal("t7").unwrap()["labels"].clone();
+    labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
+    f.core.set("t7", "labels", labels);
+}
+
 // The creation record decides, and only it: a terminal that is not provably the one this
 // session created, or that a replacement program could run in, is left alone with its handle,
-// on every OS, and an owner that cannot be inspected is never taken for gone.
+// on every OS, and an owner that cannot be inspected is never taken for gone. Nothing is
+// stranded: once the user has dealt with what the refusal names, the next close finishes.
 #[test]
 fn an_explicit_close_leaves_anything_but_its_created_terminal_alone() {
-    type Change = fn(&Fixture);
-    let rows: [(&str, Change, Observe, &str); 11] = [
-        (
-            "finished and kept",
-            |f| {
+    let rows = [
+        Refusal {
+            label: "finished and kept",
+            change: |f| {
                 f.finish();
                 f.core.set("t7", "keep", json!(true));
             },
-            exited,
-            "set to keep",
-        ),
-        (
-            "running and kept",
-            |f| f.core.set("t7", "keep", json!(true)),
-            reused,
-            "set to keep",
-        ),
-        (
-            "another program",
-            |f| f.core.set("t7", "pid", json!(4242)),
-            exited,
-            "not the terminal this session created",
-        ),
-        (
-            "another program incarnation",
-            |f| {
+            observe: exited,
+            refusal: "set to keep",
+            recover: Fixture::remove,
+            again: exited,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "running and kept",
+            change: |f| f.core.set("t7", "keep", json!(true)),
+            observe: reused,
+            refusal: "set to keep",
+            recover: |f| f.core.set("t7", "keep", json!(false)),
+            again: reused,
+            closed: CloseOutcome::Closed,
+        },
+        Refusal {
+            label: "another program",
+            change: |f| f.core.set("t7", "pid", json!(4242)),
+            observe: exited,
+            refusal: "not the terminal this session created",
+            recover: Fixture::remove,
+            again: exited,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "another program incarnation",
+            change: |f| {
                 let pid = f.store().terminal().unwrap().herdr_core().unwrap().host_pid;
                 f.core.0.borrow_mut().births.insert(pid, test_birth(1));
             },
-            reused,
-            "another process than the one recorded",
-        ),
-        (
-            "another creation",
-            |f| f.core.set("t7", "created_ms", json!(1)),
-            exited,
-            "not the terminal this session created",
-        ),
-        (
-            "another session's directory",
-            |f| {
+            observe: reused,
+            refusal: "another process than the one recorded",
+            recover: Fixture::remove,
+            again: reused,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "another creation",
+            change: |f| f.core.set("t7", "created_ms", json!(1)),
+            observe: exited,
+            refusal: "not the terminal this session created",
+            recover: Fixture::remove,
+            again: exited,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "another session's directory",
+            change: |f| {
                 let mut argv = f.core.terminal("t7").unwrap()["argv"].clone();
                 argv[2] = json!("/state/session-other");
                 f.core.set("t7", "argv", argv);
             },
-            reused,
-            "not the terminal this session created",
-        ),
-        (
-            "another launch label, running",
-            |f| {
-                let mut labels = f.core.terminal("t7").unwrap()["labels"].clone();
-                labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
-                f.core.set("t7", "labels", labels);
-            },
-            exited,
-            "different launch label",
-        ),
-        (
-            "another launch label, finished",
-            |f| {
+            observe: reused,
+            refusal: "not the terminal this session created",
+            recover: Fixture::remove,
+            again: reused,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "another launch label, running",
+            change: another_label,
+            observe: exited,
+            refusal: "different launch label",
+            recover: Fixture::remove,
+            again: exited,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "another launch label, finished",
+            change: |f| {
                 f.finish();
-                let mut labels = f.core.terminal("t7").unwrap()["labels"].clone();
-                labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
-                f.core.set("t7", "labels", labels);
+                another_label(f);
             },
-            reused,
-            "different launch label",
-        ),
-        (
-            "another core",
-            |f| f.core.0.borrow_mut().core_id = "core-b".into(),
-            exited,
-            "a different Herdr Core (id core-b)",
-        ),
-        (
-            "no core",
-            |f| f.core.0.borrow_mut().running = false,
-            reused,
-            "no Herdr Core is running",
-        ),
-        (
-            "owner not inspectable",
-            |_| {},
-            unknown,
+            observe: reused,
+            refusal: "different launch label",
+            recover: Fixture::remove,
+            again: reused,
+            closed: CloseOutcome::Missing,
+        },
+        Refusal {
+            label: "another core",
+            change: |f| f.core.0.borrow_mut().core_id = "core-b".into(),
+            observe: exited,
+            refusal: "a different Herdr Core (id core-b)",
+            recover: |f| f.core.0.borrow_mut().core_id = "core-a".into(),
+            again: exited,
+            closed: CloseOutcome::Closed,
+        },
+        Refusal {
+            label: "no core",
+            change: |f| f.core.0.borrow_mut().running = false,
+            observe: reused,
+            refusal: "no Herdr Core is running",
+            recover: |f| f.core.0.borrow_mut().running = true,
+            again: reused,
+            closed: CloseOutcome::Closed,
+        },
+        Refusal {
+            label: "owner not inspectable",
+            change: |_| {},
+            observe: unknown,
             #[cfg(unix)]
-            "owner inspection failed",
+            refusal: "owner inspection failed",
             #[cfg(windows)]
-            "the owner is not proven live (scripted)",
-        ),
+            refusal: "the owner is not proven live (scripted)",
+            recover: |_| {},
+            again: exited,
+            closed: CloseOutcome::Closed,
+        },
     ];
-    for (label, change, observe, expected) in rows {
+    for row in rows {
+        let label = row.label;
         let fixture = Fixture::new("ready", &complete_owner());
-        change(&fixture);
+        (row.change)(&fixture);
         let before = fixture.core.terminal("t7");
         fixture.core.clear_calls();
-        let result = fixture.close(observe, false);
-        let text = error_text(&result.unwrap_err());
-        assert!(text.contains(expected), "{label}: {text}");
+        let text = error_text(&fixture.close(row.observe, false).unwrap_err());
+        assert!(text.contains(row.refusal), "{label}: {text}");
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
         assert_eq!(fixture.core.terminal("t7"), before, "{label}");
         fixture.assert_retained(label, SessionState::Ready);
+
+        (row.recover)(&fixture);
+        let result = fixture.close(row.again, false);
+        assert_eq!(
+            result.as_ref().ok(),
+            Some(&row.closed),
+            "{label}: {:?}",
+            result.as_ref().map_err(error_text)
+        );
+        fixture.assert_closed(label);
     }
 }
 

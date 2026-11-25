@@ -175,7 +175,11 @@ but its terminal still runs, the same command ends it once TAB has proved from i
 recorded creation (core, address, creation time, program, session directory and launch
 label) that it is this session's terminal. This works whatever the owner record says,
 including an owner whose process ID now belongs to another process. Listing sessions,
-`tell` and `wait` never close a Herdr terminal on their own.
+`tell` and `wait` never close a Herdr terminal on their own. If the close is refused because
+the terminal no longer matches that record (another program, creation time, session directory
+or launch label), check it with `hc get <address>` and, once you are sure, end and remove it
+yourself with `hc kill <address>` and `hc rm <address>`. The next close then finds it gone and
+closes the session record.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
