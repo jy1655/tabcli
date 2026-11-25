@@ -92,10 +92,10 @@
   launch label to agree with the terminal's generated name. A failed read or removal keeps
   the handle for retry. Cleanup after binding fails uses the ordinary close proof. Cleanup
   before confirmation checks the full launch argv, label and name, plus the creation
-  time and PID from its first read at that address. A birth is needed to retain a handle for
-  retry. The core has no conditional kill or remove, so another client of the same user can
-  still change the terminal between TAB's last read and its action. hc does not sweep
-  detached processes. TAB touches no other terminal and calls no core operation.
+  time and PID from its first read at that address. It refuses a terminal set to keep. A birth
+  is needed to retain a handle for retry. The core has no conditional kill or remove, so another
+  client of the same user can still change the terminal between TAB's last read and its action.
+  hc does not sweep detached processes. TAB touches no other terminal and calls no core operation.
 - An explicit `--terminal` wins. Otherwise `HC_TERMINAL_ID` with `TERM_PROGRAM=ghostty` (the
   identity hc gives every program) selects Herdr, on Windows only for a provider whose adapter
   runs there;
