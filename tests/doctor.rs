@@ -1561,7 +1561,7 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
         check(&report, "agy_workspace_trust").clone()
     };
     let recovering_next_action = format!(
-        "{OBSERVATION} {RECOVERY}. A workspace another provider already trusts is answered from shared consent on a later ask."
+        "{OBSERVATION} {RECOVERY}. A later ask applies shared consent itself: exact trust from another provider, or the trust of the main working tree of a verified linked git worktree."
     );
     let evidence = json!({"workspace": workspace, "store": store, "log": log});
     let with_home = [("HOME", Some(home_str)), ("USERPROFILE", None)];

@@ -423,11 +423,11 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
         let (outcome, check) = gate();
         assert_eq!(outcome, refused(TRUST_STORE_MISSING), "{marker}");
         assert_eq!(check.reason_code, "agy_workspace_untrusted", "{marker}");
-        assert_eq!(
-            serde_json::to_value(&check).unwrap()["evidence"]["session_settings"],
-            serde_json::Value::Null,
-            "{marker}"
-        );
+        // The evidence any earlier binary gave: no settings file is named.
+        let row = serde_json::to_value(&check).unwrap();
+        let mut keys: Vec<_> = row["evidence"].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["log", "store", "workspace"], "{marker}");
     }
     fs::write(&consent_record, b"{").unwrap();
     assert_eq!(gate().0, refused(TRUST_STORE_MISSING));

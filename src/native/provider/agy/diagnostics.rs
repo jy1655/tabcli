@@ -84,6 +84,13 @@ pub(super) fn workspace_trust_check(
             "{OBSERVATION} {TRUST_RECOVERY}. A later ask applies shared consent itself: exact trust from another provider, or the trust of the main working tree of a verified linked git worktree."
         )
     };
+    // The session-only settings file is named only for a session launched with it, so the row
+    // of any other session keeps the evidence it always had.
+    let mut evidence =
+        serde_json::json!({ "workspace": workspace, "store": home.settings, "log": log_path });
+    if configured {
+        evidence["session_settings"] = serde_json::json!(directory.join(SESSION_SETTINGS_FILE));
+    }
     Check::new(
         CheckId::AGY_WORKSPACE_TRUST,
         availability,
@@ -91,12 +98,7 @@ pub(super) fn workspace_trust_check(
         detail,
         next_action,
     )
-    .evidence(serde_json::json!({
-        "workspace": workspace,
-        "store": home.settings,
-        "log": log_path,
-        "session_settings": configured.then(|| directory.join(SESSION_SETTINGS_FILE)),
-    }))
+    .evidence(evidence)
 }
 
 pub(super) fn input_receipt_check(
