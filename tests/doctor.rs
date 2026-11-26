@@ -2025,8 +2025,7 @@ fn provider_version_rows_keep_each_probe_outcome() {
 // The workspace row observes the recorded directory without touching it.
 #[test]
 fn workspace_rows_keep_each_directory_outcome() {
-    const DETAIL: &str =
-        "Working directory observation; CLI version checks do not depend on this directory.";
+    const DETAIL: &str = "Working directory observation; CLI version checks do not depend on this directory, except the one that decides an automatic Herdr choice, which runs where doctor runs, as ask's does.";
     const NEXT: &str =
         "Restore or inspect the recorded directory before workspace-relative operations.";
     let fixture = Fixture::new("pi");

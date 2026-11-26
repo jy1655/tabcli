@@ -63,6 +63,26 @@ impl<'a> Recorded<'a> {
         requirement: Requirement<'a>,
         deadline: Instant,
     ) -> Result<Option<(Self, Linked<'core>)>> {
+        Ok(Self::proved(core, session, requirement, deadline)?
+            .map(|(recorded, linked, _)| (recorded, linked)))
+    }
+
+    /// `open`'s proof, returning the observation it proved.
+    pub(super) fn observe(
+        core: &dyn Core,
+        session: &'a TerminalSession,
+        requirement: Requirement<'a>,
+        deadline: Instant,
+    ) -> Result<Option<Observed>> {
+        Ok(Self::proved(core, session, requirement, deadline)?.map(|(_, _, observed)| observed))
+    }
+
+    fn proved<'core>(
+        core: &'core dyn Core,
+        session: &'a TerminalSession,
+        requirement: Requirement<'a>,
+        deadline: Instant,
+    ) -> Result<Option<(Self, Linked<'core>, Observed)>> {
         let surface = target(session)?;
         let recorded = Self {
             session,
@@ -79,7 +99,7 @@ impl<'a> Recorded<'a> {
             return Ok(None);
         };
         recorded.check(core, &observed)?;
-        Ok(Some((recorded, linked)))
+        Ok(Some((recorded, linked, observed)))
     }
 
     /// Applies the same proof to a fresh observation on the verified connection.

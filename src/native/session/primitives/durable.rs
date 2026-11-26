@@ -63,6 +63,9 @@ thread_local! {
     /// Directories whose sync fails with an injected error while `with_sync_failure` runs.
     static SYNC_FAILURES: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Directories whose sync waits first while `with_sync_delay` runs.
+    static SYNC_DELAYS: std::cell::RefCell<Vec<(PathBuf, std::time::Duration)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Every journaled event the publication predicate opened, in order, so a test can
     /// prove when a search reads a journaled event and when it does not read it at all.
     static PUBLICATION_READ_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> =
@@ -143,6 +146,20 @@ pub(in crate::native) fn with_sync_failure<T>(directory: &Path, run: impl FnOnce
     SYNC_FAILURES.with(|failures| failures.borrow_mut().push(directory.to_path_buf()));
     let outcome = run();
     SYNC_FAILURES.with(|failures| failures.borrow_mut().clear());
+    outcome
+}
+
+/// Runs `run` while every sync of `directory` on this thread waits `delay` first: a slow
+/// disk under one Session.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+pub(in crate::native) fn with_sync_delay<T>(
+    directory: &Path,
+    delay: std::time::Duration,
+    run: impl FnOnce() -> T,
+) -> T {
+    SYNC_DELAYS.with(|delays| delays.borrow_mut().push((directory.to_path_buf(), delay)));
+    let outcome = run();
+    SYNC_DELAYS.with(|delays| delays.borrow_mut().clear());
     outcome
 }
 
@@ -336,6 +353,16 @@ pub(in crate::native) fn sync_parent_directory(path: &Path) -> Result<()> {
 
 pub(in crate::native) fn sync_directory(directory: &Path) -> Result<()> {
     record_sync(SyncKind::Directory, directory);
+    #[cfg(test)]
+    if let Some(delay) = SYNC_DELAYS.with(|delays| {
+        delays
+            .borrow()
+            .iter()
+            .find(|(delayed, _)| delayed == directory)
+            .map(|(_, delay)| *delay)
+    }) {
+        std::thread::sleep(delay);
+    }
     #[cfg(test)]
     if SYNC_FAILURES.with(|failures| failures.borrow().iter().any(|failed| failed == directory)) {
         bail!("injected sync failure for {}", directory.display());

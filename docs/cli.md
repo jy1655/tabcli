@@ -176,6 +176,46 @@ remain nonempty. They are record labels; a terminal can also use its own ownersh
 `--terminal` defaults to platform detection (Herdr inside an hc terminal on Linux, otherwise tmux on Linux; on Windows, Herdr inside an hc terminal for a provider that runs there, otherwise the managed console). Documented values are `ghostty`, `herdr` (aliases `hc` and `herdr-core`; macOS, Linux, and Windows except Codex), `iterm2`, `terminal`,
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
+Before it creates the Surface, TAB reproduces the launch host's check of the new session
+directory, as far as TAB can know it then. The host admits a real directory (not a symbolic
+link or a junction) owned by the account it runs as; on macOS and Linux its permission bits
+must give no other user or group access, and on Windows its access list must let no account
+other than its owners, System and Administrators change its entries. TAB judges this for the
+account the host runs as when TAB can name it (its own for tmux, the core's for Herdr); for a
+macOS terminal application it judges the permission bits but not the owner, and the Windows
+console's host makes no such check. For these hosts except tmux, the path must also be one
+that can be sent to the host as text exactly. TAB refuses only what it read: when its own
+read fails, for example because its token cannot read the directory's access list, the host
+decides. TAB detects a directory the host would refuse at once and fails the start as a Surface
+that cannot be opened does; the start returns when TAB has the session's lifecycle lock, which
+another command can hold for up to the launch timeout. The error names the directory and the
+host's reason. If TAB cannot establish, under the session's lifecycle lock and before the
+launch timeout, that the start is still its own pending launch (for example because another
+command holds the lock for the whole launch timeout, or a record cannot be read), it writes
+nothing: the session's status, its claim and its launch log stay as they were (for example
+`launching`, with the `launch_pending` line TAB wrote when the launch began), and the returned
+error holds the reason. What the status becomes afterwards is left to the launch repair that
+later commands such as `sessions` run, and to `reopen`, as for a Surface that cannot be opened
+while another command holds the lock. When TAB can establish it, TAB settles the start as it
+settles a Surface that cannot be opened, as in 0.4.49: it records `terminal launch failed: the
+<host> launch host would refuse the session directory; no surface handle was recorded and no
+prompt was sent` as the session's failed status, then releases the claim, then appends the same
+line to the launch log. An error writing the status or releasing the claim ends the settlement
+there and is returned with the refusal; the log line is best effort, and a failure to append it
+is not reported. The directory is judged once, as TAB saw it: correcting it while the start
+waits does not change the outcome, so correct it and run the command again. TAB cannot know a
+change made after its check, a host started under another account than the one it named, or an
+error only the host meets; the host still refuses those and appends to its launch log when it
+can. A Herdr start then fails at TAB's next check of the terminal, normally about a second
+after the core reports it finished, when TAB can read that the launch is still its own and
+pending and that no provider was started (when TAB completes that settlement, the session
+records `terminal surface finished before provider launch was confirmed` and the error adds the
+terminal, its exit code when the core gives one, and the launch log's path), as a tmux start
+does when its surface disappears. Otherwise TAB keeps waiting as for any surface, as in 0.4.49,
+up to the launch deadline. A surface that disappears is handled by the ordinary settlement, as
+in 0.4.49: it keeps a confirmed or ended outcome it reads under the lock, can return a record
+error, and uses `terminal surface disappeared before provider launch was confirmed` for a
+launch that is still pending and that it can settle.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort
@@ -1268,14 +1308,31 @@ The report starts human output with `scope`, describing the inputs used by these
 - `model` and `effort` are the manifest's launch overrides, not effective runtime settings;
   both are null in provider-only mode.
 - `workspace` is the manifest workspace or the current directory, or null if the scope-only
-  current-directory lookup fails. The version probe runs in a scratch directory, so this
-  field does not name every probe's working directory.
+  current-directory lookup fails. The provider's `--version` probe runs in a scratch
+  directory, except the one that decides `terminal_selection` inside an hc terminal (below),
+  which runs as `ask`'s does, in the directory you run `doctor` from; some provider checks
+  run in this workspace. This field does not name every probe's working directory.
 - `probe` records whether `--probe` was requested. `probe_budget_ms` is the shared 5000 ms
   budget captured at report start, not a fresh allowance for each probe.
 - `consent_state` reuses the `state` from the existing `workspace_consent` observation, or
   is null when that state was not observed, including provider-only mode.
 
 Scope is not proof of an effective runtime configuration or of delivery.
+
+In provider mode the `terminal_selection` check reports, as `evidence.terminal`, the terminal
+`ask` would choose without `--terminal`. Inside an hc terminal it also has `evidence.fallback`,
+the terminal used where Herdr does not admit the provider. Where the provider's installed
+version decides between the two (today Codex on macOS and Linux), the check carries the
+outcome of the version check: with `--probe` and a version `ask` accepts, the chosen terminal;
+otherwise `terminal` is null, `evidence.herdr_requires` names Herdr's version requirement, and
+the reason is that of the `provider_version` check (`probe_not_requested`,
+`executable_unavailable`, `version_probe_failed`, `version_unsupported` or
+`version_unrecognized`). For that choice alone the version probe runs first, as `ask` runs
+it: the same command, in the directory and environment you run `doctor` from, read the same
+way, with doctor's output cap and process cleanup. Otherwise the `--version` probe runs in a
+scratch directory, with `AGENT_BRIDGE_NATIVE_SESSION_DIR` removed besides the provider's own
+removals, after the terminal checks. Doctor never checks that it runs inside the calling Herdr
+terminal, which `ask` does before it launches on Herdr.
 
 On Linux, the `platform` check reports a supported platform. When the default selection is tmux, the `tmux` check reports
 `tmux_found`, `tmux_too_old`, or `tmux_unavailable`. tmux must be executable on an absolute
@@ -1961,8 +2018,10 @@ Provider trust lookup follows these environment settings:
 - `CLAUDE_CONFIG_DIR`: read `.claude.json` here; the default directory is home.
 - `PI_CODING_AGENT_DIR`: read `trust.json` here; the default is `.pi/agent` under home.
 
-On Linux and macOS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr.
-On Windows they select Herdr for Claude, Agy and Pi; Codex keeps the managed console.
+On every OS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr
+for a provider that can run there at its installed version, and otherwise the terminal the OS
+would choose with the Herdr marker ignored: Ghostty on macOS, tmux on Linux, the managed
+console on Windows (Codex below stable 0.169.0 on macOS and Linux, and Codex on Windows).
 Otherwise Linux uses tmux. On macOS,
 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, and `TERM_SESSION_ID` select the terminal as
 described under [terminal selection](terminals.md#selection-and-settings).

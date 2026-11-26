@@ -19,6 +19,7 @@
 //! Status words (OSC 7501) are never request evidence. The endpoint is the one `hc` uses:
 //! `HC_SOCKET`, else `socket` in the config, else the platform default for `HC_SESSION`
 //! (herdr-core 0.1.21 `paths.rs`).
+use super::bound_host::HostAccount;
 use super::record::HerdrHostBirth;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::terminal::{
@@ -127,6 +128,10 @@ impl CallError {
 /// One connection to a core: one request, then its one reply line.
 pub(in crate::native::terminal) trait Connection {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError>;
+    /// The account of the process that serves this connection, as its transport identified
+    /// that process: the core, whose terminals' programs, the launch host among them, run as
+    /// it.
+    fn core_account(&self) -> Result<HostAccount>;
 }
 
 /// What the adapter reads from this process and the system.
@@ -139,14 +144,31 @@ pub(in crate::native::terminal) trait Core {
     /// The local Herdr caller marker when the terminal environment selects Herdr.
     fn caller_terminal(&self) -> Option<String>;
     fn current_pid(&self) -> u32;
-    /// The parent of a live process; `None` when there is no such process.
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>>;
+    /// What this machine shows of a process's parent.
+    fn parent_pid(&self, pid: u32) -> Result<Parent>;
     /// The birth of a live process; `None` when there is no such process.
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>>;
     fn launch_nonce(&self) -> Result<String>;
+    /// Refuses a session directory that the launch host this core would start must refuse,
+    /// judged for `account`, the core's own, or only for what needs no account when it is
+    /// unknown (`bound_host::refuse_before_core_launch`).
+    fn admit_launch_directory(&self, directory: &Path, account: Option<&HostAccount>)
+    -> Result<()>;
     fn pause(&self, deadline: Instant) {
         thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
+}
+
+/// A process's parent, as far as this machine shows it.
+#[derive(Debug, PartialEq)]
+pub(in crate::native::terminal) enum Parent {
+    /// Its parent process.
+    Process(u32),
+    /// It has no parent to follow: the system records none.
+    Root,
+    /// Its parent could not be established: the process or its parent ended, the parent's PID
+    /// now names a later process, or this process may not inspect it.
+    Unknown(String),
 }
 
 /// The `HC_TERMINAL_ID` of this process: the terminal hc says this process runs in.
@@ -231,6 +253,8 @@ fn not_running(endpoint: &Path) -> anyhow::Error {
 pub(super) trait Stream {
     fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize>;
     fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize>;
+    /// The account of the process at the other end (`Connection::core_account`).
+    fn peer_account(&self) -> Result<HostAccount>;
 }
 
 /// The time left before `deadline`, or a timeout once none is left.
@@ -328,6 +352,10 @@ impl<S: Stream> Connection for Framed<S> {
         }
         let line = self.read_line(deadline).map_err(CallError::Unanswered)?;
         parse_reply(&line, id)
+    }
+
+    fn core_account(&self) -> Result<HostAccount> {
+        self.stream.peer_account()
     }
 }
 
@@ -456,6 +484,10 @@ pub(super) struct Observed {
     pub(super) created_ms: u64,
     pub(super) launch: Option<String>,
     pub(super) name: Option<String>,
+    /// The exit code the core reports for a finished terminal, if any. Only a diagnostic:
+    /// the field name is read from the installed hc 0.1.22 (its `exit_code`), and nothing
+    /// is decided on it.
+    pub(super) exit_code: Option<i64>,
 }
 
 pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
@@ -513,6 +545,7 @@ pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
                 .to_owned(),
         ),
     };
+    let exit_code = value.get("exit_code").and_then(Value::as_i64);
     Ok(Observed {
         address,
         state,
@@ -522,6 +555,7 @@ pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
         created_ms,
         launch,
         name,
+        exit_code,
     })
 }
 
@@ -613,7 +647,7 @@ fn create(
     } else {
         match caller_on(core, &mut linked, startup_deadline) {
             Ok(Caller::Verified(parent)) => Some(parent),
-            Ok(Caller::Outside(_)) => None,
+            Ok(Caller::Outside(_) | Caller::Unverified(_)) => None,
             Err(_) => {
                 // A failed read can leave a partial reply on this connection. No run has
                 // been sent. An explicit launch can still proceed without a parent if the
@@ -630,6 +664,13 @@ fn create(
     } else {
         params["no_parent"] = json!(true);
     }
+    // The launch host is the core's program and runs as the core's account: on the connection
+    // that sends `terminal.run`, right before it, a session directory that the host's
+    // admission would refuse is refused before any Surface exists. A connection that cannot
+    // name its server's account leaves the owner to the host.
+    let account = linked.connection.core_account().ok();
+    core.admit_launch_directory(directory, account.as_ref())
+        .context("the Herdr terminal was not created")?;
     let core_id = linked.core_id.clone();
     let reconcile =
         |cause: anyhow::Error| reconcile(core, &socket, &core_id, &launch, cleanup_deadline, cause);
@@ -892,6 +933,41 @@ fn surface_present(
     Ok(Recorded::open(core, session, Requirement::Bound(directory), deadline)?.is_some())
 }
 
+/// The launcher's probe before startup is confirmed: the exact terminal this launch created,
+/// proved on its recorded core as for presence, and with the launch's own label when the
+/// handle records it. Only that core's `not_found` is absence; a finished terminal is the end
+/// of the launch host before the provider started, which the core keeps until it is removed.
+fn launch_surface(
+    core: &dyn Core,
+    session: &TerminalSession,
+    directory: &Path,
+    timeout: Duration,
+) -> Result<super::LaunchSurface> {
+    let deadline = deadline_after(timeout)?;
+    let Some(observed) = Recorded::observe(core, session, Requirement::Bound(directory), deadline)?
+    else {
+        return Ok(super::LaunchSurface::Absent);
+    };
+    if observed.state == State::Live {
+        return Ok(super::LaunchSurface::Present);
+    }
+    if let Some(expected) = session.herdr_launch_nonce()
+        && observed.launch.as_deref() != Some(expected)
+    {
+        bail!(
+            "finished Herdr terminal {} has a different launch label",
+            observed.address
+        );
+    }
+    Ok(super::LaunchSurface::Finished(match observed.exit_code {
+        Some(code) => format!(
+            "Herdr terminal {} exited with code {code}",
+            observed.address
+        ),
+        None => format!("Herdr terminal {} finished", observed.address),
+    }))
+}
+
 fn verify_surface(
     core: &dyn Core,
     session: &TerminalSession,
@@ -962,7 +1038,10 @@ fn send_file(
 
 enum Caller {
     Verified(String),
+    // The command does not run inside the named terminal's program, or no such terminal holds it.
     Outside(String),
+    // Whether it does could not be established; it is treated as outside.
+    Unverified(String),
 }
 
 /// The terminal marker alone can be inherited. Verify that the local terminal holds an
@@ -987,14 +1066,33 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
             "HC_TERMINAL_ID names {address}, which is no longer running"
         )));
     };
+    // This process and up to MAX_ANCESTRY parent links above it are compared, the last one
+    // obtained included. Only a chain that ends at a root (no parent, or init) proves the
+    // command is outside the program; reaching the bound or a parent that could not be
+    // established proves nothing. All three refuse.
+    let unverified = |why: String| {
+        Caller::Unverified(format!(
+            "HC_TERMINAL_ID names Herdr terminal {address}, but TAB could not verify that this command runs inside its program: {why}"
+        ))
+    };
     let mut pid = core.current_pid();
-    for _ in 0..MAX_ANCESTRY {
+    let mut links = 0;
+    loop {
         if pid == program {
             return Ok(Caller::Verified(address));
         }
+        if links == MAX_ANCESTRY {
+            return Ok(unverified(format!(
+                "its program was not found within {MAX_ANCESTRY} parent processes of this command"
+            )));
+        }
         match core.parent_pid(pid)? {
-            Some(parent) if parent > 1 && parent != pid => pid = parent,
-            _ => break,
+            Parent::Process(parent) if parent > 1 && parent != pid => {
+                pid = parent;
+                links += 1;
+            }
+            Parent::Process(_) | Parent::Root => break,
+            Parent::Unknown(why) => return Ok(unverified(why)),
         }
     }
     Ok(Caller::Outside(format!(
@@ -1008,7 +1106,7 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
         let mut linked = link(core, &core.endpoint()?, None, deadline)?;
         match caller_on(core, &mut linked, deadline)? {
             Caller::Verified(_) => Ok(()),
-            Caller::Outside(reason) => bail!(reason),
+            Caller::Outside(reason) | Caller::Unverified(reason) => bail!(reason),
         }
     };
     verify().map_err(|error| anyhow!(
@@ -1139,6 +1237,15 @@ impl<C: Core> Adapter<C> {
         surface_present(&self.core, session, directory, timeout)
     }
 
+    pub(in crate::native::terminal) fn during_launch(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<super::LaunchSurface> {
+        launch_surface(&self.core, session, directory, timeout)
+    }
+
     pub(in crate::native::terminal) fn screen(
         &self,
         session: &TerminalSession,
@@ -1213,6 +1320,14 @@ mod posix_adapter {
             timeout: Duration,
         ) -> Result<bool> {
             self.present(directory, session, timeout)
+        }
+        fn launch_surface(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            timeout: Duration,
+        ) -> Result<crate::native::terminal::LaunchSurface> {
+            self.during_launch(directory, session, timeout)
         }
         fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
             self.screen(session, deadline)
@@ -1340,6 +1455,14 @@ mod windows_adapter {
             timeout: Duration,
         ) -> Result<bool> {
             self.present(directory, session, timeout)
+        }
+        fn launch_surface(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            timeout: Duration,
+        ) -> Result<crate::native::terminal::LaunchSurface> {
+            self.during_launch(directory, session, timeout)
         }
     }
 }

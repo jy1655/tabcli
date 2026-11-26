@@ -6,6 +6,8 @@ mod locks;
 mod state_root;
 
 // Preserve the existing namespace, including helpers now used only inside a child.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+pub(in crate::native) use durable::with_sync_delay;
 #[allow(unused_imports)]
 pub(in crate::native) use durable::{
     SyncKind, create_private, fault_point, fault_point_keeping_temporary, fill_private,
