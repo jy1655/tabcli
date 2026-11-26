@@ -599,20 +599,26 @@ fn independent_review_control_birth_reuse_must_end_running_wait() {
     );
 }
 
+// The identity this OS records, whose incarnation is absent. (A record that also carries
+// another OS's identity is never attested here; see the foreign-identity tests above.)
 #[cfg(any(target_os = "macos", windows))]
 #[test]
 fn correction_a1_recorded_identity_absence_allows_prune_and_repair() {
     let root = tempfile::tempdir().unwrap();
     let owner = NativeSessionOwner {
         pid: 4242,
+        #[cfg(target_os = "macos")]
         process_start_seconds: Some(10),
+        #[cfg(target_os = "macos")]
         process_start_microseconds: Some(20),
+        #[cfg(windows)]
         windows_process_identity: Some(crate::native::terminal::WindowsProcessIdentity {
             creation_time: 123,
             executable_path: root.path().join("provider.exe").display().to_string(),
         }),
         ..Default::default()
     };
+    let _ = &root;
     let identity = |_| Ok(None);
     let a = attest_owner_with(
         &owner,
