@@ -3671,7 +3671,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
             .env(STATE_DIR_ENV, root.path())
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&out, TEST);
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -3797,7 +3797,7 @@ fn a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement() {
             .env(STATE_DIR_ENV, root.path())
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&out, TEST);
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -3862,7 +3862,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
             .env(STATE_DIR_ENV, root.path())
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&out, TEST);
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -4012,7 +4012,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
             .env("CODEX_HOME", &codex_home)
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&out, TEST);
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
     let root = Reader::state_root().unwrap();

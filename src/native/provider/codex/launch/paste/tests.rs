@@ -1190,7 +1190,7 @@ fn real_console_payload_to_helper_seam_fences_late_retirement() {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&result, TEST);
+        crate::native::tests::assert_child_ran_this_test(&result);
         return;
     }
     let root = std::path::PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());

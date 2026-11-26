@@ -632,6 +632,6 @@ fn cwd_and_literal_prompt_file_subprocess() {
             .env(CHILD, mode)
             .output()
             .unwrap();
-        super::assert_child_test_passed(&out, TEST);
+        super::assert_child_ran_this_test(&out);
     }
 }

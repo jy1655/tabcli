@@ -255,15 +255,40 @@ pub(in crate::native) fn assert_child_test_passed(output: &std::process::Output,
     );
 }
 
+/// The same for a test that runs itself as its child. The expected name is the running test's
+/// own, which libtest gives that test's thread, never the constant that selected the child: a
+/// constant naming another test that passes would also satisfy a check made against itself.
+pub(in crate::native) fn assert_child_ran_this_test(output: &std::process::Output) {
+    let running = std::thread::current();
+    let test = running
+        .name()
+        .expect("libtest names the thread of every test it runs");
+    assert_child_test_passed(output, test);
+}
+
+fn run_child(test: &str) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--test-threads=1"])
+        .output()
+        .unwrap()
+}
+
 // A child run whose filter names no test, because the test was renamed or moved or its name
 // was written with the crate's name in front (fixed in ae6dfee, #408), exits successfully.
 #[test]
 fn a_child_run_of_no_test_is_not_a_pass() {
     let missing = "native::tests::support::no_test_has_this_name";
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", missing, "--test-threads=1"])
-        .output()
-        .unwrap();
+    let output = run_child(missing);
     assert!(output.status.success(), "{output:?}");
     assert!(std::panic::catch_unwind(|| assert_child_test_passed(&output, missing)).is_err());
+}
+
+// A child run whose filter names another test that exists and passes, as a constant copied
+// from a sibling would, ran and passed one test; only the running test's own name refuses it.
+#[test]
+fn a_child_run_of_another_passing_test_is_not_this_test() {
+    let other = "native::tests::support::a_child_run_of_no_test_is_not_a_pass";
+    let output = run_child(other);
+    assert_child_test_passed(&output, other);
+    assert!(std::panic::catch_unwind(|| assert_child_ran_this_test(&output)).is_err());
 }

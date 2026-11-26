@@ -629,7 +629,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&output, TEST);
+        crate::native::tests::assert_child_ran_this_test(&output);
         return;
     }
     let (temp, client, attempt) = fixture();
@@ -2061,7 +2061,7 @@ fn bundled_discovery_and_dispatch_ignore_invoking_terminal() {
             }
             let output = child.output().unwrap();
             println!("host case {name}");
-            crate::native::tests::assert_child_test_passed(&output, TEST_NAME);
+            crate::native::tests::assert_child_ran_this_test(&output);
         }
         return;
     };

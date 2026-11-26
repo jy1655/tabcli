@@ -486,7 +486,7 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .output()
             .unwrap();
-        crate::native::tests::assert_child_test_passed(&output, TEST);
+        crate::native::tests::assert_child_ran_this_test(&output);
         return;
     }
     let root = PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());

@@ -27,7 +27,7 @@ fn herdr_host_selection_precedes_its_ghostty_terminal_identity() {
         .env("TERM", "xterm-256color")
         .output()
         .unwrap();
-    crate::native::tests::assert_child_test_passed(&output, TEST);
+    crate::native::tests::assert_child_ran_this_test(&output);
 }
 
 #[cfg(target_os = "macos")]

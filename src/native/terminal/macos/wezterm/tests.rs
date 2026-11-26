@@ -1156,7 +1156,7 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
             }
             let output = child.output().unwrap();
             println!("host case {name}");
-            crate::native::tests::assert_child_test_passed(&output, TEST);
+            crate::native::tests::assert_child_ran_this_test(&output);
         }
         return;
     }
