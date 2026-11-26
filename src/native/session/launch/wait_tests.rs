@@ -30,7 +30,8 @@ impl Clock for Simulated {
 }
 
 // Each probe is recorded as (its time since the start, its bound) in milliseconds, then
-// answered by the script from its time.
+// answered by the script from its time. The script may change the records while it runs, as
+// the launch's own processes and readers can while a probe waits on a core.
 struct Probes<F> {
     start: Instant,
     now: Rc<Cell<Instant>>,
@@ -38,11 +39,11 @@ struct Probes<F> {
     answer: F,
 }
 
-impl<F: FnMut(u64) -> Result<bool>> SurfacePresence for Probes<F> {
+impl<F: FnMut(u64) -> Result<terminal::LaunchSurface>> SurfacePresence for Probes<F> {
     fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface> {
         let at = ms(self.now.get() - self.start);
         self.calls.push((at, ms(timeout)));
-        (self.answer)(at).map(terminal::LaunchSurface::from_presence)
+        (self.answer)(at)
     }
 }
 
@@ -52,8 +53,22 @@ struct Run {
     probes: Vec<(u64, u64)>,
 }
 
-/// Runs the wait with its deadline `deadline_ms` after its start.
-fn run(store: &Store, deadline_ms: u64, answer: impl FnMut(u64) -> Result<bool>) -> Run {
+/// Runs the wait with its deadline `deadline_ms` after its start, for a surface that is
+/// present or absent.
+fn run(store: &Store, deadline_ms: u64, mut answer: impl FnMut(u64) -> Result<bool>) -> Run {
+    run_probed(store, deadline_ms, move |at| {
+        answer(at).map(terminal::LaunchSurface::from_presence)
+    })
+}
+
+/// Runs the wait of the launch whose Claim the fixture installed, with its deadline
+/// `deadline_ms` after its start.
+fn run_probed(
+    store: &Store,
+    deadline_ms: u64,
+    answer: impl FnMut(u64) -> Result<terminal::LaunchSurface>,
+) -> Run {
+    let token = turn::current_claim_token(store).unwrap().unwrap();
     let start = Instant::now();
     let now = Rc::new(Cell::new(start));
     let mut clock = Simulated {
@@ -68,6 +83,7 @@ fn run(store: &Store, deadline_ms: u64, answer: impl FnMut(u64) -> Result<bool>)
     };
     let result = wait_with(
         store,
+        &token,
         start + Duration::from_millis(deadline_ms),
         &mut clock,
         &mut presence,
@@ -345,6 +361,7 @@ fn a_held_lock_retains_the_claim_for_either_reason() {
 // The wait with its deadline `deadline_ms` after its start, probing `surface` through the
 // installed terminal adapters, as the launcher does.
 fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalSession) -> Run {
+    let token = turn::current_claim_token(store).unwrap().unwrap();
     let start = Instant::now();
     let mut clock = Simulated {
         now: Rc::new(Cell::new(start)),
@@ -356,6 +373,7 @@ fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalS
     };
     let result = wait_with(
         store,
+        &token,
         start + Duration::from_millis(deadline_ms),
         &mut clock,
         &mut presence,
@@ -369,11 +387,12 @@ fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalS
 
 // The owner's decision of 2026-11-26 (option A): a Herdr terminal that its verified core
 // reports finished before startup was confirmed ends the wait at the next probe, as a tmux
-// surface that disappears does, instead of at the launch deadline. The failure is a fixed text
-// from the core's report (the terminal, its exit code when given) and the launch log's path;
-// a refusal line in that log changes nothing in it. The launch ends through the settlement
-// the deadline uses: failed, its Claim released, its receipt pending and its surface handle
-// kept, so that close-session removes the finished terminal.
+// surface that disappears does, instead of at the launch deadline. The Session records a fixed
+// reason; the error returned to the caller adds the core's report (the terminal, its exit code
+// when given) and the launch log's path. A refusal line in that log changes nothing in either.
+// The launch ends through the settlement the deadline uses: failed, its Claim released, its
+// receipt pending and its surface handle kept, so that close-session removes the finished
+// terminal.
 #[test]
 fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe() {
     use crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore;
@@ -409,7 +428,7 @@ fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe
         assert_eq!(run.sleeps, [100; 10], "{exit_code:?}");
         let status = store.status().unwrap();
         assert_eq!(status.state, SessionState::Failed);
-        assert_eq!(status.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(status.error.as_deref(), Some(SURFACE_FINISHED));
         assert!(!claim_is(&store, &token));
         assert_eq!(read(&store).unwrap().unwrap().phase, Phase::Pending);
         assert_eq!(store.terminal().unwrap(), surface);
@@ -460,6 +479,263 @@ fn a_confirmed_launch_or_a_host_record_wins_over_a_finished_herdr_terminal() {
         format!("{error:#}").contains("(input_flush_failed)"),
         "{error:#}"
     );
+}
+
+// What a finished terminal brings forward is the outcome the launch deadline would give the
+// same launch, so it acts only when that outcome is certain. These tests change the records
+// while the probe that finds the terminal finished is running, as the launch's own processes
+// and readers can while the probe waits on the core.
+fn finished() -> Result<terminal::LaunchSurface> {
+    Ok(terminal::LaunchSurface::Finished(
+        "Herdr terminal t7 exited with code 1".into(),
+    ))
+}
+
+fn finished_error(store: &Store) -> String {
+    format!(
+        "{SURFACE_FINISHED} (Herdr terminal t7 exited with code 1); see the launch log {}",
+        store.directory().join(LOG).display()
+    )
+}
+
+// A reader of the lifecycle lock (`lock_shared`), held from `take` until `release`.
+#[derive(Default)]
+struct LockReader(std::cell::RefCell<Option<std::fs::File>>);
+
+impl LockReader {
+    fn take(&self, store: &Store) {
+        *self.0.borrow_mut() = Some(store.lock_shared().unwrap().unwrap());
+    }
+
+    fn release(&self) {
+        self.0.borrow_mut().take();
+    }
+}
+
+// The Session records only the fixed reason, which names no path: a state root whose path
+// contains the legacy residual-surface text does not make the failure report a residual
+// surface. The error returned to the caller names the terminal and the launch log.
+#[test]
+fn a_finished_terminal_records_a_fixed_reason_and_returns_its_details() {
+    let parent = tempfile::Builder::new()
+        .prefix(&format!("{RESIDUAL_SURFACE_MARKER} "))
+        .tempdir()
+        .unwrap();
+    let (_dir, store, token) =
+        test_support::pending_launch("session-", parent.path(), START_TIMEOUT);
+    let run = run_probed(&store, 20_000, |_| finished());
+    let error = run.result.unwrap_err();
+    assert_eq!(format!("{error:#}"), finished_error(&store));
+    assert!(error.downcast_ref::<TimedOut>().is_none());
+    assert_eq!(run.probes, [(1000, 2000)]);
+    assert_eq!(run.sleeps, [100; 10]);
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some(SURFACE_FINISHED));
+    assert_eq!(status.residual_surface(), None);
+    assert!(!claim_is(&store, &token));
+}
+
+// A reader that holds the lifecycle lock when the finished terminal is seen makes that probe
+// decide nothing: the wait goes on as for a present surface, and a later probe that finds the
+// lock free ends the launch.
+#[test]
+fn a_reader_holding_the_lock_leaves_a_finished_terminal_to_a_later_probe() {
+    let (_dir, store, token) = fixture();
+    let reader = LockReader::default();
+    let run = run_probed(&store, 20_000, |at| {
+        if at == 1000 {
+            reader.take(&store);
+        } else {
+            reader.release();
+        }
+        finished()
+    });
+    let error = run.result.unwrap_err();
+    assert_eq!(format!("{error:#}"), finished_error(&store));
+    assert_eq!(run.probes, [(1000, 2000), (2000, 2000)]);
+    assert_eq!(run.sleeps, [100; 20]);
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some(SURFACE_FINISHED));
+    assert!(!claim_is(&store, &token));
+}
+
+// A confirmation published while the probe runs is the launch's outcome, whether or not a
+// reader holds the lock as the probe returns: the next poll reads it, as for a present
+// surface.
+#[test]
+fn a_confirmation_published_during_the_probe_wins_over_a_finished_terminal() {
+    for held in [false, true] {
+        let (_dir, store, token) = fixture();
+        let reader = LockReader::default();
+        let run = run_probed(&store, 20_000, |_| {
+            spawned(&store);
+            if held {
+                reader.take(&store);
+            }
+            finished()
+        });
+        reader.release();
+        run.result.unwrap();
+        assert_eq!(run.sleeps, [100; 11], "held={held}");
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Launching, "held={held}");
+        assert!(claim_is(&store, &token), "held={held}");
+    }
+}
+
+// A provider that spawned, exited and was settled by its wrapper while the probe ran has
+// ended the launch: the wait returns the provider's error, never success.
+#[test]
+fn a_provider_failure_published_during_the_probe_wins_over_a_finished_terminal() {
+    let (_dir, store, _) = fixture();
+    let run = run_probed(&store, 20_000, |_| {
+        spawned(&store);
+        finalize(&store, &Err(anyhow::anyhow!("provider exited with code 2"))).unwrap();
+        finished()
+    });
+    let error = run.result.unwrap_err();
+    assert_eq!(format!("{error:#}"), "provider exited with code 2");
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some("provider exited with code 2"));
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+}
+
+// A launch-host Record published while the probe runs names the failure, even when a reader
+// holds the lock as the probe returns: the first poll that finds the lock free settles it.
+#[test]
+fn a_host_record_published_during_the_probe_wins_over_a_finished_terminal() {
+    let (_dir, store, token) = fixture();
+    host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
+    let reader = LockReader::default();
+    let run = run_probed(&store, 20_000, |at| {
+        if at == 1000 {
+            host::fail(
+                &store,
+                &token,
+                None,
+                host::Failure {
+                    reason: host::FailureReason::IdentityUnavailable,
+                    exit_code: None,
+                    signal: None,
+                },
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+            reader.take(&store);
+        } else {
+            reader.release();
+        }
+        finished()
+    });
+    let error = run.result.unwrap_err();
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(Some(format!("{error:#}")), status.error);
+    assert!(
+        format!("{error:#}").starts_with("terminal launch host failed"),
+        "{error:#}"
+    );
+    assert!(
+        !format!("{error:#}").contains(SURFACE_FINISHED),
+        "{error:#}"
+    );
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+}
+
+// A wrapper that recorded `Spawning` may have started a provider that can still confirm
+// (`confirmed`), so a finished terminal decides nothing for it: a confirmation that arrives
+// later is the outcome, and without one the launch deadline settles it as before.
+#[test]
+fn a_spawning_receipt_is_left_to_its_confirmation_or_the_deadline() {
+    let (_dir, store, token) = fixture();
+    test_support::apply(&store, &[test_support::Change::ReceiptSpawning]);
+    let run = run_probed(&store, 20_000, |at| {
+        if at == 2000 {
+            let id = store.directory().file_name().unwrap().to_str().unwrap();
+            store
+                .record(CoreRecord::ProviderProcess)
+                .write_json(&crate::native::session::schema::ProviderProcessRecord {
+                    schema: 1,
+                    managed_session_id: id.to_owned(),
+                    pid: 0,
+                    windows_process_identity: None,
+                    spawned_unix_ms: 1,
+                })
+                .unwrap();
+            update_status(store.directory(), SessionState::Running, None, None).unwrap();
+        }
+        finished()
+    });
+    run.result.unwrap();
+    assert_eq!(run.sleeps, [100; 21]);
+    assert!(claim_is(&store, &token));
+
+    let (_dir, store, token) = fixture();
+    test_support::apply(&store, &[test_support::Change::ReceiptSpawning]);
+    let run = run_probed(&store, 2500, |_| finished());
+    let error = run.result.unwrap_err();
+    let expected = format!(
+        "{LAUNCH_DEADLINE}; provider spawn is uncertain; the claim is retained, do not resend"
+    );
+    assert_eq!(format!("{error:#}"), expected);
+    assert_eq!(run.probes.len(), 2);
+    assert_eq!(store.status().unwrap().error, Some(expected));
+    assert!(claim_is(&store, &token));
+}
+
+// Only this launch's Claim lets a finished terminal decide. While the path holds another
+// launch's records (a directory replaced for a moment), that probe writes nothing; once this
+// launch's records are back, a later probe ends this launch.
+#[test]
+fn a_finished_terminal_never_settles_another_launch_at_its_path() {
+    let (_dir, store, token) = fixture();
+    let restored = Cell::new(false);
+    let run = run_probed(&store, 20_000, |at| {
+        if at == 1000 {
+            test_support::apply(
+                &store,
+                &[
+                    test_support::Change::ReceiptToken,
+                    test_support::Change::ClaimOther,
+                ],
+            );
+        } else if !restored.get() {
+            let status = store.status().unwrap();
+            assert_eq!(
+                (status.state, status.error),
+                (SessionState::Launching, None)
+            );
+            assert!(claim_is(&store, "successor"));
+            assert_eq!(read(&store).unwrap().unwrap().claim_token, "successor");
+            let mut record = read(&store).unwrap().unwrap();
+            record.claim_token = token.clone();
+            store
+                .record(CoreRecord::Launch)
+                .write_json(&record)
+                .unwrap();
+            let claim = store.directory().join(CoreRecord::TurnClaim.name());
+            std::fs::remove_file(&claim).unwrap();
+            crate::native::session::RecordStore::at(&claim)
+                .write_private(token.as_bytes())
+                .unwrap();
+            restored.set(true);
+        }
+        finished()
+    });
+    assert!(restored.get());
+    let error = run.result.unwrap_err();
+    assert_eq!(format!("{error:#}"), finished_error(&store));
+    assert_eq!(run.probes, [(1000, 2000), (2000, 2000)]);
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(SURFACE_FINISHED)
+    );
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
 }
 
 // The production surface observation reaches the terminal's presence check: a surface that

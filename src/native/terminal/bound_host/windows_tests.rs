@@ -27,6 +27,53 @@ fn icacls(path: &Path, grant: &str) {
     assert!(status.success(), "icacls /grant {grant}");
 }
 
+// Replaces the access list of a fixture with the one that `sddl` describes.
+fn set_access_list(path: &Path, sddl: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            },
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+    };
+    let wide = |text: &std::ffi::OsStr| text.encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let (sddl_text, path_text) = (wide(sddl.as_ref()), wide(path.as_os_str()));
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_text.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(converted, 0, "{sddl}: {}", std::io::Error::last_os_error());
+    let (mut present, mut defaulted) = (0, 0);
+    let mut access_list = std::ptr::null_mut();
+    let extracted = unsafe {
+        GetSecurityDescriptorDacl(descriptor, &mut present, &mut access_list, &mut defaulted)
+    };
+    assert!(extracted != 0 && present != 0, "{sddl}");
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_text.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            access_list,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    assert_eq!(status, 0, "{sddl}");
+}
+
 fn refusal(directory: &Path) -> String {
     format!(
         "{:#}",
@@ -159,6 +206,40 @@ fn the_herdr_check_refuses_a_directory_the_launch_host_would_refuse() {
     assert!(
         text.contains("refusing non-directory Herdr launch path"),
         "{text}"
+    );
+}
+
+// The launcher refuses only what it observed: a read that TAB's own token is denied says
+// nothing about what the core's launch host, which reads the directory as the core's account,
+// will find. Here an owner-rights rule without `READ_CONTROL` replaces the owner's implicit
+// right to read the access list, so TAB cannot open the directory to read its owner and access
+// list for the core's account: the check leaves it to the host, and the host's own admission
+// (run here as this process) refuses it.
+#[test]
+fn a_session_directory_whose_access_list_tab_cannot_read_is_left_to_the_launch_host() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+    let root = tempfile::tempdir().unwrap();
+    let directory = private_session(root.path(), "session-unreadable");
+    // Owner rights: every right of `FILE_ALL_ACCESS` (0x1F01FF) but `READ_CONTROL` (0x20000).
+    set_access_list(&directory, "D:P(A;;0x1D01FF;;;OW)");
+    let denied = fs::OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&directory)
+        .unwrap_err();
+    assert_eq!(
+        denied.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{denied}"
+    );
+    let own = HostAccount::current().unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, None).unwrap();
+    let host = refusal(&directory);
+    assert!(
+        host.starts_with("cannot open Herdr launch directory"),
+        "{host}"
     );
 }
 

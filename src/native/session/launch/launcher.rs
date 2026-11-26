@@ -70,6 +70,8 @@ pub(in crate::native) fn start(
     let terminal_session = match opened {
         Ok(session) => session,
         Err(error) => {
+            #[cfg(test)]
+            open_failure_hook::run(&created.directory);
             let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
             return Err(error).with_context(|| {
                 format!(
@@ -83,6 +85,7 @@ pub(in crate::native) fn start(
     launch::wait(
         &Store::open_unchecked(&created.directory),
         &terminal_session,
+        expected_claim_token,
         launch_deadline,
     )?;
     Ok(terminal_session)
@@ -167,4 +170,27 @@ pub(in crate::native) fn validate_shell_command_component(
         );
     }
     Ok(())
+}
+
+/// A test's step between a failure to open the Surface and its settlement, run once on this
+/// thread: what another process does at that moment, such as a reader taking the lock.
+#[cfg(test)]
+pub(in crate::native) mod open_failure_hook {
+    use std::{cell::RefCell, path::Path};
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(in crate::native) fn set(hook: impl FnOnce(&Path) + 'static) {
+        HOOK.with(|slot| assert!(slot.borrow_mut().replace(Box::new(hook)).is_none()));
+    }
+
+    pub(super) fn run(directory: &Path) {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(directory);
+        }
+    }
 }

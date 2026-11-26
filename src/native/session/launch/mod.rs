@@ -757,10 +757,12 @@ fn finished_reason(reader: &Reader, finished: &str) -> String {
 pub(in crate::native) fn wait(
     store: &Store,
     surface: &terminal::TerminalSession,
+    token: &str,
     deadline: Instant,
 ) -> Result<()> {
     wait_with(
         store,
+        token,
         deadline,
         &mut crate::native::clock::SystemClock,
         &mut TerminalSurface {
@@ -777,6 +779,7 @@ pub(in crate::native) fn wait(
 /// reading of time and every sleep goes through `clock`.
 fn wait_with(
     store: &Store,
+    _token: &str,
     deadline: Instant,
     clock: &mut dyn Clock,
     presence: &mut dyn SurfacePresence,
@@ -1256,7 +1259,13 @@ mod tests {
         // This wait's own deadline, recorded by its own failure write.
         let (directory, _) = fixture();
         let store = Store::open_unchecked(directory.path());
-        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let error = wait(
+            &store,
+            &surface,
+            &turn::current_claim_token(&store).unwrap().unwrap(),
+            Instant::now(),
+        )
+        .unwrap_err();
         assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
         assert_eq!(format!("{error:#?}"), format!("{LAUNCH_DEADLINE:?}"));
         assert_eq!(classify(&error), Some(FailureKind::TimedOut));
@@ -1273,7 +1282,13 @@ mod tests {
             .record(CoreRecord::Launch)
             .write_json(&record)
             .unwrap();
-        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let error = wait(
+            &store,
+            &surface,
+            &turn::current_claim_token(&store).unwrap().unwrap(),
+            Instant::now(),
+        )
+        .unwrap_err();
         let recorded = store.status().unwrap().error.unwrap();
         assert_ne!(recorded, LAUNCH_DEADLINE);
         assert_eq!(format!("{error:#}"), recorded);
@@ -1283,7 +1298,13 @@ mod tests {
         let store = Store::open_unchecked(directory.path());
         let before = fs::read(directory.path().join(STATUS_FILE)).unwrap();
         let lock = store.lock().unwrap();
-        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let error = wait(
+            &store,
+            &surface,
+            &turn::current_claim_token(&store).unwrap().unwrap(),
+            Instant::now(),
+        )
+        .unwrap_err();
         drop(lock);
         assert_eq!(
             format!("{error:#}"),
@@ -1933,7 +1954,13 @@ mod host_decision_tests {
                     .unwrap()
                 );
             } else {
-                let error = wait(&store, &surface(), start + Duration::from_secs(20)).unwrap_err();
+                let error = wait(
+                    &store,
+                    &surface(),
+                    &turn::current_claim_token(&store).unwrap().unwrap(),
+                    start + Duration::from_secs(20),
+                )
+                .unwrap_err();
                 assert!(error.downcast_ref::<TimedOut>().is_none());
             }
             assert!(start.elapsed() < Duration::from_secs(1));
@@ -2064,7 +2091,13 @@ mod host_decision_tests {
             } else {
                 LAUNCH_DEADLINE.into()
             };
-            let error = wait(&store, &surface(), Instant::now()).unwrap_err();
+            let error = wait(
+                &store,
+                &surface(),
+                &turn::current_claim_token(&store).unwrap().unwrap(),
+                Instant::now(),
+            )
+            .unwrap_err();
             assert!(error.downcast_ref::<TimedOut>().is_some());
             assert_eq!(error.to_string(), expected);
             assert_eq!(

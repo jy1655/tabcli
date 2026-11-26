@@ -386,7 +386,9 @@ fn judged_by_the_launcher(kind: TerminalKind) -> bool {
 
 // The launcher's check is the host's own admission: it refuses exactly the directories that
 // admission refuses, with the host's reason, for a host this platform runs and whose account
-// is not another process's; any other kind is not judged here.
+// is not another process's; any other kind is not judged here. (A read that fails other than
+// by the directory's absence is left to the host:
+// `a_session_directory_the_launcher_cannot_read_is_left_to_the_launch_host`.)
 #[cfg(unix)]
 #[test]
 fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
@@ -450,6 +452,30 @@ fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
             name = judged.display_name()
         )
     );
+}
+
+// The launcher refuses only what it observed: a read of the session directory that fails for a
+// reason other than its absence (here a loop of symbolic links above it) is not a refusal, and
+// the launch goes on for the host to decide, whose own admission still refuses it.
+#[cfg(unix)]
+#[test]
+fn a_session_directory_the_launcher_cannot_read_is_left_to_the_launch_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let looped = temp.path().join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+    let directory = looped.join("session-unread");
+    let spec = BoundHostSpec { name: "Herdr" };
+    let host = format!(
+        "{:#}",
+        run_bound_host(&directory, &spec, |_| Ok(())).unwrap_err()
+    );
+    assert!(host.starts_with("no such Herdr launch directory"), "{host}");
+    for kind in KINDS {
+        refuse_before_launch(&directory, kind).unwrap();
+    }
+    let own = HostAccount::of_uid(unsafe { libc::geteuid() });
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, None).unwrap();
 }
 
 // A host that a core starts runs as the core: the check is made for the core's account, and

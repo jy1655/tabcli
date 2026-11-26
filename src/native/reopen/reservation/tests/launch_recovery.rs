@@ -398,6 +398,11 @@ fn spawn_commits_before_failure_preserves_live_states_then_releases_on_exit() {
             let error = launch::wait(
                 &Store::open_unchecked(directory),
                 &reopen_test_terminal("fixture"),
+                &crate::native::session::turn::current_claim_token(&Store::open_unchecked(
+                    directory,
+                ))
+                .unwrap()
+                .unwrap(),
                 Instant::now(),
             )
             .unwrap_err();

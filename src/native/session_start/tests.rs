@@ -1103,19 +1103,9 @@ fn a_surface_failure_after_the_fence_keeps_its_terminal_failure_settlement() {
     assert_eq!(result["error"], recorded.as_str(), "{result}");
 }
 
-// The case of 2026-11-26 on a supported route: a Herdr start whose session directory the
-// core's launch host would refuse (here: another account can change it). Before, the
-// terminal was created and its host refused the directory in the launch log only, so the
-// start waited for its deadline. Now the adapter judges the directory for the core's account
-// on the connection that would create the terminal, and `terminal.run` is never sent. The
-// scripted core refuses every `terminal.run`, so the code before this check failed at once
-// too, after sending it. The start settles as a refusal before a surface: the receipt stays
-// pending, the failure is recorded with the released Claim and the failed Request, the
-// launch log keeps the reason, and the session closes without a terminal and is pruned.
-#[test]
-fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
-    let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
-    let mut fixture = Fixture::new();
+// A Herdr start whose session directory another account can change, which the core's launch
+// host refuses, prepared in `fixture`.
+fn refused_herdr_start(fixture: &mut Fixture) -> Prepared {
     fixture.receipt_directory = false;
     fixture.terminal_kind = terminal::TerminalKind::Herdr;
     fixture.provider = FirstPartyCli::Pi;
@@ -1136,9 +1126,12 @@ fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
             .unwrap();
         assert!(status.success(), "icacls /grant");
     }
-    let (error, report) = core.reached_by(|| run(&prepared, &FreshSource));
-    let text = format!("{error:#}");
-    assert_eq!(core.runs(), 0, "{text}");
+    prepared
+}
+
+// The launch host's reason for `refused_herdr_start`, as the caller is given it after the
+// launcher's context.
+fn herdr_refusal_cause<'a>(prepared: &Prepared, text: &'a str) -> &'a str {
     let cause = text
         .strip_prefix(&format!(
             "failed to open Herdr surface for session {}: ",
@@ -1150,22 +1143,54 @@ fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
     // core's account, because who may change a directory depends on whose it is.
     let refusal = format!(
         "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
-        directory.display()
+        prepared.created.directory.display()
     );
     assert!(
         cause.starts_with(&refusal)
             || cause.starts_with(&format!("the Herdr terminal was not created: {refusal}")),
         "{cause}"
     );
+    cause
+}
+
+// What the Session records for `refused_herdr_start`: a fixed reason that names no path.
+const HERDR_REFUSAL_RECORDED: &str = "terminal launch failed: the Herdr launch host would refuse the session directory; no surface handle was recorded and no prompt was sent";
+
+// The case of 2026-11-26 on a supported route: a Herdr start whose session directory the
+// core's launch host would refuse (here: another account can change it). Before, the
+// terminal was created and its host refused the directory in the launch log only, so the
+// start waited for its deadline. Now the adapter judges the directory for the core's account
+// on the connection that would create the terminal, and `terminal.run` is never sent. The
+// scripted core refuses every `terminal.run`, so the code before this check failed at once
+// too, after sending it. The start settles as a refusal before a surface: the receipt stays
+// pending, the failure is recorded with the released Claim and the failed Request, the
+// launch log keeps the recorded reason, and the session closes without a terminal and is
+// pruned. The caller is given the host's reason with the directory; the Session records a
+// fixed reason, so a state root whose path contains the legacy residual-surface text does not
+// make the failure report a residual surface.
+#[test]
+fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
+    let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
+    let mut fixture = Fixture::new();
+    fixture.root = tempfile::Builder::new()
+        .prefix(&format!("{} ", launch::RESIDUAL_SURFACE_MARKER))
+        .tempdir()
+        .unwrap();
+    let prepared = refused_herdr_start(&mut fixture);
+    let directory = &prepared.created.directory;
+    let (error, report) = core.reached_by(|| run(&prepared, &FreshSource));
+    let text = format!("{error:#}");
+    assert_eq!(core.runs(), 0, "{text}");
+    herdr_refusal_cause(&prepared, &text);
     let store = Store::open_unchecked(directory);
     assert_eq!(
         launch::read(&store).unwrap().unwrap().phase,
         launch::Phase::Pending
     );
-    let recorded = format!(
-        "terminal launch failed: {cause}; no surface handle was recorded and no prompt was sent"
-    );
-    assert_eq!(store.status().unwrap().error, Some(recorded.clone()));
+    let recorded = HERDR_REFUSAL_RECORDED.to_owned();
+    let status = store.status().unwrap();
+    assert_eq!(status.error, Some(recorded.clone()));
+    assert_eq!(status.residual_surface(), None);
     assert!(
         fs::read_to_string(directory.join(launch::LOG))
             .unwrap()
@@ -1193,6 +1218,83 @@ fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
         std::slice::from_ref(&prepared.created.id)
     );
     assert!(!directory.exists());
+}
+
+// A reader that holds the lifecycle lock when the refusal settles is waited out within the
+// launch's own budget: the start still fails with the recorded refusal and the released Claim,
+// as an uncontended one does.
+#[test]
+fn a_refusal_settles_once_a_reader_releases_the_lifecycle_lock() {
+    let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
+    let mut fixture = Fixture::new();
+    let prepared = refused_herdr_start(&mut fixture);
+    let held = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&held);
+    launch::launcher::open_failure_hook::set(move |directory| {
+        let reader = Store::open_unchecked(directory)
+            .lock_shared()
+            .unwrap()
+            .unwrap();
+        seen.set(true);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(reader);
+        });
+    });
+    let (error, report) = core.reached_by(|| run(&prepared, &FreshSource));
+    assert!(held.get());
+    let text = format!("{error:#}");
+    assert_eq!(core.runs(), 0, "{text}");
+    let cause = herdr_refusal_cause(&prepared, &text);
+    assert!(
+        !cause.contains("provider startup is in progress"),
+        "{cause}"
+    );
+    let store = Store::open_unchecked(&prepared.created.directory);
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(HERDR_REFUSAL_RECORDED)
+    );
+    assert_settled_before_fence(&fixture, &prepared, &report);
+}
+
+// A refusal settles only this launch: when the Claim at the session directory's path is not
+// this launch's (the directory replaced for a moment), nothing is written there, and the
+// caller is still given the host's reason.
+#[test]
+fn a_refusal_writes_nothing_to_another_launch_at_its_path() {
+    let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
+    let mut fixture = Fixture::new();
+    let prepared = refused_herdr_start(&mut fixture);
+    launch::launcher::open_failure_hook::set(|directory| {
+        launch::test_support::apply(
+            &Store::open_unchecked(directory),
+            &[
+                launch::test_support::Change::ReceiptToken,
+                launch::test_support::Change::ClaimOther,
+            ],
+        );
+    });
+    let (error, _) = core.reached_by(|| run(&prepared, &FreshSource));
+    let text = format!("{error:#}");
+    assert_eq!(core.runs(), 0, "{text}");
+    let cause = herdr_refusal_cause(&prepared, &text);
+    assert!(!cause.contains("handoff"), "{cause}");
+    let store = Store::open_unchecked(&prepared.created.directory);
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some("successor")
+    );
+    let receipt = launch::read(&store).unwrap().unwrap();
+    assert_eq!(
+        (receipt.claim_token.as_str(), receipt.phase),
+        ("successor", launch::Phase::Pending)
+    );
 }
 
 // A Herdr start whose session directory any account would refuse fails with that refusal
