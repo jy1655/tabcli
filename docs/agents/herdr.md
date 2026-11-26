@@ -121,6 +121,15 @@
     lifecycle lock before it settles a session, so a handle that a concurrent close restored
     is never consumed. The steps Repair takes before that decision still run: publishing a
     completed result, and settling a launch that was never confirmed.
+  - The rule applies when no teardown intent is saved. On macOS and Linux, a close with a live
+    owner that proved its terminal absent saves a teardown intent before it ends the owner. A
+    close that finds one saved replays it under 0.4.49's rules, unchanged
+    (`terminal_teardown_intent`, the intent branch of `decide` and of `explicit_close`), before
+    and instead of the choice below. That replay refuses, among other cases, whenever the
+    intent does not validate against the current owner record and handle (the record gone,
+    unreadable, replaced or changed) or the owner's PID was reused, so it can refuse a finished
+    or absent terminal until the intent validates or is cleared. TAB clears the intent only when
+    a close completes. Bringing this replay under the rule is a follow-up.
   - `owner_exit::core_kept` chooses between the close with a live owner and the close on the
     creation record, for every owner record, and returns evidence, never an action. The owner
     record answers one question, from one typed read: is there an attested live incarnation of
@@ -132,10 +141,16 @@
     process, a gone owner, a failed start, and on macOS and Linux an owner whose control read
     found its process gone after its birth read matched (`ControlAttestation::Exited`). A record
     contradicts itself when anything in it, nested identities included (a Terminal.app
-    incarnation, a shell's birth), belongs to another platform; `record_conflicts` names every
-    field. On the creation record nothing about the owner refuses a finished or absent
-    terminal; a read or inspection failure only explains, beside each refusal's own recovery
-    instructions, why no live owner was verified.
+    incarnation, a shell's birth), belongs to another platform. `record_conflicts` destructures
+    `NativeSessionOwner`, `TerminalShellIdentity` and `MacTerminalAppIdentity` without `..`, so a
+    field added to one of those three does not compile until it is classified; it checks
+    `LinuxBirth` and `WindowsProcessIdentity` by presence only, and a field added to either
+    needs no change there. On the creation record nothing about the owner refuses a finished
+    or absent terminal; a read or inspection failure only explains, beside each refusal's own
+    recovery instructions, why no live owner was verified. The close attaches that explanation
+    once around everything it does after admission (the handle's own checks, every read, the
+    removal and its confirming read); the refusal of a running terminal states it in its own
+    text.
   - Only `close-session --explicit`, and the sessions it lists with `--with-started-from`, act on
     the creation record. On that path the cleanup after a refused reopen (`CloseCause::Cleanup`)
     is refused before the core is asked, a failed start included. With a verified live owner of
@@ -202,10 +217,9 @@
 
   On the creation record, the cleanup after a refused reopen refuses every column before the
   core is asked; a whole creation record and the terminal's verified identity are required for
-  every removal and settlement. On macOS and Linux a teardown intent left by an interrupted
-  owner teardown keeps its own route while it validates; when the owner it names can no longer
-  be established (its record gone, unreadable or not a record), the close takes the creation
-  record, which confirms absence on the core.
+  every removal and settlement. The table holds when no teardown intent is saved. On macOS and
+  Linux a close interrupted during a live owner's teardown resumes under 0.4.49's rules, which
+  can refuse a finished or absent terminal until the intent validates or is cleared (above).
 
   Handles created by 0.4.45 and 0.4.46 on macOS and Linux omit the nonce. For those, the
   terminal's launch label must be 32 lowercase hexadecimal digits and agree with the terminal's

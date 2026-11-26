@@ -160,6 +160,7 @@ leave the program running. TAB then rechecks its identity. Park before closing i
 want the session to continue. If you already closed the pane with keep enabled, check that
 `hc get <address>` on the recorded core reports `finished` for this session. Remove that
 finished terminal with `hc rm <address>`, then run `tabcli close-session <session> --explicit`.
+That close settles the session under the conditions given below for a removed terminal.
 The returned `attach_command` names the socket to use for these hc commands.
 On Linux the terminal starts bash with job control and without shell startup files. The core's environment must provide the tools the CLI needs. Remote hc machines are unsupported. See below for native Windows.
 
@@ -185,6 +186,14 @@ after the checks below, then run the close again: it removes the finished termin
 the session record. Closing a session whose owner is verified live is unchanged. Listing
 sessions, `tell` and waiting for a result never close a Herdr terminal on their own; an
 attached `ask` or `tell` stops waiting once the owner is gone.
+
+These rules apply when no teardown intent is saved. On macOS and Linux, a close with a verified
+live owner whose terminal is proven absent saves a teardown intent and then ends the owner (see
+the owner teardown under [Ownership and close](#ownership-and-close) below). If that close is
+interrupted, the next close resumes it under 0.4.49's rules, unchanged: it can refuse a finished
+or absent terminal until the intent validates against the current owner record and handle, or
+is cleared, and TAB clears it only when a close completes. Read the refusal and keep the session
+directory as it is.
 
 What changed from 0.4.49: there, on macOS and Linux, the ordinary close of a session whose
 owner had exited already refused a running Herdr terminal and removed only a finished one, and
@@ -222,17 +231,32 @@ same address can be another terminal. Check that the program arguments `hc get` 
 session's directory, whose last part is the session ID. When TAB refused the match, deciding
 that this is the session's terminal is yours. Once you are sure, end it with `hc kill
 <address>` and remove it with `hc rm <address>`, both in the same form. Refusals that name an hc
-command, such as turning keep off, already use that form. The next close then finds the
-terminal gone and closes the session record, provided the handle itself is whole: its host
-PID, host birth and launch label pass checks derived from what released TAB versions wrote on
-this platform (its wire spelling is not examined, since that close ends nothing and removes only
-a terminal the recorded core identifies). A close refuses any other handle before it asks any
-core: one with no usable terminal address or core, a host PID
-this platform's process reader never reports, a host birth no TAB writer on this platform
-records, or a launch label that is not 32 lowercase hexadecimal digits (an explicit `null`
-included; on Windows, also none). The error names the field and retains the handle, and ending
-or removing the terminal does not change that refusal. TAB has no command that repairs a
-handle: keep the session directory as it is for diagnosis.
+command, such as turning keep off, already use that form. Then run
+`tabcli close-session <session> --explicit` again. What that close does with the removed
+terminal depends on what TAB verifies about the session's owner at that moment:
+
+- When TAB cannot verify a live owner (and no teardown intent is saved), the close settles the
+  session only when the handle itself is whole and the recorded core, recognised by its
+  permanent ID, answers that the address is not found. A handle is whole when its host PID, host
+  birth and launch label pass checks derived from what released TAB versions wrote on this
+  platform (its wire spelling is not examined, since that close ends nothing and removes only a
+  terminal the recorded core identifies). Before it asks any core, this close refuses any other
+  handle: one with no usable terminal address or core, a host PID this platform's process
+  reader never reports, a host birth no TAB writer on this platform records, or a launch label
+  that is not 32 lowercase hexadecimal digits (an explicit `null` included; on Windows, also
+  none). The error names the field and retains the handle, and ending or removing the terminal
+  does not change that refusal.
+- When TAB verifies a live owner, the close needs its full ownership proof, which a removed
+  terminal fails. On Windows the close then refuses and keeps the handle while that owner
+  stays live. On macOS and Linux the proven absence leads TAB to end the owner, under the
+  checks of the owner teardown in [Ownership and close](#ownership-and-close), and the session
+  closes once its process group is gone. The checks of the creation record and launch label above do not
+  apply to this close; a handle with no usable terminal address or core is still refused
+  before any core is asked.
+- On macOS and Linux, if a teardown intent is saved, the close resumes it under 0.4.49's rules
+  (see above).
+
+TAB has no command that repairs a handle: keep the session directory as it is for diagnosis.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
