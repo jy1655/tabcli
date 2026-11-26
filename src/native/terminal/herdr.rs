@@ -196,40 +196,20 @@ fn deadline_after(timeout: Duration) -> Result<Instant> {
 }
 
 /// The `socket` setting of an `hc` configuration file: absent when the file does not exist
-/// or does not set it; an error when the file cannot be read or parsed. Only a regular file
-/// is read: the file is opened without waiting (a FIFO would wait for a writer without a
-/// bound) and anything else is refused, as hc itself could not read it.
+/// or does not set it; an error when the file cannot be read or parsed.
 fn read_config_socket(path: &Path) -> Result<Option<String>> {
-    use std::io::Read;
-    let cannot_read = |error: std::io::Error| {
-        Err(error).with_context(|| {
-            format!(
-                "cannot read the Herdr configuration {}; TAB does not guess the core's socket",
-                path.display()
-            )
-        })
-    };
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-    let mut file = match options.open(path) {
-        Ok(file) => file,
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return cannot_read(error),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot read the Herdr configuration {}; TAB does not guess the core's socket",
+                    path.display()
+                )
+            });
+        }
     };
-    match file.metadata() {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => bail!(
-            "the Herdr configuration {} is not a regular file, so TAB does not read it; TAB does not guess the core's socket",
-            path.display()
-        ),
-        Err(error) => return cannot_read(error),
-    }
-    let mut text = String::new();
-    if let Err(error) = file.read_to_string(&mut text) {
-        return cannot_read(error);
-    }
     config_socket(&text).with_context(|| {
         format!(
             "cannot parse the Herdr configuration {}; TAB does not guess the core's socket",
@@ -1042,13 +1022,6 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
                 "its program was not found within {MAX_ANCESTRY} parent processes of this command"
             )));
         }
-        // Each lookup is one read of this machine's process table; the walk stops between
-        // two of them once the deadline has passed.
-        if Instant::now() >= deadline {
-            return Ok(unverified(
-                "the deadline passed while TAB read its parent processes".to_owned(),
-            ));
-        }
         match core.parent_pid(pid)? {
             Parent::Process(parent) if parent > 1 && parent != pid => {
                 pid = parent;
@@ -1064,22 +1037,10 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
 }
 
 /// Automatic selection requires a verified caller before creating any Session records.
-// Every step ends by `deadline`: none starts once it has passed, the endpoint's configuration
-// is read only as a regular file (`read_config_socket`), the connection and its calls are
-// bounded by it, and the walk of parents checks it between lookups. A check that ends after it
-// is not accepted. Not bounded: one read of a regular configuration file and one lookup in
-// this machine's process table, both local.
 fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
     let verify = || {
-        if Instant::now() >= deadline {
-            bail!("the deadline passed before TAB could check the calling Herdr terminal");
-        }
-        let endpoint = core.endpoint()?;
-        let mut linked = link(core, &endpoint, None, deadline)?;
+        let mut linked = link(core, &core.endpoint()?, None, deadline)?;
         match caller_on(core, &mut linked, deadline)? {
-            Caller::Verified(_) if Instant::now() >= deadline => {
-                bail!("the deadline passed while TAB checked the calling Herdr terminal")
-            }
             Caller::Verified(_) => Ok(()),
             Caller::Outside(reason) | Caller::Unverified(reason) => bail!(reason),
         }

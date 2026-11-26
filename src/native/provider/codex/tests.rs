@@ -632,6 +632,8 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         ("(0.170.0)", false, true, Some(true)), // brackets
         ("unknown", false, false, None),      // not a candidate
         ("0.170", false, false, None),        // two numbers are not a candidate
+        ("0.170.0.1", false, false, None),    // four numbers are not a candidate
+        ("127.0.0.1:8080", false, false, None), // an IPv4 address and port is not either
     ];
     let before = [
         "",
@@ -740,36 +742,94 @@ mod released {
 // 0.4.49 and this build launch Codex on Herdr with it. The document holds the table, and this
 // test reads it, so that the document cannot disagree with the readers.
 fn handoff_table() -> Vec<(String, [bool; 3])> {
-    const DOCUMENT: &str = include_str!("../../../../docs/agents/codex.md");
+    handoff_rows(include_str!("../../../../docs/agents/codex.md")).unwrap()
+}
+
+// The rows between the table's markers: its header and separator, then rows of a code-spanned
+// text and three verdicts. Any other nonempty line is an error, so that no row escapes the
+// checks by its form.
+fn handoff_rows(document: &str) -> std::result::Result<Vec<(String, [bool; 3])>, String> {
     const BEGIN: &str = "<!-- herdr-version-handoff -->";
     const END: &str = "<!-- /herdr-version-handoff -->";
-    let start = DOCUMENT.find(BEGIN).expect("the handoff table's start") + BEGIN.len();
-    let end = DOCUMENT[start..]
-        .find(END)
-        .expect("the handoff table's end")
-        + start;
-    DOCUMENT[start..end]
+    const HEADER: &str = "| `--version` text | 0.4.48 | 0.4.49 | this build |";
+    const SEPARATOR: &str = "| --- | --- | --- | --- |";
+    let start = document.find(BEGIN).ok_or("no table start")? + BEGIN.len();
+    let end = document[start..].find(END).ok_or("no table end")? + start;
+    let mut lines = document[start..end]
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("| `") && !line.starts_with("| `--version` text"))
+        .filter(|line| !line.is_empty());
+    if lines.next() != Some(HEADER) || lines.next() != Some(SEPARATOR) {
+        return Err("the table does not start with its header and separator".into());
+    }
+    lines
         .map(|line| {
             let cells = line
-                .trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect::<Vec<_>>();
-            assert_eq!(cells.len(), 4, "{line}");
+                .strip_prefix('|')
+                .and_then(|line| line.strip_suffix('|'))
+                .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>())
+                .filter(|cells| cells.len() == 4)
+                .ok_or_else(|| format!("not a table row: {line}"))?;
+            let text = cells[0]
+                .strip_prefix('`')
+                .and_then(|text| text.strip_suffix('`'))
+                .filter(|text| !text.is_empty() && !text.contains('`'))
+                .ok_or_else(|| format!("the text is not one code span: {line}"))?;
             let verdict = |cell: &str| match cell {
-                "launches" => true,
-                "refuses" => false,
-                other => panic!("unknown verdict {other:?} in {line}"),
+                "launches" => Ok(true),
+                "refuses" => Ok(false),
+                other => Err(format!("unknown verdict {other:?} in {line}")),
             };
-            (
-                cells[0].trim_matches('`').replace("\\n", "\n"),
-                [verdict(cells[1]), verdict(cells[2]), verdict(cells[3])],
-            )
+            Ok((
+                text.replace("\\n", "\n"),
+                [verdict(cells[1])?, verdict(cells[2])?, verdict(cells[3])?],
+            ))
         })
         .collect()
+}
+
+// The table reader refuses a row it does not recognise instead of skipping it.
+#[test]
+fn the_handoff_table_reader_refuses_an_unrecognised_row() {
+    let table = |rows: &str| {
+        format!(
+            "<!-- herdr-version-handoff -->\n| `--version` text | 0.4.48 | 0.4.49 | this build |\n| --- | --- | --- | --- |\n{rows}\n<!-- /herdr-version-handoff -->"
+        )
+    };
+    assert_eq!(
+        handoff_rows(&table("| `0.170.0` | launches | launches | launches |")).unwrap(),
+        vec![("0.170.0".to_owned(), [true, true, true])]
+    );
+    for row in [
+        "|`0.170.0`|launches|launches|launches|",
+        "| 0.170.0 | launches | launches | launches |",
+        "| `0.170.0` | launches | launches |",
+        "| `0.170.0` | launches | maybe | launches |",
+        "`0.170.0` launches launches launches",
+    ] {
+        let rows = handoff_rows(&table(row));
+        if row.starts_with("|`") {
+            // Spacing is not form: the row is read.
+            assert_eq!(rows.unwrap().len(), 1, "{row}");
+        } else {
+            assert!(rows.is_err(), "{row}");
+        }
+    }
+    assert!(handoff_rows("| `0.170.0` | launches | launches | launches |").is_err());
+}
+
+// A sole candidate is read in time linear in its length, whatever trailing punctuation it has.
+#[test]
+fn a_long_candidate_is_read_in_linear_time() {
+    let word = format!("0.170.0+{}{}", "a".repeat(100_000), ".".repeat(100_000));
+    let started = std::time::Instant::now();
+    let version = herdr_codex_version(&word).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(version.build.as_str().len(), 100_000);
 }
 
 // A pending Herdr launch can be started by a wrapper of another release than the one that
@@ -826,6 +886,9 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         "0.168.0- runtime 22.0.0",
         "OpenAI Codex 0.168.0-rc-. (runtime 22.0.0)",
         "0.170.0-01 (runtime 22.0.0)",
+        "OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)",
+        "codex 0.170.0 build 1.2.3.4",
+        "Codex <0.169.0",
     ] {
         assert!(
             table.iter().any(|(text, _)| text == named),

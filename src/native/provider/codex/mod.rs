@@ -148,10 +148,10 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
 // version as the only one:
 //
 //   candidate = a word whose rest, after its leading non-alphanumeric characters and one
-//               optional `v`, begins with digits "." digits "." digits
-//   reading   = that rest, less trailing characters that cannot end a version (anything but a
-//               letter, a digit or `-`), removed one at a time until it is SemVer 2.0.0; none
-//               when a letter, a digit or `-` ends it first
+//               optional `v`, begins with digits "." digits "." digits, not followed by "."
+//               and a digit (so an IPv4 address or a four-part build number is none)
+//   reading   = that rest, less its trailing characters that cannot end a version (anything
+//               but a letter, a digit or `-`), read as SemVer 2.0.0; none when it is not
 //
 // The text names a version only when it has exactly one candidate and that candidate has a
 // reading: `OpenAI Codex (v0.170.0)`, `(0.170.0)`, `0.170.0+` and `Codex 0.170.0.` are
@@ -187,7 +187,8 @@ fn unlabelled_codex_version(output: &str) -> Result<Version> {
 }
 
 // The rest of a candidate word: after its leading non-alphanumeric characters and one
-// optional `v`, it begins with digits "." digits "." digits.
+// optional `v`, it begins with digits "." digits "." digits, not followed by "." and a digit
+// (a fourth number: an IPv4 address, a four-part build number).
 fn version_candidate(word: &str) -> Option<&str> {
     let rest = word.trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
     let rest = rest.strip_prefix('v').unwrap_or(rest);
@@ -202,23 +203,21 @@ fn version_candidate(word: &str) -> Option<&str> {
             remaining = remaining.strip_prefix('.')?;
         }
     }
-    Some(rest)
+    let fourth = remaining
+        .strip_prefix('.')
+        .is_some_and(|after| after.starts_with(|character: char| character.is_ascii_digit()));
+    (!fourth).then_some(rest)
 }
 
-// A candidate's version: trailing characters that cannot end a version are removed one at a
-// time until the rest is SemVer; a letter, a digit or `-` cannot be removed.
+// A candidate's version: its trailing characters that cannot end a version (anything but a
+// letter, a digit or `-`) are removed once, and the rest is read as SemVer once. Every SemVer
+// ends with a letter, a digit or `-`, so removing them one at a time and retrying would read
+// no other version.
 fn candidate_reading(rest: &str) -> Option<Version> {
-    let mut text = rest;
-    loop {
-        if let Ok(version) = Version::parse(text) {
-            return Some(version);
-        }
-        let last = text.chars().last()?;
-        if last.is_ascii_alphanumeric() || last == '-' {
-            return None;
-        }
-        text = &text[..text.len() - last.len_utf8()];
-    }
+    let kept = rest.trim_end_matches(|character: char| {
+        !(character.is_ascii_alphanumeric() || character == '-')
+    });
+    Version::parse(kept).ok()
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.

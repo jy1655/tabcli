@@ -27,10 +27,11 @@
   refused. Without a label (`unlabelled_codex_version`, the one place of that rule; owner's
   decisions 4B and B2, 2026-11-26), ambiguity is judged by a word's shape, not by whether it
   parses. A candidate is a word that, after its leading punctuation and one optional `v`,
-  begins with digits.digits.digits. The text names a version only when it has exactly one
-  candidate, whether or not the others would parse, and that candidate has a reading: its
-  rest, less trailing characters that cannot end a version (anything but a letter, a digit or
-  `-`), removed one at a time until it is SemVer. A valid prerelease or build stays:
+  begins with digits.digits.digits not followed by a dot and a digit (an IPv4 address or a
+  four-part build number is no candidate). The text names a version only when it has exactly
+  one candidate, whether or not the others would parse, and that candidate has a reading: its
+  rest, less its trailing characters that cannot end a version (anything but a letter, a digit
+  or `-`), read as SemVer. A valid prerelease or build stays:
   `0.170.0--` and `0.168.0-rc-.` are prereleases, `OpenAI Codex (v0.170.0)`, `(0.170.0)`,
   `0.170.0+` and `Codex 0.170.0.` are 0.170.0. No candidate, a candidate without a reading
   (`0.170.0-`), and two or more candidates are refused: another program's version can come
@@ -72,7 +73,16 @@
   | `OpenAI Codex 0.168.0-rc-. (runtime 22.0.0)` | refuses | refuses | refuses |
   | `OpenAI Codex (v0.168.0)` | refuses | refuses | refuses |
   | `unknown` | refuses | refuses | refuses |
+  | `OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)` | launches | refuses | launches |
+  | `codex 0.170.0 build 1.2.3.4` | launches | refuses | launches |
+  | `Codex <0.169.0` | launches | refuses | launches |
   <!-- /herdr-version-handoff -->
+
+  Notes on the table. A word of four dot-separated numbers (an IPv4 address with or without a
+  port, a four-part build number) is not a candidate, so it does not make a banner ambiguous.
+  Leading punctuation is removed before a candidate's shape is read, as 0.4.48 removed it, so
+  `Codex <0.169.0` reads as exactly 0.169.0 and launches, here as in 0.4.48: the reading cannot
+  tell a bound from a version.
 
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases

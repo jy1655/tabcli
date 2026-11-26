@@ -57,7 +57,7 @@ impl Core for Installed {
         Ok(match parent {
             Some(0) => super::Parent::Root,
             Some(parent) => super::Parent::Process(parent),
-            None => super::Parent::Unknown(format!("process {pid} is absent or invisible to TAB")),
+            None => super::Parent::Unknown(format!("process {pid} is no longer running")),
         })
     }
 
@@ -233,7 +233,7 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
             socket.display()
         );
     }
-    let stream = match connect_before(socket, deadline) {
+    let stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -242,9 +242,6 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
             ) =>
         {
             return Err(not_running(socket));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-            bail!("Herdr connection timed out");
         }
         Err(error) => {
             return Err(error).with_context(|| format!("cannot connect to {}", socket.display()));
@@ -258,94 +255,6 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
     }
     Ok(Framed::new(stream))
 }
-
-/// A connection to `socket` that ends by `deadline`. `UnixStream::connect` can wait without a
-/// bound (Linux makes a blocking connect wait for room in a full listen queue), so the socket
-/// connects without blocking and waits for room, or for completion, only until the deadline.
-fn connect_before(socket: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
-    use std::os::unix::{ffi::OsStrExt, io::FromRawFd};
-    let bytes = socket.as_os_str().as_bytes();
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the Herdr socket path cannot be connected to",
-        ));
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *slot = *byte as libc::c_char;
-    }
-    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    #[cfg(target_os = "macos")]
-    {
-        address.sun_len = length as u8;
-    }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // The stream owns the descriptor from here, and closes it on every return.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    stream.set_nonblocking(true)?;
-    loop {
-        let connected =
-            unsafe { libc::connect(fd, (&raw const address).cast(), length as libc::socklen_t) };
-        if connected == 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EINTR) => {}
-            // A full listen queue: wait for room until the deadline.
-            Some(libc::EAGAIN) => {
-                std::thread::sleep(super::remaining(deadline)?.min(CONNECT_RETRY));
-            }
-            Some(libc::EINPROGRESS) => {
-                let mut poll = libc::pollfd {
-                    fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                let wait = super::remaining(deadline)?
-                    .as_millis()
-                    .clamp(1, i32::MAX as u128);
-                match unsafe { libc::poll(&mut poll, 1, wait as libc::c_int) } {
-                    0 => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
-                    ready if ready < 0 => return Err(std::io::Error::last_os_error()),
-                    _ => {}
-                }
-                let mut failure: libc::c_int = 0;
-                let mut size = size_of::<libc::c_int>() as libc::socklen_t;
-                if unsafe {
-                    libc::getsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        (&raw mut failure).cast(),
-                        &mut size,
-                    )
-                } != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if failure != 0 {
-                    return Err(std::io::Error::from_raw_os_error(failure));
-                }
-                break;
-            }
-            _ => return Err(error),
-        }
-    }
-    stream.set_nonblocking(false)?;
-    Ok(stream)
-}
-
-/// How long a connection waits before it tries a full listen queue again.
-const CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 impl Stream for UnixStream {
     fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize> {

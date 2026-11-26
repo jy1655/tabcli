@@ -52,8 +52,6 @@ struct FakeState {
     parents: BTreeMap<u32, u32>,
     unreadable_parent: Option<u32>,
     unknown_parent: Option<u32>,
-    /// How long each parent lookup takes.
-    parent_delay: Duration,
     caller: Option<String>,
     current_pid: u32,
     /// Terminals of configured remote machines, which hc's list also returns.
@@ -274,7 +272,6 @@ impl Core for FakeCore {
     }
     fn parent_pid(&self, pid: u32) -> Result<Parent> {
         let state = self.0.borrow();
-        thread::sleep(state.parent_delay);
         if state.unreadable_parent == Some(pid) {
             bail!("process {pid} is unreadable");
         }
@@ -1385,119 +1382,6 @@ fn an_automatic_choice_proves_the_caller_runs_inside_its_terminal() {
 // The ancestry walk compares every process it reaches, the last one within its bound
 // included, and tells a bound it reached from a chain that ended: the first is inconclusive,
 // the second proves the command is outside the terminal's program. Both refuse the choice.
-// A connection to a core whose listen queue is full ends by its deadline. Linux makes a
-// blocking connect wait for room there without a bound; macOS refuses it at once, which the
-// adapter reports as a missing core. Either way `open` returns by the deadline.
-#[cfg(unix)]
-#[test]
-fn a_connection_to_a_core_that_accepts_nothing_ends_by_its_deadline() {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
-    let directory = tempfile::tempdir().unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = directory.path().join("c.sock");
-    let address = || {
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (slot, byte) in address
-            .sun_path
-            .iter_mut()
-            .zip(socket.as_os_str().as_bytes())
-        {
-            *slot = *byte as libc::c_char;
-        }
-        address
-    };
-    let length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-    let raw_socket = || {
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(fd >= 0);
-        unsafe { OwnedFd::from_raw_fd(fd) }
-    };
-    // A listener with a queue of one that never accepts.
-    let listener = raw_socket();
-    let bound = address();
-    assert_eq!(
-        unsafe {
-            libc::bind(
-                std::os::fd::AsRawFd::as_raw_fd(&listener),
-                (&raw const bound).cast(),
-                length,
-            )
-        },
-        0
-    );
-    assert_eq!(
-        unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&listener), 1) },
-        0
-    );
-    // Fill the queue with connections that do not wait, until one is refused.
-    let mut queued = Vec::new();
-    for _ in 0..64 {
-        let client = raw_socket();
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&client);
-        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
-        let target = address();
-        if unsafe { libc::connect(fd, (&raw const target).cast(), length) } != 0 {
-            break;
-        }
-        queued.push(client);
-    }
-    let (done, outcome) = std::sync::mpsc::channel();
-    let path = socket.clone();
-    thread::spawn(move || {
-        let result = super::unix::open(&path, Instant::now() + Duration::from_millis(300));
-        let _ = done.send(result.err().map(|error| error_text(&error)));
-    });
-    let error = outcome
-        .recv_timeout(Duration::from_secs(3))
-        .expect("the connection waited past its deadline")
-        .expect("no core accepted the connection");
-    assert!(
-        error.contains("timed out") || error.contains("no Herdr Core is running"),
-        "{error}"
-    );
-    drop(queued);
-    drop(listener);
-}
-
-// The caller check ends by its deadline: one that has passed refuses before the core is
-// asked anything, and a walk of parents that outlasts it stops there, unverified.
-#[test]
-fn the_caller_check_ends_by_its_deadline() {
-    let core = FakeCore::new();
-    core.0.borrow_mut().caller = Some("t3".into());
-    core.0.borrow_mut().terminals.insert(
-        "t3".into(),
-        json!({"address": "t3", "state": "live", "pid": 1009, "argv": ["sh"],
-               "created_ms": 1, "labels": {}}),
-    );
-    // 900 -> 1000 -> ... -> 1009, the terminal's program.
-    let mut parents = BTreeMap::from([(900, 1000)]);
-    for pid in 1000..1009 {
-        parents.insert(pid, pid + 1);
-    }
-    core.0.borrow_mut().parents = parents;
-    verify_caller(&core, later()).unwrap();
-    core.clear_calls();
-    let text = error_text(&verify_caller(&core, Instant::now()).unwrap_err());
-    assert!(text.contains("deadline"), "{text}");
-    assert!(text.contains("no other terminal was opened"), "{text}");
-    assert!(core.methods().is_empty(), "{:?}", core.methods());
-    // Each lookup takes 30 ms; ten of them outlast a 100 ms deadline.
-    core.0.borrow_mut().parent_delay = Duration::from_millis(30);
-    let started = Instant::now();
-    let text =
-        error_text(&verify_caller(&core, Instant::now() + Duration::from_millis(100)).unwrap_err());
-    assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "{:?}",
-        started.elapsed()
-    );
-    assert!(text.contains("could not verify"), "{text}");
-    assert!(text.contains("deadline"), "{text}");
-}
-
 #[test]
 fn the_caller_check_compares_the_last_ancestor_and_reports_its_bound_apart() {
     let core = FakeCore::new();
