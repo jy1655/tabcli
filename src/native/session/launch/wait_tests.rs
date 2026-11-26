@@ -1217,12 +1217,10 @@ fn a_finished_terminal_never_acts_when_the_budget_ends_during_its_last_read() {
 #[test]
 fn a_finished_terminal_never_acts_when_the_receipt_expires_during_its_last_read() {
     use crate::native::session::tests::{FIXED_UNIX_MS, with_fixed_time};
-    let absent = || Ok(terminal::LaunchSurface::Absent);
-    let cases: [(fn() -> Result<terminal::LaunchSurface>, &str, u64); 2] = [
-        (finished, LAUNCH_DEADLINE, 2500),
-        (absent, SURFACE_DISAPPEARED, 2000),
-    ];
-    for (second, expected, ended_ms) in cases {
+    for (absent, expected, ended_ms) in [
+        (false, LAUNCH_DEADLINE, 2500),
+        (true, SURFACE_DISAPPEARED, 2000),
+    ] {
         with_fixed_time(|| {
             let (_dir, store, _) = fixture();
             let mut record = read(&store).unwrap().unwrap();
@@ -1239,8 +1237,8 @@ fn a_finished_terminal_never_acts_when_the_receipt_expires_during_its_last_read(
                 seen.set(true);
             });
             let run = run_probed(&store, 2500, |at| match at {
-                1000 => finished(),
-                _ => second(),
+                2000 if absent => Ok(terminal::LaunchSurface::Absent),
+                _ => finished(),
             });
             assert!(ran.get(), "{expected}: the hook did not run");
             assert_eq!(format!("{:#}", run.result.unwrap_err()), expected);
