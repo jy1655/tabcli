@@ -318,3 +318,36 @@ fn the_spawn_fence_consumes_the_authority_for_an_applied_option() {
     write_private(&session.directory.join(SESSION_FILE), b"{").unwrap();
     assert!(admit_spawn_with(&session.directory, &fixture.env).is_err());
 }
+
+// Review round 3, finding 3, through the spawn fence itself: a session whose record names a
+// launch option that is not its target's own starts nothing.
+#[test]
+fn the_spawn_fence_starts_nothing_for_a_launch_option_without_consent() {
+    let (_temp, workspace, fixture) = setup();
+    trust_pi(&fixture, &workspace);
+    let session = launched(&workspace, &fixture);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["provider"] = serde_json::json!("agy");
+    write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
+    applied(&session.directory, "codex-config-override").unwrap();
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "exit", "0"]);
+        command
+    } else {
+        std::process::Command::new("true")
+    };
+    let store = crate::native::session::Store::open_unchecked(&session.directory);
+    match crate::native::session::launch::spawn(&store, &mut command, |_| Ok(())) {
+        Ok(mut child) => {
+            let _ = child.wait();
+            panic!("the provider was started");
+        }
+        Err(error) => assert!(
+            format!("{error:#}").contains("another provider's launch option"),
+            "{error:#}"
+        ),
+    }
+}
