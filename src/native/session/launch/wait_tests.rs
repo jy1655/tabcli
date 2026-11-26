@@ -1207,26 +1207,48 @@ fn a_finished_terminal_never_acts_when_the_budget_ends_during_its_last_read() {
     );
 }
 
-// The finished terminal, the receipt's deadline: the probe decides nothing, and so does the
-// next one; the launch deadline settles the launch.
+// The finished terminal, the receipt's deadline: the wall clock is the fixed test clock, which
+// only the hook moves, to the receipt's deadline, so the first probe reaches its last read with
+// the receipt unexpired and finds it expired at its clocks. That probe decides nothing. The
+// receipt's deadline is not the launch's: with the launch budget left, the wait keeps polling.
+// A terminal still finished at the next probe decides nothing either, and the launch deadline
+// settles the launch; a terminal the core then reports absent ends the wait at that probe, as
+// a disappeared surface, before the launch deadline.
 #[test]
 fn a_finished_terminal_never_acts_when_the_receipt_expires_during_its_last_read() {
-    let (_dir, store, _) = fixture();
-    let mut record = read(&store).unwrap().unwrap();
-    record.deadline_unix_ms = unix_ms() + 1500;
-    let receipt_deadline = record.deadline_unix_ms;
-    store
-        .record(CoreRecord::Launch)
-        .write_json(&record)
-        .unwrap();
-    early_facts_hook::set(move || {
-        while unix_ms() <= receipt_deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    });
-    let run = run_probed(&store, 2500, |_| finished());
-    assert_eq!(format!("{:#}", run.result.unwrap_err()), LAUNCH_DEADLINE);
-    assert_eq!(run.probes.len(), 2);
+    use crate::native::session::tests::{FIXED_UNIX_MS, with_fixed_time};
+    let absent = || Ok(terminal::LaunchSurface::Absent);
+    let cases: [(fn() -> Result<terminal::LaunchSurface>, &str, u64); 2] = [
+        (finished, LAUNCH_DEADLINE, 2500),
+        (absent, SURFACE_DISAPPEARED, 2000),
+    ];
+    for (second, expected, ended_ms) in cases {
+        with_fixed_time(|| {
+            let (_dir, store, _) = fixture();
+            let mut record = read(&store).unwrap().unwrap();
+            record.deadline_unix_ms = unix_ms() + 1500;
+            let receipt_deadline = record.deadline_unix_ms;
+            store
+                .record(CoreRecord::Launch)
+                .write_json(&record)
+                .unwrap();
+            let ran = Rc::new(Cell::new(false));
+            let seen = Rc::clone(&ran);
+            early_facts_hook::set(move || {
+                FIXED_UNIX_MS.set(Some(receipt_deadline));
+                seen.set(true);
+            });
+            let run = run_probed(&store, 2500, |at| match at {
+                1000 => finished(),
+                _ => second(),
+            });
+            assert!(ran.get(), "{expected}: the hook did not run");
+            assert_eq!(format!("{:#}", run.result.unwrap_err()), expected);
+            assert_eq!(run.probes, [(1000, 1500), (2000, 500)], "{expected}");
+            assert_eq!(run.sleeps.iter().sum::<u64>(), ended_ms, "{expected}");
+            assert_eq!(store.status().unwrap().error.as_deref(), Some(expected));
+        });
+    }
 }
 
 // The refusal, the launch budget: nothing is written, and the caller is given the refusal.
@@ -1281,10 +1303,13 @@ fn the_early_decisions_take_the_lock_only_from_a_regular_file() {
 
 // A FIFO at the lock's path never blocks either decision: the lock file is opened without
 // blocking, and a FIFO is no regular file. Each decision runs on its own thread so that a
-// blocked open fails the test instead of hanging it.
+// blocked open fails the test instead of hanging it: the test itself never waits without a
+// bound. A thread that ends without an answer has panicked, and its panic is the failure; after
+// the timeout, the FIFO is opened only without blocking, to release an open that waits on it.
 #[cfg(unix)]
 #[test]
 fn the_early_decisions_never_block_on_a_fifo_at_the_lock_path() {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::mpsc;
     let (_dir, store, token) = fixture();
     let fifo = store
@@ -1296,7 +1321,7 @@ fn the_early_decisions_never_block_on_a_fifo_at_the_lock_path() {
     let directory = store.directory().to_owned();
     let (sender, receiver) = mpsc::channel();
     let refusing = token.clone();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let store = Store::open_unchecked(&directory);
         let now = Rc::new(Cell::new(Instant::now()));
         let refused = refuse(&store, &refusing, &now, 20_000);
@@ -1316,12 +1341,25 @@ fn the_early_decisions_never_block_on_a_fifo_at_the_lock_path() {
         .is_some();
         let _ = sender.send((refused, decided));
     });
-    let outcome = receiver.recv_timeout(Duration::from_secs(5));
-    if outcome.is_err() {
-        // Unblock an open that waits for a writer, so that the thread ends.
-        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
-    }
-    let (refused, decided) = outcome.expect("an early decision blocked on the FIFO");
+    let (refused, decided) = match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => panic!("the early decisions' thread ended without an answer"),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // A read-only open of a FIFO never blocks with `O_NONBLOCK`, and a write-only one
+            // then finds that reader: whichever end a blocked open waits for is opened, and
+            // neither open waits here, also when the thread has finished meanwhile.
+            let open = |options: &mut std::fs::OpenOptions| {
+                options.custom_flags(libc::O_NONBLOCK).open(&fifo)
+            };
+            let _reader = open(std::fs::OpenOptions::new().read(true));
+            let _writer = open(std::fs::OpenOptions::new().write(true));
+            let late = receiver.recv_timeout(Duration::from_secs(5));
+            panic!("an early decision blocked on the FIFO (after its release: {late:?})");
+        }
+    };
     assert_eq!(
         refused,
         "the Herdr launch host would refuse the session directory /state/x"
