@@ -189,33 +189,33 @@ read fails, for example because its token cannot read the directory's access lis
 decides. TAB detects a directory the host would refuse at once and fails the start as a Surface
 that cannot be opened does; the start returns when TAB has the session's lifecycle lock, which
 another command can hold for up to the launch timeout. The error names the directory and the
-host's reason. When TAB settles the start, it first records `terminal launch failed: the
+host's reason. If TAB cannot establish, under the session's lifecycle lock and before the
+launch timeout, that the start is still its own pending launch (for example because another
+command holds the lock for the whole launch timeout, or a record cannot be read), it writes
+nothing: the session's status, its claim and its launch log stay as they were (for example
+`launching`, with the `launch_pending` line TAB wrote when the launch began), and the returned
+error holds the reason. What the status becomes afterwards is left to the launch repair that
+later commands such as `sessions` run, and to `reopen`, as for a Surface that cannot be opened
+while another command holds the lock. When TAB can establish it, TAB settles the start as it
+settles a Surface that cannot be opened, as in 0.4.49: it records `terminal launch failed: the
 <host> launch host would refuse the session directory; no surface handle was recorded and no
-prompt was sent` as the session's failed status, then releases the claim, then appends the
-same line to the launch log when it can; a step that fails ends the settlement there, keeps
-what was already written, and adds its error to the returned one. The
-directory is judged once, as TAB saw it: correcting it while the start waits does not change
-the outcome, so correct it and run the command again. When TAB does not settle it, because
-another command holds the lock for the whole launch timeout or the session's records do not
-show this start's own pending launch or cannot be read, TAB writes nothing and adds no refusal
-line: the session's status, its claim and its launch log stay as they were (for example
-`launching`, with the `launch_pending` line TAB wrote when the launch began), and only the
-returned error holds the reason. What the status becomes afterwards is left to the launch
-repair that later commands such as `sessions` run, and to `reopen`, as for any Surface that
-cannot be opened while the lock is held. TAB cannot know a change made
-after its check, a host started under another account than the one it named, or an error only
-the host meets; the host still refuses those and appends to its launch log when it can. A
-Herdr start then fails at TAB's next check of the terminal, normally about a second after the
-core reports it finished, when TAB can read that the launch is still its own and pending and
-that no provider was started (the session records `terminal surface finished before provider
-launch was confirmed`; the error adds the terminal, its exit code when the core gives one, and
-the launch log's path), as a tmux start does when its surface disappears. Otherwise TAB keeps
-waiting as for any surface: a later confirmation still succeeds, and a provider or launch-host
-failure ends the start with its own reason. A surface that disappears ends the wait at the
-next check: the start fails with that reason unless TAB, reading again under the lifecycle
-lock, finds a confirmation (the start succeeds) or a recorded failure (which keeps its own
-reason), or another command holds the lock (the error says so and the claim is retained).
-Without any of these the start ends at the launch deadline.
+prompt was sent` as the session's failed status, then releases the claim, then appends the same
+line to the launch log. An error writing the status or releasing the claim ends the settlement
+there and is returned with the refusal; the log line is best effort, and a failure to append it
+is not reported. The directory is judged once, as TAB saw it: correcting it while the start
+waits does not change the outcome, so correct it and run the command again. TAB cannot know a
+change made after its check, a host started under another account than the one it named, or an
+error only the host meets; the host still refuses those and appends to its launch log when it
+can. A Herdr start then fails at TAB's next check of the terminal, normally about a second
+after the core reports it finished, when TAB can read that the launch is still its own and
+pending and that no provider was started (the session records `terminal surface finished before
+provider launch was confirmed`; the error adds the terminal, its exit code when the core gives
+one, and the launch log's path), as a tmux start does when its surface disappears. Otherwise
+TAB keeps waiting as for any surface, as in 0.4.49, up to the launch deadline. A surface that
+disappears is handled by the ordinary settlement, as in 0.4.49: it keeps a confirmed or ended
+outcome, returns errors from reading or updating the records, and uses `terminal surface
+disappeared before provider launch was confirmed` for a launch that is still pending and that
+it can settle.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

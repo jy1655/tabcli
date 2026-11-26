@@ -14,18 +14,18 @@
   log for an input-flush or shell-start error. The shell-environment probe guidance applies
   to the macOS capture host. A session directory the caller refused before any Surface adds
   no row: no host ran, and a macOS capture kind keeps only its initial `awaiting_host` stage.
-  The returned error holds the host's reason with the directory; the status and the launch log
-  hold a fixed reason only when the settlement wrote them. It writes the failed status first,
-  then releases the Claim, then appends the log line on a best-effort basis, and a step that
-  fails ends it there: a Claim that cannot be removed leaves the fixed reason in the status, the
-  Claim in place and no line in the log, and its error is added to the returned one. A
-  refusal that settles nothing (a launch that is not this launch's own or cannot be read, or a
-  lifecycle lock held until the launch deadline) adds no refusal line and leaves the status and
-  the launch log as they were: for example `Launching` with TAB's earlier `launch_pending` line,
-  or a status already `Failed` or `Closed`. The refusal does not decide the status afterwards:
-  reopen copies the full error into it only if it still finds `Launching` with the matching
-  Claim, and if repair settles the launch and releases its Claim before reopen obtains the
-  lock, the failed status repair wrote stays and reopen's fence copies nothing.
+  The returned error holds the host's reason with the directory. If the early facts are not
+  established, the refusal writes nothing: the status and the launch log stay as they were (for
+  example `Launching` with TAB's earlier `launch_pending` line, or a status already `Failed` or
+  `Closed`). On established facts the existing settlement (`fail_locked`, as in 0.4.49) writes
+  the failed status with the fixed reason, then releases the Claim, then appends the same line
+  to the launch log. An error writing the status or releasing the Claim ends it there and is
+  returned with the refusal; when the Claim cannot be released, no refusal line is appended and
+  the earlier lines from TAB stay. The log append is best effort: its failure is not reported
+  and changes nothing else. What the status becomes after a refusal that wrote nothing is left
+  to the existing paths: reopen's fence (`fence_failed_start_locked`) copies the full error into
+  a launch it still finds `Launching` with the matching Claim, and a repair that settles the
+  launch and releases its Claim first keeps its own failed status.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared
