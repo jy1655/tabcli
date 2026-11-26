@@ -10,25 +10,17 @@
   rule that is neither a plain allow nor a plain deny are refused.
 - A bound launch host's session directory follows the same rule with the directory-changing
   rights added (`windows_directory_is_private`). The rule can be judged for another process's
-  owners (`windows_directory_is_private_to`): the launcher judges a Herdr session directory for
-  the core's token user and default owner before it creates the terminal. An elevated process's
-  default owner is normally the Administrators group (a token's default owner can differ by
-  policy or per process), so a directory that an elevated TAB creates is normally not private
-  to the user of a core that is not elevated. The rule itself is unchanged; an account TAB
-  cannot read leaves the owner and the access list to the host.
-- The state root is made private to the user at every session creation (`create_state_root`
-  sets mode 0700 on macOS and Linux and an access list for the user alone on Windows, and fails
-  where TAB cannot): only the user's own processes, an administrator and the system can then
-  add, remove or replace a session directory under it. TAB does not check the state root's
-  ancestors; a state root inside a directory another account can change is outside this.
-  The settlements that end a launch from outside its own records (the refusal before any
-  Surface, the finished Herdr terminal, reopen's refusal and its fencing) decide whether the
-  directory at the session's path is that launch's with one function,
-  `launch::launch_owns_directory` (a real directory, the request receipt of the launch's Claim,
-  no launch receipt of another Claim, no other bound Surface), before and again under the
-  lifecycle lock, and write nothing when it is not. A replacement by the user's own processes
-  between that check and the write is not closed with directory handles; the lock is opened by
-  name.
+  owners (`windows_directory_is_private_to`): the caller judges a Herdr session directory for
+  the core's token user and default owner before it creates the terminal, to reproduce the
+  verdict of the host, which runs as the core. An elevated process's default owner is normally
+  the Administrators group (a token's default owner can differ by policy or per process), so a
+  directory an elevated TAB creates is normally not private to the user of a core that is not
+  elevated. The rule itself is unchanged.
+- TAB treats its state root as the user's own, as it did before this check: at every session
+  creation it sets the root's mode to 0700 (macOS, Linux) or its access list to the user alone
+  (Windows), and fails where it cannot. It does not verify that nobody else can change the
+  root: on macOS an extended ACL entry survives the mode change, and on Windows the owner is
+  neither checked nor changed.
 - The check describes the store at the time of the read. It cannot tell who wrote the
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: TAB polls Agy's store every

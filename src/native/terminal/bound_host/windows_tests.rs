@@ -126,11 +126,6 @@ fn the_herdr_check_refuses_a_directory_the_launch_host_would_refuse() {
     icacls(&directory, "*S-1-1-0:(W)");
     let refusal =
         refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap_err();
-    assert!(
-        refusal
-            .downcast_ref::<super::super::RefusedDirectory>()
-            .is_some()
-    );
     let text = format!("{refusal:#}");
     assert_eq!(
         text,
@@ -215,30 +210,6 @@ fn an_elevated_tab_is_refused_for_a_core_that_is_not_elevated() {
     assert!(
         !text.contains("give their files different owners"),
         "{text}"
-    );
-}
-
-// A host writes its admission refusal only into the launch log that the launcher created:
-// without it nothing is written, and with it the line is appended.
-#[test]
-fn a_host_refusal_line_goes_only_into_the_launch_log_the_launcher_created() {
-    let root = tempfile::tempdir().unwrap();
-    let directory = private_session(root.path(), "session-unlogged");
-    icacls(&directory, "*S-1-1-0:(W)");
-    let refuse = || {
-        run_logged_bound_host(&directory, TerminalKind::Herdr, |_| -> Result<()> {
-            panic!("admission refused")
-        })
-        .unwrap_err()
-    };
-    refuse();
-    assert!(!directory.join(launch::LOG).exists());
-    crate::native::session::primitives::write_private(&directory.join(launch::LOG), b"").unwrap();
-    let error = refuse();
-    let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
-    assert!(
-        log.ends_with(&format!(" herdr_host_refused: {error:#}\n")),
-        "{log}"
     );
 }
 

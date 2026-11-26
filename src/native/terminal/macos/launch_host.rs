@@ -4,7 +4,7 @@
 //! `await_handoff` decides, on the clock and two ports (the capture result and the binding
 //! observation), whether the host keeps waiting, refuses or hands off.
 use super::bound_host::{
-    flush_startup_input, log_refusal, run_logged_bound_host, while_capture_eligible,
+    BoundHostSpec, flush_startup_input, log_refusal, run_bound_host, while_capture_eligible,
 };
 use super::shell_environment::{self, CaptureFailure, Captured};
 use crate::native::clock::{Clock, SystemClock};
@@ -29,7 +29,7 @@ pub(in crate::native::terminal) fn run(
     kind: TerminalKind,
 ) -> Result<()> {
     let name = kind.display_name();
-    run_logged_bound_host(directory, kind, |session_id| {
+    run_bound_host(directory, &BoundHostSpec { name }, |session_id| {
         let store = Store::open_unchecked(directory);
         if !kind.captures_shell_environment() {
             bail!("unsupported launch host");

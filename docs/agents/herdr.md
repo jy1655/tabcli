@@ -51,66 +51,55 @@
   If saving the binding for a confirmed terminal fails and removal also fails, the adapter
   returns that same confirmed handle to the launcher. The launcher uses the current Claim
   and Close records to decide whether to save it. A later close checks its identity again.
-- The launch host is the core's program and runs as the core's account. Before the core is
-  reached, the launcher judges what needs no account (`bound_host::refuse_before_launch`): an
-  absolute path that can be sent as text exactly, a session-id name, a real directory, and on
-  macOS and Linux the permission bits; a Windows access rule depends on the account and waits
-  for the core. On the connection that sends `terminal.run`, right before it (after the caller
-  check, which can replace the connection), the adapter runs the host's own admission for the
-  core's account (`Core::admit_launch_directory`, `bound_host::refuse_before_core_launch`): on
-  macOS and Linux the socket peer's uid, which the connection already required to be TAB's; on
-  Windows the token user and default owner read from the pipe server's process handle that the
-  user check opened and the connection keeps, so a reused PID cannot answer. A connection that
-  cannot name the account leaves the owner and, on Windows, the access list to the host. A
-  refusal (`terminal::RefusedDirectory`) comes before any Surface exists and names the host's
-  reason; when TAB's own account would be admitted it also says how the accounts differ.
-  Observed 2026-11-26 (Windows 11, hc 0.1.21): an elevated TAB (an administrator's SSH session)
-  gave the session directory the Administrators group as owner, which the host of a core that
-  is not elevated refused only in the launch log, and the caller timed out after 31.7 s. The
-  launcher settles such a refusal after waiting for the lifecycle lock, only in the directory
-  that `launch::launch_owns_directory` finds is this launch's (`launch::refused_before_surface`;
-  see Trust Store Boundary for what protects the state root). What only the host can know (the
-  directory changed after this check, a program started under another token than the core's
-  own, an I/O failure the host alone meets) is the host's: every launch host that logs
-  (`launch::append_host_refusal`) writes its refusal only into the launch log the launcher
-  created, opened without following a link, without blocking and without creating it, and
-  only as a regular file in the real directory it just checked; otherwise it writes nothing.
-  The line is a diagnostic, not a Record: the host has not verified that it owns the launch.
+- The launch host runs as the core's account and refuses a session directory it does not find
+  private to that account. The caller reproduces that verdict before any Surface exists
+  (owner's decision 2026-11-26, option 3a): before the core is reached it judges what needs no
+  account (`bound_host::refuse_before_launch`: an absolute path that can be sent as text
+  exactly, a session-id name, a real directory, and on macOS and Linux the permission bits);
+  on the connection that sends `terminal.run`, right before it (after the caller check, which
+  can replace the connection), the adapter judges the rest for the core's account
+  (`Core::admit_launch_directory`, `bound_host::refuse_before_core_launch`): on macOS and Linux
+  the socket peer's uid, which the connection already required to be TAB's; on Windows the
+  token user and default owner read from the pipe server's process handle that the user check
+  opened and the connection keeps. A connection that cannot name the account leaves the owner
+  and, on Windows, the access list to the host. A refusal names the host's reason and, when
+  TAB's own account would be admitted, how the accounts differ. Observed 2026-11-26 (Windows
+  11, hc 0.1.21): an elevated TAB (an administrator's SSH session) gave the session directory
+  the Administrators group as owner, which the host of a core that is not elevated refused
+  only in the launch log, and the caller timed out after 31.7 s. The refusal is an ordinary
+  failure to open the Surface and settles through the same path as one (`terminal_failure`):
+  for an uncontended launch the session fails with that reason and its Claim released, and
+  no terminal exists. What the caller cannot know stays the host's, unchanged from 0.4.49:
+  the directory changed after the check, a program started under another token than the
+  core's own, an I/O failure only the host meets. The host logs its refusal as before, and
+  the launch ends as below when its terminal finishes.
 - The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
   (`launch_surface`): the exact terminal with the presence proof, and the launch label when
   the handle records one. A terminal its verified core reports finished before startup was
-  confirmed fails the launch soon after the next probe, about a second, on every platform, as
-  a tmux surface that disappears does (owner's decision 2026-11-26, option A). This reverses,
-  for a host that ended before startup, #409's choice to leave its admission, receipt, binding
-  and Pending-launch refusals to the launch deadline. The finished terminal can only fail a
-  launch. The wait keeps the observation and waits for the lifecycle lock within the launch
-  deadline (a reader holding it delays, never strands, the settlement), then decides from the
-  records under the lock, for its own Claim token and Surface (`launch_owns_directory`): a
-  directory that is not this launch's is left alone and the wait fails without writing; a
-  confirmed startup and a launch-host Record (`input_flush_failed`, `launch_shell_exec_failed`)
-  keep their own outcome; a terminal that finished after confirmation is not this case. The
-  failure is `terminal surface finished before provider launch was confirmed (Herdr terminal t7
-  exited with code N); its launch host logged: <text>`. The core's report is the only
-  authority. The exit code is the core's `exit_code` when it gives one (the field name is read
-  from the installed hc 0.1.22's string table, not from a live core, and nothing is decided on
-  it). The text is the host's last `herdr_host_refused` line in the launch log, bounded and
-  with control characters escaped, read without following a link, without blocking, only as
-  a regular file and only its last MiB; without one the clause is left out. For a pending
-  launch the records end as at the deadline: failed status with that reason, the Claim
-  released, the receipt pending, the launch log line, and the surface handle kept, so
+  confirmed fails the launch at the next probe, about a second, on every platform, as a tmux
+  surface that disappears does (owner's decision 2026-11-26, option A); this reverses, for a
+  host that ended before startup, #409's choice to leave its admission, receipt, binding and
+  Pending-launch refusals to the launch deadline. The finished terminal can only fail a launch:
+  it settles through the one settlement the deadline uses (`settle`), with the same records,
+  the same lifecycle lock attempt and the same precedence of a confirmed startup or a
+  launch-host Record (`input_flush_failed`, `launch_shell_exec_failed`). Its reason is a fixed
+  text from the core's report and the launch log's path, `terminal surface finished before
+  provider launch was confirmed (Herdr terminal t7 exited with code N); see the launch log
+  <path>`; nothing is read from the log. The exit code is the core's `exit_code` when it gives
+  one (the field name is read from the installed hc 0.1.22's string table, not from a live
+  core, and nothing is decided on it). A pending, uncontended launch ends failed with that
+  reason, its Claim released, its receipt pending and its surface handle kept, so
   `close-session` removes the finished terminal (`terminal.rm`). A launch whose wrapper had
-  recorded `Spawning` keeps its Claim and receipt (a provider may have run; the reason says
-  so), and a macOS capture host can have recorded a later stage. A host that ends before its
-  Surface is bound is found by creation instead, which reads the created terminal live and
-  otherwise removes it.
+  recorded `Spawning` keeps its Claim (a provider may have run; the reason says so); when the
+  lifecycle lock is held at that moment, the Claim is retained until repair settles the launch
+  at its receipt deadline, as at the deadline. A host that ends before its Surface is bound is
+  found by creation instead, which reads the created terminal live and otherwise removes it.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface
   under the lifecycle lock. Launch wait and repair read it through the same settlement as
   the macOS host. A missing or different birth keeps the refusal in the launch log. A
-  PowerShell wait error after successful spawn also reaches only the launch log. When such a
-  host then exits, the wait below ends at its finished terminal; a provider spawn that had not
-  begun is then refused by the wrapper's fence, and one that had keeps its own outcome.
+  PowerShell wait error after successful spawn also reaches only the launch log.
 - The core gives programs its own environment, not the caller's, and it can carry another
   session's markers: the core on the owner's Mac on 2026-11-18 carried Claude Code's
   child-session and messaging variables. Every launch host removes the adapters' caller markers
@@ -207,10 +196,12 @@
   read again from a handle opened on the directory itself (`FILE_FLAG_OPEN_REPARSE_POINT`): no
   reparse point, and the trust store's access-list rule, where `FILE_DELETE_CHILD` and `DELETE`
   also count as changing a directory (`consent::windows_directory_is_private`; the store's own
-  rule is unchanged). The Herdr adapter judges the same rule for the core's owners
+  rule is unchanged). The caller judges the same rule for the core's owners
   (`consent::windows_directory_is_private_to`, read through `windows/process.rs`
-  `QueriedProcess`); the core's elevation is read only to explain a refusal. After the same binding wait, launch
-  judgment and locked re-check as the Linux host (`bound_host`), it flushes `CONIN$` (a
+  `QueriedProcess`); without the account it opens the directory for attribute access only.
+  The core's elevation is read only to word a refusal. After the same binding wait, launch
+  judgment and locked
+  re-check as the Linux host (`bound_host`), it flushes `CONIN$` (a
   console it cannot flush refuses the launch), keeps itself running through Ctrl+C and
   Ctrl+Break with a handler routine (not inherited, unlike ignoring them), and starts PowerShell
   7 from the core's `PATH` with the managed console root's exact arguments
@@ -257,8 +248,9 @@
   platform; the lookup over the Herdr adapter on a scripted core runs on macOS, Linux and
   Windows, including Repair with a scripted owner observation and the real close transaction.
   The pipe transport (a real pipe of this user, and the account it reads for its server),
-  process births, parents, tokens, the installed lookup against an absent pipe, the directory
-  admission and its check for a core's account (elevated runner), the Windows-only Repair tests,
+  the caller's check of a session directory for a core's account (elevated runner), process
+  births, parents, tokens, the installed
+  lookup against an absent pipe, the directory admission, the Windows-only Repair tests,
   the attach line under PowerShell 7 and the
   binding wait run on the Windows CI runner. Live (reported by the
   verification session, 2026-11-18): the Windows PR head (505f0e7) passed the five native

@@ -244,30 +244,6 @@ impl std::fmt::Display for RetainedLaunchSurface {
 
 impl std::error::Error for RetainedLaunchSurface {}
 
-// A session directory that a launch host would refuse, found before any surface was created
-// for it (`bound_host::refuse_before_launch`, `refuse_before_core_launch`). The launcher settles
-// it as a known refusal: only for its own Claim, never through a path that is not a real
-// directory, and after a reader holding the lifecycle lock releases it.
-#[derive(Debug)]
-pub(in crate::native) struct RefusedDirectory {
-    message: String,
-}
-
-impl RefusedDirectory {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    pub(super) fn new(message: String) -> Self {
-        Self { message }
-    }
-}
-
-impl std::fmt::Display for RefusedDirectory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RefusedDirectory {}
-
 // The WezTerm GUI incarnation that serves a session. A mux numbers its panes from 0
 // (`static PANE_ID` in mux/src/pane.rs), so the pane id of the session is an identity only
 // together with that process: its pid, its birth, and the socket it serves.
@@ -414,8 +390,9 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
 }
 
 /// The launcher's check before `open_bound_tab`: a session directory that the kind's launch
-/// host would refuse is refused with the host's own reason before any surface exists, instead
-/// of by the host once its surface runs (`bound_host::refuse_before_launch`).
+/// host would refuse is refused with the host's own reason before any Surface exists, instead
+/// of by the host once its Surface runs (`bound_host::refuse_before_launch`). The launcher
+/// settles the refusal as a failure to open the Surface.
 pub(in crate::native) fn refuse_before_launch(kind: TerminalKind, directory: &Path) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     return bound_host::refuse_before_launch(directory, kind);

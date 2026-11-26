@@ -48,9 +48,8 @@ pub(in crate::native) fn start(
     let bridge_command =
         launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
     initial_claim.fence_launch();
-    // A session directory the launch host would refuse fails here, before any Surface exists,
-    // as a surface that cannot be opened does: the host could report it only in the launch log,
-    // once its surface ran.
+    // The launch host's verdict on the session directory, reproduced before any Surface
+    // exists: a refusal is a failure to open the Surface and settles as one.
     let opened = terminal::refuse_before_launch(terminal_kind, &created.directory).and_then(|()| {
         terminal::open_bound_tab(
             terminal_kind,
@@ -71,7 +70,7 @@ pub(in crate::native) fn start(
     let terminal_session = match opened {
         Ok(session) => session,
         Err(error) => {
-            let error = settle_open_failure(&created.directory, expected_claim_token, error);
+            let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
             return Err(error).with_context(|| {
                 format!(
                     "failed to open {} surface for session {}",
@@ -84,25 +83,9 @@ pub(in crate::native) fn start(
     launch::wait(
         &Store::open_unchecked(&created.directory),
         &terminal_session,
-        expected_claim_token,
         launch_deadline,
     )?;
     Ok(terminal_session)
-}
-
-// The settlement of a fenced launch whose surface could not be opened, or whose session
-// directory was refused before one was: a known refusal settles only this launch's Claim, and
-// waits for a reader of the lifecycle lock (`launch::refused_before_surface`).
-pub(in crate::native) fn settle_open_failure(
-    directory: &Path,
-    expected_claim_token: &str,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    let store = Store::open_unchecked(directory);
-    if error.downcast_ref::<terminal::RefusedDirectory>().is_some() {
-        return launch::refused_before_surface(&store, expected_claim_token, error);
-    }
-    launch::terminal_failure(&store, error)
 }
 
 #[cfg(unix)]

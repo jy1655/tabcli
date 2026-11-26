@@ -283,23 +283,16 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
   `terminal/bound_host.rs` admits a bound host's directory in one order (absolute path,
-  session-id file name, existing real directory, private to the current user). Before a
-  surface exists, the launcher runs that admission for a host this platform runs, as far as it
-  can establish the host's account (`refuse_before_launch`: tmux as this process, the macOS
-  applications and Herdr, before its core is reached, without an account, so not their owner),
-  and the Herdr adapter runs it on the
-  connection that sends `terminal.run`, for the core's account (`refuse_before_core_launch`).
-  A directory the host would refuse fails at once, before any Surface exists, with the host's
-  reason; the launcher settles that `RefusedDirectory` after waiting for the lifecycle lock,
-  only in the directory that `launch::launch_owns_directory` finds is this launch's (reopen's
-  refusal record and fence ask the same function). A refusal only the host can know goes to the launch log from the
-  Herdr and tmux hosts and the macOS capture host on every platform (`run_logged_bound_host`),
-  only into the launch log the launcher created (`launch::append_host_refusal`); the tty-bound
-  hosts, Ghostty and Warp write nothing into a directory they refuse. The launcher's wait probes its surface through the adapter's
-  `launch_surface` (by default its presence): Herdr reports its terminal finished, which fails
-  a launch not yet confirmed soon after the next probe, as an absent surface does. The wait
-  keeps that observation and waits for the lifecycle lock within the deadline; under it, for
-  its own Claim token and Surface, a confirmed startup and a launch-host Record decide first. It owns the
+  session-id file name, existing real directory, private to the current user). Before any
+  Surface exists, the launcher reproduces that verdict for a host this platform runs, as far as
+  it can establish the host's account and on the text the host is given
+  (`refuse_before_launch`: tmux as this process; the macOS applications, and Herdr before its
+  core is reached, without an account), and the Herdr adapter for the core's account on the
+  connection that sends `terminal.run` (`refuse_before_core_launch`). A refusal is a failure
+  to open the Surface and settles as one. The launcher's wait probes its surface through the
+  adapter's `launch_surface` (by default its presence): a Herdr terminal its core reports
+  finished before startup fails the launch at the next probe through the settlement the
+  deadline uses. It owns the
   registered launch-host dispatch, the shared binding wait, startup input flush and refusal
   log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
   before flushing input. The Windows Terminal tab host uses its own offer protocol.

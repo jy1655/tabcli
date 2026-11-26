@@ -69,43 +69,43 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     bind: impl FnOnce(&Path, &str, &I) -> Result<()>,
     release_message: Option<fn(&I) -> String>,
 ) -> Result<()> {
-    // These hosts write nothing into a directory they refuse, which another account could
-    // have prepared; only the outcome after admission reaches their log policy.
-    let spec = BoundHostSpec {
-        name: kind.display_name(),
-    };
-    run_bound_host(directory, &spec, |id| {
-        let outcome = (|| {
-            let identity = identity()?;
-            bind(directory, id, &identity)?;
-            flush_startup_input(kind.display_name())?;
-            Ok(identity)
-        })();
-        let store = Store::open_unchecked(directory);
-        match outcome {
-            Ok(identity) => {
-                if let Some(message) = release_message {
-                    launch::log(&store, &message(&identity));
+    run_bound_host(
+        directory,
+        &BoundHostSpec {
+            name: kind.display_name(),
+        },
+        |id| {
+            let outcome = (|| {
+                let identity = identity()?;
+                bind(directory, id, &identity)?;
+                flush_startup_input(kind.display_name())?;
+                Ok(identity)
+            })();
+            let store = Store::open_unchecked(directory);
+            match outcome {
+                Ok(identity) => {
+                    if let Some(message) = release_message {
+                        launch::log(&store, &message(&identity));
+                    }
+                    Ok(())
                 }
-                Ok(())
+                Err(error) => {
+                    log_refusal(&store, kind, &format_args!(": {error:#}"));
+                    Err(error)
+                }
             }
-            Err(error) => {
-                log_refusal(&store, kind, &format_args!(": {error:#}"));
-                Err(error)
-            }
-        }
-    })
+        },
+    )
 }
 
-/// A launch host's refusal line, written only into the launch log the launcher created
-/// (`launch::append_host_refusal`). Keep the legacy log prefix for Terminal.app.
+/// Keep the legacy log prefix for Terminal.app.
 pub(super) fn log_refusal(store: &Store, kind: TerminalKind, detail: &impl std::fmt::Display) {
     let name = if kind == TerminalKind::AppleTerminal {
         "terminal"
     } else {
         kind.as_str()
     };
-    launch::append_host_refusal(store.directory(), &format!("{name}_host_refused{detail}"));
+    launch::log(store, &format!("{name}_host_refused{detail}"));
 }
 
 /// The receipt observes the binding; the adapter proves that it names this host.
@@ -133,38 +133,12 @@ pub(super) fn while_capture_eligible<T>(
     act()
 }
 
-// The hosts that write nothing into a directory they refuse: the tty-bound hosts
-// (`run_tty_bound_host`), Ghostty and Warp.
-#[cfg(any(target_os = "macos", test))]
 pub(super) fn run_bound_host<T>(
     directory: &Path,
     spec: &BoundHostSpec,
     run: impl FnOnce(&str) -> Result<T>,
 ) -> Result<T> {
     run(admit(directory, spec)?)
-}
-
-/// `run_bound_host` for a launch host whose admission refusal goes to the launch log, the same
-/// on every platform: the Linux and Windows handoffs (Herdr, tmux) and the macOS capture host
-/// (Herdr, iTerm2, WezTerm). The line is a diagnostic, never a launch Record, and goes only
-/// into the launch log the launcher created, in the real directory at that path
-/// (`launch::append_host_refusal`): a refusal never writes through what it refused.
-pub(super) fn run_logged_bound_host<T>(
-    directory: &Path,
-    kind: TerminalKind,
-    run: impl FnOnce(&str) -> Result<T>,
-) -> Result<T> {
-    let spec = BoundHostSpec {
-        name: kind.display_name(),
-    };
-    let id = admit(directory, &spec).inspect_err(|error| {
-        log_refusal(
-            &Store::open_unchecked(directory),
-            kind,
-            &format_args!(": {error:#}"),
-        );
-    })?;
-    run(id)
 }
 
 /// The account a launch host runs as, for the private-directory step of its admission: an
@@ -272,7 +246,7 @@ fn admit_as_sent<'a>(
 /// The launcher's check before it creates a surface whose launch host runs `admit`: the
 /// same admission, as far as the launcher can establish the host's account
 /// (`judged_by_the_launcher`), on the text the host is given. A refusal here is one the host
-/// would make, so no Surface is created; it is a `RefusedDirectory`.
+/// would make, so no Surface is created: the launcher settles it as a failure to open one.
 pub(in crate::native::terminal) fn refuse_before_launch(
     directory: &Path,
     kind: TerminalKind,
@@ -332,7 +306,7 @@ fn would_refuse(
         message.push_str("; ");
         message.push_str(&advice);
     }
-    super::RefusedDirectory::new(message).into()
+    anyhow::anyhow!(message)
 }
 
 #[cfg(unix)]
@@ -541,30 +515,27 @@ fn run_handoff_with<T>(
     let name = kind.display_name();
     let store = Store::open_unchecked(directory);
     let start = clock.now();
-    // Direct hosts have always logged admission refusals as well as later errors; the
-    // admission's own refusal only into a real directory (`run_logged_bound_host`).
+    // Direct hosts have always logged admission refusals as well as later errors.
     let refused = |error: &anyhow::Error| log_refusal(&store, kind, &format_args!(": {error:#}"));
-    let (initial, surface, flushed) = run_logged_bound_host(directory, kind, |id| {
-        (|| {
-            let initial =
-                launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-            let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
-            let _lock = store.lock()?;
-            let current =
-                launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
-            anyhow::ensure!(
-                pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?.is_ok(),
-                "{name} launch is no longer pending"
-            );
-            anyhow::ensure!(
-                pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
-                    == Some(&surface),
-                "{name} binding changed"
-            );
-            Ok((initial, surface, flush()))
-        })()
-        .inspect_err(refused)
-    })?;
+    let (initial, surface, flushed) = run_bound_host(directory, &BoundHostSpec { name }, |id| {
+        let initial =
+            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+        let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
+        let _lock = store.lock()?;
+        let current =
+            launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
+        anyhow::ensure!(
+            pending::judge(&store, &current, &initial.claim_token, Expiry::Receipt)?.is_ok(),
+            "{name} launch is no longer pending"
+        );
+        anyhow::ensure!(
+            pending::bound_surface(&store, id, || "invalid host binding")?.as_ref()
+                == Some(&surface),
+            "{name} binding changed"
+        );
+        Ok((initial, surface, flush()))
+    })
+    .inspect_err(refused)?;
 
     let (reason, outcome) = match flushed {
         Ok(()) => (FailureReason::LaunchShellExecFailed, handoff()),

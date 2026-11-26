@@ -66,13 +66,8 @@ fn run(store: &Store, deadline_ms: u64, answer: impl FnMut(u64) -> Result<bool>)
         calls: Vec::new(),
         answer,
     };
-    let token = receipt_token(store);
     let result = wait_with(
         store,
-        &ThisLaunch {
-            token: &token,
-            surface: None,
-        },
         start + Duration::from_millis(deadline_ms),
         &mut clock,
         &mut presence,
@@ -359,13 +354,8 @@ fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalS
         directory: store.directory(),
         surface,
     };
-    let token = receipt_token(store);
     let result = wait_with(
         store,
-        &ThisLaunch {
-            token: &token,
-            surface: Some(surface),
-        },
         start + Duration::from_millis(deadline_ms),
         &mut clock,
         &mut presence,
@@ -379,10 +369,11 @@ fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalS
 
 // The owner's decision of 2026-11-26 (option A): a Herdr terminal that its verified core
 // reports finished before startup was confirmed ends the wait at the next probe, as a tmux
-// surface that disappears does, instead of at the launch deadline. The failure names the
-// terminal and its exit code and points to the launch host's own line in the launch log. The
-// launch ends as the deadline would have ended it: failed, its Claim released, its receipt
-// pending and its surface handle kept for close.
+// surface that disappears does, instead of at the launch deadline. The failure is a fixed text
+// from the core's report (the terminal, its exit code when given) and the launch log's path;
+// a refusal line in that log changes nothing in it. The launch ends through the settlement
+// the deadline uses: failed, its Claim released, its receipt pending and its surface handle
+// kept, so that close-session removes the finished terminal.
 #[test]
 fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe() {
     use crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore;
@@ -406,17 +397,13 @@ fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe
         }
         let run = run_on_surface(&store, START_TIMEOUT.as_millis() as u64, &surface);
         let error = run.result.unwrap_err();
-        let mut expected = format!(
-            "terminal surface finished before provider launch was confirmed (Herdr terminal t7 {})",
+        let expected = format!(
+            "terminal surface finished before provider launch was confirmed (Herdr terminal t7 {}); see the launch log {}",
             exit_code.map_or("finished".to_owned(), |code| format!(
                 "exited with code {code}"
-            ))
+            )),
+            store.directory().join(LOG).display()
         );
-        if refusal {
-            expected.push_str(
-                "; its launch host logged: Herdr launch directory is not private to the current user",
-            );
-        }
         assert_eq!(format!("{error:#}"), expected);
         assert!(error.downcast_ref::<TimedOut>().is_none());
         assert_eq!(run.sleeps, [100; 10], "{exit_code:?}");

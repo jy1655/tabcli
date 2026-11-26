@@ -92,9 +92,6 @@ pub(super) fn record_failed_launch(
 ) -> Result<ReopenGate> {
     let store = Store::open_unchecked(directory);
     let _lock = store.lock()?;
-    if !crate::native::session::launch::launch_owns_directory(&store, token, None)? {
-        bail!("{}", crate::native::session::launch::NOT_THIS_LAUNCH);
-    }
     if let Some(text) = store.record(CoreRecord::ReopenRefusal).text()? {
         let record =
             decode_launch_refusal(&text).context("the existing launch refusal is invalid")?;

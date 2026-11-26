@@ -209,13 +209,6 @@ fn failure_probe() {
     let is_iterm = mode.starts_with("iterm");
     let is_terminal = mode.starts_with("terminal");
     crate::native::session::primitives::set_private_directory_permissions(&directory).unwrap();
-    // The launch log that the launcher creates when the launch begins: a host writes its
-    // refusal only into it (`launch::append_host_refusal`).
-    crate::native::session::primitives::write_private(
-        &directory.join(crate::native::session::launch::LOG),
-        b"",
-    )
-    .unwrap();
     let name = if is_terminal {
         "Terminal.app"
     } else if is_iterm {

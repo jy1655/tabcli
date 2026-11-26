@@ -422,22 +422,6 @@ fn fail_reopen_launch(
 ) -> anyhow::Error {
     initial_claim.fence_launch();
     let mut detail = format!("{error:#}");
-    // The refusal record and the fence are written only into this launch's own directory
-    // (`launch::launch_owns_directory`), the decision the launcher's settlement made too.
-    if !matches!(
-        session::launch::launch_owns_directory(
-            &Store::open_unchecked(&created.directory),
-            initial_claim.token(),
-            None,
-        ),
-        Ok(true)
-    ) {
-        detail.push_str(&format!("; {}", session::launch::NOT_THIS_LAUNCH));
-        return reopen_refusal(
-            reopen_refusal_gate(&error).unwrap_or(ReopenGate::LaunchFailed),
-            detail,
-        );
-    }
     let gate = match record_failed_launch(&created.directory, initial_claim.token(), &error) {
         Ok(gate) => gate,
         Err(record_error) => {
@@ -742,79 +726,4 @@ pub(super) fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
         detach,
         json,
     }))
-}
-
-// A reopened session whose launch failed records its refusal and fences its launch only in
-// its own session directory. When the path names another session (a link, or another
-// session's directory renamed into place), nothing is written there.
-#[cfg(all(test, unix))]
-mod refused_path_tests {
-    use super::*;
-    use crate::native::session::{CoreRecord, launch, turn};
-    use std::fs;
-
-    fn spec(workspace: &Path) -> SessionSpec {
-        SessionSpec {
-            provider: FirstPartyCli::Pi,
-            provider_path: PathBuf::from("pi"),
-            provider_version: "fixture".into(),
-            workspace: workspace.to_owned(),
-            title: "fixture".into(),
-            model: None,
-            effort: None,
-            yolo: false,
-            prompt: "fixture".into(),
-        }
-    }
-
-    #[test]
-    fn a_reopen_launch_failure_never_writes_into_another_session() {
-        for link in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let workspace = root.path().canonicalize().unwrap();
-            let durable = [root.path().to_owned()];
-            let a = crate::native::create_session_within(root.path(), &durable, spec(&workspace))
-                .unwrap();
-            let b = crate::native::create_session_within(root.path(), &durable, spec(&workspace))
-                .unwrap();
-            let mut a_claim = turn::claim(&Store::open_unchecked(&a.directory), &[]).unwrap();
-            let a_store = Store::open_unchecked(&a.directory);
-            launch::begin(
-                &a_store,
-                a_claim.token(),
-                Instant::now() + Duration::from_secs(30),
-            )
-            .unwrap();
-            let b_store = Store::open_unchecked(&b.directory);
-            let b_claim = turn::claim(&b_store, &[]).unwrap();
-            let b_token = b_claim.token().to_owned();
-            b_claim.retain();
-            launch::begin(&b_store, &b_token, Instant::now() + Duration::from_secs(30)).unwrap();
-            fs::rename(&a.directory, root.path().join("moved")).unwrap();
-            if link {
-                std::os::unix::fs::symlink(&b.directory, &a.directory).unwrap();
-            } else {
-                fs::rename(&b.directory, &a.directory).unwrap();
-            }
-            let at_path = Store::open_unchecked(&a.directory);
-            let records = || {
-                [
-                    CoreRecord::Status,
-                    CoreRecord::TurnClaim,
-                    CoreRecord::Launch,
-                    CoreRecord::ReopenRefusal,
-                ]
-                .map(|record| at_path.record(record).bytes().unwrap())
-            };
-            let before = records();
-            assert!(before[3].is_none());
-            let error = fail_reopen_launch(&a, &mut a_claim, anyhow::anyhow!("launch refused"));
-            assert!(format!("{error:#}").contains("launch refused"), "{error:#}");
-            assert_eq!(records(), before, "link={link}");
-            assert_eq!(
-                turn::current_claim_token(&at_path).unwrap().as_deref(),
-                Some(b_token.as_str())
-            );
-        }
-    }
 }

@@ -41,16 +41,6 @@ mod admission_tests;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) mod binding_tests;
 #[cfg(test)]
-mod finished_tests;
-
-// The token a launcher's wait carries: the launch receipt's, as the launcher wrote it.
-#[cfg(test)]
-fn receipt_token(store: &Store) -> String {
-    read(store).unwrap().unwrap().claim_token
-}
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-mod refusal_tests;
-#[cfg(test)]
 pub(in crate::native) mod test_support;
 #[cfg(test)]
 mod wait_tests;
@@ -280,9 +270,6 @@ pub(in crate::native) fn fence_failed_start(
     reason: &str,
 ) -> Result<()> {
     let _lock = store.lock()?;
-    if !launch_owns_directory(store, expected_token, None)? {
-        bail!("{NOT_THIS_LAUNCH}");
-    }
     fence_failed_start_locked(store, expected_token, reason)
 }
 
@@ -472,246 +459,6 @@ fn fail_deciding(
         fail_locked(store, &record, &reason)?;
     }
     Ok(())
-}
-
-/// What a settlement that ends a launch from outside its own records returns when the
-/// directory at the path is not that launch's: it wrote nothing.
-pub(in crate::native) const NOT_THIS_LAUNCH: &str =
-    "the session directory's path no longer names this launch, so nothing was recorded there";
-
-/// Whether the session directory at `reader`'s path is the one of the launch that `token`
-/// identifies and, once a Surface is bound to it, `surface`: a real directory at that path (not
-/// a link), holding the request receipt of that Claim, no launch receipt of another Claim and
-/// no other bound Surface. Every settlement or record write that ends a launch from outside its
-/// own records (the refusal before any Surface, the finished terminal in the wait, reopen's
-/// refusal and its fencing) asks it, then again under the lifecycle lock before it writes, and
-/// writes nothing when it is not.
-///
-/// What it guards: TAB makes the state root private to the user at every session creation
-/// (`create_state_root`), so only this user's own processes (and an administrator or the
-/// system) can replace a session directory under it. Such a replacement between this check and
-/// the write that follows it under the lock is not closed by a directory handle; the lock
-/// itself is opened by name, which can open the replacement's existing lock file.
-pub(in crate::native) fn launch_owns_directory(
-    reader: &Reader,
-    token: &str,
-    surface: Option<&terminal::TerminalSession>,
-) -> Result<bool> {
-    let real = std::fs::symlink_metadata(reader.directory())
-        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
-    if !real || crate::native::session::requests::for_claim(reader, token)?.is_none() {
-        return Ok(false);
-    }
-    if read(reader)?.is_some_and(|record| record.claim_token != token) {
-        return Ok(false);
-    }
-    if let Some(surface) = surface
-        && let Some(text) = reader.record(CoreRecord::Terminal).text()?
-        && record::terminal(&text).context("invalid surface binding")? != *surface
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Settles a fenced launch whose session directory was refused before any Surface was
-/// created for it (`terminal::RefusedDirectory`). No Surface exists, so no wrapper can hold the
-/// lifecycle lock: the settlement waits for it, and a reader holding it cannot leave the launch
-/// pending. It writes only into the directory that `launch_owns_directory` finds is this
-/// launch's, before and again under the lock. Returns the refusal, with what was not recorded.
-pub(in crate::native) fn refused_before_surface(
-    store: &Store,
-    expected_token: &str,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    if !matches!(launch_owns_directory(store, expected_token, None), Ok(true)) {
-        return error.context(NOT_THIS_LAUNCH);
-    }
-    let reason = format!(
-        "terminal launch failed: {error:#}; no surface handle was recorded and no prompt was sent"
-    );
-    let settled = store.lock().and_then(|_lock| {
-        if !launch_owns_directory(store, expected_token, None)? {
-            return Ok(false);
-        }
-        if let Some(record) = read(store)?.filter(|record| record.phase == Phase::Pending) {
-            fail_locked(store, &record, &reason)?;
-        }
-        Ok(true)
-    });
-    match settled {
-        Ok(true) => error,
-        Ok(false) => error.context(NOT_THIS_LAUNCH),
-        Err(settlement) => {
-            error.context(format!("the refusal could not be recorded: {settlement:#}"))
-        }
-    }
-}
-
-/// Appends a launch host's refusal `message` to the launch log of `directory`, a line that is
-/// a diagnostic and never a Record. The host can run as another account than the launcher (a
-/// Herdr host runs as its core), so it writes only into the log the launcher created when the
-/// launch began: opened without following a link, without blocking on a special file and
-/// without creating it, and only when the opened file is a regular file in the real directory
-/// at `directory`. Otherwise it writes nothing.
-pub(in crate::native) fn append_host_refusal(directory: &std::path::Path, message: &str) {
-    use std::io::Write;
-    if !directory.is_absolute() {
-        return;
-    }
-    if let Some(mut log) = open_launch_log_in(directory) {
-        let _ = log.write_all(format!("{} {message}\n", unix_ms()).as_bytes());
-    }
-}
-
-#[cfg(unix)]
-fn open_launch_log_in(directory: &std::path::Path) -> Option<std::fs::File> {
-    use std::os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
-        io::{AsRawFd, FromRawFd},
-    };
-    let checked = std::fs::symlink_metadata(directory).ok()?;
-    if !checked.is_dir() || checked.file_type().is_symlink() {
-        return None;
-    }
-    let folder = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory)
-        .ok()?;
-    let opened = folder.metadata().ok()?;
-    if (opened.dev(), opened.ino()) != (checked.dev(), checked.ino()) {
-        return None;
-    }
-    let name = std::ffi::CString::new(LOG).ok()?;
-    let descriptor = unsafe {
-        libc::openat(
-            folder.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        return None;
-    }
-    let log = unsafe { std::fs::File::from_raw_fd(descriptor) };
-    log.metadata().ok()?.is_file().then_some(log)
-}
-
-#[cfg(windows)]
-fn open_launch_log_in(directory: &std::path::Path) -> Option<std::fs::File> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    let folder = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(share)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(directory)
-        .ok()?;
-    let opened = folder.metadata().ok()?;
-    if !opened.is_dir() || opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return None;
-    }
-    let log = std::fs::OpenOptions::new()
-        .append(true)
-        .share_mode(share)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(directory.join(LOG))
-        .ok()?;
-    let metadata = log.metadata().ok()?;
-    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return None;
-    }
-    let (folder_path, log_path) = (windows_final_path(&folder)?, windows_final_path(&log)?);
-    log_path
-        .eq_ignore_ascii_case(&format!("{folder_path}\\{LOG}"))
-        .then_some(log)
-}
-
-#[cfg(windows)]
-fn windows_final_path(file: &std::fs::File) -> Option<String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-    let mut path = vec![0u16; 32768];
-    let length = unsafe {
-        GetFinalPathNameByHandleW(
-            file.as_raw_handle(),
-            path.as_mut_ptr(),
-            path.len() as u32,
-            0,
-        )
-    };
-    if length == 0 || length as usize >= path.len() {
-        return None;
-    }
-    path.truncate(length as usize);
-    String::from_utf16(&path).ok()
-}
-
-/// The text of the last Herdr launch-host refusal line in the launch log of `directory`, for
-/// a failure's message only: the log is read without following a link and without blocking on
-/// a special file, only as a regular file and only its last MiB. The text is bounded and its
-/// control characters escaped. `None` when there is none or the log cannot be read so.
-fn last_host_refusal(directory: &std::path::Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 1024 * 1024;
-    const SHOWN: usize = 300;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut log = options.open(directory.join(LOG)).ok()?;
-    let metadata = log.metadata().ok()?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return None;
-        }
-    }
-    if !metadata.is_file() {
-        return None;
-    }
-    log.seek(SeekFrom::Start(metadata.len().saturating_sub(TAIL)))
-        .ok()?;
-    let mut tail = Vec::new();
-    log.take(TAIL).read_to_end(&mut tail).ok()?;
-    let tail = String::from_utf8_lossy(&tail);
-    let refusal = tail.lines().rev().find_map(|line| {
-        let (stamp, rest) = line.split_once(' ')?;
-        if stamp.is_empty() || !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        rest.strip_prefix("herdr_host_refused: ")
-    })?;
-    let mut shown = String::new();
-    for (index, character) in refusal.chars().enumerate() {
-        if index == SHOWN {
-            shown.push('…');
-            break;
-        }
-        if character.is_control() {
-            shown.extend(character.escape_unicode());
-        } else {
-            shown.push(character);
-        }
-    }
-    Some(shown)
 }
 
 // The error returned by ask, including its JSON error rendering.
@@ -980,8 +727,7 @@ const SURFACE_PROBE_BOUND: Duration = Duration::from_secs(2);
 const WAIT_POLL: Duration = Duration::from_millis(100);
 
 /// The surface observation port of the launcher's wait: whether the launch's terminal
-/// surface is still present, or remains with its program finished. An inspection error
-/// proves neither absence nor an end.
+/// surface is still present. An inspection error does not prove absence.
 trait SurfacePresence {
     fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface>;
 }
@@ -999,36 +745,22 @@ impl SurfacePresence for TerminalSurface<'_> {
 }
 
 // The failure of a launch whose surface remains but whose program finished before startup
-// was confirmed (a Herdr terminal): what the verified probe saw, the only authority for the
-// failure, and the launch host's own last refusal line when the launch log holds one.
+// was confirmed (a Herdr terminal): a fixed text from the verified probe alone, and where a
+// person can read the launch log. Nothing is taken from the log's contents.
 fn finished_reason(reader: &Reader, finished: &str) -> String {
-    match last_host_refusal(reader.directory()) {
-        Some(refusal) => {
-            format!("{SURFACE_FINISHED} ({finished}); its launch host logged: {refusal}")
-        }
-        None => format!("{SURFACE_FINISHED} ({finished})"),
-    }
-}
-
-/// The launch a wait is for, as its launcher knows it: its Claim's token and its bound
-/// Surface (`launch_owns_directory`).
-struct ThisLaunch<'a> {
-    token: &'a str,
-    surface: Option<&'a terminal::TerminalSession>,
+    format!(
+        "{SURFACE_FINISHED} ({finished}); see the launch log {}",
+        reader.private(LOG).path().display()
+    )
 }
 
 pub(in crate::native) fn wait(
     store: &Store,
     surface: &terminal::TerminalSession,
-    expected_token: &str,
     deadline: Instant,
 ) -> Result<()> {
     wait_with(
         store,
-        &ThisLaunch {
-            token: expected_token,
-            surface: Some(surface),
-        },
         deadline,
         &mut crate::native::clock::SystemClock,
         &mut TerminalSurface {
@@ -1040,47 +772,30 @@ pub(in crate::native) fn wait(
 
 /// The launcher's wait for a confirmed launch. Each poll reads the records, then decides on
 /// the time and the surface: at the deadline, or when a due probe finds the surface gone or
-/// its program finished (a Herdr terminal, owner's decision 2026-11-26), the wait settles the
-/// launch under the lifecycle lock, where a confirmed startup or a launch-host Record keeps
-/// its own outcome. Every reading of time and every sleep goes through `clock`.
+/// its program finished (a Herdr terminal; owner's decision 2026-11-26), the wait settles the
+/// launch under the lifecycle lock, through the one settlement the deadline uses too. Every
+/// reading of time and every sleep goes through `clock`.
 fn wait_with(
     store: &Store,
-    this: &ThisLaunch<'_>,
     deadline: Instant,
     clock: &mut dyn Clock,
     presence: &mut dyn SurfacePresence,
 ) -> Result<()> {
     let mut next_probe = clock.now() + SURFACE_PROBE_INTERVAL;
-    // A finished terminal, once seen, is kept: its settlement waits for the lifecycle lock
-    // within the launch deadline, and what the records hold when it gets the lock decides.
-    let mut finished: Option<String> = None;
     loop {
-        if recorded_confirmation(store, this)? {
+        if recorded_confirmation(store)? {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(clock.now());
         let deadline_reached = remaining.is_zero();
-        if let Some(reason) = &finished {
-            if let Some(_lock) = store.try_lock()? {
-                return settle_locked(store, this, reason.clone(), false);
-            }
-            if deadline_reached {
-                bail!(TimedOut::new(format!(
-                    "{reason}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
-                )));
-            }
-            clock.sleep(remaining.min(WAIT_POLL));
-            continue;
-        }
         let reason = if deadline_reached {
             Some(deadline_reason(store, read(store)?.as_ref()))
         } else if clock.now() >= next_probe {
             next_probe = clock.now() + SURFACE_PROBE_INTERVAL;
             match presence.present(remaining.min(SURFACE_PROBE_BOUND)) {
                 Ok(terminal::LaunchSurface::Absent) => Some(SURFACE_DISAPPEARED.to_owned()),
-                Ok(terminal::LaunchSurface::Finished(seen)) => {
-                    finished = Some(finished_reason(store, &seen));
-                    continue;
+                Ok(terminal::LaunchSurface::Finished(finished)) => {
+                    Some(finished_reason(store, &finished))
                 }
                 // Inspection errors (including permissions/timeouts) do not prove absence.
                 Ok(terminal::LaunchSurface::Present) | Err(_) => None,
@@ -1089,7 +804,7 @@ fn wait_with(
             None
         };
         if let Some(reason) = reason {
-            return settle(store, this, reason, deadline_reached);
+            return settle(store, reason, deadline_reached);
         }
         clock.sleep(remaining.min(WAIT_POLL));
     }
@@ -1099,14 +814,8 @@ fn wait_with(
 // naming how an ended or failed launch ended, `false` while it is pending. The locked host
 // decision runs only when the lifecycle lock is free; the status and the receipt are read
 // on every poll.
-fn recorded_confirmation(store: &Store, this: &ThisLaunch<'_>) -> Result<bool> {
-    if !launch_owns_directory(store, this.token, this.surface)? {
-        bail!("{NOT_THIS_LAUNCH}");
-    }
+fn recorded_confirmation(store: &Store) -> Result<bool> {
     if let Some(_lock) = store.try_lock()? {
-        if !launch_owns_directory(store, this.token, this.surface)? {
-            bail!("{NOT_THIS_LAUNCH}");
-        }
         match host_decision_locked(store)? {
             HostDecision::Confirmed => return Ok(true),
             HostDecision::Failed => bail!(
@@ -1142,20 +851,13 @@ fn recorded_confirmation(store: &Store, this: &ThisLaunch<'_>) -> Result<bool> {
                 .unwrap_or_else(|| format!("launch entered {}", status.state))
         );
     }
-    Ok(read(store)?.is_some_and(|record| {
-        record.claim_token == this.token && confirmed(store, &record, &status)
-    }))
+    Ok(read(store)?.is_some_and(|record| confirmed(store, &record, &status)))
 }
 
 // Settles the wait for `reason` under the lifecycle lock: a launch confirmed or settled
 // meanwhile keeps its own outcome; otherwise the launch fails with `reason` (the deadline's
 // reason read again under the lock). A held lock leaves the claim and the records alone.
-fn settle(
-    store: &Store,
-    this: &ThisLaunch<'_>,
-    reason: String,
-    deadline_reached: bool,
-) -> Result<()> {
+fn settle(store: &Store, reason: String, deadline_reached: bool) -> Result<()> {
     let Some(_lock) = store.try_lock()? else {
         let message = format!(
             "{reason}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
@@ -1165,21 +867,6 @@ fn settle(
         }
         bail!("{message}");
     };
-    settle_locked(store, this, reason, deadline_reached)
-}
-
-// `settle` with the lifecycle lock held: a directory that is not this launch's is left as it
-// is; otherwise a confirmed launch or a launch-host Record keeps its outcome, and only then
-// does `reason` fail the launch.
-fn settle_locked(
-    store: &Store,
-    this: &ThisLaunch<'_>,
-    reason: String,
-    deadline_reached: bool,
-) -> Result<()> {
-    if !launch_owns_directory(store, this.token, this.surface)? {
-        bail!("{reason}; {NOT_THIS_LAUNCH}");
-    }
     let record = read(store)?.context("launch receipt disappeared")?;
     let status: SessionStatus = store.status()?;
     if confirmed(store, &record, &status) {
@@ -1569,7 +1256,7 @@ mod tests {
         // This wait's own deadline, recorded by its own failure write.
         let (directory, _) = fixture();
         let store = Store::open_unchecked(directory.path());
-        let error = wait(&store, &surface, &receipt_token(&store), Instant::now()).unwrap_err();
+        let error = wait(&store, &surface, Instant::now()).unwrap_err();
         assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
         assert_eq!(format!("{error:#?}"), format!("{LAUNCH_DEADLINE:?}"));
         assert_eq!(classify(&error), Some(FailureKind::TimedOut));
@@ -1586,7 +1273,7 @@ mod tests {
             .record(CoreRecord::Launch)
             .write_json(&record)
             .unwrap();
-        let error = wait(&store, &surface, &receipt_token(&store), Instant::now()).unwrap_err();
+        let error = wait(&store, &surface, Instant::now()).unwrap_err();
         let recorded = store.status().unwrap().error.unwrap();
         assert_ne!(recorded, LAUNCH_DEADLINE);
         assert_eq!(format!("{error:#}"), recorded);
@@ -1596,7 +1283,7 @@ mod tests {
         let store = Store::open_unchecked(directory.path());
         let before = fs::read(directory.path().join(STATUS_FILE)).unwrap();
         let lock = store.lock().unwrap();
-        let error = wait(&store, &surface, &receipt_token(&store), Instant::now()).unwrap_err();
+        let error = wait(&store, &surface, Instant::now()).unwrap_err();
         drop(lock);
         assert_eq!(
             format!("{error:#}"),
@@ -2246,13 +1933,7 @@ mod host_decision_tests {
                     .unwrap()
                 );
             } else {
-                let error = wait(
-                    &store,
-                    &surface(),
-                    &receipt_token(&store),
-                    start + Duration::from_secs(20),
-                )
-                .unwrap_err();
+                let error = wait(&store, &surface(), start + Duration::from_secs(20)).unwrap_err();
                 assert!(error.downcast_ref::<TimedOut>().is_none());
             }
             assert!(start.elapsed() < Duration::from_secs(1));
@@ -2383,8 +2064,7 @@ mod host_decision_tests {
             } else {
                 LAUNCH_DEADLINE.into()
             };
-            let error =
-                wait(&store, &surface(), &receipt_token(&store), Instant::now()).unwrap_err();
+            let error = wait(&store, &surface(), Instant::now()).unwrap_err();
             assert!(error.downcast_ref::<TimedOut>().is_some());
             assert_eq!(error.to_string(), expected);
             assert_eq!(

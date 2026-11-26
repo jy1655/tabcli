@@ -95,8 +95,6 @@ fn direct_handoff_logs_a_directory_admission_refusal() {
     for kind in [TerminalKind::Herdr, TerminalKind::Tmux] {
         let directory = root.path().join(format!("session-{}", kind.as_str()));
         fs::create_dir(&directory).unwrap();
-        // The launch log the launcher created when the launch began.
-        fs::write(directory.join(launch::LOG), b"1 launch_pending\n").unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
         let error = run_handoff_with(
             &directory,
@@ -457,7 +455,7 @@ fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
 // A host that a core starts runs as the core: the check is made for the core's account, and
 // when this process's own account would be admitted the refusal names both accounts. When the
 // connection could not name the core's account, the owner is left to the host and only what
-// needs no account is judged. Each refusal is a `RefusedDirectory`.
+// needs no account is judged.
 #[cfg(unix)]
 #[test]
 fn a_core_started_host_is_judged_for_the_cores_account() {
@@ -472,11 +470,6 @@ fn a_core_started_host_is_judged_for_the_cores_account() {
     let other = HostAccount::of_uid(own.wrapping_add(1));
     let refusal =
         refuse_before_core_launch(&private, TerminalKind::Herdr, Some(&other)).unwrap_err();
-    assert!(
-        refusal
-            .downcast_ref::<super::super::RefusedDirectory>()
-            .is_some()
-    );
     assert_eq!(
         format!("{refusal:#}"),
         format!(
@@ -546,143 +539,6 @@ fn the_elevation_advice_names_the_observed_case() {
     }
 }
 
-// A refusal only the host can know is in the launch log on every OS: the macOS capture host
-// (Herdr, and the iTerm2 and WezTerm launch form) logs its admission refusal as the Linux
-// and Windows hosts do. The line is a diagnostic, not a launch Record. The tty-bound hosts
-// keep their own rule (f2996e9): nothing is written into a directory they refuse.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_macos_capture_host_logs_its_admission_refusal() {
-    let temp = tempfile::tempdir().unwrap();
-    for kind in [
-        TerminalKind::Herdr,
-        TerminalKind::Iterm2,
-        TerminalKind::WezTerm,
-    ] {
-        let directory = temp.path().join(format!("session-{}", kind.as_str()));
-        fs::create_dir(&directory).unwrap();
-        fs::write(directory.join(launch::LOG), b"1 launch_pending\n").unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
-        let error =
-            super::super::macos::launch_host::run(&directory, "never run", kind).unwrap_err();
-        let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
-        assert!(
-            log.ends_with(&format!(" {}_host_refused: {error:#}\n", kind.as_str())),
-            "{kind:?}: {log}"
-        );
-        assert!(
-            !Store::open_unchecked(&directory)
-                .record(CoreRecord::LaunchHost)
-                .path()
-                .exists()
-        );
-    }
-    let directory = temp.path().join("session-terminal");
-    fs::create_dir(&directory).unwrap();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
-    run_tty_bound_host(
-        &directory,
-        TerminalKind::AppleTerminal,
-        || -> Result<()> { panic!("admission refused") },
-        |_, _, _| panic!("admission refused"),
-        None,
-    )
-    .unwrap_err();
-    assert!(!directory.join(launch::LOG).exists());
-}
-
-// A host refuses a link at its session directory's path and writes nothing through it: the
-// link can name another session, whose launch log stays as it was.
-#[cfg(unix)]
-#[test]
-fn a_refused_link_is_never_written_through() {
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("session-target");
-    fs::create_dir(&target).unwrap();
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
-    let link = temp.path().join("session-link");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    for kind in [TerminalKind::Herdr, TerminalKind::Tmux] {
-        let error = run_handoff_with(
-            &link,
-            kind,
-            &mut SystemClock,
-            |_| panic!("admission refused"),
-            || panic!("admission refused"),
-            || -> Result<()> { panic!("admission refused") },
-            || panic!("admission refused"),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().starts_with("refusing non-directory"),
-            "{error:#}"
-        );
-    }
-    #[cfg(target_os = "macos")]
-    super::super::macos::launch_host::run(&link, "never run", TerminalKind::Herdr).unwrap_err();
-    assert!(!target.join(launch::LOG).exists());
-}
-
-// A host writes its admission refusal only into the launch log that the launcher created,
-// opened without following a link, without blocking and without creating it, and only when
-// the opened file is a regular file in the directory the host just checked. Otherwise it
-// writes nothing: no log is created, no link is followed and a FIFO does not block it.
-#[cfg(unix)]
-#[test]
-fn a_host_refusal_line_goes_only_into_the_launch_log_the_launcher_created() {
-    let temp = tempfile::tempdir().unwrap();
-    let outside = temp.path().join("outside.log");
-    fs::write(&outside, b"outside\n").unwrap();
-    for (case, kind) in [
-        ("missing", TerminalKind::Herdr),
-        ("link", TerminalKind::Tmux),
-        ("fifo", TerminalKind::Herdr),
-    ] {
-        let directory = temp.path().join(format!("session-{case}"));
-        fs::create_dir(&directory).unwrap();
-        let log = directory.join(launch::LOG);
-        match case {
-            "link" => std::os::unix::fs::symlink(&outside, &log).unwrap(),
-            "fifo" => {
-                let path = std::ffi::CString::new(log.to_str().unwrap()).unwrap();
-                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-            }
-            _ => {}
-        }
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
-        let (done, finished) = std::sync::mpsc::channel();
-        let path = directory.clone();
-        std::thread::spawn(move || {
-            let refused = run_handoff_with(
-                &path,
-                kind,
-                &mut SystemClock,
-                |_| panic!("admission refused"),
-                || panic!("admission refused"),
-                || -> Result<()> { panic!("admission refused") },
-                || panic!("admission refused"),
-            )
-            .is_err();
-            let _ = done.send(refused);
-        });
-        assert!(
-            finished
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("the host blocked on its launch log"),
-            "{case}"
-        );
-        match case {
-            "missing" => assert!(!log.exists(), "{case}"),
-            "fifo" => assert!(
-                std::os::unix::fs::FileTypeExt::is_fifo(&log.metadata().unwrap().file_type()),
-                "{case}"
-            ),
-            _ => {}
-        }
-        assert_eq!(fs::read(&outside).unwrap(), b"outside\n", "{case}");
-    }
-}
-
 // The launch host is given its session directory as text. A path that cannot be sent as text
 // exactly is refused by the launcher's admission before any Surface exists: the host would
 // look for another directory.
@@ -692,11 +548,6 @@ fn a_session_directory_that_cannot_be_sent_as_text_is_refused_before_any_surface
     use std::os::unix::ffi::OsStrExt;
     let directory = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/state-\xff/session-text"));
     let refusal = refuse_before_launch(directory, TerminalKind::Herdr).unwrap_err();
-    assert!(
-        refusal
-            .downcast_ref::<super::super::RefusedDirectory>()
-            .is_some()
-    );
     assert_eq!(
         format!("{refusal:#}"),
         format!(
