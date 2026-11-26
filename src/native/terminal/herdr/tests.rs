@@ -1749,6 +1749,191 @@ fn the_socket_connection_bounds_every_reply() {
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+// A core that answers and then closes its end leaves its reply in the socket. macOS refuses
+// a receive timeout (SO_RCVTIMEO) with EINVAL once the peer has closed, so a read that set
+// one first lost a reply that had arrived: the test above failed once on the macOS runner
+// (2026-11-26) with "lost the Herdr Core connection: Invalid argument (os error 22)" for an
+// answered hello. The transport reads the reply, then the end of the stream, and an open core
+// that says nothing still ends the read at its deadline.
+#[cfg(unix)]
+#[test]
+fn a_reply_sent_before_the_core_closed_its_end_is_read() {
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::net::UnixStream;
+    let line = [
+        br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
+        b"\n",
+    ]
+    .concat();
+    let mut buffer = [0_u8; 256];
+    let (mut tab, mut core) = UnixStream::pair().unwrap();
+    core.write_all(&line).unwrap();
+    drop(core);
+    let read = super::Stream::read_before(&mut tab, &mut buffer, later()).unwrap();
+    assert_eq!(&buffer[..read], line.as_slice());
+    assert_eq!(
+        super::Stream::read_before(&mut tab, &mut buffer, later()).unwrap(),
+        0
+    );
+    let (mut tab, _core) = UnixStream::pair().unwrap();
+    let started = Instant::now();
+    let error =
+        super::Stream::read_before(&mut tab, &mut buffer, started + Duration::from_millis(100))
+            .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+}
+
+// Sends one urgent (out-of-band) byte from the core's end. `false` where the system keeps no
+// out-of-band data on Unix stream sockets and refuses the send: macOS, and Linux before 5.15
+// or without CONFIG_AF_UNIX_OOB. Any other error fails the test.
+#[cfg(unix)]
+fn send_urgent_byte(core: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let sent = unsafe { libc::send(core.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+    if sent == 1 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+    false
+}
+
+// A socket can be readable with nothing to read in order: Linux keeps an urgent byte on a
+// Unix stream socket in its receive queue and reports the socket readable, and an ordinary
+// blocking read then waits for ordinary data. The read still ends at its deadline. Where the
+// system refuses the urgent byte, the same read covers a silent peer.
+#[cfg(unix)]
+#[test]
+fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixStream;
+    let (mut tab, core) = UnixStream::pair().unwrap();
+    let urgent = send_urgent_byte(&core);
+    let (sender, outcome) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buffer = [0_u8; 16];
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let result = super::Stream::read_before(&mut tab, &mut buffer, deadline);
+        let _ = sender.send((result.map_err(|error| error.kind()), started.elapsed()));
+    });
+    // The core's end stays open, so a read that outlives its deadline would block for good.
+    let (result, elapsed) = outcome
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the read was still blocked ten seconds after its 100 ms deadline");
+    assert_eq!(
+        result,
+        Err(ErrorKind::TimedOut),
+        "urgent byte sent: {urgent}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+        "a 100 ms read returned after {elapsed:?} (urgent byte sent: {urgent})"
+    );
+    reader.join().unwrap();
+    drop(core);
+}
+
+// After a receive that finds nothing, the read waits again at once for the time left before
+// its original deadline, so that a reply the core sends while time is left is read. The clock
+// is simulated and the read's two steps are scripted on it; the socket tests above cover what
+// the kernels do. The deadline is 10 ms away. The socket becomes readable at 2 ms with nothing
+// to receive, as on Linux for a queue that holds only an urgent byte, and the reply arrives at
+// 5 ms. A read that pauses through its clock after the empty receive spends time asleep while
+// time is left, and is late or misses the reply: 8f316da paused for up to 10 ms of the time
+// left, here all 8 ms, and then found its deadline passed. Without a reply, the read ends at
+// its deadline without another receive.
+#[cfg(unix)]
+#[test]
+fn after_an_empty_receive_the_read_waits_again_at_once_for_the_time_left() {
+    use crate::native::clock::FakeClock;
+    use std::collections::VecDeque;
+    use std::io::ErrorKind;
+    // Each step with its simulated time since the read began.
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Wait { at: Duration, up_to: Duration },
+        Receive { at: Duration },
+    }
+    let ms = Duration::from_millis;
+    let (wait, receive) = (
+        |at, up_to| Step::Wait { at, up_to },
+        |at| Step::Receive { at },
+    );
+    let reply = [
+        br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
+        b"\n",
+    ]
+    .concat();
+    // One read with a 10 ms deadline. The socket becomes readable at each time in `readable`,
+    // and a receive at `arrives` or later returns the reply. Returns the outcome, the steps
+    // and the time the read spent asleep on its clock.
+    let read = |readable: &[Duration], arrives: Option<Duration>| {
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let steps = RefCell::new(Vec::new());
+        let mut readable = readable.iter().copied().collect::<VecDeque<_>>();
+        let mut buffer = [0_u8; 256];
+        let result = super::unix::wait_and_receive(
+            &mut clock,
+            &mut buffer,
+            start + ms(10),
+            |up_to| {
+                let at = now.get() - start;
+                steps.borrow_mut().push(Step::Wait { at, up_to });
+                match readable.front().copied() {
+                    Some(ready) if ready <= at + up_to => {
+                        readable.pop_front();
+                        now.set(start + ready.max(at));
+                        Ok(true)
+                    }
+                    _ => {
+                        now.set(start + at + up_to);
+                        Ok(false)
+                    }
+                }
+            },
+            |buffer| {
+                let at = now.get() - start;
+                steps.borrow_mut().push(Step::Receive { at });
+                match arrives {
+                    Some(arrives) if at >= arrives => {
+                        buffer[..reply.len()].copy_from_slice(&reply);
+                        Ok(reply.len())
+                    }
+                    _ => Err(ErrorKind::WouldBlock.into()),
+                }
+            },
+        )
+        .map(|read| buffer[..read].to_vec())
+        .map_err(|error| error.kind());
+        (result, steps.into_inner(), clock.slept)
+    };
+    assert_eq!(
+        read(&[ms(2), ms(5)], Some(ms(5))),
+        (
+            Ok(reply.clone()),
+            vec![
+                wait(ms(0), ms(10)),
+                receive(ms(2)),
+                wait(ms(2), ms(8)),
+                receive(ms(5)),
+            ],
+            Duration::ZERO,
+        )
+    );
+    assert_eq!(
+        read(&[ms(2)], None),
+        (
+            Err(ErrorKind::TimedOut),
+            vec![wait(ms(0), ms(10)), receive(ms(2)), wait(ms(2), ms(8))],
+            Duration::ZERO,
+        )
+    );
+}
+
 // --- Review regressions (2026-11-18): each was written and run before its fix. ---
 
 // herdr-core `terminal_run` creates the terminal, then `flush_saved` can answer

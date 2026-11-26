@@ -1849,12 +1849,7 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
             .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
 

@@ -1,8 +1,9 @@
 //! The Codex memory workspace launch admission (#216), through the public command. Each
 //! case runs the installed binary with an explicit HOME, USERPROFILE and CODEX_HOME, so no
-//! test changes this process's environment. Linux has no terminal to select, and that
-//! refusal comes before admission, so `ask` is exercised on macOS and Windows only.
-#![cfg(any(target_os = "macos", windows))]
+//! test changes this process's environment. Every supported platform selects a surface
+//! before this admission without opening it (Linux tmux since #389), so `ask` reaches the
+//! refusal on each.
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},

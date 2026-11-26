@@ -1181,17 +1181,16 @@ fn structural_overlays_veto_mixed_frames_and_partial_overlays_wait() {
 #[test]
 fn real_console_payload_to_helper_seam_fences_late_retirement() {
     const CHILD: &str = "AB_R3_CONSOLE_SEAM";
+    const TEST: &str = "native::provider::codex::launch::paste::tests::real_console_payload_to_helper_seam_fences_late_retirement";
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "native::provider::codex::launch::paste::tests::real_console_payload_to_helper_seam_fences_late_retirement", "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1").env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path()).output().unwrap();
-        assert!(
-            result.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
+            .output()
+            .unwrap();
+        crate::native::tests::assert_child_ran_this_test(&result);
         return;
     }
     let root = std::path::PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());
