@@ -70,7 +70,7 @@ fn owner_records() -> Vec<(&'static str, NativeSessionOwner)> {
 
 /// The refusal of a close on the creation record for a running terminal.
 const STILL_RUNNING: &str =
-    "is still running, and TAB does not end the terminal of a session whose owner is not live";
+    "is still running, and TAB could not verify a live owner for this session";
 
 fn gone(gone: Gone) -> OwnerAttestation {
     OwnerAttestation {
@@ -688,15 +688,6 @@ fn an_explicit_close_leaves_anything_but_its_created_terminal_alone() {
             refusal: "no Herdr Core is running",
             recover: |f| f.core.0.borrow_mut().running = true,
             again: reused,
-            closed: CloseOutcome::Closed,
-        },
-        Refusal {
-            label: "owner not inspectable",
-            change: Fixture::finish,
-            observe: unknown,
-            refusal: "owner inspection failed",
-            recover: |_| {},
-            again: exited,
             closed: CloseOutcome::Closed,
         },
         Refusal {
@@ -1409,39 +1400,49 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
     const BIRTH_FIELDS: &[&str] = &["linux_birth"];
     #[cfg(windows)]
     const BIRTH_FIELDS: &[&str] = &["host_creation_time"];
+    // Whether each release saved `herdr_launch_nonce`, from its tag's `record.rs`: 0.4.45 and
+    // 0.4.46 have no such field; 0.4.47 to 0.4.49 set it in `with_herdr_core`.
     #[allow(unused_mut)]
-    let mut accepted: Vec<(&str, Damage)> = Vec::new();
+    let mut accepted: Vec<(&str, Damage, bool)> = Vec::new();
     #[cfg(target_os = "macos")]
     accepted.extend([
-        ("0.4.45, macOS", omit_label as Damage),
-        ("0.4.46, macOS", omit_label),
-        ("0.4.47, macOS", as_written),
-        ("0.4.48, macOS", as_written),
-        ("0.4.49, macOS", as_written),
+        ("0.4.45, macOS", omit_label as Damage, false),
+        ("0.4.46, macOS", omit_label, false),
+        ("0.4.47, macOS", as_written, true),
+        ("0.4.48, macOS", as_written, true),
+        ("0.4.49, macOS", as_written, true),
     ]);
     #[cfg(target_os = "linux")]
     accepted.extend([
-        ("0.4.46, Linux", omit_label as Damage),
-        ("0.4.47, Linux", as_written),
-        ("0.4.48, Linux", as_written),
-        ("0.4.49, Linux", as_written),
+        ("0.4.46, Linux", omit_label as Damage, false),
+        ("0.4.47, Linux", as_written, true),
+        ("0.4.48, Linux", as_written, true),
+        ("0.4.49, Linux", as_written, true),
         // procfs reports zero ticks for a program started in its time namespace's first tick,
         // and the writers copied it.
-        ("0.4.46, Linux, started at tick zero", |handle| {
-            omit_label(handle);
-            handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
-        }),
-        ("0.4.49, Linux, started at tick zero", |handle| {
-            handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
-        }),
+        (
+            "0.4.46, Linux, started at tick zero",
+            |handle| {
+                omit_label(handle);
+                handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
+            },
+            false,
+        ),
+        (
+            "0.4.49, Linux, started at tick zero",
+            |handle| {
+                handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
+            },
+            true,
+        ),
     ]);
     #[cfg(windows)]
     accepted.extend([
-        ("0.4.47, Windows", as_written as Damage),
-        ("0.4.48, Windows", as_written),
-        ("0.4.49, Windows", as_written),
+        ("0.4.47, Windows", as_written as Damage, true),
+        ("0.4.48, Windows", as_written, true),
+        ("0.4.49, Windows", as_written, true),
     ]);
-    for (label, written) in accepted {
+    for (label, written, saves_label) in accepted {
         let fixture = Fixture::new("ready", &complete_owner());
         let store = fixture.store();
         let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
@@ -1455,7 +1456,7 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
             .collect();
         top.sort_unstable();
         let mut expected_top = vec!["herdr_core", "managed_session_id", "session_id", "terminal"];
-        if value.get("herdr_launch_nonce").is_some() {
+        if saves_label {
             expected_top.push("herdr_launch_nonce");
             expected_top.sort_unstable();
         }
@@ -1818,24 +1819,33 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
     }
 }
 
-// Review round 3, finding 4: a record of another session, or an unbound one, identifies no
-// process of this session, so its process is not inspected at all. That process staying
-// uninspectable never blocks the close: the running terminal is kept, and once it has been
-// ended on its recorded core the same command removes it; an absent one is settled. Only a
-// record bound to this session refuses when its process cannot be inspected.
+// Review round 3, finding 4, and round 5, finding 2: whatever record names an owner whose
+// process cannot be inspected, and while it stays uninspectable, the close never strands the
+// session. Another session's or an unbound record's process is not even inspected; this
+// session's own owner that cannot be inspected verifies no live owner. The running terminal is
+// kept, and the refusal says why no live owner was verified for this session's own record; once
+// the terminal has finished, the same command removes it; an absent one is settled.
 #[test]
-fn an_uninspectable_process_of_another_session_never_strands_the_session() {
+fn an_uninspectable_owner_process_never_strands_the_session() {
     let mut foreign = complete_owner();
     foreign.managed_session_id = Some("session-foreign".into());
     let mut unbound = complete_owner();
     unbound.managed_session_id = None;
-    for (label, owner) in [
-        ("another session's record", foreign),
-        ("an unbound record", unbound),
+    for (label, owner, why) in [
+        (
+            "this session's record",
+            complete_owner(),
+            Some("its owner's process could not be inspected: owner inspection failed"),
+        ),
+        ("another session's record", foreign, None),
+        ("an unbound record", unbound, None),
     ] {
         let fixture = Fixture::new("working", &owner);
         let text = error_text(&fixture.close(unknown, false).unwrap_err());
         assert!(text.contains(STILL_RUNNING), "{label}: {text}");
+        if let Some(why) = why {
+            assert!(text.contains(why), "{label}: {text}");
+        }
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
         fixture.assert_retained(label, SessionState::Working);
         fixture.finish();
@@ -1989,20 +1999,33 @@ fn a_replayed_consumption_marker_keeps_its_combined_reason_once() {
     assert_eq!(closed.error.as_deref(), Some(committed.as_str()));
 }
 
-// Review round 4, finding 6: the close reads the owner record once. A record that cannot be read
-// (here a directory in its place) refuses the close on every OS: nothing is sent and the handle
-// is retained.
+// Review round 4, finding 6, and round 5, finding 2: the close reads the owner record once. A
+// record that cannot be read (here a directory in its place) verifies no live owner, on every
+// OS: a running terminal is kept, with the read failure in the refusal, and once it has
+// finished the same command removes it.
 #[test]
-fn an_owner_record_that_cannot_be_read_retains_the_handle() {
+fn an_owner_record_that_cannot_be_read_never_strands_the_session() {
     let fixture = Fixture::new("working", &complete_owner());
-    fixture.finish();
     let owner = fixture.store().record(CoreRecord::Owner).path().to_owned();
     fs::remove_file(&owner).unwrap();
     fs::create_dir(&owner).unwrap();
     fixture.core.clear_calls();
-    assert!(fixture.close(exited, false).is_err());
+    let text = error_text(&fixture.close(exited, false).unwrap_err());
+    assert!(text.contains(STILL_RUNNING), "{text}");
+    assert!(
+        text.contains("its owner record could not be read"),
+        "{text}"
+    );
     assert_eq!(fixture.mutations(), (0, 0));
     fixture.assert_retained("an unreadable owner record", SessionState::Working);
+    fixture.finish();
+    fixture.core.clear_calls();
+    assert_eq!(
+        fixture.close(exited, false).map_err(|e| error_text(&e)),
+        Ok(CloseOutcome::Closed)
+    );
+    assert_eq!(fixture.mutations(), (0, 1));
+    fixture.assert_closed("an unreadable owner record, finished");
 }
 
 // The owner's decision of 2026-11-26: the refusal for a running terminal tells the person what
@@ -2028,5 +2051,200 @@ fn the_running_refusal_names_what_works() {
         assert!(text.contains(&command), "{verb}: {text}");
     }
     assert!(text.contains("run close-session again"), "{text}");
+    // Review round 5, finding 10: what TAB established, the recorded core, and the checks the
+    // guide asks for before a manual kill.
+    assert!(
+        text.contains("TAB could not verify a live owner for this session"),
+        "{text}"
+    );
+    assert!(!text.contains("is not live"), "{text}");
+    assert!(text.contains("on the recorded Herdr Core core-a"), "{text}");
+    assert!(
+        text.contains(&format!("tabcli doctor {SESSION} --probe")),
+        "{text}"
+    );
+    assert!(text.contains("this session's directory"), "{text}");
     assert_eq!(fixture.mutations(), (0, 0));
+}
+
+// Review round 5, finding 4: the mint compares the terminal address as well as the core with
+// its basis. A terminal at another address on the same core, identical in everything else, gets
+// no grant.
+#[test]
+fn a_grant_names_the_address_its_basis_records() {
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let mut other = fixture.core.terminal("t7").unwrap();
+    other["address"] = json!("t8");
+    fixture
+        .core
+        .0
+        .borrow_mut()
+        .terminals
+        .insert("t8".into(), other);
+    let session = fixture.store().terminal().unwrap();
+    let core: &dyn Core = &fixture.core;
+    let (recorded, mut linked) = Recorded::open(
+        core,
+        &session,
+        Requirement::Bound(&fixture.directory),
+        later(),
+    )
+    .unwrap()
+    .expect("present");
+    let seen = linked.observe("t8", later()).unwrap().expect("present");
+    let refused = authority::grant(core, &Basis::Owned(&recorded), &seen, false)
+        .err()
+        .expect("another address is refused");
+    let text = error_text(&refused);
+    assert!(text.contains("is not the terminal t7"), "{text}");
+    assert_eq!(fixture.mutations(), (0, 0));
+}
+
+// Review round 5, finding 8: a replay keeps a committed consumption marker's bytes and writes a
+// damaged one again (not JSON, or `consumed: false`), as before os-parity, sending nothing to the
+// core either way.
+#[test]
+fn a_replay_keeps_a_committed_marker_and_repairs_a_damaged_one() {
+    for (label, damaged) in [
+        ("not JSON", br#"{"consumed":tr"#.as_slice()),
+        (
+            "consumed false",
+            br#"{"consumed":false,"terminal":"herdr"}"#.as_slice(),
+        ),
+    ] {
+        let fixture = Fixture::new("ready", &complete_owner());
+        fixture.finish();
+        let marker = fixture
+            .store()
+            .record(CoreRecord::TerminalClosed)
+            .path()
+            .to_owned();
+        fs::write(&marker, damaged).unwrap();
+        fixture.core.clear_calls();
+        fixture.close(exited, false).unwrap();
+        assert!(
+            fixture.core.methods().is_empty(),
+            "{label}: {:?}",
+            fixture.core.methods()
+        );
+        let store = fixture.store();
+        assert!(store.terminal_closed().unwrap().consumed, "{label}");
+        assert_eq!(
+            store.status().unwrap().state,
+            SessionState::Closed,
+            "{label}"
+        );
+    }
+
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let marker = fixture
+        .store()
+        .record(CoreRecord::TerminalClosed)
+        .path()
+        .to_owned();
+    let committed =
+        br#"{"consumed":true,"terminal":"future-terminal","reason":"kept as committed"}"#;
+    fs::write(&marker, committed).unwrap();
+    fixture.core.clear_calls();
+    fixture.close(exited, false).unwrap();
+    assert!(
+        fixture.core.methods().is_empty(),
+        "{:?}",
+        fixture.core.methods()
+    );
+    assert_eq!(fs::read(&marker).unwrap(), committed);
+    let closed = fixture.store().closed_if_present().unwrap().unwrap();
+    assert!(
+        closed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("kept as committed")),
+        "{:?}",
+        closed.error
+    );
+}
+
+// Review round 5, finding 12: the close with a live owner is unchanged by the owner's decision.
+// Its ownership proof needs the terminal present and running on its recorded core. The surface
+// part of that proof is the production one here (`verify_surface` through the Herdr adapter on
+// the scripted core): a finished terminal fails it on every OS; an absent one fails it on
+// Windows, and on macOS and Linux its proven absence leads to the live owner's teardown, which
+// has its own checks (scripted to pass here). Nothing is sent to the core in any of these.
+#[test]
+fn a_live_owner_close_needs_its_terminal_running() {
+    use crate::native::terminal::close_authority::{
+        TerminalCloseAuthority, decide, test_support::TestObservation,
+    };
+    type Terminal = fn(&Fixture);
+    let rows: [(&str, Terminal); 3] = [
+        ("running", |_| {}),
+        ("finished", Fixture::finish),
+        ("absent", Fixture::remove),
+    ];
+    for (label, change) in rows {
+        let fixture = Fixture::new("ready", &complete_owner());
+        change(&fixture);
+        let surface = fixture.store().terminal().unwrap();
+        let deadline = later();
+        fixture.core.clear_calls();
+        #[cfg(unix)]
+        let answer = {
+            let adapters = Adapter::with_core(fixture.core.clone());
+            let observation =
+                TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+                    .with_evidence(crate::native::terminal::close_evidence(TerminalKind::Herdr))
+                    .with_posix_owner_live(|_| live_other())
+                    .with_proof(|| {
+                        crate::native::terminal::posix::verify_surface(
+                            &adapters,
+                            &fixture.directory,
+                            &surface,
+                            None,
+                        )
+                        .map(|_| ())
+                    })
+                    .with_presence(|| {
+                        crate::native::terminal::posix::surface_present(
+                            &adapters,
+                            &fixture.directory,
+                            &surface,
+                            std::time::Duration::from_secs(1),
+                        )
+                    })
+                    .with_attest(|| Ok(()));
+            decide(&observation, SESSION, &surface, deadline)
+        };
+        #[cfg(windows)]
+        let answer = {
+            let dispatch = crate::native::terminal::windows_dispatch::Dispatch::new(
+                Adapter::with_core(fixture.console.clone()),
+                Adapter::with_core(fixture.core.clone()),
+            );
+            let observation =
+                TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+                    .with_owner_record(|_| live_other())
+                    .with_proof(|| {
+                        crate::native::terminal::windows_dispatch::verify_surface(
+                            &dispatch, &surface, None,
+                        )
+                    });
+            decide(&observation, SESSION, &surface, deadline)
+        };
+        match label {
+            "running" => assert_eq!(answer.unwrap(), TerminalCloseAuthority::LiveOwner),
+            "finished" => {
+                let text = error_text(&answer.unwrap_err());
+                assert!(text.contains("has finished"), "{label}: {text}");
+            }
+            _ => {
+                #[cfg(unix)]
+                assert_eq!(answer.unwrap(), TerminalCloseAuthority::OwnerTeardown);
+                #[cfg(windows)]
+                assert!(answer.is_err(), "{label}: {answer:?}");
+            }
+        }
+        assert_eq!(fixture.mutations(), (0, 0), "{label}");
+    }
 }

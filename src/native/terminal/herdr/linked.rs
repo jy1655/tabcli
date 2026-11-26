@@ -1,10 +1,13 @@
-//! The verified connection to a core, and the only way a request reaches one. Every
-//! `Connection::call` takes a `Permit` that only this module constructs, and the installed
-//! transports keep their stream private (`framed`), so no other code can send a request on a
-//! raw connection. Only this module names `terminal.kill` and `terminal.rm`: `Linked::call`
-//! refuses them, and `end_program` and `remove_confirmed` send them only by consuming a grant
-//! that `authority::grant` minted from an observation this connection produced (`Seen`), which
-//! names this connection's core and the observed terminal.
+//! The verified connection to a core. In production builds the installed code sends a request
+//! to a core only through `Linked`: by visibility, `Connection::call` takes a `Permit` that only
+//! this module constructs, and the framed stream is private to `framed`. In production code
+//! only this module names `terminal.kill` and `terminal.rm` (a source scan checks the literal
+//! names; it does not catch a name assembled from parts). `Linked::call` refuses both, and
+//! `end_program` and `remove_confirmed` send them only by consuming a grant that
+//! `authority::grant` minted from an observation this connection produced (`Seen`), naming this
+//! connection's core and the observed terminal. What this does not cover: test builds can reach
+//! a raw stream, and the type system does not stop a new `Connection` implementation from
+//! forwarding the permit it receives to another request.
 use super::authority::{Kill, Remove};
 use super::{CallError, CloseOutcome, Connection, Core, GENERATION, Observed, get};
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,7 +18,8 @@ use std::{
 };
 
 /// The capability to send one request on a raw connection. Its field is private to this
-/// module; a `Connection` implementation receives it and cannot make one.
+/// module, so only this module makes one; a `Connection` implementation receives it, and
+/// nothing in the type system stops it from passing it on.
 pub(in crate::native::terminal) struct Permit(());
 
 const KILL: &str = "terminal.kill";

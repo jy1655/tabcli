@@ -63,6 +63,10 @@ pub(in crate::native) trait WindowsTerminalAdapter {
     /// the handle and the decision's `evidence`. Only a kind whose core keeps its terminals has
     /// such a record, and the dispatch refuses every other kind before its adapter, so the
     /// default is an invariant failure and never an ordinary answer.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
     fn close_created_surface(
         &self,
         directory: &Path,
@@ -208,6 +212,10 @@ pub(in crate::native) fn close_session_until(
 
 /// The close of a gone owner's surface, on its creation record. As on macOS and Linux, a kind
 /// whose core keeps no terminals is refused before its adapter.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
 pub(in crate::native) fn close_created_surface(
     adapters: &dyn Adapters,
     directory: &Path,

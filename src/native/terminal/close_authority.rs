@@ -60,6 +60,10 @@ pub(in crate::native) enum TerminalCloseAuthority {
     Absent,
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(unused_imports)
+)]
 pub(in crate::native) use owner_exit::CreationEvidence;
 
 /// What `CloseObservation::read_owner` found at the Owner record: one typed read, under the
@@ -87,6 +91,10 @@ pub(in crate::native) enum CloseCause {
 // OS and surface proofs that the production adapter keeps apart.
 pub(in crate::native) trait CloseObservation {
     /// Why the close runs, as its caller states it.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
     fn cause(&self) -> CloseCause {
         CloseCause::Explicit
     }
@@ -616,12 +624,11 @@ pub(in crate::native) fn close_windows_owned_surface_with(
     match authority {
         TerminalCloseAuthority::Absent => Ok(terminal::CloseOutcome::Missing.into()),
         TerminalCloseAuthority::CreatedSurface(evidence) => {
+            let generated = evidence.generated_reason();
             windows_dispatch::close_created_surface(
                 adapters, directory, session, evidence, deadline,
             )
-            .map(|outcome| {
-                terminal::CloseResult::keeping_diagnosis(outcome, evidence.generated_reason())
-            })
+            .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated))
         }
         // The decision never leaves a terminal its core keeps to the surface alone.
         TerminalCloseAuthority::SurfaceOnly if owner_exit::core_retains_finished(session.kind) => {
@@ -704,9 +711,9 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
             close_surface(OwnedSurfaceClose::SurfaceOnly).map(Into::into)
         }
         TerminalCloseAuthority::CreatedSurface(evidence) => {
-            close_surface(OwnedSurfaceClose::CreatedSurface(evidence)).map(|outcome| {
-                terminal::CloseResult::keeping_diagnosis(outcome, evidence.generated_reason())
-            })
+            let generated = evidence.generated_reason();
+            close_surface(OwnedSurfaceClose::CreatedSurface(evidence))
+                .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated))
         }
     }
 }
@@ -874,6 +881,9 @@ mod projected_authority_tests {
         Bound,
         /// Bound, with another platform's birth beside its own: attestation answers Unknown.
         Conflicting,
+        /// Bound, with a third platform's incarnation fields beside its own, which this
+        /// platform's attestation does not read: a matching live incarnation can be attested.
+        ConflictingUnread,
         /// Bound, PID only.
         PidOnly,
         Unbound,
@@ -925,6 +935,22 @@ mod projected_authority_tests {
                     owner.process_start_seconds = Some(1_790_000_000);
                 }
             }
+            Record::ConflictingUnread => {
+                incarnation(&mut owner);
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    owner.windows_process_identity =
+                        Some(crate::native::terminal::WindowsProcessIdentity {
+                            creation_time: 42,
+                            executable_path: r"C:\tabcli\tabcli.exe".into(),
+                        });
+                }
+                #[cfg(windows)]
+                {
+                    owner.process_start_seconds = Some(1_790_000_000);
+                    owner.process_start_microseconds = Some(42);
+                }
+            }
             Record::PidOnly => {}
         }
         match record {
@@ -959,11 +985,11 @@ mod projected_authority_tests {
 
     // os-parity: every branch of the decision for a kind whose core keeps its terminals, on
     // every OS, against the one function that chooses (`owner_exit::core_kept`). Each OS reaches
-    // it through its own owner observation. Only a record bound to this session whose attested
-    // incarnation lives reaches the live-owner rules; this session's owner that cannot be
-    // inspected refuses. Every other row is a close on the creation record, which never ends a
-    // running terminal (the owner's decision of 2026-11-26); an owner observed gone only adds the
-    // closed record's diagnosis. A cleanup's evidence is never explicit. The ownership proof and
+    // it through its own owner observation. Only a record bound to this session, whose fields do
+    // not contradict each other, with an attested live incarnation reaches the live-owner rules.
+    // Every other row is a close on the creation record, which never ends a running terminal
+    // (the owner's decision of 2026-11-26); an owner observed gone only adds the closed record's
+    // diagnosis. A cleanup's evidence is never explicit. The ownership proof and
     // the presence query are asked only on the live-owner row.
     #[test]
     fn every_herdr_branch_returns_evidence_from_one_function_on_every_os() {
@@ -1112,6 +1138,8 @@ mod projected_authority_tests {
                 CloseCause::Explicit,
                 created(true),
             ),
+            // Review round 5, finding 2: this session's owner that cannot be inspected decides
+            // nothing; the creation record removes a finished terminal and settles an absent one.
             (
                 "uninspectable owner",
                 Record::Bound,
@@ -1119,7 +1147,27 @@ mod projected_authority_tests {
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
-                Answer::Refused,
+                created(false),
+            ),
+            // Review round 5, finding 3: a record that carries another platform's incarnation
+            // fields contradicts itself, even with a matching live local incarnation.
+            (
+                "contradictory record, another platform's birth, live",
+                Record::Conflicting,
+                live,
+                SessionState::Ready,
+                None,
+                CloseCause::Explicit,
+                created(false),
+            ),
+            (
+                "contradictory record, a third platform's incarnation, live",
+                Record::ConflictingUnread,
+                live,
+                SessionState::Ready,
+                None,
+                CloseCause::Explicit,
+                created(false),
             ),
             // Review round 3, finding 4: only this session's process refuses when it cannot be
             // inspected; another session's or an unbound record's process is not inspected.
@@ -1314,7 +1362,9 @@ mod projected_authority_tests {
     // Review round 4, finding 6: a kind whose core keeps its terminals reads the owner record
     // once, as one typed result. The scripted presence stands for an earlier read that found the
     // record, and the directory now in its place for the record replaced before a later read:
-    // with one read, that read meets the replacement, and its failure refuses the close.
+    // with one read, that read meets the replacement. Its failure verifies no live owner, so the
+    // close takes the creation record (review round 5, finding 2), with the failure kept for the
+    // refusal of a running terminal.
     #[test]
     fn a_core_kept_terminal_reads_its_owner_record_once() {
         let root = tempfile::tempdir().unwrap();
@@ -1334,7 +1384,14 @@ mod projected_authority_tests {
         let observation =
             observation.with_evidence(terminal::close_evidence(terminal::TerminalKind::Herdr));
         let result = observation.decide("session-test", &surface, deadline);
-        assert!(result.is_err(), "{result:?}");
+        let Ok(TerminalCloseAuthority::CreatedSurface(evidence)) = &result else {
+            panic!("{result:?}");
+        };
+        let unverified = evidence.unverified().unwrap_or_default();
+        assert!(
+            unverified.contains("its owner record could not be read"),
+            "{unverified}"
+        );
         let calls = observation.calls();
         assert_eq!(
             calls.iter().filter(|call| **call == "read-owner").count(),

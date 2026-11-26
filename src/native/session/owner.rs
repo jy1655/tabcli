@@ -187,14 +187,21 @@ pub(in crate::native) struct OwnerObservers<'a> {
         &'a dyn Fn(u32) -> Result<Option<crate::native::terminal::WindowsProcessIdentity>>,
 }
 
-/// Whether the record's own incarnation fields conflict (another platform's or a mixed birth), so
-/// that attestation can only answer Unknown about it.
+/// Whether the record carries another platform's incarnation fields (a macOS start time, a Linux
+/// birth, a Windows process identity), beside this platform's own or instead of it. Such a record
+/// contradicts itself, whatever this platform's attestation answers about the fields it reads.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn record_conflicts(owner: &NativeSessionOwner) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    return recorded_birth(owner).is_err();
+    #[cfg(target_os = "macos")]
+    return owner.linux_birth.is_some() || owner.windows_process_identity.is_some();
+    #[cfg(target_os = "linux")]
+    return owner.process_start_seconds.is_some()
+        || owner.process_start_microseconds.is_some()
+        || owner.windows_process_identity.is_some();
     #[cfg(windows)]
-    return owner.linux_birth.is_some();
+    return owner.linux_birth.is_some()
+        || owner.process_start_seconds.is_some()
+        || owner.process_start_microseconds.is_some();
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

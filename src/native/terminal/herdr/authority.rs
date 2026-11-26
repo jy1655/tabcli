@@ -39,9 +39,11 @@ pub(super) enum Basis<'a> {
     },
 }
 
-/// A close on the creation record that `admit` let through: only an explicit close.
-#[derive(Clone, Copy)]
-pub(super) struct Admitted(());
+/// A close on the creation record that `admit` let through: only an explicit close. It keeps why
+/// a live owner could not be verified, for the refusal of a running terminal.
+pub(super) struct Admitted {
+    unverified: Option<String>,
+}
 
 /// Admits the decision's evidence before anything is read from the core: a cleanup after
 /// another command (a refused reopen) acts on no terminal that no live owner holds, and settles
@@ -52,7 +54,9 @@ pub(super) fn admit(evidence: CreationEvidence) -> Result<Admitted> {
             "no live owner of this session holds its Herdr terminal; only close-session --explicit removes or settles it, so nothing was sent and the handle is retained"
         );
     }
-    Ok(Admitted(()))
+    Ok(Admitted {
+        unverified: evidence.unverified().map(str::to_owned),
+    })
 }
 
 /// The authority to send one `terminal.kill` to the terminal `grant` observed, on its core.
@@ -98,33 +102,38 @@ pub(super) enum Grant {
 
 /// The only function that grants `terminal.kill` or `terminal.rm`. It mints from `seen`, an
 /// observation a verified connection produced, so the grant names the core that reported the
-/// terminal and that terminal's address; it refuses an observation from any core other than the
-/// one the basis is about.
+/// terminal and that terminal's address; it refuses an observation from any core, or of any
+/// address, other than the one the basis is about.
 pub(super) fn grant(
     core: &dyn Core,
     basis: &Basis<'_>,
     seen: &Seen,
     killed: bool,
 ) -> Result<Grant> {
-    let expected = match basis {
-        Basis::Owned(recorded) | Basis::Created { recorded, .. } => recorded.core_id(),
-        Basis::Launch { first, .. } => first.core_id(),
+    let (expected_core, expected_address) = match basis {
+        Basis::Owned(recorded) | Basis::Created { recorded, .. } => {
+            (recorded.core_id(), recorded.address())
+        }
+        Basis::Launch { first, .. } => (first.core_id(), first.observed().address.as_str()),
     };
     let observed = seen.observed();
-    if seen.core_id() != expected {
+    if seen.core_id() != expected_core {
         bail!(
-            "Herdr terminal {} was observed on Herdr Core {}, not on the core {expected} this close acts on; nothing was sent",
+            "Herdr terminal {} was observed on Herdr Core {}, not on the core {expected_core} this close acts on; nothing was sent",
             observed.address,
             seen.core_id()
+        );
+    }
+    if observed.address != expected_address {
+        bail!(
+            "Herdr terminal {} is not the terminal {expected_address} this close acts on; nothing was sent",
+            observed.address
         );
     }
     match basis {
         Basis::Owned(recorded) => recorded.check(core, observed)?,
         Basis::Launch { launch, first } => launch.check_cleanup(first.observed(), observed)?,
-        Basis::Created {
-            recorded,
-            admitted: Admitted(()),
-        } => recorded.check_creation_record(core, observed)?,
+        Basis::Created { recorded, .. } => recorded.check_creation_record(core, observed)?,
     }
     let core_id = seen.core_id();
     match observed.state {
@@ -134,8 +143,10 @@ pub(super) fn grant(
         })),
         State::Live if killed => Ok(Grant::Wait),
         State::Live => {
-            if let Basis::Created { recorded, .. } = basis {
-                return Err(recorded.still_running(&observed.address));
+            if let Basis::Created { recorded, admitted } = basis {
+                return Err(
+                    recorded.still_running(&observed.address, admitted.unverified.as_deref())
+                );
             }
             Ok(Grant::Kill(Kill {
                 core_id: core_id.to_owned(),

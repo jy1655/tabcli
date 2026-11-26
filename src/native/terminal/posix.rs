@@ -23,7 +23,7 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 /// work for a live owner only. `CreatedSurface` reaches only a kind whose core keeps its
 /// terminals, with no live owner of this session left: it carries the decision's evidence, and
 /// the adapter's one granting function decides from it and its own observation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::native) enum OwnedSurfaceClose {
     LiveOwner,
     SurfaceOnly,

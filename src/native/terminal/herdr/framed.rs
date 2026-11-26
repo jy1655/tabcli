@@ -1,7 +1,8 @@
 //! The framing both installed transports share: one request, then its one reply line, over a
-//! bounded stream. The stream is private to this module, so a request reaches it only through
-//! `Connection::call`, whose `Permit` only `linked` constructs. The transport tests exchange
-//! requests through `exchange_for_test`, which names no call that ends or removes a terminal.
+//! bounded stream. In production builds the stream is private to this module and a request
+//! reaches it only through `Connection::call`, whose `Permit` only `linked` makes. Test builds
+//! also have `exchange_for_test`, limited to `hello`, `terminal.get` and `terminal.send`, and
+//! `stream`, which hands out the raw stream for the framing tests' inspection.
 use super::{CallError, Connection, MAX_REPLY, Permit, Stream, parse_reply, timed_out};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};

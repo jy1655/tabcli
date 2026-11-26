@@ -572,30 +572,39 @@ fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<S
     }
 }
 
+/// Whether the consumption marker is present and decodes as JSON with `consumed: true`, whatever
+/// else it holds (a terminal kind this build does not know included). Bytes that are not such a
+/// marker are a damaged marker, which the next consumption writes again.
+fn committed_consumption_marker(store: &Store) -> Result<bool> {
+    Ok(store
+        .record(CoreRecord::TerminalClosed)
+        .bytes()?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| super::record::terminal_tombstone_value(&text).ok())
+        .is_some_and(|marker| marker.get("consumed") == Some(&serde_json::Value::Bool(true))))
+}
+
 fn consume_terminal_handle(
     store: &Store,
     terminal_kind: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
-    // A committed marker is kept as written: a replay, and a later close of the closed session,
-    // neither rewrites its reason nor its kind.
-    let tombstone_result =
-        store
-            .record(CoreRecord::TerminalClosed)
-            .present()
-            .and_then(|committed| {
-                if committed {
-                    return Ok(());
-                }
-                let mut marker = serde_json::json!({
-                    "consumed": true,
-                    "terminal": terminal_kind,
-                });
-                if let Some(reason) = reason {
-                    marker["reason"] = reason.into();
-                }
-                store.write_terminal_closed(&marker)
-            });
+    // A committed marker (one that decodes with `consumed: true`) keeps its bytes: a replay, and
+    // a later close of the closed session, neither rewrites its reason nor its kind. A damaged
+    // one (not a marker, or `consumed: false`) is written again, as before os-parity.
+    let tombstone_result = committed_consumption_marker(store).and_then(|committed| {
+        if committed {
+            return Ok(());
+        }
+        let mut marker = serde_json::json!({
+            "consumed": true,
+            "terminal": terminal_kind,
+        });
+        if let Some(reason) = reason {
+            marker["reason"] = reason.into();
+        }
+        store.write_terminal_closed(&marker)
+    });
     #[cfg(test)]
     if tombstone_result.is_ok() {
         interruption::at(interruption::Point::ConsumptionMarkerWritten);

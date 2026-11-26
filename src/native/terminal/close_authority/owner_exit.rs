@@ -49,10 +49,12 @@ pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> 
 /// to this module, so only `core_kept` can establish it (and, in tests, `scripted`). A close on
 /// the creation record removes a finished terminal and settles an absent one, and never ends a
 /// running one (the owner's decision of 2026-11-26): nothing here permits that, and nothing
-/// about the owner's process permits or refuses anything on this path. The evidence says why
-/// the close runs, and, for the closed record's diagnosis only, the PID of this session's owner
-/// when the OS reported its recorded process gone.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// about the owner permits or refuses anything on this path. The evidence says why the close
+/// runs, and, for messages only: the PID of this session's owner when the OS reported its
+/// recorded process gone (the closed record's diagnosis), and why a live owner could not be
+/// verified when the owner record or its process could not be read (the refusal of a running
+/// terminal).
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", windows)),
     allow(dead_code)
@@ -60,6 +62,7 @@ pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> 
 pub(in crate::native) struct CreationEvidence {
     cause: super::CloseCause,
     gone_owner: Option<u32>,
+    unverified: Option<String>,
 }
 
 #[cfg_attr(
@@ -68,15 +71,21 @@ pub(in crate::native) struct CreationEvidence {
 )]
 impl CreationEvidence {
     /// Whether `close-session --explicit` asked for this close.
-    pub(in crate::native::terminal) fn explicit(self) -> bool {
+    pub(in crate::native::terminal) fn explicit(&self) -> bool {
         self.cause == super::CloseCause::Explicit
     }
 
     /// The reason the closed record carries when the session stored none: the end of this
     /// session's owner, as 0.4.49's Repair wrote it.
-    pub(in crate::native::terminal) fn generated_reason(self) -> Option<String> {
+    pub(in crate::native::terminal) fn generated_reason(&self) -> Option<String> {
         self.gone_owner
             .map(|pid| format!("native session process {pid} is no longer running"))
+    }
+
+    /// Why a live owner of this session could not be verified, when the owner record or its
+    /// process could not be read.
+    pub(in crate::native::terminal) fn unverified(&self) -> Option<&str> {
+        self.unverified.as_deref()
     }
 
     /// Evidence as a test states it, for tests of what the adapter grants from it.
@@ -85,6 +94,7 @@ impl CreationEvidence {
         Self {
             cause,
             gone_owner: None,
+            unverified: None,
         }
     }
 }
@@ -109,15 +119,14 @@ pub(super) enum CoreKept {
 /// between the close with a live owner and the close on the creation record, on every OS and
 /// for every owner record. It returns evidence, never an action.
 ///
-/// The deciding observation is the OS's attestation of the process that an owner record bound to
-/// this session names, read in one typed read of the record:
-/// - an attested live incarnation leads to the close with a live owner;
-/// - when it cannot be made (the process cannot be inspected), the close refuses: nothing is
-///   sent and the handle is retained, since the close with a live owner cannot be ruled out;
-///   a record whose own fields conflict names nothing to inspect and takes the creation record;
-/// - everything else takes the creation record: no record or one that cannot be decoded,
-///   another session's or an unbound record (whose process is not inspected), a PID-only record
-///   of a live process, a gone process.
+/// The owner record answers exactly one question: is there an attested live incarnation of this
+/// session's own owner, from a record whose fields do not contradict each other (no other
+/// platform's incarnation fields)? If so, the close with a live owner applies, unchanged. In
+/// every other case the close on the creation record applies, which never ends a running
+/// terminal: a record that cannot be read, none, one that cannot be decoded, another session's
+/// or an unbound one (whose process is not inspected), a contradictory one, a process that
+/// cannot be inspected, a PID-only record of a live process, a gone process. Nothing about the
+/// owner refuses a finished or absent terminal.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(super) fn core_kept(
     observation: &dyn super::CloseObservation,
@@ -131,30 +140,44 @@ pub(super) fn core_kept(
 
     session.verify_managed_session(expected_session_id)?;
     let cause = observation.cause();
-    let created =
-        |gone_owner: Option<u32>| Ok(CoreKept::Created(CreationEvidence { cause, gone_owner }));
-    // A record that cannot be read is refused; one that is absent (a wrapper may still be
-    // registering) or cannot be decoded names no owner.
-    let owner = match observation.read_owner()? {
-        OwnerRead::Absent | OwnerRead::Malformed => return created(None),
-        OwnerRead::Recorded(owner) => *owner,
+    let created = |gone_owner: Option<u32>, unverified: Option<String>| {
+        Ok(CoreKept::Created(CreationEvidence {
+            cause,
+            gone_owner,
+            unverified,
+        }))
     };
-    if owner.binding(expected_session_id) != OwnerBinding::Bound {
-        return created(None);
+    let owner = match observation.read_owner() {
+        Err(error) => {
+            return created(
+                None,
+                Some(format!("its owner record could not be read: {error:#}")),
+            );
+        }
+        // No record (a wrapper may still be registering), or one that cannot be decoded.
+        Ok(OwnerRead::Absent | OwnerRead::Malformed) => return created(None, None),
+        Ok(OwnerRead::Recorded(owner)) => *owner,
+    };
+    if owner.binding(expected_session_id) != OwnerBinding::Bound || record_conflicts(&owner) {
+        return created(None, None);
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let attestation = observation.posix_owner_live(&owner);
     #[cfg(windows)]
     let attestation = observation.observe_owner_record(&owner);
     match &attestation.process {
-        ProcessObservation::Unknown(_) if record_conflicts(&owner) => created(None),
-        ProcessObservation::Unknown(reason) => bail!("{reason}"),
         ProcessObservation::Live(Attested::Incarnation) => {
             Ok(CoreKept::LiveOwner(Box::new((owner, attestation))))
         }
-        ProcessObservation::Live(Attested::PidOnly) => created(None),
+        ProcessObservation::Unknown(reason) => created(
+            None,
+            Some(format!(
+                "its owner's process could not be inspected: {reason}"
+            )),
+        ),
+        ProcessObservation::Live(Attested::PidOnly) => created(None, None),
         // For the diagnosis only.
-        ProcessObservation::Gone(_) => created(Some(owner.pid)),
+        ProcessObservation::Gone(_) => created(Some(owner.pid), None),
     }
 }
 
