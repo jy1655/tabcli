@@ -4258,12 +4258,7 @@ fn in_review_case(test: &str, case: impl FnOnce(&Path)) {
             .env_remove("HC_SESSION")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
     let root = Reader::state_root().unwrap();
