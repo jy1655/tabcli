@@ -367,10 +367,11 @@ const KINDS: [TerminalKind; 8] = [
 ];
 
 // The launch hosts whose admission the launcher runs before it opens a surface: the hosts
-// this platform runs, which run as this process's account (tmux) or an account TAB does not
-// attest (the macOS applications). Herdr's host runs as its core, which the adapter judges on
-// the connection that creates the terminal; a host this platform cannot run judges nothing,
-// so an unsupported surface keeps its own refusal.
+// this platform runs, which run as this process's account (tmux), an account TAB does not
+// attest (the macOS applications) or the core's (Herdr, judged here only for what needs no
+// account, and by the adapter for the rest on the connection that creates the terminal). A
+// host this platform cannot run judges nothing, so an unsupported surface keeps its own
+// refusal.
 #[cfg(unix)]
 fn judged_by_the_launcher(kind: TerminalKind) -> bool {
     match kind {
@@ -380,7 +381,8 @@ fn judged_by_the_launcher(kind: TerminalKind) -> bool {
         | TerminalKind::AppleTerminal
         | TerminalKind::Ghostty
         | TerminalKind::Warp => cfg!(target_os = "macos"),
-        TerminalKind::Herdr | TerminalKind::WindowsConsole => false,
+        TerminalKind::Herdr => true,
+        TerminalKind::WindowsConsole => false,
     }
 }
 

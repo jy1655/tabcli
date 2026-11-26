@@ -47,23 +47,10 @@ impl ScriptedHerdrCore {
     }
 
     /// Runs `call` with `HC_SOCKET` naming this core and without a caller terminal, and
-    /// restores both variables.
+    /// restores both variables, also when `call` panics.
     pub(in crate::native) fn reached_by<T>(&self, call: impl FnOnce() -> T) -> T {
-        let saved = ["HC_SOCKET", "HC_TERMINAL_ID"].map(|name| (name, std::env::var_os(name)));
-        // SAFETY: the test harness runs serially (`--test-threads=1`); the values are set
-        // for this call only and restored before the test goes on.
-        unsafe {
-            std::env::set_var("HC_SOCKET", &self.endpoint);
-            std::env::remove_var("HC_TERMINAL_ID");
-        }
-        let result = call();
-        for (name, value) in saved {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-        result
+        let _restore = CoreEnvironment::point_at(&self.endpoint);
+        call()
     }
 
     /// The terminal that a launch for `directory` created on this core, in `state` (`live` or
@@ -112,6 +99,35 @@ impl ScriptedHerdrCore {
             .unwrap()
             .iter()
             .any(|terminal| terminal["address"] == ADDRESS)
+    }
+}
+
+/// `HC_SOCKET` naming a core and no caller terminal, until dropped.
+pub(in crate::native) struct CoreEnvironment {
+    saved: [(&'static str, Option<std::ffi::OsString>); 2],
+}
+
+impl CoreEnvironment {
+    pub(in crate::native) fn point_at(endpoint: &Path) -> Self {
+        let saved = ["HC_SOCKET", "HC_TERMINAL_ID"].map(|name| (name, std::env::var_os(name)));
+        // SAFETY: the test harness runs serially (`--test-threads=1`); the values are restored
+        // when this guard is dropped, before the test goes on.
+        unsafe {
+            std::env::set_var("HC_SOCKET", endpoint);
+            std::env::remove_var("HC_TERMINAL_ID");
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for CoreEnvironment {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
     }
 }
 

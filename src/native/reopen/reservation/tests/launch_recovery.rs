@@ -395,9 +395,12 @@ fn spawn_commits_before_failure_preserves_live_states_then_releases_on_exit() {
                 .unwrap()
             });
             locked_rx.recv().unwrap();
+            let store = Store::open_unchecked(directory);
+            let token = launch::read(&store).unwrap().unwrap().claim_token;
             let error = launch::wait(
-                &Store::open_unchecked(directory),
+                &store,
                 &reopen_test_terminal("fixture"),
+                &token,
                 Instant::now(),
             )
             .unwrap_err();

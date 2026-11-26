@@ -49,6 +49,9 @@ fn native_herdr_host_dispatch_reaches_the_launch_receipt_check() {
     use super::super::host;
     let root = tempfile::tempdir().unwrap();
     let directory = private_session(root.path(), "session-herdr-host");
+    // The launch log the launcher creates when the launch begins; the host writes its refusal
+    // only into it.
+    crate::native::session::primitives::write_private(&directory.join(launch::LOG), b"").unwrap();
     let command = host::parse(
         host::HERDR_HOST_COMMAND,
         &[
@@ -211,6 +214,51 @@ fn an_elevated_tab_is_refused_for_a_core_that_is_not_elevated() {
     assert!(!text.contains("TAB is running elevated"), "{text}");
     assert!(
         !text.contains("give their files different owners"),
+        "{text}"
+    );
+}
+
+// A host writes its admission refusal only into the launch log that the launcher created:
+// without it nothing is written, and with it the line is appended.
+#[test]
+fn a_host_refusal_line_goes_only_into_the_launch_log_the_launcher_created() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = private_session(root.path(), "session-unlogged");
+    icacls(&directory, "*S-1-1-0:(W)");
+    let refuse = || {
+        run_logged_bound_host(&directory, TerminalKind::Herdr, |_| -> Result<()> {
+            panic!("admission refused")
+        })
+        .unwrap_err()
+    };
+    refuse();
+    assert!(!directory.join(launch::LOG).exists());
+    crate::native::session::primitives::write_private(&directory.join(launch::LOG), b"").unwrap();
+    let error = refuse();
+    let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
+    assert!(
+        log.ends_with(&format!(" herdr_host_refused: {error:#}\n")),
+        "{log}"
+    );
+}
+
+// A session directory whose path cannot be sent to the launch host as text exactly is refused
+// before any Surface exists.
+#[test]
+fn a_session_directory_that_cannot_be_sent_as_text_is_refused_before_any_surface() {
+    use std::os::windows::ffi::OsStringExt;
+    let mut wide: Vec<u16> = r"C:\state-".encode_utf16().collect();
+    wide.push(0xD800);
+    wide.extend(r"\session-text".encode_utf16());
+    let directory = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+    let text = format!(
+        "{:#}",
+        refuse_before_launch(&directory, TerminalKind::Herdr).unwrap_err()
+    );
+    assert!(
+        text.ends_with(
+            "Herdr launch directory is not Unicode text, which is how the launch host is given it"
+        ),
         "{text}"
     );
 }

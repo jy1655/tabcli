@@ -15,6 +15,14 @@ fn corrupt_in_place(path: &Path, after: &str) {
 
 fn refused_session() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
+    // The request receipt of the launch's Claim makes the directory that launch's
+    // (`launch_owns_directory`).
+    fs::create_dir(directory.path().join("requests")).unwrap();
+    fs::write(
+        directory.path().join("requests").join("1-2-3.json"),
+        r#"{"schema":1,"request_id":"request-launch","claim_token":"1-2-3","event_file":"event-1.json","created_unix_ms":1}"#,
+    )
+    .unwrap();
     let _ = record_reopen_refusal(
         directory.path(),
         ReopenGate::StartFailed,

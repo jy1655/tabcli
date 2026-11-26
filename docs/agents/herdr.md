@@ -51,44 +51,58 @@
   If saving the binding for a confirmed terminal fails and removal also fails, the adapter
   returns that same confirmed handle to the launcher. The launcher uses the current Claim
   and Close records to decide whether to save it. A later close checks its identity again.
-- The launch host is the core's program and runs as the core's account, so the launcher does
-  not judge a Herdr session directory itself. On the connection that sends `terminal.run`,
-  right before it (after the caller check, which can replace the connection), the adapter runs
-  the host's own directory admission for that account (`Core::admit_launch_directory`,
-  `bound_host::refuse_before_core_launch`): on macOS and Linux the socket peer's uid, which
-  the connection already required to be TAB's; on Windows the token user and default owner
-  read from the pipe server's process handle that the user check opened and the connection
-  keeps, so a reused PID cannot answer. A connection that cannot name the account leaves the
-  owner and, on Windows, the access list to the host; the path, a real directory and on macOS
-  and Linux the permission bits are still judged. A refusal (`terminal::RefusedDirectory`)
-  creates nothing and names the host's reason; when TAB's own account would be admitted it
-  also says how the accounts differ. Observed 2026-11-26 (Windows 11, hc 0.1.21): an elevated
-  TAB (an administrator's SSH session) gave the session directory the Administrators group as
-  owner, which the host of a core that is not elevated refused only in the launch log, and the
-  caller timed out after 31.7 s. The launcher settles such a refusal only for its own Claim
-  and pending receipt, only through a real directory, and after waiting for the lifecycle lock
-  (`launch::refused_before_surface`). What only the host can know (the directory changed after
-  this check, a program started under another token than the core's own, an I/O failure the
-  host alone meets) is still the host's: every Herdr host, on macOS too, writes its admission
-  refusal to the launch log, only into a real directory, as a diagnostic, not a Record. The
-  host has not verified that it owns the launch, so it publishes no Record.
+- The launch host is the core's program and runs as the core's account. Before the core is
+  reached, the launcher judges what needs no account (`bound_host::refuse_before_launch`): an
+  absolute path that can be sent as text exactly, a session-id name, a real directory, and on
+  macOS and Linux the permission bits; a Windows access rule depends on the account and waits
+  for the core. On the connection that sends `terminal.run`, right before it (after the caller
+  check, which can replace the connection), the adapter runs the host's own admission for the
+  core's account (`Core::admit_launch_directory`, `bound_host::refuse_before_core_launch`): on
+  macOS and Linux the socket peer's uid, which the connection already required to be TAB's; on
+  Windows the token user and default owner read from the pipe server's process handle that the
+  user check opened and the connection keeps, so a reused PID cannot answer. A connection that
+  cannot name the account leaves the owner and, on Windows, the access list to the host. A
+  refusal (`terminal::RefusedDirectory`) comes before any Surface exists and names the host's
+  reason; when TAB's own account would be admitted it also says how the accounts differ.
+  Observed 2026-11-26 (Windows 11, hc 0.1.21): an elevated TAB (an administrator's SSH session)
+  gave the session directory the Administrators group as owner, which the host of a core that
+  is not elevated refused only in the launch log, and the caller timed out after 31.7 s. The
+  launcher settles such a refusal after waiting for the lifecycle lock, only in the directory
+  that `launch::launch_owns_directory` finds is this launch's (`launch::refused_before_surface`;
+  see Trust Store Boundary for what protects the state root). What only the host can know (the
+  directory changed after this check, a program started under another token than the core's
+  own, an I/O failure the host alone meets) is the host's: every launch host that logs
+  (`launch::append_host_refusal`) writes its refusal only into the launch log the launcher
+  created, opened without following a link, without blocking and without creating it, and
+  only as a regular file in the real directory it just checked; otherwise it writes nothing.
+  The line is a diagnostic, not a Record: the host has not verified that it owns the launch.
 - The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
   (`launch_surface`): the exact terminal with the presence proof, and the launch label when
   the handle records one. A terminal its verified core reports finished before startup was
-  confirmed fails the launch at the next probe, about a second, on every platform, as a tmux
-  surface that disappears does (owner's decision 2026-11-26, option A). This reverses, for a
-  host that ended before startup, #409's choice to leave its admission, receipt, binding and
-  Pending-launch refusals to the launch deadline. The finished terminal can only fail a
-  launch: under the lifecycle lock a confirmed startup and a launch-host Record
-  (`input_flush_failed`, `launch_shell_exec_failed`) keep their own outcome, and a terminal
-  that finished after confirmation is not this case. The failure is `terminal surface finished
-  before provider launch was confirmed (Herdr terminal t7 exited with code N)`; the exit code
-  is the core's `exit_code` when it gives one (the field name is read from the installed hc
-  0.1.22's string table, not from a live core, and nothing is decided on it), and when the
-  launch log holds a host refusal the failure names that log. The launch ends as at the
-  deadline: failed status with that reason, the Claim released, the receipt pending, the
-  launch log line, and the surface handle kept, so `close-session` removes the finished
-  terminal (`terminal.rm`) as for any finished Herdr terminal.
+  confirmed fails the launch soon after the next probe, about a second, on every platform, as
+  a tmux surface that disappears does (owner's decision 2026-11-26, option A). This reverses,
+  for a host that ended before startup, #409's choice to leave its admission, receipt, binding
+  and Pending-launch refusals to the launch deadline. The finished terminal can only fail a
+  launch. The wait keeps the observation and waits for the lifecycle lock within the launch
+  deadline (a reader holding it delays, never strands, the settlement), then decides from the
+  records under the lock, for its own Claim token and Surface (`launch_owns_directory`): a
+  directory that is not this launch's is left alone and the wait fails without writing; a
+  confirmed startup and a launch-host Record (`input_flush_failed`, `launch_shell_exec_failed`)
+  keep their own outcome; a terminal that finished after confirmation is not this case. The
+  failure is `terminal surface finished before provider launch was confirmed (Herdr terminal t7
+  exited with code N); its launch host logged: <text>`. The core's report is the only
+  authority. The exit code is the core's `exit_code` when it gives one (the field name is read
+  from the installed hc 0.1.22's string table, not from a live core, and nothing is decided on
+  it). The text is the host's last `herdr_host_refused` line in the launch log, bounded and
+  with control characters escaped, read without following a link, without blocking, only as
+  a regular file and only its last MiB; without one the clause is left out. For a pending
+  launch the records end as at the deadline: failed status with that reason, the Claim
+  released, the receipt pending, the launch log line, and the surface handle kept, so
+  `close-session` removes the finished terminal (`terminal.rm`). A launch whose wrapper had
+  recorded `Spawning` keeps its Claim and receipt (a provider may have run; the reason says
+  so), and a macOS capture host can have recorded a later stage. A host that ends before its
+  Surface is bound is found by creation instead, which reads the created terminal live and
+  otherwise removes it.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface

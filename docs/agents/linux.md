@@ -19,9 +19,11 @@
   being gone (exit, PID reuse, another boot); a live server whose socket refuses is an error.
 - Before tmux starts a server, the launcher runs the pane host's session-directory admission
   for TAB's own account, which the server and its pane run as
-  (`bound_host::refuse_before_launch`); Herdr judges it for the core's account on the
-  connection that creates the terminal. A refusal fails the start with the host's reason. A
-  refusal only the host can know goes to the launch log, written only into a real directory.
+  (`bound_host::refuse_before_launch`); Herdr's is judged there only for what needs no account,
+  and for the core's account on the connection that creates the terminal. A refusal fails the
+  start with the host's reason before any Surface exists. A refusal only the host can know goes
+  into the launch log the launcher created, opened without following a link, without blocking
+  and without creating it.
 - The pane host waits for its exact binding, discards startup input, then runs
   `bash --noprofile --norc -m -c`. Keep job control and the wrapper's foreground process group.
   The same Linux bash handoff serves Herdr after checking its terminal address and host PID.

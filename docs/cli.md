@@ -176,23 +176,23 @@ remain nonempty. They are record labels; a terminal can also use its own ownersh
 `--terminal` defaults to platform detection (Herdr inside an hc terminal on Linux, otherwise tmux on Linux; on Windows, Herdr inside an hc terminal for a provider that runs there, otherwise the managed console). Documented values are `ghostty`, `herdr` (aliases `hc` and `herdr-core`; macOS, Linux, and Windows except Codex), `iterm2`, `terminal`,
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
-Before it creates the surface, TAB checks the new session directory as the terminal's launch
-host will, as far as TAB can establish that before creating anything: a real directory that no
+Before it creates the Surface, TAB checks the new session directory as the terminal's launch
+host will, as far as TAB can establish that before any Surface exists: a real directory that no
 other account can change, for the account the host runs as when TAB knows it (TAB's own for
 tmux, the core's for Herdr; the account of a macOS terminal application is not checked, and
-the Windows console's host makes no such check). A directory the host would refuse fails the
-start at once with the host's reason, recorded as `terminal launch failed: ...; no surface
-handle was recorded and no prompt was sent`; the failed session can be closed and pruned like
-any other. A refusal only the host can know, such as a directory changed after TAB's check, is
-written to the launch log by the Herdr, tmux, iTerm2 and WezTerm hosts (the Terminal.app,
-Ghostty and Warp hosts write nothing into a directory they refuse). A Herdr start then fails
-within about a second, when the core reports the launch's terminal finished before startup was
-confirmed (`terminal surface finished before provider launch was confirmed`, with its exit
-code when the core gives one and the launch log when it holds the host's refusal), as a tmux
-start does when its surface disappears; other surfaces end at the launch deadline unless their
-surface disappears first. A workspace,
-state directory or TAB executable path that is not Unicode text is refused before the launch,
-because the launch carries these paths as text.
+the Windows console's host makes no such check), and, for every host but tmux's, a path that
+can be sent to the host as text exactly. A directory the host would refuse fails the start at
+once with the host's reason, recorded as `terminal launch failed: ...; no surface handle was
+recorded and no prompt was sent`; the failed session can be closed and pruned like any other.
+A refusal only the host can know, such as a directory changed after TAB's check, is written by
+the Herdr, tmux, iTerm2 and WezTerm hosts into the launch log that TAB created (the
+Terminal.app, Ghostty and Warp hosts write nothing into a directory they refuse). A Herdr start
+then fails within about a second, when the core reports the launch's terminal finished before
+startup was confirmed (`terminal surface finished before provider launch was confirmed`, with
+its exit code when the core gives one and the host's own refusal line from the launch log), as
+a tmux start does when its surface disappears; other surfaces end at the launch deadline unless
+their surface disappears first. A workspace or TAB executable path that is not Unicode text is
+carried into the launch command lossily, as before.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

@@ -66,8 +66,13 @@ fn run(store: &Store, deadline_ms: u64, answer: impl FnMut(u64) -> Result<bool>)
         calls: Vec::new(),
         answer,
     };
+    let token = receipt_token(store);
     let result = wait_with(
         store,
+        &ThisLaunch {
+            token: &token,
+            surface: None,
+        },
         start + Duration::from_millis(deadline_ms),
         &mut clock,
         &mut presence,
@@ -354,8 +359,13 @@ fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalS
         directory: store.directory(),
         surface,
     };
+    let token = receipt_token(store);
     let result = wait_with(
         store,
+        &ThisLaunch {
+            token: &token,
+            surface: Some(surface),
+        },
         start + Duration::from_millis(deadline_ms),
         &mut clock,
         &mut presence,
@@ -403,10 +413,9 @@ fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe
             ))
         );
         if refusal {
-            expected.push_str(&format!(
-                "; its launch host logged a refusal in {}",
-                store.directory().join(LOG).display()
-            ));
+            expected.push_str(
+                "; its launch host logged: Herdr launch directory is not private to the current user",
+            );
         }
         assert_eq!(format!("{error:#}"), expected);
         assert!(error.downcast_ref::<TimedOut>().is_none());

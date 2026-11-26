@@ -422,6 +422,22 @@ fn fail_reopen_launch(
 ) -> anyhow::Error {
     initial_claim.fence_launch();
     let mut detail = format!("{error:#}");
+    // The refusal record and the fence are written only into this launch's own directory
+    // (`launch::launch_owns_directory`), the decision the launcher's settlement made too.
+    if !matches!(
+        session::launch::launch_owns_directory(
+            &Store::open_unchecked(&created.directory),
+            initial_claim.token(),
+            None,
+        ),
+        Ok(true)
+    ) {
+        detail.push_str(&format!("; {}", session::launch::NOT_THIS_LAUNCH));
+        return reopen_refusal(
+            reopen_refusal_gate(&error).unwrap_or(ReopenGate::LaunchFailed),
+            detail,
+        );
+    }
     let gate = match record_failed_launch(&created.directory, initial_claim.token(), &error) {
         Ok(gate) => gate,
         Err(record_error) => {

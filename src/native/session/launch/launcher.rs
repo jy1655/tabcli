@@ -48,9 +48,9 @@ pub(in crate::native) fn start(
     let bridge_command =
         launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
     initial_claim.fence_launch();
-    // A session directory the launch host would refuse fails here, as a surface that cannot
-    // be opened does: the host could report it only in the launch log, once its surface ran,
-    // and the launch would then wait for its deadline.
+    // A session directory the launch host would refuse fails here, before any Surface exists,
+    // as a surface that cannot be opened does: the host could report it only in the launch log,
+    // once its surface ran.
     let opened = terminal::refuse_before_launch(terminal_kind, &created.directory).and_then(|()| {
         terminal::open_bound_tab(
             terminal_kind,
@@ -84,6 +84,7 @@ pub(in crate::native) fn start(
     launch::wait(
         &Store::open_unchecked(&created.directory),
         &terminal_session,
+        expected_claim_token,
         launch_deadline,
     )?;
     Ok(terminal_session)
@@ -168,19 +169,15 @@ pub(in crate::native) fn bridge_shell_command(
     ))
 }
 
-// The launch command, and every launch host's arguments built from the same session
-// directory and executable (Herdr's JSON argv, the iTerm2 and WezTerm command lines), carry
-// these values as text. A value that is not Unicode would reach them changed, so the host would
-// look for another directory than the one created and checked; it is refused here, before
-// anything is created.
 pub(in crate::native) fn validate_shell_command_component(
     value: &std::ffi::OsStr,
     field: &str,
 ) -> Result<()> {
-    let Some(text) = value.to_str() else {
-        bail!("{field} is not Unicode text");
-    };
-    if let Some(character) = text.chars().find(|value| value.is_control()) {
+    if let Some(character) = value
+        .to_string_lossy()
+        .chars()
+        .find(|value| value.is_control())
+    {
         bail!(
             "{field} contains terminal control U+{:04X}",
             u32::from(character)

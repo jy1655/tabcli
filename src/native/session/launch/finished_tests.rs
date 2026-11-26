@@ -65,7 +65,17 @@ fn run_finished(store: &Store, reader: bool, during: impl FnMut()) -> Result<()>
         probed: Rc::clone(&probed),
     };
     let mut presence = FinishedProbe { during, probed };
-    wait_with(store, start + START_TIMEOUT, &mut clock, &mut presence)
+    let token = receipt_token(store);
+    wait_with(
+        store,
+        &ThisLaunch {
+            token: &token,
+            surface: None,
+        },
+        start + START_TIMEOUT,
+        &mut clock,
+        &mut presence,
+    )
 }
 
 // `inspect` holds the shared lifecycle lock when the probe finds the terminal finished. The

@@ -97,14 +97,15 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     })
 }
 
-/// Keep the legacy log prefix for Terminal.app.
+/// A launch host's refusal line, written only into the launch log the launcher created
+/// (`launch::append_host_refusal`). Keep the legacy log prefix for Terminal.app.
 pub(super) fn log_refusal(store: &Store, kind: TerminalKind, detail: &impl std::fmt::Display) {
     let name = if kind == TerminalKind::AppleTerminal {
         "terminal"
     } else {
         kind.as_str()
     };
-    launch::log(store, &format!("{name}_host_refused{detail}"));
+    launch::append_host_refusal(store.directory(), &format!("{name}_host_refused{detail}"));
 }
 
 /// The receipt observes the binding; the adapter proves that it names this host.
@@ -145,9 +146,9 @@ pub(super) fn run_bound_host<T>(
 
 /// `run_bound_host` for a launch host whose admission refusal goes to the launch log, the same
 /// on every platform: the Linux and Windows handoffs (Herdr, tmux) and the macOS capture host
-/// (Herdr, iTerm2, WezTerm). The line is a diagnostic, never a launch Record. It is written
-/// only into a real directory at an absolute path: a link or anything else at that path can
-/// name another session, and a refusal never writes through what it refused.
+/// (Herdr, iTerm2, WezTerm). The line is a diagnostic, never a launch Record, and goes only
+/// into the launch log the launcher created, in the real directory at that path
+/// (`launch::append_host_refusal`): a refusal never writes through what it refused.
 pub(super) fn run_logged_bound_host<T>(
     directory: &Path,
     kind: TerminalKind,
@@ -157,16 +158,11 @@ pub(super) fn run_logged_bound_host<T>(
         name: kind.display_name(),
     };
     let id = admit(directory, &spec).inspect_err(|error| {
-        let real_directory = directory.is_absolute()
-            && std::fs::symlink_metadata(directory)
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
-        if real_directory {
-            log_refusal(
-                &Store::open_unchecked(directory),
-                kind,
-                &format_args!(": {error:#}"),
-            );
-        }
+        log_refusal(
+            &Store::open_unchecked(directory),
+            kind,
+            &format_args!(": {error:#}"),
+        );
     })?;
     run(id)
 }
@@ -231,9 +227,10 @@ enum Judged<'a> {
 /// surface, on this platform. A host this platform does not run judges nothing here, so an
 /// unsupported surface keeps its own refusal. tmux runs its host in a server this process
 /// starts, so as this process's account; TAB does not attest the account of a macOS terminal
-/// application, so only what needs no account is judged; Herdr's host runs as its core,
-/// which the adapter judges on the connection that creates the terminal
-/// (`refuse_before_core_launch`); the Windows console host is no bound host.
+/// application, so only what needs no account is judged; Herdr's host runs as its core, so
+/// only what needs no account is judged before the core is reached, and the rest by the
+/// adapter on the connection that creates the terminal (`refuse_before_core_launch`); the
+/// Windows console host is no bound host.
 fn judged_by_the_launcher(kind: TerminalKind) -> Option<Judged<'static>> {
     match kind {
         TerminalKind::Tmux => cfg!(target_os = "linux").then_some(Judged::Own),
@@ -242,14 +239,40 @@ fn judged_by_the_launcher(kind: TerminalKind) -> Option<Judged<'static>> {
         | TerminalKind::AppleTerminal
         | TerminalKind::Ghostty
         | TerminalKind::Warp => cfg!(target_os = "macos").then_some(Judged::AccountUnknown),
-        TerminalKind::Herdr | TerminalKind::WindowsConsole => None,
+        TerminalKind::Herdr => Some(Judged::AccountUnknown),
+        TerminalKind::WindowsConsole => None,
     }
+}
+
+/// Whether the kind's launch host is given its session directory as text (Herdr's JSON argv,
+/// the command lines and frames of the macOS applications). A tmux pane host is given the
+/// path's exact bytes.
+const fn sends_directory_as_text(kind: TerminalKind) -> bool {
+    !matches!(kind, TerminalKind::Tmux | TerminalKind::WindowsConsole)
+}
+
+/// The launcher's admission: the host's own, on the text the host is given. A session
+/// directory that cannot be sent as that text exactly is refused: the host would look for
+/// another directory.
+fn admit_as_sent<'a>(
+    directory: &'a Path,
+    kind: TerminalKind,
+    spec: &BoundHostSpec,
+    judged: Judged<'_>,
+) -> Result<&'a str> {
+    if sends_directory_as_text(kind) && directory.to_str().is_none() {
+        bail!(
+            "{} launch directory is not Unicode text, which is how the launch host is given it",
+            spec.name
+        );
+    }
+    admit_as(directory, spec, judged)
 }
 
 /// The launcher's check before it creates a surface whose launch host runs `admit`: the
 /// same admission, as far as the launcher can establish the host's account
-/// (`judged_by_the_launcher`). A refusal here is one the host would make, so nothing is
-/// created; it is a `RefusedDirectory`.
+/// (`judged_by_the_launcher`), on the text the host is given. A refusal here is one the host
+/// would make, so no Surface is created; it is a `RefusedDirectory`.
 pub(in crate::native::terminal) fn refuse_before_launch(
     directory: &Path,
     kind: TerminalKind,
@@ -260,7 +283,7 @@ pub(in crate::native::terminal) fn refuse_before_launch(
     let spec = BoundHostSpec {
         name: kind.display_name(),
     };
-    match admit_as(directory, &spec, judged) {
+    match admit_as_sent(directory, kind, &spec, judged) {
         Ok(_) => Ok(()),
         Err(refusal) => Err(would_refuse(directory, &spec, &refusal, None)),
     }
@@ -282,7 +305,7 @@ pub(in crate::native::terminal) fn refuse_before_core_launch(
         name: kind.display_name(),
     };
     let judged = core.map_or(Judged::AccountUnknown, Judged::For);
-    let Err(refusal) = admit_as(directory, &spec, judged) else {
+    let Err(refusal) = admit_as_sent(directory, kind, &spec, judged) else {
         return Ok(());
     };
     let advice = core.and_then(|core| {
@@ -404,8 +427,13 @@ fn windows_private_directory(directory: &Path, name: &str, judged: Judged<'_>) -
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
     };
+    // Without an account the access list is not read, so only attribute access is asked for.
+    let access = match judged {
+        Judged::AccountUnknown => FILE_READ_ATTRIBUTES,
+        Judged::Own | Judged::For(_) => READ_CONTROL | FILE_READ_ATTRIBUTES,
+    };
     let opened = std::fs::OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(directory)

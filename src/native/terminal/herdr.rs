@@ -654,7 +654,7 @@ fn create(
     }
     // The launch host is the core's program and runs as the core's account: on the connection
     // that sends `terminal.run`, right before it, a session directory that the host's
-    // admission would refuse is refused, and nothing exists yet. A connection that cannot
+    // admission would refuse is refused before any Surface exists. A connection that cannot
     // name its server's account leaves the owner to the host.
     let account = linked.connection.core_account().ok();
     core.admit_launch_directory(directory, account.as_ref())

@@ -16,6 +16,19 @@
   policy or per process), so a directory that an elevated TAB creates is normally not private
   to the user of a core that is not elevated. The rule itself is unchanged; an account TAB
   cannot read leaves the owner and the access list to the host.
+- The state root is made private to the user at every session creation (`create_state_root`
+  sets mode 0700 on macOS and Linux and an access list for the user alone on Windows, and fails
+  where TAB cannot): only the user's own processes, an administrator and the system can then
+  add, remove or replace a session directory under it. TAB does not check the state root's
+  ancestors; a state root inside a directory another account can change is outside this.
+  The settlements that end a launch from outside its own records (the refusal before any
+  Surface, the finished Herdr terminal, reopen's refusal and its fencing) decide whether the
+  directory at the session's path is that launch's with one function,
+  `launch::launch_owns_directory` (a real directory, the request receipt of the launch's Claim,
+  no launch receipt of another Claim, no other bound Surface), before and again under the
+  lifecycle lock, and write nothing when it is not. A replacement by the user's own processes
+  between that check and the write is not closed with directory handles; the lock is opened by
+  name.
 - The check describes the store at the time of the read. It cannot tell who wrote the
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: TAB polls Agy's store every

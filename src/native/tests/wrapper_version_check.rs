@@ -582,12 +582,9 @@ fn a_wrapper_settling_its_timeout_after_the_launchers_deadline_leaves_the_launch
         serde_json::json!({"terminal": "windows-console", "session_id": "surface"}),
     )
     .unwrap();
-    let error = launch::wait(
-        &Store::open_unchecked(&session.directory),
-        &surface,
-        Instant::now(),
-    )
-    .unwrap_err();
+    let store = Store::open_unchecked(&session.directory);
+    let token = launch::read(&store).unwrap().unwrap().claim_token;
+    let error = launch::wait(&store, &surface, &token, Instant::now()).unwrap_err();
     const LAUNCH_DEADLINE: &str = "provider launch timed out before startup was confirmed";
     assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
     assert_eq!(classify(&error), Some(FailureKind::TimedOut));
