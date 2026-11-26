@@ -13,8 +13,8 @@ use std::process::Command;
 #[cfg(target_os = "macos")]
 pub(super) use support::write_attested_apple_terminal_state;
 pub(super) use support::{
-    link_directory, package_binary, reaped_child_pid, seed_close_fixture, spawn_surviving_process,
-    test_windows_process_identity, write_provider_process_record,
+    assert_child_test_passed, link_directory, package_binary, reaped_child_pid, seed_close_fixture,
+    spawn_surviving_process, test_windows_process_identity, write_provider_process_record,
 };
 
 mod args;

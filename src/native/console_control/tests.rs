@@ -982,12 +982,7 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::native::tests::assert_child_test_passed(&output, TEST);
         return;
     }
     let root = PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());

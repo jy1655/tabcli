@@ -629,12 +629,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::native::tests::assert_child_test_passed(&output, TEST);
         return;
     }
     let (temp, client, attempt) = fixture();
@@ -2065,12 +2060,8 @@ fn bundled_discovery_and_dispatch_ignore_invoking_terminal() {
                 child.env("WEZTERM_EXECUTABLE", "/not-an-owned-app/wezterm");
             }
             let output = child.output().unwrap();
-            assert!(
-                output.status.success(),
-                "host case {name}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            println!("host case {name}");
+            crate::native::tests::assert_child_test_passed(&output, TEST_NAME);
         }
         return;
     };

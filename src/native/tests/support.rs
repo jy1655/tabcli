@@ -237,3 +237,33 @@ pub(in crate::native) fn package_binary() -> std::path::PathBuf {
             )
         })
 }
+
+/// Asserts that a run of this test binary as a child (`--exact <test>`) ran that one test and
+/// that it passed. libtest exits successfully when the filter names no test, or names an
+/// ignored one, so the child's exit status alone does not tell a run that proved nothing from
+/// a pass.
+pub(in crate::native) fn assert_child_test_passed(output: &std::process::Output, test: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("running 1 test\n")
+            && stdout.contains(&format!("test {test} ... "))
+            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "the child run did not run and pass exactly {test} ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// A child run whose filter names no test, because the test was renamed or moved or its name
+// was written with the crate's name in front (fixed in ae6dfee, #408), exits successfully.
+#[test]
+fn a_child_run_of_no_test_is_not_a_pass() {
+    let missing = "native::tests::support::no_test_has_this_name";
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", missing, "--test-threads=1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(std::panic::catch_unwind(|| assert_child_test_passed(&output, missing)).is_err());
+}

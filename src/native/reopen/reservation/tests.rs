@@ -3662,20 +3662,16 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
     // next reopen's gate finds the marker stale, the command's own settlement releases it,
     // and a second reopen of the source is admitted (#245).
     const CHILD: &str = "TABCLI_REOPEN_START_FAILED_CHILD";
+    const TEST: &str = "native::reopen::reservation::tests::a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source";
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native::reopen::reservation::tests::a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, root.path())
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
+        crate::native::tests::assert_child_test_passed(&out, TEST);
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -3792,20 +3788,16 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
 #[test]
 fn a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement() {
     const CHILD: &str = "TABCLI_REOPEN_LAUNCH_BEFORE_FENCE_CHILD";
+    const TEST: &str = "native::reopen::reservation::tests::a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement";
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native::reopen::reservation::tests::a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, root.path())
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
+        crate::native::tests::assert_child_test_passed(&out, TEST);
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -3860,20 +3852,17 @@ fn a_reopen_launch_failure_before_the_fence_keeps_its_refusal_settlement() {
 fn reopened_source_creation_extra_and_failure_joints() {
     use crate::native::session_start::InitialSource;
     const CHILD: &str = "TABCLI_REOPEN_START_CHILD";
+    const TEST: &str =
+        "native::reopen::reservation::tests::reopened_source_creation_extra_and_failure_joints";
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native::reopen::reservation::tests::reopened_source_creation_extra_and_failure_joints",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, root.path())
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
+        crate::native::tests::assert_child_test_passed(&out, TEST);
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -4005,6 +3994,7 @@ fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
 #[test]
 fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_source() {
     const CHILD: &str = "TABCLI_REOPEN_ADMISSION_CHILD";
+    const TEST: &str = "native::reopen::reservation::tests::a_memory_workspace_source_is_refused_before_creation_without_touching_the_source";
     if std::env::var_os(CHILD).is_none() {
         let base = tempfile::tempdir().unwrap();
         let codex_home = base.path().join("codex");
@@ -4012,12 +4002,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
         let root = codex_home.join("memories");
         fs::create_dir_all(&root).unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native::reopen::reservation::tests::a_memory_workspace_source_is_refused_before_creation_without_touching_the_source",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, &root)
             // This fixture has its own home and no Herdr Core. Exercise workspace admission
@@ -4027,7 +4012,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
             .env("CODEX_HOME", &codex_home)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
+        crate::native::tests::assert_child_test_passed(&out, TEST);
         return;
     }
     let root = Reader::state_root().unwrap();

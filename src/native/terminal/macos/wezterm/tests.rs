@@ -1155,12 +1155,8 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
                 child.env("TERM_SESSION_ID", "caller-terminal");
             }
             let output = child.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{name}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            println!("host case {name}");
+            crate::native::tests::assert_child_test_passed(&output, TEST);
         }
         return;
     }
