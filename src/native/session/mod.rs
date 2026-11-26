@@ -85,6 +85,16 @@ pub(in crate::native) struct Reader {
 }
 
 /// A writable view. Lifecycle convergence remains with the command in step one.
+/// What `Store::try_lock_existing` found.
+pub(in crate::native) enum ExistingLock {
+    /// The lifecycle lock, held until this is dropped.
+    Held(File),
+    /// Another holder has it.
+    Busy,
+    /// The directory has no lifecycle lock file.
+    Absent,
+}
+
 pub(in crate::native) struct Store {
     reader: Reader,
 }
@@ -357,6 +367,24 @@ impl Store {
     }
     pub(in crate::native) fn try_lock(&self) -> Result<Option<TurnClaimLock>> {
         try_lock(&self.directory)
+    }
+    /// The lifecycle lock for a decision that changes nothing before it knows the directory is
+    /// its own (the launcher's early decisions): the existing lock file, opened as
+    /// `lock_shared` opens it, without creating it or changing its permissions, and locked
+    /// exclusively in one attempt.
+    pub(in crate::native) fn try_lock_existing(&self) -> Result<ExistingLock> {
+        let file = match File::open(self.directory.join(TURN_CLAIM_LOCK_FILE)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExistingLock::Absent);
+            }
+            Err(error) => return Err(error).context("failed to observe native lifecycle lock"),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(ExistingLock::Held(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(ExistingLock::Busy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
     }
     #[cfg(test)]
     pub(in crate::native) fn write_status(&self, value: &SessionStatus) -> Result<()> {

@@ -8,7 +8,9 @@ use crate::native::session::state::{
 use crate::native::clock::Clock;
 use crate::native::failure_kind::TimedOut;
 use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record, turn};
+use crate::native::session::{
+    CoreRecord, ExistingLock, Reader, RecordReader, RecordStore, Store, record, turn,
+};
 use crate::native::terminal;
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
@@ -595,14 +597,16 @@ fn unbound_wording(store: &Store, record: &Record, reason: &str) -> Result<Strin
 
 /// Settles a launch whose session directory the launch host would refuse, which the launcher
 /// established before any Surface existed (`terminal::DirectoryRefusal`), as the failure to
-/// open a Surface that it is (`terminal_failed`). It brings forward only the failure that the
-/// same launch reaches without it, at its deadline, so it settles only what that failure would:
-/// a reader that holds the lifecycle lock is waited out until `deadline`, the launch's own, and
-/// only past it does the held lock keep the Claim, as for every failure to open a Surface. Under
-/// the lock, a Claim that is not `token`, this launch's, means that the directory at this path
-/// is not this launch's: nothing is written. The Session records `recorded`, a fixed reason that
-/// names no path (`DirectoryRefusal::recorded`); the refusal, which names the directory, is
-/// returned to the caller.
+/// open a Surface that it is (`terminal_failed`). An early decision (docs/agents/herdr.md,
+/// "Early launch decisions"): it takes the existing lifecycle lock (`try_lock_existing`),
+/// waiting out another holder until `deadline`, the launch's own, and never accepting the lock
+/// at or after it; then it writes only on this launch's own pending launch, read under that
+/// lock (`early_facts`). Past the deadline the held lock keeps the Claim, as for every failure
+/// to open a Surface; without a lock file, or on facts that are not this launch's, nothing is
+/// written. The refusal is judged once, as observed: a directory corrected while the lock is
+/// awaited is not examined again. The Session records `recorded`, a fixed reason that names no
+/// path (`DirectoryRefusal::recorded`); the refusal, which names the directory, is returned to
+/// the caller.
 pub(in crate::native) fn refused_before_surface(
     store: &Store,
     token: &str,
@@ -631,25 +635,76 @@ fn refused_before_surface_with(
     let reason = format!("terminal launch failed: {recorded}");
     let settled = (|| {
         let _lock = loop {
-            if let Some(lock) = store.try_lock()? {
-                break lock;
+            match store.try_lock_existing()? {
+                ExistingLock::Held(lock) if clock.now() < deadline => break lock,
+                ExistingLock::Held(_) => return Err(startup_in_progress(&reason)),
+                ExistingLock::Absent => return Ok(()),
+                ExistingLock::Busy => {
+                    let remaining = deadline.saturating_duration_since(clock.now());
+                    if remaining.is_zero() {
+                        return Err(startup_in_progress(&reason));
+                    }
+                    clock.sleep(remaining.min(WAIT_POLL));
+                }
             }
-            let remaining = deadline.saturating_duration_since(clock.now());
-            if remaining.is_zero() {
-                return Err(startup_in_progress(&reason));
-            }
-            clock.sleep(remaining.min(WAIT_POLL));
         };
-        if turn::current_claim_token(store)?.as_deref() != Some(token) {
-            return Ok(());
+        match early_facts(store, token, deadline, clock)? {
+            EarlyFacts::Pending(_) => fail_deciding_locked(store, &reason, |record, reason| {
+                unbound_wording(store, record, reason)
+            }),
+            EarlyFacts::Expired => Err(startup_in_progress(&reason)),
+            EarlyFacts::NotPending => Ok(()),
         }
-        fail_deciding_locked(store, &reason, |record, reason| {
-            unbound_wording(store, record, reason)
-        })
     })();
     match settled {
         Ok(()) => refusal,
         Err(handoff) => refusal.context(format!("terminal launch failure handoff: {handoff:#}")),
+    }
+}
+
+/// What an early launch decision reads of this launch's own records, under the lifecycle lock it
+/// holds, before it may write: the pending-launch judgment for `token` (the status `Launching`
+/// and no tombstone, the receipt of this Claim, still `Pending`, the launch's budget on `clock`
+/// and the receipt's deadline, and this Claim at the path).
+enum EarlyFacts {
+    Pending(Record),
+    Expired,
+    NotPending,
+}
+
+fn early_facts(
+    store: &Store,
+    token: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Result<EarlyFacts> {
+    let Some(receipt) = read(store)? else {
+        return Ok(EarlyFacts::NotPending);
+    };
+    let mut spent = || clock.now() >= deadline;
+    Ok(
+        match pending::judge(
+            store,
+            &receipt,
+            token,
+            pending::Expiry::BudgetOrReceipt(&mut spent),
+        )? {
+            Ok(()) => EarlyFacts::Pending(receipt),
+            Err(pending::NotPending::Expired) => EarlyFacts::Expired,
+            Err(_) => EarlyFacts::NotPending,
+        },
+    )
+}
+
+/// The ordinary poll's reading of the launch-host Record (`host_decision_locked`), without the
+/// write that publishes a failure: `true` only when it leaves the launch pending. A Record that
+/// cannot be read, or whose schema TAB does not know, is no evidence; a recorded failure is the
+/// ordinary poll's to publish.
+fn host_record_pending(reader: &Reader, receipt: &Record) -> bool {
+    match host::observe(reader, Some(receipt)) {
+        host::HostObservation::NotRecorded | host::HostObservation::IdentityMismatch => true,
+        host::HostObservation::Recorded(record) => record.failure.is_none(),
+        host::HostObservation::Unreadable(_) | host::HostObservation::SchemaUnsupported(_) => false,
     }
 }
 
@@ -867,7 +922,9 @@ fn wait_with(
             match presence.present(remaining.min(SURFACE_PROBE_BOUND)) {
                 Ok(terminal::LaunchSurface::Absent) => Some(SURFACE_DISAPPEARED.to_owned()),
                 Ok(terminal::LaunchSurface::Finished(finished)) => {
-                    if let Some(outcome) = finished_before_startup(store, token, &finished) {
+                    if let Some(outcome) =
+                        finished_before_startup(store, token, &finished, deadline, clock)
+                    {
                         return outcome;
                     }
                     None
@@ -993,25 +1050,30 @@ fn settle_locked(store: &Store, reason: String, deadline_reached: bool) -> Resul
 }
 
 /// The decision on a launch whose surface's program its verified core reports finished before
-/// startup was confirmed (a Herdr terminal; owner's decision 2026-11-26, option A). It brings
-/// forward only the failure that the launch deadline would record for the same launch, so it
-/// acts only when that is certain: it holds the lifecycle lock; the Claim at this path is
-/// `token`, this launch's; the poll's own reading of the records under that lock, in its own
-/// precedence, still finds the launch pending; and the receipt is still `Pending`, so no
-/// provider was started that could still confirm. Then the launch fails through the deadline's
-/// settlement, with a fixed reason that names no path; the error returned to the caller adds the
-/// core's report and the launch log's path. Otherwise, and when a record cannot be read, this
-/// probe decides nothing (`None`): the wait goes on as for a present surface, and its next poll
-/// reads what the records say.
-fn finished_before_startup(store: &Store, token: &str, finished: &str) -> Option<Result<()>> {
-    let _lock = store.try_lock().ok().flatten()?;
-    let pending = (|| -> Result<bool> {
-        Ok(turn::current_claim_token(store)?.as_deref() == Some(token)
-            && !decided_locked(store)?
-            && !read_confirmation(store)?
-            && read(store)?.is_some_and(|record| record.phase == Phase::Pending))
-    })();
-    if !matches!(pending, Ok(true)) {
+/// startup was confirmed (a Herdr terminal; owner's decision 2026-11-26, option A). An early
+/// decision (docs/agents/herdr.md, "Early launch decisions"): it acts only on facts read under
+/// the existing lifecycle lock (`try_lock_existing`), at the moment of the decision, about this
+/// launch's own records: its own pending launch within the budget (`early_facts`; a `Pending`
+/// receipt means no provider was started that could still confirm) and the ordinary poll's
+/// reading of the launch-host Record, still pending (`host_record_pending`). Then the launch
+/// fails through the deadline's settlement, with a fixed reason that names no path; the error
+/// returned to the caller adds the core's report and the launch log's path. Otherwise, and when
+/// anything cannot be read, this probe decides nothing (`None`) and writes nothing: the wait
+/// goes on to its next ordinary poll, and the existing paths decide.
+fn finished_before_startup(
+    store: &Store,
+    token: &str,
+    finished: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Option<Result<()>> {
+    let Ok(ExistingLock::Held(_lock)) = store.try_lock_existing() else {
+        return None;
+    };
+    let Ok(EarlyFacts::Pending(receipt)) = early_facts(store, token, deadline, clock) else {
+        return None;
+    };
+    if !host_record_pending(store, &receipt) {
         return None;
     }
     Some(

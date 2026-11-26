@@ -914,7 +914,7 @@ fn a_host_failure_seen_by_the_finished_probe_is_left_to_the_ordinary_poll() {
     assert_eq!(
         format!("{error:#}"),
         format!(
-            "{LAUNCH_DEADLINE}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
+            "{LAUNCH_DEADLINE}; last recorded launch stage: awaiting_host; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
         )
     );
     let status = store.status().unwrap();
