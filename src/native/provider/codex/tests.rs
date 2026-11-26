@@ -632,8 +632,11 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         ("(0.170.0)", false, true, Some(true)), // brackets
         ("unknown", false, false, None),      // not a candidate
         ("0.170", false, false, None),        // two numbers are not a candidate
-        ("0.170.0.1", false, false, None),    // four numbers are not a candidate
-        ("127.0.0.1:8080", false, false, None), // an IPv4 address and port is not either
+        ("0.170.0.1", false, false, None),    // four plain numbers are not a candidate
+        ("127.0.0.1:8080", false, false, None), // nor are an IPv4 address and port
+        ("v0.170.0.1", false, true, None),    // four numbers with a `v` are an unreadable one
+        ("0.170.0.1-rc.1", false, true, None), // and with a prerelease
+        ("codex/0.168.0", false, true, None), // a version inside a word is one too
     ];
     let before = [
         "",
@@ -889,6 +892,8 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         "OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)",
         "codex 0.170.0 build 1.2.3.4",
         "Codex <0.169.0",
+        "OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)",
+        "codex/0.168.0 (node 22.0.0)",
     ] {
         assert!(
             table.iter().any(|(text, _)| text == named),

@@ -147,18 +147,21 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
 // shape, never by whether it parses, so that a malformed word cannot leave another program's
 // version as the only one:
 //
-//   candidate = a word whose rest, after its leading non-alphanumeric characters and one
-//               optional `v`, begins with digits "." digits "." digits, not followed by "."
-//               and a digit (so an IPv4 address or a four-part build number is none)
-//   reading   = that rest, less its trailing characters that cannot end a version (anything
+//   candidate = a word that contains digits "." digits "." digits, unless the word, once its
+//               surrounding punctuation is removed, is nothing but four or more numbers joined
+//               by single dots, optionally followed by ":" and a port (an IPv4 address, a
+//               four-part build number)
+//   reading   = the candidate's rest, after its leading non-alphanumeric characters and one
+//               optional `v`, less its trailing characters that cannot end a version (anything
 //               but a letter, a digit or `-`), read as SemVer 2.0.0; none when it is not
 //
 // The text names a version only when it has exactly one candidate and that candidate has a
 // reading: `OpenAI Codex (v0.170.0)`, `(0.170.0)`, `0.170.0+` and `Codex 0.170.0.` are
 // 0.170.0, and `0.170.0--` and `0.168.0-rc-.` keep their prerelease. No candidate, a candidate
-// without a reading (`0.170.0-`), and two or more candidates are refused, whether or not the
-// others would parse (`0.168.0- runtime 22.0.0`, `node v22.0.0` before a banner, the same
-// version printed twice): another program's version can come first, and a misread version
+// without a reading (`0.170.0-`, `v0.168.0.1-rc.1`, `codex/0.168.0`), and two or more
+// candidates are refused, whether or not the others would parse (`0.168.0- runtime 22.0.0`,
+// `node v22.0.0` before a banner, the same version printed twice): another program's version
+// can come first, and a misread version
 // could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
 // already have reported the request accepted. docs/agents/codex.md holds the table of texts
 // that `pending_herdr_launches_across_the_wrapper_handoff` checks against this reading.
@@ -186,27 +189,55 @@ fn unlabelled_codex_version(output: &str) -> Result<Version> {
     }
 }
 
-// The rest of a candidate word: after its leading non-alphanumeric characters and one
-// optional `v`, it begins with digits "." digits "." digits, not followed by "." and a digit
-// (a fourth number: an IPv4 address, a four-part build number).
+// A candidate word, and its rest after its leading non-alphanumeric characters and one
+// optional `v`: a word that contains three numbers joined by single dots, unless the word,
+// once its surrounding punctuation is removed, is nothing but four or more such numbers,
+// optionally followed by a colon and a port (an IPv4 address, a four-part build number).
 fn version_candidate(word: &str) -> Option<&str> {
+    if !contains_three_numbers(word) || plain_numbers(word) {
+        return None;
+    }
     let rest = word.trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
-    let rest = rest.strip_prefix('v').unwrap_or(rest);
-    let mut remaining = rest;
-    for part in 0..3 {
-        let digits = remaining.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            return None;
-        }
-        remaining = &remaining[digits..];
-        if part < 2 {
-            remaining = remaining.strip_prefix('.')?;
+    Some(rest.strip_prefix('v').unwrap_or(rest))
+}
+
+// Whether `word` holds digits "." digits "." digits anywhere; one pass.
+fn contains_three_numbers(word: &str) -> bool {
+    let mut numbers = 0;
+    let mut in_number = false;
+    let mut after_dot = false;
+    for byte in word.bytes() {
+        if byte.is_ascii_digit() {
+            if !in_number {
+                numbers = if after_dot { numbers + 1 } else { 1 };
+                if numbers >= 3 {
+                    return true;
+                }
+                in_number = true;
+                after_dot = false;
+            }
+        } else if byte == b'.' && in_number {
+            in_number = false;
+            after_dot = true;
+        } else {
+            in_number = false;
+            after_dot = false;
+            numbers = 0;
         }
     }
-    let fourth = remaining
-        .strip_prefix('.')
-        .is_some_and(|after| after.starts_with(|character: char| character.is_ascii_digit()));
-    (!fourth).then_some(rest)
+    false
+}
+
+// Whether `word`, its surrounding punctuation removed, is four or more numbers joined by
+// single dots, optionally followed by a colon and a port, and nothing else.
+fn plain_numbers(word: &str) -> bool {
+    let trimmed = word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let (numbers, port) = match trimmed.split_once(':') {
+        Some((numbers, port)) => (numbers, Some(port)),
+        None => (trimmed, None),
+    };
+    port.is_none_or(number) && numbers.split('.').count() >= 4 && numbers.split('.').all(number)
 }
 
 // A candidate's version: its trailing characters that cannot end a version (anything but a

@@ -26,12 +26,15 @@
   prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
   refused. Without a label (`unlabelled_codex_version`, the one place of that rule; owner's
   decisions 4B and B2, 2026-11-26), ambiguity is judged by a word's shape, not by whether it
-  parses. A candidate is a word that, after its leading punctuation and one optional `v`,
-  begins with digits.digits.digits not followed by a dot and a digit (an IPv4 address or a
-  four-part build number is no candidate). The text names a version only when it has exactly
-  one candidate, whether or not the others would parse, and that candidate has a reading: its
-  rest, less its trailing characters that cannot end a version (anything but a letter, a digit
-  or `-`), read as SemVer. A valid prerelease or build stays:
+  parses. A candidate is a word that contains digits.digits.digits, unless the word, once its
+  surrounding punctuation is removed, is nothing but four or more dot-separated numbers,
+  optionally followed by a colon and a port (an IPv4 address, a four-part build number). The
+  text names a version only when it has exactly one candidate, whether or not the others would
+  parse, and that candidate has a reading: its rest after its leading punctuation and one
+  optional `v`, less its trailing characters that cannot end a version (anything but a letter,
+  a digit or `-`), read as SemVer. A version inside a word (`codex/0.168.0`) and a four-part
+  word with a `v`, a prerelease or a build (`v0.168.0.1-rc.1`) are candidates without a
+  reading. A valid prerelease or build stays:
   `0.170.0--` and `0.168.0-rc-.` are prereleases, `OpenAI Codex (v0.170.0)`, `(0.170.0)`,
   `0.170.0+` and `Codex 0.170.0.` are 0.170.0. No candidate, a candidate without a reading
   (`0.170.0-`), and two or more candidates are refused: another program's version can come
@@ -76,11 +79,14 @@
   | `OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)` | launches | refuses | launches |
   | `codex 0.170.0 build 1.2.3.4` | launches | refuses | launches |
   | `Codex <0.169.0` | launches | refuses | launches |
+  | `OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)` | launches | refuses | refuses |
+  | `codex/0.168.0 (node 22.0.0)` | launches | refuses | refuses |
   <!-- /herdr-version-handoff -->
 
-  Notes on the table. A word of four dot-separated numbers (an IPv4 address with or without a
-  port, a four-part build number) is not a candidate, so it does not make a banner ambiguous.
-  Leading punctuation is removed before a candidate's shape is read, as 0.4.48 removed it, so
+  Notes on the table. A word that is nothing but four or more dot-separated numbers (an IPv4
+  address with or without a port, a four-part build number) is not a candidate, so it does not
+  make a banner ambiguous; any other word holding three dot-separated numbers is one.
+  Leading punctuation is removed before a candidate is read, as 0.4.48 removed it, so
   `Codex <0.169.0` reads as exactly 0.169.0 and launches, here as in 0.4.48: the reading cannot
   tell a bound from a version.
 
