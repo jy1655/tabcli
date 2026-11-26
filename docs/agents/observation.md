@@ -23,9 +23,9 @@
   returned with the refusal; when the Claim cannot be released, no refusal line is appended and
   the earlier lines from TAB stay. The log append is best effort: its failure is not reported
   and changes nothing else. What the status becomes after a refusal that wrote nothing is left
-  to the existing paths: reopen's fence (`fence_failed_start_locked`) copies the full error into
-  a launch it still finds `Launching` with the matching Claim, and a repair that settles the
-  launch and releases its Claim first keeps its own failed status.
+  to the existing paths: reopen's fence (`fence_failed_start_locked`) can copy the full error
+  when it finds `Launching` with the matching Claim, and a repair that settles the launch and
+  releases its Claim first keeps its own failed status.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared

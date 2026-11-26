@@ -208,14 +208,14 @@ change made after its check, a host started under another account than the one i
 error only the host meets; the host still refuses those and appends to its launch log when it
 can. A Herdr start then fails at TAB's next check of the terminal, normally about a second
 after the core reports it finished, when TAB can read that the launch is still its own and
-pending and that no provider was started (the session records `terminal surface finished before
-provider launch was confirmed`; the error adds the terminal, its exit code when the core gives
-one, and the launch log's path), as a tmux start does when its surface disappears. Otherwise
-TAB keeps waiting as for any surface, as in 0.4.49, up to the launch deadline. A surface that
-disappears is handled by the ordinary settlement, as in 0.4.49: it keeps a confirmed or ended
-outcome, returns errors from reading or updating the records, and uses `terminal surface
-disappeared before provider launch was confirmed` for a launch that is still pending and that
-it can settle.
+pending and that no provider was started (when TAB completes that settlement, the session
+records `terminal surface finished before provider launch was confirmed` and the error adds the
+terminal, its exit code when the core gives one, and the launch log's path), as a tmux start
+does when its surface disappears. Otherwise TAB keeps waiting as for any surface, as in 0.4.49,
+up to the launch deadline. A surface that disappears is handled by the ordinary settlement, as
+in 0.4.49: it keeps a confirmed or ended outcome it reads under the lock, can return a record
+error, and uses `terminal surface disappeared before provider launch was confirmed` for a
+launch that is still pending and that it can settle.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

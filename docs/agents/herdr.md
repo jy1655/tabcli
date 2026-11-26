@@ -107,18 +107,18 @@
   nothing and returns the wait to its ordinary polling, as in 0.4.49, while the launch budget
   lasts, also when the receipt's deadline deferred it (that deadline is not the launch
   deadline). A terminal the core then reports absent is handled by the ordinary settlement
-  (`settle`), as in 0.4.49: it keeps a confirmed or ended outcome, returns errors from reading
-  or updating the records, and uses the disappeared-surface reason for a launch that is still
+  (`settle`), as in 0.4.49: it keeps a confirmed or ended outcome it reads under the lock, can
+  return a record error, and uses the disappeared-surface reason for a launch that is still
   pending and that it can settle. Finished-terminal probes that keep deferring leave the launch
-  to the ordinary poll and its deadline. The Session records the fixed reason
-  `terminal surface finished before provider launch was confirmed`; the error returned to the
-  caller adds the core's report and the launch log's path, `(Herdr terminal t7 exited with code
-  N); see the launch log <path>`; nothing is read from the log. The exit code is the core's
-  `exit_code` when it gives one (the field name is read from the installed hc 0.1.22's string
-  table, not from a live core, and nothing is decided on it). The settlement writes as the
-  refusal's does (above): an error writing the status or releasing the Claim ends it there and
-  is the wait's error, and the log append is best effort. When it completes, the launch ends
-  failed, its Claim released, its receipt pending and its surface handle kept, so
+  to the ordinary poll and its deadline. On a completed settlement the Session records the
+  fixed reason `terminal surface finished before provider launch was confirmed`, and the error
+  returned to the caller adds the core's report and the launch log's path, `(Herdr terminal t7
+  exited with code N); see the launch log <path>`; nothing is read from the log. The exit code
+  is the core's `exit_code` when it gives one (the field name is read from the installed hc
+  0.1.22's string table, not from a live core, and nothing is decided on it). The settlement
+  writes as the refusal's does (above): an error writing the status or releasing the Claim ends
+  it there and is the wait's error, and the log append is best effort. When it completes, the
+  launch ends failed, its Claim released, its receipt pending and its surface handle kept, so
   `close-session` removes the finished terminal (`terminal.rm`). Creation removes a created
   terminal that its last live read finds finished; one that finishes after that read is bound
   and left to this probe.
@@ -157,17 +157,18 @@
   The fixed reasons are in the failed `status.json` and, on a best-effort basis, in
   `launch.log`; `residual_surface()` and the status readers interpret the status. A later
   successful close without a terminal handle writes its closed record and status without that
-  error. The returned error keeps the directory, the terminal and the launch log's path, and
-  reopen's refusal record keeps that full error as its detail, as for every failed launch since
-  0.4.49. Reopen can copy that detail into the status error of a refused launch still
-  launching with its Claim in two places: the original `reopen` command itself, which settles
-  its failed launch through `fence_failed_start` with the detail once it gets the lifecycle
-  lock (`fail_reopen_launch`, after `record_failed_launch`), for example when a reader held the
-  lock through the refusal's deadline and then released it; and a later reopen of the same
-  source (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`). Whether reopen
+  error. The returned refusal keeps the directory, the error of a completed finished-terminal
+  settlement keeps the terminal and the launch log's path, and reopen's refusal record can keep
+  that full error as its detail (`record_failed_launch`), as for a failed launch since 0.4.49.
+  Reopen can copy that detail into the status error of a refused launch still launching with
+  its Claim in two places: the original `reopen` command itself, which passes the detail to
+  `fence_failed_start` once it gets the lifecycle lock (`fail_reopen_launch`, after
+  `record_failed_launch`), for example when a reader held the lock through the refusal's
+  deadline and then released it; and a later reopen of the same source
+  (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`). Whether reopen
   copies it is decided by `fence_failed_start_locked` when reopen holds the lock, not by the
-  refusal or by lock contention: it copies the detail into a launch it still finds `Launching`
-  with the matching Claim and otherwise copies nothing, so a repair that settles the launch and
+  refusal or by lock contention: it can copy the detail when it finds `Launching` with the
+  matching Claim and otherwise copies nothing, so a repair that settles the launch and
   releases its Claim first keeps its own failed status.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
