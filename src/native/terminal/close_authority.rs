@@ -405,30 +405,17 @@ pub(in crate::native) fn decide(
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
-        // An interrupted owner teardown keeps its route while its evidence validates. When the
-        // owner it names can no longer be established (the record gone, unreadable or not a
-        // record), a kind whose core keeps its terminals takes the creation record instead,
-        // which confirms absence on the core and ends nothing.
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let teardown_intent = match observation.teardown_intent() {
-            Err(error)
-                if owner_exit::core_retains_finished(session.kind)
-                    && error
-                        .downcast_ref::<session::close::TeardownOwnerUnestablished>()
-                        .is_some() =>
-            {
-                None
-            }
-            result => result?,
-        };
+        let teardown_intent = observation.teardown_intent()?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let has_teardown_intent = teardown_intent.is_some();
         #[cfg(windows)]
         let has_teardown_intent = false;
         // A kind whose core keeps its terminals (Herdr) gathers its evidence in one place, for
         // every owner record, the failed start and the record that is not there included. It
-        // leaves only a live, attested owner of this session to the rules below; an
-        // interrupted owner teardown keeps its own completion rule.
+        // leaves only a live, attested owner of this session to the rules below. A saved
+        // teardown intent of an interrupted owner teardown (macOS and Linux) is read, validated
+        // and replayed exactly as 0.4.49 does it, before and instead of this choice.
         let core_kept_owner =
             if owner_exit::core_retains_finished(session.kind) && !has_teardown_intent {
                 match owner_exit::core_kept(observation, expected_session_id, session)? {

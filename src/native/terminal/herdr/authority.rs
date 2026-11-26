@@ -35,15 +35,30 @@ pub(super) enum Basis<'a> {
     /// close.
     Created {
         recorded: &'a Recorded<'a>,
-        admitted: Admitted,
+        admitted: &'a Admitted,
     },
 }
 
 /// A close on the creation record that `admit` let through: only an explicit close. It keeps why
-/// a live owner could not be verified, for the refusal of a running terminal.
+/// a live owner could not be verified, for the refusal of a running terminal and for
+/// `explain`, which the close attaches once around everything it does after admission.
 pub(super) struct Admitted {
     unverified: Option<String>,
 }
+
+/// The refusal of a running terminal on the creation record (`Recorded::still_running`). It
+/// states why no live owner was verified in its own text, so `Admitted::explain` adds nothing
+/// to it.
+#[derive(Debug)]
+struct StillRunning(String);
+
+impl std::fmt::Display for StillRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StillRunning {}
 
 /// Admits the decision's evidence before anything is read from the core: a cleanup after
 /// another command (a refused reopen) acts on no terminal that no live owner holds, and settles
@@ -80,12 +95,14 @@ pub(super) struct Remove {
 impl Admitted {
     /// A refusal on the creation record keeps why a live owner could not be verified, when the
     /// owner record or its process could not be read, beside its own recovery instructions.
+    /// The close attaches it once, around the whole admitted operation; the refusal of a running
+    /// terminal already says why.
     pub(super) fn explain(&self, error: anyhow::Error) -> anyhow::Error {
         match &self.unverified {
-            Some(why) => error.context(format!(
+            Some(why) if error.downcast_ref::<StillRunning>().is_none() => error.context(format!(
                 "TAB could not verify a live owner for this session ({why})"
             )),
-            None => error,
+            _ => error,
         }
     }
 }
@@ -150,9 +167,7 @@ pub(super) fn grant(
     match basis {
         Basis::Owned(recorded) => recorded.check(core, observed)?,
         Basis::Launch { launch, first } => launch.check_cleanup(first.observed(), observed)?,
-        Basis::Created { recorded, admitted } => recorded
-            .check_creation_record(core, observed)
-            .map_err(|error| admitted.explain(error))?,
+        Basis::Created { recorded, .. } => recorded.check_creation_record(core, observed)?,
     }
     let core_id = seen.core_id();
     match observed.state {
@@ -163,9 +178,10 @@ pub(super) fn grant(
         State::Live if killed => Ok(Grant::Wait),
         State::Live => {
             if let Basis::Created { recorded, admitted } = basis {
-                return Err(
-                    recorded.still_running(&observed.address, admitted.unverified.as_deref())
-                );
+                return Err(StillRunning(
+                    recorded.still_running(&observed.address, admitted.unverified.as_deref()),
+                )
+                .into());
             }
             Ok(Grant::Kill(Kill {
                 core_id: core_id.to_owned(),

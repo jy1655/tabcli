@@ -180,7 +180,7 @@ impl<'a> Recorded<'a> {
     /// form on the recorded endpoint: look at the terminal, check the core and the session
     /// directory as the guide says, end the terminal there or wait for it to finish, then close
     /// the session again, which removes the finished terminal.
-    pub(super) fn still_running(&self, address: &str, unverified: Option<&str>) -> anyhow::Error {
+    pub(super) fn still_running(&self, address: &str, unverified: Option<&str>) -> String {
         let socket = &self.surface.socket;
         let core_id = &self.surface.core_id;
         let session = self
@@ -193,7 +193,7 @@ impl<'a> Recorded<'a> {
         let why = unverified
             .map(|why| format!(" ({why})"))
             .unwrap_or_default();
-        anyhow::anyhow!(
+        format!(
             "Herdr terminal {address} on the recorded Herdr Core {core_id} is still running, and TAB could not verify a live owner for this session{why}, so it does not end the terminal; nothing was sent and the handle is retained. Look at it with `{get}`. Before ending it yourself, run `tabcli doctor {session} --probe` to check that the recorded core answers at its endpoint, and check that the program arguments `hc get` shows name this session's directory. Then end it with `{kill}`, or wait for it to finish, and run close-session again: it removes the finished terminal and closes the session"
         )
     }

@@ -886,6 +886,77 @@ fn a_failed_or_unanswered_removal_is_finished_by_the_next_close() {
     ));
     assert_eq!(fixture.mutations(), (0, 0));
     fixture.assert_closed("close after an unanswered removal");
+
+    // Review round 7, finding 5: with an owner record that cannot be read, a refusal after the
+    // first read keeps its own error and, once, why TAB could not verify a live owner: a refused
+    // second read, a refused removal, and a confirming read that still finds the terminal. The
+    // next close removes the finished terminal.
+    type Script = fn(&Fixture);
+    let rows: [(&str, Script, &str, Mutations); 3] = [
+        (
+            "second read refused",
+            |fixture| {
+                fixture.core.inject("terminal.get", Injected::Pass);
+                fixture
+                    .core
+                    .inject("terminal.get", Injected::Instead(refused("internal")));
+            },
+            "Herdr refused terminal.get (internal)",
+            (0, 0),
+        ),
+        (
+            "removal refused",
+            |fixture| {
+                fixture
+                    .core
+                    .inject("terminal.rm", Injected::Instead(refused("internal")));
+            },
+            "Herdr refused terminal.rm (internal)",
+            (0, 1),
+        ),
+        (
+            "still listed after the removal",
+            |fixture| {
+                let terminal = fixture.core.terminal("t7").unwrap();
+                fixture.core.after_call("terminal.rm", move |terminals| {
+                    terminals.insert("t7".into(), terminal);
+                });
+            },
+            "is still held by its core after terminal.rm",
+            (0, 1),
+        ),
+    ];
+    for (label, script, refusal, mutations) in rows {
+        let fixture = Fixture::new("ready", &complete_owner());
+        fixture.finish();
+        let owner = fixture.store().record(CoreRecord::Owner).path().to_owned();
+        fs::remove_file(&owner).unwrap();
+        fs::create_dir(&owner).unwrap();
+        script(&fixture);
+        let text = error_text(&fixture.close(exited, false).unwrap_err());
+        assert!(text.contains(refusal), "{label}: {text}");
+        assert!(
+            text.contains(
+                "TAB could not verify a live owner for this session (its owner record could not be read"
+            ),
+            "{label}: {text}"
+        );
+        assert_eq!(
+            text.matches("its owner record could not be read").count(),
+            1,
+            "{label}: {text}"
+        );
+        assert_eq!(fixture.mutations(), mutations, "{label}");
+        fixture.assert_retained(label, SessionState::Ready);
+        fixture.core.clear_calls();
+        assert_eq!(
+            fixture.close(exited, false).map_err(|e| error_text(&e)),
+            Ok(CloseOutcome::Closed),
+            "{label}"
+        );
+        assert_eq!(fixture.mutations(), (0, 1), "{label}");
+        fixture.assert_closed(label);
+    }
 }
 
 // Every Windows Herdr handle TAB has written (0.4.47 on) records its launch label, so one
@@ -1788,7 +1859,7 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
             let (recorded, mut linked): (Recorded<'_>, _) =
                 Recorded::open(core, &session, requirement, later())?.expect("present");
             let seen = linked.observe("t7", later())?.expect("present");
-            let basis = match evidence {
+            let basis = match &evidence {
                 Some(admitted) => Basis::Created {
                     recorded: &recorded,
                     admitted,
@@ -2013,8 +2084,10 @@ fn an_owner_record_that_cannot_be_read_never_strands_the_session() {
     fixture.core.clear_calls();
     let text = error_text(&fixture.close(exited, false).unwrap_err());
     assert!(text.contains(STILL_RUNNING), "{text}");
-    assert!(
-        text.contains("its owner record could not be read"),
+    // The running refusal states why in its own text, and only there (review round 7, 5).
+    assert_eq!(
+        text.matches("its owner record could not be read").count(),
+        1,
         "{text}"
     );
     assert_eq!(fixture.mutations(), (0, 0));
@@ -2313,25 +2386,37 @@ fn an_owner_that_exits_between_its_two_reads_takes_the_creation_record() {
     assert_eq!(fixture.mutations(), (0, 0));
 }
 
-// Review round 6, finding 2: a close with a live owner that proved its terminal absent records
-// a teardown intent before it ends the owner. If it is interrupted there and the owner then
-// exits and its record goes (or can no longer be read), the retry cannot validate that intent
-// against an owner. It closes on the creation record instead, which confirms the absence on the
-// recorded core; it ends nothing. macOS and Linux only (Windows records no teardown intent).
+// Review round 7, findings 1 to 4 (the coordinator's ruling): a close with a live owner that
+// proved its terminal absent records a teardown intent before it ends the owner. A close that
+// finds such an intent saved follows 0.4.49's replay rules exactly; the creation-record rule of
+// os-parity applies only when no teardown intent is saved. Here the interrupted teardown's
+// owner record has since gone, or can no longer be read: the intent cannot be validated, so the
+// retry refuses before it asks the core anything, whether the terminal finished or is absent,
+// and keeps the intent and the handle, as 0.4.49 does. Replacing this replay is a follow-up.
+// macOS and Linux only (Windows records no teardown intent).
 #[cfg(unix)]
 #[test]
-fn an_interrupted_teardown_whose_owner_is_gone_settles_on_the_creation_record() {
+fn an_interrupted_teardown_keeps_the_replay_of_0_4_49() {
     type Lose = fn(&std::path::Path);
-    let rows: [(&str, Lose); 2] = [
+    type Terminal = fn(&Fixture);
+    let owners: [(&str, Lose); 2] = [
         ("owner record gone", |path| fs::remove_file(path).unwrap()),
         ("owner record unreadable", |path| {
             fs::remove_file(path).unwrap();
             fs::create_dir(path).unwrap();
         }),
     ];
-    for (label, lose) in rows {
+    let terminals: [(&str, Terminal); 2] = [
+        ("terminal absent", Fixture::remove),
+        ("terminal finished", Fixture::finish),
+    ];
+    for ((owner_label, lose), (terminal_label, terminal)) in owners
+        .into_iter()
+        .flat_map(|owner| terminals.map(|terminal| (owner, terminal)))
+    {
+        let label = format!("{owner_label}, {terminal_label}");
         let fixture = Fixture::new("ready", &complete_owner());
-        fixture.remove();
+        terminal(&fixture);
         let store = fixture.store();
         let surface = store.terminal().unwrap();
         // The state the interrupted teardown left: its intent, naming the owner it attested.
@@ -2345,23 +2430,26 @@ fn an_interrupted_teardown_whose_owner_is_gone_settles_on_the_creation_record() 
         )
         .unwrap();
         lose(store.record(CoreRecord::Owner).path());
+        let intent = store
+            .record(CoreRecord::TerminalCloseIntent)
+            .bytes()
+            .unwrap();
         fixture.core.clear_calls();
-        assert_eq!(
-            fixture.close(exited, false).map_err(|e| error_text(&e)),
-            Ok(CloseOutcome::Missing),
-            "{label}"
-        );
+        assert!(fixture.close(exited, false).is_err(), "{label}");
         assert!(
-            fixture
-                .core
-                .methods()
-                .iter()
-                .any(|method| method == "terminal.get"),
-            "{label}: the absence is confirmed on the core: {:?}",
+            fixture.core.methods().is_empty(),
+            "{label}: the intent is validated before any core is asked: {:?}",
             fixture.core.methods()
         );
-        assert_eq!(fixture.mutations(), (0, 0), "{label}");
-        fixture.assert_closed(label);
+        assert_eq!(
+            store
+                .record(CoreRecord::TerminalCloseIntent)
+                .bytes()
+                .unwrap(),
+            intent,
+            "{label}: the intent is kept"
+        );
+        fixture.assert_retained(&label, SessionState::Ready);
     }
 }
 
@@ -2459,8 +2547,9 @@ fn a_refusal_keeps_why_no_live_owner_was_verified() {
         text.contains("TAB could not verify a live owner for this session"),
         "{text}"
     );
-    assert!(
-        text.contains("its owner record could not be read"),
+    assert_eq!(
+        text.matches("its owner record could not be read").count(),
+        1,
         "{text}"
     );
     assert_eq!(fixture.mutations(), (0, 0));

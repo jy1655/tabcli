@@ -194,9 +194,12 @@ pub(in crate::native) struct OwnerObservers<'a> {
 
 /// Whether the decoded record carries another platform's fields anywhere in it, nested ones
 /// included, beside this platform's own or instead of them. Such a record contradicts itself,
-/// whatever this platform's attestation answers about the fields it reads. Every field of the
-/// record and of its nested identities is named below, so a field added later must be placed
-/// here before the crate builds again.
+/// whatever this platform's attestation answers about the fields it reads. Three types are
+/// destructured below without `..`: `NativeSessionOwner`, `TerminalShellIdentity` and
+/// `MacTerminalAppIdentity`, so a field added to any of them must be placed here before the
+/// crate builds again. `LinuxBirth` and `WindowsProcessIdentity` are checked by presence only
+/// (each belongs to one platform whatever it holds); a field added to either needs no change
+/// here, and the compiler does not ask for one.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn record_conflicts(owner: &NativeSessionOwner) -> bool {
     use crate::native::terminal::ownership::{MacTerminalAppIdentity, TerminalShellIdentity};

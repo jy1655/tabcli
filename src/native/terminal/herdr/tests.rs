@@ -40,6 +40,8 @@ enum Injected {
     Instead(CallError),
     /// The core acts, then the reply is lost with this error.
     After(CallError),
+    /// The core acts and answers as usual: lets an earlier call of the method through.
+    Pass,
 }
 
 #[derive(Default)]
@@ -233,7 +235,7 @@ impl Connection for FakeConnection {
         let unanswered = match injected {
             Some(Injected::Instead(error)) => return Err(error),
             Some(Injected::After(error)) => Some(error),
-            None => None,
+            Some(Injected::Pass) | None => None,
         };
         let result = self.act(method, &params);
         if result.is_ok() {

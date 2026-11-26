@@ -702,26 +702,29 @@ fn close_created(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     let admitted = authority::admit(evidence)?;
-    close_remaining(deadline)?;
-    // A refusal of the first read (a terminal set to keep, another terminal, an unreachable
-    // core) keeps why no live owner was verified, as the later reads' refusals in `grant` do.
-    let Some((recorded, mut linked)) =
-        Recorded::open(core, session, Requirement::Created(directory), deadline)
-            .map_err(|error| admitted.explain(error))?
-    else {
-        return Ok(CloseOutcome::Missing);
-    };
-    close_remaining(deadline)?;
-    end_and_remove(
-        core,
-        &mut linked,
-        &session.id,
-        deadline,
-        &Basis::Created {
-            recorded: &recorded,
-            admitted,
-        },
-    )
+    // Every refusal of the admitted operation, from the handle's own checks and the first read
+    // to the confirming read after a removal, keeps why no live owner was verified: it is
+    // attached here once.
+    (|| {
+        close_remaining(deadline)?;
+        let Some((recorded, mut linked)) =
+            Recorded::open(core, session, Requirement::Created(directory), deadline)?
+        else {
+            return Ok(CloseOutcome::Missing);
+        };
+        close_remaining(deadline)?;
+        end_and_remove(
+            core,
+            &mut linked,
+            &session.id,
+            deadline,
+            &Basis::Created {
+                recorded: &recorded,
+                admitted: &admitted,
+            },
+        )
+    })()
+    .map_err(|error| admitted.explain(error))
 }
 
 fn surface_present(
