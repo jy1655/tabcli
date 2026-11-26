@@ -36,7 +36,10 @@
   close and already-ended servers send no further signal. Pane hangup can take a few seconds
   to end owner/provider processes after close returns.
 - Read owner identity from procfs: boot id plus start ticks, process group, session,
-  controlling TTY and foreground group. A zombie retains its incarnation until reaped.
+  controlling TTY and foreground group. A zombie retains its incarnation until reaped. An
+  entry read while its reaper releases the task (state X, or process group and session -1)
+  is that incarnation gone, never a malformed entry (a real-tmux presence check once failed
+  on one, 2026-11-26).
 - Measure Linux provider commands before spawn: each argument or environment string including
   NUL fits `MAX_ARG_STRLEN` (32 pages, 131072 bytes on 4 KiB pages), and argv plus environment
   fits `ARG_MAX`. Refuse oversized commands with nothing sent, including Codex queue messages.

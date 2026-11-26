@@ -1,5 +1,6 @@
-//! procfs observation: only ENOENT/ESRCH at this PID's entry proves absence.
-//! A zombie retains its incarnation. Birth-only callers never need a controlling TTY.
+//! procfs observation: only ENOENT/ESRCH at this PID's entry, or the entry of a task its
+//! reaper is releasing, proves absence. A zombie retains its incarnation until it is reaped.
+//! Birth-only callers never need a controlling TTY.
 use super::super::{LinuxBirth, ownership::NativeProcessIdentity};
 use anyhow::{Context, Result, bail};
 use std::{fs, path::Path};
@@ -16,7 +17,13 @@ struct Stat {
 }
 // The comm field is raw bytes cut at 15 bytes, so it can hold ')', newlines, and a split
 // UTF-8 sequence; only the PID before it and the fields after its last ')' are text.
-fn parse_stat(bytes: &[u8], pid: u32) -> Result<Stat> {
+//
+// `None` is a task its reaper is releasing. The kernel's `do_task_stat` (fs/proc/array.c)
+// shows state X (EXIT_DEAD) once the reaper has collected the task, and once the task's
+// signal state is released it cannot read the process group and session and prints their
+// initial -1. A read that took the task just before its PID was unhashed can show either.
+// That process is reaped, which ENOENT reports a moment later; it is not a malformed entry.
+fn parse_stat(bytes: &[u8], pid: u32) -> Result<Option<Stat>> {
     let close = bytes
         .iter()
         .rposition(|byte| *byte == b')')
@@ -26,7 +33,13 @@ fn parse_stat(bytes: &[u8], pid: u32) -> Result<Stat> {
         .position(|pair| pair == b" (")
         .context("procfs stat has no comm")?;
     let number = std::str::from_utf8(&bytes[..open]).context("procfs stat PID is not text")?;
-    anyhow::ensure!(number.parse::<u32>()? == pid, "procfs returned another PID");
+    anyhow::ensure!(
+        number
+            .parse::<u32>()
+            .with_context(|| format!("procfs stat has an invalid PID {number:?}"))?
+            == pid,
+        "procfs returned another PID"
+    );
     // tail starts at field 3 (state).
     let tail =
         std::str::from_utf8(&bytes[close + 1..]).context("procfs stat fields are not text")?;
@@ -35,19 +48,32 @@ fn parse_stat(bytes: &[u8], pid: u32) -> Result<Stat> {
         fields.len() >= 20 && fields[0].len() == 1,
         "incomplete procfs stat"
     );
-    let tty = fields[4].parse::<i32>()? as u32;
+    fn field<T: std::str::FromStr>(fields: &[&str], index: usize, name: &str) -> Result<T>
+    where
+        T::Err: std::error::Error + Send + Sync + 'static,
+    {
+        fields[index]
+            .parse()
+            .with_context(|| format!("procfs stat has an invalid {name} {:?}", fields[index]))
+    }
+    let group: i64 = field(&fields, 2, "process group")?;
+    let session: i64 = field(&fields, 3, "session")?;
+    if fields[0] == "X" || group < 0 || session < 0 {
+        return Ok(None);
+    }
+    let tty = field::<i32>(&fields, 4, "terminal")? as u32;
     // Linux new_decode_dev: never compare tty_nr's raw encoding to st_rdev.
     let major = (tty >> 8) & 0xfff;
     let minor = (tty & 0xff) | ((tty >> 12) & 0xfff00);
-    Ok(Stat {
+    Ok(Some(Stat {
         pid,
-        parent: fields[1].parse()?,
-        group: fields[2].parse()?,
-        session: fields[3].parse()?,
+        parent: field(&fields, 1, "parent")?,
+        group: u32::try_from(group).context("procfs stat has an invalid process group")?,
+        session: u32::try_from(session).context("procfs stat has an invalid session")?,
         tty: libc::makedev(major, minor),
-        foreground: fields[5].parse()?,
-        ticks: fields[19].parse()?,
-    })
+        foreground: field(&fields, 5, "terminal process group")?,
+        ticks: field(&fields, 19, "start time")?,
+    }))
 }
 fn read_stat(pid: u32) -> Result<Option<Stat>> {
     read_stat_with(pid, || fs::read(format!("/proc/{pid}/stat")))
@@ -65,7 +91,7 @@ fn read_stat_with(
         "Linux PID is out of range"
     );
     match read_pid_entry() {
-        Ok(text) => parse_stat(&text, pid).map(Some),
+        Ok(text) => parse_stat(&text, pid),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to inspect procfs process {pid}")),
     }
@@ -173,8 +199,9 @@ mod tests {
         fields[4] = "34817";
         fields[5] = "8";
         fields[19] = "123";
-        let stat =
-            parse_stat(format!("42 (a )\n b)) {}", fields.join(" ")).as_bytes(), 42).unwrap();
+        let stat = parse_stat(format!("42 (a )\n b)) {}", fields.join(" ")).as_bytes(), 42)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (stat.parent, stat.group, stat.session, stat.foreground),
             (7, 8, 9, 8)
@@ -186,7 +213,38 @@ mod tests {
         // A comm cut inside a multibyte character is still this process's entry.
         let mut cut = b"42 (a\xea\xb0\x80\xeb) ".to_vec();
         cut.extend_from_slice(fields.join(" ").as_bytes());
-        assert_eq!(parse_stat(&cut, 42).unwrap().ticks, 123);
+        assert_eq!(parse_stat(&cut, 42).unwrap().unwrap().ticks, 123);
+    }
+    // The real-tmux test once read its ended server's entry while the reaper released it
+    // (Ubuntu runner, 2026-11-26) and presence failed with "invalid digit found in string"
+    // instead of reporting the server gone. These are that entry's forms (fs/proc/array.c).
+    #[test]
+    fn a_task_its_reaper_is_releasing_is_absent_not_malformed() {
+        let entry = |state: &str, group: &str, session: &str| {
+            format!(
+                "42 (tmux: server) {state} 0 {group} {session} 0 -1 4210764 312 0 0 0 1 0 0 0 20 0 0 0 123456 0 0"
+            )
+            .into_bytes()
+        };
+        // Collected (EXIT_DEAD) with its signal state released, then before that release.
+        for released in [entry("X", "-1", "-1"), entry("X", "42", "42")] {
+            assert!(read_stat_with(42, || Ok(released)).unwrap().is_none());
+        }
+        // Once the signal state is gone the kernel prints -1 whatever state it shows.
+        assert!(
+            read_stat_with(42, || Ok(entry("Z", "-1", "-1")))
+                .unwrap()
+                .is_none()
+        );
+        // A zombie keeps its incarnation until it is reaped.
+        let zombie = read_stat_with(42, || Ok(entry("Z", "42", "42"))).unwrap();
+        assert_eq!(zombie.map(|stat| stat.ticks), Some(123456));
+        // A field that is not a number is still a malformed entry, and names that field.
+        let error = read_stat_with(42, || Ok(entry("S", "4x", "42"))).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "procfs stat has an invalid process group \"4x\": invalid digit found in string"
+        );
     }
     #[test]
     fn only_pid_entry_enoent_or_esrch_is_absence() {
