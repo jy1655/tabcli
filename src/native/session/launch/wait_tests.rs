@@ -418,6 +418,17 @@ fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe
         assert_eq!(read(&store).unwrap().unwrap().phase, Phase::Pending);
         assert_eq!(store.terminal().unwrap(), surface);
         assert!(core.holds_launch());
+        // `close-session` then removes the finished terminal and closes the session.
+        let id = store.directory().file_name().unwrap().to_str().unwrap();
+        crate::native::close::close_session_surface(
+            store.directory(),
+            id,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap();
+        assert!(!core.holds_launch());
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
     }
 }
 
