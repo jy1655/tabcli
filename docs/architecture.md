@@ -733,8 +733,8 @@ transport's stream is private to it in production builds (a source scan checks t
 names; `docs/agents/herdr.md` states what this covers and what it does not). On the creation
 record it admits only an explicit `CloseCause` and requires the creation record in the
 handle; a close with a live attested owner, the cleanup after a refused reopen included, keeps
-its own proof. It removes a finished terminal whatever the owner record says and never ends a
-running one (the owner's decision of 2026-11-26). On macOS and
+its own proof. On the creation record it removes a finished terminal whatever the owner record
+says and never ends a running one (the owner's decision of 2026-11-26). On macOS and
 Linux, Repair also preserves an intent or another Surface that can outlive its owner. Their
 ordinary dead-owner branch keeps requiring an exited, bound owner with complete control,
 apart from two earlier routes. A Linux tmux server is closed by its creation-time incarnation

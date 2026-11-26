@@ -129,9 +129,13 @@
     unchanged. In every other case the close on the creation record applies: a record that
     cannot be read, none, a damaged, contradictory, unbound or another session's one (whose
     process is not inspected), a process that cannot be inspected, a PID-only record of a live
-    process, a gone owner, a failed start. Nothing about the owner refuses a finished or absent
-    terminal; a read or inspection failure only explains, in the refusal of a running terminal,
-    why no live owner was verified.
+    process, a gone owner, a failed start, and on macOS and Linux an owner whose control read
+    found its process gone after its birth read matched (`ControlAttestation::Exited`). A record
+    contradicts itself when anything in it, nested identities included (a Terminal.app
+    incarnation, a shell's birth), belongs to another platform; `record_conflicts` names every
+    field. On the creation record nothing about the owner refuses a finished or absent
+    terminal; a read or inspection failure only explains, beside each refusal's own recovery
+    instructions, why no live owner was verified.
   - Only `close-session --explicit`, and the sessions it lists with `--with-started-from`, act on
     the creation record. On that path the cleanup after a refused reopen (`CloseCause::Cleanup`)
     is refused before the core is asked, a failed start included. With a verified live owner of
@@ -139,21 +143,22 @@
   - The creation record proves the terminal and nothing else does: the recorded core, address,
     creation time, program PID, the exact session directory in the argv and the launch label,
     from a handle whose own record is whole before even `not_found` settles it. A record is
-    whole exactly when a released writer on this platform (0.4.45 to 0.4.49) could have written
-    it, derived from those writers: a host PID that the platform's process reader reports (1 to
-    `i32::MAX` on macOS and Linux, any nonzero PID on Windows); a host birth of the platform's
-    own kind with values its writers record (macOS microseconds below a second; a Linux boot id
-    that is not all zero and any start tick, zero included; any Windows creation time); and a
-    launch label of exactly 32 lowercase hexadecimal digits, which every generator wrote. Every
-    Windows writer saved the label. The macOS and Linux writers of 0.4.45 and 0.4.46 omitted the
-    field and never wrote `null`, so an explicit `null` is refused. A finished terminal is then
-    removed and an absent one settled whatever the owner record says, including one that names
-    a live process of another session or a recycled PID. The state of the owner record never
-    strands a session. The check stops there by decision: it does not examine the shared
-    decoder's aliases, unknown fields or case normalization. This path never ends a running
-    terminal and removes only a terminal the verified core identifies, so settling an oddly
-    spelled handle on `not_found` can at worst leave a terminal the core still lists, while
-    refusing it would strand the session, which this rule exists to end.
+    whole when its decoded values pass three checks, each derived from the released writers
+    (0.4.45 to 0.4.49): a host PID that the platform's process reader reports (1 to `i32::MAX`
+    on macOS and Linux, any nonzero PID on Windows); a host birth of the platform's own kind
+    with values its writers record (macOS microseconds below a second; a Linux boot id that is
+    not all zero and any start tick, zero included; any Windows creation time); and a launch
+    label of exactly 32 lowercase hexadecimal digits, which every generator wrote. Every
+    Windows writer saved the label. The macOS and Linux writers of 0.4.45 and 0.4.46 omitted
+    the field and never wrote `null`, so an explicit `null` is refused. A finished terminal is
+    then removed and an absent one settled whatever the owner record says, including one that
+    names a live process of another session or a recycled PID. On this path the state of the
+    owner record never strands a session. The check stops there by decision: it does not
+    examine the wire spelling (the shared decoder's aliases, unknown fields or case
+    normalization), so a handle no released writer spelled that way can pass it. This path
+    never ends a running terminal and removes only a terminal the verified core identifies, so
+    settling an oddly spelled handle on `not_found` can at worst leave a terminal the core still
+    lists, while refusing it would strand the session, which this rule exists to end.
   - A close on the creation record never ends a running terminal, whatever is known about the
     session's owner (the owner's decision of 2026-11-26, which replaced the kill on positive
     evidence of the owner's death). `grant` refuses: the terminal on the recorded core (its id)
@@ -172,8 +177,9 @@
     (both on Windows as well), and, on macOS and Linux, a close resumed from the close intent of
     an interrupted close whose owner had since died. On Windows, Repair (run by listing
     sessions, `tell` and an attached `ask` or `tell`) also closed a gone owner's terminal,
-    running or not. All of those now leave a running terminal for the person, and a finished or
-    absent one is removed or settled whatever the owner record says.
+    running or not. All of those now leave a running terminal for the person, and when no live
+    owner is verified a finished or absent one is removed or settled whatever the owner record
+    says.
   - The closed record keeps the stored diagnosis, read under the lifecycle lock, when this close
     acts on the creation record. Without one, an owner record bound to this session whose
     process the OS reports gone records `native session process <pid> is no longer running`, as
@@ -191,13 +197,15 @@
 
   | Owner record and attestation | Running terminal | Finished | Absent |
   | --- | --- | --- | --- |
-  | Bound, no other platform's fields, attested live incarnation (close with a live owner) | ended and removed | refused: the ownership proof needs a running terminal | Windows: refused (the proof fails before the adapter close); macOS and Linux: proven absence leads to the live owner's teardown, under its own checks |
-  | Every other case: unreadable, none, damaged, contradictory, unbound, another session's, uninspectable process, PID-only live, gone | refused, nothing sent, handle kept | removed | settled |
+  | Bound, no other platform's fields anywhere in it, attested live incarnation (close with a live owner) | ended and removed when the full ownership proof succeeds; refused otherwise (for example a record with a matching birth but no TTY or process-group fields on macOS and Linux) | refused: the ownership proof needs a running terminal | Windows: refused (the proof fails before the adapter close); macOS and Linux: proven absence leads to the live owner's teardown, under its own checks |
+  | Every other case: unreadable, none, damaged, contradictory, unbound, another session's, uninspectable process, exited between the two reads, PID-only live, gone | refused, nothing sent, handle kept | removed | settled |
 
   On the creation record, the cleanup after a refused reopen refuses every column before the
   core is asked; a whole creation record and the terminal's verified identity are required for
-  every removal and settlement. A teardown intent left by an interrupted owner teardown keeps
-  its own rule on macOS and Linux.
+  every removal and settlement. On macOS and Linux a teardown intent left by an interrupted
+  owner teardown keeps its own route while it validates; when the owner it names can no longer
+  be established (its record gone, unreadable or not a record), the close takes the creation
+  record, which confirms absence on the core.
 
   Handles created by 0.4.45 and 0.4.46 on macOS and Linux omit the nonce. For those, the
   terminal's launch label must be 32 lowercase hexadecimal digits and agree with the terminal's

@@ -172,9 +172,12 @@ If the original program ends outside TAB with keep off, run
 `tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
 finished terminal and closes the session record. TAB first proves from its own record of the
 terminal's creation (core, address, creation time, program, session directory and launch
-label) that it is this session's terminal. A finished or removed terminal is then cleaned up
-whatever the session's owner record says, including an owner whose process ID now belongs to
-another process. When TAB cannot verify a live owner for the session, it never ends a terminal
+label) that it is this session's terminal. When TAB cannot verify a live owner for the session,
+a finished or removed terminal is then cleaned up whatever the session's owner record says,
+including an owner whose process ID now belongs to another process. With a verified live owner
+the close needs its full ownership proof instead, which a finished terminal fails, as does an
+absent one on Windows (on macOS and Linux the owner's own teardown can follow). When TAB cannot
+verify a live owner for the session, it never ends a terminal
 that still runs: the close keeps the session, sends nothing and says so, naming the recorded
 core and the `hc` commands for its endpoint, and, when the owner record or its process could
 not be read, why. Wait for the terminal to finish, or end it there with `hc kill <address>`
@@ -193,8 +196,8 @@ as well), and, on macOS and Linux, a close resumed after an interrupted close wh
 since died. On Windows, listing sessions, `tell` or an attached `ask` or `tell` also removed a
 gone owner's terminal, ending it if it still ran. In all of those cases TAB now keeps a running
 terminal: end it as described below, or wait for it to finish, then run
-`tabcli close-session <session> --explicit` again. A finished or absent terminal is now removed
-or settled whatever the owner record says.
+`tabcli close-session <session> --explicit` again. When no live owner is verified, a finished
+or absent terminal is now removed or settled whatever the owner record says.
 
 To act on the terminal yourself, first run `tabcli doctor <session> --probe`; without
 `--probe` doctor asks no core. Its `terminal_surface` check connects to the recorded socket and
@@ -220,9 +223,11 @@ session's directory, whose last part is the session ID. When TAB refused the mat
 that this is the session's terminal is yours. Once you are sure, end it with `hc kill
 <address>` and remove it with `hc rm <address>`, both in the same form. Refusals that name an hc
 command, such as turning keep off, already use that form. The next close then finds the
-terminal gone and closes the session record, provided the handle itself is whole: a handle is
-whole exactly when a released TAB could have written it on this platform. A close refuses any
-other handle before it asks any core: one with no usable terminal address or core, a host PID
+terminal gone and closes the session record, provided the handle itself is whole: its host
+PID, host birth and launch label pass checks derived from what released TAB versions wrote on
+this platform (its wire spelling is not examined, since that close ends nothing and removes only
+a terminal the recorded core identifies). A close refuses any other handle before it asks any
+core: one with no usable terminal address or core, a host PID
 this platform's process reader never reports, a host birth no TAB writer on this platform
 records, or a launch label that is not 32 lowercase hexadecimal digits (an explicit `null`
 included; on Windows, also none). The error names the field and retains the handle, and ending
