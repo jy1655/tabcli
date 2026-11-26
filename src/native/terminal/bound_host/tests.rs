@@ -95,6 +95,8 @@ fn direct_handoff_logs_a_directory_admission_refusal() {
     for kind in [TerminalKind::Herdr, TerminalKind::Tmux] {
         let directory = root.path().join(format!("session-{}", kind.as_str()));
         fs::create_dir(&directory).unwrap();
+        // The launch log the launcher created when the launch began.
+        fs::write(directory.join(launch::LOG), b"1 launch_pending\n").unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
         let error = run_handoff_with(
             &directory,
@@ -557,6 +559,7 @@ fn the_macos_capture_host_logs_its_admission_refusal() {
     ] {
         let directory = temp.path().join(format!("session-{}", kind.as_str()));
         fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(launch::LOG), b"1 launch_pending\n").unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
         let error =
             super::super::macos::launch_host::run(&directory, "never run", kind).unwrap_err();
@@ -616,4 +619,87 @@ fn a_refused_link_is_never_written_through() {
     #[cfg(target_os = "macos")]
     super::super::macos::launch_host::run(&link, "never run", TerminalKind::Herdr).unwrap_err();
     assert!(!target.join(launch::LOG).exists());
+}
+
+// A host writes its admission refusal only into the launch log that the launcher created,
+// opened without following a link, without blocking and without creating it, and only when
+// the opened file is a regular file in the directory the host just checked. Otherwise it
+// writes nothing: no log is created, no link is followed and a FIFO does not block it.
+#[cfg(unix)]
+#[test]
+fn a_host_refusal_line_goes_only_into_the_launch_log_the_launcher_created() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside.log");
+    fs::write(&outside, b"outside\n").unwrap();
+    for (case, kind) in [
+        ("missing", TerminalKind::Herdr),
+        ("link", TerminalKind::Tmux),
+        ("fifo", TerminalKind::Herdr),
+    ] {
+        let directory = temp.path().join(format!("session-{case}"));
+        fs::create_dir(&directory).unwrap();
+        let log = directory.join(launch::LOG);
+        match case {
+            "link" => std::os::unix::fs::symlink(&outside, &log).unwrap(),
+            "fifo" => {
+                let path = std::ffi::CString::new(log.to_str().unwrap()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+            _ => {}
+        }
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let path = directory.clone();
+        std::thread::spawn(move || {
+            let refused = run_handoff_with(
+                &path,
+                kind,
+                &mut SystemClock,
+                |_| panic!("admission refused"),
+                || panic!("admission refused"),
+                || -> Result<()> { panic!("admission refused") },
+                || panic!("admission refused"),
+            )
+            .is_err();
+            let _ = done.send(refused);
+        });
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the host blocked on its launch log"),
+            "{case}"
+        );
+        match case {
+            "missing" => assert!(!log.exists(), "{case}"),
+            "fifo" => assert!(
+                std::os::unix::fs::FileTypeExt::is_fifo(&log.metadata().unwrap().file_type()),
+                "{case}"
+            ),
+            _ => {}
+        }
+        assert_eq!(fs::read(&outside).unwrap(), b"outside\n", "{case}");
+    }
+}
+
+// The launch host is given its session directory as text. A path that cannot be sent as text
+// exactly is refused by the launcher's admission before any Surface exists: the host would
+// look for another directory.
+#[cfg(unix)]
+#[test]
+fn a_session_directory_that_cannot_be_sent_as_text_is_refused_before_any_surface() {
+    use std::os::unix::ffi::OsStrExt;
+    let directory = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/state-\xff/session-text"));
+    let refusal = refuse_before_launch(directory, TerminalKind::Herdr).unwrap_err();
+    assert!(
+        refusal
+            .downcast_ref::<super::super::RefusedDirectory>()
+            .is_some()
+    );
+    assert_eq!(
+        format!("{refusal:#}"),
+        format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not Unicode text, which is how the launch host is given it",
+            directory.display()
+        )
+    );
 }

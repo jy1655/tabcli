@@ -1145,11 +1145,16 @@ fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
             prepared.created.id
         ))
         .unwrap_or_else(|| panic!("{text}"));
+    // Permission bits that let another account in are judged before the core is reached on
+    // macOS and Linux; a Windows access rule is judged on the core's connection, for the
+    // core's account, because who may change a directory depends on whose it is.
+    let refusal = format!(
+        "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
+        directory.display()
+    );
     assert!(
-        cause.starts_with(&format!(
-            "the Herdr terminal was not created: the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
-            directory.display()
-        )),
+        cause.starts_with(&refusal)
+            || cause.starts_with(&format!("the Herdr terminal was not created: {refusal}")),
         "{cause}"
     );
     let store = Store::open_unchecked(directory);
@@ -1188,6 +1193,52 @@ fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
         std::slice::from_ref(&prepared.created.id)
     );
     assert!(!directory.exists());
+}
+
+// A Herdr start whose session directory any account would refuse fails with that refusal
+// even when no core answers: the facts that need no account are judged before the core is
+// reached, so the refusal is a known refusal before any Surface, not a core failure.
+#[cfg(unix)]
+#[test]
+fn a_herdr_directory_refusal_needs_no_core() {
+    let absent = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new();
+    fixture.receipt_directory = false;
+    fixture.terminal_kind = terminal::TerminalKind::Herdr;
+    fixture.provider = FirstPartyCli::Pi;
+    let prepared = fixture.prepare().unwrap();
+    let directory = &prepared.created.directory;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o770)).unwrap();
+    }
+    let saved = ["HC_SOCKET", "HC_TERMINAL_ID"].map(|name| (name, std::env::var_os(name)));
+    // SAFETY: the test harness runs serially (`--test-threads=1`); the values are restored
+    // right after the start.
+    unsafe {
+        std::env::set_var("HC_SOCKET", absent.path().join("core.sock"));
+        std::env::remove_var("HC_TERMINAL_ID");
+    }
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(&prepared, &FreshSource)
+    }));
+    for (name, value) in saved {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+    let (error, report) = started.unwrap();
+    let text = format!("{error:#}");
+    assert_eq!(
+        text,
+        format!(
+            "failed to open Herdr surface for session {}: the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user",
+            prepared.created.id,
+            directory.display()
+        )
+    );
+    assert_settled_before_fence(&fixture, &prepared, &report);
 }
 
 // A launch failure whose Claim the launcher already fenced belongs to the launcher's own

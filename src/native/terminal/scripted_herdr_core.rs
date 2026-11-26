@@ -311,3 +311,16 @@ impl Drop for ScriptedHerdrCore {
         }
     }
 }
+
+// A call that panics leaves the variables as they were for the tests that follow.
+#[test]
+fn reached_by_restores_the_environment_when_its_call_panics() {
+    let core = ScriptedHerdrCore::start();
+    let names = ["HC_SOCKET", "HC_TERMINAL_ID"];
+    let before = names.map(std::env::var_os);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        core.reached_by(|| panic!("the scripted call failed"))
+    }));
+    assert!(result.is_err());
+    assert_eq!(names.map(std::env::var_os), before);
+}
