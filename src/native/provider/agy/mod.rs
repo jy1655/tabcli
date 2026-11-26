@@ -528,17 +528,17 @@ fn prepare_launch_for_platform(
 // session-only settings.
 const APPLIED_MARKER: &str = "agy-settings-override";
 
-// Agy's `--settings` takes "a JSON object of settings.json keys, inline or as a file path",
+// Agy's `--settings` takes "a JSON object of" its settings keys, "inline or as a file path",
 // for that process only and never saved. TAB passes a private file in the session directory:
 // the workspace path then needs no quoting through a Windows command shim, and the argument is
 // a path like the log file's. Agy 1.5.17 is the only version measured (2026-11-26, macOS): with
 // the exact canonical folder in `trustedWorkspaces` it showed no trust dialog, logged the
-// workspace customization load off the main goroutine and left its own settings.json
+// workspace customization load off the main goroutine and left its own trust store
 // unchanged. The 1.5.8 changelog already names `--settings`, but whether earlier releases honour
 // `trustedWorkspaces` there was not measured, and an Agy without the option fails on it, so
 // an earlier version is launched as before. Lower this floor only with a measurement, and
 // delete the file when Agy offers a trust option of its own.
-const SESSION_SETTINGS_FILE: &str = "agy-settings.json";
+const SESSION_SETTINGS_FILE: &str = "agy-session-trust.json";
 const SESSION_SETTINGS_FLOOR: semver::Version = semver::Version::new(1, 5, 17);
 
 // Whether the Agy version this session recorded at launch takes the session-only trust setting.

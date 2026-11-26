@@ -56,6 +56,8 @@
     "const AGY_MODEL_LABEL_PREFIXES: [&str; 3] = [\"Gemini \", \"Claude \", \"GPT-\"];": 1,
     "const AGY_LOG_FILE: &str = \"agy.log\";": 1,
     "agy.log": 1,
+    "const APPLIED_MARKER: &str = \"agy-settings-override\";": 1,
+    "const SESSION_SETTINGS_FILE: &str = \"agy-session-trust.json\";": 1,
     "transcript.jsonl": 1,
     "transcript_full.jsonl": 1,
     "const HOOKS_LOADED_SOURCE: &str = \"hooks_manager.go\";": 1,

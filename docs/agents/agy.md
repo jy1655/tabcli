@@ -17,7 +17,7 @@
 - With verified consent (exact or inherited, see the Trust Store Boundary) and a recorded
   Agy version of at least 1.5.17, the launch hands Agy the exact workspace through its own
   `--settings` ("Settings for this session only, never saved"): a private
-  `agy-settings.json` in the session directory holding `{"trustedWorkspaces":[<native
+  `agy-session-trust.json` in the session directory holding `{"trustedWorkspaces":[<native
   key>]}`, then the applied marker `agy-settings-override`. A file, not inline JSON, so
   that no quote reaches a Windows command shim; the argument is a path like `--log-file`.
   No key is sent and no store is written, so every Surface on every OS takes it. Measured

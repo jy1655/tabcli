@@ -18,7 +18,7 @@ use std::time::Instant;
 
 const TRUST_SESSION_UNVERIFIED: &str = "Agy's trust store lists the workspace, but this session's agy.log does not show that this session loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so its own trust dialog may still be open";
 
-pub(super) const TRUST_SETTING_UNVERIFIED: &str = "This session was launched with Agy's session-only setting that trusts the exact workspace, but its agy.log does not show that it loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so Agy may not have taken the setting and its trust dialog may be open";
+pub(super) const TRUST_SETTING_UNVERIFIED: &str = "This session was launched with Agy's session-only setting that trusts the exact workspace, but this session's own log does not show that it loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so Agy may not have taken the setting and its trust dialog may be open";
 
 pub(super) fn workspace_customizations_loaded(log: &[u8]) -> bool {
     complete_log_lines(log).any(|line| {

@@ -49,7 +49,7 @@ pub(super) fn workspace_trust_check(
         Ok(None) if configured => (
             Available,
             Reason::AGY_WORKSPACE_TRUSTED,
-            "This session was launched with Agy's session-only setting that trusts this exact workspace (never saved to Agy's trust store), and its agy.log shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer.".to_owned(),
+            format!("This session was launched with Agy's session-only setting that trusts this exact workspace (never saved to Agy's trust store), and its {AGY_LOG_FILE} shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer."),
         ),
         Ok(None) => (
             Available,
@@ -64,7 +64,7 @@ pub(super) fn workspace_trust_check(
         Ok(Some(TRUST_SETTING_UNVERIFIED)) => (
             Unknown,
             Reason::AGY_SESSION_TRUST_UNVERIFIED,
-            format!("This session was launched with Agy's session-only setting that trusts this exact workspace, but its agy.log does not show that this session loaded the workspace customizations. Either Agy did not take the setting and shows its workspace-trust dialog, or the log is missing or no longer holds that line. {WITHHELD}"),
+            format!("This session was launched with Agy's session-only setting that trusts this exact workspace, but its {AGY_LOG_FILE} does not show that this session loaded the workspace customizations. Either Agy did not take the setting and shows its workspace-trust dialog, or the log is missing or no longer holds that line. {WITHHELD}"),
         ),
         Ok(Some(_)) => (
             Unknown,

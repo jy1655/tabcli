@@ -132,7 +132,7 @@ The code uses `HOME` first, then `USERPROFILE`, on both platforms. The override 
 entire root. `settings.json` in that root holds TAB's surface-creation preferences.
 
 Inside a session directory, these are the records most useful when checking a request. Some
-exist only during a turn or after close; `agy.log` and `agy-settings.json` are specific to Agy.
+exist only during a turn or after close; `agy.log` and `agy-session-trust.json` are specific to Agy.
 
 ```text
 session-example/
@@ -147,7 +147,7 @@ session-example/
 ├── requests/              Receipts connecting requests to results
 ├── events/                Recorded turn results
 ├── agy.log                Agy readiness, input receipts, and errors
-├── agy-settings.json      Agy's session-only trust of the workspace, when applied
+├── agy-session-trust.json Agy's session-only trust of the workspace, when applied
 └── closed.json            Recorded closed status
 ```
 
