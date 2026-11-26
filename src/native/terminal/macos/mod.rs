@@ -19,7 +19,7 @@ use anyhow::bail;
 
 use super::{
     CloseOutcome, DialogKey, GuardedDialogInput, OsTerminals, TerminalKind, TerminalSendFailure,
-    TerminalSendResult, TerminalSession, macos_selection::select_macos_host,
+    TerminalSendResult, TerminalSession, macos_selection::select_macos_terminal,
 };
 
 pub(super) use super::posix::PosixTerminalAdapter as MacTerminalAdapter;
@@ -41,6 +41,9 @@ pub(in crate::native) mod iterm2;
 pub(in crate::native) mod warp;
 pub(in crate::native) mod wezterm;
 
+// The terminal this Mac chooses, Herdr's environment aside (`terminal::select_for` applies
+// it the same way on every platform): inside hc, whose programs get `TERM_PROGRAM=ghostty`,
+// that is Ghostty.
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     // An explicit kind macOS does not run is refused before anything exists, naming the
     // kinds macOS runs, as Linux and Windows select. The automatic choice is unchanged.
@@ -51,9 +54,8 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     }
     let term_program = env::var("TERM_PROGRAM").ok();
     let term = env::var("TERM").ok();
-    Ok(select_macos_host(
+    Ok(select_macos_terminal(
         preferred,
-        env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
         term_program.as_deref(),
         term.as_deref(),
         env::var_os("ITERM_SESSION_ID").is_some(),

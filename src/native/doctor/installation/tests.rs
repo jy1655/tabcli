@@ -268,7 +268,7 @@ fn workspace_rows_follow_the_observed_kind() {
                 "workspace",
                 availability,
                 reason,
-                "Working directory observation; CLI version checks do not depend on this directory.",
+                "Working directory observation; CLI version checks do not depend on this directory, except the one that decides an automatic Herdr choice, which runs where doctor runs, as ask's does.",
                 "Restore or inspect the recorded directory before workspace-relative operations.",
                 json!({"path": workspace}),
             ),

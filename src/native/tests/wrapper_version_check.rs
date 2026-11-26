@@ -585,6 +585,9 @@ fn a_wrapper_settling_its_timeout_after_the_launchers_deadline_leaves_the_launch
     let error = launch::wait(
         &Store::open_unchecked(&session.directory),
         &surface,
+        &turn::current_claim_token(&Reader::open_unchecked(&session.directory))
+            .unwrap()
+            .unwrap(),
         Instant::now(),
     )
     .unwrap_err();

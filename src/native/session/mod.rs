@@ -57,6 +57,8 @@ pub(in crate::native) mod test_support {
     };
     #[cfg(windows)]
     pub(in crate::native) use super::primitives::close_io_test;
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(in crate::native) use super::primitives::with_sync_delay;
     pub(in crate::native) use super::primitives::{
         SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
         with_publication_read_log, with_sync_failure, with_sync_log, write_event,
@@ -82,6 +84,16 @@ pub(in crate::native) mod test_support {
 #[derive(Clone, Debug)]
 pub(in crate::native) struct Reader {
     directory: PathBuf,
+}
+
+/// What `Store::try_lock_existing` found.
+pub(in crate::native) enum ExistingLock {
+    /// The lifecycle lock, held until this is dropped.
+    Held(File),
+    /// Another holder has it.
+    Busy,
+    /// No regular file is at the lock's path.
+    Unavailable,
 }
 
 /// A writable view. Lifecycle convergence remains with the command in step one.
@@ -357,6 +369,39 @@ impl Store {
     }
     pub(in crate::native) fn try_lock(&self) -> Result<Option<TurnClaimLock>> {
         try_lock(&self.directory)
+    }
+    /// The lifecycle lock for a decision that changes nothing before it knows the directory is
+    /// its own (the launcher's early decisions): the existing lock file, opened for reading and
+    /// writing without creating or truncating it or changing its permissions (on macOS and
+    /// Linux without blocking, so that a special file cannot hold the open), accepted only when
+    /// the opened handle is a regular file, and locked exclusively in one attempt.
+    pub(in crate::native) fn try_lock_existing(&self) -> Result<ExistingLock> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = match options.open(self.directory.join(TURN_CLAIM_LOCK_FILE)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExistingLock::Unavailable);
+            }
+            Err(error) => return Err(error).context("failed to open native lifecycle lock"),
+        };
+        if !file
+            .metadata()
+            .context("failed to inspect native lifecycle lock")?
+            .is_file()
+        {
+            return Ok(ExistingLock::Unavailable);
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(ExistingLock::Held(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(ExistingLock::Busy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
     }
     #[cfg(test)]
     pub(in crate::native) fn write_status(&self, value: &SessionStatus) -> Result<()> {

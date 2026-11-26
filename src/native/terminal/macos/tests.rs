@@ -8,10 +8,16 @@ use crate::native::terminal;
 fn herdr_host_selection_precedes_its_ghostty_terminal_identity() {
     const CHILD: &str = "TABCLI_TEST_HERDR_SELECTION";
     if std::env::var_os(CHILD).is_some() {
-        assert_eq!(terminal::macos::select(None).unwrap().as_str(), "herdr");
+        // Herdr, and Ghostty, the identity hc gives, where Herdr is not admitted.
         assert_eq!(
-            terminal::macos::select(Some(terminal::TerminalKind::Iterm2)).unwrap(),
-            terminal::TerminalKind::Iterm2,
+            terminal::select_for(None).unwrap(),
+            terminal::Selection::Herdr {
+                fallback: terminal::TerminalKind::Ghostty
+            }
+        );
+        assert_eq!(
+            terminal::select_for(Some(terminal::TerminalKind::Iterm2)).unwrap(),
+            terminal::Selection::Kind(terminal::TerminalKind::Iterm2),
             "an explicit surface choice still wins inside Herdr"
         );
         return;

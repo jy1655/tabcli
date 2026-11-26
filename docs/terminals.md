@@ -58,19 +58,34 @@ which forgets the consumed terminal), it is an ordinary closed session. Closing 
 copy does not change the session on the system it came from, and closing that session there
 does not change the copy.
 
+Inside an hc terminal (`TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`, which hc gives
+every program) TAB chooses the same way on every OS unless `--terminal` says otherwise. It uses
+Herdr when the provider, at its installed version, can run there, and otherwise the terminal
+the OS chooses with the Herdr marker ignored: Ghostty on macOS (hc names it in
+`TERM_PROGRAM`), tmux on Linux and the managed console on Windows. Today that fallback applies
+to Codex below stable 0.169.0 on macOS and Linux, and to every Codex on Windows. Before it uses
+Herdr, TAB verifies that the command runs in that Herdr terminal on the running core, before
+it reads the workspace or the installed version, as 0.4.49 did. For Claude, Agy and Pi, whose
+version cannot change the choice, and for any `reopen`, failed verification refuses the launch
+at once instead of opening another terminal. For Codex the installed version decides: a
+version Herdr admits is refused with the verification's error, and an older one takes the
+fallback, where the verification does not matter. An explicit `--terminal herdr` that the provider cannot use is refused
+instead. The fallback terminal must be usable: a Mac without Ghostty, for example, fails when
+TAB opens it, as an explicit `--terminal ghostty` would. `tabcli doctor --provider <provider>
+--probe`, run from the directory you launch from, reports the terminal `ask` would choose and
+its fallback.
+
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
-with `--terminal tmux`. Automatic selection verifies a Herdr caller when both
-`TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID` are present. Failed verification
-refuses the launch. Otherwise Linux uses tmux.
+with `--terminal tmux`. Outside hc, Linux uses tmux.
 
 On Windows, `--terminal herdr` selects a running local Herdr Core. Codex is refused there before
 any session exists, because its Windows initial prompt needs the managed console. Inside an hc
-terminal the automatic choice is Herdr for Claude, Agy and Pi, verified like on Linux, and the
-managed console for Codex and for `reopen`.
+terminal the automatic choice is Herdr for Claude, Agy and Pi, and the managed console for
+Codex. A `reopen` of an eligible Claude session, the only provider that can reopen there, gets
+Herdr the same way.
 
-On macOS an explicit option wins. With `TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`,
-TAB selects Herdr and verifies the calling terminal before launch. Stale Herdr markers refuse
-the launch instead of opening Ghostty. Otherwise TAB examines `TERM_PROGRAM`, recognizing those
+On macOS an explicit option wins. Inside hc TAB chooses as described above. Otherwise TAB
+examines `TERM_PROGRAM`, recognizing those
 terminal families. An unrecognized value falls back to Terminal.app. Only when `TERM_PROGRAM` is
 absent does it check `TERM=xterm-ghostty`, then the presence of `ITERM_SESSION_ID`, then
 `TERM_SESSION_ID`; no match also falls back to Terminal.app. Detection selects an application, not
@@ -212,7 +227,9 @@ If the original program ends outside TAB with keep off, run
 `tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
 finished terminal and closes the session record.
 
-Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
+Codex requires stable 0.169.0 or newer here: `--terminal herdr` refuses an older Codex, and
+inside an hc terminal the automatic choice gives it Ghostty (macOS) or tmux (Linux) instead.
+Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
 follow-ups. Herdr's OSC status and `hc wait` are not TAB request-completion evidence.
 Agy and Pi use the addressed paste API, without forcing input past a blocked UI. A send that may
@@ -233,8 +250,18 @@ Install hc for Windows and open Herdr from the desktop, or run `hc server start`
 local named pipe, the one `hc` uses (`HC_SOCKET`, the `socket` setting, or
 `\\.\pipe\herdr-core-<user>-<session>.sock`), and only when the process serving it runs as
 your Windows user. An elevated core refuses an unelevated TAB. The session directory must
-be a real, private directory: a junction, or an access list that lets another account change
-its entries, refuses the launch.
+be a real directory owned by the core's account: a junction, another owner, or an access list
+that lets an account other than its owners, System and Administrators change its entries
+refuses the launch. The launch host runs as the core, so TAB checks the directory for the
+core's account before it creates the terminal and fails at once with the reason; when TAB's
+own token cannot read the directory's access list, it leaves the check to the host. An
+elevated TAB, such as an administrator's SSH session, normally gives the directory the
+Administrators group as owner, which the host of a core that is not elevated refuses: run TAB
+without elevation, as the core runs. A refusal only the host can know, such as a directory
+changed after TAB's check, goes to the launch log when the host can still write it; once the
+core reports the terminal finished, the start fails at TAB's next check of the terminal,
+normally about a second later, when TAB can read that the launch is still its own and pending,
+and its error names the launch log. `close-session` removes the finished terminal.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."
@@ -246,7 +273,8 @@ PowerShell 7 root that a managed console runs, so PowerShell 7 must be on the co
 Pi and Agy keep their Windows input rules (a one-line prompt, their startup checks and
 receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. Codex is refused:
 its Windows initial prompt is pasted and then submitted against the exact console screen, which
-Herdr cannot do, so use `--terminal windows-console` for it. The returned `attach_command` is a
+Herdr cannot do, so use `--terminal windows-console` for it; inside an hc terminal the automatic
+choice already gives it the managed console. The returned `attach_command` is a
 PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close ends the
 whole terminal. When a provider ends on its own, the next close or repair removes its finished
 terminal through the core; if the core cannot be reached, the session keeps its handle and a

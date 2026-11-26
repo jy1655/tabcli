@@ -68,6 +68,15 @@ impl WindowsTerminalAdapter for Recording {
         self.record("present");
         Ok(true)
     }
+    fn launch_surface(
+        &self,
+        _: &Path,
+        _: &TerminalSession,
+        _: Duration,
+    ) -> Result<crate::native::terminal::LaunchSurface> {
+        self.record("launch");
+        Ok(crate::native::terminal::LaunchSurface::Present)
+    }
 }
 
 fn input() -> GuardedDialogInput {
@@ -87,7 +96,7 @@ fn recording_dispatch() -> Dispatch<Recording, Recording> {
     Dispatch::new(Recording::default(), Recording::default())
 }
 
-/// Runs the seven operations on a handle of `kind`, in order, and returns each answer as
+/// Runs the eight operations on a handle of `kind`, in order, and returns each answer as
 /// text: `ok` or the refusal. An open passes the asked kind to its adapter and binds once.
 fn every_operation(adapters: &dyn Adapters, kind: TerminalKind) -> Vec<String> {
     let directory = Path::new("unused");
@@ -127,6 +136,7 @@ fn every_operation(adapters: &dyn Adapters, kind: TerminalKind) -> Vec<String> {
         answer(verify_surface(adapters, &session, None)),
         answer(close_session_until(adapters, directory, &session, deadline()).map(|_| ())),
         answer(surface_present(adapters, directory, &session, Duration::from_secs(1)).map(|_| ())),
+        answer(launch_surface(adapters, directory, &session, Duration::from_secs(1)).map(|_| ())),
     ]
 }
 
@@ -138,12 +148,12 @@ fn each_windows_kind_reaches_only_its_own_adapter() {
     let dispatch = recording_dispatch();
     assert_eq!(
         every_operation(&dispatch, TerminalKind::WindowsConsole),
-        ["ok"; 7]
+        ["ok"; 8]
     );
     assert_eq!(
         dispatch.console.calls(),
         [
-            "open", "send", "screen", "dialog", "verify", "close", "present"
+            "open", "send", "screen", "dialog", "verify", "close", "present", "launch"
         ]
     );
     assert!(dispatch.herdr.calls().is_empty());
@@ -154,15 +164,17 @@ fn each_windows_kind_reaches_only_its_own_adapter() {
         .expect("Herdr declares its guarded-input refusal");
     assert_eq!(
         every_operation(&dispatch, TerminalKind::Herdr),
-        ["ok", "ok", "ok", herdr_refusal, "ok", "ok", "ok"]
+        ["ok", "ok", "ok", herdr_refusal, "ok", "ok", "ok", "ok"]
     );
     assert_eq!(
         dispatch.herdr.calls(),
-        ["open", "send", "screen", "verify", "close", "present"]
+        [
+            "open", "send", "screen", "verify", "close", "present", "launch"
+        ]
     );
     assert_eq!(
         dispatch.console.calls().len(),
-        7,
+        8,
         "the console was not reached again"
     );
 }
@@ -206,6 +218,7 @@ fn every_other_kind_is_refused_by_the_lookup_before_any_adapter() {
                 refusal.clone(),
                 screen,
                 dialog,
+                refusal.clone(),
                 refusal.clone(),
                 refusal.clone(),
                 refusal.clone(),
@@ -401,13 +414,20 @@ mod herdr_core {
         fn current_pid(&self) -> u32 {
             unreachable!("no caller is verified without a core")
         }
-        fn parent_pid(&self, _: u32) -> Result<Option<u32>> {
+        fn parent_pid(&self, _: u32) -> Result<herdr::Parent> {
             unreachable!("no caller is verified without a core")
         }
         fn process_start(&self, _: u32) -> Result<Option<HerdrHostBirth>> {
             unreachable!("no program is read without a core")
         }
         fn launch_nonce(&self) -> Result<String> {
+            unreachable!("nothing is created without a core")
+        }
+        fn admit_launch_directory(
+            &self,
+            _: &Path,
+            _: Option<&crate::native::terminal::bound_host::HostAccount>,
+        ) -> Result<()> {
             unreachable!("nothing is created without a core")
         }
     }
@@ -481,6 +501,10 @@ mod herdr_core {
         errors.push(
             surface_present(&dispatch, &directory, &handle, Duration::from_secs(5)).unwrap_err(),
         );
+        // The launcher's probe: an unanswered core is neither absence nor an end.
+        errors.push(
+            launch_surface(&dispatch, &directory, &handle, Duration::from_secs(5)).unwrap_err(),
+        );
         for error in errors {
             assert!(format!("{error:#}").contains(UNANSWERED), "{error:#}");
         }
@@ -496,7 +520,7 @@ mod herdr_core {
 
         assert!(dispatch.console.calls().is_empty());
         let mut expected = vec![created_at];
-        expected.extend(vec![recorded; 5]);
+        expected.extend(vec![recorded; 6]);
         assert_eq!(*connects.borrow(), expected);
     }
 }

@@ -1,7 +1,9 @@
 # Current Linux Surface Boundary
 
 - Linux supports tmux and a running local [Herdr Core](herdr.md). Inside an hc terminal,
-  automatic selection verifies the caller on that core. Elsewhere it defaults to tmux.
+  automatic selection chooses Herdr, after verifying the caller on that core, where the
+  provider's version is admitted on Herdr, and tmux otherwise (the rule every OS shares).
+  Elsewhere it defaults to tmux.
   tmux requires version 3.2+ on an absolute PATH entry and uses its canonical path.
   WSL is not verified. The tmux server rules below apply only to tmux.
 - Selection (`linux/mod.rs`) refuses an explicit other kind for a new launch with
@@ -22,6 +24,12 @@
   just before `new-session`, with exactly one session and pane. Before every later operation,
   verify that recorded incarnation through a pidfd. Absence comes only from that incarnation
   being gone (exit, PID reuse, another boot); a live server whose socket refuses is an error.
+- Before tmux starts a server, the launcher reproduces the pane host's session-directory
+  admission for TAB's own account, which the server and its pane run as
+  (`bound_host::refuse_before_launch`); a refusal is a failure to open the Surface, and a read
+  that fails other than by absence leaves the directory to the host. Herdr's is judged before
+  the core is reached for what needs no account, and on the connection that creates the
+  terminal for the core's account.
 - The pane host waits for its exact binding, discards startup input, then runs
   `bash --noprofile --norc -m -c`. Keep job control and the wrapper's foreground process group.
   The same Linux bash handoff serves Herdr after checking its terminal address and host PID.

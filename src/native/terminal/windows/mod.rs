@@ -45,7 +45,7 @@ use super::{
 mod focus;
 pub(in crate::native::terminal) mod launch_host;
 mod process;
-pub(in crate::native) use process::{observe_process_identity, process_user_sid_of};
+pub(in crate::native) use process::{QueriedProcess, observe_process_identity};
 mod security;
 mod tab;
 pub(in crate::native) use process::query_process_identity;
@@ -155,32 +155,11 @@ const CLOSE_ATTACH_WAIT: Duration = Duration::from_secs(1);
 // and how long it then waits for a host it had to end.
 const TAB_HOST_EXIT_WAIT: Duration = Duration::from_secs(1);
 
-pub(super) fn select(
-    preferred: Option<TerminalKind>,
-    herdr_runs_provider: bool,
-) -> Result<TerminalKind> {
-    select_from(
-        preferred,
-        std::env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
-        std::env::var("TERM_PROGRAM").ok().as_deref(),
-        herdr_runs_provider,
-    )
-}
-
-// An explicit choice wins. Inside a Herdr terminal (hc's identity, as on macOS and Linux) the
-// automatic choice is Herdr when the provider's adapter runs there, which launch admission
-// then proves; for any other provider, an unknown one included, and outside hc it is the
-// managed console. Selection reads the environment and the request only and opens nothing.
-pub(super) fn select_from(
-    preferred: Option<TerminalKind>,
-    hc_terminal: bool,
-    term_program: Option<&str>,
-    herdr_runs_provider: bool,
-) -> Result<TerminalKind> {
+// The terminal Windows chooses, Herdr's environment aside (`terminal::select_for` applies it
+// the same way on every platform): an explicit kind it runs, or the managed console. It
+// reads the request only and opens nothing.
+pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     match preferred {
-        None if herdr_runs_provider && super::herdr_environment(hc_terminal, term_program) => {
-            Ok(TerminalKind::Herdr)
-        }
         None | Some(TerminalKind::WindowsConsole) => Ok(TerminalKind::WindowsConsole),
         Some(TerminalKind::Herdr) => Ok(TerminalKind::Herdr),
         // The lookup's own refusal, as macOS and Linux select.

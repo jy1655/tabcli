@@ -29,17 +29,10 @@ impl Adapters for Installed {
         }
     }
 }
+// The terminal Linux chooses, Herdr's environment aside (`terminal::select_for` applies it
+// the same way on every platform): an explicit kind it registers, or tmux.
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
-    let kind = preferred.unwrap_or_else(|| {
-        if super::herdr_environment(
-            std::env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
-        ) {
-            TerminalKind::Herdr
-        } else {
-            TerminalKind::Tmux
-        }
-    });
+    let kind = preferred.unwrap_or(TerminalKind::Tmux);
     // An explicit kind Linux does not run is refused naming the kinds Linux runs.
     if !OsTerminals::LINUX.runs(kind) {
         return Err(OsTerminals::LINUX.unavailable(kind));
