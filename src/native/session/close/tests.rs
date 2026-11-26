@@ -9,9 +9,9 @@ use crate::native::session::schema::EVENT_READ_LIMIT;
 use crate::native::session::schema::{SessionEvent, TerminalTombstone};
 use crate::native::session::test_support::lifecycle::{
     assert_journal_settled, cli_result, cli_search, cli_sessions, close_test_terminal,
-    link_directory, native_kind_or, oversized_sample_event, reaped_child_pid, request_state,
-    sample_completion, seed_claimed_session, seed_event_written_completion,
-    write_owned_terminal_state, write_test_manifest,
+    link_directory, oversized_sample_event, reaped_child_pid, request_state, sample_completion,
+    seed_claimed_session, seed_event_written_completion, write_owned_terminal_state,
+    write_test_manifest,
 };
 use crate::native::session::test_support::{injected_fault, with_fault_budget};
 use crate::native::session::turn::PendingTurnCompletion;
@@ -127,7 +127,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             .unwrap();
             store
                 .write_terminal(&terminal::TerminalSession::new(
-                    native_kind_or(terminal::TerminalKind::Iterm2),
+                    terminal::TerminalKind::Iterm2,
                     "exact-retained-surface".to_owned(),
                 ))
                 .unwrap();
@@ -266,7 +266,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession::new(
-            native_kind_or(terminal::TerminalKind::Iterm2),
+            terminal::TerminalKind::Iterm2,
             "missing-iterm-session".to_owned(),
         ),
     )
@@ -285,7 +285,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
                 None,
                 crate::native::session::close::budget::close_deadline(),
                 |session| {
-                    assert_eq!(session.kind, native_kind_or(terminal::TerminalKind::Iterm2));
+                    assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
                     assert_eq!(session.id, "missing-iterm-session");
                     close_calls += 1;
                     Ok(terminal::CloseOutcome::Missing.into())
@@ -327,7 +327,7 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession::new(
-            native_kind_or(terminal::TerminalKind::Iterm2),
+            terminal::TerminalKind::Iterm2,
             "missing-iterm-session".to_owned(),
         ),
     )
@@ -354,7 +354,7 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
             .unwrap(),
         TerminalTombstone {
             consumed: true,
-            terminal: Some(native_kind_or(terminal::TerminalKind::Iterm2)),
+            terminal: Some(terminal::TerminalKind::Iterm2),
             reason: cfg!(any(target_os = "macos", target_os = "linux"))
                 .then(|| "the tab was already gone".to_owned()),
         }
@@ -391,7 +391,7 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     write_json_atomic(
         &directory.path().join(TERMINAL_CLOSING_FILE),
         &terminal::TerminalSession::new(
-            native_kind_or(terminal::TerminalKind::Iterm2),
+            terminal::TerminalKind::Iterm2,
             "interrupted-close".to_owned(),
         ),
     )
@@ -423,11 +423,6 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     );
 }
 
-// A claimed handle of a terminal that cannot outlive its owner, of a kind this OS runs (iTerm2,
-// the managed console): Repair settles it once the owner is gone. Linux runs no such terminal
-// (a tmux pane can outlive its owner, so Repair retains it), and a kind of another OS would
-// make the session one that Repair leaves alone.
-#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn interrupted_close_without_tombstone_converges_after_owner_exit() {
     let directory = tempfile::tempdir().unwrap();
@@ -451,11 +446,7 @@ fn interrupted_close_without_tombstone_converges_after_owner_exit() {
     store
         .record(CoreRecord::TerminalClosing)
         .write_json(&terminal::TerminalSession::new(
-            if cfg!(windows) {
-                terminal::TerminalKind::WindowsConsole
-            } else {
-                terminal::TerminalKind::Iterm2
-            },
+            terminal::TerminalKind::Iterm2,
             "interrupted-close".to_owned(),
         ))
         .unwrap();
@@ -601,11 +592,27 @@ fn deadline_fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+    // A handle of a kind this host runs, bound to the fixture's session, as its writer binds
+    // it: the deadline tests reach their lock, consumption and expiry steps on every OS.
+    let kind = if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else if cfg!(target_os = "linux") {
+        terminal::TerminalKind::Tmux
+    } else {
+        terminal::TerminalKind::Iterm2
+    };
+    let session = directory
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     store
-        .write_terminal(&terminal::TerminalSession::new(
-            terminal::TerminalKind::Iterm2,
-            "deadline-fixture".into(),
-        ))
+        .write_terminal(
+            &terminal::TerminalSession::new(kind, "deadline-fixture".into())
+                .with_binding(Some(session)),
+        )
         .unwrap();
     (directory, store)
 }
@@ -1211,7 +1218,7 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession::new(
-            native_kind_or(terminal::TerminalKind::Iterm2),
+            terminal::TerminalKind::Iterm2,
             "concurrent-close".to_owned(),
         ),
     )
@@ -1271,7 +1278,7 @@ fn tell_cannot_claim_while_explicit_close_owns_the_terminal_lifecycle() {
     write_json_atomic(
         &directory.path().join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession::new(
-            native_kind_or(terminal::TerminalKind::Iterm2),
+            terminal::TerminalKind::Iterm2,
             "closing-before-tell".to_owned(),
         ),
     )
@@ -1393,29 +1400,17 @@ fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
     let record = store.record(CoreRecord::Terminal);
     record.write_json(&surface).unwrap();
     let before = record.bytes().unwrap();
-    let repaired = repair_dead_owner_with(
+    let error = repair_dead_owner_with(
         &store,
         |_| Ok(false),
         RepairSurfaces::Windows(&mut |_| panic!("a foreign surface must never reach an adapter")),
         budget::close_deadline(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("dead Windows native owner has a non-Windows terminal handle")
     );
-    if terminal::TerminalKind::Iterm2.supported_on_this_platform() {
-        // This OS runs iTerm2, so Repair reaches the Windows close step, which gives the
-        // refusal Windows gives every kind it does not run.
-        let error = repaired.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("iTerm2 is not available on Windows"),
-            "{error:#}"
-        );
-        assert_eq!(
-            crate::native::failure_kind::classify(&error),
-            Some(crate::native::failure_kind::FailureKind::Unsupported)
-        );
-    } else {
-        // Elsewhere the handle makes it a session of another OS, which Repair leaves as it is
-        // before any owner verdict or close (`terminal::foreign`).
-        assert!(!repaired.unwrap());
-    }
     assert_eq!(record.bytes().unwrap(), before);
     assert_eq!(store.status().unwrap().state, SessionState::Working);
     assert!(store.closed_if_present().unwrap().is_none());

@@ -583,7 +583,7 @@ pub(super) fn record_checks(
         }
     };
     owner_check(evidence.judge_owner(), checks);
-    terminal_check(&surface, terminal::foreign::closed(reader), checks);
+    terminal_check(&surface, checks);
     hold_check(&hold, id, checks);
     (manifest, evidence, launch_host)
 }
@@ -909,21 +909,10 @@ fn owner_check(owner: &OwnerJudgment, checks: &mut Vec<Check>) {
     checks.push(Check::new(CheckId::OWNER, availability, reason, detail, "Inspect the exact request result; do not infer delivery or resend from owner liveness.").evidence(evidence));
 }
 
-/// The terminal record check. `closed` is whether the session is closed: a closed session
-/// answers first, before its remaining handle's binding and the OS it belongs to, as every
-/// command that would act on the handle answers it (`terminal::foreign`).
-fn terminal_check(surface: &Surface, closed: bool, checks: &mut Vec<Check>) {
+fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
     use Availability::*;
     const ACTIVE_NEXT: &str = "Only tell/close revalidate their target surface; this observation grants no control authority.";
     let check = match surface {
-        Surface::Active { kind, .. } if closed => Check::new(
-            CheckId::TERMINAL_RECORD,
-            Unavailable,
-            Reason::TERMINAL_SESSION_CLOSED,
-            "The session is closed; its remaining terminal handle is not acted on.",
-            "Inspect retained results; doctor does not reopen or delete terminal records.",
-        )
-        .evidence(json!({"terminal": kind})),
         Surface::Closed { consumed } => Check::new(
             CheckId::TERMINAL_RECORD,
             if *consumed { Unavailable } else { Unknown },
@@ -971,7 +960,6 @@ fn terminal_check(surface: &Surface, closed: bool, checks: &mut Vec<Check>) {
             supported,
             bound,
             empty_id,
-            ..
         } => {
             let (availability, reason) = match ActiveHandle::of(*supported, *bound, *empty_id) {
                 ActiveHandle::Unsupported => (Unavailable, Reason::TERMINAL_UNSUPPORTED),
@@ -1297,7 +1285,6 @@ mod attestation_tests {
         let active = |supported, bound, empty_id| Surface::Active {
             kind,
             supported,
-            elsewhere: None,
             bound,
             empty_id,
         };
@@ -1336,14 +1323,8 @@ mod attestation_tests {
                 json!(["unknown", "terminal_record_unreadable"]),
                 Value::Null,
             ),
-            // The binding, the same on every OS, is judged before this OS's support.
             (
                 active(false, false, false),
-                json!(["unknown", "terminal_binding_unverified"]),
-                json!({"terminal": "warp"}),
-            ),
-            (
-                active(false, true, false),
                 json!(["unavailable", "terminal_unsupported"]),
                 json!({"terminal": "warp"}),
             ),
@@ -1374,7 +1355,7 @@ mod attestation_tests {
             ),
         ] {
             let mut checks = Vec::new();
-            terminal_check(&surface, false, &mut checks);
+            terminal_check(&surface, &mut checks);
             assert_eq!(checks[0].id, "terminal_record");
             assert_eq!(row(&checks[0]), expected, "{surface:?}");
             assert_eq!(checks[0].evidence, evidence, "{surface:?}");
@@ -1382,21 +1363,6 @@ mod attestation_tests {
                 assert_eq!(&checks[0].detail, reason);
             }
         }
-        // A closed session's remaining active handle answers closed first, whatever its
-        // binding or support; every other record keeps its own answer.
-        for (supported, bound) in [(false, false), (false, true), (true, false), (true, true)] {
-            let mut checks = Vec::new();
-            terminal_check(&active(supported, bound, false), true, &mut checks);
-            assert_eq!(
-                row(&checks[0]),
-                json!(["unavailable", "terminal_session_closed"]),
-                "{supported} {bound}"
-            );
-            assert_eq!(checks[0].evidence, json!({"terminal": "warp"}));
-        }
-        let mut checks = Vec::new();
-        terminal_check(&Surface::Closed { consumed: true }, true, &mut checks);
-        assert_eq!(row(&checks[0]), json!(["unavailable", "terminal_consumed"]));
 
         // surface_presence_check
         for (presence, expected) in [

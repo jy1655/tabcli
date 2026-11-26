@@ -1285,7 +1285,18 @@ fn another_kinds_handle_is_refused_by_the_installed_lookup() {
     let evidence = SessionEvidence::read(&reader, Ok(false));
     let presence =
         evidence.judge_surface_presence(&reader, Instant::now() + Duration::from_secs(2));
-    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
+    // The handle is this session's own and names a kind Windows does not run: the session is
+    // one of another OS, which the probe and the ownership proof refuse before any lookup,
+    // naming the directory of its records (`terminal::foreign`).
+    let session_refusal = format!(
+        "{refusal}: TAB on this machine cannot judge or end this session; once its records \
+         show it ended, an explicit close settles it (its records are in {})",
+        directory.display()
+    );
+    assert_eq!(
+        *presence,
+        SurfacePresence::Unverified(session_refusal.clone())
+    );
     assert_eq!(
         doctor::surface_presence_check(presence).reason_code,
         "terminal_surface_unverified"
@@ -1296,14 +1307,17 @@ fn another_kinds_handle_is_refused_by_the_installed_lookup() {
     fs::write(&prompt, "hello").unwrap();
     let failure = terminal::send_file(&handle, &prompt, deadline).unwrap_err();
     assert!(!failure.delivery_may_have_occurred());
+    let proof = terminal::ownership::verified_terminal_surface_owner(
+        &directory,
+        "session-foreign",
+        &handle,
+        Some(Duration::from_secs(5)),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{proof:#}"), session_refusal);
+    assert_eq!(classify(&proof), Some(FailureKind::Unsupported));
+    // Each lookup refuses the handle by its kind alone.
     let errors = [
-        terminal::ownership::verified_terminal_surface_owner(
-            &directory,
-            "session-foreign",
-            &handle,
-            Some(Duration::from_secs(5)),
-        )
-        .unwrap_err(),
         failure.into_error(),
         terminal::read_screen(&handle, deadline).unwrap_err(),
         terminal::close_session_until(&directory, &handle, deadline).unwrap_err(),

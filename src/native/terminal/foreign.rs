@@ -1,44 +1,47 @@
-//! Whether a Session belongs to another OS, judged from its Records alone, in one place.
+//! Whether a Session belongs to another OS, from its own Records, in one place.
 //!
 //! A state directory can be copied or moved between machines. A Session belongs to another OS
-//! when any of its Records says so positively: the kind of its active, claimed or consumed
-//! handle is one this OS does not run, a Herdr handle's recorded host birth names another OS,
-//! or its Owner record carries the identity another OS's writer records (macOS: the process
-//! start time; Linux: the Linux birth; Windows: the Windows process identity). A missing or
-//! null field is no evidence either way, and a PID-only or absent Owner record does not hide
-//! a terminal of another OS.
+//! only on a positive statement in a Record that is this Session's own:
+//! - its active handle, bound to this Session, names a kind this OS does not run, or, for a
+//!   Herdr handle only, records a host birth of another platform's variant;
+//! - its consumption marker decodes, says `consumed: true` and names a kind this OS does not
+//!   run;
+//! - its Owner record, bound to this Session, carries the identity another OS's writer records
+//!   (macOS: the process start time; Linux: the Linux birth; Windows: the Windows process
+//!   identity).
 //!
-//! The judgment rides in the shared steps rather than in each command:
-//! - the Owner record's one observation (`session::owner::observe`, `required`, and Origin's
-//!   read) carries the handle Records' verdict on the owner, and the one attestation
-//!   (`attest_owner_with`) makes and reports no local process observation for such an owner;
-//! - Repair (`repair_dead_owner_with`) leaves such a session exactly as it is;
-//! - the shared surface judgment (`judgment::surface`) and the ownership check
-//!   (`verified_terminal_surface_owner`) refuse its handle, and each OS's stored-handle lookup
-//!   refuses a kind it does not run, before any adapter.
+//! Nothing else is evidence: a field that does not belong to the handle's kind, a Record bound
+//! to another Session or to none, a marker that does not decode or says `consumed: false`, a
+//! claimed handle, and anything missing or null. Without evidence the Session is this OS's, and
+//! every command acts as it always did.
 //!
-//! Every command admits a session or its handle in one order: a closed session first, then a
-//! handle that is not this session's, then a session of another OS. The refusal is the same on
-//! every OS (`Elsewhere::refusal`).
+//! For a Session with evidence, TAB does nothing that depends on this machine's terminals or
+//! processes: the Owner record's one observation (`session::owner::observe`, `required`,
+//! Origin's budgeted read) carries the verdict, so owner attestation observes nothing and
+//! Repair leaves the Session as it is; each command that would address its terminal (`tell`'s
+//! ownership proof, `screen`, doctor's probe, the explicit close) refuses it in one order
+//! (`admit`): a closed Session, then a handle that is not this Session's, then another OS.
+//! The explicit close settles such a Session from its Records alone when they show it ended
+//! (`ended`), and prune removes it once closed. Everything TAB does from Records alone is
+//! unchanged.
 use super::ownership::NativeSessionOwner;
-use super::record::HerdrHostBirth;
 use super::{OsTerminals, TerminalKind, TerminalSession};
 use crate::native::failure_kind::Unsupported;
 use crate::native::session::{self, CoreRecord, Reader};
 use std::path::Path;
 
-/// What a Session's Records name as another OS, with the refusal it gives.
+/// What a Session's own Records name as another OS, with the refusal it gives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum Elsewhere {
-    /// A handle (active, claimed or consumed) names a kind this OS does not run.
+    /// The bound active handle, or the consumption marker, names a kind this OS does not run.
     Kind(TerminalKind),
-    /// A Herdr handle's host birth or the Owner record's identity names another OS (or
-    /// several).
+    /// A bound Herdr handle's host birth or the bound Owner record's identity names another
+    /// OS (or several).
     Recorded(&'static str),
 }
 
 impl Elsewhere {
-    /// What the Records name, the same on every OS: the kind's refusal when a handle names a
+    /// What the Records name, the same on every OS: the kind's refusal when a Record names a
     /// kind this OS does not run (`<Name> is not available on <OS>`), otherwise the OS the
     /// Records name. It names no terminal to use instead: only a new launch could choose one.
     pub(in crate::native) fn head(self) -> String {
@@ -52,8 +55,9 @@ impl Elsewhere {
     }
 
     /// The one refusal of a session of another OS whose Records are in `directory`, for every
-    /// command that would act on it. It says what is true: nothing on this machine can judge
-    /// or end the session, and an explicit close settles it once its Records show it ended.
+    /// command that would use this machine's terminal or processes for it. It says what is
+    /// true: nothing here can judge or end the session, and an explicit close settles it once
+    /// its Records show it ended.
     pub(in crate::native) fn refusal(self, directory: &Path) -> anyhow::Error {
         anyhow::Error::new(Unsupported::new(format!(
             "{}: TAB on this machine cannot judge or end this session; once its records show \
@@ -94,25 +98,39 @@ fn recorded_on(owner: &NativeSessionOwner) -> Vec<OsTerminals> {
     systems
 }
 
-/// The OS whose Herdr host the handle's recorded birth describes.
-fn birth_os(birth: &HerdrHostBirth) -> OsTerminals {
-    match birth {
+/// The OS whose Herdr host a Herdr handle's recorded birth describes.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn herdr_birth_os(handle: &TerminalSession) -> Option<OsTerminals> {
+    use super::record::HerdrHostBirth;
+    Some(match handle.herdr_core()?.birth {
         HerdrHostBirth::Macos { .. } => OsTerminals::MACOS,
         HerdrHostBirth::Linux { .. } => OsTerminals::LINUX,
         HerdrHostBirth::Windows { .. } => OsTerminals::WINDOWS,
-    }
+    })
 }
 
-/// What a handle itself says: its kind, then a Herdr handle's recorded host birth.
+// A platform without a managed terminal records no Herdr host.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn herdr_birth_os(_: &TerminalSession) -> Option<OsTerminals> {
+    None
+}
+
+/// What a handle itself says: a kind this OS does not run, or, for a Herdr handle only, a
+/// recorded host birth of another platform's variant. It does not say whose handle it is.
 pub(in crate::native) fn of_handle(handle: &TerminalSession) -> Option<Elsewhere> {
     let os = OsTerminals::CURRENT?;
     if !os.runs(handle.kind) {
         return Some(Elsewhere::Kind(handle.kind));
     }
-    let born = birth_os(&handle.herdr_core()?.birth);
+    if handle.kind != TerminalKind::Herdr {
+        return None;
+    }
+    let born = herdr_birth_os(handle)?;
     (born.os != os.os).then_some(Elsewhere::Recorded(born.os))
 }
-/// What an Owner record itself says: an identity this OS does not record.
+
+/// What an Owner record's identity says: an identity this OS does not record. Evidence only
+/// for a record bound to the session (`of_owner_record`).
 pub(in crate::native) fn of_owner(owner: &NativeSessionOwner) -> Option<Elsewhere> {
     let os = OsTerminals::CURRENT?;
     let recorded = recorded_on(owner);
@@ -125,60 +143,85 @@ pub(in crate::native) fn of_owner(owner: &NativeSessionOwner) -> Option<Elsewher
     }))
 }
 
-/// What the handle Records say, without the Owner record: the active handle, else a claimed
-/// one, else the kind the close tombstone kept. A Record that cannot be read, and a missing or
-/// null kind, are no evidence.
-pub(in crate::native) fn of_surface_records(reader: &Reader) -> Option<Elsewhere> {
-    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-        if let Ok(Some(handle)) = reader
-            .record(record)
-            .optional_json_with(session::record::terminal)
-        {
-            return of_handle(&handle);
-        }
-    }
-    let tombstone = reader
-        .record(CoreRecord::TerminalClosed)
-        .optional_json_with(session::record::terminal_tombstone_value)
-        .ok()
-        .flatten()?;
-    let kind: TerminalKind = serde_json::from_value(tombstone.get("terminal")?.clone()).ok()?;
-    let os = OsTerminals::CURRENT?;
-    (!os.runs(kind)).then_some(Elsewhere::Kind(kind))
+/// Whether a handle is this session's own for evidence: it names the session, with a
+/// surface id. A legacy handle that names no session is no evidence.
+fn bound_here(handle: &TerminalSession, session: &str) -> bool {
+    handle.managed_session_id.as_deref() == Some(session) && !handle.id.is_empty()
 }
 
-/// The whole judgment of a Session from its Records: the handle the caller holds (or the
-/// recorded ones), then the Owner record as its one observation reads it.
-pub(in crate::native) fn of_records(
-    reader: &Reader,
-    handle: Option<&TerminalSession>,
+/// The kind a consumption marker says was consumed: only a marker that decodes and says
+/// `consumed: true`. `None` for a marker that is absent, does not decode, says
+/// `consumed: false`, or names no kind.
+pub(in crate::native) fn consumed_kind(marker: &[u8]) -> Option<TerminalKind> {
+    let tombstone = session::record::terminal_tombstone(std::str::from_utf8(marker).ok()?).ok()?;
+    tombstone.terminal.filter(|_| tombstone.consumed)
+}
+
+/// What the handle Records of `session` say, from their bytes: the bound active handle, then
+/// the consumption marker. A Record that does not decode is no evidence. Readers that hold
+/// their own bytes (Origin's budgeted read) judge them here.
+pub(in crate::native) fn of_handle_record_bytes(
+    session: &str,
+    handle: Option<&[u8]>,
+    marker: Option<&[u8]>,
 ) -> Option<Elsewhere> {
-    let surface = match handle {
-        Some(handle) => of_handle(handle),
-        None => of_surface_records(reader),
-    };
-    surface.or_else(|| of_owner_record(&session::owner::observe(reader)))
-}
-
-/// The judgment of an active handle with the Owner record read beside it, as the shared
-/// surface judgment makes it (`judgment::surface`).
-pub(in crate::native) fn of_handle_and_owner(
-    handle: &TerminalSession,
-    owner: &session::owner::OwnerRecord,
-) -> Option<Elsewhere> {
-    of_handle(handle).or_else(|| of_owner_record(owner))
-}
-
-fn of_owner_record(owner: &session::owner::OwnerRecord) -> Option<Elsewhere> {
-    match owner {
-        session::owner::OwnerRecord::Recorded(recorded) => of_owner(&recorded.owner),
-        _ => None,
+    if let Some(handle) = handle
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| session::record::terminal(text).ok())
+        && bound_here(&handle, session)
+        && let Some(elsewhere) = of_handle(&handle)
+    {
+        return Some(elsewhere);
     }
+    let kind = consumed_kind(marker?)?;
+    (!OsTerminals::CURRENT?.runs(kind)).then_some(Elsewhere::Kind(kind))
+}
+
+/// What the handle Records of the Session `reader` opens say. Read by the Owner record's one
+/// observation, which adds what a bound Owner record says.
+pub(in crate::native) fn of_handle_records(reader: &Reader) -> Option<Elsewhere> {
+    let bytes = |record| reader.record(record).bytes().ok().flatten();
+    of_handle_record_bytes(
+        session_of(reader),
+        bytes(CoreRecord::Terminal).as_deref(),
+        bytes(CoreRecord::TerminalClosed).as_deref(),
+    )
+}
+
+/// What a decoded Owner record adds to the handle Records' verdict: its identity, only when it
+/// is bound to the Session.
+pub(in crate::native) fn with_owner(
+    handle_records: Option<Elsewhere>,
+    owner: &NativeSessionOwner,
+    binding: super::ownership::OwnerBinding,
+) -> Option<Elsewhere> {
+    handle_records.or_else(|| {
+        (binding == super::ownership::OwnerBinding::Bound)
+            .then(|| of_owner(owner))
+            .flatten()
+    })
+}
+
+/// The judgment of the Session `reader` opens, from its own Records: what its Owner record's
+/// one observation carries, or the handle Records alone when there is no decodable Owner
+/// record.
+pub(in crate::native) fn of_records(reader: &Reader) -> Option<Elsewhere> {
+    match session::owner::observe(reader) {
+        session::owner::OwnerRecord::Recorded(recorded) => recorded.owner.recorded_elsewhere,
+        _ => of_handle_records(reader),
+    }
+}
+
+fn session_of(reader: &Reader) -> &str {
+    reader
+        .directory()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
 }
 
 /// Whether the Records say the session is closed: its status, or the closed status record
-/// that an interrupted close can leave before `status.json` catches up. A closed session
-/// answers first, before its handle's binding and the OS it belongs to, for every command.
+/// that an interrupted close can leave before `status.json` catches up.
 pub(in crate::native) fn closed(reader: &Reader) -> bool {
     reader
         .status()
@@ -186,172 +229,38 @@ pub(in crate::native) fn closed(reader: &Reader) -> bool {
         || reader.closed_if_present().ok().flatten().is_some()
 }
 
-/// A session's admission for a command that changes it without addressing its terminal
-/// (`hold`, `cancel`): after the command's own closed answer, a session of another OS is
-/// refused. Such a command has no handle to bind, so it has no binding step.
-pub(in crate::native) fn admit_session(reader: &Reader) -> anyhow::Result<()> {
-    match of_records(reader, None) {
-        Some(elsewhere) => Err(elsewhere.refusal(reader.directory())),
-        None => Ok(()),
+/// The binding a command that addresses `handle` requires, in the order's second place: the
+/// handle names this session (a legacy iTerm2 handle that names none counts as this
+/// session's) and has a surface id.
+pub(in crate::native) fn binding(handle: &TerminalSession, session: &str) -> anyhow::Result<()> {
+    handle.verify_managed_session(session)?;
+    if handle.id.is_empty() {
+        anyhow::bail!("the recorded terminal handle is not bound to session {session}");
     }
+    Ok(())
+}
+
+/// The admission of a command that would use this machine's terminal or processes for the
+/// Session `reader` opens, addressing `handle` if it has one. `Ok` when the Session's Records
+/// give no evidence of another OS: the command's own path applies unchanged. Otherwise the one
+/// refusal, in one order: a closed Session (`closed`, the command's own text), then a handle
+/// that is not this Session's, then the Session of another OS.
+pub(in crate::native) fn admit(
+    reader: &Reader,
+    handle: Option<&TerminalSession>,
+    closed_answer: impl FnOnce() -> anyhow::Error,
+) -> anyhow::Result<()> {
+    let Some(elsewhere) = of_records(reader) else {
+        return Ok(());
+    };
+    if closed(reader) {
+        return Err(closed_answer());
+    }
+    if let Some(handle) = handle {
+        binding(handle, session_of(reader))?;
+    }
+    Err(elsewhere.refusal(reader.directory()))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::native::failure_kind::{FailureKind, classify};
-    use crate::native::session::Store;
-
-    fn owner_of(os: &str) -> NativeSessionOwner {
-        let mut owner = NativeSessionOwner {
-            pid: 4242,
-            ..Default::default()
-        };
-        match os {
-            "macOS" => {
-                owner.process_start_seconds = Some(1);
-                owner.process_start_microseconds = Some(2);
-            }
-            "Linux" => {
-                owner.linux_birth = Some(
-                    serde_json::from_value(serde_json::json!({
-                        "boot_id": "00112233-4455-6677-8899-aabbccddeeff",
-                        "starttime_ticks": 7
-                    }))
-                    .unwrap(),
-                );
-            }
-            _ => {
-                owner.windows_process_identity =
-                    Some(crate::native::terminal::WindowsProcessIdentity {
-                        creation_time: 1,
-                        executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
-                    });
-            }
-        }
-        owner
-    }
-
-    fn herdr_born_on(os: &str) -> TerminalSession {
-        let birth = match os {
-            "macOS" => serde_json::json!({"host_start_seconds": 1, "host_start_microseconds": 2}),
-            "Linux" => serde_json::json!({"linux_birth": {
-                "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 7}}),
-            _ => serde_json::json!({"host_creation_time": 1}),
-        };
-        let mut core = serde_json::json!({"socket": "/tmp/core.sock", "core_id": "core-a",
-            "created_ms": 1, "host_pid": 4});
-        for (key, value) in birth.as_object().unwrap() {
-            core[key] = value.clone();
-        }
-        serde_json::from_value(serde_json::json!({"terminal": "herdr", "session_id": "t7",
-            "managed_session_id": "session-foreign", "herdr_core": core}))
-        .unwrap()
-    }
-
-    // Each kind of evidence on its own: a handle's kind, a Herdr host birth, an Owner
-    // identity; their refusals; and a PID-only owner or a Herdr handle without a birth as no
-    // evidence.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    #[test]
-    fn each_record_names_its_os_and_a_missing_identity_names_none() {
-        let here = OsTerminals::CURRENT.unwrap().os;
-        let legacy = NativeSessionOwner {
-            pid: 4242,
-            ..Default::default()
-        };
-        assert_eq!(of_owner(&legacy), None);
-        assert_eq!(
-            of_handle(&TerminalSession::new(TerminalKind::Herdr, "t7".into())),
-            None
-        );
-        for os in ["macOS", "Linux", "Windows"] {
-            let expected = (os != here).then_some(Elsewhere::Recorded(
-                [OsTerminals::MACOS, OsTerminals::LINUX, OsTerminals::WINDOWS]
-                    .into_iter()
-                    .find(|system| system.os == os)
-                    .unwrap()
-                    .os,
-            ));
-            assert_eq!(of_owner(&owner_of(os)), expected, "{os}");
-            assert_eq!(of_handle(&herdr_born_on(os)), expected, "{os}");
-            if let Some(elsewhere) = expected {
-                let error = elsewhere.refusal(Path::new("records"));
-                assert_eq!(
-                    format!("{error:#}"),
-                    format!(
-                        "a session recorded on {os} is not available on {here}: TAB on this \
-                         machine cannot judge or end this session; once its records show it \
-                         ended, an explicit close settles it (its records are in records)"
-                    )
-                );
-                assert_eq!(classify(&error), Some(FailureKind::Unsupported));
-            }
-        }
-        for kind in TerminalKind::ALL {
-            let judged = of_handle(&TerminalSession::new(kind, "surface".into()));
-            if kind.supported_on_this_platform() {
-                assert_eq!(judged, None, "{kind:?}");
-            } else {
-                assert_eq!(judged, Some(Elsewhere::Kind(kind)), "{kind:?}");
-                assert_eq!(
-                    judged.unwrap().reason(),
-                    format!("{} is not available on {here}", kind.display_name())
-                );
-            }
-        }
-        let mut mixed = owner_of("Linux");
-        mixed.windows_process_identity = owner_of("Windows").windows_process_identity;
-        assert_eq!(
-            of_owner(&mixed),
-            Some(Elsewhere::Recorded("more than one operating system"))
-        );
-    }
-
-    // The Records in their precedence: the active handle, a claimed one, the kind a close
-    // tombstone kept (a missing or null kind is no evidence), then the Owner record.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    #[test]
-    fn the_records_are_read_in_one_precedence() {
-        let foreign = TerminalKind::ALL
-            .into_iter()
-            .find(|kind| !kind.supported_on_this_platform())
-            .unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("session-foreign");
-        std::fs::create_dir(&directory).unwrap();
-        let store = Store::open_unchecked(&directory);
-        let reader = Reader::open_unchecked(&directory);
-        assert_eq!(of_records(&reader, None), None);
-        for tombstone in [
-            serde_json::json!({"consumed": true}),
-            serde_json::json!({"consumed": true, "terminal": null}),
-        ] {
-            store
-                .record(CoreRecord::TerminalClosed)
-                .write_json(&tombstone)
-                .unwrap();
-            assert_eq!(of_records(&reader, None), None, "{tombstone}");
-        }
-        store
-            .record(CoreRecord::TerminalClosed)
-            .write_json(&serde_json::json!({"consumed": true, "terminal": foreign}))
-            .unwrap();
-        assert_eq!(of_records(&reader, None), Some(Elsewhere::Kind(foreign)));
-        store
-            .record(CoreRecord::TerminalClosing)
-            .write_json(&TerminalSession::new(TerminalKind::Herdr, "t7".into()))
-            .unwrap();
-        // A handle of this OS's kind decides before the tombstone.
-        assert_eq!(of_records(&reader, None), None);
-        let other = ["macOS", "Linux", "Windows"]
-            .into_iter()
-            .find(|os| *os != OsTerminals::CURRENT.unwrap().os)
-            .unwrap();
-        store.write_owner(&owner_of(other)).unwrap();
-        assert!(matches!(
-            of_records(&reader, None),
-            Some(Elsewhere::Recorded(_))
-        ));
-    }
-}
+mod tests;

@@ -25,9 +25,9 @@
   Dead-owner Repair decides whether it needs a close transaction in
   `terminal::close_authority::owner_exit`. Only a managed console or a registration whose core
   keeps a finished terminal can reach the Windows close adapter from that transaction. The
-  claimed handle is checked independently of the retained-handle scan, with the same refusal.
-  Repair never attests an Owner record that another OS wrote (a macOS start time or a Linux
-  birth): see `terminal::foreign`. The lookup's portable tests run
+  claimed handle is checked independently of the retained-handle scan. Repair never attests
+  the owner of a Session whose own Records say it belongs to another OS: see
+  `terminal::foreign`. The lookup's portable tests run
   on every CI target; the installed lookup, over the console helper and the core's pipe, is
   tested on the Windows runner only.
 - A Herdr terminal is not a managed console: its handle never reaches the console control

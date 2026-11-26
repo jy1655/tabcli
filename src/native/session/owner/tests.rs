@@ -119,179 +119,32 @@ fn r1_c6_reused_projects_mismatch_without_inspection_error() {
     );
 }
 
-// This OS's name, as a refusal names it.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-const HERE: &str = if cfg!(target_os = "macos") {
-    "macOS"
-} else if cfg!(target_os = "linux") {
-    "Linux"
-} else {
-    "Windows"
-};
-
-// Observers that fail the test when called: no process of this machine is evidence about the
-// owner of a session of another OS.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn unobserved() -> OwnerObservers<'static> {
-    OwnerObservers {
-        pid_alive: &|_| panic!("the PID of another OS's owner was observed here"),
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        birth: &|_| panic!("the birth of another OS's owner was observed here"),
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        control: &|_| panic!("the control of another OS's owner was observed here"),
-        #[cfg(windows)]
-        identity: &|_| panic!("the identity of another OS's owner was observed here"),
-    }
-}
-
-// The owner each OS's writer records: macOS the process start time, Linux the Linux birth,
-// Windows the Windows process identity.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn owner_written_on(os: &str) -> NativeSessionOwner {
-    serde_json::from_value(match os {
-        "macOS" => serde_json::json!({"pid": std::process::id(),
-            "process_start_seconds": 1, "process_start_microseconds": 2}),
-        "Linux" => serde_json::json!({"pid": std::process::id(), "linux_birth": {
-            "boot_id": "01234567-89ab-cdef-0123-456789abcdef", "starttime_ticks": 7}}),
-        _ => serde_json::json!({"pid": std::process::id(), "windows_process_identity": {
-            "creation_time": 1, "executable_path": r"C:\Program Files\PowerShell\7\pwsh.exe"}}),
-    })
-    .unwrap()
-}
-
-// An owner whose identity another OS's writer records is never observed here: no PID, birth,
-// control or identity observation is made, the projection reports none (`process_alive` is
-// null, not true or false), Repair cannot judge it dead and prune keeps its session. The PID
-// is this test's own, which any local observation would report alive.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(windows)]
 #[test]
-fn an_owner_of_another_os_is_never_observed_here() {
-    let mut mixed = owner_written_on("Linux");
-    mixed.windows_process_identity = owner_written_on("Windows").windows_process_identity;
-    let mut owners: Vec<(NativeSessionOwner, String)> = ["macOS", "Linux", "Windows"]
-        .into_iter()
-        .filter(|os| *os != HERE)
-        .map(|os| {
-            (
-                owner_written_on(os),
-                format!("a session recorded on {os} is not available on {HERE}"),
-            )
-        })
-        .collect();
-    owners.push((
-        mixed,
-        format!("a session recorded on more than one operating system is not available on {HERE}"),
-    ));
-    for (owner, refusal) in owners {
-        let a = attest_owner_with(&owner, unobserved());
-        assert_eq!(a.process, ProcessObservation::Unknown(refusal.clone()));
-        assert_eq!(a.pid_alive, None, "{refusal}");
-        assert_eq!(
-            serde_json::to_value(OwnerObservation::from(&a)).unwrap()["process_alive"],
-            serde_json::Value::Null,
-            "{refusal}"
-        );
-        assert!(prune_blocked_by(&a), "{refusal}");
-        assert!(repair_owner_is_live(&a).is_err(), "{refusal}");
-    }
-}
-
-// A PID-only owner names no OS, but the Session's other Records can: the Owner record's one
-// observation carries their verdict, so the production attestation of such an owner observes
-// nothing here either. A handle of a kind this OS does not run, a consumed one, and a Herdr
-// handle born on another OS each say so.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-#[test]
-fn a_pid_only_owner_of_a_session_of_another_os_is_never_observed_here() {
-    use crate::native::session::Store;
-    use crate::native::terminal::foreign::Elsewhere;
-    use crate::native::terminal::{TerminalKind, TerminalSession};
-    let foreign = if cfg!(windows) {
-        TerminalKind::Iterm2
-    } else {
-        TerminalKind::WindowsConsole
-    };
-    let born_elsewhere = if cfg!(target_os = "linux") {
-        (
-            "macOS",
-            serde_json::json!({"host_start_seconds": 1, "host_start_microseconds": 2}),
-        )
-    } else {
-        (
-            "Linux",
-            serde_json::json!({"linux_birth": {
-            "boot_id": "01234567-89ab-cdef-0123-456789abcdef", "starttime_ticks": 7}}),
-        )
-    };
-    let mut core = serde_json::json!({"socket": "/tmp/core.sock", "core_id": "core-a",
-        "created_ms": 1, "host_pid": 4});
-    for (key, value) in born_elsewhere.1.as_object().unwrap() {
-        core[key] = value.clone();
-    }
-    let herdr: TerminalSession = serde_json::from_value(serde_json::json!({
-        "terminal": "herdr", "session_id": "t7", "managed_session_id": "session-owner",
-        "herdr_core": core}))
+fn windows_refuses_a_linux_owner_birth_as_pid_only_evidence() {
+    let owner: NativeSessionOwner = serde_json::from_value(serde_json::json!({
+        "pid": 4242,
+        "linux_birth": {
+            "boot_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "starttime_ticks": 7
+        }
+    }))
     .unwrap();
-    type WriteRecords = Box<dyn Fn(&Store)>;
-    let cases: [(&str, WriteRecords, Elsewhere); 3] = [
-        (
-            "an active handle",
-            Box::new(move |store| {
-                store
-                    .write_terminal(
-                        &TerminalSession::new(foreign, "surface".into())
-                            .with_binding(Some("session-owner".into())),
-                    )
-                    .unwrap()
-            }),
-            Elsewhere::Kind(foreign),
-        ),
-        (
-            "a consumed handle",
-            Box::new(move |store| {
-                store
-                    .record(CoreRecord::TerminalClosed)
-                    .write_json(&serde_json::json!({"consumed": true, "terminal": foreign}))
-                    .unwrap()
-            }),
-            Elsewhere::Kind(foreign),
-        ),
-        (
-            "a Herdr handle born on another OS",
-            Box::new(move |store| store.write_terminal(&herdr).unwrap()),
-            Elsewhere::Recorded(born_elsewhere.0),
-        ),
-    ];
-    for (name, write, expected) in cases {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("session-owner");
-        std::fs::create_dir(&directory).unwrap();
-        let store = Store::open_unchecked(&directory);
-        store
-            .write_owner(&NativeSessionOwner {
-                pid: std::process::id(),
-                managed_session_id: Some("session-owner".into()),
-                ..NativeSessionOwner::default()
-            })
-            .unwrap();
-        write(&store);
-        let recorded = observe(&store).decoded().unwrap().unwrap();
-        assert_eq!(recorded.owner.recorded_elsewhere, Some(expected), "{name}");
-        assert_eq!(
-            required(&store).unwrap().owner.recorded_elsewhere,
-            Some(expected),
-            "{name}"
+    for alive in [false, true] {
+        let a = attest_owner_with(
+            &owner,
+            OwnerObservers {
+                pid_alive: &|_| alive,
+                identity: &|_| panic!("a foreign birth must not be compared"),
+            },
         );
-        let a = attest_owner_with(&recorded.owner, unobserved());
-        assert_eq!(a.pid_alive, None, "{name}");
         assert_eq!(
             a.process,
-            ProcessObservation::Unknown(expected.reason()),
-            "{name}"
+            ProcessObservation::Unknown("foreign Linux owner birth on Windows".into())
         );
-        assert_eq!(attest_owner(&recorded.owner).pid_alive, None, "{name}");
     }
 }
+
 #[cfg(windows)]
 #[test]
 fn r1_c1_windows_legacy_dead_does_not_block_prune() {
@@ -688,26 +541,20 @@ fn independent_review_control_birth_reuse_must_end_running_wait() {
     );
 }
 
-// The identity this OS records, whose incarnation is absent. (A record that also carries
-// another OS's identity is never attested here; see the foreign-identity tests above.)
 #[cfg(any(target_os = "macos", windows))]
 #[test]
 fn correction_a1_recorded_identity_absence_allows_prune_and_repair() {
     let root = tempfile::tempdir().unwrap();
     let owner = NativeSessionOwner {
         pid: 4242,
-        #[cfg(target_os = "macos")]
         process_start_seconds: Some(10),
-        #[cfg(target_os = "macos")]
         process_start_microseconds: Some(20),
-        #[cfg(windows)]
         windows_process_identity: Some(crate::native::terminal::WindowsProcessIdentity {
             creation_time: 123,
             executable_path: root.path().join("provider.exe").display().to_string(),
         }),
         ..Default::default()
     };
-    let _ = &root;
     let identity = |_| Ok(None);
     let a = attest_owner_with(
         &owner,
@@ -899,5 +746,44 @@ fn prune_attests_an_owner_record_whatever_session_it_names() {
                 .unwrap(),
             "{binding:?}"
         );
+    }
+}
+
+// The owner of a session whose own Records say it belongs to another OS (`recorded_elsewhere`,
+// set by the Owner record's one observation) is never observed here: whatever its identity,
+// no PID, birth, control or identity observer is called, the projection reports no PID
+// observation (`process_alive` null, not true or false), Repair cannot judge it dead and prune
+// keeps the session unless its Records show it closed. Without that verdict an owner is
+// attested exactly as before, whatever its shape.
+#[test]
+fn an_owner_of_a_session_of_another_os_is_never_observed_here() {
+    use crate::native::terminal::foreign::Elsewhere;
+    let unobserved = || OwnerObservers {
+        pid_alive: &|_| panic!("the PID of another OS's owner was observed here"),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        birth: &|_| panic!("the birth of another OS's owner was observed here"),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        control: &|_| panic!("the control of another OS's owner was observed here"),
+        #[cfg(windows)]
+        identity: &|_| panic!("the identity of another OS's owner was observed here"),
+    };
+    for elsewhere in [
+        Elsewhere::Kind(crate::native::terminal::TerminalKind::Tmux),
+        Elsewhere::Recorded("Windows"),
+    ] {
+        let owner = NativeSessionOwner {
+            pid: std::process::id(),
+            recorded_elsewhere: Some(elsewhere),
+            ..NativeSessionOwner::default()
+        };
+        let a = attest_owner_with(&owner, unobserved());
+        assert_eq!(a.process, ProcessObservation::Unknown(elsewhere.reason()));
+        assert_eq!(a.pid_alive, None);
+        assert_eq!(
+            serde_json::to_value(OwnerObservation::from(&a)).unwrap()["process_alive"],
+            serde_json::Value::Null
+        );
+        assert!(prune_blocked_by(&a));
+        assert!(repair_owner_is_live(&a).is_err());
     }
 }

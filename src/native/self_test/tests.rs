@@ -516,17 +516,12 @@ fn metadata_keeps_the_terminal_kind_after_close_consumes_the_handle() {
     write_json_atomic(
         &directory.join("terminal.json"),
         &crate::native::terminal::TerminalSession::new(
-            crate::native::session::test_support::lifecycle::native_kind_or(
-                crate::native::terminal::TerminalKind::Iterm2,
-            ),
+            crate::native::terminal::TerminalKind::Iterm2,
             "missing-iterm-session".to_owned(),
         ),
     )
     .unwrap();
-    let kind = crate::native::session::test_support::lifecycle::native_kind_or(
-        crate::native::terminal::TerminalKind::Iterm2,
-    );
-    let expected = ("2.1.281".to_owned(), Some(kind.as_str().to_owned()));
+    let expected = ("2.1.281".to_owned(), Some("iterm2".to_owned()));
     assert_eq!(installed.metadata("session-owned").unwrap(), expected);
 
     crate::native::session::close::close(

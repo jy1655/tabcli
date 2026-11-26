@@ -11,7 +11,6 @@ use crate::native::session::owner::{
 use crate::native::session::snapshot::Snapshot;
 use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalKind;
-use crate::native::terminal::foreign::{self, Elsewhere};
 use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
 use anyhow::Result;
 use serde_json::Value;
@@ -322,15 +321,11 @@ pub(in crate::native) enum Surface {
     Closed { consumed: bool },
     /// A claimed close handle, bound to this session or not.
     Closing { bound: bool },
-    /// An active handle. Its binding is judged before support (`ActiveHandle::of`), and a
-    /// legacy iTerm2 handle without a binding counts as bound (`verify_managed_session`).
-    /// `supported` is false for a kind this platform does not run and for a session whose
-    /// Records name another OS, which `elsewhere` names (`terminal::foreign`): the handle's
-    /// kind or Herdr host birth, then the Owner record's identity.
+    /// An active handle. Platform support is judged before the binding, and a legacy
+    /// iTerm2 handle without a binding counts as bound (`verify_managed_session`).
     Active {
         kind: TerminalKind,
         supported: bool,
-        elsewhere: Option<Elsewhere>,
         bound: bool,
         empty_id: bool,
     },
@@ -351,27 +346,19 @@ pub(in crate::native) enum ActiveHandle {
 }
 
 impl ActiveHandle {
-    /// The binding is decided before platform support; an empty id is no binding. Whether a
-    /// handle is this session's is the same fact on every OS, while whether this OS runs its
-    /// kind is not, so the same records get the same answer on every OS wherever they can.
+    /// Platform support is decided before the binding; an empty id is no binding.
     pub(in crate::native) fn of(supported: bool, bound: bool, empty_id: bool) -> Self {
-        if !bound || empty_id {
-            Self::BindingUnverified
-        } else if !supported {
+        if !supported {
             Self::Unsupported
+        } else if !bound || empty_id {
+            Self::BindingUnverified
         } else {
             Self::Bound
         }
     }
 }
 
-/// The surface record judged for `session`, with the Owner record read beside it: the one
-/// judgment every command that reads a handle before acting on it shares.
-pub(in crate::native) fn surface(
-    record: &SurfaceRecord,
-    owner: &OwnerRecord,
-    session: &str,
-) -> Surface {
+pub(in crate::native) fn surface(record: &SurfaceRecord, session: &str) -> Surface {
     let unreadable = |source, error: &anyhow::Error| Surface::Unreadable {
         source,
         reason: format!("{error:#}"),
@@ -385,16 +372,12 @@ pub(in crate::native) fn surface(
             bound: handle.verify_managed_session(session).is_ok(),
         },
         SurfaceRecord::Closing(Err(error)) => unreadable(SurfaceSource::ClosingHandle, error),
-        SurfaceRecord::Active(Ok(Some(handle))) => {
-            let elsewhere = foreign::of_handle_and_owner(handle, owner);
-            Surface::Active {
-                kind: handle.kind,
-                supported: handle.kind.supported_on_this_platform() && elsewhere.is_none(),
-                elsewhere,
-                bound: handle.verify_managed_session(session).is_ok(),
-                empty_id: handle.id.is_empty(),
-            }
-        }
+        SurfaceRecord::Active(Ok(Some(handle))) => Surface::Active {
+            kind: handle.kind,
+            supported: handle.kind.supported_on_this_platform(),
+            bound: handle.verify_managed_session(session).is_ok(),
+            empty_id: handle.id.is_empty(),
+        },
         SurfaceRecord::Active(Ok(None)) => Surface::Missing,
         SurfaceRecord::Active(Err(error)) => unreadable(SurfaceSource::ActiveHandle, error),
     }
@@ -521,7 +504,7 @@ impl Judgments {
         session: &str,
     ) -> Self {
         let request_index = self::request_index(records);
-        let surface = self::surface(&evidence.surface, &evidence.owner, session);
+        let surface = self::surface(&evidence.surface, session);
         let unreadable = unreadable_parts(
             &evidence.held,
             &evidence.owner,
@@ -1307,28 +1290,13 @@ pub(in crate::native) mod tests {
                 ),
                 None,
             ),
-            // The binding is the same fact on every OS; whether this OS runs the kind is not,
-            // so a handle that is not this session's is judged unbound everywhere.
             (
-                "unbound active handle of a kind this OS does not run",
+                "unsupported active handle, even unbound",
                 SurfaceRecord::Active(Ok(Some(handle(unsupported, None)))),
                 Surface::Active {
                     kind: unsupported,
                     supported: false,
-                    elsewhere: Some(Elsewhere::Kind(unsupported)),
                     bound: false,
-                    empty_id: false,
-                },
-                Some(ActiveHandle::BindingUnverified),
-            ),
-            (
-                "bound active handle of a kind this OS does not run",
-                SurfaceRecord::Active(Ok(Some(handle(unsupported, Some(SESSION))))),
-                Surface::Active {
-                    kind: unsupported,
-                    supported: false,
-                    elsewhere: Some(Elsewhere::Kind(unsupported)),
-                    bound: true,
                     empty_id: false,
                 },
                 Some(ActiveHandle::Unsupported),
@@ -1356,7 +1324,6 @@ pub(in crate::native) mod tests {
                     Surface::Active {
                         kind,
                         supported: true,
-                        elsewhere: None,
                         bound: true,
                         empty_id: false,
                     },
@@ -1368,7 +1335,6 @@ pub(in crate::native) mod tests {
                     Surface::Active {
                         kind,
                         supported: true,
-                        elsewhere: None,
                         bound: false,
                         empty_id: false,
                     },
@@ -1380,7 +1346,6 @@ pub(in crate::native) mod tests {
                     Surface::Active {
                         kind,
                         supported: true,
-                        elsewhere: None,
                         bound: false,
                         empty_id: false,
                     },
@@ -1392,7 +1357,6 @@ pub(in crate::native) mod tests {
                     Surface::Active {
                         kind,
                         supported: true,
-                        elsewhere: None,
                         bound: true,
                         empty_id: true,
                     },
@@ -1407,14 +1371,13 @@ pub(in crate::native) mod tests {
             Surface::Active {
                 kind: TerminalKind::Iterm2,
                 supported: true,
-                elsewhere: None,
                 bound: true,
                 empty_id: false,
             },
             Some(ActiveHandle::Bound),
         ));
         for (name, record, expected, verdict) in rows {
-            let judged = surface(&record, &OwnerRecord::Absent, SESSION);
+            let judged = surface(&record, SESSION);
             assert_eq!(judged, expected, "{name}");
             let active = match &judged {
                 Surface::Active {

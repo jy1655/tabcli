@@ -76,9 +76,8 @@ pub(super) fn decode(bytes: &[u8], session: &str) -> serde_json::Result<Recorded
 }
 
 /// One observation of the Owner record of the Session whose directory `reader` opens. The
-/// owner it yields carries what the Session's handle Records say about the OS it belongs to,
-/// so that no reader can observe this machine's processes for the owner of a session of
-/// another OS.
+/// owner it yields carries whether the Session's own Records say it belongs to another OS
+/// (`terminal::foreign`), so that no reader observes this machine's processes for its owner.
 pub(in crate::native) fn observe(reader: &Reader) -> OwnerRecord {
     let path = reader.record(CoreRecord::Owner).path().to_owned();
     match judge(read(reader), &path, session_of(reader)) {
@@ -89,12 +88,17 @@ pub(in crate::native) fn observe(reader: &Reader) -> OwnerRecord {
     }
 }
 
-/// The decoded Owner record with what the Session's handle Records say about the OS it
-/// belongs to (`terminal::foreign`). Every reader of the Owner record goes through it, so that
-/// `attest_owner_with` never observes this machine's processes for such an owner.
-pub(super) fn with_handle_evidence(mut recorded: RecordedOwner, reader: &Reader) -> RecordedOwner {
-    recorded.owner.recorded_elsewhere =
-        crate::native::terminal::foreign::of_surface_records(reader);
+/// The decoded Owner record with whether the Session's own Records say it belongs to another
+/// OS (`terminal::foreign`): its bound handle Records, then the record itself if it is bound.
+/// Every reader of the Owner record goes through it, so that `attest_owner_with` never observes
+/// this machine's processes for such an owner.
+fn with_handle_evidence(mut recorded: RecordedOwner, reader: &Reader) -> RecordedOwner {
+    use crate::native::terminal::foreign;
+    recorded.owner.recorded_elsewhere = foreign::with_owner(
+        foreign::of_handle_records(reader),
+        &recorded.owner,
+        recorded.binding,
+    );
     recorded
 }
 
@@ -168,9 +172,12 @@ pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
 
 /// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
 /// Launch repair attests the recorded process whatever Session the record names.
+/// The owner of a session of another OS is not attested here: launch repair decides nothing
+/// from it, as if it had no owner record.
 pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
     Ok(observe(reader)
         .decoded()?
+        .filter(|recorded| recorded.owner.recorded_elsewhere.is_none())
         .map(|recorded| attest_owner(&recorded.owner)))
 }
 
@@ -265,12 +272,9 @@ pub(in crate::native) fn attest_owner_with(
     owner: &NativeSessionOwner,
     observers: OwnerObservers<'_>,
 ) -> OwnerAttestation {
-    // The owner of a session of another OS, as its Records or its own identity say, is not
-    // observed here at all: no PID, birth or control observation is made or reported.
-    if let Some(elsewhere) = owner
-        .recorded_elsewhere
-        .or_else(|| crate::native::terminal::foreign::of_owner(owner))
-    {
+    // The owner of a session whose own Records say it belongs to another OS is not observed
+    // here at all: no PID, birth or control observation is made or reported.
+    if let Some(elsewhere) = owner.recorded_elsewhere {
         return OwnerAttestation {
             process: ProcessObservation::Unknown(elsewhere.reason()),
             control: ControlAttestation::NotRecorded,

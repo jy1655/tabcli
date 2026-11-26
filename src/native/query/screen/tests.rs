@@ -165,8 +165,9 @@ impl Fixture {
 }
 
 /// An owner record of this session in the shape this OS's writer records, `start` standing
-/// for the incarnation's birth: another OS's shape would make the session one of another OS
-/// (`terminal::foreign`). A check of the fake verifies whichever the record names.
+/// for the incarnation's birth: another OS's shape, bound to the session, would make it a
+/// session of another OS (`terminal::foreign`). A check of the fake verifies whichever the
+/// record names.
 fn owner(pid: u32, start: u64) -> NativeSessionOwner {
     let mut owner = NativeSessionOwner {
         pid,
@@ -599,55 +600,20 @@ fn a_handle_not_bound_to_this_session_is_refused_before_any_terminal_call() {
     };
     let mut empty = handle(kind, Some(ID));
     empty.id = String::new();
-    for (surface, expected) in [
-        (
-            handle(kind, Some("session-other")),
-            "terminal handle belongs to managed session session-other, not session-screen",
-        ),
-        (
-            handle(kind, None),
-            "terminal handle is missing its managed session binding",
-        ),
-        (
-            empty,
-            "the recorded terminal handle is not bound to session session-screen",
-        ),
+    for surface in [
+        handle(kind, Some("session-other")),
+        handle(kind, None),
+        empty,
     ] {
         let fixture = Fixture::new(SessionState::Working, Some(&surface));
         let access = Fake::new(&fixture);
         let error = refusal(fixture.observe(&access).0);
-        assert_eq!(error.to_string(), expected, "{surface:?}");
+        assert_eq!(
+            error.to_string(),
+            "the recorded terminal handle is not bound to session session-screen",
+            "{surface:?}"
+        );
         assert!(access.calls.borrow().is_empty());
-    }
-}
-
-// A handle that is not this session's is refused as unbound on every OS, whether or not this
-// OS runs its kind: the binding is the same fact everywhere, this OS's support is not. Before,
-// support was judged first, so the same records read as unbound on the kind's own OS and as
-// unsupported elsewhere.
-#[test]
-fn an_unbound_handle_is_refused_as_unbound_whatever_os_its_kind_runs_on() {
-    for kind in terminal::TerminalKind::ALL {
-        for binding in [Some("session-other"), None] {
-            if kind == terminal::TerminalKind::Iterm2 && binding.is_none() {
-                continue; // A legacy iTerm2 handle without a binding counts as bound.
-            }
-            let surface = handle(kind, binding);
-            let fixture = Fixture::new(SessionState::Working, Some(&surface));
-            let access = Fake::new(&fixture);
-            let error = refusal(fixture.observe(&access).0);
-            assert_eq!(
-                error.to_string(),
-                match binding {
-                    Some(other) => format!(
-                        "terminal handle belongs to managed session {other}, not session-screen"
-                    ),
-                    None => "terminal handle is missing its managed session binding".to_owned(),
-                },
-                "{kind:?} {binding:?}"
-            );
-            assert!(access.calls.borrow().is_empty(), "{kind:?} {binding:?}");
-        }
     }
 }
 
@@ -676,36 +642,34 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
                     declared.unwrap()
                 )
             );
+        } else if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+            // A bound handle of a kind this OS does not run makes the session one of another
+            // OS, which every command that would read its terminal refuses in one form.
+            assert_eq!(
+                text,
+                format!(
+                    "{} is not available on {}: TAB on this machine cannot judge or end this \
+                     session; once its records show it ended, an explicit close settles it \
+                     (its records are in {})",
+                    kind.display_name(),
+                    if cfg!(target_os = "macos") {
+                        "macOS"
+                    } else if cfg!(target_os = "linux") {
+                        "Linux"
+                    } else {
+                        "Windows"
+                    },
+                    fixture.directory.display()
+                )
+            );
         } else {
-            // The refusal every other command gives a kind this OS does not run.
-            let expected = if cfg!(target_os = "macos") {
-                "is not available on macOS"
-            } else if cfg!(target_os = "linux") {
-                "is not available on Linux"
-            } else if cfg!(windows) {
-                "is not available on Windows"
-            } else {
-                "is not supported on this platform"
-            };
-            if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
-                assert_eq!(
-                    text,
-                    format!(
-                        "{} {expected}: TAB on this machine cannot judge or end this session; \
-                         once its records show it ended, an explicit close settles it (its \
-                         records are in {})",
-                        kind.display_name(),
-                        fixture.directory.display()
-                    ),
-                    "{kind:?}"
-                );
-            } else {
-                assert_eq!(
-                    text,
-                    format!("the recorded terminal, {}, {expected}", kind.display_name()),
-                    "{kind:?}"
-                );
-            }
+            assert_eq!(
+                text,
+                format!(
+                    "the recorded terminal, {}, is not supported on this platform",
+                    kind.display_name()
+                )
+            );
         }
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
         assert!(access.calls.borrow().is_empty(), "{kind:?}");

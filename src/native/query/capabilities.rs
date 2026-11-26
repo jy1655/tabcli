@@ -74,16 +74,6 @@ fn cancel_value(reader: &Reader, records: &Snapshot, id: &str) -> Value {
                 }
                 value
             }
-            // The admission's one unsupported refusal: a session of another OS
-            // (`terminal::foreign`), reported as `tell`'s capability reports it.
-            None if crate::native::failure_kind::classify(&error)
-                == Some(crate::native::failure_kind::FailureKind::Unsupported) =>
-            {
-                json!({
-                    "state": "refused", "reason": "surface_unsupported",
-                    "detail": format!("{error:#}"),
-                })
-            }
             None => json!({
                 "state": "unknown", "reason": "evidence_unreadable",
                 "detail": format!("{error:#}"),
@@ -178,19 +168,37 @@ fn tell_gates(
     if evidence.recovery_required {
         return Err(Stop::unknown("recovery_required", None));
     }
-    // The one admission order (`terminal::foreign`): a closed session answers first, then the
-    // handle's binding, then a session of another OS (the surface gate). Repair leaves a
-    // session of another OS as it is, so no owner verdict of this machine's is judged for it.
-    if terminal::foreign::closed(reader) {
-        hold::ready_gate(&session::SessionState::Closed, id)?;
-    }
-    if close::repair_examines_owner(&records.status.state)
-        && terminal::foreign::of_records(reader, None).is_none()
-    {
+    // A session whose own records say it belongs to another OS (`terminal::foreign`): Repair
+    // observes nothing for it and leaves it as it is, so the owner gate passes, and `tell`'s
+    // ownership proof refuses it before any terminal call, in the one order.
+    let elsewhere = terminal::foreign::of_records(reader);
+    if close::repair_examines_owner(&records.status.state) && elsewhere.is_none() {
         owner_gate(evidence.owner)?;
     }
     let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
-    surface_gate(evidence.surface, reader)?;
+    if let Some(elsewhere) = elsewhere
+        && let Surface::Active {
+            bound, empty_id, ..
+        } = evidence.surface
+    {
+        if terminal::foreign::closed(reader) {
+            return Err(Stop::refused(
+                "state_not_ready",
+                format!("session {id} is closed; its terminal is not addressed"),
+            ));
+        }
+        if !bound || *empty_id {
+            return Err(Stop::refused(
+                "surface_unbound",
+                "the terminal handle is not bound to this session",
+            ));
+        }
+        return Err(Stop::refused(
+            "surface_unsupported",
+            format!("{:#}", elsewhere.refusal(reader.directory())),
+        ));
+    }
+    surface_gate(evidence.surface)?;
     owner_control_gate(evidence.owner, |attestation| {
         SurfaceProbe::HOST.owner_requirement(attestation)
     })?;
@@ -277,7 +285,7 @@ fn owner_ended() -> Stop {
 
 /// The recorded surface as the action reads it before its probe, judged once by the
 /// Observation (`judgment::surface`).
-fn surface_gate(surface: &Surface, reader: &Reader) -> std::result::Result<(), Stop> {
+fn surface_gate(surface: &Surface) -> std::result::Result<(), Stop> {
     match surface {
         Surface::Missing => Err(Stop::refused(
             "surface_missing",
@@ -289,19 +297,14 @@ fn surface_gate(surface: &Surface, reader: &Reader) -> std::result::Result<(), S
         )),
         Surface::Active {
             supported,
-            elsewhere,
             bound,
             empty_id,
             ..
         } => match ActiveHandle::of(*supported, *bound, *empty_id) {
             ActiveHandle::Bound => Ok(()),
-            // `tell`'s own refusal of a session of another OS.
             ActiveHandle::Unsupported => Err(Stop::refused(
                 "surface_unsupported",
-                elsewhere.map_or_else(
-                    || "the recorded terminal is not supported on this platform".to_owned(),
-                    |elsewhere| format!("{:#}", elsewhere.refusal(reader.directory())),
-                ),
+                "the recorded terminal is not supported on this platform",
             )),
             ActiveHandle::BindingUnverified => Err(Stop::refused(
                 "surface_unbound",

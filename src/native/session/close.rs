@@ -335,16 +335,12 @@ impl Reader {
         Ok(match super::owner::observe(self) {
             OwnerRecord::Absent => false,
             OwnerRecord::Unreadable(_) | OwnerRecord::Malformed { .. } => true,
-            // The owner of a closed session of another OS is never observed here, and its
-            // Records already show the session ended: it does not keep prune from removing
-            // the session (`terminal::foreign`).
+            // The owner of a closed session whose own Records say it belongs to another OS
+            // is never observed here, and its Records already show the session ended: it does
+            // not keep prune from removing the session (`terminal::foreign`).
             OwnerRecord::Recorded(recorded)
-                if terminal::foreign::closed(self)
-                    && recorded
-                        .owner
-                        .recorded_elsewhere
-                        .or_else(|| terminal::foreign::of_owner(&recorded.owner))
-                        .is_some() =>
+                if recorded.owner.recorded_elsewhere.is_some()
+                    && terminal::foreign::closed(self) =>
             {
                 false
             }
@@ -442,10 +438,27 @@ where
     let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let _turn_lock = store.lock()?;
     let status: SessionStatus = store.status()?;
+    // Whether this session's own Records say it belongs to another OS (`terminal::foreign`),
+    // read under this lock. Only such a session's close is decided differently below.
+    let elsewhere = terminal::foreign::of_records(store);
+    let marker = store
+        .record(CoreRecord::TerminalClosed)
+        .bytes()?
+        .map(|bytes| terminal::foreign::consumed_kind(&bytes));
     if status.state == SessionState::Closed {
-        let kept = kept_terminal_kind(store);
-        let consume_result =
-            consume_terminal_handle(store, kept.as_deref(), close_error.as_deref());
+        // A copy keeps the kind it consumed: its valid consumption marker's, else its
+        // remaining handle's. Any other session's marker is rewritten as it always was.
+        let kept = match elsewhere {
+            Some(_) => marker
+                .flatten()
+                .or(settled_handle(store)?.flatten().map(|h| h.kind)),
+            None => None,
+        };
+        let consume_result = consume_terminal_handle(
+            store,
+            kept.map(|kind| kind.as_str()),
+            close_error.as_deref(),
+        );
         let close_result =
             mark_session_closed_locked(store, &claim_path, close_error.or(status.error));
         consume_result?;
@@ -455,30 +468,37 @@ where
     let terminal_path = store.record(CoreRecord::Terminal).path().to_owned();
     let closing = store.record(CoreRecord::TerminalClosing);
     let closing_path = closing.path().to_owned();
-    if store.record(CoreRecord::TerminalClosed).present()? {
+    // A finished consumption completes as it always did. For a copy only a marker that
+    // decodes and says `consumed: true` is one, and the kind it names is kept.
+    let copy_consumed = elsewhere.and(marker.flatten());
+    if store.record(CoreRecord::TerminalClosed).present()?
+        && (elsewhere.is_none() || copy_consumed.is_some())
+    {
         close_error = merge_close_reason(close_error, terminal_consumption_reason(store)?);
-        let kept = kept_terminal_kind(store);
-        let consume_result =
-            consume_terminal_handle(store, kept.as_deref(), close_error.as_deref());
+        let consume_result = consume_terminal_handle(
+            store,
+            copy_consumed.map(|kind| kind.as_str()),
+            close_error.as_deref(),
+        );
         let close_result = mark_session_closed_locked(store, &claim_path, close_error);
         consume_result?;
         return close_result;
     }
-    // A session of another OS (`terminal::foreign`) is decided from its Records alone, under
-    // this lock, after a closed session and a finished consumption (above) and after its
-    // handle's binding: a handle that is not this session's, or that cannot be read, takes
-    // the ordinary path, whose ownership check refuses it. One that its Records show ended
-    // (`foreign::ended`) is settled with no terminal call and no process observation: its
-    // handle, active or claimed, is consumed as an ordinary close consumes it, and the
-    // session is closed. Any other is refused and nothing is written.
-    if let Some(elsewhere) = terminal::foreign::of_records(store, None)
+    // A copy (`terminal::foreign`) is decided from its Records alone, after a closed session
+    // and a finished consumption (above) and after its handle's binding: a handle that is not
+    // this session's, or that cannot be read, takes the ordinary path, whose ownership check
+    // refuses it. One its Records show ended (`foreign::ended`) is settled with no terminal
+    // call and no process observation: its handle, active or claimed, is consumed as an
+    // ordinary close consumes it, keeping its kind and the session's failure diagnosis, and
+    // the session is closed. Any other is refused and nothing is written.
+    if let Some(elsewhere) = elsewhere
         && let Some(handle) = settled_handle(store)?
     {
         if !terminal::foreign::ended(&status.state) {
             return Err(elsewhere.refusal(store.directory()));
         }
         close_error = merge_close_reason(
-            close_error,
+            merge_close_reason(close_error, status.error.clone()),
             Some(format!(
                 "settled from its records alone ({}); no terminal or process was observed or closed",
                 elsewhere.head()
@@ -575,32 +595,10 @@ where
     close_result
 }
 
-/// The terminal kind a close that finishes from its records keeps in the tombstone it
-/// rewrites: the remaining handle's, else the kind the tombstone already records. Finishing a
-/// close never erases which terminal was consumed, which the judgment of a session of another
-/// OS reads (`terminal::foreign`); `None` when no record names one.
-fn kept_terminal_kind(store: &Store) -> Option<String> {
-    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-        if let Ok(Some(handle)) = store
-            .record(record)
-            .optional_json_with(super::record::terminal)
-        {
-            return Some(handle.kind.as_str().to_owned());
-        }
-    }
-    store
-        .record(CoreRecord::TerminalClosed)
-        .optional_json_with(super::record::terminal_tombstone_value)
-        .ok()
-        .flatten()?
-        .get("terminal")?
-        .as_str()
-        .map(str::to_owned)
-}
-
-/// The handle a settlement of a session of another OS consumes: the active one, else the
-/// claimed one an interrupted close left, `Some(None)` when there is none. `None` when the
-/// recorded handle cannot be read or is not this session's: the ordinary path answers it.
+/// The handle a settlement of a copy consumes: the active one, else the claimed one an
+/// interrupted close left, `Some(None)` when there is none. `None` when the recorded handle
+/// cannot be read or is not this session's (`terminal::foreign::binding`): the ordinary path
+/// answers it.
 fn settled_handle(store: &Store) -> Result<Option<Option<terminal::TerminalSession>>> {
     let id = store
         .directory()
@@ -613,7 +611,7 @@ fn settled_handle(store: &Store) -> Result<Option<Option<terminal::TerminalSessi
             .optional_json_with(super::record::terminal)
         {
             Ok(None) => continue,
-            Ok(Some(handle)) if handle.verify_managed_session(id).is_ok() => {
+            Ok(Some(handle)) if terminal::foreign::binding(&handle, id).is_ok() => {
                 return Ok(Some(Some(handle)));
             }
             Ok(Some(_)) | Err(_) => return Ok(None),
@@ -974,12 +972,6 @@ fn repair_dead_owner_with(
         Some(error) => Err(error),
         None => Ok(false),
     };
-    // A session whose Records name another OS (`terminal::foreign`) is not judged from this
-    // machine's processes or clock, neither its launch nor its owner: Repair leaves it exactly
-    // as it is, and the command that would act on it refuses it in the one admission order.
-    if terminal::foreign::of_records(store, None).is_some() {
-        return untouched(recovery_damage);
-    }
     if launch::repair(store)? {
         return untouched(recovery_damage);
     }
@@ -992,6 +984,12 @@ fn repair_dead_owner_with(
         return untouched(recovery_damage);
     };
     let owner = owner.owner;
+    // The owner of a session whose own Records say it belongs to another OS is never observed
+    // here, and nothing is decided from it: Repair leaves the session as it is
+    // (`terminal::foreign`). What its Records alone settle was settled above.
+    if owner.recorded_elsewhere.is_some() {
+        return untouched(recovery_damage);
+    }
     let owner_live = owner_is_live(&owner)?;
     if owner_live {
         return untouched(recovery_damage);

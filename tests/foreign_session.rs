@@ -1,35 +1,36 @@
-//! A Session whose Records belong to another OS, as a state directory copied between machines
-//! holds it. Its Records say so positively: the kind of its active, claimed or consumed handle,
-//! a Herdr handle's recorded host birth, or the identity its Owner record carries. A PID-only or
-//! absent Owner record does not hide such a terminal.
+//! A Session whose own Records positively say it belongs to another OS, as a state directory
+//! copied between machines holds it: its bound active handle names a kind this OS does not run
+//! (or, for Herdr, a host born on another OS), its consumption marker says it consumed such a
+//! kind, or its bound Owner record has another OS's identity.
 //!
-//! Every public command that `describe` lists is classified below, and the test runs each one
-//! against every fixture. A command that acts on a session gives the one refusal (or, for a
-//! closed copy, the closed answer that comes first) and writes nothing. The explicit close and
-//! prune decide from the Records alone: the close settles a copy they show ended (exited or
-//! failed) with no terminal call and refuses one they leave running; prune removes a closed copy
-//! and keeps the others. A command that only reads keeps working, writes nothing and reports no
-//! observation of this machine's processes; a command that takes no session is listed as such.
-//! A command added later that is on none of the lists fails the test. The same on macOS, Linux
-//! and Windows.
+//! For such a Session TAB does nothing that depends on this machine's terminals or processes,
+//! and everything it does from Records alone is as before. Every public command that
+//! `describe` lists is classified below and run against every fixture:
+//! - `tell`, `screen` and doctor's probe give the one refusal where they would address the
+//!   terminal, in one order (closed, then unbound, then another OS);
+//! - the explicit close settles a copy whose Records show it ended and refuses any other, and
+//!   prune removes a closed copy; a settlement followed by prune removes the same fixture;
+//! - every other command gives its answer from Records, as before.
+//!
+//! No command connects to the Herdr Core or tmux server the fixture's handle names, or reports
+//! a local observation of the owner (a PID-only owner is this test's own, alive here). A
+//! command added later that is on no list fails the test. The same on macOS, Linux and Windows.
 #![cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
-/// Commands that act on a session and never settle a copy: each gives the one refusal and
-/// writes nothing.
-const ACTS: &[&str] = &["tell", "hold", "cancel", "reopen", "screen"];
-/// Commands that settle a copy its Records show ended, from those Records alone.
+/// Commands that would address the session's terminal: they give the one refusal there.
+const REFUSES: &[&str] = &["tell", "screen", "doctor"];
+/// Commands that settle a copy from its Records: the explicit close and prune.
 const SETTLES: &[&str] = &["close-session", "prune-sessions"];
-/// Commands that only read records (`sessions` runs Repair, which leaves such a session as it
-/// is): each writes nothing and reports no observation of a local process about the owner.
-const READS: &[&str] = &[
-    "status", "inspect", "result", "wait", "search", "doctor", "sessions",
+/// Commands that act from Records alone, exactly as before.
+const RECORDS: &[&str] = &[
+    "hold", "cancel", "reopen", "status", "inspect", "result", "wait", "search", "sessions",
 ];
 /// Commands that take no session.
 const NO_SESSION: &[&str] = &["describe", "ask", "self-test", "consent", "settings"];
@@ -37,6 +38,7 @@ const NO_SESSION: &[&str] = &["describe", "ask", "self-test", "consent", "settin
 const ID: &str = "session-foreign";
 const CLAIM: &str = "7-7-7";
 const REQUEST: &str = "request-foreign";
+const FAILURE: &str = "the provider failed";
 
 // This OS's name.
 fn here() -> &'static str {
@@ -51,10 +53,10 @@ fn here() -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Owner {
-    /// The Owner record that the terminal's own OS writes, for a PID absent here.
+    /// The Owner record that the terminal's own OS writes, bound, for a PID absent here.
     Full,
-    /// A PID-only record whose PID is this test's own, alive here: any local observation of
-    /// it would report a live process.
+    /// A bound PID-only record whose PID is this test's own, alive here: any local observation
+    /// of it would report a live process.
     PidOnly,
     Absent,
 }
@@ -62,40 +64,44 @@ enum Owner {
 /// Where the fixture's handle is recorded.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Handle {
-    /// The active handle (`terminal.json`).
+    /// The active handle, bound to the session.
     Active,
-    /// Claimed by a close that was interrupted before it consumed it (`terminal.closing.json`).
+    /// Claimed by a close interrupted before it consumed it.
     Claimed,
-    /// Consumed by a close: its kind is kept in the consumption marker only
-    /// (`terminal.closed.json`).
+    /// Consumed: a marker that says so and keeps its kind, beside a leftover Herdr handle.
     Consumed,
 }
 
 #[derive(Clone, Debug)]
 struct Case {
     name: String,
-    /// The handle record, or the consumption marker for a consumed one.
-    terminal: Value,
+    /// The handle's kind as its record names it.
     kind: &'static str,
+    terminal: Value,
     handle: Handle,
     origin: &'static str,
     owner: Owner,
     state: &'static str,
-    /// The session is closed (`closed.json`).
     closed: bool,
-    /// A launch whose receipt deadline has passed, with its claim.
     expired_launch: bool,
-    /// A turn in progress: a claim and its request.
     working: bool,
     /// What the Records name: the start of the one refusal.
     head: String,
 }
 
 impl Case {
-    // Whether the explicit close settles it from its records: they show it ended, or a close
-    // already consumed its handle, or it is closed.
+    // Whether the explicit close settles it: closed, already consumed, or ended; an expired
+    // launch is settled as failed from its records first, as before.
     fn settles(&self) -> bool {
-        self.closed || self.handle == Handle::Consumed || ["exited", "failed"].contains(&self.state)
+        self.closed
+            || self.handle == Handle::Consumed
+            || self.expired_launch
+            || ["exited", "failed"].contains(&self.state)
+    }
+
+    // Whether an active handle is recorded (a consumed copy keeps a leftover one).
+    fn active(&self) -> bool {
+        self.handle == Handle::Active || (self.handle == Handle::Consumed && !self.closed)
     }
 }
 
@@ -103,6 +109,7 @@ fn handle(terminal: &str) -> Value {
     json!({"terminal": terminal, "session_id": "surface", "managed_session_id": ID})
 }
 
+// A Herdr handle born on `origin`, naming a socket in the fixture root.
 fn herdr(origin: &str) -> Value {
     let birth = match origin {
         "macOS" => json!({"host_start_seconds": 1, "host_start_microseconds": 2}),
@@ -110,8 +117,8 @@ fn herdr(origin: &str) -> Value {
             "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 7}}),
         _ => json!({"host_creation_time": 1}),
     };
-    let mut core = json!({"socket": "/tmp/herdr-core.sock", "core_id": "core-a",
-        "created_ms": 1, "host_pid": 4});
+    let mut core = json!({"socket": "HERDR_SOCKET", "core_id": "core-a", "created_ms": 1,
+        "host_pid": 4});
     for (key, value) in birth.as_object().unwrap() {
         core[key] = value.clone();
     }
@@ -122,19 +129,6 @@ fn herdr(origin: &str) -> Value {
 fn cases() -> Vec<Case> {
     let os = here();
     let mut cases = Vec::new();
-    let base = |name: String, terminal, kind, origin, owner, head: String| Case {
-        name,
-        terminal,
-        kind,
-        handle: Handle::Active,
-        origin,
-        owner,
-        state: "ready",
-        closed: false,
-        expired_launch: false,
-        working: false,
-        head,
-    };
     for (terminal, name, origin) in [
         ("iterm2", "iTerm2", "macOS"),
         ("apple-terminal", "Terminal.app", "macOS"),
@@ -147,96 +141,84 @@ fn cases() -> Vec<Case> {
         if origin == os {
             continue;
         }
-        let head = format!("{name} is not available on {os}");
-        let base = |name: String, owner| {
-            base(
-                name,
-                handle(terminal),
-                terminal,
-                origin,
-                owner,
-                head.clone(),
-            )
+        let base = |label: &str, state: &'static str, owner| Case {
+            name: format!("{terminal}, {label}"),
+            kind: terminal,
+            terminal: handle(terminal),
+            handle: Handle::Active,
+            origin,
+            owner,
+            state,
+            closed: false,
+            expired_launch: false,
+            working: false,
+            head: format!("{name} is not available on {os}"),
         };
-        for owner in [Owner::Full, Owner::PidOnly, Owner::Absent] {
-            cases.push(base(format!("{terminal}, owner {owner:?}"), owner));
+        for (label, owner) in [
+            ("ready, owner", Owner::Full),
+            ("ready, PID-only owner", Owner::PidOnly),
+            ("ready, no owner", Owner::Absent),
+        ] {
+            cases.push(base(label, "ready", owner));
         }
         cases.push(Case {
-            state: "launching",
             expired_launch: true,
-            ..base(
-                format!("{terminal}, expired launch, no owner"),
-                Owner::Absent,
-            )
+            ..base("expired launch, no owner", "launching", Owner::Absent)
         });
         cases.push(Case {
-            state: "working",
             working: true,
-            ..base(format!("{terminal}, working"), Owner::Full)
+            ..base("working", "working", Owner::Full)
         });
+        // A claimed handle is no evidence: the Owner record names the OS.
+        let owner_head = format!("a session recorded on {origin} is not available on {os}");
         cases.push(Case {
-            state: "working",
             handle: Handle::Claimed,
-            ..base(
-                format!("{terminal}, working, interrupted close"),
-                Owner::Full,
-            )
+            head: owner_head.clone(),
+            ..base("working, interrupted close", "working", Owner::Full)
         });
+        cases.push(base("exited", "exited", Owner::Full));
+        cases.push(base("failed, PID-only owner", "failed", Owner::PidOnly));
         cases.push(Case {
-            state: "exited",
-            ..base(format!("{terminal}, exited"), Owner::Full)
-        });
-        cases.push(Case {
-            state: "failed",
-            ..base(
-                format!("{terminal}, failed, PID-only owner"),
-                Owner::PidOnly,
-            )
-        });
-        cases.push(Case {
-            state: "failed",
             handle: Handle::Claimed,
-            ..base(
-                format!("{terminal}, failed, interrupted close"),
-                Owner::Full,
-            )
+            head: owner_head,
+            ..base("failed, interrupted close", "failed", Owner::Full)
         });
         cases.push(Case {
-            state: "exited",
             handle: Handle::Consumed,
             terminal: json!({"consumed": true, "terminal": terminal}),
-            ..base(format!("{terminal}, exited, handle consumed"), Owner::Full)
+            ..base("exited, handle consumed", "exited", Owner::PidOnly)
         });
         cases.push(Case {
-            state: "closed",
+            handle: Handle::Consumed,
             closed: true,
-            handle: Handle::Consumed,
             terminal: json!({"consumed": true, "terminal": terminal}),
-            ..base(format!("{terminal}, closed copy"), Owner::Full)
+            ..base("closed copy", "closed", Owner::Full)
         });
     }
     for origin in ["macOS", "Linux", "Windows"] {
-        if origin != os {
-            let born = base(
-                format!("herdr born on {origin}, no owner"),
-                herdr(origin),
-                "herdr",
-                origin,
-                Owner::Absent,
-                format!("a session recorded on {origin} is not available on {os}"),
-            );
+        if origin == os {
+            continue;
+        }
+        for state in ["ready", "exited"] {
             cases.push(Case {
-                state: "exited",
-                name: format!("herdr born on {origin}, exited, no owner"),
-                ..born.clone()
+                name: format!("herdr born on {origin}, {state}, no owner"),
+                kind: "herdr",
+                terminal: herdr(origin),
+                handle: Handle::Active,
+                origin,
+                owner: Owner::Absent,
+                state,
+                closed: false,
+                expired_launch: false,
+                working: false,
+                head: format!("a session recorded on {origin} is not available on {os}"),
             });
-            cases.push(born);
         }
     }
     cases
 }
 
-// The Owner record that `os`'s writer records.
+// The Owner record that `os`'s writer records, bound to the session.
 fn owner(os: &str, pid: u32) -> Value {
     let mut owner = json!({"pid": pid, "managed_session_id": ID});
     match os {
@@ -283,16 +265,59 @@ fn absent_pid() -> u32 {
     pid
 }
 
+// The endpoints a fixture's handle names, listening, so that any connection is counted: the
+// Herdr Core socket its Herdr handle records, and the tmux server socket of the session.
+#[cfg(unix)]
+struct Endpoints(Vec<std::os::unix::net::UnixListener>);
+
+#[cfg(unix)]
+impl Endpoints {
+    fn listen(paths: &[PathBuf]) -> Self {
+        Self(
+            paths
+                .iter()
+                .map(|path| {
+                    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    listener
+                })
+                .collect(),
+        )
+    }
+
+    // The connections made since the last count.
+    fn connections(&self) -> usize {
+        self.0
+            .iter()
+            .map(|listener| std::iter::from_fn(|| listener.accept().ok()).count())
+            .sum()
+    }
+}
+
+// Windows has no Unix socket listener here; its endpoints are named pipes no fixture names.
+#[cfg(not(unix))]
+struct Endpoints;
+
+#[cfg(not(unix))]
+impl Endpoints {
+    fn listen(_: &[PathBuf]) -> Self {
+        Self
+    }
+
+    fn connections(&self) -> usize {
+        0
+    }
+}
+
 struct Fixture {
     root: tempfile::TempDir,
+    endpoints: Endpoints,
 }
 
 impl Fixture {
     fn new(case: &Case) -> Self {
-        let fixture = Self {
-            root: tempfile::tempdir().unwrap(),
-        };
-        let directory = fixture.directory();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(ID);
         fs::create_dir_all(directory.join("events")).unwrap();
         fs::create_dir_all(directory.join("requests")).unwrap();
         // The lifecycle locks exist, as in every session, so that taking one writes nothing.
@@ -306,13 +331,14 @@ impl Fixture {
                 "pi",
                 "pi".as_ref(),
                 "1.5.0",
-                &fixture.root.path().canonicalize().unwrap(),
+                &root.path().canonicalize().unwrap(),
                 "copied from another OS",
             ),
         );
+        let error = (case.state == "failed").then_some(FAILURE);
         support::write(
             &directory.join("status.json"),
-            &support::status(case.state, 2, None),
+            &support::status(case.state, 2, error),
         );
         if case.closed {
             support::write(
@@ -320,12 +346,22 @@ impl Fixture {
                 &support::status("closed", 2, None),
             );
         }
-        let record = match case.handle {
-            Handle::Active => "terminal.json",
-            Handle::Claimed => "terminal.closing.json",
-            Handle::Consumed => "terminal.closed.json",
-        };
-        support::write(&directory.join(record), &case.terminal);
+        let socket = root.path().join("herdr-core.sock");
+        let mut terminal = case.terminal.clone();
+        if terminal["herdr_core"].is_object() {
+            terminal["herdr_core"]["socket"] = json!(socket);
+        }
+        match case.handle {
+            Handle::Active => support::write(&directory.join("terminal.json"), &terminal),
+            Handle::Claimed => support::write(&directory.join("terminal.closing.json"), &terminal),
+            Handle::Consumed => {
+                support::write(&directory.join("terminal.closed.json"), &terminal);
+                if !case.closed {
+                    // A leftover handle of a kind this OS runs: the marker's kind is kept.
+                    support::write(&directory.join("terminal.json"), &handle("herdr"));
+                }
+            }
+        }
         match case.owner {
             Owner::Full => support::write(
                 &directory.join("native-session.json"),
@@ -352,7 +388,8 @@ impl Fixture {
                 &support::receipt(REQUEST, CLAIM, "event-7.json"),
             );
         }
-        fixture
+        let endpoints = Endpoints::listen(&[socket, directory.join("tmux.sock")]);
+        Self { root, endpoints }
     }
 
     fn directory(&self) -> PathBuf {
@@ -391,10 +428,57 @@ impl Fixture {
                 .collect::<Vec<_>>(),
         )
     }
+
+    // The records, without the listening sockets.
+    fn records(&self) -> Vec<support::Entry> {
+        fn walk(directory: &Path, entries: &mut Vec<support::Entry>) {
+            let mut children: Vec<_> = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            children.sort();
+            for path in children {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    entries.push((path.clone(), None));
+                    walk(&path, entries);
+                } else {
+                    entries.push((path.clone(), Some(fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        walk(self.root.path(), &mut entries);
+        entries
+    }
+
+    // Moves the closed status records back in time, as days passing would, so that prune's
+    // retention cutoff covers a settlement just made.
+    fn age_closed_records(&self) {
+        for name in ["status.json", "closed.json"] {
+            let path = self.directory().join(name);
+            let mut status = read_json(&path);
+            status["updated_unix_ms"] = json!(2);
+            support::write(&path, &status);
+        }
+    }
 }
 
 fn reply(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
+}
+
+// A record as JSON; null when it is missing or unreadable, so that a departure is reported.
+fn read_json(path: &Path) -> Value {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null)
 }
 
 // The command's arguments against this fixture's session.
@@ -426,36 +510,7 @@ fn arguments(command: &str) -> Vec<String> {
     args.into_iter().map(str::to_owned).collect()
 }
 
-// What a command that acts answers for this fixture: the closed answer for a closed copy (the
-// session's own state comes first), a surface being closed or already consumed for `screen`,
-// the one refusal otherwise. `None` where the answer is the command's own read of a missing
-// active handle (`tell` reads `terminal.json`).
-fn acting_answer(command: &str, case: &Case, refusal: &str) -> Option<String> {
-    if case.closed && command != "reopen" {
-        return Some(match command {
-            "tell" => format!("session {ID} is closed; tell requires the ready state"),
-            "hold" => "the session is closed; a hold cannot be set or released".to_owned(),
-            "cancel" => {
-                format!("session {ID} is closed; cancel requires the running or working state")
-            }
-            _ => format!("session {ID} is closed; its terminal surface is not read"),
-        });
-    }
-    if case.handle != Handle::Active {
-        match command {
-            "screen" => {
-                return Some(format!(
-                    "the terminal surface of session {ID} is closed or being closed"
-                ));
-            }
-            "tell" => return None,
-            _ => {}
-        }
-    }
-    Some(refusal.to_owned())
-}
-
-// Every owner observation a read reports for the session: none may come from this machine.
+// Every owner observation a command reports: none may come from this machine.
 fn owner_observations(value: &Value) -> Vec<Value> {
     let mut found = Vec::new();
     fn walk(value: &Value, found: &mut Vec<Value>) {
@@ -500,17 +555,71 @@ fn failure(output: &Output) -> String {
         .to_owned()
 }
 
-// A record as JSON; null when it is missing or unreadable, so that a departure is reported.
-fn read_json(path: &std::path::Path) -> Value {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or(Value::Null)
+// What a command answers for this fixture. `Ok(None)` is a success whose details the caller
+// checks; `Err(text)` a failure whose error is `text` or ends with it.
+fn expected(command: &str, case: &Case, fixture: &Fixture) -> Result<Option<Value>, String> {
+    let refusal = fixture.refusal(&case.head);
+    let state = if case.closed { "closed" } else { case.state };
+    match command {
+        // The proof refuses an active handle; without one, `tell` reads no handle, as before.
+        "tell" if case.active() => Err(refusal),
+        "tell" => Err("terminal.json: No such file or directory (os error 2)".to_owned()),
+        "screen" if case.closed => Err(format!(
+            "session {ID} is closed; its terminal surface is not read"
+        )),
+        "screen" if case.handle == Handle::Active => Err(refusal),
+        "screen" => Err(format!(
+            "the terminal surface of session {ID} is closed or being closed"
+        )),
+        "hold" if case.closed => {
+            Err("the session is closed; a hold cannot be set or released".to_owned())
+        }
+        "hold" => Ok(Some(json!({"held": true}))),
+        "cancel" if case.working => Err(
+            "this session was started by an extension without cancel support; start a new session"
+                .to_owned(),
+        ),
+        "cancel" if state == "working" => {
+            Err(format!("session {ID} has no active claim to cancel"))
+        }
+        "cancel" => Err(format!(
+            "session {ID} is {state}; cancel requires the running or working state"
+        )),
+        "reopen" if case.closed => Err(format!(
+            "reopen refused (source-identity-missing): session {ID} has no pi event that records a provider session id; a session whose only turn failed cannot be reopened"
+        )),
+        "reopen" => Err(format!(
+            "reopen refused (source-not-closed): session {ID} is {state}; reopen requires a session closed with its closed tombstone"
+        )),
+        "result" => Err("no published result is available for this selection".to_owned()),
+        "wait" if case.working => {
+            Err("waiting timed out; no request was cancelled or resent".to_owned())
+        }
+        "wait" => Err(format!(
+            "no such TAB request: {REQUEST}; legacy events have no request mapping"
+        )),
+        "close-session" if !case.settles() => Err(refusal),
+        "prune-sessions" if case.closed => Ok(Some(json!({"pruned": [ID]}))),
+        "prune-sessions" => Ok(Some(json!({"pruned": []}))),
+        _ => Ok(None),
+    }
 }
 
 #[test]
 fn every_public_command_is_classified_for_a_session_of_another_os() {
     let probe = Fixture::new(&cases()[0]);
+    // The endpoint counter counts: one connection to each endpoint a fixture listens on.
+    #[cfg(unix)]
+    {
+        for path in [
+            probe.root.path().join("herdr-core.sock"),
+            probe.directory().join("tmux.sock"),
+        ] {
+            drop(std::os::unix::net::UnixStream::connect(path).unwrap());
+        }
+        assert_eq!(probe.endpoints.connections(), 2);
+        assert_eq!(probe.endpoints.connections(), 0);
+    }
     let described = reply(&probe.output(&["describe", "--json"]));
     let names: Vec<String> = described["commands"]
         .as_array()
@@ -520,16 +629,16 @@ fn every_public_command_is_classified_for_a_session_of_another_os() {
         .collect();
     assert!(!names.is_empty());
     for name in &names {
-        let classes = [ACTS, SETTLES, READS, NO_SESSION]
+        let classes = [REFUSES, SETTLES, RECORDS, NO_SESSION]
             .iter()
             .filter(|class| class.contains(&name.as_str()))
             .count();
         assert_eq!(
             classes, 1,
-            "{name} must be on exactly one list: does it act on a session, settle one from its records, only read records, or take no session?"
+            "{name} must be on exactly one list: does it address the terminal, settle from records, act from records alone, or take no session?"
         );
     }
-    for class in [ACTS, SETTLES, READS, NO_SESSION] {
+    for class in [REFUSES, SETTLES, RECORDS, NO_SESSION] {
         for name in class {
             assert!(
                 names.iter().any(|listed| listed == name),
@@ -540,14 +649,13 @@ fn every_public_command_is_classified_for_a_session_of_another_os() {
 }
 
 #[test]
-fn a_session_of_another_os_is_refused_settled_from_its_records_or_only_read() {
+fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
     // Every departure is collected, so that one run names all of them.
     let mut failures = Vec::new();
     for case in cases() {
-        for command in ACTS.iter().chain(SETTLES).chain(READS) {
+        for command in REFUSES.iter().chain(SETTLES).chain(RECORDS) {
             let fixture = Fixture::new(&case);
-            let refusal = fixture.refusal(&case.head);
-            let before = support::entries(fixture.root.path());
+            let before = fixture.records();
             let output = fixture.run(command);
             let text = format!(
                 "{}{}",
@@ -560,105 +668,120 @@ fn a_session_of_another_os_is_refused_settled_from_its_records_or_only_read() {
                 }
             };
             check(
+                fixture.endpoints.connections() == 0,
+                "connected to the terminal's endpoint",
+            );
+            check(
                 !text.contains("relative-herdr-core.sock"),
                 "addressed a Herdr Core",
             );
-            let unchanged = support::entries(fixture.root.path()) == before;
-            if ACTS.contains(command) {
-                check(!output.status.success(), "succeeded");
-                check(unchanged, "changed the records");
-                let Some(answer) = acting_answer(command, &case, &refusal) else {
-                    continue;
-                };
-                let error = failure(&output);
-                check(
-                    error == answer || error.ends_with(&format!(": {answer}")),
-                    &format!("not `{answer}`"),
-                );
-                if answer == refusal {
-                    check(
-                        reply(&output)["failure_kind"] == "unsupported",
-                        "not an unsupported failure",
-                    );
-                }
-                continue;
-            }
-            if *command == "close-session" {
-                let directory = fixture.directory();
-                if !case.settles() {
-                    // A copy its records leave running is not ended from here.
-                    check(!output.status.success(), "succeeded");
-                    check(unchanged, "changed the records");
-                    check(
-                        String::from_utf8_lossy(&output.stderr)
-                            .ends_with(&format!("Caused by:\n    {refusal}\n")),
-                        &format!("not `{refusal}`"),
-                    );
-                    continue;
-                }
-                // Settled from the records alone: the handle, active or claimed, is consumed
-                // as a close consumes it, keeping its kind, and the session is closed.
-                check(output.status.success(), "did not settle");
-                check(
-                    read_json(&directory.join("status.json"))["state"] == "closed",
-                    "status is not closed",
-                );
-                check(
-                    read_json(&directory.join("closed.json"))["state"] == "closed",
-                    "no closed record",
-                );
-                check(
-                    !directory.join("terminal.json").exists()
-                        && !directory.join("terminal.closing.json").exists(),
-                    "a handle remains",
-                );
-                let marker = read_json(&directory.join("terminal.closed.json"));
-                check(
-                    marker["consumed"] == true && marker["terminal"] == case.kind,
-                    "the consumption marker does not keep the kind",
-                );
-                if !case.closed && case.handle != Handle::Consumed {
-                    check(
-                        read_json(&directory.join("status.json"))["error"]
-                            .as_str()
-                            .is_some_and(|error| {
-                                error.contains(&format!(
-                                    "settled from its records alone ({})",
-                                    case.head
-                                ))
-                            }),
-                        "the closed status does not say how it was settled",
-                    );
-                }
-                continue;
-            }
-            if *command == "prune-sessions" {
-                let pruned = reply(&output)["pruned"].clone();
-                check(output.status.success(), "failed");
-                if case.closed {
-                    // A closed copy is removed, whatever OS recorded its owner.
-                    check(pruned == json!([ID]), "the closed copy was kept");
-                    check(!fixture.directory().exists(), "the directory remains");
-                } else {
-                    check(pruned == json!([]), "an open copy was pruned");
-                    check(unchanged, "changed the records");
-                }
-                continue;
-            }
-            check(unchanged, "changed the records");
             let value = reply(&output);
             for observation in owner_observations(&value) {
                 check(observation.is_null(), "reported a local owner observation");
             }
+            match expected(command, &case, &fixture) {
+                Err(answer) => {
+                    check(!output.status.success(), "succeeded");
+                    let error = failure(&output);
+                    check(
+                        error == answer || error.ends_with(&answer),
+                        &format!("not `{answer}`"),
+                    );
+                    if answer == fixture.refusal(&case.head) && *command != "close-session" {
+                        check(
+                            value["failure_kind"] == "unsupported",
+                            "not an unsupported failure",
+                        );
+                    }
+                }
+                Ok(details) => {
+                    check(output.status.success(), "failed");
+                    check(!value.is_null(), "no JSON answer");
+                    if let Some(Value::Object(details)) = details {
+                        for (key, expected) in details {
+                            check(
+                                value[&key] == expected,
+                                &format!("`{key}` is not {expected}"),
+                            );
+                        }
+                    }
+                }
+            }
+            // What may change: an expired launch is settled from its records by the commands
+            // that converge, as before; `hold` writes its record; the close and prune settle.
+            let after = fixture.records();
+            match *command {
+                "close-session" if case.settles() => {
+                    let directory = fixture.directory();
+                    let status = read_json(&directory.join("status.json"));
+                    check(status["state"] == "closed", "status is not closed");
+                    check(
+                        read_json(&directory.join("closed.json"))["state"] == "closed",
+                        "no closed record",
+                    );
+                    check(
+                        !directory.join("terminal.json").exists()
+                            && !directory.join("terminal.closing.json").exists(),
+                        "a handle remains",
+                    );
+                    let marker = read_json(&directory.join("terminal.closed.json"));
+                    check(
+                        marker["consumed"] == true && marker["terminal"] == case.kind,
+                        "the consumption marker does not keep the consumed kind",
+                    );
+                    let error = status["error"].as_str().unwrap_or_default().to_owned();
+                    if !case.closed && case.handle != Handle::Consumed {
+                        check(
+                            error.contains(&format!(
+                                "settled from its records alone ({})",
+                                case.head
+                            )),
+                            "the closed status does not say how it was settled",
+                        );
+                    }
+                    if case.state == "failed" {
+                        check(error.contains(FAILURE), "the failure diagnosis was lost");
+                    }
+                    // The same copy, once its retention has passed, is pruned without a local
+                    // observation of its owner.
+                    fixture.age_closed_records();
+                    let pruned = fixture.run("prune-sessions");
+                    check(
+                        reply(&pruned)["pruned"] == json!([ID]) && !directory.exists(),
+                        "the settled copy was not pruned",
+                    );
+                    check(
+                        fixture.endpoints.connections() == 0,
+                        "prune connected to the terminal's endpoint",
+                    );
+                }
+                "prune-sessions" if case.closed => {
+                    check(!fixture.directory().exists(), "the closed copy remains");
+                }
+                "hold" if !case.closed => {
+                    let others = |entries: Vec<support::Entry>| -> Vec<support::Entry> {
+                        entries
+                            .into_iter()
+                            .filter(|(path, _)| !path.ends_with("hold.json"))
+                            .collect()
+                    };
+                    check(
+                        others(after) == others(before),
+                        "changed a record besides the hold",
+                    );
+                }
+                "tell" | "sessions" if case.expired_launch => {}
+                _ => check(after == before, "changed the records"),
+            }
             if *command == "doctor" {
-                // The probe's answer: the closed one first, then a missing active handle, the
-                // one refusal otherwise.
-                let answer = if case.closed {
-                    format!("session {ID} is closed; its terminal surface is not read")
-                } else if case.handle != Handle::Active {
+                // The probe's answer: a missing active handle as before, then the closed one,
+                // the one refusal otherwise.
+                let answer = if !case.active() {
                     "no active terminal handle is recorded".to_owned()
+                } else if case.closed {
+                    format!("session {ID} is closed; its terminal surface is not read")
                 } else {
-                    refusal.clone()
+                    fixture.refusal(&case.head)
                 };
                 check(
                     doctor_check(&value, "terminal_surface")["detail"]
@@ -666,43 +789,27 @@ fn a_session_of_another_os_is_refused_settled_from_its_records_or_only_read() {
                     "the probe did not give the one answer",
                 );
             }
-            if *command == "wait" && case.working {
-                check(value["timed_out"] == true, "the wait ended");
-            }
             if *command == "inspect" {
-                // The capabilities project what `tell` and `cancel` would answer.
-                let refused = json!({"state": "refused", "reason": "surface_unsupported",
-                    "detail": refusal});
-                let (tell, cancel) = if case.closed {
-                    (
-                        json!({"state": "refused", "reason": "state_not_ready",
-                            "detail": format!("session {ID} is closed; tell requires the ready state")}),
-                        json!({"state": "refused", "reason": "state_not_running",
-                            "detail": format!("session {ID} is closed; cancel requires the running or working state")}),
-                    )
-                } else if case.handle != Handle::Active {
-                    (
-                        json!({"state": "refused", "reason": "surface_closed",
-                            "detail": "the terminal surface is closed or being closed"}),
-                        refused,
-                    )
-                } else {
-                    (refused.clone(), refused)
-                };
-                check(value["capabilities"]["tell"] == tell, "the tell capability");
-                check(
-                    value["capabilities"]["cancel"] == cancel,
-                    "the cancel capability",
-                );
+                // `tell`'s capability projects its ownership proof for an active handle.
+                let tell = &value["capabilities"]["tell"];
+                if case.handle == Handle::Active {
+                    check(
+                        *tell
+                            == json!({"state": "refused", "reason": "surface_unsupported",
+                                "detail": fixture.refusal(&case.head)}),
+                        "the tell capability",
+                    );
+                }
             }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
-// The same records get the same answer from every command, in one order: a closed session
-// first, then a handle that is not this session's, then a session of another OS. A legacy
-// iTerm2 handle without a binding still counts as this session's.
+// The same records get the same answer from every command that would address the terminal,
+// in one order: a closed session first, then a handle that is not this session's, then a
+// session of another OS. A legacy iTerm2 handle without a binding still counts as this
+// session's there, though it is no evidence by itself.
 #[test]
 fn every_command_answers_the_same_records_in_one_order() {
     let os = here();
@@ -711,7 +818,7 @@ fn every_command_answers_the_same_records_in_one_order() {
     } else {
         ("windows-console", "Windows")
     };
-    let mut ready = cases()
+    let ready = cases()
         .into_iter()
         .find(|case| {
             case.terminal["terminal"] == terminal
@@ -721,19 +828,18 @@ fn every_command_answers_the_same_records_in_one_order() {
         .unwrap();
     assert_eq!(ready.origin, origin);
 
-    // A handle bound to another session: the binding answers before the OS.
-    ready.terminal["managed_session_id"] = json!("session-other");
+    // A handle bound to another session, beside an Owner record of another OS: the binding
+    // answers before the OS.
+    let mut unbound = ready.clone();
+    unbound.terminal["managed_session_id"] = json!("session-other");
     let binding = format!("terminal handle belongs to managed session session-other, not {ID}");
-    let fixture = Fixture::new(&ready);
-    let before = support::entries(fixture.root.path());
+    let fixture = Fixture::new(&unbound);
+    let before = fixture.records();
     for command in ["tell", "screen", "close-session"] {
         let output = fixture.run(command);
         assert!(!output.status.success(), "{command}");
         let error = failure(&output);
-        assert!(
-            error == binding || error.ends_with(&format!(": {binding}")),
-            "{command}: {error}"
-        );
+        assert!(error.ends_with(&binding), "{command}: {error}");
     }
     let inspected = reply(&fixture.output(&["inspect", ID, "--json"]));
     assert_eq!(
@@ -742,17 +848,13 @@ fn every_command_answers_the_same_records_in_one_order() {
     );
     let doctor = reply(&fixture.output(&["doctor", ID, "--probe", "--json"]));
     assert_eq!(
-        doctor_check(&doctor, "terminal_record")["reason_code"],
-        "terminal_binding_unverified"
-    );
-    assert_eq!(
         doctor_check(&doctor, "terminal_surface")["detail"],
         format!("Surface presence could not be verified: {binding}")
     );
-    assert_eq!(support::entries(fixture.root.path()), before);
+    assert_eq!(fixture.records(), before);
 
-    // A legacy iTerm2 handle without a binding is this session's: on an OS that does not run
-    // iTerm2 the OS answers.
+    // A legacy iTerm2 handle without a binding, beside an Owner record of macOS: on an OS
+    // that does not run iTerm2 the OS the owner names answers.
     if os != "macOS" {
         let legacy = Case {
             terminal: json!({"terminal": "iterm2", "session_id": "surface"}),
@@ -760,13 +862,12 @@ fn every_command_answers_the_same_records_in_one_order() {
             ..ready.clone()
         };
         let fixture = Fixture::new(&legacy);
-        let refusal = fixture.refusal(&format!("iTerm2 is not available on {os}"));
+        let refusal = fixture.refusal(&format!(
+            "a session recorded on macOS is not available on {os}"
+        ));
         for command in ["tell", "screen", "close-session"] {
             let error = failure(&fixture.run(command));
-            assert!(
-                error == refusal || error.ends_with(&format!(": {refusal}")),
-                "{command}: {error}"
-            );
+            assert!(error.ends_with(&refusal), "{command}: {error}");
         }
         let inspected = reply(&fixture.output(&["inspect", ID, "--json"]));
         assert_eq!(
@@ -774,10 +875,6 @@ fn every_command_answers_the_same_records_in_one_order() {
             json!({"state": "refused", "reason": "surface_unsupported", "detail": refusal})
         );
         let doctor = reply(&fixture.output(&["doctor", ID, "--probe", "--json"]));
-        assert_eq!(
-            doctor_check(&doctor, "terminal_record")["reason_code"],
-            "terminal_unsupported"
-        );
         assert_eq!(
             doctor_check(&doctor, "terminal_surface")["detail"],
             format!("Surface presence could not be verified: {refusal}")
@@ -787,25 +884,18 @@ fn every_command_answers_the_same_records_in_one_order() {
     // A closed session whose bound handle of another OS remains: closed answers first.
     let stale = Case {
         state: "closed",
-        ..cases()
-            .into_iter()
-            .find(|case| {
-                case.terminal["terminal"] == terminal
-                    && case.owner == Owner::Full
-                    && case.state == "ready"
-            })
-            .unwrap()
+        ..ready
     };
     let fixture = Fixture::new(&stale);
     support::write(
         &fixture.directory().join("closed.json"),
         &support::status("closed", 2, None),
     );
-    let before = support::entries(fixture.root.path());
+    let before = fixture.records();
     for (command, answer) in [
         (
             "tell",
-            format!("session {ID} is closed; tell requires the ready state"),
+            format!("session {ID} is closed; its terminal is not addressed"),
         ),
         (
             "screen",
@@ -818,21 +908,17 @@ fn every_command_answers_the_same_records_in_one_order() {
     assert_eq!(
         inspected["capabilities"]["tell"],
         json!({"state": "refused", "reason": "state_not_ready",
-            "detail": format!("session {ID} is closed; tell requires the ready state")})
+            "detail": format!("session {ID} is closed; its terminal is not addressed")})
     );
     let doctor = reply(&fixture.output(&["doctor", ID, "--probe", "--json"]));
-    assert_eq!(
-        doctor_check(&doctor, "terminal_record")["reason_code"],
-        "terminal_session_closed"
-    );
     assert_eq!(
         doctor_check(&doctor, "terminal_surface")["detail"],
         format!(
             "Surface presence could not be verified: session {ID} is closed; its terminal surface is not read"
         )
     );
-    assert_eq!(support::entries(fixture.root.path()), before);
-    // Its records alone settle the close, as for any closed session: the handle is consumed,
+    assert_eq!(fixture.records(), before);
+    // Its records alone finish the close, as for any closed session: the handle is consumed,
     // its kind kept, and no terminal is reached.
     let output = fixture.run("close-session");
     assert!(output.status.success(), "{}", failure(&output));
@@ -841,4 +927,5 @@ fn every_command_answers_the_same_records_in_one_order() {
         read_json(&fixture.directory().join("terminal.closed.json"))["terminal"],
         terminal
     );
+    assert_eq!(fixture.endpoints.connections(), 0);
 }

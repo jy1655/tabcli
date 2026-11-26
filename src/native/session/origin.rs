@@ -632,6 +632,8 @@ fn observe_target(
     // The owner record a verdict was derived from: its bytes, or `Some(None)` for "no
     // owner record". `None` when no owner-derived verdict depends on it.
     let mut owner_bytes: Option<Option<Vec<u8>>> = None;
+    // The handle Records a bound owner's verdict was judged with (`terminal::foreign`).
+    let mut handle_bytes: Option<HandleBytes> = None;
     let (ended, reason, detail) = match &status.state {
         SessionState::Closed => (Some(true), "recorded_closed", None),
         SessionState::Failed => (Some(true), "recorded_failed", None),
@@ -642,8 +644,9 @@ fn observe_target(
             Some("the recorded state is not one this version knows".to_owned()),
         ),
         _ => {
-            let (owner, read) = owner_verdict(&reader, id, budget, clock, &**attest);
+            let (owner, read, handles) = owner_verdict(&reader, id, budget, clock, &**attest);
             owner_bytes = read;
+            handle_bytes = handles;
             (owner.ended, owner.reason, owner.detail)
         }
     };
@@ -668,6 +671,13 @@ fn observe_target(
             Err(fault) => return fault_target(fault, "origin_unreadable"),
         }
     }
+    if let Some(handle_bytes) = handle_bytes {
+        match read_handle_records(&reader, budget, clock) {
+            Ok(bytes) if bytes == handle_bytes => (),
+            Ok(_) => return target(None, "origin_busy", None),
+            Err(fault) => return fault_target(fault, "origin_unreadable"),
+        }
+    }
     Target {
         stored_state: Some(status.state.as_str().to_owned()),
         ended,
@@ -676,15 +686,32 @@ fn observe_target(
     }
 }
 
-/// The owner verdict and the owner record bytes it was derived from (`Some(None)` when
-/// there was no owner record, `None` when the record could not be read).
+/// The active handle's and the consumption marker's bytes, as one budgeted read took them.
+type HandleBytes = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// The handle Records whether the Session belongs to another OS is judged from, within the
+/// observation's read budget like every other Record it reads.
+fn read_handle_records(
+    reader: &Reader,
+    budget: &mut ReadBudget,
+    clock: &mut dyn Clock,
+) -> Result<HandleBytes, ReadFault> {
+    let handle = budget.read(&reader.record(CoreRecord::Terminal), clock)?;
+    let marker = budget.read(&reader.record(CoreRecord::TerminalClosed), clock)?;
+    Ok((handle, marker))
+}
+
+/// The owner verdict, the owner record bytes it was derived from (`Some(None)` when there was
+/// no owner record, `None` when the record could not be read), and the handle Records a bound
+/// owner's verdict was judged with. The owner of a session whose own Records say it belongs to
+/// another OS is never attested here (`terminal::foreign`).
 fn owner_verdict(
     reader: &Reader,
     id: &str,
     budget: &mut ReadBudget,
     clock: &mut dyn Clock,
     attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
-) -> (Target, Option<Option<Vec<u8>>>) {
+) -> (Target, Option<Option<Vec<u8>>>, Option<HandleBytes>) {
     let record = reader.record(CoreRecord::Owner);
     let bytes = match budget.read_within(&record, clock, owner::LIMIT) {
         Ok(Some(bytes)) => bytes,
@@ -692,14 +719,35 @@ fn owner_verdict(
             return (
                 target(None, "owner_unverified", Some("no owner record".to_owned())),
                 Some(None),
+                None,
             );
         }
-        Err(fault) => return (fault_target(fault, "owner_unverified"), None),
+        Err(fault) => return (fault_target(fault, "owner_unverified"), None, None),
     };
+    let mut handles = None;
     let verdict = match owner::decode(&bytes, id) {
-        Ok(recorded) => {
-            let recorded = owner::with_handle_evidence(recorded, reader);
-            owner_attested(&recorded.owner, recorded.binding, attest)
+        Ok(mut recorded) => {
+            // Only a bound owner is attested, so only its verdict depends on the handles.
+            if recorded.binding == OwnerBinding::Bound {
+                let (handle, marker) = match read_handle_records(reader, budget, clock) {
+                    Ok(bytes) => bytes,
+                    Err(fault) => {
+                        return (fault_target(fault, "owner_unverified"), None, None);
+                    }
+                };
+                use crate::native::terminal::foreign;
+                recorded.owner.recorded_elsewhere = foreign::with_owner(
+                    foreign::of_handle_record_bytes(id, handle.as_deref(), marker.as_deref()),
+                    &recorded.owner,
+                    recorded.binding,
+                );
+                handles = Some((handle, marker));
+            }
+            match recorded.owner.recorded_elsewhere {
+                // The owner of a session of another OS is never attested here.
+                Some(elsewhere) => target(None, "owner_unverified", Some(elsewhere.reason())),
+                None => owner_attested(&recorded.owner, recorded.binding, attest),
+            }
         }
         Err(error) => target(
             None,
@@ -710,7 +758,7 @@ fn owner_verdict(
             )),
         ),
     };
-    (verdict, Some(Some(bytes)))
+    (verdict, Some(Some(bytes)), handles)
 }
 
 fn owner_attested(

@@ -254,39 +254,43 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `<Name> is not available on <OS>`, naming no terminal, since only a new launch could choose
   one. Both are unsupported and the same on macOS, Linux and Windows.
   `supported_on_this_platform` reads the same list.
-  A state directory can be copied between machines. `terminal::foreign` decides in one place,
-  from a Session's Records alone, whether it belongs to another OS: any Record that says so
-  positively (the kind of its active, claimed or consumed handle, a Herdr handle's recorded
-  host birth, or the identity its Owner record carries: macOS the process start time, Linux
-  the Linux birth, Windows the Windows process identity). A missing or null field is no
-  evidence, and a PID-only or absent Owner record does not hide such a terminal. The judgment
-  rides in the shared steps, so no command has its own call: the Owner record's one
-  observation (`session::owner::observe`, `required`, Origin's read) carries the handle
-  Records' verdict, and owner attestation (`attest_owner_with`) then makes and reports no
-  local process observation (`pid_alive` absent); Repair (`repair_dead_owner_with`) leaves
-  such a Session exactly as it is, before launch repair; the shared surface judgment
-  (`judgment::surface`, read by `screen`, doctor and the capabilities) judges the handle with
-  the Owner record beside it; and the ownership proof, the explicit close
-  (`close_authority::close_owned_surface`), the doctor probe and `reopen`'s source check refuse
-  it. `hold` and `cancel`, which change a Session without a handle, refuse it under the
-  lifecycle lock (`foreign::admit_session`). The refusal starts with the kind's refusal when a
-  handle names a kind this OS does not run, otherwise `a session recorded on <OS> is not
-  available on <this OS>`, and says that nothing here can judge or end the Session, that an
-  explicit close settles it once its Records show it ended, and where its Records are. The
-  explicit close and prune decide such a Session from its Records alone (owner's decision,
-  2026-11-26): the close transaction (`close_session_state_with_error`), after a closed
-  Session, a finished consumption and the handle's binding, settles one whose Records show it
-  ended (`foreign::ended`: exited or failed) by consuming its active or claimed handle with
-  no terminal call and no process observation, as an ordinary close consumes it, and closing
-  it; any other it refuses without writing. Prune does not count the owner of such a closed
-  Session (`native_owner_blocks_prune`). A close that finishes from its Records keeps the
-  consumed kind in the tombstone it rewrites (`kept_terminal_kind`). Every command admits a Session in one order: a closed Session first, then a
-  handle bound to another session (a legacy iTerm2 handle without a binding counts as bound),
-  then a Session of another OS, so the same Records get the same answer from every command and
-  on every OS. Guarded input refuses a kind this OS does not run before the macOS and Linux
-  claim check. The created-host close evidence
-  of a tmux handle on macOS or Windows answers with the kind's refusal only when the close
-  decision is reached without `close_owned_surface`, which refuses first.
+  A state directory can be copied between machines. `terminal::foreign` decides in one place
+  whether a Session belongs to another OS, only on a positive statement in a Record that is the
+  Session's own: its active handle bound to it names a kind this OS does not run or, for Herdr
+  only, a host birth of another platform's variant; its consumption marker decodes, says
+  `consumed: true` and names such a kind; or its Owner record bound to it carries another OS's
+  identity (macOS the process start time, Linux the Linux birth, Windows the Windows process
+  identity). A Record of another Session or of none, a field that does not belong to the
+  handle's kind, a marker that does not decode or says `consumed: false`, a claimed handle, and
+  a missing or null field are no evidence, and such a Session is this OS's. For a Session with
+  evidence TAB does nothing that depends on this machine's terminals or processes: the Owner
+  record's one observation (`session::owner::observe`, `required`, and Origin's budgeted read)
+  carries the verdict, so owner attestation (`attest_owner_with`) observes and reports nothing
+  (`pid_alive` absent), launch repair decides nothing from that owner, and Repair
+  (`repair_dead_owner_with`) leaves the Session as it is once its record-only recovery is done.
+  The commands that would address its terminal refuse it through `foreign::admit`, in one
+  order (a closed Session, then a handle that is not the Session's, with a legacy iTerm2 handle
+  that names none counting as its own, then another OS): the ownership proof
+  (`verified_terminal_surface_owner`, before `tell`'s paste and guarded input), `screen`,
+  doctor's probe and the explicit close (`close_authority::close_owned_surface`); `tell`'s
+  capability projects the same answer. The refusal starts with the kind's refusal when a Record
+  names a kind this OS does not run, otherwise `a session recorded on <OS> is not available on
+  <this OS>`, and says that nothing here can judge or end the Session, that an explicit close
+  settles it once its Records show it ended, and where its Records are. The explicit close and
+  prune settle such a Session from its Records alone (owner's decision, 2026-11-26): the close
+  transaction (`close_session_state_with_error`), after a closed Session and a valid finished
+  consumption, which keeps its marker's kind, and after the handle's binding, settles one whose
+  status is exited or failed (`foreign::ended`) by consuming its active or claimed handle with
+  no terminal call and no process observation, keeping the consumed kind and the status's
+  failure diagnosis, and refuses any other without writing; prune does not count such a closed
+  Session's owner (`native_owner_blocks_prune`). Everything else TAB does from Records alone,
+  including `hold`, `cancel`, `reopen`, record-only recovery and an ordinary Session's
+  tombstone, is unchanged. Once a settled copy's remaining Records name no other OS (a Herdr
+  marker, or a copy an older TAB closed again, which rewrites the kind to null), it is an
+  ordinary closed Session. Guarded input refuses a kind this OS does not run before the macOS
+  and Linux claim check. The created-host close evidence of a tmux handle on macOS or Windows
+  answers with the kind's refusal only when the close decision is reached without
+  `close_owned_surface`, which refuses first.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types with the

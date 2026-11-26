@@ -208,7 +208,6 @@ vocabulary! { Reason {
     TERMINAL_RECORD_UNREADABLE => "terminal_record_unreadable",
     TERMINAL_SELECTED => "terminal_selected",
     TERMINAL_SELECTION_FAILED => "terminal_selection_failed",
-    TERMINAL_SESSION_CLOSED => "terminal_session_closed",
     TERMINAL_SURFACE_MISSING => "terminal_surface_missing",
     TERMINAL_SURFACE_PRESENT => "terminal_surface_present",
     TERMINAL_SURFACE_UNVERIFIED => "terminal_surface_unverified",

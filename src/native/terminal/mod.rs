@@ -269,6 +269,10 @@ impl OsTerminals {
 
     /// The refusal of a kind this OS does not run, requested for a new launch: it names the
     /// kinds this OS runs. Callers ask it only for such a kind.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
     pub(in crate::native::terminal) fn unavailable(self, kind: TerminalKind) -> anyhow::Error {
         debug_assert!(!self.runs(kind), "{} runs {kind:?}", self.os);
         let names: Vec<_> = self.kinds.iter().map(|kind| kind.as_str()).collect();
@@ -1318,6 +1322,185 @@ mod tests {
                 );
             }
         }
+    }
+
+    // A kind this OS runs other than Herdr, and one it does not run.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn native_and_foreign_kinds() -> (TerminalKind, TerminalKind) {
+        let native = TerminalKind::ALL
+            .into_iter()
+            .find(|kind| kind.supported_on_this_platform() && *kind != TerminalKind::Herdr)
+            .unwrap();
+        let foreign = TerminalKind::ALL
+            .into_iter()
+            .find(|kind| !kind.supported_on_this_platform())
+            .unwrap();
+        (native, foreign)
+    }
+
+    // Records that are not this session's own, or that say nothing, are no evidence: the
+    // session is this OS's, and the explicit close takes its ordinary path to the terminal
+    // (here an injected closer), never the settlement. The reviewer's two fixtures: a bound
+    // handle of a kind this OS runs carrying another OS's Herdr host field beside a live PID,
+    // and an Owner record of another OS's shape bound to another session.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn records_that_are_not_the_sessions_own_never_settle_its_close() {
+        use crate::native::session::{CoreRecord, SessionState, Store, update_status};
+        let (native, _) = native_and_foreign_kinds();
+        let other = ["macOS", "Linux", "Windows"]
+            .into_iter()
+            .find(|os| *os != super::OsTerminals::CURRENT.unwrap().os)
+            .unwrap();
+        let mut herdr_field = serde_json::json!({
+            "terminal": native, "session_id": "surface", "managed_session_id": "session-native",
+            "herdr_core": {"socket": "/tmp/core.sock", "core_id": "core-a", "created_ms": 1,
+                "host_pid": 4}
+        });
+        let birth = if other == "Linux" {
+            serde_json::json!({"linux_birth": {
+                "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 7}})
+        } else if other == "Windows" {
+            serde_json::json!({"host_creation_time": 1})
+        } else {
+            serde_json::json!({"host_start_seconds": 1, "host_start_microseconds": 2})
+        };
+        for (key, value) in birth.as_object().unwrap() {
+            herdr_field["herdr_core"][key] = value.clone();
+        }
+        let live = crate::native::terminal::ownership::NativeSessionOwner {
+            pid: std::process::id(),
+            managed_session_id: Some("session-native".into()),
+            windows_process_identity:
+                crate::native::session::test_support::lifecycle::test_windows_process_identity(
+                    std::process::id(),
+                ),
+            ..Default::default()
+        };
+        let mut elsewhere_bound = owner_written_on(other, "session-other", std::process::id());
+        elsewhere_bound.managed_session_id = Some("session-other".into());
+        let bound_native = serde_json::json!({
+            "terminal": native, "session_id": "surface", "managed_session_id": "session-native"
+        });
+        for (name, handle, owner) in [
+            (
+                "a native handle with another OS's Herdr field",
+                herdr_field,
+                live,
+            ),
+            (
+                "an Owner record of another OS bound to another session",
+                bound_native,
+                elsewhere_bound,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("session-native");
+            std::fs::create_dir_all(directory.join("events")).unwrap();
+            update_status(&directory, SessionState::Exited, None, None).unwrap();
+            let store = Store::open_unchecked(&directory);
+            store
+                .record(CoreRecord::Terminal)
+                .write_json(&handle)
+                .unwrap();
+            store.write_owner(&owner).unwrap();
+            assert_eq!(super::foreign::of_records(&store), None, "{name}");
+            let calls = std::cell::Cell::new(0);
+            crate::native::session::close::close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(super::CloseOutcome::Closed.into())
+                },
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(
+                calls.get(),
+                1,
+                "{name}: the ordinary path reaches its terminal"
+            );
+            assert!(
+                !store
+                    .status()
+                    .unwrap()
+                    .error
+                    .unwrap_or_default()
+                    .contains("settled from its records"),
+                "{name}"
+            );
+        }
+    }
+
+    // A consumption marker that says `consumed: false` is no completed consumption and no
+    // evidence: a running copy with one is refused and keeps every record, and a closed
+    // native session with one whose owner is live here stays for prune, as before.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn a_marker_that_says_not_consumed_completes_nothing() {
+        use crate::native::session::{CoreRecord, Reader, SessionState, Store, update_status};
+        let (_, foreign) = native_and_foreign_kinds();
+        let root = tempfile::tempdir().unwrap();
+        // A running copy (its bound handle says so) with a marker that says not consumed.
+        let directory = root.path().join("session-copy");
+        std::fs::create_dir_all(directory.join("events")).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
+        let store = Store::open_unchecked(&directory);
+        store
+            .write_terminal(
+                &TerminalSession::new(foreign, "surface".into())
+                    .with_binding(Some("session-copy".into())),
+            )
+            .unwrap();
+        store
+            .record(CoreRecord::TerminalClosed)
+            .write_json(&serde_json::json!({"consumed": false, "terminal": foreign}))
+            .unwrap();
+        // The lifecycle lock exists, as in every session, so that taking it writes nothing.
+        drop(store.lock().unwrap());
+        let before = crate::native::reopen::tests::snapshot_directory(&directory);
+        let error = crate::native::close::close_session_surface(
+            &directory,
+            "session-copy",
+            None,
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("TAB on this machine cannot judge or end this session"),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::native::reopen::tests::snapshot_directory(&directory),
+            before
+        );
+        // A closed native session whose marker says not consumed, with a live owner.
+        let directory = root.path().join("session-native");
+        std::fs::create_dir_all(directory.join("events")).unwrap();
+        update_status(&directory, SessionState::Closed, None, None).unwrap();
+        let store = Store::open_unchecked(&directory);
+        store
+            .record(CoreRecord::TerminalClosed)
+            .write_json(&serde_json::json!({"consumed": false, "terminal": foreign}))
+            .unwrap();
+        store
+            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: Some("session-native".into()),
+                windows_process_identity:
+                    crate::native::session::test_support::lifecycle::test_windows_process_identity(
+                        std::process::id(),
+                    ),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(super::foreign::of_records(&store), None);
+        assert!(
+            Reader::open_unchecked(&directory)
+                .native_owner_blocks_prune()
+                .unwrap()
+        );
     }
 
     // Guarded input through the terminal entry point, for a kind this OS does not run and a
