@@ -288,11 +288,16 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   it can establish the host's account and on the text the host is given
   (`refuse_before_launch`: tmux as this process; the macOS applications, and Herdr before its
   core is reached, without an account), and the Herdr adapter for the core's account on the
-  connection that sends `terminal.run` (`refuse_before_core_launch`). A refusal is a failure
-  to open the Surface and settles as one. The launcher's wait probes its surface through the
+  connection that sends `terminal.run` (`refuse_before_core_launch`). It refuses only what it
+  read; a read that fails other than by absence leaves the directory to the host. A refusal
+  (`DirectoryRefusal`) is a failure to open the Surface and settles as one, for this launch's
+  Claim only, waiting out a reader until the launch deadline
+  (`launch::refused_before_surface`). The launcher's wait probes its surface through the
   adapter's `launch_surface` (by default its presence): a Herdr terminal its core reports
-  finished before startup fails the launch at the next probe through the settlement the
-  deadline uses. It owns the
+  finished before startup fails the launch through the settlement the deadline uses, at a
+  probe that holds the lifecycle lock and finds this launch's Claim, a `Pending` receipt and
+  the poll's own reading still pending (`finished_before_startup`); any other probe decides
+  nothing, as for a present surface. It owns the
   registered launch-host dispatch, the shared binding wait, startup input flush and refusal
   log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
   before flushing input. The Windows Terminal tab host uses its own offer protocol.

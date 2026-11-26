@@ -66,34 +66,51 @@
   TAB's own account would be admitted, how the accounts differ. Observed 2026-11-26 (Windows
   11, hc 0.1.21): an elevated TAB (an administrator's SSH session) gave the session directory
   the Administrators group as owner, which the host of a core that is not elevated refused
-  only in the launch log, and the caller timed out after 31.7 s. The refusal is an ordinary
-  failure to open the Surface and settles through the same path as one (`terminal_failure`):
-  for an uncontended launch the session fails with that reason and its Claim released, and
-  no terminal exists. What the caller cannot know stays the host's, unchanged from 0.4.49:
-  the directory changed after the check, a program started under another token than the
-  core's own, an I/O failure only the host meets. The host logs its refusal as before, and
-  the launch ends as below when its terminal finishes.
+  only in the launch log, and the caller timed out after 31.7 s. The caller refuses only what
+  a read showed (an absent directory included): a read that fails otherwise, such as TAB's own
+  token denied `READ_CONTROL` or a transient I/O error, refuses nothing, and the host decides
+  as in 0.4.49. A refusal brings forward only the failure that the launch reaches at its
+  deadline without it, and settles as a failure to open the Surface
+  (`launch::refused_before_surface`, with `terminal_failed`'s wording): a reader that holds
+  the lifecycle lock is waited out until the launch's own deadline, and under the lock a Claim
+  that is not this launch's token means the directory at the path is not this launch's, so
+  nothing is written. The caller's error names the directory and the host's reason; the
+  Session records a fixed reason that names no path (`terminal launch failed: the Herdr launch
+  host would refuse the session directory; no surface handle was recorded and no prompt was
+  sent`), and the launch log gets the same line on a best-effort basis. A lock held past the
+  deadline leaves the Session launching and its Claim retained, as for every failure to open a
+  Surface; then only the returned error holds the refusal. No terminal exists either way.
+  What the caller cannot know stays the host's, unchanged from 0.4.49: the directory changed
+  after the check, a program started under another token than the core's own, a read only the
+  host can make. The host logs its refusal as before when it still can (a directory that is
+  gone takes no line), and the launch ends as below when its terminal finishes.
 - The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
   (`launch_surface`): the exact terminal with the presence proof, and the launch label when
   the handle records one. A terminal its verified core reports finished before startup was
-  confirmed fails the launch at the next probe, about a second, on every platform, as a tmux
+  confirmed fails the launch at the next successful probe, on every platform, as a tmux
   surface that disappears does (owner's decision 2026-11-26, option A); this reverses, for a
   host that ended before startup, #409's choice to leave its admission, receipt, binding and
-  Pending-launch refusals to the launch deadline. The finished terminal can only fail a launch:
-  it settles through the one settlement the deadline uses (`settle`), with the same records,
-  the same lifecycle lock attempt and the same precedence of a confirmed startup or a
-  launch-host Record (`input_flush_failed`, `launch_shell_exec_failed`). Its reason is a fixed
-  text from the core's report and the launch log's path, `terminal surface finished before
-  provider launch was confirmed (Herdr terminal t7 exited with code N); see the launch log
-  <path>`; nothing is read from the log. The exit code is the core's `exit_code` when it gives
-  one (the field name is read from the installed hc 0.1.22's string table, not from a live
-  core, and nothing is decided on it). A pending, uncontended launch ends failed with that
-  reason, its Claim released, its receipt pending and its surface handle kept, so
-  `close-session` removes the finished terminal (`terminal.rm`). A launch whose wrapper had
-  recorded `Spawning` keeps its Claim (a provider may have run; the reason says so); when the
-  lifecycle lock is held at that moment, the Claim is retained until repair settles the launch
-  at its receipt deadline, as at the deadline. A host that ends before its Surface is bound is
-  found by creation instead, which reads the created terminal live and otherwise removes it.
+  Pending-launch refusals to the launch deadline. It brings forward only the failure that the
+  deadline records for the same launch, so it acts only on certainty
+  (`finished_before_startup`): it holds the lifecycle lock; the Claim at the path is this
+  launch's token; the poll's own reading under that lock, in its precedence (`decided_locked`,
+  then `read_confirmation`: an ended status before a confirmation, a launch-host Record's
+  failure such as `input_flush_failed` or `launch_shell_exec_failed` before a pending launch),
+  still finds the launch pending; and the receipt is still `Pending`, so no provider was started
+  that could still confirm. Then the launch fails through the deadline's settlement
+  (`settle_locked`). Otherwise that probe decides nothing and the wait goes on exactly as for a
+  present surface, whose next poll reads what the records then say: a confirmation, an ended
+  launch or a host Record published during the probe keeps its own outcome, and a lock held at
+  every probe, another launch's Claim at the path or a `Spawning` receipt leaves the launch to
+  its confirmation or its deadline, as in 0.4.49. The Session records the fixed reason
+  `terminal surface finished before provider launch was confirmed`; the error returned to the
+  caller adds the core's report and the launch log's path, `(Herdr terminal t7 exited with code
+  N); see the launch log <path>`; nothing is read from the log. The exit code is the core's
+  `exit_code` when it gives one (the field name is read from the installed hc 0.1.22's string
+  table, not from a live core, and nothing is decided on it). The launch ends failed, its Claim
+  released, its receipt pending and its surface handle kept, so `close-session` removes the
+  finished terminal (`terminal.rm`). Creation removes a created terminal that its last live read
+  finds finished; one that finishes after that read is bound, and this probe ends the launch.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface

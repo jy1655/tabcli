@@ -177,19 +177,29 @@ remain nonempty. They are record labels; a terminal can also use its own ownersh
 `tmux`, `warp`, `wezterm`, and `windows-console`; only platform-supported values can launch. See [terminal
 selection](terminals.md#selection-and-settings), including accepted aliases.
 Before it creates the Surface, TAB reproduces the launch host's check of the new session
-directory, as far as TAB can know it then: a real directory that no other account can change,
-for the account the host runs as when TAB can name it (TAB's own for tmux, the core's for
-Herdr; a macOS terminal application's account is not checked, and the Windows console's host
-makes no such check), and, for these hosts except tmux, a path that can be sent to the host
-as text exactly. A directory the host would refuse fails the start at once with the host's
-reason, as a Surface that cannot be opened does (`terminal launch failed: ...; no surface
-handle was recorded and no prompt was sent`). TAB cannot know a change made after its check,
-a host started under another account than the one it named, or an error only the host meets;
-the host still refuses those and writes its launch log as before. A Herdr start then fails
-within about a second, when the core reports the launch's terminal finished before startup was
-confirmed (`terminal surface finished before provider launch was confirmed`, with its exit
-code when the core gives one and the launch log's path), as a tmux start does when its surface
-disappears; other surfaces end at the launch deadline unless their surface disappears first.
+directory, as far as TAB can know it then. The host admits a real directory (not a symbolic
+link or a junction) owned by the account it runs as; on macOS and Linux its permission bits
+must give no other user or group access, and on Windows its access list must let no account
+other than its owners, System and Administrators change its entries. TAB judges this for the
+account the host runs as when TAB can name it (its own for tmux, the core's for Herdr); for a
+macOS terminal application it judges the permission bits but not the owner, and the Windows
+console's host makes no such check. For these hosts except tmux, the path must also be one
+that can be sent to the host as text exactly. TAB refuses only what it read: when its own
+read fails, for example because its token cannot read the directory's access list, the host
+decides. A directory the host would refuse fails the start at once, as a Surface that cannot
+be opened does: the error names the directory and the host's reason, and the session records
+`terminal launch failed: the <host> launch host would refuse the session directory; no surface
+handle was recorded and no prompt was sent`. If another command holds the session's lifecycle
+lock for the whole launch timeout, the session stays launching with its claim, as for any
+Surface that cannot be opened, and only the returned error holds the reason. TAB cannot know a
+change made after its check, a host started under another account than the one it named, or
+an error only the host meets; the host still refuses those and appends to its launch log when
+it can. A Herdr start then fails at TAB's next successful check of the terminal, normally
+about a second after the core reports it finished, when nothing else has decided the launch
+and no provider was started (the session records `terminal surface finished before provider
+launch was confirmed`; the error adds the terminal, its exit code when the core gives one, and
+the launch log's path), as a tmux start does when its surface disappears. Otherwise, and for
+other surfaces, the start ends at the launch deadline unless the surface disappears first.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

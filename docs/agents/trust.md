@@ -12,7 +12,8 @@
   rights added (`windows_directory_is_private`). The rule can be judged for another process's
   owners (`windows_directory_is_private_to`): the caller judges a Herdr session directory for
   the core's token user and default owner before it creates the terminal, to reproduce the
-  verdict of the host, which runs as the core. An elevated process's default owner is normally
+  verdict of the host, which runs as the core; a read that TAB's own token is denied leaves
+  the directory to the host. An elevated process's default owner is normally
   the Administrators group (a token's default owner can differ by policy or per process), so a
   directory an elevated TAB creates is normally not private to the user of a core that is not
   elevated. The rule itself is unchanged.

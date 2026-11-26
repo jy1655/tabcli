@@ -13,8 +13,10 @@
   its `launch_stage` row keeps `launch_host_failed` and directs the caller to the launch
   log for an input-flush or shell-start error. The shell-environment probe guidance applies
   to the macOS capture host. A session directory the caller refused before any Surface adds
-  no row: no host ran, the status and the launch log hold the reason, and a macOS capture kind
-  keeps only its initial `awaiting_host` stage.
+  no row: no host ran, and a macOS capture kind keeps only its initial `awaiting_host` stage.
+  The returned error holds the host's reason with the directory; the status and the launch log
+  hold a fixed reason only when the settlement wrote them (a lifecycle lock held past the
+  launch deadline leaves the status launching, and the log line is best effort).
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared
