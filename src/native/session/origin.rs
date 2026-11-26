@@ -685,11 +685,6 @@ fn owner_verdict(
     clock: &mut dyn Clock,
     attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
 ) -> (Target, Option<Option<Vec<u8>>>) {
-    // An Origin whose own Records say it belongs to another OS (`terminal::foreign`): its owner
-    // is never attested (`owner_verdict_elsewhere`).
-    if let Some(evidence) = ElsewhereEvidence::read(reader, id, budget.deadline, clock) {
-        return owner_verdict_elsewhere(reader, id, budget, clock, evidence);
-    }
     let record = reader.record(CoreRecord::Owner);
     let bytes = match budget.read_within(&record, clock, owner::LIMIT) {
         Ok(Some(bytes)) => bytes,
@@ -713,110 +708,6 @@ fn owner_verdict(
         ),
     };
     (verdict, Some(Some(bytes)))
-}
-
-/// The allowance of the evidence read of one Origin's owner verdict: its handle Records and
-/// its Owner record, read twice.
-const EVIDENCE_BYTES: u64 = 2 * (2 * RECORD_LIMIT + owner::LIMIT);
-
-/// The Records whether an Origin belongs to another OS is judged from: its active handle, its
-/// consumption marker and its Owner record, as one read took them (`None` for a Record that is
-/// absent or could not be read).
-type EvidenceBytes = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
-
-/// Positive evidence, from an Origin's own Records, that it belongs to another OS
-/// (`terminal::foreign`).
-struct ElsewhereEvidence {
-    elsewhere: crate::native::terminal::foreign::Elsewhere,
-    bytes: EvidenceBytes,
-    budget: ReadBudget,
-}
-
-impl ElsewhereEvidence {
-    /// The evidence read: the Records within the per-record bounds, within an allowance of its
-    /// own and the observation's deadline, so that an Origin of this OS is observed and charged
-    /// exactly as it always was. A Record it cannot read is inconclusive about the OS.
-    fn read(reader: &Reader, id: &str, deadline: Instant, clock: &mut dyn Clock) -> Option<Self> {
-        use crate::native::terminal::foreign;
-        let mut budget = ReadBudget::new(deadline, EVIDENCE_BYTES);
-        let bytes = Self::bytes(reader, &mut budget, clock);
-        let elsewhere = foreign::of_handle_record_bytes(id, bytes.0.as_deref(), bytes.1.as_deref())
-            .or_else(|| {
-                let recorded = owner::decode(bytes.2.as_deref()?, id).ok()?;
-                (recorded.binding == OwnerBinding::Bound)
-                    .then(|| foreign::of_owner(&recorded.owner))
-                    .flatten()
-            })?;
-        Some(Self {
-            elsewhere,
-            bytes,
-            budget,
-        })
-    }
-
-    fn bytes(reader: &Reader, budget: &mut ReadBudget, clock: &mut dyn Clock) -> EvidenceBytes {
-        let mut read = |record, limit| {
-            budget
-                .read_within(&reader.record(record), clock, limit)
-                .ok()
-                .flatten()
-        };
-        (
-            read(CoreRecord::Terminal, RECORD_LIMIT),
-            read(CoreRecord::TerminalClosed, RECORD_LIMIT),
-            read(CoreRecord::Owner, owner::LIMIT),
-        )
-    }
-
-    /// Whether the Records still are what the evidence was judged from.
-    fn holds(mut self, reader: &Reader, clock: &mut dyn Clock) -> bool {
-        Self::bytes(reader, &mut self.budget, clock) == self.bytes
-    }
-}
-
-/// The owner verdict of an Origin whose own Records say it belongs to another OS: what its
-/// Records alone answer, as `owner_verdict` answers it (no owner record, a read fault, a
-/// record that does not decode, an owner not bound to it), and otherwise what its Records name,
-/// with no attestation. The verdict holds only while the Records the evidence was judged from
-/// are unchanged.
-fn owner_verdict_elsewhere(
-    reader: &Reader,
-    id: &str,
-    budget: &mut ReadBudget,
-    clock: &mut dyn Clock,
-    evidence: ElsewhereEvidence,
-) -> (Target, Option<Option<Vec<u8>>>) {
-    let elsewhere = evidence.elsewhere;
-    let record = reader.record(CoreRecord::Owner);
-    let (verdict, read) = match budget.read_within(&record, clock, owner::LIMIT) {
-        Ok(Some(bytes)) => {
-            let verdict = match owner::decode(&bytes, id) {
-                Ok(recorded) => owner_attested(&recorded.owner, recorded.binding, &|_| {
-                    ProcessObservation::Unknown(elsewhere.reason())
-                }),
-                Err(error) => target(
-                    None,
-                    "owner_unverified",
-                    Some(format!(
-                        "invalid JSON in {}: {error}",
-                        record.path().display()
-                    )),
-                ),
-            };
-            (verdict, Some(Some(bytes)))
-        }
-        Ok(None) => (
-            target(None, "owner_unverified", Some("no owner record".to_owned())),
-            Some(None),
-        ),
-        Err(fault) => (fault_target(fault, "owner_unverified"), None),
-    };
-    #[cfg(test)]
-    tests::checkpoint(tests::Checkpoint::EvidenceRead, reader.directory());
-    if !evidence.holds(reader, clock) {
-        return (target(None, "origin_busy", None), None);
-    }
-    (verdict, read)
 }
 
 fn owner_attested(

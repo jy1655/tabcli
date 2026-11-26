@@ -28,35 +28,36 @@ session belongs to another system only when one of its own records says so: its 
 bound to the session, names a terminal this system does not run (or a Herdr Core started on
 another system); its consumption record says it consumed such a terminal; or its owner record,
 bound to the session, carries the identity another system records. Nothing else counts: a handle
-that does not name its terminal (older records that omit it are read as iTerm2), a record of
-another session or of none, a field that does not belong to the terminal, a consumption record
-that does not say it consumed, a missing, empty or unreadable record. TAB never judges such a
-session from this machine's terminals or processes: it does not report its owner as live or
-gone, dead-owner repair leaves it as it is, and the process of a refused reopen of it is not
-checked here, so that reopen keeps holding its source until its records show no provider
-started (`doctor` reports it as unverified). `tell`, `screen` and `doctor --probe` refuse to
-address its terminal, with `<Name> is not available on <system>` when its terminal is one this
-system does not run, otherwise `a session recorded on <system> is not available on <this
-system>`, followed by the directory that holds its records. When its records name different
-systems, the handle the command read speaks first, then the active handle, the consumption
-record and the owner record. Only a new launch could choose another terminal, so the refusal
-names none. Where they refuse, a closed session answers first, then a terminal that is not this
-session's. Everything TAB does from records alone, such as `hold`, `cancel`, `reopen`,
-`inspect`, `status` and the recovery `sessions` runs, works as for any session.
+that does not name its terminal (older records that omit it are read as iTerm2), a handle left
+claimed by an interrupted close, a record of another session or of none, a field that does not
+belong to the terminal, a consumption record that repeats a field or does not say it consumed,
+and a missing, empty or unreadable record.
 
-`close-session --explicit` settles such a session from its records alone when they show it
-ended (exited or failed): it consumes the recorded handle, active or left claimed by an
-interrupted close, without addressing any terminal or process, keeps the consumed terminal and
-the session's failure in its records, and closes the session. A close whose consumption record
-already says it consumed finishes as for any session, keeping the terminal it names and the
-session's failure. A recorded handle that cannot be read or belongs to another session is
-reported and left where it is. Any other such session is refused and nothing is written; TAB
-cannot end a copy whose records leave it running. `prune-sessions`
-removes an eligible closed copy without observing its owner. Once nothing in a settled copy's
-remaining records names another system (a Herdr copy, or a copy an older TAB closed again,
-which forgets the consumed terminal), it is an ordinary closed session. Closing or pruning a
-copy does not change the session on the system it came from, and closing that session there
-does not change the copy.
+Only three things treat such a session differently, all of them steps that change a session's
+records. `close-session --explicit` settles it from its records alone when they show it ended
+(exited or failed): it consumes the recorded handle, active or left claimed by an interrupted
+close, without addressing any terminal or process, names the consumed terminal only when the
+handle's record named it, keeps the session's failure in its records, and closes the session.
+Every handle it would remove must be readable and this session's; otherwise the close reports
+that handle and leaves both where they are. A close whose consumption record already says it
+consumed finishes as for any session, keeping the terminal it names; the reason that record
+gives is kept as this system's close keeps it, and only a consumption record without one keeps
+the session's failure. Any other such session is refused and nothing is written; TAB cannot end
+a copy whose records leave it running. `prune-sessions` removes an eligible closed copy without
+observing its owner. Dead-owner repair, which `sessions`, `tell` and `close-session` run, does
+not judge its owner from this machine's processes and leaves it as it is.
+
+Every other command answers for such a session as it answers for any session. `status`,
+`inspect`, `wait`, `doctor` and the origin a session reports can include the liveness of an
+unrelated process of this machine that happens to have the recorded process id; `tell`,
+`screen` and `doctor --probe` address the terminal its handle names, which this system refuses
+for a terminal it does not run (`<Name> is not available on <system>`); and a refused `reopen`
+of such a session is judged by the recorded provider process id on this machine.
+
+Once nothing in a settled copy's remaining records names another system (a Herdr copy, or a copy
+an older TAB closed again, which forgets the consumed terminal), it is an ordinary closed
+session. Closing or pruning a copy does not change the session on the system it came from, and
+closing that session there does not change the copy.
 
 Inside an hc terminal (`TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`, which hc gives
 every program) TAB chooses the same way on every OS unless `--terminal` says otherwise. It uses

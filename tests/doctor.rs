@@ -678,25 +678,13 @@ fn missing_workspace_does_not_hide_the_installed_version_or_probe_another_daemon
     assert_eq!(entries(fixture.root.path()), before);
 }
 
-// A terminal this OS runs: with another OS's kind the session would be one of another OS, whose
-// owner is never observed here.
-fn native_terminal() -> &'static str {
-    if cfg!(windows) {
-        "windows-console"
-    } else if cfg!(target_os = "linux") {
-        "tmux"
-    } else {
-        "iterm2"
-    }
-}
-
 #[test]
 fn terminal_close_markers_are_reported_without_consuming_or_resuming_them() {
     let fixture = Fixture::new("claude");
     write(
         &fixture.directory.join("terminal.closing.json"),
         &json!({
-            "terminal": native_terminal(), "session_id":"owned-surface", "managed_session_id":"session-doctor"
+            "terminal":"iterm2", "session_id":"owned-surface", "managed_session_id":"session-doctor"
         }),
     );
     let before = entries(fixture.root.path());
@@ -707,7 +695,7 @@ fn terminal_close_markers_are_reported_without_consuming_or_resuming_them() {
     assert_eq!(entries(fixture.root.path()), before);
     write(
         &fixture.directory.join("terminal.closed.json"),
-        &json!({"consumed":true,"terminal": native_terminal()}),
+        &json!({"consumed":true,"terminal":"iterm2"}),
     );
     let before = entries(fixture.root.path());
     assert_eq!(

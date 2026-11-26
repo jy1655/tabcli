@@ -2,6 +2,7 @@
 #![cfg(any(target_os = "macos", target_os = "linux", windows))]
 use super::*;
 use crate::native::failure_kind::{FailureKind, classify};
+use crate::native::session::record::{terminal, terminal_stated};
 use serde_json::{Value, json};
 
 const ID: &str = "session-copy";
@@ -68,8 +69,9 @@ fn handle(kind: TerminalKind, binding: Option<&str>) -> Value {
     handle
 }
 
-// One session directory holding the given Records (a string is written as it is).
-fn session_with(records: &[(&str, Value)]) -> (tempfile::TempDir, std::path::PathBuf) {
+// One session directory with the given Records (a string is written as it is), judged as the
+// close transaction judges it: each Record read once.
+fn judge_records(records: &[(&str, Value)]) -> Option<Elsewhere> {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join(ID);
     std::fs::create_dir(&directory).unwrap();
@@ -80,25 +82,12 @@ fn session_with(records: &[(&str, Value)]) -> (tempfile::TempDir, std::path::Pat
             value => std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap(),
         }
     }
-    (root, directory)
-}
-
-// One session directory with the given Records, judged by `of_records`, and the verdict the
-// Owner record's one observation carries.
-fn judge(records: &[(&str, Value)]) -> (Option<Elsewhere>, Option<Elsewhere>) {
-    let (_root, directory) = session_with(records);
-    let reader = Reader::open_unchecked(&directory);
-    let observed = match session::owner::observe(&reader) {
-        session::owner::OwnerRecord::Recorded(recorded) => recorded.owner.recorded_elsewhere,
-        _ => None,
-    };
-    (of_records(&reader), observed)
+    of_records(&Reader::open_unchecked(&directory))
 }
 
 // Each positive statement in a Record that is this session's own: the bound active handle's
-// kind or (Herdr only) host birth, a valid consumption marker's kind, and a bound Owner
-// record's identity. The Owner record's observation carries the same verdict.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+// stated kind or (Herdr only) host birth, a strict marker's kind, and a bound Owner record's
+// identity.
 #[test]
 fn a_session_belongs_to_another_os_only_on_its_own_records_positive_statement() {
     let foreign = foreign_kind();
@@ -130,7 +119,7 @@ fn a_session_belongs_to_another_os_only_on_its_own_records_positive_statement() 
                     "terminal.closed.json",
                     json!({"consumed": true, "terminal": foreign}),
                 ),
-                ("native-session.json", pid_only.clone()),
+                ("native-session.json", pid_only),
             ],
             Elsewhere::Kind(foreign),
         ),
@@ -149,39 +138,29 @@ fn a_session_belongs_to_another_os_only_on_its_own_records_positive_statement() 
         ),
     ];
     for (name, records, expected) in accepted {
-        let (judged, observed) = judge(&records);
-        assert_eq!(judged, Some(expected), "{name}");
-        if records
-            .iter()
-            .any(|(record, _)| *record == "native-session.json")
-        {
-            assert_eq!(observed, Some(expected), "{name}");
-        }
+        assert_eq!(judge_records(&records), Some(expected), "{name}");
     }
 }
 
 // Nothing else is evidence, and such a session is this OS's: a field that does not belong to
-// the handle's kind, a Record bound to another session or to none, a marker that does not
-// decode or says `consumed: false`, a claimed handle, a missing or null kind. The reviewer's
-// fixtures: a bound native handle carrying another OS's Herdr host field beside a live PID, a
-// Windows Owner record bound to another session, and `consumed: false` markers.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+// the handle's kind, a Record bound to another session or to none, a claimed handle, a marker
+// that does not decode, repeats `consumed` or `terminal`, or does not say `consumed: true`, a
+// missing or null kind, and a Record its reader refuses.
 #[test]
 fn nothing_but_a_positive_statement_in_the_sessions_own_records_is_evidence() {
     let foreign = foreign_kind();
+    let native = native_kind();
     let other = other_os();
     let live_pid = json!({"pid": std::process::id(), "managed_session_id": ID});
-    let mut native_with_herdr_field = handle(native_kind(), Some(ID));
+    let mut native_with_herdr_field = handle(native, Some(ID));
     native_with_herdr_field["herdr_core"] = herdr_core(other);
     let mut owner_of_another_session = owner_shape(other);
     owner_of_another_session["managed_session_id"] = json!("session-other");
-    let mut legacy_owner = owner_shape(other);
-    legacy_owner
-        .as_object_mut()
-        .unwrap()
-        .remove("managed_session_id");
+    let legacy_owner = owner_shape(other);
     let mut empty_id = handle(foreign, Some(ID));
     empty_id["session_id"] = json!("");
+    let foreign_name = foreign.as_str();
+    let native_name = native.as_str();
     let rejected: Vec<(&str, Vec<(&str, Value)>)> = vec![
         ("no records", vec![]),
         (
@@ -194,7 +173,7 @@ fn nothing_but_a_positive_statement_in_the_sessions_own_records_is_evidence() {
         (
             "another OS's Owner record bound to another session",
             vec![
-                ("terminal.json", handle(native_kind(), Some(ID))),
+                ("terminal.json", handle(native, Some(ID))),
                 ("native-session.json", owner_of_another_session),
             ],
         ),
@@ -222,11 +201,52 @@ fn nothing_but_a_positive_statement_in_the_sessions_own_records_is_evidence() {
             vec![("terminal.closing.json", handle(foreign, Some(ID)))],
         ),
         (
+            "a claimed Herdr handle born on another OS",
+            vec![(
+                "terminal.closing.json",
+                json!({"terminal": "herdr", "session_id": "t7", "managed_session_id": ID,
+                    "herdr_core": herdr_core(other)}),
+            )],
+        ),
+        (
+            "a handle of such a kind that repeats its kind",
+            vec![(
+                "terminal.json",
+                Value::String(format!(
+                    r#"{{"terminal":"{foreign_name}","terminal":"{foreign_name}","session_id":"s","managed_session_id":"{ID}"}}"#
+                )),
+            )],
+        ),
+        (
             "a marker that says consumed: false, beside a live PID",
             vec![
                 (
                     "terminal.closed.json",
                     json!({"consumed": false, "terminal": foreign}),
+                ),
+                ("native-session.json", live_pid.clone()),
+            ],
+        ),
+        (
+            "a marker whose consumed field is repeated, beside a live PID",
+            vec![
+                (
+                    "terminal.closed.json",
+                    Value::String(format!(
+                        r#"{{"consumed":false,"consumed":true,"terminal":"{foreign_name}"}}"#
+                    )),
+                ),
+                ("native-session.json", live_pid.clone()),
+            ],
+        ),
+        (
+            "a marker whose terminal field is repeated, beside a live PID",
+            vec![
+                (
+                    "terminal.closed.json",
+                    Value::String(format!(
+                        r#"{{"consumed":true,"terminal":"{native_name}","terminal":"{foreign_name}"}}"#
+                    )),
                 ),
                 ("native-session.json", live_pid),
             ],
@@ -234,6 +254,13 @@ fn nothing_but_a_positive_statement_in_the_sessions_own_records_is_evidence() {
         (
             "a marker with no consumed fact",
             vec![("terminal.closed.json", json!({"terminal": foreign}))],
+        ),
+        (
+            "a marker whose consumed fact is not a boolean",
+            vec![(
+                "terminal.closed.json",
+                json!({"consumed": "true", "terminal": foreign}),
+            )],
         ),
         (
             "a marker that does not decode",
@@ -250,34 +277,46 @@ fn nothing_but_a_positive_statement_in_the_sessions_own_records_is_evidence() {
             "a marker of a kind this OS runs",
             vec![(
                 "terminal.closed.json",
-                json!({"consumed": true, "terminal": native_kind()}),
+                json!({"consumed": true, "terminal": native}),
             )],
+        ),
+        (
+            "an active handle its reader refuses (not UTF-8)",
+            vec![("terminal.json", Value::String("\u{fffd}".into()))],
         ),
     ];
     for (name, records) in rejected {
-        assert_eq!(judge(&records), (None, None), "{name}");
+        assert_eq!(judge_records(&records), None, "{name}");
     }
 }
 
 // The judgment needs a kind the handle record itself states. The reader supplies iTerm2 for
 // a handle that omits its kind (a legacy record); that default is never evidence, on any OS,
-// while a handle that states iTerm2 is evidence where iTerm2 does not run (the reviewer's
-// fixture: `{"session_id":"s","managed_session_id":ID}` counted as iTerm2 on Linux and
-// Windows).
+// while a handle that states iTerm2 is evidence where iTerm2 does not run.
 #[test]
 fn a_kind_the_handle_record_does_not_state_is_never_evidence() {
-    let omitted = json!({"session_id": "s", "managed_session_id": ID});
-    let stated = json!({"terminal": "iterm2", "session_id": "s", "managed_session_id": ID});
-    let bytes = |value: &Value| serde_json::to_vec(value).unwrap();
+    let omitted =
+        terminal_stated(&json!({"session_id": "s", "managed_session_id": ID}).to_string()).unwrap();
+    let stated = terminal_stated(
+        &json!({"terminal": "iterm2", "session_id": "s", "managed_session_id": ID}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(omitted.handle.kind, TerminalKind::Iterm2);
+    assert!(!omitted.kind_stated && stated.kind_stated);
     for os in [OsTerminals::MACOS, OsTerminals::LINUX, OsTerminals::WINDOWS] {
+        let judged = |handle| {
+            judge_on(
+                os,
+                ID,
+                Records {
+                    active: Some(handle),
+                    ..Records::default()
+                },
+            )
+        };
+        assert_eq!(judged(&omitted), None, "an omitted kind on {}", os.os);
         assert_eq!(
-            of_handle_record_bytes_on(os, ID, Some(&bytes(&omitted)), None),
-            None,
-            "an omitted kind on {}",
-            os.os
-        );
-        assert_eq!(
-            of_handle_record_bytes_on(os, ID, Some(&bytes(&stated)), None),
+            judged(&stated),
             (!os.runs(TerminalKind::Iterm2)).then_some(Elsewhere::Kind(TerminalKind::Iterm2)),
             "a stated iTerm2 on {}",
             os.os
@@ -285,93 +324,132 @@ fn a_kind_the_handle_record_does_not_state_is_never_evidence() {
     }
 }
 
-// The same on this OS through every command's admission: a session whose only handle omits
-// its kind, beside a live PID-only owner, is this OS's; the command's own path answers it.
-#[cfg(any(target_os = "linux", windows))]
+// The handle reader that keeps whether the kind was stated is the handle reader: the same
+// decode over the same text, which accepts, refuses and returns exactly what the ordinary one
+// does, a deeply nested field it does not know included, and adds only whether the record's
+// own fields named `terminal`.
 #[test]
-fn an_admission_reads_no_evidence_from_an_omitted_kind() {
-    let omitted = json!({"session_id": "s", "managed_session_id": ID});
-    let (_root, directory) = session_with(&[
-        ("terminal.json", omitted.clone()),
+fn the_stated_handle_reader_decodes_exactly_as_the_handle_reader() {
+    let deep = format!(
+        r#"{{"terminal":"tmux","session_id":"s","x":{}1{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let cases: Vec<(String, Option<bool>)> = vec![
         (
-            "native-session.json",
-            json!({"pid": std::process::id(), "managed_session_id": ID}),
+            json!({"terminal": "tmux", "session_id": "s"}).to_string(),
+            Some(true),
         ),
-    ]);
-    let reader = Reader::open_unchecked(&directory);
-    let decoded: TerminalSession = serde_json::from_value(omitted).unwrap();
-    assert_eq!(decoded.kind, TerminalKind::Iterm2);
-    assert_eq!(of_records(&reader), None);
-    admit(&reader, Some(&decoded), || anyhow::anyhow!("closed")).unwrap();
+        (json!({"session_id": "s"}).to_string(), Some(false)),
+        (json!({"iterm_session_id": "s"}).to_string(), Some(false)),
+        (
+            r#"{"termin\u0061l":"warp","session_id":"s"}"#.to_owned(),
+            Some(true),
+        ),
+        (
+            json!({"session_id": "s", "x": {"terminal": "tmux"}}).to_string(),
+            Some(false),
+        ),
+        (
+            json!({"terminal": "herdr", "session_id": "t7", "herdr_core": {"socket": "/s",
+                "core_id": "c", "created_ms": 1, "host_pid": 4, "host_creation_time": 1}})
+            .to_string(),
+            Some(true),
+        ),
+        (deep, None),
+        (
+            r#"{"terminal":"tmux","terminal":"tmux","session_id":"s"}"#.to_owned(),
+            None,
+        ),
+        (
+            json!({"terminal": null, "session_id": "s"}).to_string(),
+            None,
+        ),
+        (
+            json!({"terminal": "kitty", "session_id": "s"}).to_string(),
+            None,
+        ),
+        (json!(["tmux", "s"]).to_string(), None),
+        (
+            r#"{"terminal":"tmux","session_id":"s"} trailing"#.to_owned(),
+            None,
+        ),
+        ("5".to_owned(), None),
+    ];
+    for (text, stated) in cases {
+        let ordinary = terminal(&text);
+        let kept = terminal_stated(&text);
+        match (&ordinary, &kept) {
+            (Ok(handle), Ok(read)) => assert_eq!(*handle, read.handle, "{text}"),
+            (Err(ordinary), Err(kept)) => {
+                assert_eq!(ordinary.to_string(), kept.to_string(), "{text}")
+            }
+            _ => panic!("{text}: {ordinary:?} against {kept:?}"),
+        }
+        if let Some(stated) = stated {
+            assert_eq!(kept.unwrap().kind_stated, stated, "{text}");
+        }
+    }
 }
 
-// The admission judges the handle the command read and is about to use, not only what the
-// Records say when it asks. The reviewer's interleaving: a close settles an ownerless Herdr
-// copy born on another OS between doctor's read of its handle and the admission, leaving a
-// marker that names Herdr, which this OS runs. The handle that was read still names another
-// OS, so the probe never reaches the core it names: refused while the status catches up, the
-// closed answer once it says closed.
+// A marker counts once and only when it says `consumed: true`: a repeated `consumed` or
+// `terminal`, or a `consumed` that is not `true`, is no completed consumption; its kind is
+// optional (absent, null or one this version does not know is none).
 #[test]
-fn the_admission_judges_the_handle_that_was_read() {
-    let other = other_os();
-    let mut read = handle(TerminalKind::Herdr, Some(ID));
-    read["herdr_core"] = herdr_core(other);
-    let read: TerminalSession = serde_json::from_value(read).unwrap();
-    let marker = json!({"consumed": true, "terminal": "herdr"});
-    let status = |state: &str| {
-        json!({"state": state, "generation": 2, "updated_unix_ms": 2, "exit_code": null,
-            "error": null})
-    };
-    let (_root, settling) = session_with(&[
-        ("terminal.closed.json", marker.clone()),
-        ("status.json", status("exited")),
-    ]);
-    let reader = Reader::open_unchecked(&settling);
-    assert_eq!(
-        of_records(&reader),
-        None,
-        "the records alone name no other OS"
-    );
-    let error = admit(&reader, Some(&read), || anyhow::anyhow!("closed")).unwrap_err();
-    assert_eq!(
-        format!("{error:#}"),
-        format!("{:#}", Elsewhere::Recorded(other).refusal(&settling))
-    );
-    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
-    let (_root, settled) = session_with(&[
-        ("terminal.closed.json", marker),
-        ("status.json", status("closed")),
-        ("closed.json", status("closed")),
-    ]);
-    let reader = Reader::open_unchecked(&settled);
-    let error = admit(&reader, Some(&read), || anyhow::anyhow!("closed")).unwrap_err();
-    assert_eq!(format!("{error:#}"), "closed");
-    // A handle this OS runs, bound to the session, is the command's own to answer.
-    let (_root, native) = session_with(&[("status.json", status("ready"))]);
-    let native_handle: TerminalSession =
-        serde_json::from_value(handle(native_kind(), Some(ID))).unwrap();
-    admit(
-        &Reader::open_unchecked(&native),
-        Some(&native_handle),
-        || anyhow::anyhow!("closed"),
-    )
-    .unwrap();
+fn a_marker_states_a_completed_consumption_only_strictly() {
+    use crate::native::session::record::{Consumption, consumption};
+    let kind = |kind| Some(Consumption { kind });
+    for (text, expected) in [
+        (
+            r#"{"consumed":true,"terminal":"tmux"}"#,
+            kind(Some(TerminalKind::Tmux)),
+        ),
+        (r#"{"consumed":true}"#, kind(None)),
+        (r#"{"consumed":true,"terminal":null}"#, kind(None)),
+        (r#"{"consumed":true,"terminal":"kitty"}"#, kind(None)),
+        (
+            r#"{"consumed":true,"terminal":"warp","reason":"gone","x":[1]}"#,
+            kind(Some(TerminalKind::Warp)),
+        ),
+        (r#"{"consumed":false,"terminal":"tmux"}"#, None),
+        (
+            r#"{"consumed":false,"consumed":true,"terminal":"tmux"}"#,
+            None,
+        ),
+        (
+            r#"{"consumed":true,"consumed":true,"terminal":"tmux"}"#,
+            None,
+        ),
+        (
+            r#"{"consumed":true,"terminal":"tmux","terminal":"warp"}"#,
+            None,
+        ),
+        (r#"{"consumed":"true","terminal":"tmux"}"#, None),
+        (r#"{"terminal":"tmux"}"#, None),
+        (r#"{"consumed":true,"terminal":5}"#, None),
+        ("{broken", None),
+        ("[true]", None),
+        (" \n[true, \"tmux\"]", None),
+        (" \n{\"consumed\":true}", kind(None)),
+    ] {
+        assert_eq!(consumption(text.as_bytes()), expected, "{text}");
+    }
+    assert_eq!(consumption(b"\xff"), None);
 }
 
 // The refusal names what the Records name and the directory of the records, and no terminal
 // to use instead; a Herdr host birth counts for a Herdr handle only.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn each_statement_gives_one_refusal() {
     let os = here().os;
     for kind in TerminalKind::ALL {
-        let judged = of_handle(&TerminalSession::new(kind, "surface".into()));
+        let judged = of_handle_on(here(), &TerminalSession::new(kind, "surface".into()));
         if kind.supported_on_this_platform() {
             assert_eq!(judged, None, "{kind:?}");
         } else {
             assert_eq!(judged, Some(Elsewhere::Kind(kind)), "{kind:?}");
             assert_eq!(
-                judged.unwrap().reason(),
+                judged.unwrap().head(),
                 format!("{} is not available on {os}", kind.display_name())
             );
         }
@@ -393,11 +471,11 @@ fn each_statement_gives_one_refusal() {
             .unwrap()
             .windows_process_identity;
     assert_eq!(
-        of_owner(&mixed),
+        of_owner_on(here(), &mixed),
         Some(Elsewhere::Recorded("more than one operating system"))
     );
     assert_eq!(
-        of_owner(&serde_json::from_value(owner_shape(os)).unwrap()),
+        of_owner_on(here(), &serde_json::from_value(owner_shape(os)).unwrap()),
         None
     );
 }

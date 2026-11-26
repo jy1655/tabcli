@@ -143,17 +143,6 @@ impl SessionEvidence {
                     .record(CoreRecord::Terminal)
                     .optional_json_with(session::record::terminal)?
                     .context("no active terminal handle is recorded")?;
-                // No surface of a Session of another OS is probed from this machine
-                // (`terminal::foreign`): the handle just read is judged as it was read.
-                terminal::foreign::admit(reader, Some(&session), || {
-                    anyhow::anyhow!(
-                        "session {} is closed; its terminal surface is not read",
-                        directory
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                    )
-                })?;
                 session.verify_managed_session(
                     directory
                         .file_name()

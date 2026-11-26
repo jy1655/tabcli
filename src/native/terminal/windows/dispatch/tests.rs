@@ -293,8 +293,7 @@ fn an_expired_open_of_another_kind_gets_the_lookup_refusal() {
 // Doctor's probe of a stored handle of another OS's terminal reads the lookup's refusal on
 // Windows, as on macOS and Linux: the presence is unverified, never a missing surface. Before
 // the lookup refused it, the managed console parsed a WezTerm pane id `0` as a process id and
-// reported the surface missing. (On every OS the probe's own judgment of a session of another
-// OS answers before any lookup; this test reads the Windows lookup directly, on every host.)
+// reported the surface missing. This test reads the Windows lookup directly, on every host.
 #[test]
 fn doctor_probe_of_another_kinds_handle_is_unverified() {
     use crate::native::doctor;

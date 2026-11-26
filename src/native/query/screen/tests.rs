@@ -100,7 +100,7 @@ impl SurfaceAccess for Fake {
         if let Some(owner) = &owner {
             self.verified_owners
                 .borrow_mut()
-                .push((owner.pid, birth(owner)));
+                .push((owner.pid, owner.process_start_seconds));
         }
         Ok(owner)
     }
@@ -164,45 +164,15 @@ impl Fixture {
     }
 }
 
-/// An owner record of this session in the shape this OS's writer records, `start` standing
-/// for the incarnation's birth: another OS's shape, bound to the session, would make it a
-/// session of another OS (`terminal::foreign`). A check of the fake verifies whichever the
-/// record names.
-fn owner(pid: u32, start: u64) -> NativeSessionOwner {
-    let mut owner = NativeSessionOwner {
+/// An owner record of this session; a check of the fake verifies whichever the record names.
+fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
+    NativeSessionOwner {
         pid,
         managed_session_id: Some(ID.into()),
+        process_start_seconds: Some(start_seconds),
+        process_start_microseconds: Some(0),
         ..NativeSessionOwner::default()
-    };
-    if cfg!(windows) {
-        owner.windows_process_identity = Some(terminal::WindowsProcessIdentity {
-            creation_time: start,
-            executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
-        });
-    } else if cfg!(target_os = "linux") {
-        owner.linux_birth = Some(
-            serde_json::from_value(json!({
-                "boot_id": "00112233-4455-6677-8899-aabbccddeeff",
-                "starttime_ticks": start
-            }))
-            .unwrap(),
-        );
-    } else {
-        owner.process_start_seconds = Some(start);
-        owner.process_start_microseconds = Some(0);
     }
-    owner
-}
-
-/// The birth `owner` stands for, whichever OS's shape records it.
-fn birth(owner: &NativeSessionOwner) -> Option<u64> {
-    owner
-        .process_start_seconds
-        .or(owner.linux_birth.map(|birth| birth.starttime_ticks))
-        .or(owner
-            .windows_process_identity
-            .as_ref()
-            .map(|identity| identity.creation_time))
 }
 
 fn handle(kind: terminal::TerminalKind, bound_to: Option<&str>) -> terminal::TerminalSession {
@@ -640,26 +610,6 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
                     "{} screen reads are unsupported: {}",
                     kind.display_name(),
                     declared.unwrap()
-                )
-            );
-        } else if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
-            // A bound handle of a kind this OS does not run makes the session one of another
-            // OS, which every command that would read its terminal refuses in one form.
-            assert_eq!(
-                text,
-                format!(
-                    "{} is not available on {}: TAB on this machine cannot judge or end this \
-                     session; once its records show it ended, an explicit close settles it \
-                     (its records are in {})",
-                    kind.display_name(),
-                    if cfg!(target_os = "macos") {
-                        "macOS"
-                    } else if cfg!(target_os = "linux") {
-                        "Linux"
-                    } else {
-                        "Windows"
-                    },
-                    fixture.directory.display()
                 )
             );
         } else {

@@ -48,7 +48,8 @@ pub(in crate::native) fn reaped_child_pid() -> u32 {
 // The surface and the owner are both bound to the Session the directory belongs to, as their
 // writers bind them; the owner records neither a birth nor a control identity. The surface is
 // of a kind this OS runs (tmux on Linux): a bound handle of a kind another OS runs would make
-// the session one of another OS, whose owner is never observed here.
+// the session one of another OS, which Repair leaves as it is and the explicit close settles
+// from its records (`terminal::foreign`).
 pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
     let session_id = directory.file_name().unwrap().to_str().unwrap().to_owned();
     fs::create_dir(directory.join("events")).unwrap();

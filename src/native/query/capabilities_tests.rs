@@ -250,13 +250,11 @@ fn a_snapshot_without_the_lifecycle_lock_is_unknown() {
     assert!(!fixture.directory.join(TURN_CLAIM_LOCK_FILE).exists());
 }
 
-/// A terminal kind this platform runs. A bound handle of a kind another OS runs would make the
-/// session one of another OS, whose owner is never judged here (`terminal::foreign`).
+/// The terminal kind this platform supports. Linux supports none, so a handle of this kind
+/// is judged unsupported there.
 fn supported_kind() -> terminal::TerminalKind {
     if cfg!(windows) {
         terminal::TerminalKind::WindowsConsole
-    } else if cfg!(target_os = "linux") {
-        terminal::TerminalKind::Tmux
     } else {
         terminal::TerminalKind::AppleTerminal
     }
@@ -491,9 +489,12 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
 fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated() {
     let fixture = ready("pi");
     let directory = &fixture.directory;
-    // `supported_kind` runs on every OS, so its handle of another session is unbound; a bound
-    // handle of a kind this OS does not run is a session of another OS, which `tell` refuses.
-    let unbound = "surface_unbound";
+    let platform_supports_terminals = cfg!(any(windows, target_os = "macos"));
+    let unbound = if platform_supports_terminals {
+        "surface_unbound"
+    } else {
+        "surface_unsupported"
+    };
     let other_platform = if cfg!(windows) {
         terminal::TerminalKind::AppleTerminal
     } else {

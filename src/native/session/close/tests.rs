@@ -4132,3 +4132,209 @@ fn a_handle_that_omits_its_kind_takes_the_ordinary_close() {
             .contains("settled from its records alone")
     );
 }
+
+// Round 10 (one decode): what makes a session a copy is read once, by the reader the step uses.
+
+// The Herdr handle a launch on `os` records, bound to `session`, at `socket`.
+fn herdr_handle_born_on(os: &str, session: &str, socket: &Path) -> Value {
+    let birth = match os {
+        "macOS" => json!({"host_start_seconds": 1, "host_start_microseconds": 2}),
+        "Linux" => json!({"linux_birth": {
+            "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 7}}),
+        _ => json!({"host_creation_time": 1}),
+    };
+    let mut core = json!({"socket": socket, "core_id": "core-a", "created_ms": 1, "host_pid": 4});
+    for (key, value) in birth.as_object().unwrap() {
+        core[key] = value.clone();
+    }
+    json!({"terminal": "herdr", "session_id": "t7", "managed_session_id": session,
+        "herdr_core": core})
+}
+
+// Another OS than this one.
+fn other_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Linux"
+    } else {
+        "macOS"
+    }
+}
+
+// Finding 1 of the seventh review: a marker whose `consumed` or `terminal` field is repeated
+// is no evidence, whichever occurrence a lenient reader would keep. An aged closed session of
+// this OS with such a marker and a live owner stays, as on main.
+#[test]
+fn a_marker_with_a_repeated_field_never_lets_prune_remove_a_native_session() {
+    let foreign = kind_elsewhere().as_str();
+    let native = terminal::TerminalKind::ALL
+        .into_iter()
+        .find(|kind| kind.supported_on_this_platform())
+        .unwrap()
+        .as_str();
+    for marker in [
+        format!(r#"{{"consumed":false,"consumed":true,"terminal":"{foreign}"}}"#),
+        format!(r#"{{"consumed":true,"terminal":"{native}","terminal":"{foreign}"}}"#),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-native");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        write_test_manifest(&directory);
+        update_status(&directory, SessionState::Closed, None, None).unwrap();
+        let store = Store::open_unchecked(&directory);
+        store
+            .record(CoreRecord::Closed)
+            .write_json(
+                &json!({"state": "closed", "generation": 1, "updated_unix_ms": 1,
+                "exit_code": null, "error": null}),
+            )
+            .unwrap();
+        fs::write(directory.join(TERMINAL_TOMBSTONE_FILE), &marker).unwrap();
+        store
+            .write_owner(&NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: Some("session-native".to_owned()),
+                windows_process_identity: test_windows_process_identity(std::process::id()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            Reader::open_unchecked(&directory)
+                .native_owner_blocks_prune()
+                .unwrap(),
+            "{marker}"
+        );
+        assert!(
+            prune_closed_sessions(root.path(), u128::MAX)
+                .unwrap()
+                .is_empty(),
+            "{marker}"
+        );
+        assert!(directory.exists(), "{marker}");
+    }
+}
+
+// Finding 2: a copy identified by its owner record alone whose active handle omits its kind is
+// settled with a marker that names no kind: the reader's iTerm2 default is never written out.
+#[test]
+fn a_settlement_names_no_kind_the_handle_did_not_state() {
+    let (_root, store) = copy_fixture(SessionState::Failed, Some("failure before close"));
+    fs::write(
+        store.record(CoreRecord::Terminal).path(),
+        serde_json::to_vec(&json!({"session_id": "s", "managed_session_id": COPY})).unwrap(),
+    )
+    .unwrap();
+    close_copy(&store).unwrap();
+    let marker: Value = read_json(store.record(CoreRecord::TerminalClosed).path()).unwrap();
+    assert_eq!(marker["consumed"], true);
+    assert_eq!(marker["terminal"], Value::Null);
+    assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+}
+
+// Finding 4: a claimed handle is never evidence, whatever it records. A failed session with
+// only a claimed Herdr handle born on another OS gets main's ordinary close, which addresses
+// the core it names and, finding none, restores the handle as main does. That restored handle
+// is then the session's active handle, which names another OS.
+#[test]
+fn a_claimed_handle_takes_the_ordinary_close() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-claimed");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    update_status(&directory, SessionState::Failed, None, None).unwrap();
+    #[cfg(windows)]
+    let socket = PathBuf::from(format!(
+        r"\\.\pipe\tabcli-absent-core-{}",
+        std::process::id()
+    ));
+    #[cfg(not(windows))]
+    let socket = root.path().join("absent-core.sock");
+    let handle = herdr_handle_born_on(other_os(), "session-claimed", &socket);
+    fs::write(
+        directory.join(TERMINAL_CLOSING_FILE),
+        serde_json::to_vec(&handle).unwrap(),
+    )
+    .unwrap();
+    let close = || {
+        crate::native::close::close_session_surface(
+            &directory,
+            "session-claimed",
+            None,
+            budget::close_deadline(),
+        )
+    };
+    let error = format!("{:#}", close().unwrap_err());
+    assert!(error.contains("no Herdr Core is running"), "{error}");
+    assert!(
+        !error.contains("TAB on this machine cannot judge"),
+        "{error}"
+    );
+    assert!(!directory.join(TERMINAL_CLOSING_FILE).exists());
+    let restored: Value = read_json(&directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+    assert_eq!(restored, handle);
+    assert_eq!(
+        Store::open_unchecked(&directory).status().unwrap().state,
+        SessionState::Failed
+    );
+}
+
+// Finding 7: before a settlement removes anything, every handle it would remove, active and
+// claimed, is readable and this session's; otherwise the close answers that handle's error and
+// leaves both where they are.
+#[test]
+fn a_settlement_validates_every_handle_it_would_remove() {
+    let active = serde_json::to_vec(&json!({"terminal": kind_elsewhere(), "session_id": "t0",
+        "managed_session_id": COPY}))
+    .unwrap();
+    for (name, claimed, expected) in [
+        (
+            "a claimed handle bound to another session",
+            serde_json::to_vec(&json!({"terminal": kind_elsewhere(), "session_id": "t1",
+                "managed_session_id": "session-other"}))
+            .unwrap(),
+            "terminal handle belongs to managed session session-other",
+        ),
+        (
+            "a claimed handle that is not JSON",
+            b"not JSON".to_vec(),
+            "invalid JSON in ",
+        ),
+    ] {
+        let (_root, store) = copy_fixture(SessionState::Failed, Some("provider launch failed"));
+        let active_path = store.record(CoreRecord::Terminal).path().to_owned();
+        let claimed_path = store.record(CoreRecord::TerminalClosing).path().to_owned();
+        fs::write(&active_path, &active).unwrap();
+        fs::write(&claimed_path, &claimed).unwrap();
+        let error = format!("{:#}", close_copy(&store).unwrap_err());
+        assert!(error.contains(expected), "{name}: {error}");
+        assert_eq!(fs::read(&active_path).unwrap(), active, "{name}");
+        assert_eq!(fs::read(&claimed_path).unwrap(), claimed, "{name}");
+        assert!(
+            !store.record(CoreRecord::TerminalClosed).present().unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            store.status().unwrap().state,
+            SessionState::Failed,
+            "{name}"
+        );
+    }
+}
+
+// Finding 8: a copy's replay keeps the baseline. The marker's recorded reason is preferred
+// where this OS's close reads one (macOS and Linux, as 0.4.49 did); only a marker without one
+// keeps the status's diagnosis.
+#[test]
+fn a_copys_replay_prefers_the_recorded_reason_as_the_baseline_does() {
+    let (_root, store) = copy_fixture(SessionState::Failed, Some("failure before close"));
+    store
+        .write_terminal_closed(&json!({"consumed": true, "terminal": null,
+            "reason": "terminal had already exited"}))
+        .unwrap();
+    close_copy(&store).unwrap();
+    let error = store.status().unwrap().error.unwrap_or_default();
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        assert_eq!(error, "terminal had already exited");
+    } else {
+        assert!(error.contains("failure before close"), "{error}");
+    }
+}

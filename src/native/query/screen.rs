@@ -242,13 +242,6 @@ fn bound_surface(
     }
     let record = SurfaceRecord::read(reader);
     drop(snapshot);
-    // No terminal of a Session of another OS is read from this machine (`terminal::foreign`);
-    // the closed answer above came first.
-    if let SurfaceRecord::Active(Ok(Some(handle))) = &record {
-        terminal::foreign::admit(reader, Some(handle), || {
-            anyhow::anyhow!("session {id} is closed; its terminal surface is not read")
-        })?;
-    }
     match (judgment::surface(&record, id), record) {
         (
             Surface::Active {

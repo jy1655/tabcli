@@ -496,15 +496,6 @@ pub(in crate::native) fn close_owned_surface(
     session: &TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
-    // A Session of another OS (`terminal::foreign`), here only through the handle the close
-    // claimed (the close transaction settles or refuses one its Records name before it claims
-    // anything): the one refusal, before any record or observation is read, so that no OS's own
-    // close rules answer for it. The ordinary transaction then restores the handle.
-    terminal::foreign::admit(
-        &crate::native::session::Reader::open_unchecked(directory),
-        Some(session),
-        || anyhow::anyhow!("session {id} is closed; its terminal is not addressed"),
-    )?;
     let observation = Production::new(directory, id, session, deadline);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return observation.close_posix_surface();

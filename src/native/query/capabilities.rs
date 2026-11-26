@@ -168,12 +168,6 @@ fn tell_gates(
     if evidence.recovery_required {
         return Err(Stop::unknown("recovery_required", None));
     }
-    // A Session whose own Records say it belongs to another OS (`terminal::foreign`).
-    if let Some(elsewhere) = terminal::foreign::of_records(reader) {
-        return Err(tell_gate_elsewhere(
-            reader, records, id, evidence, elsewhere,
-        ));
-    }
     if close::repair_examines_owner(&records.status.state) {
         owner_gate(evidence.owner)?;
     }
@@ -200,46 +194,6 @@ fn tell_gates(
     unevaluated.push("provider_delivery_readiness");
     unevaluated.extend_from_slice(adapter);
     Ok(unevaluated)
-}
-
-/// `tell`'s gate for a Session whose own Records say it belongs to another OS: Repair judges
-/// no owner for it, so the owner gate passes; an active handle is refused as `tell`'s
-/// ownership proof refuses it, before any terminal call and in the one order (a closed
-/// Session, then a handle that is not this Session's, then another OS); without one, the
-/// recorded surface's own refusal.
-fn tell_gate_elsewhere(
-    reader: &Reader,
-    records: &Snapshot,
-    id: &str,
-    evidence: &FollowUpEvidence<'_>,
-    elsewhere: terminal::foreign::Elsewhere,
-) -> Stop {
-    if let Err(error) = FirstPartyCli::from_str(&records.manifest.provider) {
-        return Stop::unreadable(error);
-    }
-    let Surface::Active {
-        bound, empty_id, ..
-    } = evidence.surface
-    else {
-        return surface_gate(evidence.surface)
-            .expect_err("only an active handle passes the surface gate");
-    };
-    if terminal::foreign::closed(reader) {
-        return Stop::refused(
-            "state_not_ready",
-            format!("session {id} is closed; its terminal is not addressed"),
-        );
-    }
-    if !bound || *empty_id {
-        return Stop::refused(
-            "surface_unbound",
-            "the terminal handle is not bound to this session",
-        );
-    }
-    Stop::refused(
-        "surface_unsupported",
-        format!("{:#}", elsewhere.refusal(reader.directory())),
-    )
 }
 
 /// The liveness verdict dead-owner repair would act on, judged where convergence runs.

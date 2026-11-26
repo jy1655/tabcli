@@ -81,10 +81,7 @@ impl ScriptedHerdrCore {
                     core_id: CORE_ID.into(),
                     created_ms: CREATED_MS,
                     host_pid: HOST_PID,
-                    birth: HerdrHostBirth::Macos {
-                        host_start_seconds: 1,
-                        host_start_microseconds: 0,
-                    },
+                    birth: this_os_birth(),
                 },
                 NONCE,
             );
@@ -100,6 +97,28 @@ impl ScriptedHerdrCore {
             .iter()
             .any(|terminal| terminal["address"] == ADDRESS)
     }
+}
+
+/// The host birth that this OS's Herdr adapter records (`herdr/unix.rs`, `herdr/pipe.rs`), so
+/// that a scripted launch belongs to this OS, as a real one does (`terminal::foreign`). The
+/// scripted host's PID is never a live process, so no adapter compares this birth.
+fn this_os_birth() -> HerdrHostBirth {
+    #[cfg(target_os = "macos")]
+    return HerdrHostBirth::Macos {
+        host_start_seconds: 1,
+        host_start_microseconds: 0,
+    };
+    #[cfg(target_os = "linux")]
+    return HerdrHostBirth::Linux {
+        linux_birth: super::LinuxBirth {
+            boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
+            starttime_ticks: 1,
+        },
+    };
+    #[cfg(windows)]
+    return HerdrHostBirth::Windows {
+        host_creation_time: 1,
+    };
 }
 
 /// `HC_SOCKET` naming a core and no caller terminal, until dropped.

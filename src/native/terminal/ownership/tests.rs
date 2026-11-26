@@ -54,7 +54,6 @@ fn owner_fixture() -> (
         }),
         terminal_app: None,
         windows_process_identity: None,
-        recorded_elsewhere: None,
     };
     let live = NativeProcessIdentity {
         birth: crate::native::terminal::ownership::ProcessBirth::Macos(100, 200),

@@ -58,11 +58,6 @@ pub(in crate::native) struct NativeSessionOwner {
     pub(in crate::native) terminal_app: Option<MacTerminalAppIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) windows_process_identity: Option<terminal::WindowsProcessIdentity>,
-    /// Not a field of the record: what the Session's other Records say about the OS it belongs
-    /// to, set by the Owner record's one observation (`session::owner::observe`). An owner of a
-    /// session of another OS is never observed on this machine (`attest_owner_with`).
-    #[serde(skip)]
-    pub(in crate::native) recorded_elsewhere: Option<terminal::foreign::Elsewhere>,
 }
 
 /// What an owner record says about the Session it belongs to, for one expected Session.
@@ -485,7 +480,6 @@ pub(in crate::native) fn current_native_session_owner(
         terminal_shell: Some(terminal_shell),
         terminal_app: None,
         windows_process_identity: None,
-        recorded_elsewhere: None,
     };
     verified_terminal_owner_process_group(&owner, &live)?;
     // The surface record, and with it the kind, is read only after the owner is built
@@ -641,17 +635,6 @@ pub(in crate::native) fn verified_terminal_surface_owner(
     session: &terminal::TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<Option<NativeSessionOwner>> {
-    // A session of another OS is refused before any surface or owner observation here, in
-    // the one order (`terminal::foreign::admit`).
-    terminal::foreign::admit(
-        &crate::native::session::Reader::open_unchecked(directory),
-        Some(session),
-        || {
-            anyhow::anyhow!(
-                "session {expected_session_id} is closed; its terminal is not addressed"
-            )
-        },
-    )?;
     session.verify_managed_session(expected_session_id)?;
     #[cfg(windows)]
     let owner = {

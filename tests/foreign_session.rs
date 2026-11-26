@@ -1,24 +1,21 @@
 //! A Session whose own Records positively say it belongs to another OS, as a state directory
-//! copied between machines holds it: its bound active handle names a kind this OS does not run
-//! (or, for Herdr, a host born on another OS), its consumption marker says it consumed such a
-//! kind, or its bound Owner record has another OS's identity.
+//! copied between machines holds it: its bound active handle states a kind this OS does not
+//! run (or, for Herdr, a host born on another OS), its consumption marker says it consumed such
+//! a kind, or its bound Owner record has another OS's identity.
 //!
-//! For such a Session TAB does nothing that depends on this machine's terminals or processes,
-//! and everything it does from Records alone is as before. Every public command that
-//! `describe` lists is classified below and run against every fixture:
-//! - `tell`, `screen` and doctor's probe give the one refusal where they would address the
-//!   terminal, in one order (closed, then unbound, then another OS);
-//! - the explicit close settles a copy whose Records show it ended and refuses any other, and
-//!   prune removes a closed copy; a settlement followed by prune removes the same fixture;
-//! - every other command gives its answer from Records, as before.
+//! Only the explicit close, prune and Repair treat such a Session differently: the close
+//! settles a copy whose Records show it ended and refuses any other, prune removes a closed
+//! copy, and Repair (which `sessions`, `tell` and the close run) changes nothing from what this
+//! machine's processes show. Every command `describe` lists is on one list below; a command
+//! added later that is on no list fails the test.
 //!
-//! No command connects to the Herdr Core or tmux server the fixture's handle names. Every
-//! command runs twice against each fixture: once with every recorded PID (the owner's and the
-//! provider's, of the session, of a refused reopen of it, and the Herdr host's) naming a process
-//! alive on this machine, and once naming one that is not. The responses and every record must
-//! be the same in both runs, so anything derived from a local process observation fails the
-//! test without anyone listing where it is observed. A command added later that is on no list
-//! fails the test. The same on macOS, Linux and Windows.
+//! The explicit close, prune and the commands that run Repair are run twice against each
+//! fixture: once with every recorded PID (the owner's, the provider's and the Herdr host's)
+//! naming a process alive on this machine, and once naming one that is not. Their answers and
+//! every record must be the same in both runs, so anything derived from a local process
+//! observation fails the test without anyone listing where it is observed. The other commands
+//! answer for a copy as for any session; nothing here asserts that they do not depend on local
+//! processes. The same on macOS, Linux and Windows.
 #![cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod support;
 use serde_json::{Value, json};
@@ -28,22 +25,18 @@ use std::{
     process::{Command, Output},
 };
 
-/// Commands that would address the session's terminal: they give the one refusal there.
-const REFUSES: &[&str] = &["tell", "screen", "doctor"];
-/// Commands that settle a copy from its Records: the explicit close and prune.
+/// The commands that settle a copy from its Records: the explicit close and prune.
 const SETTLES: &[&str] = &["close-session", "prune-sessions"];
-/// Commands that act from Records alone, exactly as before.
-const RECORDS: &[&str] = &[
-    "hold", "cancel", "reopen", "status", "inspect", "result", "wait", "search", "sessions",
+/// The commands that run Repair before their own work, which leaves a copy as it is.
+const REPAIRS: &[&str] = &["sessions", "tell"];
+/// The commands that answer for a copy as for any session.
+const OTHERS: &[&str] = &[
+    "hold", "cancel", "reopen", "status", "inspect", "result", "wait", "search", "screen", "doctor",
 ];
 /// Commands that take no session.
 const NO_SESSION: &[&str] = &["describe", "ask", "self-test", "consent", "settings"];
 
 const ID: &str = "session-foreign";
-/// A session whose initial request the copy sent: its Origin observation reads the copy.
-const STARTED: &str = "session-started";
-/// A reopen of a closed copy, refused at launch on the copy's OS, whose provider PID is recorded.
-const REOPENED: &str = "session-reopened";
 const CLAIM: &str = "7-7-7";
 const REQUEST: &str = "request-foreign";
 const FAILURE: &str = "the provider failed";
@@ -104,11 +97,6 @@ impl Case {
             || self.handle == Handle::Consumed
             || self.expired_launch
             || ["exited", "failed"].contains(&self.state)
-    }
-
-    // Whether an active handle is recorded (a consumed copy keeps a leftover one).
-    fn active(&self) -> bool {
-        self.handle == Handle::Active || (self.handle == Handle::Consumed && !self.closed)
     }
 }
 
@@ -255,56 +243,6 @@ fn owner(os: &str, id: &str, pid: u32) -> Value {
     owner
 }
 
-// `number` replaced by `with` wherever it stands alone, not inside a longer number.
-fn replace_number(text: &str, number: u32, with: &str) -> String {
-    let number = number.to_string();
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(at) = rest.find(&number) {
-        let before = rest[..at].chars().next_back();
-        let after = rest[at + number.len()..].chars().next();
-        out.push_str(&rest[..at]);
-        if before.is_some_and(|c| c.is_ascii_digit()) || after.is_some_and(|c| c.is_ascii_digit()) {
-            out.push_str(&number);
-        } else {
-            out.push_str(with);
-        }
-        rest = &rest[at + number.len()..];
-    }
-    out.push_str(rest);
-    out
-}
-
-// The times in a text: a run of twelve digits or more (a Unix time in milliseconds) and a
-// count of milliseconds (`991 ms`).
-fn without_times(text: &str) -> String {
-    let mut out = String::new();
-    let mut chars = text.char_indices().peekable();
-    while let Some((at, c)) = chars.next() {
-        if !c.is_ascii_digit() {
-            out.push(c);
-            continue;
-        }
-        let mut end = at + c.len_utf8();
-        while let Some(&(next, digit)) = chars.peek() {
-            if !digit.is_ascii_digit() {
-                break;
-            }
-            end = next + digit.len_utf8();
-            chars.next();
-        }
-        let digits = &text[at..end];
-        if digits.len() >= 12 {
-            out.push_str("<time>");
-        } else if text[end..].starts_with(" ms") {
-            out.push_str("<n>");
-        } else {
-            out.push_str(digits);
-        }
-    }
-    out
-}
-
 // A PID that no process holds here: a child that has exited and been reaped.
 fn absent_pid() -> u32 {
     #[cfg(windows)]
@@ -349,6 +287,17 @@ impl Endpoints {
             .map(|listener| std::iter::from_fn(|| listener.accept().ok()).count())
             .sum()
     }
+
+    // Stops listening and removes the endpoints, so that a connection finds no core.
+    fn close(&mut self) {
+        for listener in self.0.drain(..) {
+            if let Ok(address) = listener.local_addr()
+                && let Some(path) = address.as_pathname()
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
 
 // Windows has no Unix socket listener here; its endpoints are named pipes no fixture names.
@@ -364,6 +313,8 @@ impl Endpoints {
     fn connections(&self) -> usize {
         0
     }
+
+    fn close(&mut self) {}
 }
 
 struct Fixture {
@@ -407,6 +358,9 @@ fn provider_process(directory: &Path, id: &str, pid: u32) {
         &json!({"schema": 1, "managed_session_id": id, "pid": pid, "spawned_unix_ms": 1}),
     );
 }
+
+/// The recorded fields that hold a process id: what differs between two runs of one case.
+const PID_FIELDS: &[&str] = &["pid", "host_pid", "process_group", "terminal_process_group"];
 
 impl Fixture {
     // The fixture of `case` with every recorded PID `pid`.
@@ -464,128 +418,12 @@ impl Fixture {
                 &support::receipt(REQUEST, CLAIM, "event-7.json"),
             );
         }
-        // A session the copy started: its Origin observation reads the copy's records. It
-        // records no owner or handle of its own.
-        let started = session(root.path(), STARTED, "ready", None);
-        support::write(
-            &started.join("launch.json"),
-            &json!({"schema": 1, "claim_token": "100-1", "deadline_unix_ms": 1,
-                "phase": "spawned"}),
-        );
-        support::write(
-            &started.join("requests").join("100-1.json"),
-            &json!({"schema": 1, "request_id": "request-100-1", "claim_token": "100-1",
-                "event_file": "event-100-1.json", "created_unix_ms": 100,
-                "context_sources": [], "source": ID}),
-        );
-        if case.closed {
-            // A reopen of the closed copy that its OS refused at launch, after its provider
-            // process was recorded: its own records name the copy's OS.
-            support::write(
-                &directory.join("reopen.marker.json"),
-                &json!({"schema": 1, "claim": "claim", "provider_session_id": "conversation",
-                    "reopened_by": REOPENED, "created_unix_ms": 1}),
-            );
-            let reopened = session(root.path(), REOPENED, "failed", None);
-            support::write(
-                &reopened.join("reopen.refusal.json"),
-                &json!({"schema": 2, "phase": "launch", "gate": "reopen-conflict",
-                    "detail": "blocked", "created_unix_ms": 2}),
-            );
-            support::write(
-                &reopened.join("native-session.json"),
-                &owner(case.origin, REOPENED, pid),
-            );
-            provider_process(&reopened, REOPENED, pid);
-        }
         let endpoints = Endpoints::listen(&[socket, directory.join("tmux.sock")]);
         Self {
             root,
             endpoints,
             pid,
         }
-    }
-
-    // The sessions the fixture holds.
-    fn sessions(&self) -> usize {
-        fs::read_dir(self.root.path())
-            .unwrap()
-            .filter(|entry| entry.as_ref().unwrap().path().is_dir())
-            .count()
-    }
-
-    // What differs between two fixtures of one case besides the records' answers: the root,
-    // as the commands name it, the recorded PIDs, and the times a command reads when it runs
-    // (a Unix time in milliseconds, a duration in milliseconds).
-    fn normalized(&self, text: &str) -> String {
-        let mut text = text.to_owned();
-        let canonical = self.root.path().canonicalize().unwrap();
-        for root in [canonical.as_path(), self.root.path()] {
-            text = text.replace(&root.display().to_string(), "<root>");
-        }
-        without_times(&replace_number(&text, self.pid, "<pid>"))
-    }
-
-    // A JSON value with the root and the PIDs replaced, and the times a command records when
-    // it runs (`*_ms`) zeroed: what two runs of one command must share.
-    fn normalized_value(&self, value: &Value) -> Value {
-        match value {
-            Value::String(text) => Value::String(self.normalized(text)),
-            Value::Number(number) if number.as_u64() == Some(u64::from(self.pid)) => {
-                json!("<pid>")
-            }
-            Value::Array(items) => Value::Array(
-                items
-                    .iter()
-                    .map(|item| self.normalized_value(item))
-                    .collect(),
-            ),
-            Value::Object(map) => Value::Object(
-                map.iter()
-                    .map(|(key, child)| {
-                        let child = if key.ends_with("_ms") && child.is_number() {
-                            json!(0)
-                        } else {
-                            self.normalized_value(child)
-                        };
-                        (key.clone(), child)
-                    })
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-
-    // A command's output as two runs must share it.
-    fn answer(&self, output: &Output) -> (Option<i32>, Value, String) {
-        let stdout = match serde_json::from_slice::<Value>(&output.stdout) {
-            Ok(value) => self.normalized_value(&value),
-            Err(_) => Value::String(self.normalized(&String::from_utf8_lossy(&output.stdout))),
-        };
-        (
-            output.status.code(),
-            stdout,
-            self.normalized(&String::from_utf8_lossy(&output.stderr)),
-        )
-    }
-
-    // The records as two runs must share them: relative paths, and their contents normalized.
-    fn shared_records(&self) -> Vec<(String, Option<Value>)> {
-        self.records()
-            .into_iter()
-            .map(|(path, bytes)| {
-                let relative = path
-                    .strip_prefix(self.root.path())
-                    .unwrap()
-                    .display()
-                    .to_string();
-                let content = bytes.map(|bytes| match serde_json::from_slice::<Value>(&bytes) {
-                    Ok(value) => self.normalized_value(&value),
-                    Err(_) => Value::String(self.normalized(&String::from_utf8_lossy(&bytes))),
-                });
-                (relative, content)
-            })
-            .collect()
     }
 
     fn directory(&self) -> PathBuf {
@@ -663,6 +501,99 @@ impl Fixture {
             support::write(&path, &status);
         }
     }
+
+    // A text as two runs of one case must share it: the root as the commands name it, the
+    // recorded PID only where a known diagnostic names it, and the time a launch log line
+    // starts with. Every other number, a boot id's included, is kept as it is.
+    fn normalized_text(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        let canonical = self.root.path().canonicalize().unwrap();
+        for root in [canonical.as_path(), self.root.path()] {
+            text = text.replace(&root.display().to_string(), "<root>");
+        }
+        // Repair's diagnosis of an owner it found gone names the owner's PID.
+        text.replace(
+            &format!("native session process {} ", self.pid),
+            "native session process <pid> ",
+        )
+    }
+
+    // A JSON value as two runs of one case must share it: its texts normalized, a recorded
+    // process id (`PID_FIELDS`) equal to the fixture's replaced, and the times a command
+    // records when it runs (`*_ms`) zeroed.
+    fn normalized_value(&self, value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(self.normalized_text(text)),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.normalized_value(item))
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, child)| {
+                        let child = if PID_FIELDS.contains(&key.as_str())
+                            && child.as_u64() == Some(u64::from(self.pid))
+                        {
+                            json!("<pid>")
+                        } else if key.ends_with("_ms") && child.is_number() {
+                            json!(0)
+                        } else {
+                            self.normalized_value(child)
+                        };
+                        (key.clone(), child)
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    // A command's output as two runs must share it.
+    fn answer(&self, output: &Output) -> (Option<i32>, Value, String) {
+        let stdout = match serde_json::from_slice::<Value>(&output.stdout) {
+            Ok(value) => self.normalized_value(&value),
+            Err(_) => Value::String(self.normalized_text(&String::from_utf8_lossy(&output.stdout))),
+        };
+        (
+            output.status.code(),
+            stdout,
+            self.normalized_text(&String::from_utf8_lossy(&output.stderr)),
+        )
+    }
+
+    // The records as two runs must share them: relative paths, and their contents normalized.
+    // A launch log line starts with the time it was written.
+    fn shared_records(&self) -> Vec<(String, Option<Value>)> {
+        self.records()
+            .into_iter()
+            .map(|(path, bytes)| {
+                let relative = path
+                    .strip_prefix(self.root.path())
+                    .unwrap()
+                    .display()
+                    .to_string();
+                let log = path.ends_with("launch.log");
+                let content = bytes.map(|bytes| match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value) => self.normalized_value(&value),
+                    Err(_) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        let text = if log {
+                            text.lines()
+                                .map(|line| line.split_once(' ').map_or(line, |(_, rest)| rest))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else {
+                            text.into_owned()
+                        };
+                        Value::String(self.normalized_text(&text))
+                    }
+                });
+                (relative, content)
+            })
+            .collect()
+    }
 }
 
 // A record of a snapshot as JSON; null when it is missing or not JSON.
@@ -700,20 +631,9 @@ fn read_json(path: &Path) -> Value {
 
 // The command's arguments against this fixture's session.
 fn arguments(command: &str) -> Vec<String> {
-    let address = format!("{ID}/{REQUEST}");
     let args: Vec<&str> = match command {
         "tell" => vec!["tell", ID, "--prompt", "hello", "--json"],
-        "hold" => vec!["hold", ID, "--json"],
-        "cancel" => vec!["cancel", ID, "--json"],
-        "reopen" => vec!["reopen", ID, "--prompt", "continue", "--json"],
-        "screen" => vec!["screen", ID, "--json"],
         "close-session" => vec!["close-session", ID, "--explicit", "--json"],
-        "status" => vec!["status", "--all-workspaces", "--all", "--json"],
-        "inspect" => vec!["inspect", ID, "--json"],
-        "result" => vec!["result", ID, "--latest", "--json"],
-        "wait" => vec!["wait", &address, "--timeout-secs", "1", "--json"],
-        "search" => vec!["search", "hello", "--all-workspaces", "--json"],
-        "doctor" => vec!["doctor", ID, "--probe", "--json"],
         "sessions" => vec!["sessions", "--json"],
         "prune-sessions" => vec![
             "prune-sessions",
@@ -725,36 +645,6 @@ fn arguments(command: &str) -> Vec<String> {
         other => panic!("no arguments for {other}"),
     };
     args.into_iter().map(str::to_owned).collect()
-}
-
-// Every owner observation a command reports: none may come from this machine.
-fn owner_observations(value: &Value) -> Vec<Value> {
-    let mut found = Vec::new();
-    fn walk(value: &Value, found: &mut Vec<Value>) {
-        match value {
-            Value::Object(map) => {
-                for (key, child) in map {
-                    if key == "process_alive" || key == "owner_process_alive" {
-                        found.push(child.clone());
-                    }
-                    walk(child, found);
-                }
-            }
-            Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
-            _ => {}
-        }
-    }
-    walk(value, &mut found);
-    found
-}
-
-// One check of a doctor report.
-fn doctor_check(value: &Value, id: &str) -> Value {
-    value["checks"]
-        .as_array()
-        .and_then(|checks| checks.iter().find(|check| check["id"] == id))
-        .cloned()
-        .unwrap_or(Value::Null)
 }
 
 // The error text of a failed command: its JSON `error`, or the last cause on stderr.
@@ -772,14 +662,6 @@ fn failure(output: &Output) -> String {
         .to_owned()
 }
 
-// The marker of an expected answer that is the read error of a missing record: the record's
-// name and the error code (`os error 2`) are the same on every OS, the OS's wording is not.
-const MISSING: &str = "missing record: ";
-
-fn missing_record(record: &str) -> String {
-    format!("{MISSING}{record}")
-}
-
 // The row a listing gives this fixture's session.
 fn row<'a>(rows: &'a Value, id: &str) -> &'a Value {
     rows.as_array()
@@ -787,73 +669,29 @@ fn row<'a>(rows: &'a Value, id: &str) -> &'a Value {
         .unwrap_or(&Value::Null)
 }
 
-// What a command answers for this fixture. `Ok(None)` is a success whose details the caller
-// checks; `Err(text)` a failure whose error is `text` or ends with it.
-fn expected(command: &str, case: &Case, fixture: &Fixture) -> Result<Option<Value>, String> {
-    let refusal = fixture.refusal(&case.head);
-    let state = if case.closed { "closed" } else { case.state };
-    match command {
-        // The proof refuses an active handle; without one, `tell` reads no handle, as before.
-        "tell" if case.active() => Err(refusal),
-        // The OS words the missing file its own way: only the record and the error code are
-        // the same everywhere (`missing_record`).
-        "tell" => Err(missing_record("terminal.json")),
-        "screen" if case.closed => Err(format!(
-            "session {ID} is closed; its terminal surface is not read"
-        )),
-        "screen" if case.handle == Handle::Active => Err(refusal),
-        "screen" => Err(format!(
-            "the terminal surface of session {ID} is closed or being closed"
-        )),
-        "hold" if case.closed => {
-            Err("the session is closed; a hold cannot be set or released".to_owned())
-        }
-        "hold" => Ok(Some(json!({"held": true}))),
-        "cancel" if case.working => Err(
-            "this session was started by an extension without cancel support; start a new session"
-                .to_owned(),
-        ),
-        "cancel" if state == "working" => {
-            Err(format!("session {ID} has no active claim to cancel"))
-        }
-        "cancel" => Err(format!(
-            "session {ID} is {state}; cancel requires the running or working state"
-        )),
-        // The refused reopen of a closed copy is a copy too: its provider process is never
-        // observed here, so the reservation stays unverified.
-        "reopen" if case.closed => Err(format!(
-            "reopen refused (already-reopened): session {ID} was already reopened as {REOPENED}; that launch was refused (reopen-conflict) but its records cannot be verified: a session recorded on {} is not available on {}: provider process {} of refused session {REOPENED} cannot be observed from this machine",
-            case.origin,
-            here(),
-            fixture.pid
-        )),
-        "reopen" => Err(format!(
-            "reopen refused (source-not-closed): session {ID} is {state}; reopen requires a session closed with its closed tombstone"
-        )),
-        "result" => Err("no published result is available for this selection".to_owned()),
-        "wait" if case.working => {
-            Err("waiting timed out; no request was cancelled or resent".to_owned())
-        }
-        "wait" => Err(format!(
-            "no such TAB request: {REQUEST}; legacy events have no request mapping"
-        )),
-        "close-session" if !case.settles() => Err(refusal),
-        "prune-sessions" if case.closed => Ok(Some(json!({"pruned": [ID]}))),
-        "prune-sessions" => Ok(Some(json!({"pruned": []}))),
-        // The searched records: every session of the fixture, no hit.
-        "search" => Ok(Some(json!({"ok": true, "hits": [], "incomplete": false,
-            "scanned": {"events": 0, "sessions": fixture.sessions()}}))),
-        _ => Ok(None),
-    }
+// What a command answers for this fixture: `Some(Err(text))` a failure whose error is `text`
+// or ends with it, `Some(Ok(details))` a success with those fields, `None` an answer this test
+// does not pin (`tell`'s own, after its Repair, is the same as for any session).
+fn expected(command: &str, case: &Case, fixture: &Fixture) -> Option<Result<Value, String>> {
+    Some(match command {
+        "close-session" if !case.settles() => Err(fixture.refusal(&case.head)),
+        "close-session" => Ok(json!({"closed": true})),
+        "prune-sessions" if case.closed => Ok(json!({"pruned": [ID]})),
+        "prune-sessions" => Ok(json!({"pruned": []})),
+        "sessions" => Ok(json!({})),
+        _ => return None,
+    })
 }
 
-// The state a listing reports for the fixture's session: its records' state, which `sessions`
-// first converges (an expired launch fails), as before.
-fn listed_state(command: &str, case: &Case) -> &'static str {
-    match command {
-        _ if case.closed => "closed",
-        "sessions" if case.expired_launch => "failed",
-        _ => case.state,
+// The state `sessions` lists for the fixture's session: its records' state once Repair has
+// run (an expired launch fails from its records, as before).
+fn listed_state(case: &Case) -> &'static str {
+    if case.closed {
+        "closed"
+    } else if case.expired_launch {
+        "failed"
+    } else {
+        case.state
     }
 }
 
@@ -881,16 +719,16 @@ fn every_public_command_is_classified_for_a_session_of_another_os() {
         .collect();
     assert!(!names.is_empty());
     for name in &names {
-        let classes = [REFUSES, SETTLES, RECORDS, NO_SESSION]
+        let classes = [SETTLES, REPAIRS, OTHERS, NO_SESSION]
             .iter()
             .filter(|class| class.contains(&name.as_str()))
             .count();
         assert_eq!(
             classes, 1,
-            "{name} must be on exactly one list: does it address the terminal, settle from records, act from records alone, or take no session?"
+            "{name} must be on exactly one list: does it settle a copy, run Repair, answer as for any session, or take no session?"
         );
     }
-    for class in [REFUSES, SETTLES, RECORDS, NO_SESSION] {
+    for class in [SETTLES, REPAIRS, OTHERS, NO_SESSION] {
         for name in class {
             assert!(
                 names.iter().any(|listed| listed == name),
@@ -900,20 +738,50 @@ fn every_public_command_is_classified_for_a_session_of_another_os() {
     }
 }
 
-// Every command against every fixture, twice: with every recorded PID alive here, then with
-// every one absent. Both runs must give the same answer and leave the same records; the
-// first run's answer must also be the expected one.
+// The normalizer replaces only a recorded process id and the diagnostics known to name one:
+// with the fixture's PID equal to a component of the Linux boot id the fixtures record
+// (6677), the boot id and every other number stay as they are.
 #[test]
-fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
+fn the_normalizer_keeps_every_number_that_is_not_a_recorded_pid() {
+    let fixture = Fixture::new(&cases()[0], 6677);
+    let value = json!({
+        "linux_birth": {"boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 6677},
+        "pid": 6677, "host_pid": 6677, "count": 6677, "process_group": 6677,
+        "error": "native session process 6677 is no longer running; 6677 requests",
+        "updated_unix_ms": 1795,
+    });
+    assert_eq!(
+        fixture.normalized_value(&value),
+        json!({
+            "linux_birth": {"boot_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "starttime_ticks": 6677},
+            "pid": "<pid>", "host_pid": "<pid>", "count": 6677, "process_group": "<pid>",
+            "error": "native session process <pid> is no longer running; 6677 requests",
+            "updated_unix_ms": 0,
+        })
+    );
+}
+
+// The explicit close, prune and the commands that run Repair, against every fixture, twice:
+// with every recorded PID alive here, then with every one absent. Both runs must give the same
+// answer and leave the same records, and the first run's answer must be the expected one.
+#[test]
+fn the_close_prune_and_repair_answer_a_copy_from_its_records_alone() {
     // Every departure is collected, so that one run names all of them.
     let mut failures = Vec::new();
     let alive = std::process::id();
     for case in cases() {
-        for command in REFUSES.iter().chain(SETTLES).chain(RECORDS) {
+        for command in SETTLES.iter().chain(REPAIRS) {
             let runs: Vec<_> = [alive, absent_pid()]
                 .into_iter()
                 .map(|pid| {
-                    let fixture = Fixture::new(&case, pid);
+                    let mut fixture = Fixture::new(&case, pid);
+                    // `tell` goes on, after its Repair, as for any session: its ownership proof
+                    // addresses the core a Herdr handle names, which a listener that never
+                    // answers would hold. Without one the core is simply absent.
+                    if *command == "tell" {
+                        fixture.endpoints.close();
+                    }
                     let before = fixture.records();
                     let output = fixture.run(command);
                     let after = fixture.records();
@@ -966,73 +834,51 @@ fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
                     "the settlement or its prune depends on whether its recorded PIDs are alive here",
                 );
             }
-            for run in [&fixture, &other] {
-                check(
-                    run.endpoints.connections() == 0,
-                    "connected to the terminal's endpoint",
-                );
+            // `tell` goes on, after its Repair, as for any session, which addresses the
+            // terminal its handle names; the close, prune and Repair address none.
+            if *command != "tell" {
+                for run in [&fixture, &other] {
+                    check(
+                        run.endpoints.connections() == 0,
+                        "connected to the terminal's endpoint",
+                    );
+                }
             }
             check(
                 !text.contains("relative-herdr-core.sock"),
-                "addressed a Herdr Core",
+                "addressed a Herdr Core of this machine",
             );
             let value = reply(&output);
-            for observation in owner_observations(&value) {
-                check(observation.is_null(), "reported a local owner observation");
-            }
             match expected(command, &case, &fixture) {
-                Err(answer) => {
+                Some(Err(answer)) => {
                     check(!output.status.success(), "succeeded");
                     let error = failure(&output);
-                    let matched = match answer.strip_prefix(MISSING) {
-                        Some(record) => {
-                            error.starts_with("failed to read ")
-                                && error.contains(record)
-                                && error.ends_with("(os error 2)")
-                        }
-                        None => error == answer || error.ends_with(&answer),
-                    };
-                    check(matched, &format!("not `{answer}`"));
-                    if answer == fixture.refusal(&case.head) && *command != "close-session" {
+                    check(
+                        error == answer || error.ends_with(&answer),
+                        &format!("not `{answer}`"),
+                    );
+                }
+                Some(Ok(Value::Object(details))) => {
+                    check(output.status.success(), "failed");
+                    check(!value.is_null(), "no JSON answer");
+                    for (key, expected) in details {
                         check(
-                            value["failure_kind"] == "unsupported",
-                            "not an unsupported failure",
+                            value[&key] == expected,
+                            &format!("`{key}` is not {expected}"),
                         );
                     }
                 }
-                Ok(details) => {
-                    check(output.status.success(), "failed");
-                    check(!value.is_null(), "no JSON answer");
-                    if let Some(Value::Object(details)) = details {
-                        for (key, expected) in details {
-                            check(
-                                value[&key] == expected,
-                                &format!("`{key}` is not {expected}"),
-                            );
-                        }
-                    }
-                }
-            }
-            // The listings show the fixture's session in the state its records give.
-            match *command {
-                "status" => {
-                    let listed = row(&value["sessions"], ID);
-                    check(
-                        listed["state"] == listed_state(command, &case),
-                        &format!("its status row is not {}", listed_state(command, &case)),
-                    );
-                }
-                "sessions" => {
-                    let listed = row(&value, ID);
-                    check(
-                        listed["state"] == listed_state(command, &case),
-                        &format!("its sessions row is not {}", listed_state(command, &case)),
-                    );
-                }
                 _ => {}
             }
+            if *command == "sessions" {
+                let listed = row(&value, ID);
+                check(
+                    listed["state"] == listed_state(&case),
+                    &format!("its sessions row is not {}", listed_state(&case)),
+                );
+            }
             // What may change: an expired launch is settled from its records by the commands
-            // that converge, as before; `hold` writes its record; the close and prune settle.
+            // that run Repair, as before; the close and prune settle.
             let directory = fixture.directory();
             let record = |name: &str| recorded(&after, &directory.join(name));
             match *command {
@@ -1054,12 +900,9 @@ fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
                         "the consumption marker does not keep the consumed kind",
                     );
                     let error = status["error"].as_str().unwrap_or_default().to_owned();
-                    if !case.closed && case.handle != Handle::Consumed {
+                    if !case.closed {
                         check(
-                            error.contains(&format!(
-                                "settled from its records alone ({})",
-                                case.head
-                            )),
+                            error.contains("settled from its records alone"),
                             "the closed status does not say how it was settled",
                         );
                     }
@@ -1076,18 +919,6 @@ fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
                 }
                 "prune-sessions" if case.closed => {
                     check(!directory.exists(), "the closed copy remains");
-                }
-                "hold" if !case.closed => {
-                    let others = |entries: Vec<support::Entry>| -> Vec<support::Entry> {
-                        entries
-                            .into_iter()
-                            .filter(|(path, _)| !path.ends_with("hold.json"))
-                            .collect()
-                    };
-                    check(
-                        others(after) == others(before),
-                        "changed a record besides the hold",
-                    );
                 }
                 "tell" | "sessions" if case.expired_launch => {
                     // The expired launch failed from its records, its claim released and the
@@ -1124,48 +955,17 @@ fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
                 }
                 _ => check(after == before, "changed the records"),
             }
-            if *command == "doctor" {
-                // The probe's answer: a missing active handle as before, then the closed one,
-                // the one refusal otherwise.
-                let answer = if !case.active() {
-                    "no active terminal handle is recorded".to_owned()
-                } else if case.closed {
-                    format!("session {ID} is closed; its terminal surface is not read")
-                } else {
-                    fixture.refusal(&case.head)
-                };
-                check(
-                    doctor_check(&value, "terminal_surface")["detail"]
-                        == format!("Surface presence could not be verified: {answer}"),
-                    "the probe did not give the one answer",
-                );
-                if case.closed {
-                    check(
-                        doctor_check(&value, "reopen_marker")["reason_code"]
-                            == "reopen_marker_unverified",
-                        "the refused reopen's provider was judged here",
-                    );
-                }
-            }
-            if *command == "inspect" {
-                // `tell`'s capability projects its ownership proof for an active handle.
-                let tell = &value["capabilities"]["tell"];
-                if case.handle == Handle::Active {
-                    check(
-                        *tell
-                            == json!({"state": "refused", "reason": "surface_unsupported",
-                                "detail": fixture.refusal(&case.head)}),
-                        "the tell capability",
-                    );
-                }
-            }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+// The close answers the same records in one order: a handle that is not this session's
+// before the session of another OS, with a legacy iTerm2 handle that names no session counting
+// as its own; and a closed copy's close finishes again from its records, keeping the kind its
+// remaining handle states.
 #[test]
-fn every_command_answers_the_same_records_in_one_order() {
+fn the_close_answers_a_copys_records_in_one_order() {
     let os = here();
     let (terminal, origin) = if os == "Windows" {
         ("apple-terminal", "macOS")
@@ -1183,28 +983,16 @@ fn every_command_answers_the_same_records_in_one_order() {
     assert_eq!(ready.origin, origin);
 
     // A handle bound to another session, beside an Owner record of another OS: the binding
-    // answers before the OS.
+    // answers before the OS, and nothing is written.
     let mut unbound = ready.clone();
     unbound.terminal["managed_session_id"] = json!("session-other");
     let binding = format!("terminal handle belongs to managed session session-other, not {ID}");
     let fixture = Fixture::new(&unbound, absent_pid());
     let before = fixture.records();
-    for command in ["tell", "screen", "close-session"] {
-        let output = fixture.run(command);
-        assert!(!output.status.success(), "{command}");
-        let error = failure(&output);
-        assert!(error.ends_with(&binding), "{command}: {error}");
-    }
-    let inspected = reply(&fixture.output(&["inspect", ID, "--json"]));
-    assert_eq!(
-        inspected["capabilities"]["tell"]["reason"], "surface_unbound",
-        "{inspected}"
-    );
-    let doctor = reply(&fixture.output(&["doctor", ID, "--probe", "--json"]));
-    assert_eq!(
-        doctor_check(&doctor, "terminal_surface")["detail"],
-        format!("Surface presence could not be verified: {binding}")
-    );
+    let output = fixture.run("close-session");
+    assert!(!output.status.success());
+    let error = failure(&output);
+    assert!(error.ends_with(&binding), "{error}");
     assert_eq!(fixture.records(), before);
 
     // A legacy iTerm2 handle without a binding, beside an Owner record of macOS: on an OS
@@ -1219,23 +1007,13 @@ fn every_command_answers_the_same_records_in_one_order() {
         let refusal = fixture.refusal(&format!(
             "a session recorded on macOS is not available on {os}"
         ));
-        for command in ["tell", "screen", "close-session"] {
-            let error = failure(&fixture.run(command));
-            assert!(error.ends_with(&refusal), "{command}: {error}");
-        }
-        let inspected = reply(&fixture.output(&["inspect", ID, "--json"]));
-        assert_eq!(
-            inspected["capabilities"]["tell"],
-            json!({"state": "refused", "reason": "surface_unsupported", "detail": refusal})
-        );
-        let doctor = reply(&fixture.output(&["doctor", ID, "--probe", "--json"]));
-        assert_eq!(
-            doctor_check(&doctor, "terminal_surface")["detail"],
-            format!("Surface presence could not be verified: {refusal}")
-        );
+        let error = failure(&fixture.run("close-session"));
+        assert!(error.ends_with(&refusal), "{error}");
     }
 
-    // A closed session whose bound handle of another OS remains: closed answers first.
+    // A closed session whose bound handle of another OS remains: its records alone finish the
+    // close, as for any closed session: the handle is consumed, its kind kept, and no terminal
+    // is reached.
     let stale = Case {
         state: "closed",
         ..ready
@@ -1245,35 +1023,6 @@ fn every_command_answers_the_same_records_in_one_order() {
         &fixture.directory().join("closed.json"),
         &support::status("closed", 2, None),
     );
-    let before = fixture.records();
-    for (command, answer) in [
-        (
-            "tell",
-            format!("session {ID} is closed; its terminal is not addressed"),
-        ),
-        (
-            "screen",
-            format!("session {ID} is closed; its terminal surface is not read"),
-        ),
-    ] {
-        assert_eq!(failure(&fixture.run(command)), answer, "{command}");
-    }
-    let inspected = reply(&fixture.output(&["inspect", ID, "--json"]));
-    assert_eq!(
-        inspected["capabilities"]["tell"],
-        json!({"state": "refused", "reason": "state_not_ready",
-            "detail": format!("session {ID} is closed; its terminal is not addressed")})
-    );
-    let doctor = reply(&fixture.output(&["doctor", ID, "--probe", "--json"]));
-    assert_eq!(
-        doctor_check(&doctor, "terminal_surface")["detail"],
-        format!(
-            "Surface presence could not be verified: session {ID} is closed; its terminal surface is not read"
-        )
-    );
-    assert_eq!(fixture.records(), before);
-    // Its records alone finish the close, as for any closed session: the handle is consumed,
-    // its kind kept, and no terminal is reached.
     let output = fixture.run("close-session");
     assert!(output.status.success(), "{}", failure(&output));
     assert!(!fixture.directory().join("terminal.json").exists());

@@ -203,10 +203,10 @@ impl FromStr for TerminalKind {
 /// The kinds one OS runs, and its refusals of every other kind, the same on macOS, Linux and
 /// Windows. Each OS's selection refuses an explicit such kind for a new launch with
 /// `unavailable` (`<Name> is not available on <OS>; use <its kinds>`). Each OS's adapter lookup
-/// refuses a stored handle of such a kind, or a Herdr handle born on another OS, with
-/// `not_here` (`<Name> is not available on <OS>`) before any adapter is reached; only a kind's
-/// declared screen or guarded-input refusal answers before it. Whether a whole Session belongs
-/// to another OS is judged in `foreign`.
+/// refuses a stored handle of such a kind with `not_here` (`<Name> is not available on <OS>`)
+/// before any adapter is reached; only a kind's declared screen or guarded-input refusal
+/// answers before it. Whether a whole Session belongs to another OS, for the explicit close,
+/// prune and Repair, is judged in `foreign`.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native::terminal) struct OsTerminals {
     os: &'static str,
@@ -1273,9 +1273,8 @@ mod tests {
 
     // A Session of another OS whose owner's PID is absent here: nothing on this machine is
     // evidence about it. Repair (as `sessions`, `tell` and `close-session` run it) leaves it
-    // exactly as it is, and the ownership proof refuses it before any surface or owner check,
-    // the same on every OS. The explicit close decides from its Records alone: a ready one is
-    // refused twice and keeps its handle, and prune stays blocked; a failed one is settled, its
+    // exactly as it is, the same on every OS. The explicit close decides from its Records
+    // alone: a ready one is refused twice and keeps its handle; a failed one is settled, its
     // handle consumed with no terminal call, and prune may then remove it. Before, macOS read a
     // Windows owner (and Windows a macOS owner) as a PID-only owner, so Repair settled a
     // session from an unrelated local PID.
@@ -1325,15 +1324,6 @@ mod tests {
                 unchanged(&case);
                 store.converge_until(deadline).unwrap();
                 unchanged(&case);
-                let proof = super::ownership::verified_terminal_surface_owner(
-                    &directory,
-                    "session-foreign",
-                    &surface,
-                    Some(std::time::Duration::from_secs(5)),
-                )
-                .unwrap_err();
-                assert_eq!(format!("{proof:#}"), refusal, "{case}");
-                assert_eq!(classify(&proof), Some(FailureKind::Unsupported), "{case}");
                 let close = || {
                     crate::native::close::close_session_surface(
                         &directory,
@@ -1349,12 +1339,6 @@ mod tests {
                         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
                         unchanged(&case);
                     }
-                    assert!(
-                        Reader::open_unchecked(&directory)
-                            .native_owner_blocks_prune()
-                            .unwrap(),
-                        "{case}"
-                    );
                     continue;
                 }
                 close().unwrap_or_else(|error| panic!("{case}: {error:#}"));

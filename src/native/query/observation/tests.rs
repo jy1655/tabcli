@@ -453,23 +453,12 @@ fn each_damaged_auxiliary_record_is_its_unreadable_part() {
     }
 }
 
-// A terminal this OS runs: the probe is never asked about a session of another OS.
-fn native_terminal() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "tmux"
-    } else if cfg!(windows) {
-        "windows-console"
-    } else {
-        "warp"
-    }
-}
-
 #[test]
 fn surface_presence_is_judged_once_per_observation() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("terminal.json"),
-        &json!({"terminal": native_terminal(), "session_id": "surface-1", "managed_session_id": "session-fault"}),
+        &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
     )
     .unwrap();
     let reader = Reader::open_unchecked(&fixture.directory);
@@ -512,7 +501,7 @@ fn surface_presence_is_judged_once_per_observation() {
     let expired = Observation::read(&reader).unwrap();
     crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("terminal.json"),
-        &json!({"terminal": native_terminal(), "session_id": "surface-1", "managed_session_id": "session-fault"}),
+        &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
     )
     .unwrap();
     let presence =
