@@ -1545,6 +1545,41 @@ fn the_socket_connection_bounds_every_reply() {
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+// A core that answers and then closes its end leaves its reply in the socket. macOS refuses
+// a receive timeout (SO_RCVTIMEO) with EINVAL once the peer has closed, so a read that set
+// one first lost a reply that had arrived: the test above failed once on the macOS runner
+// (2026-11-26) with "lost the Herdr Core connection: Invalid argument (os error 22)" for an
+// answered hello. The transport reads the reply, then the end of the stream, and an open core
+// that says nothing still ends the read at its deadline.
+#[cfg(unix)]
+#[test]
+fn a_reply_sent_before_the_core_closed_its_end_is_read() {
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::net::UnixStream;
+    let line = [
+        br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
+        b"\n",
+    ]
+    .concat();
+    let mut buffer = [0_u8; 256];
+    let (mut tab, mut core) = UnixStream::pair().unwrap();
+    core.write_all(&line).unwrap();
+    drop(core);
+    let read = super::Stream::read_before(&mut tab, &mut buffer, later()).unwrap();
+    assert_eq!(&buffer[..read], line.as_slice());
+    assert_eq!(
+        super::Stream::read_before(&mut tab, &mut buffer, later()).unwrap(),
+        0
+    );
+    let (mut tab, _core) = UnixStream::pair().unwrap();
+    let started = Instant::now();
+    let error =
+        super::Stream::read_before(&mut tab, &mut buffer, started + Duration::from_millis(100))
+            .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+}
+
 // --- Review regressions (2026-11-18): each was written and run before its fix. ---
 
 // herdr-core `terminal_run` creates the terminal, then `flush_saved` can answer

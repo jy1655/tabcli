@@ -257,8 +257,35 @@ impl Stream for UnixStream {
         Write::write(self, bytes)
     }
 
+    // The read waits with poll(2), not a receive timeout: macOS refuses SO_RCVTIMEO with
+    // EINVAL once the core has closed its end, and a reply the core sent before it closed is
+    // still in the socket to be read.
     fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize> {
-        self.set_read_timeout(Some(super::remaining(deadline)?))?;
+        wait_readable(self, deadline)?;
         Read::read(self, buffer)
+    }
+}
+
+/// Returns once a read of `stream` does not block (bytes, the end of the stream or an error
+/// is waiting), or `TimedOut` at the deadline.
+fn wait_readable(stream: &UnixStream, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        // Rounded up to whole milliseconds, so that no wait ends before the deadline.
+        let timeout = super::remaining(deadline)?.as_micros().div_ceil(1000);
+        let mut poll = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut poll, 1, i32::try_from(timeout).unwrap_or(i32::MAX)) } {
+            0 => {}
+            ready if ready > 0 => return Ok(()),
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
     }
 }
