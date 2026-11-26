@@ -29,8 +29,8 @@ mod reservation;
 use gate::reopen_refusal;
 pub(super) use gate::{ReopenGate, reopen_refusal_gate};
 use reservation::{
-    Reservation, record_failed_launch, retry_interrupted_launch_fence, settle_reopen_outcome,
-    verify_reopen_source_is_closed,
+    Reservation, pending_launch_fence, record_failed_launch, settle_reopen_outcome,
+    verify_reopen_source_is_closed, verify_reopen_source_is_closed_apart_from_its_marker,
 };
 pub(super) use reservation::{marker_check, record_reopen_refusal};
 
@@ -275,6 +275,7 @@ pub(super) fn resolution<'a>(
     provider: FirstPartyCli,
     workspace: &'a Path,
     surface: terminal::Selection,
+    before_writes: Option<Box<dyn FnOnce() -> Result<()> + 'a>>,
 ) -> session_start::Resolution<'a> {
     session_start::Resolution {
         provider,
@@ -294,6 +295,7 @@ pub(super) fn resolution<'a>(
         admission_refusal: |error| {
             reopen_refusal(ReopenGate::WorkspaceRefused, format!("{error:#}"))
         },
+        before_writes,
     }
 }
 
@@ -303,11 +305,17 @@ impl ResolvedReopen {
         // decided with the provider, and its caller checked, in the resolution below.
         let surface = session_start::choose_launch_surface(request.terminal)?;
         let source_directory = Reader::session_directory(&request.id)?;
-        let _ = retry_interrupted_launch_fence(&source_directory);
+        // The settlement that an interrupted launch failure of the source's last reopen still
+        // owes its child is a write to that child. 0.4.49 ran it after its caller check; here it
+        // runs once every other refusal of the resolution has passed (the caller check, the
+        // provider's support and version, the deadline), right before the first write of the
+        // resolution, so that a refused or expired reopen leaves the child as it was. The
+        // judgment of the source's marker, which reads that child, waits for it.
+        let pending = pending_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not
         // alter the record it continues from.
-        let source = inspect_reopen_source(&source_directory, &request.id)?;
+        let source = inspect_reopen_source_with(&source_directory, &request.id, pending.is_none())?;
         provider::reopen(source.provider)
             .and_then(|support| support.verify_available(&source.provider_session_id))
             .map_err(|error| {
@@ -315,12 +323,20 @@ impl ResolvedReopen {
             })?;
         // The shared resolution fails before anything is created, so a failed consent
         // assessment leaves the source reopenable.
+        let before_writes = pending.map(|pending| {
+            let (directory, id) = (source_directory.clone(), request.id.clone());
+            Box::new(move || {
+                let _ = pending.retry();
+                verify_reopen_source_is_closed(&directory, &id).map(drop)
+            }) as Box<dyn FnOnce() -> Result<()>>
+        });
         let start = session_start::resolve(
             resolution(
                 &request,
                 source.provider,
                 &source.manifest.workspace,
                 surface,
+                before_writes,
             ),
             deadline,
         )?;
@@ -494,10 +510,21 @@ fn create_reopened_session(
 
 // Require a tombstoned, settled source with resolved receipts and a provider identity.
 // Validate receipts first so corrupt events consistently refuse as request-unresolved.
+#[cfg(test)]
 fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
+    inspect_reopen_source_with(directory, id, true)
+}
+
+// `marker`: whether the source's marker is judged here; a reopen that owes the marker's child
+// a pending settlement judges it after that settlement instead.
+fn inspect_reopen_source_with(directory: &Path, id: &str, marker: bool) -> Result<ReopenSource> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    verify_reopen_source_is_closed(directory, id)?;
+    if marker {
+        verify_reopen_source_is_closed(directory, id)?;
+    } else {
+        verify_reopen_source_is_closed_apart_from_its_marker(directory, id)?;
+    }
     // Reject linked or non-directory events paths before reads can escape the session.
     // An absent directory reaches the receipt/identity gates, which report what is missing.
     Reader::open_unchecked(directory)

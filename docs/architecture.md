@@ -157,10 +157,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
   explicit choice is refused. An automatic choice gets the caller check
   (`terminal::admit_selection`) once, as soon as it is known to be Herdr, by the rule stated at
-  `resolve_with`. Current Herdr Surface Boundary states exactly where the request's deadline
-  is read on the Herdr and creation steps: the caller check's waits for the core's replies and
-  its successful return, the entry to creation, a reopen's reservation, and the allocation of
-  the Session directory.
+  `resolve_with`. Current Herdr Surface Boundary states what the request's deadline owes this
+  order against 0.4.49 (no reordered step lets a write happen that 0.4.49's order prevented,
+  so a reopen settles an interrupted launch failure only after every other refusal) and where
+  the clock is read on the Herdr and creation steps.
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option

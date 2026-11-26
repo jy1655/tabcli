@@ -523,6 +523,33 @@ fn state_root_faults_preserve_repair_and_prune_interleaving() {
     assert!(!closed.exists());
 }
 
+// A request whose deadline has passed when creation reaches the state root leaves it as it was
+// (its mode and its durability receipt) and allocates no Session: the clock is read right
+// before the state root is prepared, as a reopen reaches it after its reservation.
+#[cfg(unix)]
+#[test]
+fn an_expired_request_leaves_the_state_root_unprepared() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::session::Store;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("state");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let durable = [base.path().to_owned()];
+    let error = Store::create_directory(&root, &durable, Some(Instant::now())).unwrap_err();
+    assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+    let text = format!("{error:#}");
+    assert!(text.contains("no Session was created"), "{text}");
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!root.join(STATE_ROOT_DURABLE_FILE).exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+}
+
 // The clock is read after the state root is prepared and right before the Session directory is
 // allocated: a request that enters in time and whose preparation crosses its deadline
 // allocates no Session directory. Were the clock read before preparation instead, this

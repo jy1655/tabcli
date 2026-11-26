@@ -449,35 +449,49 @@ pub(super) fn settle_reopen_outcome(
     (outcome, gate)
 }
 
-pub(super) fn retry_interrupted_launch_fence(source_directory: &Path) -> Result<()> {
-    let marker = Reader::open_unchecked(source_directory).reopen_marker_if_present();
-    let Ok(Some(marker)) = marker else {
-        return Ok(());
-    };
-    let Some(child) = marker.reopened_by.filter(|id| valid_session_id(id)) else {
-        return Ok(());
-    };
-    let child = source_directory
-        .parent()
-        .context("session directory has no state root")?
-        .join(child);
+// The settlement that an interrupted launch failure of the source's last reopen still owes its
+// child: the marker names that child, its refusal record is a launch failure, and the child is
+// still launching under that launch's Claim. Read without a lock; `retry` settles it under
+// the child's lock only while that still holds.
+pub(super) struct PendingLaunchFence {
+    child: PathBuf,
+    token: String,
+    detail: String,
+}
+
+pub(super) fn pending_launch_fence(source_directory: &Path) -> Option<PendingLaunchFence> {
+    let marker = Reader::open_unchecked(source_directory)
+        .reopen_marker_if_present()
+        .ok()??;
+    let child = marker.reopened_by.filter(|id| valid_session_id(id))?;
+    let child = source_directory.parent()?.join(child);
     if !fs::symlink_metadata(&child).is_ok_and(|metadata| metadata.is_dir()) {
-        return Ok(());
+        return None;
     }
-    let Some(refusal) = read_reopen_launch_refusal(&child) else {
-        return Ok(());
-    };
-    if refusal.gate == ReopenGate::LaunchFailed.as_str() {
+    let refusal = read_reopen_launch_refusal(&child)?;
+    if refusal.gate != ReopenGate::LaunchFailed.as_str() {
+        return None;
+    }
+    let token = refusal.claim_token?;
+    let store = Store::open_unchecked(&child);
+    let launching = store.status().ok()?.state == SessionState::Launching;
+    let current = session::turn::current_claim_token(&store).ok()?;
+    let pending = launching && current.as_deref() == Some(token.as_str());
+    pending.then_some(PendingLaunchFence {
+        child,
+        token,
+        detail: refusal.detail,
+    })
+}
+
+impl PendingLaunchFence {
+    pub(super) fn retry(self) -> Result<()> {
         session::launch::retry_failed_start_fence(
-            &Store::open_unchecked(&child),
-            refusal
-                .claim_token
-                .as_deref()
-                .expect("validated launch token"),
-            &refusal.detail,
-        )?;
+            &Store::open_unchecked(&self.child),
+            &self.token,
+            &self.detail,
+        )
     }
-    Ok(())
 }
 
 // Release only the marker naming this refused launch, once its provider is verified gone.
@@ -571,6 +585,15 @@ pub(super) fn verify_reopen_source_is_closed(
     directory: &Path,
     id: &str,
 ) -> Result<Option<marker::StaleReopenMarker>> {
+    verify_reopen_source_is_closed_apart_from_its_marker(directory, id)?;
+    marker::observe(directory)?.into_stale(id)
+}
+
+// The closed tombstone and converged close of the source, without the judgment of its marker.
+pub(super) fn verify_reopen_source_is_closed_apart_from_its_marker(
+    directory: &Path,
+    id: &str,
+) -> Result<()> {
     let closed = Reader::open_unchecked(directory).closed_if_present()?;
     let status = Reader::open_unchecked(directory).status_if_present()?;
     let state = status
@@ -606,7 +629,7 @@ pub(super) fn verify_reopen_source_is_closed(
             ));
         }
     }
-    marker::observe(directory)?.into_stale(id)
+    Ok(())
 }
 
 // The winner's hold on a closed source. Dropping it before `finalize` removes the marker

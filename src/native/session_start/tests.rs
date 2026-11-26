@@ -583,6 +583,7 @@ mod resolution {
                             FirstPartyCli::Codex,
                             workspace,
                             terminal::Selection::Kind(SELECTED),
+                            None,
                         ),
                         far(),
                         probe,
@@ -1558,10 +1559,9 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         .err()
         .expect("the deadline refuses creation");
     assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
-    assert!(
-        format!("{error:#}").contains("nothing was created"),
-        "{error:#}"
-    );
+    let text = format!("{error:#}");
+    assert!(text.contains("no Session was created"), "{text}");
+    assert!(!text.contains("nothing was"), "{text}");
     assert!(!receipt.exists(), "a durability receipt was written");
     #[cfg(unix)]
     assert_eq!(mode(), mode_before, "the state root's mode changed");
@@ -1613,6 +1613,9 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
     let root = Reader::state_root().unwrap();
     let project = root.parent().unwrap().join("project");
     fs::create_dir_all(&project).unwrap();
+    // The canonical spelling: consent skips an aliased workspace without writing, and the
+    // temporary directory of macOS lies behind a link.
+    let project = project.canonicalize().unwrap();
     let fallback = platform_fallback();
     // Claude's caller is checked before its probe, Codex's after it (off Windows).
     let mut cases = vec![(FirstPartyCli::Claude, "2.1.302")];
@@ -1655,6 +1658,33 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
             "{provider:?}: the workspace-consent store was written"
         );
     }
+    // The same resolution with time left writes the store: the assertion above can fail.
+    let ask = AskRequest {
+        provider: FirstPartyCli::Claude,
+        workspace: project.clone(),
+        prompt: "fixture prompt".into(),
+        title: None,
+        model: None,
+        effort: None,
+        terminal: None,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+        context_results: Vec::new(),
+    };
+    resolve_with(
+        fresh_resolution(
+            &ask,
+            context::resolve(&[]).unwrap(),
+            terminal::Selection::Herdr { fallback },
+        ),
+        far(),
+        |_| Ok((PathBuf::from("provider-fixture"), "2.1.302".to_owned())),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(root.join("workspace-consent").exists());
 }
 
 // A deadline no test reaches.

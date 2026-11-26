@@ -84,9 +84,10 @@ impl Resolved {
     }
 
     // The clock is read before `create` runs, so that a request whose deadline passed during
-    // the resolution writes nothing (the state root's mode and durability receipt included).
-    // `create` receives the deadline: a reopen's reservation reads it again before it writes
-    // its marker, and `create_session` right before it allocates the Session directory.
+    // the resolution creates nothing more (the state root's mode and durability receipt
+    // included). `create` receives the deadline: a reopen's reservation reads it again before
+    // it writes its marker, and `create_session` before it prepares the state root and again
+    // right before it allocates the Session directory.
     pub(super) fn create_with<T>(
         self,
         create: impl FnOnce(
@@ -97,7 +98,7 @@ impl Resolved {
     ) -> Result<(Prepared, T)> {
         if Instant::now() >= self.deadline {
             bail!(TimedOut::new(
-                "the request's deadline passed before its Session was created; nothing was created"
+                "the request's deadline passed before creation began; no Session was created"
             ));
         }
         let provider = self.spec.provider;
@@ -228,6 +229,10 @@ pub(super) struct Resolution<'a> {
     // How an admission refusal is reported: unchanged for `ask`, typed as reopen's
     // workspace-refused gate for a reopen.
     pub(super) admission_refusal: fn(anyhow::Error) -> anyhow::Error,
+    // A write the command owes before its own, run once every other refusal of the resolution
+    // has passed, right before the workspace-consent store is written: a reopen's settlement
+    // of an interrupted launch failure, then the source marker's judgment it waited for.
+    pub(super) before_writes: Option<Box<dyn FnOnce() -> Result<()> + 'a>>,
 }
 
 // The launchable spec of a start, after the command selected its terminal, in this order:
@@ -266,9 +271,11 @@ pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<R
 // deadline limits the check's wait for the core's replies, a check that fails after it is
 // reported as timed out, and the clock is read when the check returns successfully, the
 // boundary where 0.4.49's version probe stopped a late request before any write. The check's
-// other steps and what the resolution reads besides are not bounded by it, as in 0.4.49.
-// Creation reads it again (`Resolved::create_with`, `Reservation::claim_until`,
-// `state_root::create_directory`); docs/agents/herdr.md states the whole guarantee.
+// other steps and what the resolution reads besides are not bounded by it, as in 0.4.49, nor
+// is the wait for the workspace-consent lock. `before_writes` runs after every other refusal
+// and before that store is written. Creation reads the deadline again
+// (`Resolved::create_with`, `Reservation::claim_until`, `state_root::create_directory`);
+// docs/agents/herdr.md states the whole guarantee.
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
     deadline: Instant,
@@ -289,6 +296,7 @@ pub(super) fn resolve_with(
         context_sources,
         workspace_noun,
         admission_refusal,
+        before_writes,
     } = resolution;
     let mut verify_caller = Some(verify_caller);
     let mut check_caller = |kind: terminal::TerminalKind| -> Result<()> {
@@ -306,11 +314,11 @@ pub(super) fn resolve_with(
                 }
             })?;
             // 0.4.49 ran the deadline-aware version probe after the caller check, so a check
-            // that returns after the deadline stopped the request before anything was written;
-            // the clock is read here for the same boundary.
+            // that returns after the deadline stopped the request before the workspace-consent
+            // store was written; the clock is read here for the same boundary.
             if Instant::now() >= deadline {
                 bail!(TimedOut::new(
-                    "the request's deadline passed during the Herdr caller check; nothing was written"
+                    "the request's deadline passed during the Herdr caller check; no Session was created"
                 ));
             }
         }
@@ -358,6 +366,9 @@ pub(super) fn resolve_with(
         default_title.render(provider, workspace_name)
     });
     let title = sanitize_title(&requested_title)?;
+    if let Some(before_writes) = before_writes {
+        before_writes()?;
+    }
     let consent = consent::assess(
         &root,
         match consent_path {
@@ -522,6 +533,7 @@ pub(super) fn fresh_resolution(
         context_sources: attached.sources,
         workspace_noun: "workspace",
         admission_refusal: std::convert::identity,
+        before_writes: None,
     }
 }
 

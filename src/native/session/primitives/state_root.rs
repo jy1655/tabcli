@@ -206,9 +206,9 @@ pub(in crate::native) fn validate_hook_directory(directory: &Path) -> Result<()>
     require_valid_session_id(id)
 }
 
-// `deadline`, the request's, is read after the state root is prepared and right before the
-// Session directory is allocated: once it has passed, no Session is created. Preparing the
-// state root (its ancestry sync included) is not bounded by it.
+// `deadline`, the request's, is read before the state root is prepared, and again after it and
+// right before the Session directory is allocated: once it has passed, no Session is created.
+// Preparing the state root (its ancestry sync included) is not bounded by it once begun.
 pub(in crate::native) fn create_directory(
     root: &Path,
     durable_directories: &[PathBuf],
@@ -219,12 +219,18 @@ pub(in crate::native) fn create_directory(
     })
 }
 
-// The Session directory once `prepare` has readied the state root; tests time `prepare`.
+// The Session directory once `prepare` has readied the state root; tests time `prepare`. The
+// clock is read before `prepare` too: a reopen reaches it after its reservation.
 pub(in crate::native) fn create_directory_after(
     root: &Path,
     deadline: Option<std::time::Instant>,
     prepare: impl FnOnce() -> Result<Option<String>>,
 ) -> Result<(PathBuf, String, Option<String>)> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        bail!(crate::native::failure_kind::TimedOut::new(
+            "the request's deadline passed before its state root was prepared; no Session was created"
+        ));
+    }
     let ancestry_error = prepare()?;
     if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
         bail!(crate::native::failure_kind::TimedOut::new(

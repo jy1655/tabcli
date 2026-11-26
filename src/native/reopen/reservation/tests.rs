@@ -4193,6 +4193,133 @@ fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
     assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());
 }
 
+// The settlement that an interrupted launch failure of the source's last reopen still owes its
+// child is a write to that child. 0.4.49 checked an automatic Herdr choice against its caller
+// before it, so a reopen refused there left the child launching. Here it waits until nothing
+// but the source's marker can refuse the request: a reopen refused by its caller check, its
+// provider's support or its expired deadline leaves the child as it was, automatic or explicit.
+#[test]
+fn a_refused_or_expired_reopen_leaves_an_interrupted_child_launching() {
+    const CHILD_PROCESS: &str = "TABCLI_REOPEN_INTERRUPTED_CHILD";
+    const SOURCE: &str = "session-interrupted-source";
+    const CHILD: &str = "session-interrupted-child";
+    if std::env::var_os(CHILD_PROCESS).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let bin = base.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // A Claude whose `--version` would succeed: only the deadline can stop the probe.
+        #[cfg(windows)]
+        fs::write(bin.join("claude.cmd"), "@echo off\r\necho 2.1.302\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let claude = bin.join("claude");
+            fs::write(&claude, "#!/bin/sh\necho 2.1.302\n").unwrap();
+            fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut path = vec![bin];
+        #[cfg(windows)]
+        path.push(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"));
+        #[cfg(unix)]
+        path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        #[cfg(windows)]
+        let absent_core = format!(r"\\.\pipe\tabcli-reopen-interrupted-{}", std::process::id());
+        #[cfg(unix)]
+        let absent_core = base.path().join("absent.sock").display().to_string();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::reopen::reservation::tests::a_refused_or_expired_reopen_leaves_an_interrupted_child_launching",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_PROCESS, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
+            .env("CODEX_HOME", base.path().join("codex"))
+            .env("CLAUDE_CONFIG_DIR", base.path().join("claude"))
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("HC_TERMINAL_ID", "t7")
+            .env("TERM_PROGRAM", "ghostty")
+            .env("HC_SOCKET", absent_core)
+            .env_remove("HC_SESSION")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let registry = root.parent().unwrap().join("claude-sessions");
+    fs::create_dir_all(&registry).unwrap();
+    provider::claude::override_session_registry_for_test(Some(registry));
+    let source = write_closed_reopen_source(
+        &root,
+        SOURCE,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let child = write_reopen_launch_session(&root, CHILD, Path::new("claude"));
+    Reservation::claim(&source, SOURCE, REOPEN_TEST_CONVERSATION)
+        .unwrap()
+        .finalize(CHILD)
+        .unwrap();
+    let store = Store::open_unchecked(&child);
+    let claim = turn::claim(&store, &[]).unwrap();
+    let token = claim.token().to_owned();
+    claim.retain();
+    launch::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+    store
+        .record(CoreRecord::ReopenRefusal)
+        .write_json(
+            &serde_json::json!({"schema":3,"phase":"launch","gate":"launch-failed",
+            "detail":"interrupted launch failure","created_unix_ms":1,"claim_token":token}),
+        )
+        .unwrap();
+    let before_source = snapshot_directory(&source);
+    let before_child = snapshot_directory(&child);
+    let explicit = if cfg!(target_os = "macos") {
+        terminal::TerminalKind::Ghostty
+    } else if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else {
+        terminal::TerminalKind::Tmux
+    };
+    for terminal in [None, Some(explicit)] {
+        let request = ReopenRequest {
+            id: SOURCE.into(),
+            prompt: "new prompt".into(),
+            title: None,
+            model: None,
+            effort: None,
+            terminal,
+            yolo: false,
+            timeout: Duration::from_secs(30),
+            detach: false,
+            json: false,
+        };
+        let error = ResolvedReopen::resolve(request, Instant::now())
+            .err()
+            .expect("the reopen must be refused");
+        assert_eq!(
+            Reader::open_unchecked(&child).status().unwrap().state,
+            SessionState::Launching,
+            "{terminal:?}: {error:#}"
+        );
+        assert_eq!(snapshot_directory(&child), before_child, "{terminal:?}");
+        assert_eq!(snapshot_directory(&source), before_source, "{terminal:?}");
+    }
+    provider::claude::override_session_registry_for_test(None);
+}
+
 // A reopen whose source lock is held past the request's deadline reserves and creates
 // nothing: its wait for the lock ends at the deadline, and the clock is read again before the
 // marker is written and before the Session directory is allocated.
