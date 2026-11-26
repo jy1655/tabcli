@@ -449,6 +449,7 @@ fn fresh_macos_launch_ignores_draft_stop_until_native_completion() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         false,
     )
@@ -950,6 +951,7 @@ fn managed_launch_name_is_the_known_unique_session_id() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         })
         .unwrap();
 
@@ -1049,6 +1051,7 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
                 yolo: false,
                 model: None,
                 effort: None,
+                provider_version: "fixture",
             },
             windows,
         )
@@ -1141,6 +1144,7 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         true,
     )
@@ -1671,6 +1675,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                             yolo,
                             model,
                             effort,
+                            provider_version: "fixture",
                         },
                         windows,
                     )

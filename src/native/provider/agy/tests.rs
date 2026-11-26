@@ -294,9 +294,9 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                             yolo,
                             model,
                             effort,
+                            provider_version: "1.5.17",
                         },
                         windows,
-                        &mut || Some("1.5.17".into()),
                         &mut |_| Ok(refused()),
                     )
                     .unwrap();
@@ -383,10 +383,10 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         false,
-        &mut || None,
-        &mut |_| panic!("no consent work for an Agy that does not take the setting"),
+        &mut |_| panic!("no consent work for an Agy whose version identifies nothing"),
     )
     .unwrap();
     assert_eq!(
@@ -415,7 +415,10 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
 fn refused() -> crate::native::consent::Authority {
     crate::native::consent::Authority {
         applied: None,
-        verdict: Err("no consent".into()),
+        verdict: Err(crate::native::consent::Refusal {
+            reason: "no consent".into(),
+            unreadable: false,
+        }),
     }
 }
 
@@ -427,8 +430,8 @@ fn consented(kind: crate::native::consent::Consented) -> crate::native::consent:
 }
 
 // A session directory with its manifest, claim and consent record, in a state root of its
-// own, for a launch in `workspace` by the recorded Agy `version`.
-fn consented_launch_session(root: &Path, workspace: &Path, version: &str) -> std::path::PathBuf {
+// own, for a launch in `workspace`.
+fn consented_launch_session(root: &Path, workspace: &Path) -> std::path::PathBuf {
     use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
     let directory = root.join("session-safe123");
     std::fs::create_dir(&directory).unwrap();
@@ -440,7 +443,7 @@ fn consented_launch_session(root: &Path, workspace: &Path, version: &str) -> std
             id: "session-safe123".to_owned(),
             provider: "agy".to_owned(),
             provider_path: "agy".into(),
-            provider_version: version.to_owned(),
+            provider_version: "recorded at resolution".to_owned(),
             workspace: workspace.to_owned(),
             title: "Agy test".to_owned(),
             model: None,
@@ -457,7 +460,12 @@ fn consented_launch_session(root: &Path, workspace: &Path, version: &str) -> std
     directory
 }
 
-fn launch_context<'a>(directory: &'a Path, workspace: &'a Path, yolo: bool) -> LaunchContext<'a> {
+fn launch_context<'a>(
+    directory: &'a Path,
+    workspace: &'a Path,
+    yolo: bool,
+    version: &'a str,
+) -> LaunchContext<'a> {
     LaunchContext {
         bridge_executable: Path::new("/opt/agent-bridge"),
         directory,
@@ -467,27 +475,31 @@ fn launch_context<'a>(directory: &'a Path, workspace: &'a Path, yolo: bool) -> L
         yolo,
         model: None,
         effort: None,
+        provider_version: version,
     }
 }
 
-// With consent, exact or inherited (owner's decision, 2026-11-26), an Agy that takes the
+// With consent, exact or inherited (owner's decisions, 2026-11-26), an Agy that takes the
 // session-only settings gets the exact workspace in a private settings file of the session,
 // named by `--settings` before the log file, on both platforms and whatever the bypass; the
-// applied marker follows the file. The version is the launch's own probe, judged before any
-// consent work: an older or unreadable one launches as before, writes nothing and asks
-// consent nothing.
+// applied marker follows the file. The version is the wrapper's own probe of this launch (the
+// manifest's is never read), judged before any consent work: an older one records only that
+// the option is unavailable, and one that identifies nothing writes nothing; neither asks
+// consent anything.
 #[test]
 fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
     use crate::native::consent::Consented;
-    for (version, applies) in [
-        ("1.5.17", true),
-        ("1.6.0", true),
-        ("v1.5.17", true),
-        (" 1.5.18\n", true),
-        ("1.5.16", false),
-        ("1.5.17-rc.1", false),
-        ("agy 2.0.1 (go 1.25.0)", false),
-        ("unknown", false),
+    for (version, support) in [
+        ("1.5.17", "supported"),
+        ("1.6.0", "supported"),
+        ("v1.5.17", "supported"),
+        (" 1.5.18\n", "supported"),
+        ("1.5.16", "older"),
+        ("1.5.17-rc.1", "older"),
+        ("1.1.12", "older"),
+        ("agy 2.0.1 (go 1.25.0)", "unknown"),
+        ("unknown", "unknown"),
+        ("", "unknown"),
     ] {
         for kind in [Consented::Exact, Consented::Inherited] {
             for windows in [false, true] {
@@ -499,12 +511,11 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                     // Characters that a command shim would interpret: none reaches an argument.
                     let workspace = root.join("work 'q' ü & %PATH% $HOME ^");
                     std::fs::create_dir(&workspace).unwrap();
-                    let directory = consented_launch_session(&root, &workspace, "fixture");
+                    let directory = consented_launch_session(&root, &workspace);
                     let mut asked = 0;
                     let plan = prepare_launch_for_platform(
-                        launch_context(&directory, &workspace, yolo),
+                        launch_context(&directory, &workspace, yolo, version),
                         windows,
-                        &mut || Some(version.into()),
                         &mut |asked_for| {
                             assert_eq!(asked_for, directory);
                             asked += 1;
@@ -512,6 +523,7 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                         },
                     )
                     .unwrap();
+                    let applies = support == "supported";
                     assert_eq!(asked, usize::from(applies), "{label}");
                     let settings = directory.join(SESSION_SETTINGS_FILE);
                     let mut expected = agy_policy(yolo, None, None);
@@ -549,7 +561,11 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                         assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
                     } else {
                         assert!(!settings.exists(), "{label}");
-                        assert_eq!(observed.applied_marker(), None, "{label}");
+                        assert_eq!(
+                            observed.applied_marker(),
+                            (support == "older").then_some("launch-option-unavailable"),
+                            "{label}"
+                        );
                     }
                     // No provider store was created or written under this home.
                     assert!(!root.join(".gemini").exists(), "{label}");
@@ -559,35 +575,23 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
     }
 }
 
-// Review finding 11: the floor is judged on the version this launch probes, not on the one
-// the session recorded earlier; a refused or failing authority writes nothing.
+// A refused or failing authority writes nothing; a refusal records nothing either, so the
+// dialog step sends no key for such a launch (review round 3, finding 1).
 #[test]
-fn the_launchs_own_probe_and_the_authority_decide_the_setting() {
+fn the_authority_decides_the_setting_and_an_inconclusive_one_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().canonicalize().unwrap();
-    let directory = consented_launch_session(&root, &root, "1.5.17");
-    for probe in [None, Some("1.5.16".to_owned())] {
-        let plan = prepare_launch_for_platform(
-            launch_context(&directory, &root, false),
-            false,
-            &mut || probe.clone(),
-            &mut |_| panic!("no consent work below the floor"),
-        )
-        .unwrap();
-        assert!(!plan.arguments.contains(&OsString::from("--settings")));
-    }
+    let directory = consented_launch_session(&root, &root);
     let plan = prepare_launch_for_platform(
-        launch_context(&directory, &root, false),
+        launch_context(&directory, &root, false, "1.5.17"),
         false,
-        &mut || Some("1.5.17".into()),
         &mut |_| Ok(refused()),
     )
     .unwrap();
     assert!(!plan.arguments.contains(&OsString::from("--settings")));
     let error = prepare_launch_for_platform(
-        launch_context(&directory, &root, false),
+        launch_context(&directory, &root, false, "1.5.17"),
         false,
-        &mut || Some("1.5.17".into()),
         &mut |_| Err(anyhow::anyhow!("consent unreadable")),
     )
     .err()
@@ -604,19 +608,15 @@ fn the_launchs_own_probe_and_the_authority_decide_the_setting() {
 fn the_session_settings_floor_is_the_measured_version() {
     assert_eq!(SESSION_SETTINGS_FLOOR, semver::Version::new(1, 5, 17));
     assert_eq!(ADAPTER.applied_marker(), Some("agy-settings-override"));
-    for (version, supported) in [
-        ("1.5.17", true),
-        ("v1.5.17", true),
-        ("1.5.18\n", true),
-        ("antigravity 1.5.18\n", false),
-        ("1.5.16", false),
-        ("1.1.12", false),
-        ("", false),
+    for (version, support) in [
+        ("1.5.17", SettingSupport::Supported),
+        ("v1.5.17", SettingSupport::Supported),
+        ("1.5.18\n", SettingSupport::Supported),
+        ("1.5.16", SettingSupport::Older),
+        ("1.1.12", SettingSupport::Older),
+        ("antigravity 1.5.18\n", SettingSupport::Unknown),
+        ("", SettingSupport::Unknown),
     ] {
-        assert_eq!(
-            session_settings_supported(version),
-            supported,
-            "{version:?}"
-        );
+        assert_eq!(setting_support(version), support, "{version:?}");
     }
 }

@@ -409,7 +409,7 @@ impl NativeProviderAdapter for AgyAdapter {
                 CheckId::AGY_FOLLOW_UP,
                 Unknown,
                 Reason::AGY_TERMINAL_FALLBACK,
-                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; every paste also waits until Agy's own trust store lists the exact workspace, or the session's launch configured Agy's session-only setting that trusts it while its consent still holds, and the session's own log shows that it loaded the workspace customizations. The macOS initial prompt is a launch argument and never waits.",
+                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. The Windows initial prompt and every macOS and Linux follow-up wait for Agy's own log to show startup readiness; a Windows follow-up skips that wait. Every paste requires a HandleUserInput receipt and waits until Agy's own trust store lists the exact workspace, or the session's launch configured Agy's session-only setting that trusts it while its consent still holds, and the session's own log shows that it loaded the workspace customizations; the trust is checked again immediately before the paste. The macOS and Linux initial prompt is a launch argument and never waits.",
                 "Inspect the managed owner and terminal; retain this fallback until Agy offers a verified native path.",
             ),
             input_receipt_check(context.directory),
@@ -428,19 +428,13 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let directory = context.directory;
-        prepare_launch_for_platform(
-            context,
-            cfg!(windows),
-            &mut || installed_version(directory),
-            &mut |directory| {
-                super::super::consent::authority(
-                    directory,
-                    FirstPartyCli::Agy,
-                    &super::super::consent::Environment::current(),
-                )
-            },
-        )
+        prepare_launch_for_platform(context, cfg!(windows), &mut |directory| {
+            super::super::consent::authority(
+                directory,
+                FirstPartyCli::Agy,
+                &super::super::consent::Environment::current(),
+            )
+        })
     }
 
     fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
@@ -479,15 +473,13 @@ fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
 
 // The complete launch command: the requested policy in Agy's flags (the bypass only when
 // requested, then effort, then model), Agy's session-only settings file that trusts the exact
-// workspace when the installed Agy takes it and consent holds, the private log file, and off
-// Windows the correlated prompt as the interactive prompt argument. `version` probes the
-// installed Agy for this launch and `authority` is consent's one answer; production passes the
-// live probe and `consent::authority`. The applied marker is recorded right after the settings
-// file, before the plan exists.
+// workspace when the Agy the wrapper just probed takes it and consent holds, the private log
+// file, and off Windows the correlated prompt as the interactive prompt argument. `authority`
+// is consent's one answer; production passes `consent::authority`. The applied marker is
+// recorded right after the settings file, before the plan exists.
 fn prepare_launch_for_platform(
     context: LaunchContext<'_>,
     windows: bool,
-    version: &mut dyn FnMut() -> Option<String>,
     authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
 ) -> Result<LaunchPlan> {
     let claim_token =
@@ -516,7 +508,7 @@ fn prepare_launch_for_platform(
                 .map(OsString::from),
         );
     }
-    if let Some(settings) = session_trust_settings(&context, version, authority)? {
+    if let Some(settings) = session_trust_settings(&context, authority)? {
         arguments.extend([OsString::from("--settings"), settings.into_os_string()]);
     }
     arguments.extend([
@@ -557,42 +549,47 @@ const APPLIED_MARKER: &str = "agy-settings-override";
 const SESSION_SETTINGS_FILE: &str = "agy-session-trust.json";
 const SESSION_SETTINGS_FLOOR: semver::Version = semver::Version::new(1, 5, 17);
 
-// How long the launch's own version probe may take.
-const VERSION_PROBE_BOUND: Duration = Duration::from_secs(10);
-
-// The version the installed Agy reports for this launch, probed right before its command is
-// built; `None` when it cannot be read.
-fn installed_version(directory: &Path) -> Option<String> {
-    let manifest = Reader::open_unchecked(directory).manifest().ok()?;
-    crate::native::provider_installation::check_provider_version_until(
-        FirstPartyCli::Agy,
-        &manifest.provider_path,
-        Some(Instant::now() + VERSION_PROBE_BOUND),
-    )
-    .ok()
-}
-
-// Whether an Agy `--version` text names a version that takes the session-only trust setting.
+// What the version text of this launch's wrapper probe says about the session-only setting.
 // Agy prints its version alone; any other text, such as a banner naming more than one version,
-// does not count.
-fn session_settings_supported(version: &str) -> bool {
-    let version = version.trim();
-    semver::Version::parse(version.strip_prefix('v').unwrap_or(version))
-        .is_ok_and(|version| version >= SESSION_SETTINGS_FLOOR)
+// identifies nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingSupport {
+    Supported,
+    // Positively identified as older than the setting: the only launch that keeps the guarded
+    // dialog answer for exact consent.
+    Older,
+    Unknown,
 }
 
-// When the installed Agy takes the setting and consent holds for the workspace now (exact
-// trust from another provider's store, or inherited by a verified linked worktree; owner's
-// decision, 2026-11-26), the session-only settings file that trusts the workspace, written
-// before the applied marker. The version is judged first, so an older Agy launches exactly as
-// before and does no consent work here. Otherwise nothing is written.
+fn setting_support(version: &str) -> SettingSupport {
+    let version = version.trim();
+    match semver::Version::parse(version.strip_prefix('v').unwrap_or(version)) {
+        Ok(version) if version >= SESSION_SETTINGS_FLOOR => SettingSupport::Supported,
+        Ok(_) => SettingSupport::Older,
+        Err(_) => SettingSupport::Unknown,
+    }
+}
+
+// When the Agy the wrapper probed takes the setting and consent holds for the workspace now
+// (exact trust from another provider's store, or inherited by a verified worktree; owner's
+// decisions, 2026-11-26), the session-only settings file that trusts the workspace, written
+// before the applied marker. The version is judged first, so an older Agy does no consent work
+// here; it records only that the option is unavailable, which alone keeps the guarded dialog
+// answer for it. A version that identifies nothing, a refusal or any other inconclusive
+// check writes nothing, so no key is sent either.
 fn session_trust_settings(
     context: &LaunchContext<'_>,
-    version: &mut dyn FnMut() -> Option<String>,
     authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
 ) -> Result<Option<PathBuf>> {
-    if !version().is_some_and(|version| session_settings_supported(&version)) {
-        return Ok(None);
+    match setting_support(context.provider_version) {
+        SettingSupport::Supported => {}
+        SettingSupport::Older => {
+            // An older launch keeps running as before even if this record cannot be written;
+            // without it the dialog step only withholds its key.
+            let _ = super::super::consent::option_unavailable(context.directory);
+            return Ok(None);
+        }
+        SettingSupport::Unknown => return Ok(None),
     }
     if authority(context.directory)?.verdict.is_err() {
         return Ok(None);

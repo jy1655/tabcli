@@ -314,9 +314,10 @@ _Avoid_: parent trust, repository trust (a parent directory never supplies conse
 
 **Consent authority**:
 The one answer to whether a target provider may treat a session's workspace as consented now,
-derived again from current records, stores and Git files at every use (a launch option, the
-launch dialog step, a paste gate, doctor) and never written. A launch's applied marker records
-what it did and is never authority.
+derived again from current records, stores and Git files at every use and never written. Its yes
+is consumed at the act: a launch option in its plan and in the spawn fence, a dialog key inside
+its dispatch, an Agy paste immediately before the dispatch. A session's recheck needs the pins
+recorded at its start. A launch's applied marker records what it did and is never authority.
 _Avoid_: authorized flag, consent cache
 
 **Launch dialog**:

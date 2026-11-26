@@ -45,27 +45,37 @@ directories, and a symlink alias cannot supply fresh consent. If the original pr
 its decision, TAB does not silently choose another provider as the source.
 
 Git worktrees are the one exception, for every provider. When no provider trusts a directory
-exactly, and Git's own files prove that it is a linked worktree of a repository whose main
-working tree has verified consent in TAB, the worktree inherits that consent; Codex does the same
-by itself. The main working tree's own consent decides, with its source, identity and revocation:
-`tabcli consent revoke` on the main working tree also stops its worktrees. A provider that
-declines the worktree itself, either the source of that consent or the provider being launched,
-stops it too. TAB reads Git's files without running `git`, accepts only a stated subset of Git's
-layout and configuration, and checks the registration in both directions; absolute and relative
-registrations (`git worktree add --relative-paths`) both count. A path through a symbolic link
-or junction, a pointer to another drive or network share, a submodule, a bare repository, a
-repository without `HEAD`, objects or refs, a main working tree moved by `core.worktree`, and a
-configuration TAB cannot read as Git does (for example one that includes another file) do not
-count. The record then also names the main working tree (`repository_root`). Anyone who can
-write that repository's `.git` directory can register a worktree, whose files are then trusted
+exactly, and Git's own files prove that it is a linked worktree registered by a repository whose
+main working tree has verified consent in TAB, the worktree inherits that consent; Codex does
+the same by itself. The rule is about who can register a worktree in a trusted repository: anyone
+who can write that repository's `.git` directory can, and the worktree's files are then trusted
 like any commit checked out in the main working tree. A cloned or fetched repository cannot
-register a worktree by itself.
+register a worktree by itself. The main working tree's own consent decides, with its source,
+identity and revocation: `tabcli consent revoke` on the main working tree also stops its
+worktrees. A provider that declines the worktree itself, either the source of that consent or
+the provider being launched, stops it too.
 
-TAB checks consent again at every use, not only at launch: before a provider option is applied,
-before and during a trust-dialog answer, before every Agy paste, and in `doctor`. Each check
-reads the records, provider stores and Git files as they are now and writes nothing. What a
-launch recorded is history: a revoked consent, a source that no longer trusts the directory or a
-worktree that is no longer registered stops TAB from pasting into a running Agy session.
+TAB reads the worktree's `.git` file and the registration it names without running `git`. Before
+it touches the main working tree that the file names, a provider must already trust exactly that
+path, so a `.git` file cannot make TAB reach an untrusted folder or network share. It then checks
+the registration in both directions by file identity, absolute and relative registrations
+(`git worktree add --relative-paths`) alike, and refuses a path through a symbolic link or
+junction, a submodule, a bare repository, and a main working tree whose `.git` points to a common
+directory of its own. TAB does not evaluate Git configuration, `HEAD`, objects or refs: a
+repository whose configuration moves its working tree (`core.worktree`) or uses unusual extensions
+is judged by its registration alone. The record then also names the main working tree
+(`repository_root`).
+
+TAB checks consent again at every use, not only at launch, and consumes it at the act: when a
+provider option is planned and again immediately before the provider starts, immediately before
+a trust-dialog key, and immediately before every Agy paste; `doctor` reports the same check.
+Each check reads the records, provider stores and Git files as they are now and writes nothing.
+A session's check needs the source recorded at its start: after `tabcli consent reset` of the
+workspace or of its main working tree, only a new `ask` acquires consent again. What a launch
+recorded is history. A revoked consent, a source that no longer trusts the directory or a worktree
+that is no longer registered stops a TAB paste into a running Agy session that relies on its
+session-only setting. It does not change what the running Agy trusts, and a session whose
+workspace Agy's own trust store lists exactly keeps its pastes.
 
 TAB never writes a provider trust store. With verified consent, Codex receives a process-local
 configuration override, Pi receives its one-run approval option, and Agy 1.5.17 or newer receives
@@ -78,8 +88,9 @@ dialog, after which Agy saved the folder in its own store; in Herdr, tmux and We
 failed because no guarded key can be sent there; in Ghostty and Warp it failed at the screen
 read. Now all of them launch with the setting, and Agy no longer saves such a folder because of
 TAB. Without such an option, and only with exact consent, TAB can answer Claude's startup trust
-dialog, or that of an Agy older than 1.5.17, once in iTerm2, Terminal.app, and the native
-Windows console; the provider saves the decision after the guarded response. See
+dialog, or that of an Agy whose version the launch identified as older than 1.5.17, once in
+iTerm2, Terminal.app, and the native Windows console; the provider saves the decision after the
+guarded response. An Agy launch whose version or consent check was inconclusive gets no key. See
 [terminal requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts)
 for the terminal-specific limits.
 

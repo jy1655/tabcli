@@ -104,7 +104,7 @@ pub(in crate::native) fn provision_with(
         .ok()
         .flatten()
         .and_then(|record| record.recheck_bound(Instant::now));
-    check(provider, &manifest.provider_path, deadline)?;
+    let provider_version = check(provider, &manifest.provider_path, deadline)?;
     let prompt_path = Reader::open_unchecked(directory)
         .record(CoreRecord::InitialPrompt)
         .path()
@@ -152,6 +152,7 @@ pub(in crate::native) fn provision_with(
                     yolo: manifest.yolo,
                     model: manifest.model.as_deref(),
                     effort: manifest.effort.as_deref(),
+                    provider_version: &provider_version,
                 },
             )?;
             (arguments, initial_prompt, watcher, environment_removals)

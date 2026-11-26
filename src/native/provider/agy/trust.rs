@@ -9,7 +9,7 @@ use crate::native::consent::{self, TrustReadiness};
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::session::Reader;
 use agent_bridge::FirstPartyCli;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::path::Path;
 use std::time::Instant;
 
@@ -89,33 +89,54 @@ fn wait_for_workspace_trust_evidence<C: Clock>(
     )
 }
 
-// The first trust fact is that Agy was told to trust the exact workspace: its own store lists
-// it, or this session's launch handed it over in Agy's session-only settings (then the shared
-// store is not read). The second is always this process's own log line.
-// Both trust facts of a paste, or the first one that is missing. The first fact is Agy's own
-// store entry, read first as every earlier release did; only a session whose record says its
-// launch applied the setting is asked about the setting, and then consent's authority decides
-// from its own reading of that record: the marker alone is never enough. The second fact is
-// always this process's own log line.
-pub(super) fn workspace_trust_evidence(
+// The first trust fact of a paste: Agy was told to trust the exact workspace now. Agy's own
+// store entry is read first, as every earlier release did; only a session whose record says
+// its launch applied the setting is asked about the setting, and then consent's authority
+// decides from its own reading of that record: the marker alone is never enough. Evidence that
+// cannot be read (the session's consent record, or Agy's own trust store behind the setting)
+// is an error, never reported as an absence.
+pub(super) fn told_to_trust(
     workspace: &Path,
     env: &consent::Environment,
     directory: &Path,
 ) -> Result<std::result::Result<TrustRoute, &'static str>> {
     use consent::Trust;
-    let route = match ADAPTER.workspace_trust(workspace, env, None) {
-        Ok(Trust::Trusted(_)) => TrustRoute::Store,
-        store => {
-            if consent::observe(directory).applied_marker() != Some(APPLIED_MARKER) {
-                store?;
-                return Ok(Err(TRUST_STORE_MISSING));
-            }
-            let authority = consent::authority(directory, FirstPartyCli::Agy, env)?;
-            if authority.applied.as_deref() != Some(APPLIED_MARKER) || authority.verdict.is_err() {
-                return Ok(Err(TRUST_SETTING_WITHOUT_CONSENT));
-            }
-            TrustRoute::Setting
-        }
+    let store = match ADAPTER.workspace_trust(workspace, env, None) {
+        Ok(Trust::Trusted(_)) => return Ok(Ok(TrustRoute::Store)),
+        store => store,
+    };
+    let observed = consent::observe(directory);
+    if observed.unreadable() {
+        bail!(
+            "this session's workspace consent record could not be read: {}",
+            observed.value()["detail"].as_str().unwrap_or_default()
+        );
+    }
+    if observed.applied_marker() != Some(APPLIED_MARKER) {
+        store?;
+        return Ok(Err(TRUST_STORE_MISSING));
+    }
+    let authority = consent::authority(directory, FirstPartyCli::Agy, env)?;
+    if authority.applied.as_deref() != Some(APPLIED_MARKER) {
+        return Ok(Err(TRUST_SETTING_WITHOUT_CONSENT));
+    }
+    match authority.verdict {
+        Ok(_) => Ok(Ok(TrustRoute::Setting)),
+        Err(refusal) if refusal.unreadable => bail!("{}", refusal.reason),
+        Err(_) => Ok(Err(TRUST_SETTING_WITHOUT_CONSENT)),
+    }
+}
+
+// Both trust facts, or the first one that is missing: the first as `told_to_trust`, the
+// second this process's own log line.
+pub(super) fn workspace_trust_evidence(
+    workspace: &Path,
+    env: &consent::Environment,
+    directory: &Path,
+) -> Result<std::result::Result<TrustRoute, &'static str>> {
+    let route = match told_to_trust(workspace, env, directory)? {
+        Ok(route) => route,
+        Err(missing) => return Ok(Err(missing)),
     };
     let log_path = Reader::open_unchecked(directory)
         .private(AGY_LOG_FILE)
@@ -141,6 +162,23 @@ pub(super) fn workspace_trust_missing(
     directory: &Path,
 ) -> Result<Option<&'static str>> {
     Ok(workspace_trust_evidence(workspace, env, directory)?.err())
+}
+
+// The first trust fact again, immediately before a paste is dispatched: the yes is consumed at
+// the act, after every readiness wait. The second fact is the load line in the very log
+// contents that supplied the receipt offset, which delivery checks.
+pub(super) fn trust_at_dispatch(directory: &Path, env: &consent::Environment) -> Result<()> {
+    let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
+    match told_to_trust(&workspace, env, directory).map_err(|error| {
+        anyhow::anyhow!(
+            "Agy's trust evidence could not be read immediately before the paste ({error:#})"
+        )
+    })? {
+        Ok(_) => Ok(()),
+        Err(missing) => bail!(
+            "Agy workspace trust did not hold immediately before the paste, so the prompt was not pasted: {missing}. {TRUST_RECOVERY}"
+        ),
+    }
 }
 
 // The gate takes the caller's environment once per delivery; the user home is required

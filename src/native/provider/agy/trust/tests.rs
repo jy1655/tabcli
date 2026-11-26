@@ -445,11 +445,19 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
         serde_json::json!(directory.join(SESSION_SETTINGS_FILE))
     );
     // Agy's own store must still be readable: the authority asks the target whether it
-    // declines the workspace, and a read failure refuses.
+    // declines the workspace. A read failure withholds the paste and is reported as unreadable
+    // evidence, never as an absent entry (review round 3, finding 12).
     fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
     let store = root.join(".gemini/antigravity-cli/settings.json");
     fs::write(&store, b"{\"trustedWorkspaces\":true}").unwrap();
-    assert_eq!(gate().0, refused(TRUST_SETTING_WITHOUT_CONSENT));
+    let (outcome, check) = gate();
+    let outcome = outcome.unwrap_err();
+    assert!(
+        outcome.contains("Agy's trust evidence could not be read")
+            && outcome.contains("trustedWorkspaces"),
+        "{outcome}"
+    );
+    assert_eq!(check.reason_code, "agy_trust_evidence_unreadable");
     fs::remove_file(&store).unwrap();
     write_json_atomic(&store, &serde_json::json!({"trustedWorkspaces": []})).unwrap();
     assert_eq!(gate().0, Ok(()));
@@ -530,5 +538,21 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     assert!(
         outcome.contains("Agy's trust evidence could not be read"),
         "{outcome}"
+    );
+    // A session record that cannot be read at all is unreadable evidence too, not a missing
+    // marker, even with Agy's store readable and without the workspace.
+    fs::write(&consent_record, b"{").unwrap();
+    let (outcome, check) = gate();
+    let outcome = outcome.unwrap_err();
+    assert!(
+        outcome.contains("workspace consent record could not be read"),
+        "{outcome}"
+    );
+    assert_eq!(check.reason_code, "agy_trust_evidence_unreadable");
+    assert!(
+        serde_json::to_value(&check).unwrap()["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("Repair or restore"),
     );
 }

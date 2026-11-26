@@ -1,15 +1,18 @@
 //! The one answer to "may this target provider treat this session's workspace as consented
-//! now". Every use asks it: a provider's launch plan, the launch dialog step, a paste gate
-//! and doctor. It derives the answer again from current truth at each use and writes nothing.
-//! The session's record says what was assessed at the start and what the launch applied;
-//! neither is authority by itself. See AGENTS.md, Trust Store Boundary.
+//! now". It derives the answer again from current truth at each use and writes nothing; a
+//! session's recheck needs the pins recorded at its start. The session's record says what was
+//! assessed at the start and what the launch applied; neither is authority by itself. The yes
+//! is consumed at the act, inside the step that performs it: a provider's launch plan and the
+//! spawn fence for a launch option, the dispatch of a guarded key, and the dispatch of an Agy
+//! paste. See AGENTS.md, Trust Store Boundary.
 use super::record::{Assessment, SESSION_FILE, assess_current};
 use super::store::{Environment, Trust, identity, user_home};
 use crate::native::provider;
 use crate::native::session::Reader;
 use agent_bridge::FirstPartyCli;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
+use std::str::FromStr;
 
 /// How a session's workspace is consented.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,14 +31,24 @@ pub(in crate::native) struct Authority {
     /// never authority.
     pub(in crate::native) applied: Option<String>,
     /// Consented now, and how; or why not.
-    pub(in crate::native) verdict: std::result::Result<Consented, String>,
+    pub(in crate::native) verdict: std::result::Result<Consented, Refusal>,
+}
+
+/// Why the authority refused: a fact that does not hold, or evidence that cannot be read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) struct Refusal {
+    pub(in crate::native) reason: String,
+    pub(in crate::native) unreadable: bool,
 }
 
 impl Authority {
     fn refused(applied: Option<String>, reason: impl Into<String>) -> Self {
         Self {
             applied,
-            verdict: Err(reason.into()),
+            verdict: Err(Refusal {
+                reason: reason.into(),
+                unreadable: false,
+            }),
         }
     }
 }
@@ -102,14 +115,17 @@ pub(in crate::native) fn authority(
                 ));
             }
             Err(error) => {
-                return Ok(Authority::refused(
+                return Ok(Authority {
                     applied,
-                    format!(
-                        "{}'s trust of {} cannot be read: {error:#}",
-                        target.as_str(),
-                        path.display()
-                    ),
-                ));
+                    verdict: Err(Refusal {
+                        reason: format!(
+                            "{}'s trust of {} cannot be read: {error:#}",
+                            target.as_str(),
+                            path.display()
+                        ),
+                        unreadable: true,
+                    }),
+                });
             }
             Ok(_) => {}
         }
@@ -130,6 +146,45 @@ pub(in crate::native) fn authorized(directory: &Path, target: FirstPartyCli) -> 
     Ok(authority(directory, target, &Environment::current())?
         .verdict
         .is_ok())
+}
+
+/// The spawn fence's check, under the session's lifecycle lock immediately before the provider
+/// is started: a trust-bearing launch option that the session's launch applied (its adapter's
+/// own marker) still has the authority's yes for the target, which binds it to the workspace
+/// the provider starts in. Another adapter's option refuses; a session without a consent record
+/// or without an applied option has nothing to check. A record that cannot be read refuses.
+pub(in crate::native) fn admit_spawn(directory: &Path) -> Result<()> {
+    admit_spawn_with(directory, &Environment::current())
+}
+
+pub(super) fn admit_spawn_with(directory: &Path, env: &Environment) -> Result<()> {
+    let reader = Reader::open_unchecked(directory);
+    let Some(text) = reader.private(SESSION_FILE).text()? else {
+        return Ok(());
+    };
+    let assessment: Assessment = serde_json::from_str(&text)?;
+    let Some(applied) = assessment.applied.as_deref() else {
+        return Ok(());
+    };
+    if !provider::launch_trust_markers().any(|marker| marker == applied) {
+        return Ok(());
+    }
+    let target =
+        FirstPartyCli::from_str(&reader.manifest()?.provider).map_err(anyhow::Error::msg)?;
+    if provider::applied_marker(target) != Some(applied) {
+        bail!(
+            "the session's consent record names another provider's launch option ({applied}), so the provider was not started"
+        );
+    }
+    let authority = authority(directory, target, env)?;
+    match authority.verdict {
+        Ok(_) if authority.applied.as_deref() == Some(applied) => Ok(()),
+        Ok(_) => bail!("the session's launch option changed, so the provider was not started"),
+        Err(refusal) => bail!(
+            "workspace consent for the launch option does not hold now, so the provider was not started: {}",
+            refusal.reason
+        ),
+    }
 }
 
 #[cfg(test)]

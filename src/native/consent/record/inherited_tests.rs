@@ -422,3 +422,66 @@ fn records_keep_the_shape_an_earlier_binary_reads_and_an_inherited_one_never_ver
             .is_none()
     );
 }
+
+// Review finding 6: the main working tree's own assessment during a worktree's start records
+// only a verified pin; refusing, it leaves no record behind, while the workspace's own start
+// records what it found as every earlier release did.
+#[test]
+fn the_main_working_tree_is_recorded_only_when_its_consent_is_verified() {
+    let (temp, fixture, git) = worktree_setup();
+    let main_record = record_path(temp.path(), &git.repository);
+    let inherited = assess_in(temp.path(), &git.repository, &fixture.env, Mode::Inherit).unwrap();
+    assert_eq!(inherited.state, "unverified");
+    assert!(!main_record.exists());
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "unverified"
+    );
+    assert!(!main_record.exists());
+    assert!(record_path(temp.path(), &git.worktree).exists());
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    assert_eq!(
+        assess_in(temp.path(), &git.repository, &fixture.env, Mode::Inherit)
+            .unwrap()
+            .state,
+        "verified"
+    );
+    assert!(main_record.exists());
+}
+
+// Review finding 5: a recheck requires the pins recorded at the start; a reset of the
+// worktree's record or of its main working tree's leaves nothing for it to recheck, and only a
+// new start acquires consent again.
+#[test]
+fn a_recheck_requires_the_pins_and_acquires_nothing() {
+    for reset in ["worktree", "main"] {
+        let (temp, fixture, git) = worktree_setup();
+        trust(&fixture, FirstPartyCli::Codex, &git.repository);
+        assert_eq!(
+            assess_with(temp.path(), &git.worktree, &fixture.env)
+                .unwrap()
+                .state,
+            "verified"
+        );
+        let path = if reset == "worktree" {
+            &git.worktree
+        } else {
+            &git.repository
+        };
+        with_record(temp.path(), path, |record_path, record| {
+            write_json_atomic(record_path, &changed(record, identity(path)?, false))
+        })
+        .unwrap();
+        let recheck = assess_current(temp.path(), &git.worktree, &fixture.env).unwrap();
+        assert_ne!(recheck.state, "verified", "{reset}");
+        assert_eq!(
+            assess_with(temp.path(), &git.worktree, &fixture.env)
+                .unwrap()
+                .state,
+            "verified",
+            "{reset}: a new start acquires it again"
+        );
+    }
+}

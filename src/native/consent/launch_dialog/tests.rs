@@ -241,6 +241,7 @@ fn unsupported_dialog_response_preserves_consent_without_pending_input() {
                 session: &session,
             }
             .guarded_key(),
+            None,
             &terminal::GuardedDialogInput {
                 expected_claim: None,
                 expires_unix_ms: None,
@@ -268,6 +269,7 @@ fn the_unguarded_refusal_names_the_surface_and_records_nothing() {
         let error = respond_to_workspace_dialog(
             &c.directory,
             guarded_key_of(kind),
+            None,
             &terminal::GuardedDialogInput {
                 expected_claim: None,
                 expires_unix_ms: None,
@@ -708,13 +710,151 @@ fn applied_or_inherited_consent_takes_no_key() {
     }
 }
 
+// A launch of an Agy positively identified as older than its session-only setting: the one
+// Agy launch that keeps the guarded dialog answer for exact consent.
+fn older_agy(yolo: bool) -> Consented {
+    let c = consented(FirstPartyCli::Agy, yolo);
+    super::super::record::option_unavailable(&c.directory).unwrap();
+    c
+}
+
+// Review round 3, finding 1: an Agy launch that did not apply its setting and did not record
+// it as unavailable (an inconclusive version, a refused or unreadable check) never falls back
+// to the guarded key, on any surface. Only a positively older Agy takes it.
+#[test]
+fn an_inconclusive_agy_launch_never_falls_back_to_the_key() {
+    for yolo in [false, true] {
+        let c = consented(FirstPartyCli::Agy, yolo);
+        c.complete(
+            FirstPartyCli::Agy,
+            provider::launch_dialog(FirstPartyCli::Agy),
+            &mut FakeClock::new(Instant::now()),
+            &mut Untouched,
+        )
+        .unwrap();
+        assert_eq!(observe(&c.directory).applied_marker(), None);
+    }
+}
+
+// Review round 3, finding 11: a value the step does not know refuses the step.
+#[test]
+fn an_unknown_launch_value_refuses_the_step() {
+    for target in [FirstPartyCli::Claude, FirstPartyCli::Agy] {
+        let c = consented(target, false);
+        super::super::record::applied(&c.directory, "some-future-option").unwrap();
+        let error = c
+            .complete(
+                target,
+                provider::launch_dialog(target),
+                &mut FakeClock::new(Instant::now()),
+                &mut Untouched,
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "the session's consent record holds an unknown launch value (some-future-option); no response sent"
+        );
+    }
+}
+
+// A clock that runs a hook at one chosen reading after the screen was read: the test places a
+// change of the session's consent at an exact point of the step.
+struct Hooked<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    at: usize,
+    hook: Option<Box<dyn FnOnce() + 'a>>,
+}
+
+impl Clock for Hooked<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            if self.readings == self.at
+                && let Some(hook) = self.hook.take()
+            {
+                hook();
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// Review round 3, finding 4: the pending transition is written only while the record still
+// holds what the step assessed, and the dispatch callback asks the authority after that write.
+// A launch option recorded just before the write keeps its record and gets no key; consent
+// withdrawn just after it gets no key either, and the record returns to what was assessed.
+#[test]
+fn the_authority_is_consumed_inside_the_dispatch_after_the_pending_write() {
+    // Readings after the screen: 1 when it was observed, 2 at the deadline check right before
+    // the pending write, 3 at the deadline check inside the dispatch callback.
+    for (at, change) in [(2, "launch option"), (3, "withdrawn")] {
+        let c = older_agy(false);
+        let armed = Cell::new(false);
+        let directory = c.directory.clone();
+        let pi = c.stores.pi.clone();
+        let mut clock = Hooked {
+            clock: FakeClock::new(Instant::now()),
+            armed: &armed,
+            readings: 0,
+            at,
+            hook: Some(Box::new(move || {
+                if change == "withdrawn" {
+                    fs::remove_file(&pi).unwrap();
+                } else {
+                    super::super::record::applied(&directory, "agy-settings-override").unwrap();
+                }
+            })),
+        };
+        let deadline = clock.clock.now() + Duration::from_secs(3);
+        let error = LaunchDialog {
+            directory: &c.directory,
+            target: FirstPartyCli::Agy,
+            expected_claim: "1-2-3",
+            deadline,
+        }
+        .complete(
+            provider::launch_dialog(FirstPartyCli::Agy),
+            &c.stores.env,
+            &mut clock,
+            &mut scripted(
+                GuardedKey::Taken,
+                || {
+                    armed.set(true);
+                    Ok(agy_dialog(&c.workspace))
+                },
+                || panic!("{change}: no key"),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "workspace consent changed before trust dialog response; no response sent",
+            "{change}"
+        );
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some(if change == "withdrawn" {
+                "launch-option-unavailable"
+            } else {
+                "agy-settings-override"
+            }),
+            "{change}"
+        );
+    }
+}
+
 // Review finding 6: the step asks the one authority again before the screen read and
 // immediately before the one dispatch. Consent withdrawn, or a launch option recorded, after
 // the screen was read sends no key.
 #[test]
 fn consent_is_asked_again_immediately_before_the_dispatch() {
     for change in ["withdrawn", "applied"] {
-        let c = consented(FirstPartyCli::Agy, false);
+        let c = older_agy(false);
         let reads = Cell::new(0);
         let error = c
             .complete(
@@ -751,7 +891,7 @@ fn consent_is_asked_again_immediately_before_the_dispatch() {
 #[test]
 fn agy_under_bypass_still_checks_the_dialog() {
     for yolo in [false, true] {
-        let c = consented(FirstPartyCli::Agy, yolo);
+        let c = older_agy(yolo);
         let answers = Cell::new(0);
         c.complete(
             FirstPartyCli::Agy,
@@ -785,7 +925,7 @@ fn agy_under_bypass_still_checks_the_dialog() {
 #[test]
 fn a_surface_without_a_guarded_key_refuses_the_dialog_in_the_loop() {
     for yolo in [false, true] {
-        let c = consented(FirstPartyCli::Agy, yolo);
+        let c = older_agy(yolo);
         let reads = Cell::new(0);
         let error = c
             .complete(
@@ -807,7 +947,11 @@ fn a_surface_without_a_guarded_key_refuses_the_dialog_in_the_loop() {
             format!("{UNGUARDED} WezTerm; {UNGUARDED_ADVICE}; no response sent")
         );
         assert_eq!(reads.get(), 1);
-        assert_eq!(observe(&c.directory).applied_marker(), None);
+        // The record still holds what the launch recorded: no pending response.
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some("launch-option-unavailable")
+        );
     }
 }
 

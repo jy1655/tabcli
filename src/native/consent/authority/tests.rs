@@ -54,6 +54,7 @@ fn verdict(
     authority(&session.directory, target, &fixture.env)
         .unwrap()
         .verdict
+        .map_err(|refusal| refusal.reason)
 }
 
 #[test]
@@ -187,7 +188,7 @@ fn the_launch_record_is_history_and_never_authority() {
     .unwrap();
     let found = authority(&session.directory, FirstPartyCli::Agy, &fixture.env).unwrap();
     assert_eq!(found.applied.as_deref(), Some("agy-settings-override"));
-    assert!(found.verdict.unwrap_err().contains("source-reset"));
+    assert!(found.verdict.unwrap_err().reason.contains("source-reset"));
 
     // A withdrawn source, on a fresh session.
     let (_temp, fixture, git) = worktree();
@@ -205,23 +206,115 @@ fn the_launch_record_is_history_and_never_authority() {
     assert!(authority(&session.directory, FirstPartyCli::Agy, &fixture.env).is_err());
 }
 
-// The authority writes nothing, so doctor and a paste gate stay observations: with the shared
-// records gone, it finds the same consent again and creates no record or directory.
+// The authority writes nothing, so doctor and a paste gate stay observations. A session's
+// recheck needs the pins recorded at its start (review finding 5): with the shared records
+// gone, or reset, it refuses and acquires nothing, and creates no record or directory.
 #[test]
-fn the_authority_writes_nothing() {
+fn the_authority_writes_nothing_and_needs_the_pins() {
     let (_temp, fixture, git) = worktree();
     trust_pi(&fixture, &git.repository);
     let session = launched(&git.worktree, &fixture);
     let shared = session.root.path().join("workspace-consent");
     fs::remove_dir_all(&shared).unwrap();
     let before = fs::read(session.directory.join(SESSION_FILE)).unwrap();
-    assert_eq!(
-        verdict(&session, FirstPartyCli::Agy, &fixture),
-        Ok(Consented::Inherited)
+    assert!(
+        verdict(&session, FirstPartyCli::Agy, &fixture)
+            .unwrap_err()
+            .contains("No source is pinned")
     );
     assert!(!shared.exists());
     assert_eq!(
         fs::read(session.directory.join(SESSION_FILE)).unwrap(),
         before
     );
+
+    // `consent reset` of the worktree, or of its main working tree, after the start.
+    for reset in ["worktree", "main"] {
+        let (_temp, fixture, git) = worktree();
+        trust_pi(&fixture, &git.repository);
+        let session = launched(&git.worktree, &fixture);
+        assert_eq!(
+            verdict(&session, FirstPartyCli::Agy, &fixture),
+            Ok(Consented::Inherited)
+        );
+        let path = if reset == "worktree" {
+            &git.worktree
+        } else {
+            &git.repository
+        };
+        super::super::record::with_record(session.root.path(), path, |record_path, record| {
+            let mut value = serde_json::to_value(record.unwrap()).unwrap();
+            value["source"] = serde_json::Value::Null;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("repository_root");
+            }
+            write_json_atomic(record_path, &value)
+        })
+        .unwrap();
+        assert!(
+            verdict(&session, FirstPartyCli::Agy, &fixture).is_err(),
+            "{reset}"
+        );
+    }
+}
+
+// The spawn fence's check (review finding 3): an applied launch option must still have the
+// authority's yes for its own target, bound to the workspace; another adapter's option
+// refuses; a session without a record, without an applied option, or with only the dialog
+// step's or an older provider's value has nothing to check.
+#[test]
+fn the_spawn_fence_consumes_the_authority_for_an_applied_option() {
+    let (_temp, fixture, git) = worktree();
+    trust_pi(&fixture, &git.repository);
+    let session = launched(&git.worktree, &fixture);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["provider"] = serde_json::json!("agy");
+    write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
+    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    for value in [
+        "launch-option-unavailable",
+        "workspace-dialog-response-pending",
+        "provider-workspace-dialog",
+    ] {
+        applied(&session.directory, value).unwrap();
+        admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    }
+    applied(&session.directory, "agy-settings-override").unwrap();
+    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    // Withdrawn between the plan and the start: nothing starts.
+    fs::remove_file(&fixture.pi).unwrap();
+    let error = admit_spawn_with(&session.directory, &fixture.env).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("workspace consent for the launch option does not hold now"),
+        "{error:#}"
+    );
+    trust_pi(&fixture, &git.repository);
+    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    // The workspace replaced at the same path.
+    let moved = git.worktree.with_file_name("worktree-moved");
+    fs::rename(&git.worktree, &moved).unwrap();
+    fs::create_dir(&git.worktree).unwrap();
+    fs::copy(moved.join(".git"), git.worktree.join(".git")).unwrap();
+    assert!(admit_spawn_with(&session.directory, &fixture.env).is_err());
+    fs::remove_dir_all(&git.worktree).unwrap();
+    fs::rename(&moved, &git.worktree).unwrap();
+    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    // Another adapter's option.
+    applied(&session.directory, "codex-config-override").unwrap();
+    assert!(
+        admit_spawn_with(&session.directory, &fixture.env)
+            .unwrap_err()
+            .to_string()
+            .contains("another provider's launch option")
+    );
+    // No record: nothing to check.
+    fs::remove_file(session.directory.join(SESSION_FILE)).unwrap();
+    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    // A record that cannot be read refuses.
+    write_private(&session.directory.join(SESSION_FILE), b"{").unwrap();
+    assert!(admit_spawn_with(&session.directory, &fixture.env).is_err());
 }

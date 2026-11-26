@@ -16,12 +16,16 @@
   counterexample).
 - With consent's authority finding the workspace consented (exact trust from another
   provider's store, or inherited by a verified worktree; owner's decisions, 2026-11-26) and
-  the installed Agy, probed by this launch right before its command is built, at 1.5.17 or
-  newer (its `--version` text must be the version alone), the launch hands Agy the exact
-  workspace through its own `--settings` ("Settings for this session only, never saved"): a
-  private `agy-session-trust.json` in the session directory holding
-  `{"trustedWorkspaces":[<native key>]}`, then the applied marker `agy-settings-override`.
-  The version is judged before any consent work, so an older Agy launches exactly as before.
+  the version that the wrapper's own probe returned for this launch (`LaunchContext::
+  provider_version`) at 1.5.17 or newer (the text must be the version alone), the launch hands
+  Agy the exact workspace through its own `--settings` ("Settings for this session only,
+  never saved"): a private `agy-session-trust.json` in the session directory holding
+  `{"trustedWorkspaces":[<native key>]}`, then the applied marker `agy-settings-override`,
+  which the spawn fence checks again immediately before the provider starts. The version is
+  judged before any consent work. An Agy positively identified as older records only
+  `launch-option-unavailable` and is the one Agy launch whose exact consent may still take the
+  guarded dialog answer; a version that identifies nothing, or a refused or failing check on a
+  supported version, records nothing, and the dialog step then sends no key.
   A file, not inline JSON, so that no quote reaches a Windows command shim; the argument is a
   path like `--log-file`. No key is sent and Agy's store is not written. For an ordinary folder
   that only another provider trusts this replaces the guarded answer (iTerm2, Terminal.app,
@@ -41,12 +45,16 @@
   store lists it, or this session's record says its launch configured the setting and
   consent's authority finds the workspace consented now), and this session's own `agy.log`
   shows the workspace customization load, a `hooks_manager.go` line from a goroutine other
-  than the main one. The store is shared by every Agy process, so a dialog approved in one
+  than the main one, in the very log contents that supply the receipt offset. The first fact
+  is checked once more immediately before the dispatch, after every readiness wait. An
+  unreadable store, session record or log is reported as unreadable evidence, never as an
+  absent entry. The store is shared by every Agy process, so a dialog approved in one
   session leaves another session's dialog open; the log line is per process and appears at
   startup in a workspace trusted before launch or when the dialog is approved in that
   session. The setting is TAB's configuration, not evidence, and the marker is history, not
   authority: an Agy that ignores the setting logs no such line, and a revoked or withdrawn
-  consent refuses the next paste. Every paste waits for both, the Windows follow-up included
+  consent refuses the next paste that relies on the setting. It does not change what the
+  running Agy trusts, and a session whose workspace Agy's own store lists keeps its pastes. Every paste waits for both, the Windows follow-up included
   (it skips only the startup readiness wait), and fails `not_sent` at the deadline. Do not put
   a time window in their place, and do not answer the dialog without verified exact consent
   that no launch option applied.

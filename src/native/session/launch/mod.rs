@@ -930,6 +930,10 @@ where
     let _lock = Store::open_unchecked(directory).lock()?;
     let mut record = read(store)?;
     check_spawn_locked(store, record.as_ref())?;
+    // A trust-bearing launch option is consumed here, under the lock and immediately before
+    // the provider starts: its consent, bound to the workspace the provider starts in, must
+    // still hold. A refusal starts nothing.
+    crate::native::consent::admit_spawn(directory)?;
     if let Some(record) = &mut record {
         record.phase = Phase::Spawning;
         Store::open_unchecked(directory)

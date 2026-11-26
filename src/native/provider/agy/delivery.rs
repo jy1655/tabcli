@@ -1,13 +1,13 @@
 use super::readiness::{ReadinessTiming, wait_for_startup_readiness_with};
 use super::receipt::confirm_input_receipt_with;
-use super::trust::wait_for_workspace_trust;
+use super::trust::{trust_at_dispatch, wait_for_workspace_trust, workspace_customizations_loaded};
 use super::turn::{PendingAgyTurn, read_pending_turn};
 use super::{AGY_LOG_FILE, INPUT_RECEIPT_WINDOW, STARTUP_POLL_INTERVAL};
 
 use crate::native::consent::Environment;
 use crate::native::session::{Reader, RecordReader, Store};
 use crate::native::terminal;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -159,37 +159,56 @@ pub(super) fn deliver_terminal_turn<R: Runtime>(
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
+    let env = runtime.split().1.environment();
     let prepared = PreparedTerminalTurn::prepare_with(
         &directory,
         runtime,
+        |runtime| wait_for_workspace_trust(&directory, deadline, &env, runtime.split().0),
         |runtime| {
             let (clock, io) = runtime.split();
-            wait_for_workspace_trust(&directory, deadline, &io.environment(), clock)
-        },
-        |runtime| {
-            let (clock, io) = runtime.split();
-            if let Some(timing) = readiness {
+            let mut qualifying = None;
+            let offset = if let Some(timing) = readiness {
                 // No later log read may replace the gate's receipt offset.
                 wait_for_startup_readiness_with(
-                    &mut || io.read_log(&log_path),
+                    &mut || {
+                        let log = io.read_log(&log_path)?;
+                        qualifying.clone_from(&log);
+                        Ok(log)
+                    },
                     deadline,
                     timing,
                     STARTUP_POLL_INTERVAL,
                     clock,
-                )
+                )?
             } else {
                 let log = io
                     .read_log(&log_path)
                     .context("Agy log could not be read before the console paste")?;
-                follow_up_pre_paste_offset(log.as_deref())
-            }
+                let offset = follow_up_pre_paste_offset(log.as_deref())?;
+                qualifying = log;
+                offset
+            };
+            // This process's own load line, in the very contents whose length is the receipt
+            // offset: a replaced or rotated log that lost it supplies no offset.
+            ensure!(
+                qualifying
+                    .as_deref()
+                    .and_then(|log| log.get(..offset))
+                    .is_some_and(workspace_customizations_loaded),
+                "the {AGY_LOG_FILE} contents that supply the receipt offset do not show this session's workspace customization load, so the prompt was not pasted"
+            );
+            Ok(offset)
         },
     )
     .map_err(TerminalSendFailure::not_sent)?;
     prepared.deliver(
         session.kind.as_str(),
         runtime,
-        |runtime| runtime.split().1.send(session, prompt_path, deadline),
+        |runtime| {
+            // The trust is consumed here, after every wait and immediately before the paste.
+            trust_at_dispatch(&directory, &env).map_err(TerminalSendFailure::not_sent)?;
+            runtime.split().1.send(session, prompt_path, deadline)
+        },
         |runtime, pending, pre_paste_len| {
             let (clock, io) = runtime.split();
             // The composer after an unconfirmed paste is unknown; never paste again.

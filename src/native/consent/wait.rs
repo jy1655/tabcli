@@ -1,4 +1,4 @@
-use super::authority::authority;
+use super::authority::{Authority, authority};
 use super::record::observe;
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
@@ -94,20 +94,21 @@ fn wait_for_native_trust_with(
     ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
     wait_for_native_trust_authorized_with(directory, target, deadline, env, ready, &mut || {
-        Ok(authority(directory, target, env)?.verdict.is_ok())
+        authority(directory, target, env)
     })
 }
 
-// Codex's readiness, in order and short-circuiting: a registered applied marker with
-// authorization (an authorization error is fatal), then the adapter's exact stored
-// trust (a lookup error is not trust), then the adapter's own readiness evidence.
+// Codex's readiness, in order and short-circuiting: the target's own applied marker, read
+// again in the one typed authority result together with its yes (an authority error is
+// fatal), then the adapter's exact stored trust (a lookup error is not trust), then the
+// adapter's own readiness evidence. Another adapter's marker is not the target's option.
 fn wait_for_native_trust_authorized_with(
     directory: &Path,
     target: FirstPartyCli,
     deadline: Instant,
     env: &Environment,
     ready: &mut dyn FnMut() -> bool,
-    authorized: &mut dyn FnMut() -> Result<bool>,
+    authority: &mut dyn FnMut() -> Result<Authority>,
 ) -> Result<()> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
     wait_until_trusted(
@@ -124,12 +125,14 @@ fn wait_for_native_trust_authorized_with(
             )
         },
         &mut || {
-            let assessment = observe(directory);
-            let applied_here = assessment.applied_marker().is_some_and(|marker| {
-                provider::launch_trust_markers().any(|registered| registered == marker)
-            });
+            let own = provider::applied_marker(target);
+            let applied_here = own.is_some() && observe(directory).applied_marker() == own;
+            let applied_with_consent = applied_here && {
+                let found = authority()?;
+                found.applied.as_deref() == own && found.verdict.is_ok()
+            };
             Ok(
-                if (applied_here && authorized()?)
+                if applied_with_consent
                     || matches!(
                         provider::workspace_trust(target, &manifest.workspace, env, None),
                         Ok(Trust::Trusted(_))
@@ -148,9 +151,25 @@ fn wait_for_native_trust_authorized_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::authority::{Consented, Refusal};
     use super::super::record::SESSION_FILE;
     use super::super::tests::{session, setup, trust_pi};
     use super::*;
+
+    // An authority result with `applied` recorded and a yes or a refusal.
+    fn found(applied: &str, consented: bool) -> Authority {
+        Authority {
+            applied: Some(applied.to_owned()),
+            verdict: if consented {
+                Ok(Consented::Exact)
+            } else {
+                Err(Refusal {
+                    reason: "refused".into(),
+                    unreadable: false,
+                })
+            },
+        }
+    }
     use crate::native::clock::FakeClock;
     use crate::native::session::primitives::write_json_atomic;
     use std::fs;
@@ -193,8 +212,11 @@ mod tests {
             }
         }
     }
+    // Review round 3, finding 11: only the target's own marker, confirmed in the one typed
+    // authority result together with its yes, opens the gate; another adapter's marker is
+    // not asked about and opens nothing.
     #[test]
-    fn native_trust_cross_accepts_registered_markers_only_with_authorization() {
+    fn native_trust_accepts_only_the_targets_own_marker_with_its_authority() {
         let (_temp, workspace, fixture) = setup();
         let (_root, directory) = session(&workspace, "awaiting-initial-input");
         for marker in [
@@ -213,55 +235,55 @@ mod tests {
                 FirstPartyCli::Agy,
                 FirstPartyCli::Pi,
             ] {
+                let label = format!("{marker} {target:?}");
+                let wait =
+                    |ready: &mut dyn FnMut() -> bool,
+                     authority: &mut dyn FnMut() -> Result<Authority>| {
+                        wait_for_native_trust_authorized_with(
+                            &directory,
+                            target,
+                            Instant::now(),
+                            &fixture.env,
+                            ready,
+                            authority,
+                        )
+                    };
+                if provider::applied_marker(target) != Some(marker) {
+                    let mut asked = false;
+                    let error = wait(
+                        &mut || {
+                            asked = true;
+                            false
+                        },
+                        &mut || panic!("{label}: another adapter's marker is not asked about"),
+                    )
+                    .unwrap_err();
+                    assert!(asked, "{label}");
+                    assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT, "{label}");
+                    continue;
+                }
                 let mut authorizations = 0;
-                wait_for_native_trust_authorized_with(
-                    &directory,
-                    target,
-                    Instant::now(),
-                    &fixture.env,
-                    &mut || panic!("authorized marker short circuits"),
+                wait(
+                    &mut || panic!("{label}: the authorized marker short circuits"),
                     &mut || {
                         authorizations += 1;
-                        Ok(true)
+                        Ok(found(marker, true))
                     },
                 )
                 .unwrap();
-                assert_eq!(authorizations, 1);
-                let mut asked = false;
-                let error = wait_for_native_trust_authorized_with(
-                    &directory,
-                    target,
-                    Instant::now(),
-                    &fixture.env,
-                    &mut || {
-                        asked = true;
-                        false
-                    },
-                    &mut || Ok(false),
+                assert_eq!(authorizations, 1, "{label}");
+                for refused in [found(marker, false), found("another-marker", true)] {
+                    let error = wait(&mut || false, &mut || Ok(refused.clone())).unwrap_err();
+                    assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT, "{label}");
+                    // A refusal still permits the adapter's independent readiness evidence.
+                    wait(&mut || true, &mut || Ok(refused.clone())).unwrap();
+                }
+                let error = wait(
+                    &mut || panic!("{label}: an authority error precedes ready"),
+                    &mut || bail!("authority error"),
                 )
                 .unwrap_err();
-                assert!(asked);
-                assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
-                // False authorization still permits the adapter's independent readiness evidence.
-                wait_for_native_trust_authorized_with(
-                    &directory,
-                    target,
-                    Instant::now(),
-                    &fixture.env,
-                    &mut || true,
-                    &mut || Ok(false),
-                )
-                .unwrap();
-                let error = wait_for_native_trust_authorized_with(
-                    &directory,
-                    target,
-                    Instant::now(),
-                    &fixture.env,
-                    &mut || panic!("authorization error precedes ready"),
-                    &mut || bail!("authorization error"),
-                )
-                .unwrap_err();
-                assert_eq!(error.to_string(), "authorization error");
+                assert_eq!(error.to_string(), "authority error", "{label}");
             }
         }
     }
@@ -321,10 +343,11 @@ mod tests {
             &mut || panic!("no marker"),
         )
         .unwrap();
-        // A registered marker still requires authorization before the already trusted store.
+        // The target's own marker still requires the authority before the already trusted
+        // store.
         write_json_atomic(
             &directory.join(SESSION_FILE),
-            &serde_json::json!({"applied": "codex-config-override"}),
+            &serde_json::json!({"applied": "pi-approve-once"}),
         )
         .unwrap();
         let error = wait_for_native_trust_authorized_with(
@@ -343,7 +366,7 @@ mod tests {
             Instant::now(),
             &fixture.env,
             &mut || panic!("trusted store precedes ready"),
-            &mut || Ok(false),
+            &mut || Ok(found("pi-approve-once", false)),
         )
         .unwrap();
         write_json_atomic(&directory.join(SESSION_FILE), &serde_json::json!({})).unwrap();

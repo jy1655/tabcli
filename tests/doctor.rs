@@ -1633,7 +1633,12 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
         row["detail"],
         "Agy's trust store or this session's agy.log could not be read, so the dialog state is unobserved: Agy trustedWorkspaces is not an array"
     );
-    assert_eq!(row["next_action"], recovering_next_action);
+    assert_eq!(
+        row["next_action"],
+        format!(
+            "{OBSERVATION} Repair or restore the file named in the detail (Agy's settings, this session's workspace consent record or its log); TAB pastes nothing into this session while it cannot be read."
+        )
+    );
     assert_eq!(row["evidence"], evidence);
 }
 

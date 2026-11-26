@@ -1,11 +1,18 @@
 use super::super::store::native_key;
 use super::*;
+use std::cell::RefCell;
 use std::process::Command;
 
 // A path as Git spells it in its files and takes it as an argument: without Windows' verbatim
-// prefix, and with forward slashes there.
+// prefix, and with forward slashes on Windows only. A backslash is an ordinary character in a
+// Unix file name, so a Unix path is passed unchanged.
 pub(in crate::native::consent) fn git_path(path: &Path) -> String {
-    native_key(path).unwrap().replace('\\', "/")
+    let path = native_key(path).unwrap();
+    if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
 }
 
 // Git as a user runs it, isolated from the developer's environment: no repository, index,
@@ -107,18 +114,21 @@ pub(in crate::native::consent) fn git_worktree(
     relative: bool,
 ) -> (PathBuf, PathBuf) {
     let repository = git_repository(git, root);
-    let worktree = git_path(root) + "/" + name;
-    let mut arguments = vec!["-C", &git_path(&repository)]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    arguments.extend(["worktree", "add", "--quiet", "--detach"].map(str::to_owned));
+    let worktree = root.join(name);
+    let mut arguments = vec![
+        "-C".to_owned(),
+        git_path(&repository),
+        "worktree".to_owned(),
+        "add".to_owned(),
+        "--quiet".to_owned(),
+        "--detach".to_owned(),
+    ];
     if relative {
         arguments.push("--relative-paths".into());
     }
-    arguments.push(worktree.clone());
+    arguments.push(git_path(&worktree));
     git.run(&arguments.iter().map(String::as_str).collect::<Vec<_>>());
-    (repository, Path::new(&worktree).canonicalize().unwrap())
+    (repository, worktree.canonicalize().unwrap())
 }
 
 fn canonical_root() -> (tempfile::TempDir, PathBuf) {
@@ -153,7 +163,7 @@ pub(in crate::native::consent) fn registered(root: &Path) -> Registered {
 
 // The registration that `git worktree add --relative-paths` (Git 2.48) writes, made from the
 // absolute one by hand so that it does not depend on the installed Git: both pointers relative
-// to their own directory, and the extension that keeps an older Git from misreading them.
+// to their own directory.
 fn make_relative(fixture: &Registered) {
     fs::write(
         fixture.worktree.join(".git"),
@@ -165,15 +175,19 @@ fn make_relative(fixture: &Registered) {
         "../../../../worktree/.git\n",
     )
     .unwrap();
-    let config = fixture.repository.join(".git/config");
-    let text = fs::read_to_string(&config)
-        .unwrap()
-        .replace("repositoryformatversion = 0", "repositoryformatversion = 1");
-    fs::write(
-        &config,
-        format!("{text}[extensions]\n\trelativeWorktrees = true\n"),
-    )
-    .unwrap();
+}
+
+// The verifier with a screen that trusts every claimed main working tree.
+fn verified(workspace: &Path) -> Result<Option<PathBuf>> {
+    main_worktree(workspace, &mut |_| true)
+}
+
+fn error(workspace: &Path) -> String {
+    format!("{:#}", verified(workspace).unwrap_err())
+}
+
+fn point(fixture: &Registered, target: &str) {
+    fs::write(fixture.worktree.join(".git"), format!("gitdir: {target}\n")).unwrap();
 }
 
 #[test]
@@ -184,18 +198,18 @@ fn a_worktree_that_git_added_names_its_main_working_tree() {
     let pointer = fs::read_to_string(worktree.join(".git")).unwrap();
     let target = pointer.trim_end().strip_prefix("gitdir: ").unwrap();
     assert!(Path::new(target).is_absolute(), "{pointer}");
-    assert_eq!(main_worktree(&worktree).unwrap(), Some(repository.clone()));
+    assert_eq!(verified(&worktree).unwrap(), Some(repository.clone()));
     let (_, second) = git_worktree(&git, &root, "second", false);
-    assert_eq!(main_worktree(&second).unwrap(), Some(repository.clone()));
+    assert_eq!(verified(&second).unwrap(), Some(repository.clone()));
     // The main working tree, a directory inside a worktree and a plain directory are no
     // linked worktree: the exact rule alone applies to them.
-    assert_eq!(main_worktree(&repository).unwrap(), None);
+    assert_eq!(verified(&repository).unwrap(), None);
     let child = worktree.join("child");
     fs::create_dir(&child).unwrap();
-    assert_eq!(main_worktree(&child).unwrap(), None);
+    assert_eq!(verified(&child).unwrap(), None);
     let plain = root.join("plain");
     fs::create_dir(&plain).unwrap();
-    assert_eq!(main_worktree(&plain).unwrap(), None);
+    assert_eq!(verified(&plain).unwrap(), None);
     // After Git removed a worktree, a copied `.git` file names a registration that does not
     // name it back.
     git.run(&[
@@ -209,9 +223,7 @@ fn a_worktree_that_git_added_names_its_main_working_tree() {
     fs::create_dir(&second).unwrap();
     fs::copy(worktree.join(".git"), second.join(".git")).unwrap();
     assert_eq!(
-        main_worktree(&second.canonicalize().unwrap())
-            .unwrap_err()
-            .to_string(),
+        error(&second.canonicalize().unwrap()),
         "the worktree registration names another .git file"
     );
 }
@@ -225,17 +237,20 @@ fn a_relative_path_registration_names_its_main_working_tree() {
     let fixture = registered(&root);
     make_relative(&fixture);
     assert_eq!(
-        main_worktree(&fixture.worktree).unwrap(),
+        verified(&fixture.worktree).unwrap(),
         Some(fixture.repository.clone())
     );
     // Relative, the registration must still name this worktree back.
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join(".git"), "").unwrap();
     fs::write(
         fixture.registration.join("gitdir"),
         "../../../../elsewhere/.git\n",
     )
     .unwrap();
     assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
+        error(&fixture.worktree),
         "the worktree registration names another .git file"
     );
 
@@ -249,17 +264,104 @@ fn a_relative_path_registration_names_its_main_working_tree() {
     let (repository, worktree) = git_worktree(&git, &root, "relative", true);
     let pointer = fs::read_to_string(worktree.join(".git")).unwrap();
     assert!(pointer.starts_with("gitdir: ../"), "{pointer}");
-    assert_eq!(main_worktree(&worktree).unwrap(), Some(repository));
+    assert_eq!(verified(&worktree).unwrap(), Some(repository));
+}
+
+// Review rulings, round 3: the claimed main working tree is screened, lexically and before any
+// I/O on it, against exact consent evidence; a destination without it is never touched.
+#[test]
+fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    let asked = RefCell::new(Vec::new());
+    let screen = |answer: bool| {
+        let asked = &asked;
+        move |main: &Path| {
+            asked.borrow_mut().push(main.to_owned());
+            answer
+        }
+    };
+    // A destination that does not exist: refused by the screen, not by the file system.
+    let unknown = root.join("unknown/repository");
+    point(
+        &fixture,
+        &git_path(&unknown.join(".git/worktrees/worktree")),
+    );
+    assert_eq!(
+        main_worktree(&fixture.worktree, &mut screen(false))
+            .unwrap_err()
+            .to_string(),
+        "the main working tree that the .git file names has no exact consent evidence"
+    );
+    assert_eq!(asked.borrow().as_slice(), std::slice::from_ref(&unknown));
+    // Only past the screen is it touched.
+    assert!(
+        format!(
+            "{:#}",
+            main_worktree(&fixture.worktree, &mut screen(true)).unwrap_err()
+        )
+        .contains("cannot be read")
+    );
+    // The real registration, relative too: the screen is asked with the main working tree.
+    asked.borrow_mut().clear();
+    make_relative(&fixture);
+    assert_eq!(
+        main_worktree(&fixture.worktree, &mut screen(true)).unwrap(),
+        Some(fixture.repository.clone())
+    );
+    assert_eq!(
+        asked.borrow().as_slice(),
+        std::slice::from_ref(&fixture.repository)
+    );
+    // A layout that is no registration of a main working tree is not even screened: a
+    // submodule's gitdir and a bare repository's registration.
+    asked.borrow_mut().clear();
+    for target in [
+        fixture.repository.join(".git/modules/worktree"),
+        root.join("bare.git/worktrees/worktree"),
+    ] {
+        point(&fixture, &git_path(&target));
+        assert_eq!(
+            main_worktree(&fixture.worktree, &mut screen(true))
+                .unwrap_err()
+                .to_string(),
+            "the gitdir is not a linked worktree registration of a main working tree"
+        );
+    }
+    assert!(asked.borrow().is_empty());
+}
+
+// Each component is inspected before the next is taken: `..` steps back only over a
+// directory that exists and is no link, as Git's own lookup needs it.
+#[test]
+fn a_component_is_inspected_before_dotdot_steps_back_over_it() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    point(
+        &fixture,
+        &git_path(&root.join("missing/../repository/.git/worktrees/worktree")),
+    );
+    assert!(error(&fixture.worktree).contains("missing cannot be read"));
+    fs::write(root.join("file"), "").unwrap();
+    point(
+        &fixture,
+        &git_path(&root.join("file/../repository/.git/worktrees/worktree")),
+    );
+    assert!(error(&fixture.worktree).ends_with("is not a directory"));
+    point(
+        &fixture,
+        &git_path(&root.join("worktree/../repository/.git/worktrees/worktree")),
+    );
+    assert_eq!(
+        verified(&fixture.worktree).unwrap(),
+        Some(fixture.repository.clone())
+    );
 }
 
 #[test]
-fn the_registration_must_name_the_worktree_back() {
+fn the_registration_must_name_this_worktree_and_its_common_directory_by_identity() {
     let (_temp, root) = canonical_root();
     let fixture = registered(&root);
-    assert_eq!(
-        main_worktree(&fixture.worktree).unwrap(),
-        Some(fixture.repository.clone())
-    );
     // A line ending that Git on Windows can leave.
     fs::write(
         fixture.worktree.join(".git"),
@@ -267,56 +369,77 @@ fn the_registration_must_name_the_worktree_back() {
     )
     .unwrap();
     assert_eq!(
-        main_worktree(&fixture.worktree).unwrap(),
+        verified(&fixture.worktree).unwrap(),
         Some(fixture.repository.clone())
     );
-
     // Another worktree's registration: the forward pointer alone proves nothing.
     let other = root.join("other");
     fs::create_dir(&other).unwrap();
     fs::copy(fixture.worktree.join(".git"), other.join(".git")).unwrap();
     assert_eq!(
-        main_worktree(&other).unwrap_err().to_string(),
+        error(&other),
         "the worktree registration names another .git file"
     );
-    let gitdir = fixture.registration.join("gitdir");
-    fs::remove_file(&gitdir).unwrap();
-    assert!(main_worktree(&fixture.worktree).is_err());
+    // The common directory named by the registration must be the main working tree's `.git`.
+    let commondir = fixture.registration.join("commondir");
+    let saved = fs::read(&commondir).unwrap();
+    fs::write(&commondir, "..\n").unwrap();
+    assert_eq!(
+        error(&fixture.worktree),
+        "the worktree registration names another common directory"
+    );
+    fs::write(
+        &commondir,
+        format!("{}\n", git_path(&fixture.repository.join(".git"))),
+    )
+    .unwrap();
+    assert!(verified(&fixture.worktree).unwrap().is_some());
+    fs::write(&commondir, &saved).unwrap();
+    // A `.git` of the main working tree that points to a common directory of its own.
+    fs::write(fixture.repository.join(".git/commondir"), "../other\n").unwrap();
+    assert_eq!(
+        error(&fixture.worktree),
+        "the main working tree's .git names a common directory of its own"
+    );
+    fs::remove_file(fixture.repository.join(".git/commondir")).unwrap();
+    // A missing back-pointer refuses.
+    fs::remove_file(fixture.registration.join("gitdir")).unwrap();
+    assert!(error(&fixture.worktree).contains("cannot be read"));
 }
 
-// A layout outside the subset is refused from the pointer's text alone, before any I/O on what
-// it names: the error is the layout's, not the file system's.
+// TAB does not read Git's configuration: a repository that Git itself would treat differently
+// (here one whose `core.worktree` names another directory) is judged by its registration
+// alone. Only a writer of its `.git` can register a worktree there either way.
 #[test]
-fn an_implausible_pointer_is_refused_before_it_is_followed() {
+fn the_configuration_is_not_read() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    for config in [
+        "[core]\n\tworktree = /elsewhere\n",
+        "\u{feff}[core]\n\tbare = true\n",
+        "[include]\n\tpath = other\n",
+        "not a configuration at all",
+    ] {
+        fs::write(fixture.repository.join(".git/config"), config).unwrap();
+        assert_eq!(
+            verified(&fixture.worktree).unwrap(),
+            Some(fixture.repository.clone()),
+            "{config:?}"
+        );
+    }
+    fs::remove_file(fixture.repository.join(".git/HEAD")).unwrap();
+    assert_eq!(
+        verified(&fixture.worktree).unwrap(),
+        Some(fixture.repository.clone())
+    );
+}
+
+#[test]
+fn only_gits_pointer_form_is_read() {
     let (_temp, root) = canonical_root();
     let fixture = registered(&root);
     let pointer = fixture.worktree.join(".git");
-    let point = |target: &str| fs::write(&pointer, target).unwrap();
-    const LAYOUT: &str = "the gitdir is not a linked worktree registration of a main working tree";
-    for target in [
-        format!(
-            "gitdir: {}\n",
-            git_path(&root.join("tab-test-nonexistent/elsewhere"))
-        ),
-        // A submodule's own gitdir, and a bare repository's registration.
-        format!(
-            "gitdir: {}\n",
-            git_path(&fixture.repository.join(".git/modules/worktree"))
-        ),
-        format!(
-            "gitdir: {}\n",
-            git_path(&root.join("bare.git/worktrees/worktree"))
-        ),
-        "gitdir: ../../tab-test-nonexistent/worktrees/x\n".to_owned(),
-    ] {
-        point(&target);
-        assert_eq!(
-            main_worktree(&fixture.worktree).unwrap_err().to_string(),
-            LAYOUT,
-            "{target:?}"
-        );
-    }
-    for (content, error) in [
+    for (content, expected) in [
         (
             format!("{}\n", git_path(&fixture.registration)),
             "the .git file does not name a gitdir",
@@ -331,260 +454,9 @@ fn an_implausible_pointer_is_refused_before_it_is_followed() {
             "the .git file does not name a gitdir",
         ),
     ] {
-        point(&content);
-        assert_eq!(
-            main_worktree(&fixture.worktree).unwrap_err().to_string(),
-            error,
-            "{content:?}"
-        );
+        fs::write(&pointer, &content).unwrap();
+        assert_eq!(error(&fixture.worktree), expected, "{content:?}");
     }
-    point(&format!("gitdir: {}\n", git_path(&fixture.registration)));
-    assert!(main_worktree(&fixture.worktree).unwrap().is_some());
-    // A common directory named otherwise than the registration's own.
-    fs::write(fixture.registration.join("commondir"), "..\n").unwrap();
-    assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
-        "the worktree registration names another common directory"
-    );
-    fs::write(
-        fixture.registration.join("commondir"),
-        format!("{}\n", git_path(&fixture.repository.join(".git"))),
-    )
-    .unwrap();
-    assert!(main_worktree(&fixture.worktree).unwrap().is_some());
-}
-
-// On Windows a pointer to another drive or share is refused before any I/O on it, so a local
-// workspace cannot make TAB reach a network share. Runs on the Windows CI runner only.
-#[cfg(windows)]
-#[test]
-fn a_pointer_to_another_volume_is_refused_before_it_is_followed() {
-    let (_temp, root) = canonical_root();
-    let fixture = registered(&root);
-    for target in [
-        "gitdir: //tab-test.invalid/share/repository/.git/worktrees/worktree\n",
-        "gitdir: \\\\tab-test.invalid\\share\\repository\\.git\\worktrees\\worktree\n",
-    ] {
-        fs::write(fixture.worktree.join(".git"), target).unwrap();
-        let started = std::time::Instant::now();
-        assert_eq!(
-            main_worktree(&fixture.worktree).unwrap_err().to_string(),
-            "the .git file names a directory on another volume",
-            "{target:?}"
-        );
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    }
-}
-
-// Both Git directories must be usable as Git checks them: the incomplete registration that
-// matching pointers alone would accept is refused.
-#[test]
-fn matching_pointers_without_a_usable_repository_are_refused() {
-    let (_temp, root) = canonical_root();
-    let fixture = registered(&root);
-    let common = fixture.repository.join(".git");
-    let verdict = || main_worktree(&fixture.worktree).map_err(|error| format!("{error:#}"));
-    let saved = fs::read(fixture.registration.join("HEAD")).unwrap();
-    for head in [
-        &b""[..],
-        b"ref: heads/main\n",
-        b"not a head\n",
-        b"0123456789abcdef0123456789abcdef0123456",
-    ] {
-        fs::write(fixture.registration.join("HEAD"), head).unwrap();
-        assert!(
-            verdict().unwrap_err().ends_with("is not a Git HEAD"),
-            "{head:?}"
-        );
-    }
-    for head in [
-        &b"ref:refs/heads/main"[..],
-        b"ref: \t refs/heads/other\n",
-        b"0123456789abcdef0123456789abcdef01234567\n",
-    ] {
-        fs::write(fixture.registration.join("HEAD"), head).unwrap();
-        assert_eq!(verdict(), Ok(Some(fixture.repository.clone())), "{head:?}");
-    }
-    fs::write(fixture.registration.join("HEAD"), &saved).unwrap();
-    fs::remove_file(fixture.registration.join("HEAD")).unwrap();
-    assert!(verdict().is_err());
-    fs::write(fixture.registration.join("HEAD"), &saved).unwrap();
-    for (missing, rename) in [("objects", "objects-gone"), ("refs", "refs-gone")] {
-        fs::rename(common.join(missing), common.join(rename)).unwrap();
-        assert!(verdict().is_err(), "{missing}");
-        fs::rename(common.join(rename), common.join(missing)).unwrap();
-    }
-    fs::rename(common.join("HEAD"), common.join("HEAD-gone")).unwrap();
-    assert!(verdict().is_err());
-    fs::rename(common.join("HEAD-gone"), common.join("HEAD")).unwrap();
-    assert_eq!(verdict(), Ok(Some(fixture.repository.clone())));
-
-    // The registration written by hand with no repository behind it.
-    let (_temp, root) = canonical_root();
-    let repository = root.join("repository");
-    let registration = repository.join(".git/worktrees/worktree");
-    fs::create_dir_all(&registration).unwrap();
-    fs::write(repository.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
-    let worktree = root.join("worktree");
-    fs::create_dir(&worktree).unwrap();
-    fs::write(
-        worktree.join(".git"),
-        format!("gitdir: {}\n", git_path(&registration)),
-    )
-    .unwrap();
-    fs::write(registration.join("commondir"), "../..\n").unwrap();
-    fs::write(
-        registration.join("gitdir"),
-        format!("{}\n", git_path(&worktree.join(".git"))),
-    )
-    .unwrap();
-    let error = format!("{:#}", main_worktree(&worktree).unwrap_err());
-    assert!(error.contains("HEAD cannot be read"), "{error}");
-}
-
-#[test]
-fn the_configuration_is_read_as_git_reads_it() {
-    let (_temp, root) = canonical_root();
-    let fixture = registered(&root);
-    let config = fixture.repository.join(".git/config");
-    let original = fs::read_to_string(&config).unwrap();
-    let verdict = |text: &str| {
-        fs::write(&config, text).unwrap();
-        main_worktree(&fixture.worktree).map_err(|error| format!("{error:#}"))
-    };
-    for text in [
-        original.as_str(),
-        "[core]\n\tbare = false\n",
-        "\u{feff}[core]\n\tbare = false\n",
-        "[Core]\n\tBare=No ; a comment\n",
-        "[core] bare = off\n",
-        "[core]\n\tbare = \"0\"\n",
-        "[core]\n\tbare = true\n\tbare = false\n",
-        "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha1\n",
-        "[remote \"origin\"]\n\turl = https://example.invalid/x # c\n\tbare = true\n",
-        "[core \"x\"]\n\tbare = true\n",
-        "[core.x]\n\tworktree = /elsewhere\n",
-        "# [core] bare = true\n",
-        "[alias]\n\tst = \"status \\\"--short\\\"\"\n",
-        "",
-    ] {
-        assert_eq!(
-            verdict(text),
-            Ok(Some(fixture.repository.clone())),
-            "{text:?}"
-        );
-    }
-    const BARE: &str = "repository config: the repository is bare";
-    for (text, error) in [
-        ("[core]\n\tbare = true\n", BARE),
-        ("[core]\n\tbare\n", BARE),
-        ("[core]\n\tbare = 2\n", BARE),
-        ("[core]\n\tbare = false\n\tbare = yes\n", BARE),
-        ("\u{feff}[core]\n\tbare = true\n", BARE),
-        (
-            "[core]\n\tbare = maybe\n",
-            "repository config: \"maybe\" is not a decimal number Git reads here: invalid digit found in string",
-        ),
-        (
-            "[core]\n\tworktree = /elsewhere\n",
-            "repository config: core.worktree moves the working tree",
-        ),
-        // Git reads this first section past its byte order mark.
-        (
-            "\u{feff}[core]\n\tworktree = /elsewhere\n",
-            "repository config: core.worktree moves the working tree",
-        ),
-        (
-            "[include]\n\tpath = other\n",
-            "repository config: the configuration includes another file",
-        ),
-        (
-            "[includeIf \"gitdir:/x/\"]\n\tpath = other\n",
-            "repository config: the configuration includes another file",
-        ),
-        (
-            "[core]\n\tbare = false \\\n",
-            "repository config: a configuration value continues on the next line",
-        ),
-        (
-            "[core\n",
-            "repository config: unterminated configuration section",
-        ),
-        (
-            "[ core ]\n",
-            "repository config: an empty configuration section name",
-        ),
-        (
-            "bare = false\n",
-            "repository config: a configuration variable outside any section",
-        ),
-        (
-            "[core]\n\t-bare = false\n",
-            "repository config: a malformed configuration variable",
-        ),
-        (
-            "[core]\n\tname = \"open\n",
-            "repository config: a configuration value with an unterminated quote",
-        ),
-        (
-            "[core]\n\tname = a\\qb\n",
-            "repository config: a configuration value with an escape Git rejects",
-        ),
-        (
-            "[core]\n\trepositoryformatversion = 2\n",
-            "repository config: core.repositoryformatversion 2 is not one Git reads",
-        ),
-        (
-            "[extensions]\n\tsomethingNew = true\n",
-            "repository config: extensions.somethingnew is not an extension Git defines",
-        ),
-    ] {
-        assert_eq!(verdict(text), Err(error.to_owned()), "{text:?}");
-    }
-    // A repository without a configuration is not one Git made.
-    fs::remove_file(&config).unwrap();
-    assert!(main_worktree(&fixture.worktree).is_err());
-}
-
-// With `extensions.worktreeConfig`, Git also reads `config.worktree` of the main working tree
-// and of the registration; without it, Git reads neither, and neither does TAB.
-#[test]
-fn per_worktree_configuration_counts_exactly_when_git_reads_it() {
-    let (_temp, root) = canonical_root();
-    let fixture = registered(&root);
-    let config = fixture.repository.join(".git/config");
-    let common = fixture.repository.join(".git/config.worktree");
-    let own = fixture.registration.join("config.worktree");
-    let moved = "[core]\n\tworktree = /elsewhere\n";
-    let verdict = || main_worktree(&fixture.worktree).map_err(|error| format!("{error:#}"));
-    fs::write(&common, moved).unwrap();
-    fs::write(&own, moved).unwrap();
-    assert_eq!(verdict(), Ok(Some(fixture.repository.clone())));
-    fs::write(
-        &config,
-        "[core]\n\tbare = false\n[extensions]\n\tworktreeConfig = true\n",
-    )
-    .unwrap();
-    assert_eq!(
-        verdict(),
-        Err("repository config.worktree: core.worktree moves the working tree".to_owned())
-    );
-    fs::remove_file(&common).unwrap();
-    assert_eq!(
-        verdict(),
-        Err("worktree config.worktree: core.worktree moves the working tree".to_owned())
-    );
-    fs::write(&own, "[core]\n\tbare = true\n").unwrap();
-    assert_eq!(
-        verdict(),
-        Err("worktree config.worktree: the repository is bare".to_owned())
-    );
-    fs::write(&own, "[core]\n\tsparseCheckout = true\n").unwrap();
-    assert_eq!(verdict(), Ok(Some(fixture.repository.clone())));
-    // Only "not found" is absence: a `config.worktree` that cannot be read refuses.
-    fs::remove_file(&own).unwrap();
-    fs::create_dir(&own).unwrap();
-    assert!(verdict().unwrap_err().ends_with("is not a regular file"));
 }
 
 #[cfg(unix)]
@@ -598,35 +470,19 @@ fn no_link_on_the_way_counts() {
     let moved = root.join("pointer");
     fs::rename(&pointer, &moved).unwrap();
     symlink(&moved, &pointer).unwrap();
-    assert!(
-        main_worktree(&fixture.worktree)
-            .unwrap_err()
-            .to_string()
-            .ends_with("is not a regular file")
-    );
+    assert!(error(&fixture.worktree).ends_with("is not a regular file"));
     fs::remove_file(&pointer).unwrap();
     fs::rename(&moved, &pointer).unwrap();
-    assert!(main_worktree(&fixture.worktree).unwrap().is_some());
+    assert!(verified(&fixture.worktree).unwrap().is_some());
     // The registration reached through a linked directory.
     let alias = root.join("alias");
     symlink(&fixture.repository, &alias).unwrap();
-    fs::write(
-        &pointer,
-        format!(
-            "gitdir: {}\n",
-            git_path(&alias.join(".git/worktrees/worktree"))
-        ),
-    )
-    .unwrap();
+    point(&fixture, &git_path(&alias.join(".git/worktrees/worktree")));
     assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
+        error(&fixture.worktree),
         format!("{} is a link", alias.display())
     );
-    fs::write(
-        &pointer,
-        format!("gitdir: {}\n", git_path(&fixture.registration)),
-    )
-    .unwrap();
+    point(&fixture, &git_path(&fixture.registration));
     // The registration naming this worktree back through a linked directory.
     let worktree_alias = root.join("worktree-alias");
     symlink(&fixture.worktree, &worktree_alias).unwrap();
@@ -636,33 +492,20 @@ fn no_link_on_the_way_counts() {
     )
     .unwrap();
     assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
-        "the worktree registration names another .git file"
+        error(&fixture.worktree),
+        format!("{} is a link", worktree_alias.display())
     );
     fs::write(
         fixture.registration.join("gitdir"),
         format!("{}\n", git_path(&pointer)),
     )
     .unwrap();
-    // A HEAD or configuration that is a link.
-    let head = fixture.registration.join("HEAD");
-    let real_head = root.join("real-head");
-    fs::rename(&head, &real_head).unwrap();
-    symlink(&real_head, &head).unwrap();
-    assert!(
-        main_worktree(&fixture.worktree)
-            .unwrap_err()
-            .to_string()
-            .ends_with("is not a regular file")
-    );
-    fs::remove_file(&head).unwrap();
-    fs::rename(&real_head, &head).unwrap();
     // A `.git` directory that is a link is no main working tree's own.
     let real = root.join("real-git");
     fs::rename(fixture.repository.join(".git"), &real).unwrap();
     symlink(&real, fixture.repository.join(".git")).unwrap();
     assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
+        error(&fixture.worktree),
         format!("{} is a link", fixture.repository.join(".git").display())
     );
 }
@@ -684,35 +527,41 @@ fn a_junction_on_the_way_is_a_link() {
             .unwrap();
         assert!(status.success(), "mklink /J");
     };
-    let pointer = fixture.worktree.join(".git");
     let alias = root.join("alias");
     junction(&alias, &fixture.repository);
-    fs::write(
-        &pointer,
-        format!(
-            "gitdir: {}\n",
-            git_path(&alias.join(".git/worktrees/worktree"))
-        ),
-    )
-    .unwrap();
-    assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
-        format!("{} is a link", native_key(&alias).unwrap())
-    );
-    fs::write(
-        &pointer,
-        format!("gitdir: {}\n", git_path(&fixture.registration)),
-    )
-    .unwrap();
-    assert!(main_worktree(&fixture.worktree).unwrap().is_some());
+    point(&fixture, &git_path(&alias.join(".git/worktrees/worktree")));
+    assert!(error(&fixture.worktree).ends_with("alias is a link"));
+    point(&fixture, &git_path(&fixture.registration));
+    assert!(verified(&fixture.worktree).unwrap().is_some());
     let real = root.join("real-git");
     fs::rename(fixture.repository.join(".git"), &real).unwrap();
     junction(&fixture.repository.join(".git"), &real);
-    assert_eq!(
-        main_worktree(&fixture.worktree).unwrap_err().to_string(),
-        format!(
-            "{} is a link",
-            native_key(&fixture.repository.join(".git")).unwrap()
-        )
+    assert!(error(&fixture.worktree).ends_with(".git is a link"));
+}
+
+// On Windows the claimed main working tree on another drive or share is screened like any
+// other: refused without exact consent evidence before any I/O on it, so a local workspace
+// cannot make TAB reach an untrusted network share. Runs on the Windows CI runner only.
+#[cfg(windows)]
+#[test]
+fn a_share_without_consent_evidence_is_never_touched() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    point(
+        &fixture,
+        "//tab-test.invalid/share/repository/.git/worktrees/worktree",
     );
+    let started = std::time::Instant::now();
+    let mut asked = Vec::new();
+    let error = main_worktree(&fixture.worktree, &mut |main| {
+        asked.push(main.to_owned());
+        false
+    })
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "the main working tree that the .git file names has no exact consent evidence"
+    );
+    assert_eq!(asked.len(), 1);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }

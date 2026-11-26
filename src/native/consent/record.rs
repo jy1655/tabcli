@@ -74,6 +74,12 @@ impl SessionConsentObservation {
         self.value.get("applied").and_then(|marker| marker.as_str())
     }
 
+    // Whether the session's record exists but cannot be read.
+    pub(in crate::native) fn unreadable(&self) -> bool {
+        self.value.get("state").and_then(|state| state.as_str()) == Some("unreadable")
+            && self.value.get("schema").is_none()
+    }
+
     pub(in crate::native) fn value(&self) -> &serde_json::Value {
         &self.value
     }
@@ -155,12 +161,17 @@ pub(super) fn with_record<T>(
     f(&path, record)
 }
 
-// Whether an assessment records what it finds. The assessment at a session's start does, as
-// every earlier release did; a recheck of consent (the authority) never writes, so that
-// doctor and a paste gate stay observations.
+// What an assessment may do beyond reading. `Record` is the assessment at a session's start
+// (`ask`, a supported `reopen`): it looks for a first source where none is pinned and records
+// what it finds, as every earlier release did. `Inherit` is the main working tree's own
+// assessment during such a start: it may look for a first source too, but records only a
+// verified one, so a refusal leaves no record behind. `Recheck` is the authority's: it never
+// looks for a source, requires the pins already recorded, and writes nothing, so a reset
+// consent is acquired again only by a new start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Mode {
     Record,
+    Inherit,
     Recheck,
 }
 
@@ -168,7 +179,7 @@ pub(super) fn assess_with(root: &Path, requested: &Path, env: &Environment) -> R
     assess_in(root, requested, env, Mode::Record)
 }
 
-// The same assessment without the lock or any write: the shared record as it is now.
+// The recheck: the pins as they are now, without the lock or any write.
 pub(super) fn assess_current(
     root: &Path,
     requested: &Path,
@@ -197,7 +208,7 @@ fn assess_in(root: &Path, requested: &Path, env: &Environment, mode: Mode) -> Re
         return Ok(assessment);
     }
     match mode {
-        Mode::Record => with_record(root, &identity.path, |path, existing| {
+        Mode::Record | Mode::Inherit => with_record(root, &identity.path, |path, existing| {
             let (assessment, write) = decide(root, existing, assessment, env, mode)?;
             if let Some(record) = write {
                 RecordStore::at(path).write_json(&record)?;
@@ -225,7 +236,7 @@ fn read_record(root: &Path, workspace: &Path) -> Result<Option<Record>> {
 }
 
 // What one assessment concludes from the workspace's shared record and the current stores,
-// and the record to write when it looked for a first source.
+// and the record to write.
 fn decide(
     root: &Path,
     existing: Option<Record>,
@@ -241,6 +252,12 @@ fn decide(
         revoked: false,
         repository_root: None,
     });
+    // The main working tree of an inherited source is assessed with the same reach: looking
+    // for its first source only while this assessment may.
+    let main_mode = match mode {
+        Mode::Record | Mode::Inherit => Mode::Inherit,
+        Mode::Recheck => Mode::Recheck,
+    };
     let mut write = None;
     if record.schema != 1 || record.identity != identity {
         assessment.state = "identity-changed".into();
@@ -262,7 +279,7 @@ fn decide(
             ),
             // An inherited source is derived again: the same main working tree, by identity,
             // whose own consent still names this source.
-            Some(main) => inherited(root, &identity.path, env, mode)
+            Some(main) => inherited(root, &identity.path, env, main_mode)
                 .is_some_and(|(now, now_main)| now == *source && now_main == *main),
         };
         if holds {
@@ -272,12 +289,17 @@ fn decide(
             assessment.state = "source-reset".into();
             assessment.detail = "The original provider trust is absent, declined, or unreadable. No other provider is silently substituted; reset consent after approving again.".into();
         }
+    } else if mode == Mode::Recheck {
+        // No pin: a recheck acquires nothing.
+        assessment.detail = "No source is pinned for this workspace (it was never verified, or its consent was reset); a new ask acquires consent again.".into();
     } else {
         // Exact trust of the workspace first. Only a workspace that no provider trusts
         // exactly inherits the consent of its repository's main working tree.
         let found = match exact_source(&identity.path, env) {
             Some(source) => Some((source, None)),
-            None => inherited(root, &identity.path, env, mode).map(|(s, main)| (s, Some(main))),
+            None => {
+                inherited(root, &identity.path, env, main_mode).map(|(s, main)| (s, Some(main)))
+            }
         };
         record.repository_root = None;
         if let Some((source, main)) = found {
@@ -286,7 +308,10 @@ fn decide(
             record.source = Some(source);
             record.repository_root = main;
         }
-        write = Some(record);
+        // The main working tree's own assessment records only what it verified.
+        if mode == Mode::Record || record.source.is_some() {
+            write = Some(record);
+        }
     }
     if assessment.source.is_some() {
         assessment.state = "verified".into();
@@ -301,9 +326,10 @@ fn decide(
 }
 
 // The source and the main working tree that `workspace` inherits consent from, derived from
-// current truth: Git's registration of `workspace` as a linked worktree, the main working
-// tree's own consent exactly as TAB assesses that folder (its pinned source, identity and
-// revocation), and a source provider that neither declines nor fails to read the worktree
+// current truth: the claimed main working tree screened against exact consent evidence before
+// any I/O on it, Git's registration of `workspace` there verified by identity, the main
+// working tree's own consent exactly as TAB assesses that folder (its pinned source, identity
+// and revocation), and a source provider that neither declines nor fails to read the worktree
 // itself. Anything that does not hold, or cannot be read, inherits nothing.
 fn inherited(
     root: &Path,
@@ -311,7 +337,8 @@ fn inherited(
     env: &Environment,
     mode: Mode,
 ) -> Option<(Evidence, Identity)> {
-    let main = worktree::main_worktree(workspace).ok()??;
+    let main = worktree::main_worktree(workspace, &mut |main| exact_source(main, env).is_some())
+        .ok()??;
     let main_identity = identity(&main).ok()?;
     // Two records under one lock file would wait on each other.
     if record_path(root, &main) == record_path(root, workspace) {
@@ -367,14 +394,71 @@ pub(in crate::native) fn prepare_at_home(
     Ok(assessment)
 }
 
+// The session's consent record, changed under its own lock: a launch that records the option
+// it applied and the dialog step that records its answer are serialized on it.
+const SESSION_LOCK: &str = "workspace-consent.lock";
+
+fn with_session_record<T>(
+    directory: &Path,
+    f: impl FnOnce(&Path, Assessment) -> Result<T>,
+) -> Result<T> {
+    let reader = Reader::open_unchecked(directory);
+    let lock_path = reader.private(SESSION_LOCK).path().to_owned();
+    if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
+        bail!("invalid workspace consent lock");
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    RecordStore::set_file_private(&lock)?;
+    lock.lock()?;
+    let path = reader.private(SESSION_FILE).path().to_owned();
+    let assessment: Assessment = RecordReader::at(&path).json()?;
+    f(&path, assessment)
+}
+
 pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
+    with_session_record(directory, |path, mut assessment| {
+        assessment.applied = Some(method.to_owned());
+        RecordStore::at(path).write_json(&assessment)
+    })
+}
+
+/// Changes the session record's applied marker from `from` to `to` only while it still is
+/// `from`, under the record's lock; whether it did.
+pub(in crate::native) fn transition(
+    directory: &Path,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<bool> {
+    with_session_record(directory, |path, mut assessment| {
+        if assessment.applied.as_deref() != from {
+            return Ok(false);
+        }
+        assessment.applied = to.map(str::to_owned);
+        RecordStore::at(path).write_json(&assessment)?;
+        Ok(true)
+    })
+}
+
+/// The applied value of a launch that positively could not apply its adapter's launch option,
+/// because the provider was identified as older than the option: only such a launch may still
+/// take the guarded dialog answer for exact consent.
+pub(in crate::native) const LAUNCH_OPTION_UNAVAILABLE: &str = "launch-option-unavailable";
+
+/// Records `LAUNCH_OPTION_UNAVAILABLE` for a session that has a consent record.
+pub(in crate::native) fn option_unavailable(directory: &Path) -> Result<()> {
     let path = Reader::open_unchecked(directory)
         .private(SESSION_FILE)
         .path()
         .to_owned();
-    let mut assessment: Assessment = RecordReader::at(&path).json()?;
-    assessment.applied = Some(method.to_owned());
-    RecordStore::at(&path).write_json(&assessment)
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => applied(directory, LAUNCH_OPTION_UNAVAILABLE),
+    }
 }
 
 pub(in crate::native) fn observe(directory: &Path) -> SessionConsentObservation {

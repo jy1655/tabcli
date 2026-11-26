@@ -89,6 +89,10 @@ pub(super) struct LaunchContext<'a> {
     pub(super) yolo: bool,
     pub(super) model: Option<&'a str>,
     pub(super) effort: Option<&'a str>,
+    // The version text the wrapper's own probe of the installed CLI returned for this launch,
+    // right before the plan is built. An adapter that offers a launch option only from some
+    // version on judges that version here; the others ignore it.
+    pub(super) provider_version: &'a str,
 }
 
 // How the initial prompt reaches the provider process, declared by the adapter from its own

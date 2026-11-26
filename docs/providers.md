@@ -547,7 +547,8 @@ working tree has verified consent, is handed to Agy in a settings file for that 
 (`--settings`). No key is sent and Agy's own trust store is left unchanged; Agy no longer saves
 such a folder because of TAB. This was measured with Agy 1.5.17 on macOS only: no trust dialog.
 Older versions launch without it and keep the dialog, which TAB answers only with exact consent
-on iTerm2, Terminal.app and the Windows console.
+on iTerm2, Terminal.app and the Windows console. A launch whose Agy version cannot be identified,
+or whose consent check is inconclusive, gets neither the setting nor a key.
 
 On macOS and Linux, TAB passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
 behind its workspace-trust dialog, so receiving the first result does not prove it is ready for
