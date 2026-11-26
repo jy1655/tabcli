@@ -4439,7 +4439,8 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
                 ),
                 Instant::now() + Duration::from_secs(30),
             );
-            release.send(()).unwrap();
+            // The holder has already let go if the provider was probed.
+            let _ = release.send(());
             holder.join().unwrap();
             assert!(!started.exists(), "the provider was probed");
             fs::remove_file(&slow).unwrap();
