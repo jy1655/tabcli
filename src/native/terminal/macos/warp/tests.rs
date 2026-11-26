@@ -2691,7 +2691,9 @@ fn mode_open_fixture(
     )
 }
 
-// `launch` bounds the whole fake launch, its title proof included.
+// `launch` bounds the whole fake launch, its title proof included. Both deadlines come from
+// one start in production's order: cleanup keeps its reserve after the launch deadline, so a
+// close that the launch attempts is made, and recorded, rather than refused for time.
 fn open_fixture_within(
     runner: &mut FakeRunner,
     client: &ControlClient,
@@ -2701,6 +2703,7 @@ fn open_fixture_within(
     force_new_window: bool,
     launch: Duration,
 ) -> Result<TerminalSession> {
+    let deadline = Instant::now() + launch;
     open_bound_tab_with(
         runner,
         OpenRequest {
@@ -2708,8 +2711,8 @@ fn open_fixture_within(
             clients: std::slice::from_ref(client),
             command: "ignored",
             directory,
-            deadline: Instant::now() + launch,
-            cleanup_deadline: Instant::now() + Duration::from_secs(1),
+            deadline,
+            cleanup_deadline: deadline + STARTUP_CLEANUP_RESERVE,
             attempt,
         },
         |_| {
