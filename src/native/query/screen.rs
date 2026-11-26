@@ -242,6 +242,13 @@ fn bound_surface(
     }
     let record = SurfaceRecord::read(reader);
     drop(snapshot);
+    // No terminal of a Session of another OS is read from this machine (`terminal::foreign`);
+    // the closed answer above came first.
+    if let SurfaceRecord::Active(Ok(Some(handle))) = &record {
+        terminal::foreign::admit(reader, Some(handle), || {
+            anyhow::anyhow!("session {id} is closed; its terminal surface is not read")
+        })?;
+    }
     match (judgment::surface(&record, id), record) {
         (
             Surface::Active {
@@ -251,19 +258,16 @@ fn bound_surface(
                 empty_id,
             },
             SurfaceRecord::Active(Ok(Some(handle))),
-        ) => {
-            // No terminal of a session of another OS is read from this machine
-            // (`terminal::foreign`); the closed answer above came first.
-            terminal::foreign::admit(reader, Some(&handle), || {
-                anyhow::anyhow!("session {id} is closed; its terminal surface is not read")
-            })?;
-            active_handle(
-                ActiveHandle::of(supported, bound, empty_id),
-                kind,
-                handle,
-                id,
-            )
-        }
+        ) => match ActiveHandle::of(supported, bound, empty_id) {
+            ActiveHandle::Bound => Ok(handle),
+            ActiveHandle::Unsupported => Err(anyhow::Error::new(Unsupported::new(format!(
+                "the recorded terminal, {}, is not supported on this platform",
+                kind.display_name()
+            )))),
+            ActiveHandle::BindingUnverified => {
+                bail!("the recorded terminal handle is not bound to session {id}")
+            }
+        },
         (Surface::Missing, _) => bail!(
             "session {id} ({state}) has no active terminal handle; a launching session records it once its surface is bound"
         ),
@@ -274,24 +278,6 @@ fn bound_surface(
             bail!("the terminal surface record of session {id} is unreadable: {reason}")
         }
         (Surface::Active { .. }, _) => unreachable!("only an active handle is judged active"),
-    }
-}
-
-fn active_handle(
-    verdict: ActiveHandle,
-    kind: terminal::TerminalKind,
-    handle: terminal::TerminalSession,
-    id: &str,
-) -> Result<terminal::TerminalSession> {
-    match verdict {
-        ActiveHandle::Bound => Ok(handle),
-        ActiveHandle::Unsupported => Err(anyhow::Error::new(Unsupported::new(format!(
-            "the recorded terminal, {}, is not supported on this platform",
-            kind.display_name()
-        )))),
-        ActiveHandle::BindingUnverified => {
-            bail!("the recorded terminal handle is not bound to session {id}")
-        }
     }
 }
 

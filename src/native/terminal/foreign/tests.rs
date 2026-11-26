@@ -68,9 +68,8 @@ fn handle(kind: TerminalKind, binding: Option<&str>) -> Value {
     handle
 }
 
-// One session directory with the given Records, judged by `of_records`, and the verdict the
-// Owner record's one observation carries.
-fn judge(records: &[(&str, Value)]) -> (Option<Elsewhere>, Option<Elsewhere>) {
+// One session directory holding the given Records (a string is written as it is).
+fn session_with(records: &[(&str, Value)]) -> (tempfile::TempDir, std::path::PathBuf) {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join(ID);
     std::fs::create_dir(&directory).unwrap();
@@ -81,6 +80,13 @@ fn judge(records: &[(&str, Value)]) -> (Option<Elsewhere>, Option<Elsewhere>) {
             value => std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap(),
         }
     }
+    (root, directory)
+}
+
+// One session directory with the given Records, judged by `of_records`, and the verdict the
+// Owner record's one observation carries.
+fn judge(records: &[(&str, Value)]) -> (Option<Elsewhere>, Option<Elsewhere>) {
+    let (_root, directory) = session_with(records);
     let reader = Reader::open_unchecked(&directory);
     let observed = match session::owner::observe(&reader) {
         session::owner::OwnerRecord::Recorded(recorded) => recorded.owner.recorded_elsewhere,
@@ -251,6 +257,105 @@ fn nothing_but_a_positive_statement_in_the_sessions_own_records_is_evidence() {
     for (name, records) in rejected {
         assert_eq!(judge(&records), (None, None), "{name}");
     }
+}
+
+// The judgment needs a kind the handle record itself states. The reader supplies iTerm2 for
+// a handle that omits its kind (a legacy record); that default is never evidence, on any OS,
+// while a handle that states iTerm2 is evidence where iTerm2 does not run (the reviewer's
+// fixture: `{"session_id":"s","managed_session_id":ID}` counted as iTerm2 on Linux and
+// Windows).
+#[test]
+fn a_kind_the_handle_record_does_not_state_is_never_evidence() {
+    let omitted = json!({"session_id": "s", "managed_session_id": ID});
+    let stated = json!({"terminal": "iterm2", "session_id": "s", "managed_session_id": ID});
+    let bytes = |value: &Value| serde_json::to_vec(value).unwrap();
+    for os in [OsTerminals::MACOS, OsTerminals::LINUX, OsTerminals::WINDOWS] {
+        assert_eq!(
+            of_handle_record_bytes_on(os, ID, Some(&bytes(&omitted)), None),
+            None,
+            "an omitted kind on {}",
+            os.os
+        );
+        assert_eq!(
+            of_handle_record_bytes_on(os, ID, Some(&bytes(&stated)), None),
+            (!os.runs(TerminalKind::Iterm2)).then_some(Elsewhere::Kind(TerminalKind::Iterm2)),
+            "a stated iTerm2 on {}",
+            os.os
+        );
+    }
+}
+
+// The same on this OS through every command's admission: a session whose only handle omits
+// its kind, beside a live PID-only owner, is this OS's; the command's own path answers it.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn an_admission_reads_no_evidence_from_an_omitted_kind() {
+    let omitted = json!({"session_id": "s", "managed_session_id": ID});
+    let (_root, directory) = session_with(&[
+        ("terminal.json", omitted.clone()),
+        (
+            "native-session.json",
+            json!({"pid": std::process::id(), "managed_session_id": ID}),
+        ),
+    ]);
+    let reader = Reader::open_unchecked(&directory);
+    let decoded: TerminalSession = serde_json::from_value(omitted).unwrap();
+    assert_eq!(decoded.kind, TerminalKind::Iterm2);
+    assert_eq!(of_records(&reader), None);
+    admit(&reader, Some(&decoded), || anyhow::anyhow!("closed")).unwrap();
+}
+
+// The admission judges the handle the command read and is about to use, not only what the
+// Records say when it asks. The reviewer's interleaving: a close settles an ownerless Herdr
+// copy born on another OS between doctor's read of its handle and the admission, leaving a
+// marker that names Herdr, which this OS runs. The handle that was read still names another
+// OS, so the probe never reaches the core it names: refused while the status catches up, the
+// closed answer once it says closed.
+#[test]
+fn the_admission_judges_the_handle_that_was_read() {
+    let other = other_os();
+    let mut read = handle(TerminalKind::Herdr, Some(ID));
+    read["herdr_core"] = herdr_core(other);
+    let read: TerminalSession = serde_json::from_value(read).unwrap();
+    let marker = json!({"consumed": true, "terminal": "herdr"});
+    let status = |state: &str| {
+        json!({"state": state, "generation": 2, "updated_unix_ms": 2, "exit_code": null,
+            "error": null})
+    };
+    let (_root, settling) = session_with(&[
+        ("terminal.closed.json", marker.clone()),
+        ("status.json", status("exited")),
+    ]);
+    let reader = Reader::open_unchecked(&settling);
+    assert_eq!(
+        of_records(&reader),
+        None,
+        "the records alone name no other OS"
+    );
+    let error = admit(&reader, Some(&read), || anyhow::anyhow!("closed")).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        format!("{:#}", Elsewhere::Recorded(other).refusal(&settling))
+    );
+    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+    let (_root, settled) = session_with(&[
+        ("terminal.closed.json", marker),
+        ("status.json", status("closed")),
+        ("closed.json", status("closed")),
+    ]);
+    let reader = Reader::open_unchecked(&settled);
+    let error = admit(&reader, Some(&read), || anyhow::anyhow!("closed")).unwrap_err();
+    assert_eq!(format!("{error:#}"), "closed");
+    // A handle this OS runs, bound to the session, is the command's own to answer.
+    let (_root, native) = session_with(&[("status.json", status("ready"))]);
+    let native_handle: TerminalSession =
+        serde_json::from_value(handle(native_kind(), Some(ID))).unwrap();
+    admit(
+        &Reader::open_unchecked(&native),
+        Some(&native_handle),
+        || anyhow::anyhow!("closed"),
+    )
+    .unwrap();
 }
 
 // The refusal names what the Records name and the directory of the records, and no terminal

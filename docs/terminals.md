@@ -27,25 +27,31 @@ A state directory copied from another operating system can hold sessions that be
 session belongs to another system only when one of its own records says so: its active handle,
 bound to the session, names a terminal this system does not run (or a Herdr Core started on
 another system); its consumption record says it consumed such a terminal; or its owner record,
-bound to the session, carries the identity another system records. Nothing else counts: a record
-of another session or of none, a field that does not belong to the terminal, a consumption
-record that does not say it consumed, a missing or empty field. TAB never judges such a session
-from this machine's terminals or processes: it does not report its owner as live or gone, and
-dead-owner repair leaves it as it is. `tell`, `screen` and `doctor --probe` refuse to address
-its terminal, with `<Name> is not available on <system>` when its terminal is one this system
-does not run, otherwise `a session recorded on <system> is not available on <this system>`,
-followed by the directory that holds its records. Only a new launch could choose another
-terminal, so the refusal names none. Where they refuse, a closed session answers first, then a
-terminal that is not this session's. Everything TAB does from records alone, such as `hold`,
-`cancel`, `reopen`, `inspect`, `status` and the recovery `sessions` runs, works as for any
-session.
+bound to the session, carries the identity another system records. Nothing else counts: a handle
+that does not name its terminal (older records that omit it are read as iTerm2), a record of
+another session or of none, a field that does not belong to the terminal, a consumption record
+that does not say it consumed, a missing, empty or unreadable record. TAB never judges such a
+session from this machine's terminals or processes: it does not report its owner as live or
+gone, dead-owner repair leaves it as it is, and the process of a refused reopen of it is not
+checked here, so that reopen keeps holding its source until its records show no provider
+started (`doctor` reports it as unverified). `tell`, `screen` and `doctor --probe` refuse to
+address its terminal, with `<Name> is not available on <system>` when its terminal is one this
+system does not run, otherwise `a session recorded on <system> is not available on <this
+system>`, followed by the directory that holds its records. When its records name different
+systems, the handle the command read speaks first, then the active handle, the consumption
+record and the owner record. Only a new launch could choose another terminal, so the refusal
+names none. Where they refuse, a closed session answers first, then a terminal that is not this
+session's. Everything TAB does from records alone, such as `hold`, `cancel`, `reopen`,
+`inspect`, `status` and the recovery `sessions` runs, works as for any session.
 
 `close-session --explicit` settles such a session from its records alone when they show it
 ended (exited or failed): it consumes the recorded handle, active or left claimed by an
 interrupted close, without addressing any terminal or process, keeps the consumed terminal and
 the session's failure in its records, and closes the session. A close whose consumption record
-already says it consumed finishes as for any session. Any other such session is refused and
-nothing is written; TAB cannot end a copy whose records leave it running. `prune-sessions`
+already says it consumed finishes as for any session, keeping the terminal it names and the
+session's failure. A recorded handle that cannot be read or belongs to another session is
+reported and left where it is. Any other such session is refused and nothing is written; TAB
+cannot end a copy whose records leave it running. `prune-sessions`
 removes an eligible closed copy without observing its owner. Once nothing in a settled copy's
 remaining records names another system (a Herdr copy, or a copy an older TAB closed again,
 which forgets the consumed terminal), it is an ordinary closed session. Closing or pruning a

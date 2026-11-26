@@ -4223,3 +4223,66 @@ fn consent_failure_after_a_reopened_launch_keeps_the_source_reservation() {
         "a second reopen was admitted"
     );
 }
+
+// A refused child whose own Records say it belongs to another OS (`terminal::foreign`): its
+// recorded provider process is never observed from this machine, so the reservation it holds
+// stays unverified, whatever that PID is here (the reviewer's fixture: a live local PID kept
+// it, a reaped one released it). Proof from its Records alone that no provider was spawned
+// still releases it.
+#[test]
+fn a_refused_copys_provider_process_is_never_observed_here() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-reopencopy";
+    let directory = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
+    update_status(&directory, SessionState::Failed, None, None).unwrap();
+    let mut owner = NativeSessionOwner {
+        pid: std::process::id(),
+        managed_session_id: Some(id.to_owned()),
+        ..Default::default()
+    };
+    if cfg!(windows) {
+        owner.process_start_seconds = Some(1);
+        owner.process_start_microseconds = Some(2);
+    } else {
+        owner.windows_process_identity = Some(terminal::WindowsProcessIdentity {
+            creation_time: 1,
+            executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".to_owned(),
+        });
+    }
+    Store::open_unchecked(&directory)
+        .write_owner(&owner)
+        .unwrap();
+    let elsewhere = terminal::foreign::of_records(&Reader::open_unchecked(&directory))
+        .expect("the child's owner record names another OS");
+    let unobserved = |_: &ProviderProcessRecord| -> ProviderProcessObservation {
+        panic!("a provider process of another OS was observed here")
+    };
+    // No provider record and a refusal before any spawn: released from the Records alone.
+    assert_eq!(
+        refused_launch_cleanup_with(
+            &directory,
+            &test_launch_refusal(ReopenGate::StartFailed),
+            unobserved
+        )
+        .unwrap(),
+        RefusedLaunchCleanup::NoProcessSpawned
+    );
+    let alive = std::process::id();
+    let reaped = crate::native::session::test_support::lifecycle::reaped_child_pid();
+    for gate in [ReopenGate::ReopenConflict, ReopenGate::StartFailed] {
+        for pid in [alive, reaped] {
+            write_provider_process_record(&directory, id, pid);
+            let error =
+                refused_launch_cleanup_with(&directory, &test_launch_refusal(gate), unobserved)
+                    .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "{}: provider process {pid} of refused session {id} cannot be observed from this machine",
+                    elsewhere.head()
+                ),
+                "{gate}"
+            );
+        }
+    }
+}

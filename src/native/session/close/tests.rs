@@ -3888,3 +3888,247 @@ fn entries(directory: &Path) -> Vec<Entry> {
 }
 
 type Entry = (PathBuf, Option<Vec<u8>>);
+
+// A session whose own Records say it belongs to another OS (`terminal::foreign`) is closed
+// from its Records alone, in the close transaction's one early branch; everything after that
+// branch is the ordinary transaction, unchanged. The fixtures below are the reviewer's.
+const COPY: &str = "session-copy";
+
+// A kind another OS runs.
+fn kind_elsewhere() -> terminal::TerminalKind {
+    terminal::TerminalKind::ALL
+        .into_iter()
+        .find(|kind| !kind.supported_on_this_platform())
+        .unwrap()
+}
+
+// The Owner record another OS's writer records, bound to the copy: what makes it a copy when
+// no handle names another OS.
+fn copy_owner(pid: u32) -> NativeSessionOwner {
+    let mut owner = NativeSessionOwner {
+        pid,
+        managed_session_id: Some(COPY.to_owned()),
+        ..Default::default()
+    };
+    if cfg!(windows) {
+        owner.process_start_seconds = Some(1);
+        owner.process_start_microseconds = Some(2);
+    } else {
+        owner.windows_process_identity = Some(terminal::WindowsProcessIdentity {
+            creation_time: 1,
+            executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".to_owned(),
+        });
+    }
+    owner
+}
+
+// A copy in `state`, identified by its bound Owner record alone.
+fn copy_fixture(state: SessionState, error: Option<&str>) -> (tempfile::TempDir, Store) {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(COPY);
+    fs::create_dir_all(directory.join("events")).unwrap();
+    update_status(&directory, state, None, error.map(str::to_owned)).unwrap();
+    let store = Store::open_unchecked(&directory);
+    store.write_owner(&copy_owner(reaped_child_pid())).unwrap();
+    assert!(terminal::foreign::of_records(&store).is_some());
+    (root, store)
+}
+
+fn close_copy(store: &Store) -> Result<()> {
+    close_session_state_with_error(
+        store,
+        None,
+        |_| panic!("the close of a session of another OS reached a terminal"),
+        budget::close_deadline(),
+    )
+}
+
+// A copy whose consumption completed without naming a kind (`{"consumed":true,"terminal":null}`)
+// and has no handle left finishes from its Records, as 0.4.49 did: `consumed: true` alone says
+// the consumption completed, whatever the status.
+#[test]
+fn a_copys_completed_consumption_without_a_kind_finishes_from_its_records() {
+    let (_root, store) = copy_fixture(SessionState::Working, None);
+    store
+        .write_terminal_closed(&json!({"consumed": true, "terminal": null}))
+        .unwrap();
+    close_copy(&store).unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+    assert_eq!(
+        store.closed_if_present().unwrap().unwrap().state,
+        SessionState::Closed
+    );
+    assert!(!store.record(CoreRecord::TurnClaim).present().unwrap());
+    let marker: Value = read_json(store.record(CoreRecord::TerminalClosed).path()).unwrap();
+    assert_eq!(marker["consumed"], true);
+    assert_eq!(marker["terminal"], Value::Null);
+}
+
+// Once a copy is identified, a handle that cannot be read or is not its own answers with its
+// own error from the copy's close and stays where it is: the claimed handle of a running copy
+// is never renamed back to the active one by the ordinary transaction's rollback.
+#[test]
+fn a_copys_unreadable_or_unbound_claimed_handle_is_refused_where_it_is() {
+    let unbound = serde_json::to_vec(&json!({"terminal": kind_elsewhere(), "session_id": "t0",
+        "managed_session_id": "session-other"}))
+    .unwrap();
+    for (name, content, expected) in [
+        (
+            "bound to another session",
+            unbound,
+            format!("terminal handle belongs to managed session session-other, not {COPY}"),
+        ),
+        (
+            "not JSON",
+            b"not JSON".to_vec(),
+            "invalid JSON in ".to_owned(),
+        ),
+    ] {
+        let (_root, store) = copy_fixture(SessionState::Working, None);
+        let closing = store.record(CoreRecord::TerminalClosing).path().to_owned();
+        fs::write(&closing, &content).unwrap();
+        let status = store.record(CoreRecord::Status).bytes().unwrap();
+        let error = format!("{:#}", close_copy(&store).unwrap_err());
+        assert!(error.contains(&expected), "{name}: {error}");
+        assert!(
+            name != "not JSON" || error.contains(TERMINAL_CLOSING_FILE),
+            "{name}: {error}"
+        );
+        assert_eq!(fs::read(&closing).unwrap(), content, "{name}");
+        assert!(
+            !store.record(CoreRecord::Terminal).present().unwrap(),
+            "{name}"
+        );
+        assert!(
+            !store.record(CoreRecord::TerminalClosed).present().unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            store.record(CoreRecord::Status).bytes().unwrap(),
+            status,
+            "{name}"
+        );
+    }
+}
+
+// A closed native session's close finishes again over a consumption marker that is a dangling
+// link, as in 0.4.49: the link is replaced and never read. The native transaction gained no
+// marker read.
+#[cfg(unix)]
+#[test]
+fn a_native_reclose_replaces_a_dangling_consumption_marker_link() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-native");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    update_status(&directory, SessionState::Closed, None, None).unwrap();
+    let marker = directory.join(TERMINAL_TOMBSTONE_FILE);
+    std::os::unix::fs::symlink(root.path().join("missing"), &marker).unwrap();
+    let store = Store::open_unchecked(&directory);
+    close_session_state_with_error(
+        &store,
+        None,
+        |_| panic!("a closed session's close reached a terminal"),
+        budget::close_deadline(),
+    )
+    .unwrap();
+    assert!(fs::symlink_metadata(&marker).unwrap().is_file());
+    let marker: Value = read_json(&marker).unwrap();
+    assert_eq!(marker, json!({"consumed": true, "terminal": null}));
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+    assert!(!root.path().join("missing").exists());
+}
+
+// A copy's settlement interrupted after its consumption marker and before its status, as on
+// Windows, whose marker carries no reason: the replay keeps the failure diagnosis and says
+// how the copy was settled. An ordinary session's replay over the same marker is 0.4.49's.
+#[test]
+fn a_copys_interrupted_settlement_keeps_its_failure_diagnosis_on_replay() {
+    let (_root, store) = copy_fixture(SessionState::Failed, Some("the provider failed"));
+    let kind = kind_elsewhere();
+    store
+        .write_terminal_closed(&json!({"consumed": true, "terminal": kind}))
+        .unwrap();
+    close_copy(&store).unwrap();
+    for status in [
+        store.status().unwrap(),
+        store.closed_if_present().unwrap().unwrap(),
+    ] {
+        assert_eq!(status.state, SessionState::Closed);
+        let error = status.error.unwrap_or_default();
+        assert!(error.contains("the provider failed"), "{error}");
+        assert!(error.contains("settled from its records alone"), "{error}");
+    }
+    let marker: Value = read_json(store.record(CoreRecord::TerminalClosed).path()).unwrap();
+    assert_eq!(marker["terminal"], json!(kind));
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-native");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    update_status(
+        &directory,
+        SessionState::Failed,
+        None,
+        Some("the provider failed".to_owned()),
+    )
+    .unwrap();
+    let store = Store::open_unchecked(&directory);
+    store
+        .write_terminal_closed(&json!({"consumed": true, "terminal": null}))
+        .unwrap();
+    close_session_state_with_error(
+        &store,
+        None,
+        |_| panic!("a consumed handle's close reached a terminal"),
+        budget::close_deadline(),
+    )
+    .unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+    assert_eq!(store.status().unwrap().error, None);
+}
+
+// On an OS that does not run iTerm2, a handle that omits its kind (which the reader reads as
+// iTerm2) is no evidence: a failed session with such a handle and a PID-only owner takes the
+// ordinary close, which reaches the adapter, and is not settled from its Records.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn a_handle_that_omits_its_kind_takes_the_ordinary_close() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-legacy");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    update_status(&directory, SessionState::Failed, None, None).unwrap();
+    fs::write(
+        directory.join(TERMINAL_HANDLE_FILE),
+        serde_json::to_vec(&json!({"session_id": "s", "managed_session_id": "session-legacy"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let store = Store::open_unchecked(&directory);
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: reaped_child_pid(),
+            managed_session_id: Some("session-legacy".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut reached = false;
+    close_session_state_with_error(
+        &store,
+        None,
+        |surface| {
+            assert_eq!(surface.kind, terminal::TerminalKind::Iterm2);
+            reached = true;
+            Ok(terminal::CloseOutcome::Missing.into())
+        },
+        budget::close_deadline(),
+    )
+    .unwrap();
+    assert!(reached, "the ordinary close did not reach the adapter");
+    assert!(
+        !store
+            .status()
+            .unwrap()
+            .error
+            .unwrap_or_default()
+            .contains("settled from its records alone")
+    );
+}

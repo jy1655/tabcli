@@ -496,12 +496,10 @@ pub(in crate::native) fn close_owned_surface(
     session: &TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
-    // A session of another OS (`terminal::foreign`) gets the one refusal after the budget, in
-    // the one order, before any other record or observation is read, so that no OS's own close
-    // rules (an owner's attestation, a startup rule, a surface probe) answer for it: this OS's
-    // processes say nothing about it. The close transaction settled such a session before
-    // claiming its handle if its Records show it ended.
-    close_remaining(deadline)?;
+    // A Session of another OS (`terminal::foreign`), here only through the handle the close
+    // claimed (the close transaction settles or refuses one its Records name before it claims
+    // anything): the one refusal, before any record or observation is read, so that no OS's own
+    // close rules answer for it. The ordinary transaction then restores the handle.
     terminal::foreign::admit(
         &crate::native::session::Reader::open_unchecked(directory),
         Some(session),

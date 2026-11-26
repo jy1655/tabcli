@@ -6,6 +6,7 @@
 //! maps the answer to its own vocabulary, messages and authority.
 use super::{CoreRecord, Reader};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation, classify};
+use crate::native::terminal::foreign;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::NativeProcessIdentity;
 use crate::native::terminal::ownership::{NativeSessionOwner, OwnerBinding};
@@ -75,31 +76,42 @@ pub(super) fn decode(bytes: &[u8], session: &str) -> serde_json::Result<Recorded
     Ok(RecordedOwner { owner, binding })
 }
 
-/// One observation of the Owner record of the Session whose directory `reader` opens. The
-/// owner it yields carries whether the Session's own Records say it belongs to another OS
-/// (`terminal::foreign`), so that no reader observes this machine's processes for its owner.
+/// One observation of the Owner record of the Session whose directory `reader` opens.
 pub(in crate::native) fn observe(reader: &Reader) -> OwnerRecord {
+    // A Session whose own Records say it belongs to another OS (`terminal::foreign`): the same
+    // observation, its owner marked, so that no reader observes this machine's processes for
+    // it (`attest_owner_with`).
+    if let Some(elsewhere) = foreign::of_records(reader) {
+        let path = reader.record(CoreRecord::Owner).path().to_owned();
+        return match judge(read(reader), &path, session_of(reader)) {
+            OwnerRecord::Recorded(recorded) => OwnerRecord::Recorded(recorded.elsewhere(elsewhere)),
+            other => other,
+        };
+    }
+    let path = reader.record(CoreRecord::Owner).path().to_owned();
+    judge(read(reader), &path, session_of(reader))
+}
+
+/// The Owner record bound to the Session `reader` opens, as the judgment of whether the
+/// Session belongs to another OS reads it (`terminal::foreign`): `None` when it is absent,
+/// cannot be read or decoded, or is not bound to the Session.
+pub(in crate::native) fn bound(reader: &Reader) -> Option<NativeSessionOwner> {
     let path = reader.record(CoreRecord::Owner).path().to_owned();
     match judge(read(reader), &path, session_of(reader)) {
-        OwnerRecord::Recorded(recorded) => {
-            OwnerRecord::Recorded(with_handle_evidence(recorded, reader))
+        OwnerRecord::Recorded(recorded) if recorded.binding == OwnerBinding::Bound => {
+            Some(recorded.owner)
         }
-        other => other,
+        _ => None,
     }
 }
 
-/// The decoded Owner record with whether the Session's own Records say it belongs to another
-/// OS (`terminal::foreign`): its bound handle Records, then the record itself if it is bound.
-/// Every reader of the Owner record goes through it, so that `attest_owner_with` never observes
-/// this machine's processes for such an owner.
-fn with_handle_evidence(mut recorded: RecordedOwner, reader: &Reader) -> RecordedOwner {
-    use crate::native::terminal::foreign;
-    recorded.owner.recorded_elsewhere = foreign::with_owner(
-        foreign::of_handle_records(reader),
-        &recorded.owner,
-        recorded.binding,
-    );
-    recorded
+impl RecordedOwner {
+    /// The owner of a Session whose own Records say it belongs to another OS: never observed
+    /// on this machine.
+    fn elsewhere(mut self, elsewhere: foreign::Elsewhere) -> Self {
+        self.owner.recorded_elsewhere = Some(elsewhere);
+        self
+    }
 }
 
 /// Whether the read found no Owner record. Only a missing record is absent: a linked,
@@ -122,11 +134,19 @@ fn session_of(reader: &Reader) -> &str {
 /// Windows close paths; Linux has no managed surface yet.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(super) fn required(reader: &Reader) -> Result<RecordedOwner> {
+    // A Session of another OS (`terminal::foreign`): the same record, its owner marked.
+    if let Some(elsewhere) = foreign::of_records(reader) {
+        let path = reader.record(CoreRecord::Owner).path().to_owned();
+        let bytes =
+            read_policy(&path)?.with_context(|| format!("failed to read {}", path.display()))?;
+        return decode(&bytes, session_of(reader))
+            .map(|recorded| recorded.elsewhere(elsewhere))
+            .with_context(|| format!("invalid JSON in {}", path.display()));
+    }
     let path = reader.record(CoreRecord::Owner).path().to_owned();
     let bytes =
         read_policy(&path)?.with_context(|| format!("failed to read {}", path.display()))?;
     decode(&bytes, session_of(reader))
-        .map(|recorded| with_handle_evidence(recorded, reader))
         .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
@@ -172,12 +192,15 @@ pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
 
 /// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
 /// Launch repair attests the recorded process whatever Session the record names.
-/// The owner of a session of another OS is not attested here: launch repair decides nothing
-/// from it, as if it had no owner record.
 pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
+    // The owner of a Session of another OS (`terminal::foreign`) is not attested: launch repair
+    // decides nothing from it, as if no owner were recorded. A record that cannot be read or
+    // decoded is still the read's error, as for any Session.
+    if foreign::of_records(reader).is_some() {
+        return observe(reader).decoded().map(|_| None);
+    }
     Ok(observe(reader)
         .decoded()?
-        .filter(|recorded| recorded.owner.recorded_elsewhere.is_none())
         .map(|recorded| attest_owner(&recorded.owner)))
 }
 
@@ -272,7 +295,7 @@ pub(in crate::native) fn attest_owner_with(
     owner: &NativeSessionOwner,
     observers: OwnerObservers<'_>,
 ) -> OwnerAttestation {
-    // The owner of a session whose own Records say it belongs to another OS is not observed
+    // The owner of a Session whose own Records say it belongs to another OS is not observed
     // here at all: no PID, birth or control observation is made or reported.
     if let Some(elsewhere) = owner.recorded_elsewhere {
         return OwnerAttestation {

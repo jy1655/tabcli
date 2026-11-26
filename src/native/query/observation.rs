@@ -143,16 +143,23 @@ impl SessionEvidence {
                     .record(CoreRecord::Terminal)
                     .optional_json_with(session::record::terminal)?
                     .context("no active terminal handle is recorded")?;
-                let id = directory
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .context("invalid session path")?;
-                // No surface of a session of another OS is probed from this machine
-                // (`terminal::foreign`).
+                // No surface of a Session of another OS is probed from this machine
+                // (`terminal::foreign`): the handle just read is judged as it was read.
                 terminal::foreign::admit(reader, Some(&session), || {
-                    anyhow::anyhow!("session {id} is closed; its terminal surface is not read")
+                    anyhow::anyhow!(
+                        "session {} is closed; its terminal surface is not read",
+                        directory
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                    )
                 })?;
-                session.verify_managed_session(id)?;
+                session.verify_managed_session(
+                    directory
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .context("invalid session path")?,
+                )?;
                 let budget = deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(2));

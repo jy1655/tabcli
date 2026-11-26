@@ -2,32 +2,40 @@
 //!
 //! A state directory can be copied or moved between machines. A Session belongs to another OS
 //! only on a positive statement in a Record that is this Session's own:
-//! - its active handle, bound to this Session, names a kind this OS does not run, or, for a
-//!   Herdr handle only, records a host birth of another platform's variant;
-//! - its consumption marker decodes, says `consumed: true` and names a kind this OS does not
-//!   run;
+//! - its active handle, bound to this Session and stating its kind, names a kind this OS does
+//!   not run, or, for a Herdr handle only, records a host birth of another platform's variant;
+//! - its consumption marker says `consumed: true` and names a kind this OS does not run;
 //! - its Owner record, bound to this Session, carries the identity another OS's writer records
 //!   (macOS: the process start time; Linux: the Linux birth; Windows: the Windows process
 //!   identity).
 //!
-//! Nothing else is evidence: a field that does not belong to the handle's kind, a Record bound
-//! to another Session or to none, a marker that does not decode or says `consumed: false`, a
-//! claimed handle, and anything missing or null. Without evidence the Session is this OS's, and
-//! every command acts as it always did.
+//! Nothing else is evidence: the kind the reader supplies for a handle that omits it (iTerm2,
+//! the legacy default), a field that does not belong to the handle's kind, a Record bound to
+//! another Session or to none, a marker that does not decode or does not say `consumed: true`,
+//! a claimed handle, and anything missing, null or unreadable. Without evidence the Session is
+//! this OS's, and every command acts exactly as it always did.
+//!
+//! When the Records name more than one OS, the first statement in this order gives the
+//! refusal's opening: the handle a command read and is about to use (`admit` only), the active
+//! handle, the consumption marker, then the Owner record.
 //!
 //! For a Session with evidence, TAB does nothing that depends on this machine's terminals or
-//! processes: the Owner record's one observation (`session::owner::observe`, `required`,
-//! Origin's budgeted read) carries the verdict, so owner attestation observes nothing and
-//! Repair leaves the Session as it is; each command that would address its terminal (`tell`'s
-//! ownership proof, `screen`, doctor's probe, the explicit close) refuses it in one order
-//! (`admit`): a closed Session, then a handle that is not this Session's, then another OS.
-//! The explicit close settles such a Session from its Records alone when they show it ended
-//! (`ended`), and prune removes it once closed. Everything TAB does from Records alone is
-//! unchanged.
+//! processes. Each shared step that would observe them takes one early branch on this
+//! judgment, complete in itself, and leaves the rest of the step as it was: the Owner record's
+//! one observation (`session::owner::observe`, `required`) marks the owner, so owner
+//! attestation (`attest_owner_with`) observes nothing and launch repair decides nothing from
+//! it; Repair leaves the Session as it is; prune does not count a closed copy's owner; Origin
+//! does not attest it; a refused reopen's provider process is not observed; and each command
+//! that would address its terminal (`tell`'s ownership proof, `screen`, doctor's probe, the
+//! close of a claimed handle) refuses it in one order (`admit`): a closed Session, then a
+//! handle that is not this Session's, then another OS. The close transaction settles such a
+//! Session from its Records alone when they show it ended (`ended`), and refuses any other.
+//! Everything TAB does from Records alone is unchanged.
 use super::ownership::NativeSessionOwner;
 use super::{OsTerminals, TerminalKind, TerminalSession};
 use crate::native::failure_kind::Unsupported;
 use crate::native::session::{self, CoreRecord, Reader};
+use serde_json::Value;
 use std::path::Path;
 
 /// What a Session's own Records name as another OS, with the refusal it gives.
@@ -70,6 +78,14 @@ impl Elsewhere {
     /// The reason an owner observation reports for such an owner: what the Records name.
     pub(in crate::native) fn reason(self) -> String {
         self.head()
+    }
+
+    /// How the close transaction closed such a session: from its Records alone.
+    pub(in crate::native) fn settled(self) -> String {
+        format!(
+            "settled from its records alone ({}); no terminal or process was observed or closed",
+            self.head()
+        )
     }
 }
 
@@ -118,7 +134,10 @@ fn herdr_birth_os(_: &TerminalSession) -> Option<OsTerminals> {
 /// What a handle itself says: a kind this OS does not run, or, for a Herdr handle only, a
 /// recorded host birth of another platform's variant. It does not say whose handle it is.
 pub(in crate::native) fn of_handle(handle: &TerminalSession) -> Option<Elsewhere> {
-    let os = OsTerminals::CURRENT?;
+    of_handle_on(OsTerminals::CURRENT?, handle)
+}
+
+fn of_handle_on(os: OsTerminals, handle: &TerminalSession) -> Option<Elsewhere> {
     if !os.runs(handle.kind) {
         return Some(Elsewhere::Kind(handle.kind));
     }
@@ -130,9 +149,12 @@ pub(in crate::native) fn of_handle(handle: &TerminalSession) -> Option<Elsewhere
 }
 
 /// What an Owner record's identity says: an identity this OS does not record. Evidence only
-/// for a record bound to the session (`of_owner_record`).
+/// for a record bound to the session.
 pub(in crate::native) fn of_owner(owner: &NativeSessionOwner) -> Option<Elsewhere> {
-    let os = OsTerminals::CURRENT?;
+    of_owner_on(OsTerminals::CURRENT?, owner)
+}
+
+fn of_owner_on(os: OsTerminals, owner: &NativeSessionOwner) -> Option<Elsewhere> {
     let recorded = recorded_on(owner);
     if !recorded.iter().any(|system| system.os != os.os) {
         return None;
@@ -149,67 +171,97 @@ fn bound_here(handle: &TerminalSession, session: &str) -> bool {
     handle.managed_session_id.as_deref() == Some(session) && !handle.id.is_empty()
 }
 
-/// The kind a consumption marker says was consumed: only a marker that decodes and says
-/// `consumed: true`. `None` for a marker that is absent, does not decode, says
-/// `consumed: false`, or names no kind.
-pub(in crate::native) fn consumed_kind(marker: &[u8]) -> Option<TerminalKind> {
-    let tombstone = session::record::terminal_tombstone(std::str::from_utf8(marker).ok()?).ok()?;
-    tombstone.terminal.filter(|_| tombstone.consumed)
+/// Whether a decoded handle stated its kind. The reader supplies iTerm2 for a handle record
+/// that omits its kind (the legacy default), and only iTerm2, so a decoded handle of any other
+/// kind stated it; a decoded iTerm2 handle is evidence only from its record's bytes
+/// (`stated_handle`).
+fn states_kind(handle: &TerminalSession) -> bool {
+    handle.kind != TerminalKind::Iterm2
 }
 
-/// What the handle Records of `session` say, from their bytes: the bound active handle, then
-/// the consumption marker. A Record that does not decode is no evidence. Readers that hold
-/// their own bytes (Origin's budgeted read) judge them here.
+/// The handle a record's bytes hold, only when the record itself states its kind (a
+/// `terminal` field) and decodes.
+fn stated_handle(bytes: &[u8]) -> Option<TerminalSession> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let fields: serde_json::Map<String, Value> = serde_json::from_str(text).ok()?;
+    if !fields.contains_key("terminal") {
+        return None;
+    }
+    session::record::terminal(text).ok()
+}
+
+/// A consumption marker that says its consumption completed.
+#[derive(Debug, Eq, PartialEq)]
+pub(in crate::native) struct Consumption {
+    /// The consumed kind, when the marker names one this version knows.
+    pub(in crate::native) kind: Option<TerminalKind>,
+    /// The close's reason, when the marker records one (macOS and Linux writers do).
+    pub(in crate::native) reason: Option<String>,
+}
+
+/// What a consumption marker's bytes say: `consumed: true` alone says that a consumption
+/// completed; the kind it names and its reason are optional. `None` for bytes that are not a
+/// JSON object saying `consumed: true`.
+pub(in crate::native) fn consumption(marker: &[u8]) -> Option<Consumption> {
+    let value: Value = serde_json::from_str(std::str::from_utf8(marker).ok()?).ok()?;
+    if value.get("consumed") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    Some(Consumption {
+        kind: value
+            .get("terminal")
+            .and_then(|kind| serde_json::from_value(kind.clone()).ok()),
+        reason: value
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// What the handle Records of `session` say, from their bytes: the bound active handle that
+/// states its kind, then the consumption marker. A Record that does not decode is no
+/// evidence. Readers that hold their own bytes (Origin's budgeted read) judge them here.
 pub(in crate::native) fn of_handle_record_bytes(
     session: &str,
     handle: Option<&[u8]>,
     marker: Option<&[u8]>,
 ) -> Option<Elsewhere> {
-    if let Some(handle) = handle
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(|text| session::record::terminal(text).ok())
+    of_handle_record_bytes_on(OsTerminals::CURRENT?, session, handle, marker)
+}
+
+fn of_handle_record_bytes_on(
+    os: OsTerminals,
+    session: &str,
+    handle: Option<&[u8]>,
+    marker: Option<&[u8]>,
+) -> Option<Elsewhere> {
+    if let Some(handle) = handle.and_then(stated_handle)
         && bound_here(&handle, session)
-        && let Some(elsewhere) = of_handle(&handle)
+        && let Some(elsewhere) = of_handle_on(os, &handle)
     {
         return Some(elsewhere);
     }
-    let kind = consumed_kind(marker?)?;
-    (!OsTerminals::CURRENT?.runs(kind)).then_some(Elsewhere::Kind(kind))
+    let kind = consumption(marker?)?.kind?;
+    (!os.runs(kind)).then_some(Elsewhere::Kind(kind))
 }
 
-/// What the handle Records of the Session `reader` opens say. Read by the Owner record's one
-/// observation, which adds what a bound Owner record says.
-pub(in crate::native) fn of_handle_records(reader: &Reader) -> Option<Elsewhere> {
+/// The judgment of the Session `reader` opens, from its own Records: its handle Records, then
+/// its Owner record if it is bound to the Session. A Record that cannot be read is no
+/// evidence, so this read never fails and never changes what a command does for a Session of
+/// this OS.
+pub(in crate::native) fn of_records(reader: &Reader) -> Option<Elsewhere> {
+    of_records_on(OsTerminals::CURRENT?, reader)
+}
+
+fn of_records_on(os: OsTerminals, reader: &Reader) -> Option<Elsewhere> {
     let bytes = |record| reader.record(record).bytes().ok().flatten();
-    of_handle_record_bytes(
+    of_handle_record_bytes_on(
+        os,
         session_of(reader),
         bytes(CoreRecord::Terminal).as_deref(),
         bytes(CoreRecord::TerminalClosed).as_deref(),
     )
-}
-
-/// What a decoded Owner record adds to the handle Records' verdict: its identity, only when it
-/// is bound to the Session.
-pub(in crate::native) fn with_owner(
-    handle_records: Option<Elsewhere>,
-    owner: &NativeSessionOwner,
-    binding: super::ownership::OwnerBinding,
-) -> Option<Elsewhere> {
-    handle_records.or_else(|| {
-        (binding == super::ownership::OwnerBinding::Bound)
-            .then(|| of_owner(owner))
-            .flatten()
-    })
-}
-
-/// The judgment of the Session `reader` opens, from its own Records: what its Owner record's
-/// one observation carries, or the handle Records alone when there is no decodable Owner
-/// record.
-pub(in crate::native) fn of_records(reader: &Reader) -> Option<Elsewhere> {
-    match session::owner::observe(reader) {
-        session::owner::OwnerRecord::Recorded(recorded) => recorded.owner.recorded_elsewhere,
-        _ => of_handle_records(reader),
-    }
+    .or_else(|| session::owner::bound(reader).and_then(|owner| of_owner_on(os, &owner)))
 }
 
 fn session_of(reader: &Reader) -> &str {
@@ -241,23 +293,29 @@ pub(in crate::native) fn binding(handle: &TerminalSession, session: &str) -> any
 }
 
 /// The admission of a command that would use this machine's terminal or processes for the
-/// Session `reader` opens, addressing `handle` if it has one. `Ok` when the Session's Records
-/// give no evidence of another OS: the command's own path applies unchanged. Otherwise the one
-/// refusal, in one order: a closed Session (`closed`, the command's own text), then a handle
-/// that is not this Session's, then the Session of another OS.
+/// Session `reader` opens, addressing `handle` if it has one. The handle the command read and
+/// is about to use is judged as it was read, so that a Record changed since then (a
+/// settlement that consumed it) cannot let it through; then the Session's Records. `Ok` when
+/// neither gives evidence of another OS: the command's own path applies unchanged. Otherwise
+/// the one refusal, in one order: a closed Session (`closed`, the command's own text), then a
+/// handle that is not this Session's, then the Session of another OS.
 pub(in crate::native) fn admit(
     reader: &Reader,
     handle: Option<&TerminalSession>,
     closed_answer: impl FnOnce() -> anyhow::Error,
 ) -> anyhow::Result<()> {
-    let Some(elsewhere) = of_records(reader) else {
+    let session = session_of(reader);
+    let carried = handle
+        .filter(|handle| states_kind(handle) && bound_here(handle, session))
+        .and_then(of_handle);
+    let Some(elsewhere) = carried.or_else(|| of_records(reader)) else {
         return Ok(());
     };
     if closed(reader) {
         return Err(closed_answer());
     }
     if let Some(handle) = handle {
-        binding(handle, session_of(reader))?;
+        binding(handle, session)?;
     }
     Err(elsewhere.refusal(reader.directory()))
 }

@@ -445,7 +445,11 @@ resume can start between them.
 After refusing a launch, TAB releases the source marker only when it proves the refused launch
 cannot still hold the conversation. Otherwise it keeps the marker. A later `reopen` checks the
 recorded refusal again and can release the marker once the provider process is verified gone.
-`doctor` reports this condition but never releases the marker. See [architecture](architecture.md).
+`doctor` reports this condition but never releases the marker. When the refused session's own
+records say it belongs to another operating system ([copied sessions](terminals.md#selection-and-settings)),
+its recorded provider process is not checked on this machine: the marker is kept as unverified
+(`doctor` reports `reopen_marker_unverified`) unless its records prove that no provider process
+was spawned. See [architecture](architecture.md).
 
 ## sessions
 
@@ -2142,7 +2146,7 @@ authenticated identity.
 | `owner_exited` | managed | true | The origin's bound owner process is attested gone. |
 | `owner_reused` | managed | true | The owner's process id now belongs to another process, which grants no authority. |
 | `owner_live` | managed | false | The owner is attested live; `detail` notes a process-id-only record. |
-| `owner_unverified` | managed | null | No owner record, an unbound or foreign one, an unreadable one (the 128 KiB owner bound included), or an attestation that could not decide. |
+| `owner_unverified` | managed | null | No owner record, an unbound or foreign one, an unreadable one (the 128 KiB owner bound included), an attestation that could not decide, or an origin whose own records say it belongs to another operating system, whose owner is not attested here (`detail` says what its records name). |
 | `origin_missing` | managed | null | No session directory with that id in this state root; a pruned, deleted or foreign session looks the same. |
 | `origin_unreadable` | managed | null | A linked or damaged directory, manifest, status or tombstone. |
 | `origin_unverified` | managed | null | A recorded state this version does not know. |

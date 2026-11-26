@@ -17,6 +17,8 @@ pub(in crate::native) enum Checkpoint {
     /// After a verification admitted the candidate directory, before any of its records
     /// were re-read.
     Verify,
+    /// After the owner verdict of an Origin of another OS, before its evidence is read again.
+    EvidenceRead,
 }
 
 type CheckpointHook = Box<dyn FnMut(Checkpoint, &Path)>;
@@ -1544,14 +1546,16 @@ fn an_owner_record_is_read_within_the_owner_bound() {
     }
 }
 
-// A bound owner's verdict also depends on the Origin's handle Records (`terminal::foreign`):
-// they are read within the observation's budget, an oversized one is a read fault and not
-// evidence, a bound handle of a kind this OS does not run makes the Origin one of another OS
-// whose owner is never attested, and a handle that changes before the recheck is busy.
+// A native Origin's owner verdict is 0.4.49's whatever its handle Records hold. The evidence
+// read (`terminal::foreign`) judges them within its own allowance and the observation's
+// deadline: a handle it cannot read (one byte that is not UTF-8, a record over the per-record
+// limit, a dangling link) is inconclusive about the OS, and the bound owner is attested as
+// before; a handle of a kind this OS runs says nothing either. The observation's own reads are
+// charged exactly as without any handle record.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
-fn the_handle_records_an_owner_verdict_depends_on_are_budgeted_and_rechecked() {
-    let hooks = Hooks::new();
+fn a_native_origins_owner_verdict_does_not_depend_on_its_handle_records() {
+    let _hooks = Hooks::new();
     let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
@@ -1559,48 +1563,126 @@ fn the_handle_records_an_owner_verdict_depends_on_are_budgeted_and_rechecked() {
     origin.owner(Some("session-origin"), 7);
     environment.attest(|_| {
         attestation(
-            ProcessObservation::Gone(Gone::Exited),
+            ProcessObservation::Live(Attested::PidOnly),
             ControlAttestation::NotRecorded,
         )
     });
+    let observed_and_charged = |environment: &mut Environment| {
+        let mut environment = environment.origin();
+        let mut budget = ReadBudget::for_query(None, environment.clock);
+        let reference = read_reference(&child.reader(), &mut budget, environment.clock);
+        let before = budget.remaining;
+        let observation = observe(root.path(), reference, &mut budget, &mut environment);
+        (observation, before - budget.remaining)
+    };
+    let (reference, charged) = observed_and_charged(&mut environment);
+    assert_eq!(
+        (reference.ended, reference.reason.as_str()),
+        (Some(false), "owner_live")
+    );
+    let handle = origin.record(CoreRecord::Terminal);
+    let native = crate::native::terminal::TerminalKind::ALL
+        .into_iter()
+        .find(|kind| kind.supported_on_this_platform())
+        .unwrap();
+    type Write = Box<dyn Fn(&Path)>;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut records: Vec<(&str, Write)> = vec![
+        (
+            "one byte that is not UTF-8",
+            Box::new(|path| fs::write(path, b"\xff").unwrap()),
+        ),
+        (
+            "a record over the per-record limit",
+            Box::new(|path| fs::write(path, vec![b' '; RECORD_LIMIT as usize + 1]).unwrap()),
+        ),
+        (
+            "a bound handle of a kind this OS runs",
+            Box::new(move |path| {
+                write(
+                    path,
+                    &json!({"terminal": native, "session_id": "surface",
+                        "managed_session_id": "session-origin"}),
+                )
+            }),
+        ),
+    ];
+    #[cfg(unix)]
+    records.push((
+        "a dangling link",
+        Box::new(|path| std::os::unix::fs::symlink(path.with_file_name("missing"), path).unwrap()),
+    ));
+    for (name, record) in records {
+        let _ = fs::remove_file(&handle);
+        record(&handle);
+        let (observation, cost) = observed_and_charged(&mut environment);
+        assert_eq!(observation, reference, "{name}");
+        assert_eq!(cost, charged, "{name}");
+    }
+}
+
+// An Origin whose own Records say it belongs to another OS: its owner is never attested, and
+// the verdict names what its Records name. Every answer its Records alone give is as before
+// (here, an owner record bound to another session). The verdict holds only while the handle
+// Records it was judged from are unchanged: a handle that changes before the evidence is read
+// again makes it busy.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn the_owner_of_an_origin_of_another_os_is_never_attested() {
+    let hooks = Hooks::new();
+    let mut environment = Environment::new();
+    let root = tempfile::tempdir().unwrap();
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let origin = Session::new(root.path(), "session-origin", "ready");
+    origin.owner(Some("session-origin"), 7);
+    environment.attest(|_| panic!("the owner of an Origin of another OS was attested"));
     let foreign = crate::native::terminal::TerminalKind::ALL
         .into_iter()
         .find(|kind| !kind.supported_on_this_platform())
         .unwrap();
     let handle = origin.record(CoreRecord::Terminal);
-    // An oversized handle is a fault of the read, never evidence either way.
-    fs::write(&handle, vec![b' '; RECORD_LIMIT as usize + 1]).unwrap();
-    let observation = observed(&mut environment, root.path(), &child);
-    assert_eq!(
-        (observation.ended, observation.reason.as_str()),
-        (None, "owner_unverified")
-    );
-    // A bound handle of a kind this OS does not run: the owner is not attested.
     write(
         &handle,
         &json!({"terminal": foreign, "session_id": "surface",
             "managed_session_id": "session-origin"}),
     );
-    environment.attest(|_| panic!("the owner of an Origin of another OS was attested"));
     let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
-        (observation.ended, observation.reason.as_str()),
-        (None, "owner_unverified")
-    );
-    // A handle that changes between the verdict and the recheck makes the verdict busy.
-    environment.attest(|_| {
-        attestation(
-            ProcessObservation::Gone(Gone::Exited),
-            ControlAttestation::NotRecorded,
+        (
+            observation.ended,
+            observation.reason.as_str(),
+            observation.detail
+        ),
+        (
+            None,
+            "owner_unverified",
+            crate::native::terminal::foreign::of_handle(
+                &crate::native::terminal::TerminalSession::new(foreign, "surface".into())
+            )
+            .map(|elsewhere| elsewhere.reason())
         )
-    });
-    fs::remove_file(&handle).unwrap();
+    );
+    origin.owner(Some("session-other"), 7);
+    let observation = observed(&mut environment, root.path(), &child);
+    assert_eq!(
+        (
+            observation.ended,
+            observation.reason.as_str(),
+            observation.detail.as_deref()
+        ),
+        (
+            None,
+            "owner_unverified",
+            Some("owner record belongs to another session")
+        )
+    );
+    origin.owner(Some("session-origin"), 7);
     let changed = handle.clone();
     hooks.checkpoint(move |point, _| {
-        if point == Checkpoint::OriginRead {
+        if point == Checkpoint::EvidenceRead {
             write(
                 &changed,
-                &json!({"terminal": "herdr", "session_id": "t7",
+                &json!({"terminal": foreign, "session_id": "another",
                     "managed_session_id": "session-origin"}),
             );
         }

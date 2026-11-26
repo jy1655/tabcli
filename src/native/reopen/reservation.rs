@@ -368,6 +368,19 @@ fn refused_launch_cleanup_with(
             record.managed_session_id, record.schema
         )));
     }
+    // A refused Session whose own Records say it belongs to another OS (`terminal::foreign`):
+    // its provider process is never observed from this machine, so the reservation stays
+    // unverified. Only the proof above, from its Records alone, that no provider was spawned
+    // releases it.
+    if let Some(elsewhere) =
+        crate::native::terminal::foreign::of_records(&Reader::open_unchecked(refused_directory))
+    {
+        bail!(
+            "{}: provider process {} of refused session {refused_session} cannot be observed from this machine",
+            elsewhere.head(),
+            record.pid
+        );
+    }
     let evidence = match observe(&record) {
         ProviderProcessObservation::Gone(evidence) => evidence,
         ProviderProcessObservation::Alive => {
