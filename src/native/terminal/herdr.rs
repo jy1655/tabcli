@@ -123,8 +123,10 @@ impl CallError {
     }
 }
 
-/// One connection to a core: one request, then its one reply line. Only `linked` holds the
-/// `Permit` a call takes, so every request goes through the verified connection there.
+/// One connection to a core: one request, then its one reply line. Only `linked` constructs the
+/// `Permit` a call takes, so the installed code sends every request through the verified
+/// connection there; an implementation holds the permit it receives for that call, and nothing
+/// in the type system stops it from passing it on.
 pub(in crate::native::terminal) trait Connection {
     fn call(
         &mut self,
@@ -701,8 +703,11 @@ fn close_created(
 ) -> Result<CloseOutcome> {
     let admitted = authority::admit(evidence)?;
     close_remaining(deadline)?;
+    // A refusal of the first read (a terminal set to keep, another terminal, an unreachable
+    // core) keeps why no live owner was verified, as the later reads' refusals in `grant` do.
     let Some((recorded, mut linked)) =
-        Recorded::open(core, session, Requirement::Created(directory), deadline)?
+        Recorded::open(core, session, Requirement::Created(directory), deadline)
+            .map_err(|error| admitted.explain(error))?
     else {
         return Ok(CloseOutcome::Missing);
     };

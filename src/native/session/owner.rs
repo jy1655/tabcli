@@ -172,6 +172,11 @@ pub(in crate::native) enum ControlAttestation {
     Changed(String),
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
     Unknown(String),
+    /// The control read found no process at the PID whose birth the read before it matched:
+    /// the process exited during attestation.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    Exited,
 }
 
 pub(in crate::native) struct OwnerObservers<'a> {
@@ -187,21 +192,71 @@ pub(in crate::native) struct OwnerObservers<'a> {
         &'a dyn Fn(u32) -> Result<Option<crate::native::terminal::WindowsProcessIdentity>>,
 }
 
-/// Whether the record carries another platform's incarnation fields (a macOS start time, a Linux
-/// birth, a Windows process identity), beside this platform's own or instead of it. Such a record
-/// contradicts itself, whatever this platform's attestation answers about the fields it reads.
+/// Whether the decoded record carries another platform's fields anywhere in it, nested ones
+/// included, beside this platform's own or instead of them. Such a record contradicts itself,
+/// whatever this platform's attestation answers about the fields it reads. Every field of the
+/// record and of its nested identities is named below, so a field added later must be placed
+/// here before the crate builds again.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn record_conflicts(owner: &NativeSessionOwner) -> bool {
+    use crate::native::terminal::ownership::{MacTerminalAppIdentity, TerminalShellIdentity};
+    let NativeSessionOwner {
+        // Every platform's.
+        pid: _,
+        managed_session_id: _,
+        linux_birth,
+        terminal_tty,
+        terminal_tty_device,
+        process_start_seconds,
+        process_start_microseconds,
+        process_group,
+        terminal_process_group,
+        terminal_shell,
+        terminal_app,
+        windows_process_identity,
+    } = owner;
+    // The shell's birth is macOS's start time or Linux's birth, never both (its decoder refuses
+    // a mixed one).
+    let shell_linux = terminal_shell.as_ref().map(|shell| {
+        let TerminalShellIdentity {
+            pid: _,
+            process_group: _,
+            terminal_tty_device: _,
+            process_start_seconds: _,
+            process_start_microseconds: _,
+            linux_birth,
+        } = shell;
+        linux_birth.is_some()
+    });
+    // Terminal.app's incarnation is macOS's alone.
+    let app = terminal_app.as_ref().is_some_and(|app| {
+        let MacTerminalAppIdentity {
+            pid: _,
+            start_seconds: _,
+            start_microseconds: _,
+        } = app;
+        true
+    });
+    let macos = process_start_seconds.is_some()
+        || process_start_microseconds.is_some()
+        || app
+        || shell_linux == Some(false);
+    let linux = linux_birth.is_some() || shell_linux == Some(true);
+    // The controlling TTY and the process groups are macOS's and Linux's.
+    let posix = terminal_tty.is_some()
+        || terminal_tty_device.is_some()
+        || process_group.is_some()
+        || terminal_process_group.is_some()
+        || terminal_shell.is_some();
+    let windows = windows_process_identity.is_some();
     #[cfg(target_os = "macos")]
-    return owner.linux_birth.is_some() || owner.windows_process_identity.is_some();
+    let foreign = linux || windows;
     #[cfg(target_os = "linux")]
-    return owner.process_start_seconds.is_some()
-        || owner.process_start_microseconds.is_some()
-        || owner.windows_process_identity.is_some();
+    let foreign = macos || windows;
     #[cfg(windows)]
-    return owner.linux_birth.is_some()
-        || owner.process_start_seconds.is_some()
-        || owner.process_start_microseconds.is_some();
+    let foreign = macos || linux || posix;
+    let _ = (macos, linux, posix, windows);
+    foreign
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -364,7 +419,7 @@ pub(in crate::native) fn attest_owner_with(
                     ControlAttestation::Changed(format!("owner {} changed", changed.join(", ")))
                 }
             }
-            Ok(None) => ControlAttestation::Unknown("exited during attestation".into()),
+            Ok(None) => ControlAttestation::Exited,
             Err(e) => ControlAttestation::Unknown(format!(
                 "failed to verify the birth identity of live native-session process {}: {e:#}",
                 owner.pid
@@ -421,6 +476,10 @@ impl From<&OwnerAttestation> for OwnerObservation {
                 }
                 #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Unknown(reason) => (a.pid_alive, None, Some(reason.clone())),
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
+                ControlAttestation::Exited => {
+                    (a.pid_alive, None, Some("exited during attestation".into()))
+                }
                 ControlAttestation::NotRecorded => (Some(true), None, None),
             },
             ProcessObservation::Live(Attested::PidOnly) => (Some(true), None, None),

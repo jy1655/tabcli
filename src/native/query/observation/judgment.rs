@@ -99,7 +99,7 @@ impl BoundOwner {
                 #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 ControlAttestation::Changed(_) => Self::ControlChanged,
                 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-                ControlAttestation::Unknown(_) => Self::Unknown,
+                ControlAttestation::Unknown(_) | ControlAttestation::Exited => Self::Unknown,
                 ControlAttestation::NotRecorded => Self::Uncompared,
             },
             ProcessObservation::Live(Attested::PidOnly) => Self::Uncompared,

@@ -165,6 +165,14 @@ pub(super) fn core_kept(
     let attestation = observation.posix_owner_live(&owner);
     #[cfg(windows)]
     let attestation = observation.observe_owner_record(&owner);
+    // The control read after a matching birth found the process gone (macOS and Linux).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if matches!(
+        attestation.control,
+        crate::native::session::owner::ControlAttestation::Exited
+    ) {
+        return created(Some(owner.pid), None);
+    }
     match &attestation.process {
         ProcessObservation::Live(Attested::Incarnation) => {
             Ok(CoreKept::LiveOwner(Box::new((owner, attestation))))

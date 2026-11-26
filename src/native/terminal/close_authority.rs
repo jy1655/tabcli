@@ -405,8 +405,22 @@ pub(in crate::native) fn decide(
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
+        // An interrupted owner teardown keeps its route while its evidence validates. When the
+        // owner it names can no longer be established (the record gone, unreadable or not a
+        // record), a kind whose core keeps its terminals takes the creation record instead,
+        // which confirms absence on the core and ends nothing.
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        let teardown_intent = observation.teardown_intent()?;
+        let teardown_intent = match observation.teardown_intent() {
+            Err(error)
+                if owner_exit::core_retains_finished(session.kind)
+                    && error
+                        .downcast_ref::<session::close::TeardownOwnerUnestablished>()
+                        .is_some() =>
+            {
+                None
+            }
+            result => result?,
+        };
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let has_teardown_intent = teardown_intent.is_some();
         #[cfg(windows)]
@@ -489,6 +503,9 @@ pub(in crate::native) fn decide(
                     crate::native::session::owner::ControlAttestation::Changed(reason)
                     | crate::native::session::owner::ControlAttestation::Unknown(reason) => {
                         bail!("{reason}")
+                    }
+                    crate::native::session::owner::ControlAttestation::Exited => {
+                        bail!("exited during attestation")
                     }
                     _ => {}
                 }
@@ -884,6 +901,9 @@ mod projected_authority_tests {
         /// Bound, with a third platform's incarnation fields beside its own, which this
         /// platform's attestation does not read: a matching live incarnation can be attested.
         ConflictingUnread,
+        /// Bound, with another platform's identity nested in the record: on Windows and Linux a
+        /// Terminal.app incarnation, on macOS a shell recorded with a Linux birth.
+        ConflictingNested,
         /// Bound, PID only.
         PidOnly,
         Unbound,
@@ -933,6 +953,33 @@ mod projected_authority_tests {
                 #[cfg(target_os = "linux")]
                 {
                     owner.process_start_seconds = Some(1_790_000_000);
+                }
+            }
+            Record::ConflictingNested => {
+                incarnation(&mut owner);
+                #[cfg(any(target_os = "linux", windows))]
+                {
+                    owner.terminal_app =
+                        Some(crate::native::terminal::ownership::MacTerminalAppIdentity {
+                            pid: 501,
+                            start_seconds: 1_790_000_000,
+                            start_microseconds: 7,
+                        });
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    owner.terminal_shell =
+                        Some(crate::native::terminal::ownership::TerminalShellIdentity {
+                            pid: 4241,
+                            process_group: 4241,
+                            terminal_tty_device: 42,
+                            process_start_seconds: 0,
+                            process_start_microseconds: 0,
+                            linux_birth: Some(crate::native::terminal::LinuxBirth {
+                                boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
+                                starttime_ticks: 41,
+                            }),
+                        });
                 }
             }
             Record::ConflictingUnread => {
@@ -1163,6 +1210,16 @@ mod projected_authority_tests {
             (
                 "contradictory record, a third platform's incarnation, live",
                 Record::ConflictingUnread,
+                live,
+                SessionState::Ready,
+                None,
+                CloseCause::Explicit,
+                created(false),
+            ),
+            // Review round 6, finding 1: the whole decoded record, nested identities included.
+            (
+                "contradictory record, another platform's nested identity, live",
+                Record::ConflictingNested,
                 live,
                 SessionState::Ready,
                 None,

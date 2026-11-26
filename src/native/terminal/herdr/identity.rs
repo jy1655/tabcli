@@ -130,13 +130,17 @@ impl<'a> Recorded<'a> {
         self.check(core, observed)
     }
 
-    /// The handle's own creation record is whole exactly when a released writer on this
-    /// platform could have written it (0.4.45 to 0.4.49): a host PID that this platform's process
-    /// reader reports (`host_pid_reported`), a host birth of this platform's kind with values its
-    /// writers record (`host_birth_written`), and a launch label exactly as the generators wrote
-    /// it, 32 lowercase hexadecimal digits. On Windows every writer (0.4.47 on) saved the label.
-    /// The macOS and Linux writers of 0.4.45 and 0.4.46 omitted the field, never wrote `null`;
-    /// their label is checked on the terminal and compared with its name (`check_launch`).
+    /// The handle's own creation record is whole when its decoded values pass three checks,
+    /// each derived from the released writers (0.4.45 to 0.4.49): a host PID that this
+    /// platform's process reader reports (`host_pid_reported`), a host birth of this platform's
+    /// kind with values its writers record (`host_birth_written`), and a launch label as the
+    /// generators wrote it, 32 lowercase hexadecimal digits (on Windows, where every writer saved
+    /// it, present; never an explicit `null`). The macOS and Linux writers of 0.4.45 and 0.4.46
+    /// omitted the field; their label is checked on the terminal and compared with its name
+    /// (`check_launch`). The wire spelling is not examined (the shared decoder's aliases,
+    /// unknown fields, case): this path ends nothing and removes only a terminal the verified
+    /// core identifies, so settling an oddly spelled handle on `not_found` can at worst leave a
+    /// terminal the core still lists, while refusing it would strand the session.
     fn check_creation_record_whole(&self) -> Result<()> {
         let address = &self.session.id;
         let damaged = |what: &str| {

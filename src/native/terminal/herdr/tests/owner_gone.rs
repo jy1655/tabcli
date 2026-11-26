@@ -1376,8 +1376,9 @@ fn a_session_without_an_owner_record_keeps_its_running_terminal() {
 type Damage = fn(&mut serde_json::Map<String, Value>);
 
 // Review rounds 2 to 4 (finding 6, then 3 and 4): a close settles an absent terminal from its
-// creation record exactly when a released writer on this platform could have written that
-// record. Each accepted row is one released writer's output, as its tag's source writes it:
+// creation record when the decoded host PID, host birth and launch label pass the checks derived
+// from the released writers. Each accepted row is one released writer's output, as its tag's
+// source writes it:
 // 0.4.45 (macOS) and 0.4.46 (macOS, Linux) omit the launch label; 0.4.47 to 0.4.49 (macOS,
 // Linux, Windows) save the 32 lowercase hexadecimal digits their generator wrote; the host PID is
 // one the core reported and the platform's reader returned a birth for; the host birth is the
@@ -2247,4 +2248,238 @@ fn a_live_owner_close_needs_its_terminal_running() {
         }
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
     }
+}
+
+// Review round 6, finding 3: the attestation reads the owner's birth, then its control identity.
+// When the birth matched but the control read finds no process at the PID, the owner exited
+// during attestation: the decision takes the creation record (with the diagnosis), instead of
+// choosing the close with a live owner and refusing there. macOS and Linux only.
+#[cfg(unix)]
+#[test]
+fn an_owner_that_exits_between_its_two_reads_takes_the_creation_record() {
+    use crate::native::session::owner::{ControlAttestation, OwnerObservers, attest_owner_with};
+    use crate::native::terminal::close_authority::{
+        TerminalCloseAuthority, decide, test_support::TestObservation,
+    };
+    use std::cell::RefCell;
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let surface = fixture.store().terminal().unwrap();
+    let deadline = later();
+    let reads = RefCell::new(Vec::new());
+    let attest = |owner: &NativeSessionOwner| {
+        attest_owner_with(
+            owner,
+            OwnerObservers {
+                pid_alive: &|_| true,
+                #[cfg(target_os = "macos")]
+                birth: &|_| {
+                    reads.borrow_mut().push("birth");
+                    Ok(owner
+                        .process_start_seconds
+                        .zip(owner.process_start_microseconds))
+                },
+                #[cfg(target_os = "linux")]
+                birth: &|_| {
+                    reads.borrow_mut().push("birth");
+                    Ok(owner
+                        .linux_birth
+                        .map(crate::native::terminal::ownership::ProcessBirth::Linux))
+                },
+                control: &|_| {
+                    reads.borrow_mut().push("control");
+                    Ok(None)
+                },
+            },
+        )
+    };
+    let attestation = attest(&complete_owner());
+    assert!(matches!(attestation.control, ControlAttestation::Exited));
+    reads.borrow_mut().clear();
+    let observation = TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+        .with_evidence(crate::native::terminal::close_evidence(TerminalKind::Herdr))
+        .with_posix_owner_live(attest)
+        .with_proof(|| panic!("the creation record asks no ownership proof"))
+        .with_presence(|| panic!("the creation record asks no presence"));
+    let answer = decide(&observation, SESSION, &surface, deadline);
+    assert_eq!(*reads.borrow(), ["birth", "control"]);
+    let Ok(TerminalCloseAuthority::CreatedSurface(evidence)) = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(
+        evidence.generated_reason().as_deref(),
+        Some("native session process 4242 is no longer running")
+    );
+    assert_eq!(fixture.mutations(), (0, 0));
+}
+
+// Review round 6, finding 2: a close with a live owner that proved its terminal absent records
+// a teardown intent before it ends the owner. If it is interrupted there and the owner then
+// exits and its record goes (or can no longer be read), the retry cannot validate that intent
+// against an owner. It closes on the creation record instead, which confirms the absence on the
+// recorded core; it ends nothing. macOS and Linux only (Windows records no teardown intent).
+#[cfg(unix)]
+#[test]
+fn an_interrupted_teardown_whose_owner_is_gone_settles_on_the_creation_record() {
+    type Lose = fn(&std::path::Path);
+    let rows: [(&str, Lose); 2] = [
+        ("owner record gone", |path| fs::remove_file(path).unwrap()),
+        ("owner record unreadable", |path| {
+            fs::remove_file(path).unwrap();
+            fs::create_dir(path).unwrap();
+        }),
+    ];
+    for (label, lose) in rows {
+        let fixture = Fixture::new("ready", &complete_owner());
+        fixture.remove();
+        let store = fixture.store();
+        let surface = store.terminal().unwrap();
+        // The state the interrupted teardown left: its intent, naming the owner it attested.
+        session::close::record_terminal_teardown_intent(
+            &store,
+            SESSION,
+            &surface,
+            &complete_owner(),
+            4242,
+            "the surface was proven absent while its owner was live; the owner was ended",
+        )
+        .unwrap();
+        lose(store.record(CoreRecord::Owner).path());
+        fixture.core.clear_calls();
+        assert_eq!(
+            fixture.close(exited, false).map_err(|e| error_text(&e)),
+            Ok(CloseOutcome::Missing),
+            "{label}"
+        );
+        assert!(
+            fixture
+                .core
+                .methods()
+                .iter()
+                .any(|method| method == "terminal.get"),
+            "{label}: the absence is confirmed on the core: {:?}",
+            fixture.core.methods()
+        );
+        assert_eq!(fixture.mutations(), (0, 0), "{label}");
+        fixture.assert_closed(label);
+    }
+}
+
+// Review round 6, finding 4: the close with a live owner needs its full ownership proof. A bound
+// record whose birth matches but which lacks the TTY and process-group fields is refused by the
+// production proof (the Herdr adapter's surface check, then the owner check, here with the
+// process reads scripted), and nothing is sent. macOS and Linux only.
+#[cfg(unix)]
+#[test]
+fn a_live_owner_without_its_control_record_is_refused_by_the_full_proof() {
+    use crate::native::terminal::close_authority::{decide, test_support::TestObservation};
+    use crate::native::terminal::ownership::{NativeProcessIdentity, ProcessBirth};
+    use crate::native::terminal::posix_ownership::{
+        ProcessReads, verified_posix_terminal_owner_with,
+    };
+    let mut owner = complete_owner();
+    owner.terminal_tty = None;
+    owner.terminal_tty_device = None;
+    owner.process_group = None;
+    owner.terminal_process_group = None;
+    let fixture = Fixture::new("ready", &owner);
+    let surface = fixture.store().terminal().unwrap();
+    let deadline = later();
+    #[cfg(target_os = "macos")]
+    let birth = ProcessBirth::Macos(1_790_000_000, 42);
+    #[cfg(target_os = "linux")]
+    let birth = ProcessBirth::Linux(complete_owner().linux_birth.unwrap());
+    let identity = move |pid: u32| {
+        Ok(NativeProcessIdentity {
+            pid,
+            parent_pid: 1,
+            terminal_tty_device: 42,
+            process_group: 4242,
+            terminal_process_group: 4242,
+            birth,
+        })
+    };
+    let tty_device = |_: &std::path::Path| Ok(42);
+    let reads = ProcessReads {
+        identity: &identity,
+        tty_device: &tty_device,
+    };
+    let adapters = Adapter::with_core(fixture.core.clone());
+    let observation = TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+        .with_evidence(crate::native::terminal::close_evidence(TerminalKind::Herdr))
+        .with_posix_owner_live(|_| live_other())
+        .with_proof(|| {
+            let tty = crate::native::terminal::posix::verify_surface(
+                &adapters,
+                &fixture.directory,
+                &surface,
+                None,
+            )?;
+            verified_posix_terminal_owner_with(
+                &fixture.directory,
+                SESSION,
+                &surface,
+                tty.as_deref(),
+                reads,
+            )
+            .map(|_| ())
+        })
+        .with_presence(|| {
+            crate::native::terminal::posix::surface_present(
+                &adapters,
+                &fixture.directory,
+                &surface,
+                std::time::Duration::from_secs(1),
+            )
+        })
+        .with_attest(|| panic!("a present terminal is not torn down"));
+    let text = error_text(&decide(&observation, SESSION, &surface, deadline).unwrap_err());
+    assert!(
+        text.contains("birth, TTY, or foreground identity changed"),
+        "{text}"
+    );
+    assert_eq!(fixture.mutations(), (0, 0));
+}
+
+// Review round 6, finding 5: a refusal on the creation record keeps why no live owner was
+// verified, beside its own recovery instructions (here a running terminal set to keep, with an
+// owner record that cannot be read); the cleanup after a refused reopen says that TAB could not
+// verify a live owner.
+#[test]
+fn a_refusal_keeps_why_no_live_owner_was_verified() {
+    let fixture = Fixture::new("working", &complete_owner());
+    fixture.core.set("t7", "keep", json!(true));
+    let owner = fixture.store().record(CoreRecord::Owner).path().to_owned();
+    fs::remove_file(&owner).unwrap();
+    fs::create_dir(&owner).unwrap();
+    let text = error_text(&fixture.close(exited, false).unwrap_err());
+    assert!(text.contains("set to keep"), "{text}");
+    assert!(text.contains("keep t7 --off"), "{text}");
+    assert!(
+        text.contains("TAB could not verify a live owner for this session"),
+        "{text}"
+    );
+    assert!(
+        text.contains("its owner record could not be read"),
+        "{text}"
+    );
+    assert_eq!(fixture.mutations(), (0, 0));
+
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let text = error_text(
+        &fixture
+            .close_as(unknown, false, CloseCause::Cleanup)
+            .unwrap_err(),
+    );
+    assert!(
+        text.contains("TAB could not verify a live owner for this session"),
+        "{text}"
+    );
+    assert!(text.contains("only close-session --explicit"), "{text}");
+    assert!(
+        !text.contains("no live owner of this session holds"),
+        "{text}"
+    );
+    assert_eq!(fixture.mutations(), (0, 0));
 }

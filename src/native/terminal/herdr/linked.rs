@@ -4,10 +4,12 @@
 //! only this module names `terminal.kill` and `terminal.rm` (a source scan checks the literal
 //! names; it does not catch a name assembled from parts). `Linked::call` refuses both, and
 //! `end_program` and `remove_confirmed` send them only by consuming a grant that
-//! `authority::grant` minted from an observation this connection produced (`Seen`), naming this
-//! connection's core and the observed terminal. What this does not cover: test builds can reach
-//! a raw stream, and the type system does not stop a new `Connection` implementation from
-//! forwarding the permit it receives to another request.
+//! `authority::grant` minted from an observation a verified connection produced (`Seen`). The
+//! grant names the core that answered that connection and the observed terminal; the
+//! connection that consumes it need not be the one that observed the terminal, only a verified
+//! connection to the same core (it compares the permanent core id). What this does not cover:
+//! test builds can reach a raw stream, and the type system does not stop a new `Connection`
+//! implementation from forwarding the permit it receives to another request.
 use super::authority::{Kill, Remove};
 use super::{CallError, CloseOutcome, Connection, Core, GENERATION, Observed, get};
 use anyhow::{Context, Result, anyhow, bail};

@@ -50,8 +50,12 @@ pub(super) struct Admitted {
 /// no absent one either.
 pub(super) fn admit(evidence: CreationEvidence) -> Result<Admitted> {
     if !evidence.explicit() {
+        let why = evidence
+            .unverified()
+            .map(|why| format!(" ({why})"))
+            .unwrap_or_default();
         bail!(
-            "no live owner of this session holds its Herdr terminal; only close-session --explicit removes or settles it, so nothing was sent and the handle is retained"
+            "TAB could not verify a live owner for this session{why}; without one, only close-session --explicit removes or settles its Herdr terminal, so nothing was sent and the handle is retained"
         );
     }
     Ok(Admitted {
@@ -71,6 +75,19 @@ pub(super) struct Kill {
 pub(super) struct Remove {
     core_id: String,
     address: String,
+}
+
+impl Admitted {
+    /// A refusal on the creation record keeps why a live owner could not be verified, when the
+    /// owner record or its process could not be read, beside its own recovery instructions.
+    pub(super) fn explain(&self, error: anyhow::Error) -> anyhow::Error {
+        match &self.unverified {
+            Some(why) => error.context(format!(
+                "TAB could not verify a live owner for this session ({why})"
+            )),
+            None => error,
+        }
+    }
 }
 
 impl Kill {
@@ -133,7 +150,9 @@ pub(super) fn grant(
     match basis {
         Basis::Owned(recorded) => recorded.check(core, observed)?,
         Basis::Launch { launch, first } => launch.check_cleanup(first.observed(), observed)?,
-        Basis::Created { recorded, .. } => recorded.check_creation_record(core, observed)?,
+        Basis::Created { recorded, admitted } => recorded
+            .check_creation_record(core, observed)
+            .map_err(|error| admitted.explain(error))?,
     }
     let core_id = seen.core_id();
     match observed.state {

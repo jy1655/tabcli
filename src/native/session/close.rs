@@ -211,6 +211,22 @@ pub(in crate::native) fn record_terminal_teardown_intent(
         })
 }
 
+/// The owner record a teardown intent is validated against could not be read, decoded or
+/// found. Its message is the read's own.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug)]
+pub(in crate::native) struct TeardownOwnerUnestablished(String);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl std::fmt::Display for TeardownOwnerUnestablished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl std::error::Error for TeardownOwnerUnestablished {}
+
 // Teardown is independent of surface retention policy, including iTerm2. A record
 // claiming this intent kind must validate; it may never fall through to dead-owner
 // absence based on the surface alone.
@@ -230,7 +246,9 @@ pub(in crate::native) fn terminal_teardown_intent(
         return Ok(None);
     }
     let intent: TerminalCloseIntent = serde_json::from_value(value)?;
-    let owner: NativeSessionOwner = reader.owner()?;
+    let owner: NativeSessionOwner = reader
+        .owner()
+        .map_err(|error| anyhow::Error::new(TeardownOwnerUnestablished(format!("{error:#}"))))?;
     let teardown = intent.teardown.context("missing teardown intent")?;
     // A complete control record also needs both process groups, which the clauses comparing
     // them with the intent's group already require.

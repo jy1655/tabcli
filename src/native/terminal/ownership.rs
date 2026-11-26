@@ -419,7 +419,9 @@ impl SurfaceProbe {
                     Self::WindowsProcess | Self::Unprobed => OwnerRequirement::Met,
                 },
                 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-                ControlAttestation::Unknown(_) => OwnerRequirement::Uninspected,
+                ControlAttestation::Unknown(_) | ControlAttestation::Exited => {
+                    OwnerRequirement::Uninspected
+                }
                 ControlAttestation::NotRecorded => self.uncompared(),
             },
             // A Windows record without its process identity is attested PID-only.
