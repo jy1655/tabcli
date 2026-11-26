@@ -10,8 +10,9 @@
   in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
   Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
   session or terminal exists: an explicit `--terminal herdr` fails with that refusal, and an
-  automatic Herdr choice inside hc takes the OS's own terminal instead, without the caller
-  check (`session_start::admit_choice`). `surface_version_requirement` declares that this
+  automatic Herdr choice inside hc takes the OS's own terminal instead
+  (`session_start::admit_choice`). Its caller check has already run by then, once, before the
+  probe, as in 0.4.49; the fallback ignores its outcome. `surface_version_requirement` declares that this
   choice depends on the version (stable 0.169.0 or newer), so `doctor` decides it with the
   launch's own probe (`provider_installation::read_installed_version`). `prepare_launch`
   applies the same decision from the recorded
@@ -35,9 +36,10 @@
   `0.170.0+`, `0.170.0-`, `<0.169.0`, `codex/0.168.0`, `v0.168.0.1-rc.1` and `0.168.0.1--` do
   not read. With no such word, with two or more (the same version printed twice included), or
   with one that does not read, the text is not read for Herdr. Where the general provider
-  probe has read a version from the same text, an automatic choice then takes its fallback
-  and an explicit `--terminal herdr` is refused; text the general probe cannot parse
-  (`unknown`, `codex/0.168.0` alone) is refused there, before any surface is chosen. The rule
+  probe has accepted a supported version from the same text, an automatic choice then takes
+  its fallback and an explicit `--terminal herdr` is refused; text the general probe cannot
+  parse (`unknown`, `codex/0.168.0` alone) or refuses (`0.146.0+`, below TAB's 0.147.0
+  minimum) is refused there, before any surface is chosen. The rule
   refuses whenever more than one word could be the version, since a misread version could let
   a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can already have
   reported the request accepted when Codex refuses the option. Its accepted cost: a banner that
@@ -93,8 +95,10 @@
 
   Notes on the table. The Codex column says whether the Codex the text describes meets the
   floor (stable 0.169.0 or newer): `yes`, `no`, or `unknown` where the text does not show
-  Codex's own version. This build launches a row only when its one version-like word, read
-  alone, is a stable version at or above the floor; the test checks that the rows it launches
+  Codex's own version. This build launches a labelled row only when its `codex-cli` field is a
+  stable version at or above the floor, whatever other versions the text holds
+  (`plugin 0.160.0\ncodex-cli 0.170.0` launches from its field), and an unlabelled row only
+  when its one version-like word, read alone, is. The test checks that the rows it launches
   whose Codex is not shown to meet the floor are exactly `unknown (runtime 22.0.0)` and
   `Codex < 0.169.0`, the limits stated above. A `<` written onto the version is part of the
   word and no enclosing punctuation, so `Codex <0.169.0`, which 0.4.48 read as 0.169.0 and

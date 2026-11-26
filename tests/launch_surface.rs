@@ -1,7 +1,9 @@
 //! The Surface a launch starts on, through the public commands, the same on every OS. `ask`
-//! and `reopen` select it from the request and the caller's environment; the provider, with
-//! its probed version, then decides between Herdr and the OS's own choice, and only a launch
-//! that will use Herdr checks its caller, after the workspace, the source and the probe.
+//! and `reopen` select it from the request and the caller's environment and check the caller of
+//! an automatic Herdr choice there, before the workspace, the source and the probe, as in
+//! 0.4.49; the provider, with its probed version, then decides between Herdr and the OS's own
+//! choice, and a failed check refuses only a launch that will use Herdr (a Codex that takes the
+//! fallback ignores it).
 //! `doctor` reports that decision without the caller check. Most cases run the built binary as
 //! if inside a Herdr terminal (hc gives every program `HC_TERMINAL_ID` and
 //! `TERM_PROGRAM=ghostty`) whose core is absent, so a caller check fails; some run a provider

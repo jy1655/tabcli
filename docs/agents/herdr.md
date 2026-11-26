@@ -125,9 +125,17 @@
   automatic choice that ends on Herdr launches there only if its check passed, and is
   otherwise refused with the check's error; one that takes the fallback ignores the check.
   So every later step runs in 0.4.49's order, after the same refusals and clock reads: the
-  caller check ends by its own bound, not by the request's deadline; the version probe reads
-  the deadline before it starts; and nothing after it reads the deadline before the Session
-  exists, as in 0.4.49 (bounding every step by the deadline is a separate, later change).
+  caller check's calls to the core end by its own ten-second bound, not by the request's
+  deadline, while its endpoint discovery and its walk of parents are not bounded and can take
+  longer, as in 0.4.49; the version probe reads the deadline before it starts; and nothing
+  after it reads the deadline before the Session exists, as in 0.4.49 (bounding every step by
+  the deadline is a separate, later change). Two differences remain, both from the owner's
+  decision on the automatic choice: a Codex off Windows whose check failed goes on to the
+  workspace, the admission and its probe, and its version then refuses it with the check's
+  error or gives it the fallback, where 0.4.49 refused at the check; and an automatic reopen
+  inside hc on Windows is checked, where 0.4.49 chose the managed console without a check.
+  That added check can also change which of two truthful contention verdicts a concurrent
+  reopen gets, because the probes after it happen later.
   For `reopen`, the settlement of an interrupted launch failure of the source's last child
   (`retry_interrupted_launch_fence`) runs after the selection, the caller check and the
   lookup of the source directory, as in 0.4.49. The judgment of the source's marker, the

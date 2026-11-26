@@ -158,8 +158,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   (`CallerCheck`) goes with the selection. `resolve` decides that choice with the provider and
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
   explicit choice is refused; a Herdr choice whose check failed is refused. Every step after the
-  check therefore keeps 0.4.49's order and its refusals and clock reads (Current Herdr Surface
-  Boundary).
+  check therefore keeps 0.4.49's order and its clock reads, and its refusals except where the
+  owner's decision on the automatic choice moved one: a Codex whose check failed is refused
+  with that check's error only once its version is known, so a missing workspace is reported
+  first (Current Herdr Surface Boundary).
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option
