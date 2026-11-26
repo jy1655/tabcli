@@ -68,12 +68,45 @@ fn run_probed(
     deadline_ms: u64,
     answer: impl FnMut(u64) -> Result<terminal::LaunchSurface>,
 ) -> Run {
+    run_stepping(store, deadline_ms, answer, |_| {})
+}
+
+// A simulated clock whose every sleep first runs `step` with the time since the start: what
+// another process does while the wait sleeps.
+struct Stepping<F> {
+    start: Instant,
+    now: Rc<Cell<Instant>>,
+    sleeps: Vec<u64>,
+    step: F,
+}
+
+impl<F: FnMut(u64)> Clock for Stepping<F> {
+    fn now(&mut self) -> Instant {
+        self.now.get()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        (self.step)(ms(self.now.get() - self.start));
+        self.sleeps.push(ms(duration));
+        self.now.set(self.now.get() + duration);
+    }
+}
+
+/// `run_probed`, with `step` run at every sleep.
+fn run_stepping(
+    store: &Store,
+    deadline_ms: u64,
+    answer: impl FnMut(u64) -> Result<terminal::LaunchSurface>,
+    step: impl FnMut(u64),
+) -> Run {
     let token = turn::current_claim_token(store).unwrap().unwrap();
     let start = Instant::now();
     let now = Rc::new(Cell::new(start));
-    let mut clock = Simulated {
+    let mut clock = Stepping {
+        start,
         now: Rc::clone(&now),
         sleeps: Vec::new(),
+        step,
     };
     let mut presence = Probes {
         start,
@@ -773,6 +806,293 @@ fn a_refusal_keeps_the_claim_once_its_launch_budget_is_spent_on_a_held_lock() {
     let after = store.status().unwrap();
     assert_eq!((after.state, after.error), (before.state, before.error));
     assert!(claim_is(&store, &token));
+}
+
+// The bar for the early decisions: facts about this launch's own records, read under the
+// lifecycle lock at the moment of the decision. A receipt of another Claim is not this
+// launch's pending receipt, even with this launch's Claim at the path: the finished terminal
+// decides nothing, and the launch deadline settles the launch as before.
+#[test]
+fn a_receipt_of_another_claim_never_ends_the_wait_as_finished() {
+    let (_dir, store, token) = fixture();
+    let run = run_probed(&store, 2500, |at| {
+        if at == 1000 {
+            test_support::apply(&store, &[test_support::Change::ReceiptToken]);
+        }
+        finished()
+    });
+    let error = run.result.unwrap_err();
+    assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
+    assert_eq!(run.probes.len(), 2);
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert!(claim_is(&store, &token));
+}
+
+// A launch-host Record that cannot be read is no evidence that the launch is pending: the
+// finished terminal decides nothing, and when the Record becomes readable with a failure, the
+// ordinary poll names that failure.
+#[test]
+fn an_unreadable_host_record_defers_a_finished_terminal() {
+    let (_dir, store, token) = fixture();
+    host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
+    let path = store.directory().join(CoreRecord::LaunchHost.name());
+    let original = std::fs::read(&path).unwrap();
+    let run = run_probed(&store, 20_000, |at| {
+        if at == 1000 {
+            std::fs::write(&path, b"{").unwrap();
+        } else if at == 2000 {
+            assert_eq!(store.status().unwrap().state, SessionState::Launching);
+            std::fs::write(&path, &original).unwrap();
+            host::fail(
+                &store,
+                &token,
+                None,
+                host::Failure {
+                    reason: host::FailureReason::IdentityUnavailable,
+                    exit_code: None,
+                    signal: None,
+                },
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        finished()
+    });
+    let error = run.result.unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("terminal launch host failed"),
+        "{error:#}"
+    );
+    assert_eq!(Some(format!("{error:#}")), store.status().unwrap().error);
+    assert_eq!(run.probes.len(), 2);
+}
+
+// A host failure that the finished probe finds recorded is the ordinary poll's to publish:
+// the probe writes nothing. A reader that takes the lock right after the probe and keeps it
+// through the deadline then leaves the Claim retained, as without the probe.
+#[test]
+fn a_host_failure_seen_by_the_finished_probe_is_left_to_the_ordinary_poll() {
+    let (_dir, store, token) = fixture();
+    host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
+    let reader = LockReader::default();
+    let run = run_stepping(
+        &store,
+        2500,
+        |at| {
+            if at == 1000 {
+                host::fail(
+                    &store,
+                    &token,
+                    None,
+                    host::Failure {
+                        reason: host::FailureReason::IdentityUnavailable,
+                        exit_code: None,
+                        signal: None,
+                    },
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            finished()
+        },
+        |at| {
+            if at == 1000 && reader.0.borrow().is_none() {
+                reader.take(&store);
+            }
+        },
+    );
+    reader.release();
+    let error = run.result.unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "{LAUNCH_DEADLINE}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
+        )
+    );
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert!(claim_is(&store, &token));
+}
+
+// A probe that the core answers after the launch deadline decides nothing: the deadline path
+// settles the launch, as without the probe.
+#[test]
+fn a_finished_reply_after_the_deadline_is_left_to_the_deadline() {
+    struct LateReply(Rc<Cell<Instant>>);
+    impl SurfacePresence for LateReply {
+        fn present(&mut self, _: Duration) -> Result<terminal::LaunchSurface> {
+            self.0.set(self.0.get() + Duration::from_millis(600));
+            finished()
+        }
+    }
+    let (_dir, store, token) = fixture();
+    let start = Instant::now();
+    let now = Rc::new(Cell::new(start));
+    let mut clock = Simulated {
+        now: Rc::clone(&now),
+        sleeps: Vec::new(),
+    };
+    let error = wait_with(
+        &store,
+        &token,
+        start + Duration::from_millis(1500),
+        &mut clock,
+        &mut LateReply(now),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
+    assert!(error.downcast_ref::<TimedOut>().is_some());
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(LAUNCH_DEADLINE)
+    );
+}
+
+// A refusal whose lifecycle lock is freed only after the launch deadline never settles: the
+// budget is spent, and the held lock's outcome stands.
+#[test]
+fn a_refusal_never_settles_after_its_launch_budget() {
+    let (_dir, store, token) = fixture();
+    let lock = std::cell::RefCell::new(Some(store.lock().unwrap()));
+    let start = Instant::now();
+    let mut clock = Stepping {
+        start,
+        now: Rc::new(Cell::new(start)),
+        sleeps: Vec::new(),
+        // The third sleep ends at the deadline; the holder lets go before the launcher resumes.
+        step: |at| {
+            if at == 200 {
+                lock.borrow_mut().take();
+            }
+        },
+    };
+    let error = refused_before_surface_with(
+        &store,
+        &token,
+        anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x"),
+        "the Herdr launch host would refuse the session directory",
+        start + Duration::from_millis(250),
+        &mut clock,
+    );
+    assert_eq!(clock.sleeps, [100, 100, 50]);
+    assert!(
+        format!("{error:#}").contains("provider startup is in progress; the claim is retained"),
+        "{error:#}"
+    );
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert!(claim_is(&store, &token));
+}
+
+// The early decisions create no lock file and change no lock file's permissions before they
+// know the directory is this launch's: a replacement directory with another launch's records
+// and no lock file gets none, and one whose lock file another account may read keeps it so.
+#[test]
+fn the_early_decisions_take_only_an_existing_lock_file() {
+    let lock_file = |store: &Store| {
+        store
+            .directory()
+            .join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE)
+    };
+    let replace = |store: &Store, lock: bool| {
+        test_support::apply(
+            store,
+            &[
+                test_support::Change::ReceiptToken,
+                test_support::Change::ClaimOther,
+            ],
+        );
+        std::fs::remove_file(lock_file(store)).unwrap();
+        if lock {
+            std::fs::write(lock_file(store), b"").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(lock_file(store), std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+        }
+    };
+    let unchanged = |store: &Store, lock: bool| {
+        assert_eq!(lock_file(store).exists(), lock);
+        #[cfg(unix)]
+        if lock {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(lock_file(store))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+        let status = store.status().unwrap();
+        assert_eq!(
+            (status.state, status.error),
+            (SessionState::Launching, None)
+        );
+        assert!(claim_is(store, "successor"));
+    };
+    for lock in [false, true] {
+        // The finished terminal: the replacement as the probe returns, observed at the sleep
+        // right after its decision, before the next ordinary poll.
+        let (_dir, store, _) = fixture();
+        let observed = Cell::new(false);
+        let run = run_stepping(
+            &store,
+            1100,
+            |_| {
+                replace(&store, lock);
+                finished()
+            },
+            |at| {
+                if at == 1000 && !observed.get() {
+                    unchanged(&store, lock);
+                    observed.set(true);
+                }
+            },
+        );
+        assert!(observed.get(), "lock={lock}");
+        drop(run);
+
+        // The refusal: the replacement before it settles.
+        let (_dir, store, token) = fixture();
+        replace(&store, lock);
+        let start = Instant::now();
+        let mut clock = Simulated {
+            now: Rc::new(Cell::new(start)),
+            sleeps: Vec::new(),
+        };
+        let error = refused_before_surface_with(
+            &store,
+            &token,
+            anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x"),
+            "the Herdr launch host would refuse the session directory",
+            start + Duration::from_secs(20),
+            &mut clock,
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "the Herdr launch host would refuse the session directory /state/x",
+            "lock={lock}"
+        );
+        unchanged(&store, lock);
+    }
 }
 
 // The production surface observation reaches the terminal's presence check: a surface that

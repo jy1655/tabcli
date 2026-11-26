@@ -1304,6 +1304,49 @@ fn a_refusal_writes_nothing_to_another_launch_at_its_path() {
     );
 }
 
+// A refusal creates nothing in a directory that is not this launch's: a replacement with
+// another launch's records and no lifecycle lock file gets no lock file, and nothing is
+// written; the caller is still given the host's reason.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn a_refusal_creates_no_lock_file_in_a_replacement_directory() {
+    let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
+    let mut fixture = Fixture::new();
+    let prepared = refused_herdr_start(&mut fixture);
+    launch::launcher::open_failure_hook::set(|directory| {
+        launch::test_support::apply(
+            &Store::open_unchecked(directory),
+            &[
+                launch::test_support::Change::ReceiptToken,
+                launch::test_support::Change::ClaimOther,
+            ],
+        );
+        fs::remove_file(directory.join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE))
+            .unwrap();
+    });
+    let (error, _) = core.reached_by(|| run(&prepared, &FreshSource));
+    let text = format!("{error:#}");
+    assert_eq!(core.runs(), 0, "{text}");
+    let cause = herdr_refusal_cause(&prepared, &text);
+    assert!(!cause.contains("handoff"), "{cause}");
+    let directory = &prepared.created.directory;
+    assert!(
+        !directory
+            .join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE)
+            .exists()
+    );
+    let store = Store::open_unchecked(directory);
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some("successor")
+    );
+}
+
 // A Herdr start whose session directory any account would refuse fails with that refusal
 // even when no core answers: the facts that need no account are judged before the core is
 // reached, so the refusal is a known refusal before any Surface, not a core failure.
