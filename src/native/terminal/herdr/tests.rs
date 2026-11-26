@@ -452,6 +452,17 @@ fn config_socket_reads_only_a_string_setting() {
     );
 }
 
+// A configuration linked to the null device reads as an empty one, as hc reads it: no
+// `socket` setting, so the default socket is used.
+#[cfg(unix)]
+#[test]
+fn a_configuration_linked_to_the_null_device_is_empty() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    std::os::unix::fs::symlink("/dev/null", &config).unwrap();
+    assert_eq!(read_config_socket(&config).unwrap(), None);
+}
+
 #[test]
 fn replies_and_hello_are_validated_field_by_field() {
     assert_eq!(

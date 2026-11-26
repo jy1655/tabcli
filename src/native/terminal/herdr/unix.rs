@@ -57,7 +57,7 @@ impl Core for Installed {
         Ok(match parent {
             Some(0) => super::Parent::Root,
             Some(parent) => super::Parent::Process(parent),
-            None => super::Parent::Unknown(format!("process {pid} is no longer running")),
+            None => super::Parent::Unknown(format!("process {pid} is absent or invisible to TAB")),
         })
     }
 

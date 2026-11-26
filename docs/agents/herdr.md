@@ -120,19 +120,20 @@
   the choice is known to be Herdr. Where the adapter's answer does not depend on the version
   (Claude, Agy, Pi), that is before the workspace and the probe, as in 0.4.49 for `ask` and
   right after the source and its provider's reopen support for `reopen`; where it does (Codex
-  off Windows), after the probe, and only for a choice that ends on Herdr. The check is held
-  to the request's deadline: it does not start once the deadline has passed, it reads the
-  configuration only as a regular file (opened without waiting, so a FIFO is refused, not
-  waited on), its Unix connection waits for room or completion and every call waits for a
-  reply only until the deadline (the Windows pipe's busy wait was bounded already), the walk
-  of parents checks the clock between lookups, and a success after the deadline is not
-  accepted; a failure after it is reported as timed out. Not bounded: a single read of a
-  regular configuration file and a single lookup in the process table, both local. Nothing is
-  created after the deadline: `Resolved::create_with` reads the clock right before a Session
-  is created, and a reopen's reservation waits for the source's lock only until the deadline
-  and reads the clock again before the stale-marker release, the marker and the Session. The
-  write that follows a passing check is not interrupted if the deadline passes during it. The
-  caller's terminal must be live on the addressed
+  off Windows), after the probe, and only for a choice that ends on Herdr. The request's
+  deadline bounds exactly these steps: the caller check's calls to the core (`hello`,
+  `terminal.get`), each of which waits for a reply only until the deadline, a failure after it
+  being reported as timed out; the reservation of a reopen's source, which waits for the
+  source's lock only until the deadline and reads the clock again before it releases a stale
+  marker and before it writes the marker (`Reservation::claim_until`); and the creation of a
+  Session, which reads the clock right before the Session directory is allocated, after the
+  state root is prepared (`state_root::create_directory`). Nothing else is bounded by it, as
+  in 0.4.49: the caller check's own steps other than its calls to the core (endpoint
+  discovery, the connection, whose Windows wait for a free pipe instance alone ends by the
+  deadline, and the walk of parents), state-root preparation, and, once the
+  child exists, its provenance and the reservation's finalization, which waits for the
+  source's lock so that the child stays bound to its source. A write that starts before the
+  deadline is not interrupted. The caller's terminal must be live on the addressed
   core with this process among its program's descendants, or the launch is refused without
   opening another terminal. Up to 64 parent links are compared; only a chain that ends at a
   root (no parent, or init) proves the command is outside, while reaching that bound or a

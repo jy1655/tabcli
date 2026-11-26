@@ -3635,7 +3635,7 @@ fn start_source_fixture_on(root: &Path, terminal_kind: terminal::TerminalKind) -
 
 fn attempt_fixture(root: &Path) -> ReopenAttempt {
     start_source_fixture(root)
-        .create_with(|spec, consent| {
+        .create_with(|spec, consent, _| {
             let created = create_session_within(root, &[root.to_owned()], spec)?;
             session_start::record_consent(&created, consent)?;
             Ok(created)
@@ -4194,20 +4194,16 @@ fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
 }
 
 // A reopen whose source lock is held past the request's deadline reserves and creates
-// nothing: its wait for the lock ends at the deadline, and the clock is checked again before
-// the marker and before the Session are written.
+// nothing: its wait for the lock ends at the deadline, and the clock is read again before the
+// marker is written and before the Session directory is allocated.
 #[test]
 fn a_contended_reopen_creates_nothing_after_its_deadline() {
     use crate::native::failure_kind::{FailureKind, classify};
     let root = tempfile::tempdir().unwrap();
     let fixture = start_source_fixture(root.path());
-    let fixture = ResolvedReopen {
-        start: fixture
-            .start
-            .with_deadline(Instant::now() + Duration::from_millis(300)),
-        ..fixture
-    };
     let directory = fixture.source_directory.clone();
+    // The baseline before anyone holds the lock: Windows refuses to read a locked file.
+    let before = snapshot_directory(&directory);
     let (locked, wait) = std::sync::mpsc::channel();
     let holder = {
         let directory = directory.clone();
@@ -4218,10 +4214,17 @@ fn a_contended_reopen_creates_nothing_after_its_deadline() {
         })
     };
     wait.recv().unwrap();
-    let before = snapshot_directory(&directory);
+    // The deadline starts once the lock is held, so that it is the reservation's wait that
+    // meets it, however long the fixture took.
+    let fixture = ResolvedReopen {
+        start: fixture
+            .start
+            .with_deadline(Instant::now() + Duration::from_millis(300)),
+        ..fixture
+    };
     let started = Instant::now();
     let error = fixture
-        .create_with(|_, _| -> Result<CreatedSession> {
+        .create_with(|_, _, _| -> Result<CreatedSession> {
             panic!("nothing is created after the deadline")
         })
         .err()

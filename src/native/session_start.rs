@@ -70,11 +70,6 @@ impl Resolved {
         }
     }
 
-    // The request's deadline, which a source's own creation steps read again before writing.
-    pub(super) fn deadline(&self) -> Instant {
-        self.deadline
-    }
-
     // A fixture whose request ends at `deadline`.
     #[cfg(test)]
     pub(super) fn with_deadline(mut self, deadline: Instant) -> Self {
@@ -88,21 +83,19 @@ impl Resolved {
         &mut self.spec
     }
 
+    // `create` receives the request's deadline: `create_session` reads it right before the
+    // Session directory is allocated, and a reopen's reservation right before its marker is
+    // written, so that nothing is created after it.
     pub(super) fn create_with<T>(
         self,
-        create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<(CreatedSession, T)>,
+        create: impl FnOnce(
+            SessionSpec,
+            Option<&consent::Assessment>,
+            Instant,
+        ) -> Result<(CreatedSession, T)>,
     ) -> Result<(Prepared, T)> {
         let provider = self.spec.provider;
-        // A resolution that outlived the request's deadline (a slow caller check, consent
-        // read) creates nothing: no Session, consent record or reopen reservation. A source
-        // that waits for a lock before it writes (a reopen's reservation) reads the clock again
-        // after that wait; a write that starts before the deadline is not interrupted.
-        if Instant::now() >= self.deadline {
-            bail!(TimedOut::new(
-                "the request's deadline passed before its Session was created; nothing was created"
-            ));
-        }
-        let (created, source) = create(self.spec, self.consent.as_ref())?;
+        let (created, source) = create(self.spec, self.consent.as_ref(), self.deadline)?;
         Ok((
             Prepared {
                 created,
@@ -263,11 +256,11 @@ pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<R
 // workspace and the probe, as early as in 0.4.49 for `ask` and right after the source and its
 // provider's reopen support for `reopen`, whose resolution starts here. Where it depends on
 // the version, it is after the probe, and only for a choice that then ends on Herdr. A
-// fallback and an explicit choice are never checked against the caller. The check is held
-// to the request's deadline step by step (`herdr::verify_caller` lists what is bounded and
-// what is not), and a check that fails after it is reported as timed out. What the
-// resolution reads besides (workspace, consent stores) is local and not bounded; creation
-// reads the clock again (`Resolved::create_with`).
+// fallback and an explicit choice are never checked against the caller. The request's
+// deadline bounds the check's calls to the core only, and a check that fails after it is
+// reported as timed out; the check's other steps and what the resolution reads besides are
+// not bounded by it, as in 0.4.49. Creation reads it again (`state_root::create_directory`,
+// `Reservation::claim_until`); docs/agents/herdr.md states the whole guarantee.
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
     deadline: Instant,
@@ -520,9 +513,10 @@ pub(super) fn fresh_resolution(
 pub(super) fn create_with_consent(
     mut spec: SessionSpec,
     assessment: Option<&consent::Assessment>,
+    deadline: Instant,
 ) -> Result<CreatedSession> {
     spec.prompt = delegation_prompt(&spec.prompt);
-    let created = create_session(spec)?;
+    let created = create_session(spec, deadline)?;
     record_consent(&created, assessment)?;
     Ok(created)
 }
@@ -832,8 +826,8 @@ fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
     };
     let start = Start::new(options)?;
     let resolved = resolve_fresh(&request, start.deadline())?;
-    let (prepared, ()) = resolved.create_with(|spec, consent| {
-        create_with_consent(spec, consent).map(|created| (created, ()))
+    let (prepared, ()) = resolved.create_with(|spec, consent, deadline| {
+        create_with_consent(spec, consent, deadline).map(|created| (created, ()))
     })?;
     start.run(&prepared, &FreshSource, report)
 }

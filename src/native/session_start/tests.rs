@@ -1,8 +1,8 @@
 use super::*;
-use crate::native::create_session_within;
 use crate::native::query;
 use crate::native::session::test_support::STATUS_LOCK_FILE;
 use crate::native::session::{CoreRecord, close};
+use crate::native::{create_session_until, create_session_within};
 use std::fs;
 
 struct Fixture {
@@ -66,7 +66,7 @@ impl Fixture {
                 .map(|requested| consent::assess(self.root.path(), requested))
                 .transpose()?,
         );
-        let (prepared, ()) = resolved.create_with(|spec, consent| {
+        let (prepared, ()) = resolved.create_with(|spec, consent, _| {
             let created =
                 create_session_within(self.root.path(), &[self.root.path().to_owned()], spec)?;
             // Stop before any terminal or provider could be launched.
@@ -1523,7 +1523,8 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         "{error:#}"
     );
 
-    // A resolution that outlives the request's deadline creates nothing.
+    // A resolution that outlives the request's deadline creates no Session: the clock is read
+    // right before the Session directory is allocated.
     let ask = request(FirstPartyCli::Pi, &project, None);
     let resolved = resolve_with(
         fresh_resolution(
@@ -1538,8 +1539,11 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
     .unwrap();
     std::thread::sleep(Duration::from_millis(100));
     let error = resolved
-        .create_with(|_, _| -> Result<(CreatedSession, ())> {
-            panic!("nothing is created after the deadline")
+        .create_with(|spec, consent, deadline| {
+            let created =
+                create_session_until(&root, std::slice::from_ref(&root), spec, Some(deadline))?;
+            record_consent(&created, consent)?;
+            Ok((created, ()))
         })
         .err()
         .expect("the deadline refuses creation");
@@ -1708,7 +1712,7 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
     };
     assert_eq!(resolved.initial_transport.facts().name, expected_name);
     let (prepared, ()) = resolved
-        .create_with(|spec, consent| {
+        .create_with(|spec, consent, _| {
             let created = create_session_within(&root, std::slice::from_ref(&root), spec)?;
             record_consent(&created, consent)?;
             Ok((created, ()))

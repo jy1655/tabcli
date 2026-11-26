@@ -206,11 +206,20 @@ pub(in crate::native) fn validate_hook_directory(directory: &Path) -> Result<()>
     require_valid_session_id(id)
 }
 
+// `deadline`, the request's, is read after the state root is prepared and right before the
+// Session directory is allocated: once it has passed, no Session is created. Preparing the
+// state root (its ancestry sync included) is not bounded by it.
 pub(in crate::native) fn create_directory(
     root: &Path,
     durable_directories: &[PathBuf],
+    deadline: Option<std::time::Instant>,
 ) -> Result<(PathBuf, String, Option<String>)> {
     let ancestry_error = create_state_root(root, durable_directories)?;
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        bail!(crate::native::failure_kind::TimedOut::new(
+            "the request's deadline passed before its Session was created; nothing was created"
+        ));
+    }
     let temp = tempfile::Builder::new()
         .prefix("session-")
         .tempdir_in(root)?;

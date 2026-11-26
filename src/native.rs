@@ -483,19 +483,38 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
     }
 }
 
-fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
-    create_session_within(&Reader::state_root()?, &Reader::home_directories(), spec)
+// A Session for a request that ends at `deadline`: nothing is created once it has passed.
+fn create_session(spec: SessionSpec, deadline: std::time::Instant) -> Result<CreatedSession> {
+    create_session_until(
+        &Reader::state_root()?,
+        &Reader::home_directories(),
+        spec,
+        Some(deadline),
+    )
 }
 
-/// [`create_session`] with the directories whose own entries are taken as durable
-/// (the user's home directory in production), so the state-root ancestry walk stops
-/// there instead of at the filesystem root.
+/// [`create_session`] without a request deadline, for tests of creation itself.
+#[cfg(test)]
 fn create_session_within(
     root: &Path,
     durable_directories: &[PathBuf],
     spec: SessionSpec,
 ) -> Result<CreatedSession> {
-    let (directory, id, ancestry_error) = Store::create_directory(root, durable_directories)?;
+    create_session_until(root, durable_directories, spec, None)
+}
+
+/// [`create_session`] with the directories whose own entries are taken as durable
+/// (the user's home directory in production), so the state-root ancestry walk stops
+/// there instead of at the filesystem root. `deadline` is read right before the Session
+/// directory is allocated (`Store::create_directory`).
+fn create_session_until(
+    root: &Path,
+    durable_directories: &[PathBuf],
+    spec: SessionSpec,
+    deadline: Option<std::time::Instant>,
+) -> Result<CreatedSession> {
+    let (directory, id, ancestry_error) =
+        Store::create_directory(root, durable_directories, deadline)?;
     let manifest = SessionManifest {
         schema: SESSION_SCHEMA,
         id: id.clone(),

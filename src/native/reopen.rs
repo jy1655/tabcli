@@ -338,16 +338,19 @@ impl ResolvedReopen {
 
     fn create_with(
         self,
-        create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<CreatedSession>,
+        create: impl FnOnce(
+            SessionSpec,
+            Option<&consent::Assessment>,
+            Instant,
+        ) -> Result<CreatedSession>,
     ) -> Result<ReopenAttempt> {
-        let deadline = self.start.deadline();
-        let (prepared, resumed_from) = self.start.create_with(|spec, consent| {
+        let (prepared, resumed_from) = self.start.create_with(|spec, consent, deadline| {
             create_reopened_session(
                 &self.source_directory,
                 &self.source_id,
                 &self.source,
                 deadline,
-                || create(spec, consent),
+                || create(spec, consent, deadline),
             )
         })?;
         Ok(ReopenAttempt {
@@ -446,9 +449,11 @@ fn fail_reopen_launch(
     reopen_refusal(gate, detail)
 }
 
-// Nothing is reserved or created once the request's `deadline` has passed: the reservation
-// reads the clock after its lock wait and before its writes, and the Session's creation reads
-// it again after the reservation (an unfinalized reservation releases its marker).
+// Nothing is reserved once the request's `deadline` has passed (`Reservation::claim_until`),
+// and `create` allocates no Session directory after it (`create_session`); an unfinalized
+// reservation releases its marker. Once the child exists, its provenance and the
+// reservation's finalization are written even if the deadline passes meanwhile (finalization
+// waits for the source's lock without a bound), so the child stays bound to its source.
 fn create_reopened_session(
     source_directory: &Path,
     source_id: &str,
@@ -462,12 +467,6 @@ fn create_reopened_session(
         &source.provider_session_id,
         deadline,
     )?;
-    if Instant::now() >= deadline {
-        drop(marker);
-        bail!(crate::native::failure_kind::TimedOut::new(format!(
-            "the request's deadline passed before the reopen of session {source_id} created its Session; nothing was created"
-        )));
-    }
     let created = create()?;
     let resumed_from = ResumedFrom {
         session: source_id.to_owned(),

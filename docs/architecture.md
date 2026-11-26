@@ -157,9 +157,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
   explicit choice is refused. An automatic choice gets the caller check
   (`terminal::admit_selection`) once, as soon as it is known to be Herdr, by the rule stated at
-  `resolve_with`, within the request's deadline as Current Herdr Surface Boundary states it;
-  `create_with`, and for a reopen the reservation and the Session's creation, read the clock
-  again right before they write, so nothing is created after that deadline.
+  `resolve_with`. Current Herdr Surface Boundary states exactly which steps the request's
+  deadline bounds: the caller check's calls to the core, a reopen's reservation, and the
+  allocation of the Session directory.
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option

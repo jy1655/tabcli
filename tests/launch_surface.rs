@@ -865,63 +865,6 @@ fn the_caller_check_ends_at_the_request_deadline() {
     );
 }
 
-// The Herdr configuration is read only as a regular file: one that is a FIFO (or anything
-// else) is refused at once instead of waiting for a writer past the request's deadline.
-#[cfg(unix)]
-#[test]
-fn a_herdr_configuration_that_is_not_a_file_refuses_without_waiting() {
-    let fixture = Fixture::new();
-    let config = fixture.base.join("config");
-    std::fs::create_dir_all(config.join("herdr-core")).unwrap();
-    let fifo = config.join("herdr-core").join("config.toml");
-    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    let pi = fixture.printing("pi", "1.5.0");
-    let homes = fixture.homes();
-    let mut environment: Vec<(&str, &OsStr)> = homes
-        .iter()
-        .map(|(name, path)| (*name, path.as_os_str()))
-        .collect();
-    environment.push(("PATH", pi.as_os_str()));
-    environment.push(("XDG_CONFIG_HOME", config.as_os_str()));
-    let project = fixture.base.join("project");
-    std::fs::create_dir_all(&project).unwrap();
-    let mut command = fixture.command_from(
-        &fixture.base,
-        &[
-            "ask",
-            "pi",
-            "--workspace",
-            project.to_str().unwrap(),
-            "--prompt",
-            "must not be delivered",
-            "--json",
-            "--timeout-secs",
-            "1",
-        ],
-        Caller::Herdr,
-        &environment,
-    );
-    command
-        .env_remove("HC_SOCKET")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let started = std::time::Instant::now();
-    let mut child = command.spawn().unwrap();
-    while child.try_wait().unwrap().is_none() {
-        if started.elapsed() > std::time::Duration::from_secs(6) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("ask still waited for the Herdr configuration after 6 s");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let reply = refusal(child.wait_with_output().unwrap());
-    assert!(error(&reply).contains("is not a regular file"), "{reply}");
-    assert!(error(&reply).ends_with(CALLER_REFUSAL), "{reply}");
-    assert!(!fixture.state_root().exists());
-}
-
 // The probe that decides doctor's terminal row runs the launch's command under doctor's
 // diagnostic limits: an output past the cap decides nothing, and a process it started does
 // not outlive it.

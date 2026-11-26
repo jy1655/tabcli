@@ -508,8 +508,9 @@ impl Store {
     pub(in crate::native) fn create_directory(
         root: &Path,
         durable: &[PathBuf],
+        deadline: Option<std::time::Instant>,
     ) -> Result<(PathBuf, String, Option<String>)> {
-        create_directory(root, durable)
+        create_directory(root, durable, deadline)
     }
     pub(in crate::native) fn create_state_root(
         root: &Path,
