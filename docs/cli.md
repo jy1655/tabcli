@@ -184,7 +184,9 @@ the Windows console's host makes no such check). A directory the host would refu
 start at once with the host's reason, recorded as `terminal launch failed: ...; no surface
 handle was recorded and no prompt was sent`; the failed session can be closed and pruned like
 any other. A refusal only the host can know, such as a directory changed after TAB's check, is
-written to the launch log by the host, and the start ends at the launch deadline. A workspace,
+written to the launch log by the Herdr, tmux, iTerm2 and WezTerm hosts (the Terminal.app,
+Ghostty and Warp hosts write nothing into a directory they refuse), and the start ends at the
+launch deadline. A workspace,
 state directory or TAB executable path that is not Unicode text is refused before the launch,
 because the launch carries these paths as text.
 

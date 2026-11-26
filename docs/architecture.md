@@ -290,8 +290,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   connection that sends `terminal.run`, for the core's account (`refuse_before_core_launch`).
   A directory the host would refuse fails at once with the host's reason; the launcher settles
   that `RefusedDirectory` only for its own Claim, only through a real directory, after waiting
-  for the lifecycle lock. A refusal only the host can know goes to the launch log on every
-  platform (`run_logged_bound_host`), only into a real directory. It owns the
+  for the lifecycle lock. A refusal only the host can know goes to the launch log from the
+  Herdr and tmux hosts and the macOS capture host on every platform (`run_logged_bound_host`),
+  only into a real directory; the tty-bound hosts, Ghostty and Warp write nothing into a
+  directory they refuse. It owns the
   registered launch-host dispatch, the shared binding wait, startup input flush and refusal
   log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
   before flushing input. The Windows Terminal tab host uses its own offer protocol.

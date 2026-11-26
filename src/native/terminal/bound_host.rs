@@ -69,7 +69,12 @@ pub(in crate::native::terminal) fn run_tty_bound_host<I>(
     bind: impl FnOnce(&Path, &str, &I) -> Result<()>,
     release_message: Option<fn(&I) -> String>,
 ) -> Result<()> {
-    run_logged_bound_host(directory, kind, |id| {
+    // These hosts write nothing into a directory they refuse, which another account could
+    // have prepared; only the outcome after admission reaches their log policy.
+    let spec = BoundHostSpec {
+        name: kind.display_name(),
+    };
+    run_bound_host(directory, &spec, |id| {
         let outcome = (|| {
             let identity = identity()?;
             bind(directory, id, &identity)?;
@@ -127,7 +132,8 @@ pub(super) fn while_capture_eligible<T>(
     act()
 }
 
-// The Ghostty and Warp hosts, which report their own refusals.
+// The hosts that write nothing into a directory they refuse: the tty-bound hosts
+// (`run_tty_bound_host`), Ghostty and Warp.
 #[cfg(any(target_os = "macos", test))]
 pub(super) fn run_bound_host<T>(
     directory: &Path,
@@ -137,11 +143,11 @@ pub(super) fn run_bound_host<T>(
     run(admit(directory, spec)?)
 }
 
-/// `run_bound_host` for a launch host whose admission refusal goes to the launch log, on
-/// every platform: the Linux and Windows handoffs, the macOS capture host and the tty-bound
-/// hosts. The line is a diagnostic, never a launch Record. It is written only into a real
-/// directory at an absolute path: a link or anything else at that path can name another
-/// session, and a refusal never writes through what it refused.
+/// `run_bound_host` for a launch host whose admission refusal goes to the launch log, the same
+/// on every platform: the Linux and Windows handoffs (Herdr, tmux) and the macOS capture host
+/// (Herdr, iTerm2, WezTerm). The line is a diagnostic, never a launch Record. It is written
+/// only into a real directory at an absolute path: a link or anything else at that path can
+/// name another session, and a refusal never writes through what it refused.
 pub(super) fn run_logged_bound_host<T>(
     directory: &Path,
     kind: TerminalKind,

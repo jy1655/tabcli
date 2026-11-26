@@ -542,12 +542,13 @@ fn the_elevation_advice_names_the_observed_case() {
     }
 }
 
-// A refusal only the host can know is in the launch log on every OS: the macOS hosts log
-// their admission refusal as the Linux and Windows hosts do. The line is a diagnostic, not a
-// launch Record.
+// A refusal only the host can know is in the launch log on every OS: the macOS capture host
+// (Herdr, and the iTerm2 and WezTerm launch form) logs its admission refusal as the Linux
+// and Windows hosts do. The line is a diagnostic, not a launch Record. The tty-bound hosts
+// keep their own rule (f2996e9): nothing is written into a directory they refuse.
 #[cfg(target_os = "macos")]
 #[test]
-fn the_macos_hosts_log_their_admission_refusal() {
+fn the_macos_capture_host_logs_its_admission_refusal() {
     let temp = tempfile::tempdir().unwrap();
     for kind in [
         TerminalKind::Herdr,
@@ -574,7 +575,7 @@ fn the_macos_hosts_log_their_admission_refusal() {
     let directory = temp.path().join("session-terminal");
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
-    let error = run_tty_bound_host(
+    run_tty_bound_host(
         &directory,
         TerminalKind::AppleTerminal,
         || -> Result<()> { panic!("admission refused") },
@@ -582,11 +583,7 @@ fn the_macos_hosts_log_their_admission_refusal() {
         None,
     )
     .unwrap_err();
-    let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
-    assert!(
-        log.ends_with(&format!(" terminal_host_refused: {error:#}\n")),
-        "{log}"
-    );
+    assert!(!directory.join(launch::LOG).exists());
 }
 
 // A host refuses a link at its session directory's path and writes nothing through it: the
