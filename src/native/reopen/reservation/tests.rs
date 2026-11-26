@@ -4452,12 +4452,12 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
                 ),
                 Instant::now() + Duration::from_secs(30),
             );
-            // The holder has already let go if the provider was probed or the watchdog expired.
+            // The holder may already have exited, so a failed send is harmless.
             let _ = release.send(());
             let expired = holder.join().unwrap();
             assert!(
                 !expired,
-                "the recovery blocked before probing: the reopen still waited for the child's lock after {WATCHDOG:?}, when the test's watchdog released it; it then returned {}",
+                "the test's watchdog released the child's lock after {WATCHDOG:?}, before the holder saw either the probe marker or the reopen-return signal; the reopen then returned {}",
                 match &outcome {
                     Ok(_) => "a resolution".to_owned(),
                     Err(error) => format!("{error:#}"),
