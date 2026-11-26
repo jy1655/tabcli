@@ -715,9 +715,9 @@ const timer = setInterval(() => {
     let deadline = started + Duration::from_secs(60);
     let observed_directory = directory.clone();
     let observer = thread::spawn(move || {
-        // When the wrapper's and Node's start records appeared, so that a missed deadline
-        // names the slow stage: the provider command and its wrapper, Node's start, or what
-        // Node did after it started.
+        // When this observer first saw the wrapper's and Node's start records. If the envelope
+        // is still missing at the deadline, the failure reports both. A sender that runs out
+        // of time after the envelope appeared reports its own error alone.
         let (mut wrapper_seen, mut node_seen) = (None, None);
         while !observed_directory.join("messenger-envelope.ready").exists() {
             for (seen, record) in [
