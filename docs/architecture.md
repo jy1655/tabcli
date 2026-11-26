@@ -264,7 +264,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   record gate and `reopen`'s source check refuse such a Session with the same refusal: the
   kind's when the handle names a kind this OS does not run, otherwise `a session recorded on
   <OS> is not available on <this OS>`. Guarded input refuses a kind this OS does not run
-  before the macOS and Linux claim check. What the Records alone settle still settles: a
+  before the macOS and Linux claim check. Facts that the Records establish the same way on
+  every OS answer before this refusal: a closed session is refused as closed, and a handle
+  bound to another session as unbound (`judgment::ActiveHandle`, read by `screen`, doctor
+  and the capabilities), so the same Records get the same answer on every OS. What the
+  Records alone settle still settles: a
   close that a tombstone or a closed status already finished, and a Session with no handle.
   An Owner record that names no identity (a legacy PID-only record) is judged by its handle
   at the surface entry points only; Repair still attests it. The created-host close evidence

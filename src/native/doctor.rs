@@ -1323,8 +1323,14 @@ mod attestation_tests {
                 json!(["unknown", "terminal_record_unreadable"]),
                 Value::Null,
             ),
+            // The binding, the same on every OS, is judged before this OS's support.
             (
                 active(false, false, false),
+                json!(["unknown", "terminal_binding_unverified"]),
+                json!({"terminal": "warp"}),
+            ),
+            (
+                active(false, true, false),
                 json!(["unavailable", "terminal_unsupported"]),
                 json!({"terminal": "warp"}),
             ),
