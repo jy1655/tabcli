@@ -138,71 +138,65 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
         [] => return unlabelled_codex_version(output),
         _ => bail!("found the `{LABEL}` label more than once in {output:?}"),
     };
-    Version::parse(field.strip_prefix('v').unwrap_or(field))
+    field_version(field)
         .with_context(|| format!("Codex version {field:?} is not a semantic version"))
 }
 
-// The Herdr gate's reading of text without the label, one word or more (owner's decisions
-// 4B and B2, 2026-11-26), and the one place of that rule. Ambiguity is judged by a word's
-// shape, never by whether it parses, so that a malformed word cannot leave another program's
-// version as the only one:
+// The grammar of a version field: one optional leading `v`, then SemVer 2.0.0, read whole.
+fn field_version(field: &str) -> std::result::Result<Version, semver::Error> {
+    Version::parse(field.strip_prefix('v').unwrap_or(field))
+}
+
+// The Herdr gate's reading of text without the label (owner's decisions 4B and B2, 2026-11-26:
+// read it only when exactly one version-like word is present), and the one place of that rule.
+// The text is split on whitespace, and a word counts as version-like when it contains three
+// dot-separated numbers anywhere in it; no word is exempt:
 //
-//   candidate = a word that contains digits "." digits "." digits, unless the word, once its
-//               surrounding punctuation is removed, is nothing but four or more numbers joined
-//               by single dots, optionally followed by ":" and a port (an IPv4 address, a
-//               four-part build number)
-//   reading   = the candidate's rest, after its leading non-alphanumeric characters and one
-//               optional `v`, less its trailing characters that cannot end a version (anything
-//               but a letter, a digit or `-`), read as SemVer 2.0.0; none when it is not
+//   exactly one such word -> without its enclosing punctuation (opening brackets and quotes
+//                            before it; closing brackets, quotes and . , ; : ! ? after it), it
+//                            must read whole as a version field does (`field_version`)
+//   none, or two or more  -> the text is not read
 //
-// The text names a version only when it has exactly one candidate and that candidate has a
-// reading: `OpenAI Codex (v0.170.0)`, `(0.170.0)`, `0.170.0+` and `Codex 0.170.0.` are
-// 0.170.0, and `0.170.0--` and `0.168.0-rc-.` keep their prerelease. No candidate, a candidate
-// without a reading (`0.170.0-`, `v0.168.0.1-rc.1`, `codex/0.168.0`), and two or more
-// candidates are refused, whether or not the others would parse (`0.168.0- runtime 22.0.0`,
-// `node v22.0.0` before a banner, the same version printed twice): another program's version
-// can come first, and a misread version
-// could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
-// already have reported the request accepted. docs/agents/codex.md holds the table of texts
-// that `pending_herdr_launches_across_the_wrapper_handoff` checks against this reading.
+// `OpenAI Codex (v0.170.0)`, `(0.170.0)`, `Codex 0.170.0.` and `"0.170.0",` are 0.170.0, and
+// `0.170.0--` and `0.168.0-rc-.` keep their prerelease. `0.170.0+`, `0.170.0-`, `<0.169.0`,
+// `codex/0.168.0`, `v0.168.0.1-rc.1` and `0.168.0.1--` do not read. A banner that also shows an
+// address, a URL with a numeric host, a four-part build number or another program's version,
+// or the same version twice, has two such words and is not read: the rule errs toward
+// refusal, since a misread version could let a Codex that lacks `--no-daemon` start on Herdr,
+// where a detached `ask` can already have reported the request accepted. A sole such word is
+// read whatever program it names. docs/agents/codex.md holds the table of texts that
+// `pending_herdr_launches_across_the_wrapper_handoff` checks against this reading.
 fn unlabelled_codex_version(output: &str) -> Result<Version> {
-    let candidates = output
+    let words = output
         .split_whitespace()
-        .filter_map(|word| version_candidate(word).map(|rest| (word, rest)))
+        .filter(|word| version_like(word))
         .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [(word, rest)] => candidate_reading(rest).with_context(|| {
-            format!(
-                "found no `{HERDR_VERSION_LABEL}` label, and its one version {word:?} is not a semantic version"
-            )
-        }),
+    match words.as_slice() {
+        [word] => {
+            let inner = word
+                .trim_start_matches(['(', '[', '{', '"', '\'', '`'])
+                .trim_end_matches([')', ']', '}', '"', '\'', '`', '.', ',', ';', ':', '!', '?']);
+            field_version(inner).ok().with_context(|| {
+                format!(
+                    "found no `{HERDR_VERSION_LABEL}` label, and its one version {word:?} is not a semantic version"
+                )
+            })
+        }
         [] => bail!("found no `{HERDR_VERSION_LABEL}` label and no version in {output:?}"),
         _ => bail!(
             "found no `{HERDR_VERSION_LABEL}` label and {} versions ({}) in {output:?}; TAB does not guess which one is Codex's",
-            candidates.len(),
-            candidates
+            words.len(),
+            words
                 .iter()
-                .map(|(word, _)| format!("{word:?}"))
+                .map(|word| format!("{word:?}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-// A candidate word, and its rest after its leading non-alphanumeric characters and one
-// optional `v`: a word that contains three numbers joined by single dots, unless the word,
-// once its surrounding punctuation is removed, is nothing but four or more such numbers,
-// optionally followed by a colon and a port (an IPv4 address, a four-part build number).
-fn version_candidate(word: &str) -> Option<&str> {
-    if !contains_three_numbers(word) || plain_numbers(word) {
-        return None;
-    }
-    let rest = word.trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
-    Some(rest.strip_prefix('v').unwrap_or(rest))
-}
-
-// Whether `word` holds digits "." digits "." digits anywhere; one pass.
-fn contains_three_numbers(word: &str) -> bool {
+// Whether `word` contains digits "." digits "." digits anywhere; one pass.
+fn version_like(word: &str) -> bool {
     let mut numbers = 0;
     let mut in_number = false;
     let mut after_dot = false;
@@ -226,29 +220,6 @@ fn contains_three_numbers(word: &str) -> bool {
         }
     }
     false
-}
-
-// Whether `word`, its surrounding punctuation removed, is four or more numbers joined by
-// single dots, optionally followed by a colon and a port, and nothing else.
-fn plain_numbers(word: &str) -> bool {
-    let trimmed = word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
-    let number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    let (numbers, port) = match trimmed.split_once(':') {
-        Some((numbers, port)) => (numbers, Some(port)),
-        None => (trimmed, None),
-    };
-    port.is_none_or(number) && numbers.split('.').count() >= 4 && numbers.split('.').all(number)
-}
-
-// A candidate's version: its trailing characters that cannot end a version (anything but a
-// letter, a digit or `-`) are removed once, and the rest is read as SemVer once. Every SemVer
-// ends with a letter, a digit or `-`, so removing them one at a time and retrying would read
-// no other version.
-fn candidate_reading(rest: &str) -> Option<Version> {
-    let kept = rest.trim_end_matches(|character: char| {
-        !(character.is_ascii_alphanumeric() || character == '-')
-    });
-    Version::parse(kept).ok()
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.

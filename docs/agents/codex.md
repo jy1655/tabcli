@@ -24,26 +24,25 @@
   before the label (a warning, a timestamp, another program's version) and after the field
   are never read as the version and are only scanned for a second label, so `0.170.0--` is a
   prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
-  refused. Without a label (`unlabelled_codex_version`, the one place of that rule; owner's
-  decisions 4B and B2, 2026-11-26), ambiguity is judged by a word's shape, not by whether it
-  parses. A candidate is a word that contains digits.digits.digits, unless the word, once its
-  surrounding punctuation is removed, is nothing but four or more dot-separated numbers,
-  optionally followed by a colon and a port (an IPv4 address, a four-part build number). The
-  text names a version only when it has exactly one candidate, whether or not the others would
-  parse, and that candidate has a reading: its rest after its leading punctuation and one
-  optional `v`, less its trailing characters that cannot end a version (anything but a letter,
-  a digit or `-`), read as SemVer. A version inside a word (`codex/0.168.0`) and a four-part
-  word with a `v`, a prerelease or a build (`v0.168.0.1-rc.1`) are candidates without a
-  reading. A valid prerelease or build stays:
-  `0.170.0--` and `0.168.0-rc-.` are prereleases, `OpenAI Codex (v0.170.0)`, `(0.170.0)`,
-  `0.170.0+` and `Codex 0.170.0.` are 0.170.0. No candidate, a candidate without a reading
-  (`0.170.0-`), and two or more candidates are refused: another program's version can come
-  first (`node v22.0.0` before a banner, `0.168.0- runtime 22.0.0`), and a misread version
-  could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
-  already have reported the request accepted when Codex refuses the option. The same version
-  printed twice is two candidates. A sole candidate is read whatever program it names
-  (`unknown (runtime 22.0.0)` is 22.0.0). A second label and a label without a field on its
-  line are refused.
+  refused. Without a label (`unlabelled_codex_version`, the one place of that rule), the text
+  is read only when exactly one version-like word is present (owner's decisions 4B and B2,
+  2026-11-26). The text is split on whitespace, and a word counts when it contains three
+  dot-separated numbers anywhere in it; no word is exempt. With exactly one such word, its
+  enclosing punctuation is removed (opening brackets and quotes before it; closing brackets,
+  quotes and `.`, `,`, `;`, `:`, `!`, `?` after it), and the rest must read whole as the
+  labelled field does: one optional `v`, then SemVer. `OpenAI Codex (v0.170.0)`, `(0.170.0)`
+  and `Codex 0.170.0.` are 0.170.0, `0.170.0--` and `0.168.0-rc-.` are prereleases, and
+  `0.170.0+`, `0.170.0-`, `<0.169.0`, `codex/0.168.0`, `v0.168.0.1-rc.1` and `0.168.0.1--` do
+  not read. With no such word, with two or more (the same version printed twice included), or
+  with one that does not read, the text is not read: an automatic choice takes its fallback
+  and an explicit `--terminal herdr` is refused. The rule errs toward refusal, since a misread
+  version could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
+  already have reported the request accepted when Codex refuses the option. Its accepted cost:
+  a banner that also shows an address, a URL with a numeric host, a four-part build number or
+  another program's version is not read, including banners 0.4.48 admitted such as
+  `OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)`. A sole version-like word is read whatever
+  program it names (`unknown (runtime 22.0.0)` is 22.0.0): the rule cannot tell whose version
+  a lone word is. A second label and a label without a field on its line are refused.
   The wrapper reads the recorded version by the same rule, so a pending launch that another
   release's binary starts (the executable at its path replaced in between) can be refused
   there, after its Session and terminal exist. Do not replace the binary while a Herdr launch
@@ -52,43 +51,46 @@
   0.4.48 and 0.4.49 readers and this build's (`\n` is a line break):
 
   <!-- herdr-version-handoff -->
-  | `--version` text | 0.4.48 | 0.4.49 | this build |
-  | --- | --- | --- | --- |
-  | `codex-cli 0.170.0` | launches | launches | launches |
-  | `codex-cli 0.168.0` | refuses | refuses | refuses |
-  | `codex-cli 0.170.0-alpha.1` | refuses | refuses | refuses |
-  | `0.170.0` | launches | launches | launches |
-  | `OpenAI Codex (v0.170.0)` | launches | refuses | launches |
-  | `(0.170.0)` | launches | refuses | launches |
-  | `0.170.0+` | launches | refuses | launches |
-  | `codex 0.170.0` | launches | refuses | launches |
-  | `unknown (runtime 22.0.0)` | launches | refuses | launches |
-  | `plugin 0.160.0\ncodex-cli 0.170.0` | refuses | launches | launches |
-  | `codex-cli 0.170.0+` | launches | refuses | refuses |
-  | `node v22.0.0\ncodex-cli 0.168.0` | launches | refuses | refuses |
-  | `node v22.0.0\nOpenAI Codex (v0.170.0)` | launches | refuses | refuses |
-  | `codex 0.170.0 (v0.170.0)` | launches | refuses | refuses |
-  | `0.170.0-01 (runtime 22.0.0)` | launches | refuses | refuses |
-  | `0.170.0--` | launches | refuses | refuses |
-  | `(0.170.0--)` | launches | refuses | refuses |
-  | `0.170.0-` | launches | refuses | refuses |
-  | `0.168.0- runtime 22.0.0` | refuses | refuses | refuses |
-  | `OpenAI Codex 0.168.0-rc-. (runtime 22.0.0)` | refuses | refuses | refuses |
-  | `OpenAI Codex (v0.168.0)` | refuses | refuses | refuses |
-  | `unknown` | refuses | refuses | refuses |
-  | `OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)` | launches | refuses | launches |
-  | `codex 0.170.0 build 1.2.3.4` | launches | refuses | launches |
-  | `Codex <0.169.0` | launches | refuses | launches |
-  | `OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)` | launches | refuses | refuses |
-  | `codex/0.168.0 (node 22.0.0)` | launches | refuses | refuses |
+  | `--version` text | Codex meets the floor | 0.4.48 | 0.4.49 | this build |
+  | --- | --- | --- | --- | --- |
+  | `codex-cli 0.170.0` | yes | launches | launches | launches |
+  | `codex-cli 0.168.0` | no | refuses | refuses | refuses |
+  | `codex-cli 0.170.0-alpha.1` | no | refuses | refuses | refuses |
+  | `0.170.0` | yes | launches | launches | launches |
+  | `OpenAI Codex (v0.170.0)` | yes | launches | refuses | launches |
+  | `(0.170.0)` | yes | launches | refuses | launches |
+  | `0.170.0+` | yes | launches | refuses | refuses |
+  | `codex 0.170.0` | yes | launches | refuses | launches |
+  | `unknown (runtime 22.0.0)` | unknown | launches | refuses | launches |
+  | `plugin 0.160.0\ncodex-cli 0.170.0` | yes | refuses | launches | launches |
+  | `codex-cli 0.170.0+` | yes | launches | refuses | refuses |
+  | `node v22.0.0\ncodex-cli 0.168.0` | no | launches | refuses | refuses |
+  | `node v22.0.0\nOpenAI Codex (v0.170.0)` | yes | launches | refuses | refuses |
+  | `codex 0.170.0 (v0.170.0)` | yes | launches | refuses | refuses |
+  | `0.170.0-01 (runtime 22.0.0)` | no | launches | refuses | refuses |
+  | `0.170.0--` | no | launches | refuses | refuses |
+  | `(0.170.0--)` | no | launches | refuses | refuses |
+  | `0.170.0-` | unknown | launches | refuses | refuses |
+  | `0.168.0- runtime 22.0.0` | no | refuses | refuses | refuses |
+  | `OpenAI Codex 0.168.0-rc-. (runtime 22.0.0)` | no | refuses | refuses | refuses |
+  | `OpenAI Codex (v0.168.0)` | no | refuses | refuses | refuses |
+  | `unknown` | unknown | refuses | refuses | refuses |
+  | `OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)` | yes | launches | refuses | refuses |
+  | `OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)` | yes | launches | refuses | refuses |
+  | `OpenAI Codex (v0.170.0) (proxy http://127.0.0.1:8080/)` | yes | launches | refuses | refuses |
+  | `codex 0.170.0 build 1.2.3.4` | yes | launches | refuses | refuses |
+  | `Codex <0.169.0` | no | launches | refuses | refuses |
+  | `OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)` | no | launches | refuses | refuses |
+  | `OpenAI Codex (0.168.0.1--) (runtime 22.0.0)` | no | launches | refuses | refuses |
+  | `codex/0.168.0 (node 22.0.0)` | no | launches | refuses | refuses |
   <!-- /herdr-version-handoff -->
 
-  Notes on the table. A word that is nothing but four or more dot-separated numbers (an IPv4
-  address with or without a port, a four-part build number) is not a candidate, so it does not
-  make a banner ambiguous; any other word holding three dot-separated numbers is one.
-  Leading punctuation is removed before a candidate is read, as 0.4.48 removed it, so
-  `Codex <0.169.0` reads as exactly 0.169.0 and launches, here as in 0.4.48: the reading cannot
-  tell a bound from a version.
+  Notes on the table. The Codex column says whether the Codex the text describes meets the
+  floor (stable 0.169.0 or newer): `yes`, `no`, or `unknown` where the text does not show
+  Codex's own version. The test checks that this build launches no row marked `no`, and that
+  the one row it launches marked `unknown` is `unknown (runtime 22.0.0)`, the sole-word cost
+  above. A `<` is no enclosing punctuation, so `Codex <0.169.0`, which 0.4.48 read as 0.169.0
+  and launched, does not read here.
 
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases

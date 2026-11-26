@@ -626,17 +626,21 @@ fn herdr_version_grammar_reads_only_the_labelled_field() {
         ("0.170.0-", false, true, None),      // its `-` names no prerelease
         ("0.170.0-alpha.1.", false, true, Some(false)), // a period after a prerelease
         ("0.168.0-rc-.", false, true, Some(false)), // a period after the prerelease `rc-`
-        ("0.170.0+", false, true, Some(true)), // an empty build marker
+        ("0.170.0+", false, true, None),      // an empty build marker is no version
         ("0.170.0.", false, true, Some(true)), // a sentence's period
         ("0.170.0-01", false, true, None),    // a leading zero in a prerelease
         ("(0.170.0)", false, true, Some(true)), // brackets
         ("unknown", false, false, None),      // not a candidate
         ("0.170", false, false, None),        // two numbers are not a candidate
-        ("0.170.0.1", false, false, None),    // four plain numbers are not a candidate
-        ("127.0.0.1:8080", false, false, None), // nor are an IPv4 address and port
-        ("v0.170.0.1", false, true, None),    // four numbers with a `v` are an unreadable one
-        ("0.170.0.1-rc.1", false, true, None), // and with a prerelease
-        ("codex/0.168.0", false, true, None), // a version inside a word is one too
+        ("0.170.0.1", false, true, None),     // four numbers count, and do not parse
+        ("127.0.0.1:8080", false, true, None), // an IPv4 address and port count too
+        ("v0.170.0.1", false, true, None),    // with a `v`
+        ("0.170.0.1-rc.1", false, true, None), // with a prerelease
+        ("0.168.0.1--", false, true, None),   // with a prerelease `-`
+        ("0.168.0.1-\u{3b2}", false, true, None), // with a non-ASCII letter after `-`
+        ("codex/0.168.0", false, true, None), // a version inside a word counts
+        ("<0.169.0", false, true, None),      // a bound is not enclosing punctuation
+        ("\"0.170.0\",", false, true, Some(true)), // quotes and a comma enclose it
     ];
     let before = [
         "",
@@ -741,21 +745,26 @@ mod released {
     }
 }
 
-// The handoff table of docs/agents/codex.md, one row per `--version` text: whether 0.4.48,
-// 0.4.49 and this build launch Codex on Herdr with it. The document holds the table, and this
-// test reads it, so that the document cannot disagree with the readers.
-fn handoff_table() -> Vec<(String, [bool; 3])> {
+// One row of the handoff table: the `--version` text; whether the Codex it describes meets the
+// Herdr floor (`None`: the text does not show Codex's own version); and whether 0.4.48, 0.4.49
+// and this build launch Codex on Herdr with it.
+type HandoffRow = (String, Option<bool>, [bool; 3]);
+
+// The handoff table of docs/agents/codex.md. The document holds the table, and this test reads
+// it, so that the document cannot disagree with the readers.
+fn handoff_table() -> Vec<HandoffRow> {
     handoff_rows(include_str!("../../../../docs/agents/codex.md")).unwrap()
 }
 
 // The rows between the table's markers: its header and separator, then rows of a code-spanned
-// text and three verdicts. Any other nonempty line is an error, so that no row escapes the
-// checks by its form.
-fn handoff_rows(document: &str) -> std::result::Result<Vec<(String, [bool; 3])>, String> {
+// text, the Codex cell and three verdicts. Any other nonempty line is an error, so that no row
+// escapes the checks by its form.
+fn handoff_rows(document: &str) -> std::result::Result<Vec<HandoffRow>, String> {
     const BEGIN: &str = "<!-- herdr-version-handoff -->";
     const END: &str = "<!-- /herdr-version-handoff -->";
-    const HEADER: &str = "| `--version` text | 0.4.48 | 0.4.49 | this build |";
-    const SEPARATOR: &str = "| --- | --- | --- | --- |";
+    const HEADER: &str =
+        "| `--version` text | Codex meets the floor | 0.4.48 | 0.4.49 | this build |";
+    const SEPARATOR: &str = "| --- | --- | --- | --- | --- |";
     let start = document.find(BEGIN).ok_or("no table start")? + BEGIN.len();
     let end = document[start..].find(END).ok_or("no table end")? + start;
     let mut lines = document[start..end]
@@ -771,13 +780,19 @@ fn handoff_rows(document: &str) -> std::result::Result<Vec<(String, [bool; 3])>,
                 .strip_prefix('|')
                 .and_then(|line| line.strip_suffix('|'))
                 .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>())
-                .filter(|cells| cells.len() == 4)
+                .filter(|cells| cells.len() == 5)
                 .ok_or_else(|| format!("not a table row: {line}"))?;
             let text = cells[0]
                 .strip_prefix('`')
                 .and_then(|text| text.strip_suffix('`'))
                 .filter(|text| !text.is_empty() && !text.contains('`'))
                 .ok_or_else(|| format!("the text is not one code span: {line}"))?;
+            let codex = match cells[1] {
+                "yes" => Some(true),
+                "no" => Some(false),
+                "unknown" => None,
+                other => return Err(format!("unknown Codex cell {other:?} in {line}")),
+            };
             let verdict = |cell: &str| match cell {
                 "launches" => Ok(true),
                 "refuses" => Ok(false),
@@ -785,7 +800,8 @@ fn handoff_rows(document: &str) -> std::result::Result<Vec<(String, [bool; 3])>,
             };
             Ok((
                 text.replace("\\n", "\n"),
-                [verdict(cells[1])?, verdict(cells[2])?, verdict(cells[3])?],
+                codex,
+                [verdict(cells[2])?, verdict(cells[3])?, verdict(cells[4])?],
             ))
         })
         .collect()
@@ -796,19 +812,23 @@ fn handoff_rows(document: &str) -> std::result::Result<Vec<(String, [bool; 3])>,
 fn the_handoff_table_reader_refuses_an_unrecognised_row() {
     let table = |rows: &str| {
         format!(
-            "<!-- herdr-version-handoff -->\n| `--version` text | 0.4.48 | 0.4.49 | this build |\n| --- | --- | --- | --- |\n{rows}\n<!-- /herdr-version-handoff -->"
+            "<!-- herdr-version-handoff -->\n| `--version` text | Codex meets the floor | 0.4.48 | 0.4.49 | this build |\n| --- | --- | --- | --- | --- |\n{rows}\n<!-- /herdr-version-handoff -->"
         )
     };
     assert_eq!(
-        handoff_rows(&table("| `0.170.0` | launches | launches | launches |")).unwrap(),
-        vec![("0.170.0".to_owned(), [true, true, true])]
+        handoff_rows(&table(
+            "| `0.170.0` | yes | launches | launches | launches |"
+        ))
+        .unwrap(),
+        vec![("0.170.0".to_owned(), Some(true), [true, true, true])]
     );
     for row in [
-        "|`0.170.0`|launches|launches|launches|",
-        "| 0.170.0 | launches | launches | launches |",
-        "| `0.170.0` | launches | launches |",
-        "| `0.170.0` | launches | maybe | launches |",
-        "`0.170.0` launches launches launches",
+        "|`0.170.0`|yes|launches|launches|launches|",
+        "| 0.170.0 | yes | launches | launches | launches |",
+        "| `0.170.0` | launches | launches | launches |",
+        "| `0.170.0` | yes | launches | maybe | launches |",
+        "| `0.170.0` | maybe | launches | launches | launches |",
+        "`0.170.0` yes launches launches launches",
     ] {
         let rows = handoff_rows(&table(row));
         if row.starts_with("|`") {
@@ -818,7 +838,7 @@ fn the_handoff_table_reader_refuses_an_unrecognised_row() {
             assert!(rows.is_err(), "{row}");
         }
     }
-    assert!(handoff_rows("| `0.170.0` | launches | launches | launches |").is_err());
+    assert!(handoff_rows("| `0.170.0` | yes | launches | launches | launches |").is_err());
 }
 
 // A sole candidate is read in time linear in its length, whatever trailing punctuation it has.
@@ -868,11 +888,26 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         launched
     };
     let table = handoff_table();
-    for (text, [by_0_4_48, by_0_4_49, by_this_build]) in &table {
+    for (text, _, [by_0_4_48, by_0_4_49, by_this_build]) in &table {
         assert_eq!(released::v0_4_48(text), *by_0_4_48, "0.4.48 on {text:?}");
         assert_eq!(released::v0_4_49(text), *by_0_4_49, "0.4.49 on {text:?}");
         assert_eq!(launches(text), *by_this_build, "this build on {text:?}");
     }
+    // This build launches no row whose Codex is below the floor. It launches one row whose text
+    // does not show Codex's own version: a sole version-like word is read whatever program it
+    // names, the cost of reading unlabelled text at all.
+    for (text, codex, [.., by_this_build]) in &table {
+        assert!(
+            !(*by_this_build && *codex == Some(false)),
+            "this build launches a Codex below the floor on {text:?}"
+        );
+    }
+    let launched_unknown = table
+        .iter()
+        .filter(|(_, codex, [.., by_this_build])| *by_this_build && codex.is_none())
+        .map(|(text, ..)| text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(launched_unknown, ["unknown (runtime 22.0.0)"]);
     for named in [
         "OpenAI Codex (v0.170.0)",
         "(0.170.0)",
@@ -894,9 +929,12 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         "Codex <0.169.0",
         "OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)",
         "codex/0.168.0 (node 22.0.0)",
+        "OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)",
+        "OpenAI Codex (v0.170.0) (proxy http://127.0.0.1:8080/)",
+        "OpenAI Codex (0.168.0.1--) (runtime 22.0.0)",
     ] {
         assert!(
-            table.iter().any(|(text, _)| text == named),
+            table.iter().any(|(text, ..)| text == named),
             "the handoff table lacks {named:?}"
         );
     }
@@ -924,13 +962,13 @@ fn herdr_version_refusals_name_the_rule_that_refused() {
             "{text:?}: {error}"
         );
     }
-    // A sole candidate is read with its prerelease or build, less trailing characters that
-    // cannot end a version.
+    // A sole version-like word is read with its prerelease or build, less its enclosing
+    // punctuation.
     for text in [
         "OpenAI Codex (v0.170.0)",
         "(0.170.0)",
-        "0.170.0+",
         "Codex 0.170.0.",
+        "\"0.170.0\",",
     ] {
         assert_eq!(
             herdr_codex_version(text).unwrap(),
@@ -956,10 +994,14 @@ fn herdr_version_refusals_name_the_rule_that_refused() {
             format!("found no `codex-cli` label and no version in {text:?}")
         );
     }
-    assert_eq!(
-        refusal("0.170.0-"),
-        "found no `codex-cli` label, and its one version \"0.170.0-\" is not a semantic version"
-    );
+    for word in ["0.170.0-", "0.170.0+", "<0.169.0", "0.168.0.1--"] {
+        assert_eq!(
+            refusal(word),
+            format!(
+                "found no `codex-cli` label, and its one version {word:?} is not a semantic version"
+            )
+        );
+    }
     for (text, candidates) in [
         (
             "node v22.0.0\nOpenAI Codex (v0.170.0)",
