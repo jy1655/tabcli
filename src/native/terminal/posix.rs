@@ -58,6 +58,18 @@ pub(in crate::native::terminal) trait PosixTerminalAdapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool>;
+    /// The launcher's probe before startup is confirmed. A surface whose program cannot end
+    /// while the surface remains is present or absent; an adapter whose surface outlives
+    /// its program (Herdr) says when that program has finished.
+    fn launch_surface(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<super::LaunchSurface> {
+        self.surface_present(directory, session, timeout)
+            .map(super::LaunchSurface::from_presence)
+    }
     // A kind that declares a refusal for one of these in its registration is refused
     // by the shared dispatch before its adapter is reached, so the defaults are an
     // invariant failure and never an ordinary answer.
@@ -168,6 +180,17 @@ pub(in crate::native::terminal) fn surface_present(
     adapters
         .adapter(session.kind)?
         .surface_present(directory, session, timeout)
+}
+
+pub(in crate::native::terminal) fn launch_surface(
+    adapters: &dyn Adapters,
+    directory: &Path,
+    session: &TerminalSession,
+    timeout: Duration,
+) -> Result<super::LaunchSurface> {
+    adapters
+        .adapter(session.kind)?
+        .launch_surface(directory, session, timeout)
 }
 
 // The declared refusals answer before any adapter is reached.

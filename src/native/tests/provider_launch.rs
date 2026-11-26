@@ -103,6 +103,30 @@ fn bridge_shell_command_rejects_controls_in_dynamic_components() {
     }
 }
 
+// The launch command carries the workspace, the state root and TAB's executable as 0.4.49
+// did, lossily when one is not Unicode text (a pre-existing limit), and Ghostty's caller
+// `PATH` with an unused entry that is not Unicode text still passes the same check. Only the
+// session directory is refused when it cannot be sent exactly, by the launcher's admission.
+#[cfg(unix)]
+#[test]
+fn the_launch_command_check_refuses_controls_only() {
+    use std::os::unix::ffi::OsStrExt;
+    let inexact = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/state-\xff"));
+    let normal = Path::new("/tmp/normal");
+    for (workspace, root, executable) in [
+        (inexact, normal, normal),
+        (normal, inexact, normal),
+        (normal, normal, inexact),
+    ] {
+        bridge_shell_command(workspace, root, executable, "session-safe123").unwrap();
+    }
+    crate::native::session::launch::launcher::validate_shell_command_component(
+        std::ffi::OsStr::from_bytes(b"/usr/bin:/opt/\xff/bin"),
+        "Ghostty launch PATH",
+    )
+    .unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn provider_resolution_rejects_relative_path_entries() {

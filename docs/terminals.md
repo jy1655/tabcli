@@ -210,8 +210,18 @@ Install hc for Windows and open Herdr from the desktop, or run `hc server start`
 local named pipe, the one `hc` uses (`HC_SOCKET`, the `socket` setting, or
 `\\.\pipe\herdr-core-<user>-<session>.sock`), and only when the process serving it runs as
 your Windows user. An elevated core refuses an unelevated TAB. The session directory must
-be a real, private directory: a junction, or an access list that lets another account change
-its entries, refuses the launch.
+be a real directory owned by the core's account: a junction, another owner, or an access list
+that lets an account other than its owners, System and Administrators change its entries
+refuses the launch. The launch host runs as the core, so TAB checks the directory for the
+core's account before it creates the terminal and fails at once with the reason; when TAB's
+own token cannot read the directory's access list, it leaves the check to the host. An
+elevated TAB, such as an administrator's SSH session, normally gives the directory the
+Administrators group as owner, which the host of a core that is not elevated refuses: run TAB
+without elevation, as the core runs. A refusal only the host can know, such as a directory
+changed after TAB's check, goes to the launch log when the host can still write it; once the
+core reports the terminal finished, the start fails at TAB's next check of the terminal,
+normally about a second later, when TAB can read that the launch is still its own and pending,
+and its error names the launch log. `close-session` removes the finished terminal.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."

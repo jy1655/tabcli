@@ -418,6 +418,53 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
     }
 }
 
+/// The launch host's refusal of a session directory, which the launcher established before any
+/// Surface existed (`refuse_before_launch`, and the Herdr adapter on the connection that would
+/// create the terminal). It reads as the host's reason, naming the directory, for the caller;
+/// the Session records only `recorded`, a fixed text that names no path.
+#[derive(Debug)]
+pub(in crate::native) struct DirectoryRefusal {
+    host: &'static str,
+    reason: String,
+}
+
+impl DirectoryRefusal {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn new(host: &'static str, reason: String) -> Self {
+        Self { host, reason }
+    }
+
+    pub(in crate::native) fn recorded(&self) -> String {
+        format!(
+            "the {} launch host would refuse the session directory",
+            self.host
+        )
+    }
+}
+
+impl std::fmt::Display for DirectoryRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for DirectoryRefusal {}
+
+/// The launcher's check before `open_bound_tab`: a session directory that the kind's launch
+/// host would refuse is refused with the host's own reason before any Surface exists, instead
+/// of by the host once its Surface runs (`bound_host::refuse_before_launch`). Only what the
+/// launcher observed is refused; a read that fails leaves the directory to the host. The
+/// launcher settles the refusal (`DirectoryRefusal`) as a failure to open the Surface.
+pub(in crate::native) fn refuse_before_launch(kind: TerminalKind, directory: &Path) -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    return bound_host::refuse_before_launch(directory, kind);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (kind, directory);
+        Ok(())
+    }
+}
+
 // `directory` is the private directory of the managed session. Windows and Warp use it
 // for a one-writer host offer/start decision before the provider process can run.
 pub(super) fn open_bound_tab<F, U>(
@@ -484,6 +531,8 @@ where
 
 #[cfg(all(test, windows))]
 pub(in crate::native) mod launch_failure_test_support;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+pub(in crate::native) mod scripted_herdr_core;
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn bind_surface_before_start<T, Bind, Start, Cleanup, Unbind>(
@@ -698,6 +747,52 @@ pub(super) fn close_session_until(
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         platform::close_session_until(directory, session, deadline)
+    }
+}
+
+/// What the launcher's wait finds of the surface it launched, before startup is confirmed. A
+/// platform without terminal adapters finds none (`launch_surface` refuses every probe).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+pub(in crate::native) enum LaunchSurface {
+    Present,
+    Absent,
+    /// The surface remains but its program ended: a core that keeps a finished terminal
+    /// says so of the exact terminal the launch created. The text names it and, when the
+    /// core gives it, its exit code.
+    Finished(String),
+}
+
+impl LaunchSurface {
+    #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+    pub(in crate::native) fn from_presence(present: bool) -> Self {
+        if present { Self::Present } else { Self::Absent }
+    }
+}
+
+/// The read-only probe of the launcher's wait: presence, and for an adapter whose surface
+/// outlives its program, whether that program has finished (an inspection error proves
+/// neither absence nor an end).
+pub(super) fn launch_surface(
+    directory: &Path,
+    session: &TerminalSession,
+    timeout: std::time::Duration,
+) -> Result<LaunchSurface> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        posix::launch_surface(posix_installed(), directory, session, timeout)
+    }
+    #[cfg(windows)]
+    {
+        windows_dispatch::launch_surface(windows_installed(), directory, session, timeout)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (directory, session, timeout);
+        bail!("terminal surface probes are unsupported on this platform")
     }
 }
 

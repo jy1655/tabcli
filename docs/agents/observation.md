@@ -31,7 +31,20 @@
 - Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,
   its `launch_stage` row keeps `launch_host_failed` and directs the caller to the launch
   log for an input-flush or shell-start error. The shell-environment probe guidance applies
-  to the macOS capture host.
+  to the macOS capture host. A session directory the caller refused before any Surface adds
+  no row: no host ran, and a macOS capture kind keeps only its initial `awaiting_host` stage.
+  The returned error holds the host's reason with the directory. If the early facts are not
+  established, the refusal writes nothing: the status and the launch log stay as they were (for
+  example `Launching` with TAB's earlier `launch_pending` line, or a status already `Failed` or
+  `Closed`). On established facts the existing settlement (`fail_locked`, as in 0.4.49) writes
+  the failed status with the fixed reason, then releases the Claim, then appends the same line
+  to the launch log. An error writing the status or releasing the Claim ends it there and is
+  returned with the refusal; when the Claim cannot be released, no refusal line is appended and
+  the earlier lines from TAB stay. The log append is best effort: its failure is not reported
+  and changes nothing else. What the status becomes after a refusal that wrote nothing is left
+  to the existing paths: reopen's fence (`fence_failed_start_locked`) can copy the full error
+  when it finds `Launching` with the matching Claim, and a repair that settles the launch and
+  releases its Claim first keeps its own failed status.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared

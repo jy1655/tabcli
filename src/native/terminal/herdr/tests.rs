@@ -57,6 +57,10 @@ struct FakeState {
     /// Terminals of configured remote machines, which hc's list also returns.
     remote: Vec<Value>,
     after_call: Option<(&'static str, Mutation)>,
+    /// Each session directory the launch host's admission was asked about, with the number
+    /// of calls made before it, and the refusal that admission gives, if any.
+    admitted: Vec<(PathBuf, usize)>,
+    refused_directory: Option<String>,
 }
 
 type Mutation = Box<dyn FnOnce(&mut BTreeMap<String, Value>)>;
@@ -245,6 +249,10 @@ impl Connection for FakeConnection {
             None => result,
         }
     }
+    // The scripted core runs as this process.
+    fn core_account(&self) -> Result<HostAccount> {
+        HostAccount::current()
+    }
 }
 
 impl Core for FakeCore {
@@ -290,6 +298,15 @@ impl Core for FakeCore {
     }
     fn launch_nonce(&self) -> Result<String> {
         Ok("0123456789abcdef0123456789abcdef".into())
+    }
+    fn admit_launch_directory(&self, directory: &Path, _: Option<&HostAccount>) -> Result<()> {
+        let mut state = self.0.borrow_mut();
+        let made = state.calls.len();
+        state.admitted.push((directory.to_owned(), made));
+        match &state.refused_directory {
+            Some(reason) => bail!("{reason}"),
+            None => Ok(()),
+        }
     }
     fn pause(&self, _: Instant) {}
 }
@@ -703,6 +720,102 @@ fn creation_needs_a_running_core_and_never_starts_one() {
     assert!(core.methods().is_empty());
 }
 
+// The launch host is the core's program: a session directory that its admission would refuse,
+// for the account of the process that serves the connection, is refused on that connection
+// before `terminal.run`, so no terminal exists; an admitted directory goes on to the run.
+#[test]
+fn creation_refuses_a_directory_the_cores_launch_host_would_refuse() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().refused_directory = Some(
+        "the Herdr launch host would refuse the session directory /state/session-herdr1: Herdr launch directory is not private to the current user".into(),
+    );
+    let error = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
+    assert_eq!(
+        error,
+        "the Herdr terminal was not created: the Herdr launch host would refuse the session directory /state/session-herdr1: Herdr launch directory is not private to the current user"
+    );
+    assert_eq!(core.methods(), ["connect", "hello"]);
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), 2)]);
+    assert!(core.0.borrow().terminals.is_empty());
+    let core = FakeCore::new();
+    created(&core);
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), 2)]);
+    assert_eq!(core.methods()[..3], ["connect", "hello", "terminal.run"]);
+}
+
+// When the caller check fails on the first connection, the terminal is created on a new one.
+// The directory is admitted on that connection, for the account that serves it, right before
+// `terminal.run`, not on the connection that was given up.
+#[cfg(unix)]
+#[test]
+fn creation_admits_the_directory_on_the_connection_that_runs_the_terminal() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().caller = Some("t3".into());
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": 300, "argv": ["shell"], "created_ms": 1}),
+    );
+    core.inject("terminal.get", Injected::Instead(refused("unavailable")));
+    created(&core);
+    let methods = core.methods();
+    let run = methods
+        .iter()
+        .position(|method| method == "terminal.run")
+        .unwrap();
+    assert_eq!(
+        methods[..run],
+        ["connect", "hello", "terminal.get", "connect", "hello"]
+    );
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), run)]);
+}
+
+// The launcher's probe before startup is confirmed reads the exact terminal this launch
+// created, with the presence proof: live is present, the core's `not_found` is absence, and a
+// finished terminal is the end of its program, with its exit code when the core gives one. A
+// finished terminal with another launch label, one set to keep, or one that is not this
+// launch's is an inspection error, which ends nothing.
+#[test]
+fn the_launch_probe_reports_a_finished_launch_terminal() {
+    let core = FakeCore::new();
+    let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
+    let probe = || adapter.during_launch(Path::new(DIRECTORY), &session, Duration::from_secs(5));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Present
+    );
+    core.set("t7", "state", json!("finished"));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Finished("Herdr terminal t7 finished".into())
+    );
+    core.set("t7", "exit_code", json!(3));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Finished(
+            "Herdr terminal t7 exited with code 3".into()
+        )
+    );
+    let labels = core.terminal("t7").unwrap()["labels"].clone();
+    core.set(
+        "t7",
+        "labels",
+        json!({SESSION_LABEL: SESSION, LAUNCH_LABEL: "another"}),
+    );
+    assert!(error_text(&probe().unwrap_err()).contains("different launch label"));
+    core.set("t7", "labels", labels);
+    core.set("t7", "keep", json!(true));
+    assert!(error_text(&probe().unwrap_err()).contains("set to keep"));
+    core.set("t7", "keep", json!(false));
+    core.set("t7", "created_ms", json!(1));
+    assert!(error_text(&probe().unwrap_err()).contains("is not the terminal this session created"));
+    core.0.borrow_mut().terminals.clear();
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Absent
+    );
+}
+
 #[test]
 fn a_refused_run_creates_nothing_and_is_not_recovered() {
     let core = FakeCore::new();
@@ -866,6 +979,13 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
         }
         fn launch_nonce(&self) -> Result<String> {
             self.0.launch_nonce()
+        }
+        fn admit_launch_directory(
+            &self,
+            directory: &Path,
+            account: Option<&HostAccount>,
+        ) -> Result<()> {
+            self.0.admit_launch_directory(directory, account)
         }
         fn pause(&self, _: Instant) {}
     }
@@ -1592,6 +1712,13 @@ fn the_socket_connection_bounds_every_reply() {
         }
     });
     let mut connection = super::unix::open(&socket, later()).unwrap();
+    // The core's account is the peer's, which open required to be this process's.
+    assert!(
+        connection
+            .core_account()
+            .unwrap()
+            .same(&HostAccount::current().unwrap())
+    );
     assert_eq!(
         connection
             .call("hello", json!({"generation": 1}), later())
@@ -1923,6 +2050,9 @@ impl Stream for ScriptedStream {
         buffer[..bytes.len()].copy_from_slice(&bytes);
         Ok(bytes.len())
     }
+    fn peer_account(&self) -> Result<HostAccount> {
+        bail!("a scripted stream has no peer process")
+    }
 }
 
 fn io(kind: std::io::ErrorKind) -> std::io::Error {
@@ -2097,6 +2227,13 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
         }
     });
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
+    // This process serves the pipe, so the core's account is this process's own.
+    assert!(
+        connection
+            .core_account()
+            .unwrap()
+            .same(&HostAccount::current().unwrap())
+    );
     assert_eq!(
         connection
             .call("hello", json!({"generation": 1}), later())

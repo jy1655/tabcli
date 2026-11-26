@@ -222,11 +222,99 @@ fn windows_is_private(noun: &str, owner: &str, writers: &[String], own: &[String
 /// own check is unchanged.
 #[cfg(windows)]
 pub(in crate::native) fn windows_directory_is_private(directory: &File) -> Result<()> {
+    windows_directory_is_private_to(directory, windows_current_owners)
+}
+
+/// The same rule for the account whose `owners` are given, read after the directory's own
+/// owner and access list: the launcher judges a session directory as the launch host that a
+/// Herdr Core starts would, for the core's account (`windows_process_account`).
+#[cfg(windows)]
+pub(in crate::native) fn windows_directory_is_private_to(
+    directory: &File,
+    owners: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD};
     const NOUN: &str = "session directory";
     let (owner, writers) =
         windows_access(directory, store_change() | FILE_DELETE_CHILD | DELETE, NOUN)?;
-    windows_is_private(NOUN, &owner, &writers, &windows_current_owners()?)
+    windows_is_private(NOUN, &owner, &writers, &owners()?)
+}
+
+/// The account whose files a Windows process writes, read from its primary token: the owners
+/// its new files can have (`windows_current_owners`) and, only to explain a refusal, whether
+/// the token is elevated (`None` when that could not be read).
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(in crate::native) struct WindowsAccount {
+    pub(in crate::native) owners: Vec<String>,
+    pub(in crate::native) elevated: Option<bool>,
+}
+
+#[cfg(windows)]
+impl WindowsAccount {
+    /// Whether the two accounts give their files the same owners. SIDs compare without
+    /// regard to case.
+    pub(in crate::native) fn same_owners(&self, other: &Self) -> bool {
+        let covers = |a: &Self, b: &Self| {
+            a.owners
+                .iter()
+                .all(|sid| b.owners.iter().any(|other| other.eq_ignore_ascii_case(sid)))
+        };
+        covers(self, other) && covers(other, self)
+    }
+}
+
+/// This process's account.
+#[cfg(windows)]
+pub(in crate::native) fn windows_current_account() -> Result<WindowsAccount> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{
+        Security::TOKEN_QUERY,
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    let mut raw = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let token = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+    windows_token_account(&token)
+}
+
+/// The account of the process that `process` opens: a handle the caller opened for limited
+/// query (the Windows process module opens it; this module opens no other process).
+#[cfg(windows)]
+pub(in crate::native) fn windows_process_account(
+    process: &std::os::windows::io::OwnedHandle,
+) -> Result<WindowsAccount> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::{Security::TOKEN_QUERY, System::Threading::OpenProcessToken};
+    let mut raw = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open the Windows process token");
+    }
+    let token = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+    windows_token_account(&token)
+}
+
+#[cfg(windows)]
+fn windows_token_account(token: &std::os::windows::io::OwnedHandle) -> Result<WindowsAccount> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TokenElevation};
+    let owners = windows_token_owners(token.as_raw_handle())?;
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut needed = 0;
+    let elevated = (unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenElevation,
+            std::ptr::addr_of_mut!(elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut needed,
+        )
+    } != 0)
+        .then_some(elevation.TokenIsElevated != 0);
+    Ok(WindowsAccount { owners, elevated })
 }
 
 // What an access rule must allow for an account to change a trust store's content or its
@@ -332,7 +420,7 @@ fn windows_access(file: &File, change: u32, noun: &str) -> Result<(String, Vec<S
 fn windows_current_owners() -> Result<Vec<String>> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::{
-        Security::{GetTokenInformation, PSID, TOKEN_QUERY, TokenOwner, TokenUser},
+        Security::TOKEN_QUERY,
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
     let mut raw = std::ptr::null_mut();
@@ -340,6 +428,13 @@ fn windows_current_owners() -> Result<Vec<String>> {
         return Err(std::io::Error::last_os_error().into());
     }
     let _handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+    windows_token_owners(raw)
+}
+
+// The user and the default owner that the token `raw` gives new files.
+#[cfg(windows)]
+fn windows_token_owners(raw: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<String>> {
+    use windows_sys::Win32::Security::{GetTokenInformation, PSID, TokenOwner, TokenUser};
     let mut owners = Vec::new();
     // `TOKEN_USER` and `TOKEN_OWNER` both begin with the pointer to their SID.
     for class in [TokenUser, TokenOwner] {

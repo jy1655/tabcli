@@ -2,6 +2,8 @@
 //! located as `hc` locates it (herdr-core 0.1.21 `paths.rs`), and this machine's processes.
 use super::{Core, Framed, Stream, core_session, not_running};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
+use crate::native::terminal::TerminalKind;
+use crate::native::terminal::bound_host::HostAccount;
 use crate::native::terminal::record::HerdrHostBirth;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -80,6 +82,18 @@ impl Core for Installed {
         let mut bytes = [0_u8; 16];
         fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn admit_launch_directory(
+        &self,
+        directory: &Path,
+        account: Option<&HostAccount>,
+    ) -> Result<()> {
+        crate::native::terminal::bound_host::refuse_before_core_launch(
+            directory,
+            TerminalKind::Herdr,
+            account,
+        )
     }
 }
 
@@ -265,5 +279,12 @@ impl Stream for UnixStream {
     fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize> {
         self.set_read_timeout(Some(super::remaining(deadline)?))?;
         Read::read(self, buffer)
+    }
+
+    /// The peer's effective uid, which `open` already required to be this process's.
+    fn peer_account(&self) -> Result<HostAccount> {
+        Ok(HostAccount::of_uid(
+            peer_uid(self).context("cannot identify the Herdr Core socket's user")?,
+        ))
     }
 }

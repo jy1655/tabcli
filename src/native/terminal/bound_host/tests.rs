@@ -350,3 +350,261 @@ fn a_tmux_handoff_failure_is_logged_without_a_host_record() {
             .is_none()
     );
 }
+
+// Every kind whose host runs the admission, and the Windows console, whose host does not.
+#[cfg(unix)]
+const KINDS: [TerminalKind; 8] = [
+    TerminalKind::Herdr,
+    TerminalKind::Tmux,
+    TerminalKind::Iterm2,
+    TerminalKind::WezTerm,
+    TerminalKind::AppleTerminal,
+    TerminalKind::Ghostty,
+    TerminalKind::Warp,
+    TerminalKind::WindowsConsole,
+];
+
+// The launch hosts whose admission the launcher runs before it opens a surface: the hosts
+// this platform runs, which run as this process's account (tmux), an account TAB does not
+// attest (the macOS applications) or the core's (Herdr, judged here only for what needs no
+// account, and by the adapter for the rest on the connection that creates the terminal). A
+// host this platform cannot run judges nothing, so an unsupported surface keeps its own
+// refusal.
+#[cfg(unix)]
+fn judged_by_the_launcher(kind: TerminalKind) -> bool {
+    match kind {
+        TerminalKind::Tmux => cfg!(target_os = "linux"),
+        TerminalKind::Iterm2
+        | TerminalKind::WezTerm
+        | TerminalKind::AppleTerminal
+        | TerminalKind::Ghostty
+        | TerminalKind::Warp => cfg!(target_os = "macos"),
+        TerminalKind::Herdr => true,
+        TerminalKind::WindowsConsole => false,
+    }
+}
+
+// The launcher's check is the host's own admission: it refuses exactly the directories that
+// admission refuses, with the host's reason, for a host this platform runs and whose account
+// is not another process's; any other kind is not judged here. (A read that fails other than
+// by the directory's absence is left to the host:
+// `a_session_directory_the_launcher_cannot_read_is_left_to_the_launch_host`.)
+#[cfg(unix)]
+#[test]
+fn the_launcher_refuses_exactly_what_the_launch_host_would_refuse() {
+    let temp = tempfile::tempdir().unwrap();
+    let private = temp.path().join("session-private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let shared = temp.path().join("session-shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o750)).unwrap();
+    let link = temp.path().join("session-link");
+    std::os::unix::fs::symlink(&private, &link).unwrap();
+    let invalid = temp.path().join("invalid id");
+    fs::create_dir(&invalid).unwrap();
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).unwrap();
+    let missing = temp.path().join("session-missing");
+    for directory in [
+        private.as_path(),
+        &shared,
+        &link,
+        &invalid,
+        &missing,
+        Path::new("session-relative"),
+    ] {
+        for kind in KINDS {
+            let spec = BoundHostSpec {
+                name: kind.display_name(),
+            };
+            let host = run_bound_host(directory, &spec, |_| Ok(()));
+            let launcher = refuse_before_launch(directory, kind);
+            if !judged_by_the_launcher(kind) {
+                launcher.unwrap();
+                continue;
+            }
+            match host {
+                Ok(()) => launcher.unwrap(),
+                Err(refusal) => assert_eq!(
+                    format!("{:#}", launcher.unwrap_err()),
+                    format!(
+                        "the {} launch host would refuse the session directory {}: {refusal:#}",
+                        kind.display_name(),
+                        directory.display()
+                    ),
+                    "{kind:?} {}",
+                    directory.display()
+                ),
+            }
+        }
+    }
+    let judged = if cfg!(target_os = "linux") {
+        TerminalKind::Tmux
+    } else {
+        TerminalKind::Iterm2
+    };
+    assert!(refuse_before_launch(&private, judged).is_ok());
+    assert_eq!(
+        format!("{:#}", refuse_before_launch(&shared, judged).unwrap_err()),
+        format!(
+            "the {name} launch host would refuse the session directory {}: {name} launch directory is not private to the current user",
+            shared.display(),
+            name = judged.display_name()
+        )
+    );
+}
+
+// The launcher refuses only what it observed: a read of the session directory that fails for a
+// reason other than its absence (here a loop of symbolic links above it) is not a refusal, and
+// the launch goes on for the host to decide, whose own admission still refuses it.
+#[cfg(unix)]
+#[test]
+fn a_session_directory_the_launcher_cannot_read_is_left_to_the_launch_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let looped = temp.path().join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+    let directory = looped.join("session-unread");
+    let spec = BoundHostSpec { name: "Herdr" };
+    let host = format!(
+        "{:#}",
+        run_bound_host(&directory, &spec, |_| Ok(())).unwrap_err()
+    );
+    assert!(host.starts_with("no such Herdr launch directory"), "{host}");
+    for kind in KINDS {
+        refuse_before_launch(&directory, kind).unwrap();
+    }
+    let own = HostAccount::of_uid(unsafe { libc::geteuid() });
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, Some(&own)).unwrap();
+    refuse_before_core_launch(&directory, TerminalKind::Herdr, None).unwrap();
+}
+
+// The Herdr adapter refuses on the core's connection under its own context; the refusal keeps
+// its type there, so the launcher settles it as a refusal and records only its fixed reason.
+#[cfg(unix)]
+#[test]
+fn a_refusal_keeps_its_type_and_fixed_reason_under_the_adapters_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("session-typed");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o750)).unwrap();
+    let own = HostAccount::of_uid(unsafe { libc::geteuid() });
+    let error = refuse_before_core_launch(&shared, TerminalKind::Herdr, Some(&own))
+        .unwrap_err()
+        .context("the Herdr terminal was not created");
+    let refusal = error
+        .downcast_ref::<super::super::DirectoryRefusal>()
+        .unwrap();
+    assert_eq!(
+        refusal.recorded(),
+        "the Herdr launch host would refuse the session directory"
+    );
+    assert!(
+        format!("{error:#}").contains(&shared.display().to_string()),
+        "{error:#}"
+    );
+}
+
+// A host that a core starts runs as the core: the check is made for the core's account, and
+// when this process's own account would be admitted the refusal names both accounts. When the
+// connection could not name the core's account, the owner is left to the host and only what
+// needs no account is judged.
+#[cfg(unix)]
+#[test]
+fn a_core_started_host_is_judged_for_the_cores_account() {
+    let temp = tempfile::tempdir().unwrap();
+    let private = temp.path().join("session-core");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let own = unsafe { libc::geteuid() };
+    let this = HostAccount::of_uid(own);
+    refuse_before_core_launch(&private, TerminalKind::Herdr, Some(&this)).unwrap();
+    refuse_before_core_launch(&private, TerminalKind::Herdr, None).unwrap();
+    let other = HostAccount::of_uid(own.wrapping_add(1));
+    let refusal =
+        refuse_before_core_launch(&private, TerminalKind::Herdr, Some(&other)).unwrap_err();
+    assert_eq!(
+        format!("{refusal:#}"),
+        format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not private to the current user; TAB runs as uid {own} and the Herdr Core as uid {}; run TAB as the core's user",
+            private.display(),
+            own.wrapping_add(1)
+        )
+    );
+    // A directory neither account would admit is refused for its own reason alone, and with
+    // no account known as well.
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o770)).unwrap();
+    for core in [Some(&other), None] {
+        let text = format!(
+            "{:#}",
+            refuse_before_core_launch(&private, TerminalKind::Herdr, core).unwrap_err()
+        );
+        assert!(text.ends_with("not private to the current user"), "{text}");
+    }
+    let link = temp.path().join("session-link");
+    std::os::unix::fs::symlink(&private, &link).unwrap();
+    let text = format!(
+        "{:#}",
+        refuse_before_core_launch(&link, TerminalKind::Herdr, None).unwrap_err()
+    );
+    assert!(
+        text.contains("refusing non-directory Herdr launch path"),
+        "{text}"
+    );
+}
+
+// What the refusal tells a user whose TAB and core give their files different owners on
+// Windows: the observed case (TAB elevated, the core not) names elevation and what to do.
+#[test]
+fn the_elevation_advice_names_the_observed_case() {
+    let observed = elevation_advice("Herdr", Some(true), Some(false));
+    assert!(
+        observed.starts_with("TAB is running elevated and the Herdr Core is not:"),
+        "{observed}"
+    );
+    assert!(
+        observed.contains("Run TAB without elevation, as the core runs"),
+        "{observed}"
+    );
+    for (tab, core, words) in [
+        (
+            Some(false),
+            Some(true),
+            "TAB (not elevated) and the Herdr Core (elevated)",
+        ),
+        (
+            Some(true),
+            Some(true),
+            "TAB (elevated) and the Herdr Core (elevated)",
+        ),
+        (
+            None,
+            Some(false),
+            "TAB (elevation unknown) and the Herdr Core (not elevated)",
+        ),
+    ] {
+        let advice = elevation_advice("Herdr", tab, core);
+        assert!(advice.starts_with(words), "{advice}");
+        assert!(
+            advice.ends_with("run TAB with the core's account and elevation"),
+            "{advice}"
+        );
+    }
+}
+
+// The launch host is given its session directory as text. A path that cannot be sent as text
+// exactly is refused by the launcher's admission before any Surface exists: the host would
+// look for another directory.
+#[cfg(unix)]
+#[test]
+fn a_session_directory_that_cannot_be_sent_as_text_is_refused_before_any_surface() {
+    use std::os::unix::ffi::OsStrExt;
+    let directory = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/state-\xff/session-text"));
+    let refusal = refuse_before_launch(directory, TerminalKind::Herdr).unwrap_err();
+    assert_eq!(
+        format!("{refusal:#}"),
+        format!(
+            "the Herdr launch host would refuse the session directory {}: Herdr launch directory is not Unicode text, which is how the launch host is given it",
+            directory.display()
+        )
+    );
+}

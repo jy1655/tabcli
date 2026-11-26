@@ -157,7 +157,7 @@ impl TerminalSession {
         self.herdr_core.as_ref()
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native::terminal) fn herdr_launch_nonce(&self) -> Option<&str> {
         self.herdr_launch_nonce.as_deref()
     }
