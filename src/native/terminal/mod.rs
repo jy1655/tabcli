@@ -721,8 +721,13 @@ pub(super) fn close_session_until(
     }
 }
 
-/// What the launcher's wait finds of the surface it launched, before startup is confirmed.
+/// What the launcher's wait finds of the surface it launched, before startup is confirmed. A
+/// platform without terminal adapters finds none (`launch_surface` refuses every probe).
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(in crate::native) enum LaunchSurface {
     Present,
     Absent,

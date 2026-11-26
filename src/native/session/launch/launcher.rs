@@ -198,6 +198,7 @@ pub(in crate::native) mod open_failure_hook {
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native) fn set(hook: impl FnOnce(&Path) + 'static) {
         HOOK.with(|slot| assert!(slot.borrow_mut().replace(Box::new(hook)).is_none()));
     }

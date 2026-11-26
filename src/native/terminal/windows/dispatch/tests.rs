@@ -68,6 +68,15 @@ impl WindowsTerminalAdapter for Recording {
         self.record("present");
         Ok(true)
     }
+    fn launch_surface(
+        &self,
+        _: &Path,
+        _: &TerminalSession,
+        _: Duration,
+    ) -> Result<crate::native::terminal::LaunchSurface> {
+        self.record("launch");
+        Ok(crate::native::terminal::LaunchSurface::Present)
+    }
 }
 
 fn input() -> GuardedDialogInput {
@@ -87,7 +96,7 @@ fn recording_dispatch() -> Dispatch<Recording, Recording> {
     Dispatch::new(Recording::default(), Recording::default())
 }
 
-/// Runs the seven operations on a handle of `kind`, in order, and returns each answer as
+/// Runs the eight operations on a handle of `kind`, in order, and returns each answer as
 /// text: `ok` or the refusal. An open passes the asked kind to its adapter and binds once.
 fn every_operation(adapters: &dyn Adapters, kind: TerminalKind) -> Vec<String> {
     let directory = Path::new("unused");
@@ -127,6 +136,7 @@ fn every_operation(adapters: &dyn Adapters, kind: TerminalKind) -> Vec<String> {
         answer(verify_surface(adapters, &session, None)),
         answer(close_session_until(adapters, directory, &session, deadline()).map(|_| ())),
         answer(surface_present(adapters, directory, &session, Duration::from_secs(1)).map(|_| ())),
+        answer(launch_surface(adapters, directory, &session, Duration::from_secs(1)).map(|_| ())),
     ]
 }
 
@@ -138,12 +148,12 @@ fn each_windows_kind_reaches_only_its_own_adapter() {
     let dispatch = recording_dispatch();
     assert_eq!(
         every_operation(&dispatch, TerminalKind::WindowsConsole),
-        ["ok"; 7]
+        ["ok"; 8]
     );
     assert_eq!(
         dispatch.console.calls(),
         [
-            "open", "send", "screen", "dialog", "verify", "close", "present"
+            "open", "send", "screen", "dialog", "verify", "close", "present", "launch"
         ]
     );
     assert!(dispatch.herdr.calls().is_empty());
@@ -154,15 +164,17 @@ fn each_windows_kind_reaches_only_its_own_adapter() {
         .expect("Herdr declares its guarded-input refusal");
     assert_eq!(
         every_operation(&dispatch, TerminalKind::Herdr),
-        ["ok", "ok", "ok", herdr_refusal, "ok", "ok", "ok"]
+        ["ok", "ok", "ok", herdr_refusal, "ok", "ok", "ok", "ok"]
     );
     assert_eq!(
         dispatch.herdr.calls(),
-        ["open", "send", "screen", "verify", "close", "present"]
+        [
+            "open", "send", "screen", "verify", "close", "present", "launch"
+        ]
     );
     assert_eq!(
         dispatch.console.calls().len(),
-        7,
+        8,
         "the console was not reached again"
     );
 }
@@ -200,10 +212,10 @@ fn every_other_kind_stays_with_the_managed_console() {
             reached.push("dialog");
             "ok"
         });
-        reached.extend(["verify", "close", "present"]);
+        reached.extend(["verify", "close", "present", "launch"]);
         assert_eq!(
             every_operation(&dispatch, kind),
-            ["ok", "ok", screen, dialog, "ok", "ok", "ok"],
+            ["ok", "ok", screen, dialog, "ok", "ok", "ok", "ok"],
             "{kind:?}"
         );
         assert_eq!(dispatch.console.calls(), reached, "{kind:?}");

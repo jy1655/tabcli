@@ -359,7 +359,9 @@ fn a_held_lock_retains_the_claim_for_either_reason() {
 }
 
 // The wait with its deadline `deadline_ms` after its start, probing `surface` through the
-// installed terminal adapters, as the launcher does.
+// installed terminal adapters, as the launcher does. Like the scripted Herdr core it serves,
+// it exists where TAB runs Herdr.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalSession) -> Run {
     let token = turn::current_claim_token(store).unwrap().unwrap();
     let start = Instant::now();
@@ -393,6 +395,7 @@ fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalS
 // The launch ends through the settlement the deadline uses: failed, its Claim released, its
 // receipt pending and its surface handle kept, so that close-session removes the finished
 // terminal.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe() {
     use crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore;
@@ -450,6 +453,7 @@ fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe
 // What already decides the launch keeps deciding it when the terminal has finished: a
 // confirmed startup ends the wait as confirmed, and a launch-host Record (#409) names the
 // failure it records.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_confirmed_launch_or_a_host_record_wins_over_a_finished_herdr_terminal() {
     use crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore;

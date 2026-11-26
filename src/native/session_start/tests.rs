@@ -1104,7 +1104,9 @@ fn a_surface_failure_after_the_fence_keeps_its_terminal_failure_settlement() {
 }
 
 // A Herdr start whose session directory another account can change, which the core's launch
-// host refuses, prepared in `fixture`.
+// host refuses, prepared in `fixture`. These Herdr starts use the scripted core, which exists
+// where TAB runs Herdr.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn refused_herdr_start(fixture: &mut Fixture) -> Prepared {
     fixture.receipt_directory = false;
     fixture.terminal_kind = terminal::TerminalKind::Herdr;
@@ -1131,6 +1133,7 @@ fn refused_herdr_start(fixture: &mut Fixture) -> Prepared {
 
 // The launch host's reason for `refused_herdr_start`, as the caller is given it after the
 // launcher's context.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn herdr_refusal_cause<'a>(prepared: &Prepared, text: &'a str) -> &'a str {
     let cause = text
         .strip_prefix(&format!(
@@ -1154,6 +1157,7 @@ fn herdr_refusal_cause<'a>(prepared: &Prepared, text: &'a str) -> &'a str {
 }
 
 // What the Session records for `refused_herdr_start`: a fixed reason that names no path.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const HERDR_REFUSAL_RECORDED: &str = "terminal launch failed: the Herdr launch host would refuse the session directory; no surface handle was recorded and no prompt was sent";
 
 // The case of 2026-11-26 on a supported route: a Herdr start whose session directory the
@@ -1168,6 +1172,7 @@ const HERDR_REFUSAL_RECORDED: &str = "terminal launch failed: the Herdr launch h
 // pruned. The caller is given the host's reason with the directory; the Session records a
 // fixed reason, so a state root whose path contains the legacy residual-surface text does not
 // make the failure report a residual surface.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
     let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
@@ -1223,6 +1228,7 @@ fn a_herdr_directory_its_launch_host_would_refuse_never_reaches_terminal_run() {
 // A reader that holds the lifecycle lock when the refusal settles is waited out within the
 // launch's own budget: the start still fails with the recorded refusal and the released Claim,
 // as an uncontended one does.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_refusal_settles_once_a_reader_releases_the_lifecycle_lock() {
     let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
@@ -1261,6 +1267,7 @@ fn a_refusal_settles_once_a_reader_releases_the_lifecycle_lock() {
 // A refusal settles only this launch: when the Claim at the session directory's path is not
 // this launch's (the directory replaced for a moment), nothing is written there, and the
 // caller is still given the host's reason.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_refusal_writes_nothing_to_another_launch_at_its_path() {
     let core = crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore::start();
