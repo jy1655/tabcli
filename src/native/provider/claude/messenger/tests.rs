@@ -637,11 +637,54 @@ fn cleanup_after_an_early_target_completion_leaves_the_next_request_intact() {
     );
 }
 
+// The first Node start on a machine can outlast a fixture's whole deadline. On the Windows
+// runner (2026-11-26) the fixture below, the first test of its binary to start Node, reached
+// its 15 s deadline with its wrapper started and no Node start record, while every later Node
+// start of that run took under 1.5 s. This runs the same chain once (the platform's provider
+// command, a shell wrapper and Node) under a bound of its own, so that the fixture's deadline
+// covers only the fixture.
+fn start_node_through_the_provider_chain(root: &Path) {
+    let directory = root.join("node-warm-up");
+    std::fs::create_dir(&directory).unwrap();
+    #[cfg(windows)]
+    let executable = {
+        let path = directory.join("warm-up.cmd");
+        std::fs::write(&path, "@node -e 0\r\n").unwrap();
+        path
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("warm-up");
+        std::fs::write(&path, "#!/bin/sh\nexec node -e 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    let mut command =
+        crate::native::process_env::provider_command(&executable, &directory, Vec::new(), &[])
+            .unwrap();
+    command.current_dir(&directory);
+    let started = Instant::now();
+    let output = crate::native::process_env::command_output_until(
+        &mut command,
+        started + Duration::from_secs(120),
+        "the Node start before the messenger fixture",
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "Node did not start through the provider chain ({:?}): {}",
+        started.elapsed(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn native_messenger_success_without_target_turn_keeps_the_claim() {
     use crate::native::session::{SessionState, Store, turn};
 
     let root = tempfile::tempdir().unwrap();
+    start_node_through_the_provider_chain(root.path());
     let directory = managed_session_directory(root.path());
     crate::native::session::update_status(&directory, SessionState::Working, None, None).unwrap();
     let store = Store::open_unchecked(&directory);
@@ -707,15 +750,27 @@ const timer = setInterval(() => {
     };
     // One absolute deadline, taken before the observer and the send start, bounds both, so
     // the observer does not expire before the sender's delivery deadline.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(15);
     let observed_directory = directory.clone();
     let observer = thread::spawn(move || {
+        // When the wrapper's start record appeared, so that a missed deadline names the slow
+        // stage: the provider command and its wrapper, or Node.
+        let mut wrapper_seen = None;
         while !observed_directory.join("messenger-envelope.ready").exists() {
+            if wrapper_seen.is_none()
+                && observed_directory
+                    .join("messenger-wrapper-started")
+                    .exists()
+            {
+                wrapper_seen = Some(started.elapsed());
+            }
             if Instant::now() >= deadline {
-                return Err(
+                return Err(format!(
                     "the controlled messenger published no envelope before the shared deadline; \
-                     this alone does not show that its stdin was missing",
-                );
+                     this alone does not show that its stdin was missing; its wrapper's start \
+                     was first seen after {wrapper_seen:?}"
+                ));
             }
             thread::sleep(Duration::from_millis(10));
         }
