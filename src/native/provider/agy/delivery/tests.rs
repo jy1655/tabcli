@@ -74,6 +74,10 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
         let result = prepared.deliver(
             "iterm2",
             &mut (),
+            || {
+                order.borrow_mut().push("dispatch-check");
+                Ok(())
+            },
             |_| {
                 order.borrow_mut().push("paste");
                 match failure {
@@ -100,9 +104,9 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
             },
         );
         let expected = if matches!(failure, "not-sent" | "send-uncertain") {
-            vec!["trust", "ready-read", "paste"]
+            vec!["trust", "ready-read", "dispatch-check", "paste"]
         } else {
-            vec!["trust", "ready-read", "paste", "receipt"]
+            vec!["trust", "ready-read", "dispatch-check", "paste", "receipt"]
         };
         assert_eq!(*order.borrow(), expected);
         match failure {

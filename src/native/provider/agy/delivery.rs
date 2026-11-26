@@ -119,10 +119,13 @@ impl<'a> PreparedTerminalTurn<'a> {
         })
     }
 
+    // `at_dispatch` runs immediately before `send`, after every wait: the trust is consumed
+    // there, and its refusal sends nothing.
     fn deliver<R>(
         self,
         terminal: &str,
         runtime: &mut R,
+        at_dispatch: impl FnOnce() -> Result<()>,
         send: impl FnOnce(&mut R) -> terminal::TerminalSendResult,
         confirm: impl FnOnce(&mut R, &PendingAgyTurn, usize) -> terminal::TerminalSendResult,
     ) -> terminal::TerminalSendResult {
@@ -132,7 +135,10 @@ impl<'a> PreparedTerminalTurn<'a> {
             self.pre_paste_len,
             terminal,
             runtime,
-            send,
+            |runtime| {
+                at_dispatch().map_err(terminal::TerminalSendFailure::not_sent)?;
+                send(runtime)
+            },
             |runtime| confirm(runtime, &self.pending, self.pre_paste_len),
         )
     }
@@ -204,11 +210,9 @@ pub(super) fn deliver_terminal_turn<R: Runtime>(
     prepared.deliver(
         session.kind.as_str(),
         runtime,
-        |runtime| {
-            // The trust is consumed here, after every wait and immediately before the paste.
-            trust_at_dispatch(&directory, &env).map_err(TerminalSendFailure::not_sent)?;
-            runtime.split().1.send(session, prompt_path, deadline)
-        },
+        // The trust is consumed here, after every wait and immediately before the paste.
+        || trust_at_dispatch(&directory, &env),
+        |runtime| runtime.split().1.send(session, prompt_path, deadline),
         |runtime, pending, pre_paste_len| {
             let (clock, io) = runtime.split();
             // The composer after an unconfirmed paste is unknown; never paste again.
