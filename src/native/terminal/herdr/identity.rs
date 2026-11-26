@@ -89,6 +89,11 @@ impl<'a> Recorded<'a> {
         Ok(Some((recorded, linked)))
     }
 
+    /// The permanent id of the core the handle records.
+    pub(super) fn core_id(&self) -> &str {
+        &self.surface.core_id
+    }
+
     /// Applies the same proof to a fresh observation on the verified connection.
     pub(super) fn check(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
         let identity = self.check_identity(core, observed);
@@ -121,11 +126,13 @@ impl<'a> Recorded<'a> {
         self.check(core, observed)
     }
 
-    /// The handle's own creation record is whole: a host PID; this platform's host birth with
-    /// values the platform can report; and a launch label in the form every writer produced
-    /// (16 random bytes as 32 lowercase hexadecimal digits), which on Windows, where every
-    /// writer (0.4.47 on) saved it, must be present. The macOS and Linux handles of 0.4.45 and
-    /// 0.4.46 omitted it; their label is compared with the name.
+    /// The handle's own creation record is whole exactly when a released writer on this
+    /// platform could have written it (0.4.45 to 0.4.49): a host PID that this platform's process
+    /// reader reports (`host_pid_reported`), a host birth of this platform's kind with values its
+    /// writers record (`host_birth_written`), and a launch label exactly as the generators wrote
+    /// it, 32 lowercase hexadecimal digits. On Windows every writer (0.4.47 on) saved the label.
+    /// The macOS and Linux writers of 0.4.45 and 0.4.46 omitted the field, never wrote `null`;
+    /// their label is checked on the terminal and compared with its name (`check_launch`).
     fn check_creation_record_whole(&self) -> Result<()> {
         let address = &self.session.id;
         let damaged = |what: &str| {
@@ -133,11 +140,18 @@ impl<'a> Recorded<'a> {
                 "Herdr handle for terminal {address} records {what}; the handle is retained"
             )
         };
-        if self.surface.host_pid == 0 {
-            return Err(damaged("no host PID"));
+        if !host_pid_reported(self.surface.host_pid) {
+            return Err(damaged(
+                "a host PID that this platform's process reader never reports",
+            ));
         }
-        if !host_birth_is_possible(&self.surface.birth) {
-            return Err(damaged("a host birth this platform cannot report"));
+        if !host_birth_written(&self.surface.birth) {
+            return Err(damaged(
+                "a host birth that no writer on this platform records",
+            ));
+        }
+        if self.session.herdr_launch_nonce_is_null() {
+            return Err(damaged("a null launch label, which no writer saved"));
         }
         match self.session.herdr_launch_nonce() {
             Some(nonce) if written_launch_label(nonce) => Ok(()),
@@ -198,12 +212,15 @@ impl<'a> Recorded<'a> {
         {
             bail!("Herdr terminal {address} is not the terminal this session created");
         }
+        // Every check runs on a connection whose `hello` named the recorded core id, so a refusal
+        // from here on says that the recorded core answered at its endpoint.
+        let core_id = &recorded.core_id;
         if observed.keep {
             if observed.state == State::Finished {
                 let get = hc_command(&recorded.socket, "get", address, cfg!(windows));
                 let remove = hc_command(&recorded.socket, "rm", address, cfg!(windows));
                 bail!(
-                    "finished Herdr terminal {address} is set to keep; verify it with `{get}`, run `{remove}`, then retry close-session"
+                    "finished Herdr terminal {address} is set to keep on the recorded Herdr Core {core_id}, which answered at its endpoint; verify it with `{get}`, run `{remove}`, then retry close-session"
                 );
             }
             let keep_off = hc_command(
@@ -213,7 +230,7 @@ impl<'a> Recorded<'a> {
                 cfg!(windows),
             );
             bail!(
-                "Herdr terminal {address} is set to keep, so a replacement program can run in it; run `{keep_off}` first, after checking that the core at that endpoint is the one TAB recorded"
+                "Herdr terminal {address} is set to keep on the recorded Herdr Core {core_id}, which answered at its endpoint, so a replacement program can run in it; run `{keep_off}` first"
             );
         }
         if observed.state == State::Live
@@ -240,6 +257,8 @@ impl<'a> Recorded<'a> {
             // Records from 0.4.45 and 0.4.46, on macOS and Linux only, omitted the nonce. Every
             // Windows writer (0.4.47 on) saved it, so a Windows handle without one is not TAB's
             // (`check_creation_record_whole` refuses it first).
+            // The observed label must itself be one the generators wrote before its name is
+            // compared (`launch_name` refuses any other form).
             #[cfg(unix)]
             None => observed.name.as_deref() == Some(launch_name(nonce)?.as_str()),
             #[cfg(windows)]
@@ -363,8 +382,8 @@ impl<'a> Launch<'a> {
     }
 }
 
-/// The form both launch-token writers produce (`unix.rs` and `pipe.rs`, since 0.4.46): 16 random
-/// bytes as 32 lowercase hexadecimal digits.
+/// The form every launch-token generator wrote (0.4.45 on, `unix.rs` and `pipe.rs` today): 16
+/// random bytes as 32 lowercase hexadecimal digits.
 fn written_launch_label(nonce: &str) -> bool {
     nonce.len() == 32
         && nonce
@@ -372,31 +391,40 @@ fn written_launch_label(nonce: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// A host birth of this platform's kind with values it can report: macOS seconds above zero and
-/// microseconds below a second; a Linux boot identity that is not all zero and a positive start
-/// tick count; a Windows creation time above zero.
-fn host_birth_is_possible(birth: &HerdrHostBirth) -> bool {
+/// A PID that this platform's process reader reports for the program a core started. Every
+/// writer took the PID the core reported (above zero) and recorded a handle only after that
+/// reader returned the program's birth: on macOS (`macos_process_info`) and Linux (procfs
+/// `read_stat`) the reader refuses anything above `i32::MAX`; on Windows (`OpenProcess`) it
+/// takes any nonzero `DWORD`.
+fn host_pid_reported(pid: u32) -> bool {
+    #[cfg(unix)]
+    return pid > 0 && pid <= i32::MAX as u32;
+    #[cfg(windows)]
+    return pid > 0;
+}
+
+/// A host birth of this platform's kind with values its writers record: on macOS the kernel's
+/// start `timeval`, whose microseconds are below a second; on Linux the kernel's boot identity,
+/// a random UUID that is never all zero, and any procfs start tick, zero included (a program
+/// started in its time namespace's first tick); on Windows any `GetProcessTimes` creation time.
+fn host_birth_written(birth: &HerdrHostBirth) -> bool {
     match *birth {
         HerdrHostBirth::Macos {
-            host_start_seconds,
             host_start_microseconds,
-        } => {
-            cfg!(target_os = "macos")
-                && host_start_seconds > 0
-                && host_start_microseconds < 1_000_000
-        }
+            ..
+        } => cfg!(target_os = "macos") && host_start_microseconds < 1_000_000,
         HerdrHostBirth::Linux { linux_birth } => {
-            cfg!(target_os = "linux")
-                && !linux_birth.boot_id.is_nil()
-                && linux_birth.starttime_ticks > 0
+            cfg!(target_os = "linux") && !linux_birth.boot_id.is_nil()
         }
-        HerdrHostBirth::Windows { host_creation_time } => cfg!(windows) && host_creation_time > 0,
+        HerdrHostBirth::Windows { .. } => cfg!(windows),
     }
 }
 
+/// The local name TAB gives the terminal of a launch label, which must be one the generators
+/// wrote.
 fn launch_name(nonce: &str) -> Result<String> {
-    if nonce.len() < NAME_ENTROPY || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("the Herdr launch token is not hexadecimal");
+    if !written_launch_label(nonce) {
+        bail!("the Herdr launch label is not 32 lowercase hexadecimal digits");
     }
     Ok(format!("{NAME_PREFIX}{}", &nonce[..NAME_ENTROPY]))
 }

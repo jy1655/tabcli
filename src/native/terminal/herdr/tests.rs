@@ -1,3 +1,5 @@
+use super::framed::TestRequest;
+use super::linked::{REQUIRED_METHODS, validate_hello};
 use super::*;
 use std::{
     cell::RefCell,
@@ -1403,21 +1405,15 @@ fn the_socket_connection_bounds_every_reply() {
     let mut connection = super::unix::open(&socket, later()).unwrap();
     assert_eq!(
         connection
-            .call(
-                Permit::for_test(),
-                "hello",
-                json!({"generation": 1}),
-                later()
-            )
+            .exchange_for_test(TestRequest::Hello, json!({"generation": 1}), later())
             .unwrap(),
         json!({"ok": true})
     );
     let mut connection = super::unix::open(&socket, later()).unwrap();
     let started = Instant::now();
     let error = connection
-        .call(
-            Permit::for_test(),
-            "terminal.send",
+        .exchange_for_test(
+            TestRequest::Send,
             json!({}),
             Instant::now() + Duration::from_millis(200),
         )
@@ -1426,7 +1422,7 @@ fn the_socket_connection_bounds_every_reply() {
     assert!(started.elapsed() < Duration::from_millis(550));
     let mut connection = super::unix::open(&socket, later()).unwrap();
     let error = connection
-        .call(Permit::for_test(), "terminal.get", json!({}), later())
+        .exchange_for_test(TestRequest::Get, json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();
@@ -1752,13 +1748,8 @@ fn the_shared_framing_reports_unsent_only_before_any_byte_was_written() {
     use std::io::ErrorKind::{BrokenPipe, Interrupted, TimedOut, WouldBlock};
     let call = |stream: ScriptedStream| {
         let mut framed = Framed::new(stream);
-        let result = framed.call(
-            Permit::for_test(),
-            "terminal.send",
-            json!({"text": "x"}),
-            later(),
-        );
-        (result, framed.stream.written)
+        let result = framed.exchange_for_test(TestRequest::Send, json!({"text": "x"}), later());
+        (result, framed.stream().written.clone())
     };
     let reply =
         |id: u64| format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"turn":1}}}}"#).into_bytes();
@@ -1919,12 +1910,7 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     assert_eq!(
         connection
-            .call(
-                Permit::for_test(),
-                "hello",
-                json!({"generation": 1}),
-                later()
-            )
+            .exchange_for_test(TestRequest::Hello, json!({"generation": 1}), later())
             .unwrap(),
         json!({"ok": true})
     );
@@ -1932,9 +1918,8 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     let started = Instant::now();
     let error = connection
-        .call(
-            Permit::for_test(),
-            "terminal.send",
+        .exchange_for_test(
+            TestRequest::Send,
             json!({}),
             Instant::now() + Duration::from_millis(200),
         )
@@ -1944,7 +1929,7 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     drop(connection);
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     let error = connection
-        .call(Permit::for_test(), "terminal.get", json!({}), later())
+        .exchange_for_test(TestRequest::Get, json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();
@@ -2056,3 +2041,45 @@ mod ended_close;
 
 // os-parity: Repair and explicit close of a terminal whose owner is verified gone, on every OS.
 mod owner_gone;
+
+// Review round 4 (the seal around the mutation calls): in production code only `linked.rs`, the
+// verified connection, names `terminal.kill` or `terminal.rm`, and it sends them only for a
+// grant. This fails if either name appears in any other production source, where a request with
+// it could be built. Test sources are not production code: the scripted core receives these
+// names and the tests assert on them.
+#[test]
+fn only_the_verified_connection_names_the_mutation_calls() {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+    fn production_sources(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            if path.is_dir() {
+                if name != "tests" {
+                    production_sources(&path, found);
+                }
+            } else if name.ends_with(".rs")
+                && name != "tests.rs"
+                && name != "test_support.rs"
+                && !name.ends_with("_tests.rs")
+            {
+                found.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let linked = root.join("native/terminal/herdr/linked.rs");
+    let mut sources = Vec::new();
+    production_sources(&root, &mut sources);
+    assert!(sources.contains(&linked), "{sources:?}");
+    let named: Vec<_> = sources
+        .iter()
+        .filter(|path| **path != linked)
+        .filter(|path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            text.contains("\"terminal.kill\"") || text.contains("\"terminal.rm\"")
+        })
+        .collect();
+    assert!(named.is_empty(), "{named:?}");
+}

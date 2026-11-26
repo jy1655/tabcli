@@ -355,8 +355,8 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
         TerminalTombstone {
             consumed: true,
             terminal: Some(terminal::TerminalKind::Iterm2),
-            reason: cfg!(any(target_os = "macos", target_os = "linux"))
-                .then(|| "the tab was already gone".to_owned()),
+            // Every OS records the reason (os-parity).
+            reason: Some("the tab was already gone".to_owned()),
         }
     );
 

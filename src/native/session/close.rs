@@ -554,9 +554,20 @@ fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
         .and_then(|text| super::record::terminal_consumption_reason(&text)))
 }
 
+/// Joins two close reasons with `; `. A reason that the other already carries, whole or as a
+/// run of its `; `-joined parts, is not added again: a replay of a committed consumption marker
+/// meets the reason it committed, and the retry's own reason is already part of it.
 fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<String> {
+    fn carries(whole: &str, part: &str) -> bool {
+        whole == part
+            || whole.starts_with(&format!("{part}; "))
+            || whole.ends_with(&format!("; {part}"))
+            || whole.contains(&format!("; {part}; "))
+    }
     match (first, second) {
-        (Some(first), Some(second)) if first != second => Some(format!("{first}; {second}")),
+        (Some(first), Some(second)) if carries(&first, &second) => Some(first),
+        (Some(first), Some(second)) if carries(&second, &first) => Some(second),
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
         (first, second) => first.or(second),
     }
 }
@@ -566,14 +577,25 @@ fn consume_terminal_handle(
     terminal_kind: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
-    let mut marker = serde_json::json!({
-        "consumed": true,
-        "terminal": terminal_kind,
-    });
-    if let Some(reason) = reason {
-        marker["reason"] = reason.into();
-    }
-    let tombstone_result = store.write_terminal_closed(&marker);
+    // A committed marker is kept as written: a replay, and a later close of the closed session,
+    // neither rewrites its reason nor its kind.
+    let tombstone_result =
+        store
+            .record(CoreRecord::TerminalClosed)
+            .present()
+            .and_then(|committed| {
+                if committed {
+                    return Ok(());
+                }
+                let mut marker = serde_json::json!({
+                    "consumed": true,
+                    "terminal": terminal_kind,
+                });
+                if let Some(reason) = reason {
+                    marker["reason"] = reason.into();
+                }
+                store.write_terminal_closed(&marker)
+            });
     #[cfg(test)]
     if tombstone_result.is_ok() {
         interruption::at(interruption::Point::ConsumptionMarkerWritten);

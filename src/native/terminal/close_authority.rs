@@ -64,10 +64,8 @@ pub(in crate::native) use owner_exit::CreationEvidence;
 
 /// What `CloseObservation::read_owner` found at the Owner record: one typed read, under the
 /// record's read policy. A record that cannot be read is the read's error.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", windows)),
-    allow(dead_code)
-)]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[derive(Debug)]
 pub(in crate::native) enum OwnerRead {
     Absent,
     /// The bytes are not an Owner record.
@@ -1269,9 +1267,7 @@ mod projected_authority_tests {
             .with_reuse(move |_| corroborated)
             .with_presence(|| panic!("no Herdr row asks presence"));
             let observation = if matches!(record, Record::Damaged) {
-                observation
-                    .with_owner_present(|| Ok(true))
-                    .with_owner(|| bail!("invalid native-session owner record"))
+                observation.with_read_owner(|| Ok(OwnerRead::Malformed))
             } else {
                 observation
             };
@@ -1386,5 +1382,41 @@ mod projected_authority_tests {
         reads.push("teardown-intent");
         reads.extend(["owner-present", "launch", "status", "owner", "owner-record"]);
         assert_eq!(observation.calls(), reads);
+    }
+
+    // Review round 4, finding 6: a kind whose core keeps its terminals reads the owner record
+    // once, as one typed result. The scripted presence stands for an earlier read that found the
+    // record, and the directory now in its place for the record replaced before a later read:
+    // with one read, that read meets the replacement, and its failure refuses the close.
+    #[test]
+    fn a_core_kept_terminal_reads_its_owner_record_once() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(root.path());
+        crate::native::session::update_status(root.path(), SessionState::Ready, None, None)
+            .unwrap();
+        std::fs::create_dir(store.record(CoreRecord::Owner).path()).unwrap();
+        let surface = TerminalSession::new(terminal::TerminalKind::Herdr, "t7".into())
+            .with_binding(Some("session-test".into()));
+        let deadline = crate::native::session::close::budget::close_deadline();
+        let observation =
+            TestObservation::on_records(root.path(), "session-test", &surface, deadline)
+                .with_owner_present(|| Ok(true))
+                .with_presence(|| panic!("an unreadable owner record asks no presence"))
+                .with_proof(|| panic!("an unreadable owner record asks no proof"));
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let observation =
+            observation.with_evidence(terminal::close_evidence(terminal::TerminalKind::Herdr));
+        let result = observation.decide("session-test", &surface, deadline);
+        assert!(result.is_err(), "{result:?}");
+        let calls = observation.calls();
+        assert_eq!(
+            calls.iter().filter(|call| **call == "read-owner").count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            !calls.contains(&"owner-present") && !calls.contains(&"owner"),
+            "{calls:?}"
+        );
     }
 }

@@ -1,11 +1,13 @@
 //! The verified connection to a core, and the only way a request reaches one. Every
-//! `Connection::call` takes a `Permit` that only this module constructs, so no other code can
-//! send a request on a raw connection. `Linked::call` refuses `terminal.kill` and `terminal.rm`,
-//! which are sent only by `kill` and `remove`, each consuming a grant that `authority::grant`
-//! minted for the terminal it observed on this core.
+//! `Connection::call` takes a `Permit` that only this module constructs, and the installed
+//! transports keep their stream private (`framed`), so no other code can send a request on a
+//! raw connection. Only this module names `terminal.kill` and `terminal.rm`: `Linked::call`
+//! refuses them, and `end_program` and `remove_confirmed` send them only by consuming a grant
+//! that `authority::grant` minted from an observation this connection produced (`Seen`), which
+//! names this connection's core and the observed terminal.
 use super::authority::{Kill, Remove};
-use super::{CallError, Connection, Core, GENERATION, validate_hello};
-use anyhow::{Result, anyhow, bail};
+use super::{CallError, CloseOutcome, Connection, Core, GENERATION, Observed, get};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -16,16 +18,19 @@ use std::{
 /// module; a `Connection` implementation receives it and cannot make one.
 pub(in crate::native::terminal) struct Permit(());
 
-#[cfg(test)]
-impl Permit {
-    /// For the transport tests, which exercise a raw connection's framing.
-    pub(in crate::native::terminal) fn for_test() -> Self {
-        Self(())
-    }
-}
-
+const KILL: &str = "terminal.kill";
+const REMOVE: &str = "terminal.rm";
 /// The calls that end or remove a terminal.
-const MUTATIONS: [&str; 2] = ["terminal.kill", "terminal.rm"];
+const MUTATIONS: [&str; 2] = [KILL, REMOVE];
+/// The methods a core must offer in `hello`.
+pub(super) const REQUIRED_METHODS: [&str; 6] = [
+    "terminal.run",
+    "terminal.get",
+    KILL,
+    REMOVE,
+    "terminal.send",
+    "terminal.read",
+];
 
 /// A connection whose `hello` named this core: generation 1, the methods TAB uses, and,
 /// when one is expected, the recorded core id.
@@ -91,14 +96,46 @@ impl Linked<'_> {
         self.connection.call(Permit(()), method, params, deadline)
     }
 
-    /// The one `terminal.kill` that `grant` permitted, for the terminal it observed.
-    pub(super) fn kill(&mut self, kill: Kill, deadline: Instant) -> Result<Value, CallError> {
-        self.mutate("terminal.kill", kill.core_id(), kill.address(), deadline)
+    /// The terminal at `address` as this connection observes it, bound to this connection's core.
+    /// The only constructor of `Seen`.
+    pub(super) fn observe(&mut self, address: &str, deadline: Instant) -> Result<Option<Seen>> {
+        let core_id = self.core_id.clone();
+        Ok(get(self, address, deadline)?.map(|observed| Seen { core_id, observed }))
     }
 
-    /// The one `terminal.rm` that `grant` permitted, for the terminal it observed.
-    pub(super) fn remove(&mut self, remove: Remove, deadline: Instant) -> Result<Value, CallError> {
-        self.mutate("terminal.rm", remove.core_id(), remove.address(), deadline)
+    /// The one `terminal.kill` that `grant` permitted, for the terminal it observed.
+    pub(super) fn end_program(&mut self, kill: Kill, deadline: Instant) -> Result<()> {
+        match self.mutate(KILL, kill.core_id(), kill.address(), deadline) {
+            Ok(_) => Ok(()),
+            Err(CallError::Refused { kind, .. }) if kind == "not_found" || kind == "finished" => {
+                Ok(())
+            }
+            Err(error) => Err(error.into_error(KILL)),
+        }
+    }
+
+    /// The one `terminal.rm` that `grant` permitted, for the terminal it observed, and one read
+    /// to confirm it. `not_found` from the recorded core answers the removal itself: another
+    /// client removed the terminal after the last read. A removal the core acknowledged while it
+    /// still lists the terminal is not sent again; the handle is kept for the next close.
+    pub(super) fn remove_confirmed(
+        &mut self,
+        remove: Remove,
+        deadline: Instant,
+        outcome: CloseOutcome,
+    ) -> Result<CloseOutcome> {
+        let address = remove.address().to_owned();
+        match self.mutate(REMOVE, remove.core_id(), &address, deadline) {
+            Ok(_) => {}
+            Err(CallError::Refused { kind, .. }) if kind == "not_found" => return Ok(outcome),
+            Err(error) => return Err(error.into_error(REMOVE)),
+        }
+        if get(self, &address, deadline)?.is_some() {
+            bail!(
+                "Herdr terminal {address} is still held by its core after {REMOVE}; the handle is retained"
+            );
+        }
+        Ok(CloseOutcome::Closed)
     }
 
     fn mutate(
@@ -116,5 +153,53 @@ impl Linked<'_> {
         }
         self.connection
             .call(Permit(()), method, json!({"terminal": address}), deadline)
+    }
+}
+
+pub(super) fn validate_hello(hello: &Value) -> Result<String> {
+    if hello.get("generation").and_then(Value::as_u64) != Some(GENERATION) {
+        bail!("Herdr Core does not speak protocol generation {GENERATION}");
+    }
+    hello
+        .get("version")
+        .and_then(Value::as_str)
+        .context("Herdr hello has no version")?;
+    let methods: Vec<&str> = hello
+        .get("methods")
+        .and_then(Value::as_array)
+        .context("Herdr hello has no method list")?
+        .iter()
+        .map(|method| method.as_str().context("Herdr method name is not text"))
+        .collect::<Result<_>>()?;
+    if let Some(missing) = REQUIRED_METHODS
+        .iter()
+        .find(|method| !methods.contains(method))
+    {
+        bail!("Herdr Core does not offer {missing}");
+    }
+    let id = hello
+        .pointer("/core/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .context("Herdr hello has no core id")?;
+    Ok(id.to_owned())
+}
+
+/// A terminal as a verified connection observed it: that connection's core and the reply for
+/// the terminal, inseparable. Only `Linked::observe` constructs it, so a grant minted from it
+/// names the core that actually reported the terminal.
+pub(super) struct Seen {
+    core_id: String,
+    observed: Observed,
+}
+
+impl Seen {
+    /// The permanent id of the core that reported the terminal.
+    pub(super) fn core_id(&self) -> &str {
+        &self.core_id
+    }
+
+    pub(super) fn observed(&self) -> &Observed {
+        &self.observed
     }
 }

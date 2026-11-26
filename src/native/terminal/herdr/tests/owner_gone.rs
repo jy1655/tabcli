@@ -1439,16 +1439,112 @@ fn an_impossible_recorded_birth_is_no_evidence_that_the_owner_is_gone() {
 /// A handle damage for the absence test.
 type Damage = fn(&mut serde_json::Map<String, Value>);
 
-// Review round 2, finding 6: absence is accepted only from a handle whose creation record is
-// whole: a host PID, this platform's host birth with possible values, and a launch label in the
-// form both writers produce (32 lowercase hexadecimal digits), or, on macOS and Linux only, none
-// at all (the handles of 0.4.45 and 0.4.46). Anything else refuses the close before the core's
-// `not_found` can settle the handle, and the refusal names the field (review round 3, finding 6).
+// Review rounds 2 to 4 (finding 6, then 3 and 4): a close settles an absent terminal from its
+// creation record exactly when a released writer on this platform could have written that
+// record. Each accepted row is one released writer's output, as its tag's source writes it:
+// 0.4.45 (macOS) and 0.4.46 (macOS, Linux) omit the launch label; 0.4.47 to 0.4.49 (macOS,
+// Linux, Windows) save the 32 lowercase hexadecimal digits their generator wrote; the host PID is
+// one the core reported and the platform's reader returned a birth for; the host birth is the
+// platform's own kind (0.4.45's flat macOS fields are the same wire). Each refused row damages
+// one field in a way a review named, and the refusal names that field before the core's
+// `not_found` can settle the handle.
 #[test]
-fn an_absent_terminal_settles_only_a_whole_creation_record() {
+fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_it() {
+    const PID: &str = "records a host PID that this platform's process reader never reports";
+    const BIRTH: &str = "records a host birth that no writer on this platform records";
     const LABEL: &str = "records a damaged launch label";
-    const BIRTH: &str = "records a host birth this platform cannot report";
-    let mut damage: Vec<(&str, Damage, &str)> = vec![
+    fn omit_label(handle: &mut serde_json::Map<String, Value>) {
+        handle.remove("herdr_launch_nonce");
+    }
+    fn as_written(_: &mut serde_json::Map<String, Value>) {}
+    // The host birth fields each platform's writers record.
+    #[cfg(target_os = "macos")]
+    const BIRTH_FIELDS: &[&str] = &["host_start_microseconds", "host_start_seconds"];
+    #[cfg(target_os = "linux")]
+    const BIRTH_FIELDS: &[&str] = &["linux_birth"];
+    #[cfg(windows)]
+    const BIRTH_FIELDS: &[&str] = &["host_creation_time"];
+    #[allow(unused_mut)]
+    let mut accepted: Vec<(&str, Damage)> = Vec::new();
+    #[cfg(target_os = "macos")]
+    accepted.extend([
+        ("0.4.45, macOS", omit_label as Damage),
+        ("0.4.46, macOS", omit_label),
+        ("0.4.47, macOS", as_written),
+        ("0.4.48, macOS", as_written),
+        ("0.4.49, macOS", as_written),
+    ]);
+    #[cfg(target_os = "linux")]
+    accepted.extend([
+        ("0.4.46, Linux", omit_label as Damage),
+        ("0.4.47, Linux", as_written),
+        ("0.4.48, Linux", as_written),
+        ("0.4.49, Linux", as_written),
+        // procfs reports zero ticks for a program started in its time namespace's first tick,
+        // and the writers copied it.
+        ("0.4.46, Linux, started at tick zero", |handle| {
+            omit_label(handle);
+            handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
+        }),
+        ("0.4.49, Linux, started at tick zero", |handle| {
+            handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
+        }),
+    ]);
+    #[cfg(windows)]
+    accepted.extend([
+        ("0.4.47, Windows", as_written as Damage),
+        ("0.4.48, Windows", as_written),
+        ("0.4.49, Windows", as_written),
+    ]);
+    for (label, written) in accepted {
+        let fixture = Fixture::new("ready", &complete_owner());
+        let store = fixture.store();
+        let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
+        written(value.as_object_mut().unwrap());
+        // The fields that writer saved, and no others.
+        let mut top: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top.sort_unstable();
+        let mut expected_top = vec!["herdr_core", "managed_session_id", "session_id", "terminal"];
+        if value.get("herdr_launch_nonce").is_some() {
+            expected_top.push("herdr_launch_nonce");
+            expected_top.sort_unstable();
+        }
+        assert_eq!(top, expected_top, "{label}");
+        let mut core: Vec<&str> = value["herdr_core"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        core.sort_unstable();
+        let mut expected_core = vec!["core_id", "created_ms", "host_pid", "socket"];
+        expected_core.extend(BIRTH_FIELDS);
+        expected_core.sort_unstable();
+        assert_eq!(core, expected_core, "{label}");
+        store
+            .record(CoreRecord::Terminal)
+            .write_json(&value)
+            .unwrap();
+        fixture.remove();
+        assert_eq!(
+            fixture.close(exited, false).map_err(|e| error_text(&e)),
+            Ok(CloseOutcome::Missing),
+            "{label}"
+        );
+        fixture.assert_closed(label);
+    }
+
+    let mut refused: Vec<(&str, Damage, &str)> = vec![
+        (
+            "host PID zero",
+            |handle| handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(0),
+            PID,
+        ),
         (
             "a launch label TAB never generates",
             |handle| {
@@ -1477,82 +1573,86 @@ fn an_absent_terminal_settles_only_a_whole_creation_record() {
             LABEL,
         ),
         (
-            "host PID zero",
+            "an explicit null launch label",
             |handle| {
-                handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(0);
+                handle.insert("herdr_launch_nonce".into(), Value::Null);
             },
-            "records no host PID",
+            "records a null launch label",
         ),
     ];
-    // This platform's host birth with values it cannot report.
+    // The macOS and Linux readers never report a PID above `i32::MAX`.
+    #[cfg(unix)]
+    refused.extend([
+        (
+            "host PID above i32::MAX",
+            (|handle| handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(2_147_483_648_u64))
+                as Damage,
+            PID,
+        ),
+        (
+            "host PID 4294967295",
+            |handle| handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(u32::MAX),
+            PID,
+        ),
+        (
+            "another platform's host birth",
+            |handle| {
+                let core = handle
+                    .get_mut("herdr_core")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+                core.retain(|key, _| {
+                    !matches!(
+                        key.as_str(),
+                        "host_start_seconds" | "host_start_microseconds" | "linux_birth"
+                    )
+                });
+                core.insert("host_creation_time".into(), json!(1));
+            },
+            BIRTH,
+        ),
+    ]);
     #[cfg(target_os = "macos")]
-    damage.push((
-        "microseconds of a whole second",
+    refused.push((
+        "start microseconds of a whole second",
         |handle| {
             handle.get_mut("herdr_core").unwrap()["host_start_microseconds"] = json!(1_000_000);
         },
         BIRTH,
     ));
     #[cfg(target_os = "linux")]
-    damage.push((
-        "no start ticks",
+    refused.push((
+        "a boot identity of zeros",
         |handle| {
-            handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
+            handle.get_mut("herdr_core").unwrap()["linux_birth"]["boot_id"] =
+                json!("00000000-0000-0000-0000-000000000000");
         },
         BIRTH,
     ));
     #[cfg(windows)]
-    damage.push((
-        "no creation time",
-        |handle| {
-            handle.get_mut("herdr_core").unwrap()["host_creation_time"] = json!(0);
-        },
-        BIRTH,
-    ));
-    // Another platform's host birth in place of this one's.
-    #[cfg(unix)]
-    damage.push((
-        "another platform's host birth",
-        |handle| {
-            let core = handle
-                .get_mut("herdr_core")
-                .unwrap()
-                .as_object_mut()
-                .unwrap();
-            core.retain(|key, _| {
-                !matches!(
-                    key.as_str(),
-                    "host_start_seconds" | "host_start_microseconds" | "linux_birth"
-                )
-            });
-            core.insert("host_creation_time".into(), json!(1));
-        },
-        BIRTH,
-    ));
-    #[cfg(windows)]
-    damage.push((
-        "another platform's host birth",
-        |handle| {
-            let core = handle
-                .get_mut("herdr_core")
-                .unwrap()
-                .as_object_mut()
-                .unwrap();
-            core.remove("host_creation_time");
-            core.insert("host_start_seconds".into(), json!(1_800_000_000));
-            core.insert("host_start_microseconds".into(), json!(1));
-        },
-        BIRTH,
-    ));
-    #[cfg(windows)]
-    damage.push((
-        "no launch label on Windows",
-        |handle| {
-            handle.remove("herdr_launch_nonce");
-        },
-        "records no launch label",
-    ));
-    for (label, damage, refusal) in damage {
+    refused.extend([
+        (
+            "another platform's host birth",
+            (|handle| {
+                let core = handle
+                    .get_mut("herdr_core")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+                core.remove("host_creation_time");
+                core.insert("host_start_seconds".into(), json!(1_800_000_000));
+                core.insert("host_start_microseconds".into(), json!(1));
+            }) as Damage,
+            BIRTH,
+        ),
+        (
+            "no launch label on Windows",
+            omit_label,
+            "records no launch label",
+        ),
+    ]);
+    for (label, damage, refusal) in refused {
         let fixture = Fixture::new("ready", &complete_owner());
         let store = fixture.store();
         let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
@@ -1562,14 +1662,27 @@ fn an_absent_terminal_settles_only_a_whole_creation_record() {
             .write_json(&value)
             .unwrap();
         fixture.remove();
-        let text = error_text(&fixture.close(exited, false).unwrap_err());
+        let refused = fixture
+            .close(exited, false)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: settled as absent"));
+        let text = error_text(&refused);
         assert!(text.contains(refusal), "{label}: {text}");
         fixture.assert_retained(label, SessionState::Ready);
     }
+}
 
-    // The documented legacy exception: a macOS or Linux handle without a launch label settles.
-    #[cfg(unix)]
-    {
+// Review round 4, finding 3: a legacy macOS or Linux handle has no saved label, so its terminal's
+// label is checked as the generators wrote it (32 lowercase hexadecimal digits) before it is
+// compared with the terminal's name. A label of the name's 24 digits, or in upper case, is not
+// TAB's, and the finished terminal is left alone.
+#[cfg(unix)]
+#[test]
+fn a_legacy_handle_accepts_only_a_launch_label_as_written() {
+    for (label, launch) in [
+        ("the name's 24 digits", "0123456789abcdef01234567"),
+        ("upper case", "0123456789ABCDEF0123456789ABCDEF"),
+    ] {
         let fixture = Fixture::new("ready", &complete_owner());
         let store = fixture.store();
         let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
@@ -1578,12 +1691,14 @@ fn an_absent_terminal_settles_only_a_whole_creation_record() {
             .record(CoreRecord::Terminal)
             .write_json(&value)
             .unwrap();
-        fixture.remove();
-        assert_eq!(
-            fixture.close(exited, false).map_err(|e| error_text(&e)),
-            Ok(CloseOutcome::Missing)
-        );
-        fixture.assert_closed("a legacy handle without a launch label");
+        fixture.finish();
+        let mut labels = fixture.core.terminal("t7").unwrap()["labels"].clone();
+        labels[LAUNCH_LABEL] = json!(launch);
+        fixture.core.set("t7", "labels", labels);
+        fixture.core.clear_calls();
+        assert!(fixture.close(exited, false).is_err(), "{label}");
+        assert_eq!(fixture.mutations(), (0, 0), "{label}");
+        fixture.assert_retained(label, SessionState::Ready);
     }
 }
 
@@ -1607,6 +1722,12 @@ fn the_keep_refusal_names_the_recorded_core() {
     let text = error_text(&fixture.close(exited, false).unwrap_err());
     assert!(text.contains("HC_SOCKET"), "{text}");
     assert!(text.contains("keep t7 --off"), "{text}");
+    // Review round 4, finding 9: the refusal says that the recorded core answered, which
+    // `doctor --probe` shows as its unverified detail.
+    assert!(
+        text.contains("on the recorded Herdr Core core-a, which answered at its endpoint"),
+        "{text}"
+    );
 }
 
 // Review round 2, finding 5 at the close: a reuse that the live process at the PID contradicts
@@ -1773,7 +1894,7 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
             };
             let (recorded, mut linked): (Recorded<'_>, _) =
                 Recorded::open(core, &session, requirement, later())?.expect("present");
-            let observed = get(&mut linked, "t7", later())?.expect("present");
+            let seen = linked.observe("t7", later())?.expect("present");
             let basis = match evidence {
                 Some(evidence) => Basis::Created {
                     recorded: &recorded,
@@ -1781,21 +1902,18 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
                 },
                 None => Basis::Owned(&recorded),
             };
-            let core_id = linked.core_id().to_owned();
-            Ok(
-                match authority::grant(core, &basis, &core_id, &observed, killed)? {
-                    // A grant names the terminal it observed, on the core that answered.
-                    Grant::Kill(kill) => {
-                        assert_eq!((kill.core_id(), kill.address()), ("core-a", "t7"));
-                        "kill"
-                    }
-                    Grant::Remove(remove) => {
-                        assert_eq!((remove.core_id(), remove.address()), ("core-a", "t7"));
-                        "remove"
-                    }
-                    Grant::Wait => "wait",
-                },
-            )
+            Ok(match authority::grant(core, &basis, &seen, killed)? {
+                // A grant names the terminal it observed, on the core that answered.
+                Grant::Kill(kill) => {
+                    assert_eq!((kill.core_id(), kill.address()), ("core-a", "t7"));
+                    "kill"
+                }
+                Grant::Remove(remove) => {
+                    assert_eq!((remove.core_id(), remove.address()), ("core-a", "t7"));
+                    "remove"
+                }
+                Grant::Wait => "wait",
+            })
         })();
         match answer {
             Ok(answer) => assert_eq!(answer, expected, "{label}"),
@@ -1877,16 +1995,25 @@ fn an_interrupted_close_keeps_the_diagnosis_across_its_consumption_marker() {
     assert_eq!(closed.error.as_deref(), Some("provider launch timed out"));
 }
 
-// Review round 3, finding 7: the verified connection sends `terminal.kill` and `terminal.rm`
-// only for a grant over a terminal observed on its own core; a plain call naming either is not
-// sent, nor is a grant minted for another core.
+// Review rounds 3 and 4 (finding 1): a grant is minted only from an observation the verified
+// connection produced, which names that connection's core. `grant` takes no core id from its
+// caller and refuses an observation from another core; a grant for one core is not sent on a
+// connection to another; a plain call naming either mutation is not sent. Two cores both hold
+// a terminal at `t7`.
 #[test]
-fn a_mutation_reaches_the_core_only_through_a_grant_for_its_terminal() {
+fn a_grant_names_the_core_that_reported_its_terminal() {
     let fixture = Fixture::new("ready", &complete_owner());
     fixture.finish();
     let session = fixture.store().terminal().unwrap();
     let core: &dyn Core = &fixture.core;
-    let (recorded, mut linked) = Recorded::open(
+    let other = FakeCore::new();
+    other.0.borrow_mut().core_id = "core-b".into();
+    other
+        .0
+        .borrow_mut()
+        .terminals
+        .insert("t7".into(), fixture.core.terminal("t7").unwrap());
+    let (recorded, mut linked_a) = Recorded::open(
         core,
         &session,
         Requirement::Bound(&fixture.directory),
@@ -1894,18 +2021,95 @@ fn a_mutation_reaches_the_core_only_through_a_grant_for_its_terminal() {
     )
     .unwrap()
     .expect("present");
+    let socket = Path::new(&session.herdr_core().unwrap().socket);
+    let mut linked_b = link(&other, socket, Some("core-b"), later()).unwrap();
     for method in ["terminal.kill", "terminal.rm"] {
-        let sent = linked.call(method, json!({"terminal": "t7"}), later());
+        let sent = linked_a.call(method, json!({"terminal": "t7"}), later());
         assert!(matches!(sent, Err(CallError::NotSent(_))), "{method}");
     }
-    assert_eq!(fixture.mutations(), (0, 0));
-    let observed = get(&mut linked, "t7", later()).unwrap().expect("present");
-    let Grant::Remove(remove) =
-        authority::grant(core, &Basis::Owned(&recorded), "core-b", &observed, false).unwrap()
+    // core-b's `t7` mints nothing for a handle recorded on core-a.
+    let seen_b = linked_b.observe("t7", later()).unwrap().expect("present");
+    let refused = authority::grant(core, &Basis::Owned(&recorded), &seen_b, false)
+        .err()
+        .expect("an observation from another core is refused");
+    let text = error_text(&refused);
+    assert!(text.contains("observed on Herdr Core core-b"), "{text}");
+    // core-a's grant names core-a and is not sent to core-b.
+    let seen_a = linked_a.observe("t7", later()).unwrap().expect("present");
+    let Ok(Grant::Remove(remove)) =
+        authority::grant(core, &Basis::Owned(&recorded), &seen_a, false)
     else {
         panic!("a finished terminal is removed");
     };
-    let sent = linked.remove(remove, later());
-    assert!(matches!(sent, Err(CallError::NotSent(_))));
+    assert_eq!((remove.core_id(), remove.address()), ("core-a", "t7"));
+    assert!(
+        linked_b
+            .remove_confirmed(remove, later(), CloseOutcome::Missing)
+            .is_err()
+    );
     assert_eq!(fixture.mutations(), (0, 0));
+    let sent = other.methods();
+    assert!(
+        !sent
+            .iter()
+            .any(|method| method == "terminal.rm" || method == "terminal.kill"),
+        "{sent:?}"
+    );
+}
+
+// Review round 4, finding 7: a replay keeps the committed consumption marker. A close whose
+// pre-close Repair failed (another session's record, its process uninspectable) and whose
+// session stored a diagnosis commits both in the marker. The retry after an interruption there
+// records that combined reason once, and a later explicit close of the closed session keeps the
+// marker and the closed record as committed.
+#[test]
+fn a_replayed_consumption_marker_keeps_its_combined_reason_once() {
+    use crate::native::session::close::interruption::{self, Point};
+    let mut foreign = complete_owner();
+    foreign.managed_session_id = Some("session-foreign".into());
+    let fixture = Fixture::new("working", &foreign);
+    fixture.finish();
+    fixture.diagnose(SessionState::Working, "provider exited with status 7");
+    let interrupted = interruption::during(Point::ConsumptionMarkerWritten, || {
+        fixture.close(unknown, false)
+    });
+    assert!(interrupted.is_err(), "the close must stop at the marker");
+    let committed = fixture
+        .store()
+        .terminal_closed()
+        .unwrap()
+        .reason
+        .expect("the marker records the reason");
+    assert!(
+        committed.contains("pre-close session repair failed")
+            && committed.contains("provider exited with status 7"),
+        "{committed}"
+    );
+    fixture.close(unknown, false).unwrap();
+    let closed = fixture.store().closed_if_present().unwrap().unwrap();
+    assert_eq!(closed.error.as_deref(), Some(committed.as_str()));
+    fixture.close(unknown, false).unwrap();
+    let store = fixture.store();
+    assert_eq!(
+        store.terminal_closed().unwrap().reason.as_deref(),
+        Some(committed.as_str())
+    );
+    let closed = store.closed_if_present().unwrap().unwrap();
+    assert_eq!(closed.error.as_deref(), Some(committed.as_str()));
+}
+
+// Review round 4, finding 6: the close reads the owner record once. A record that cannot be read
+// (here a directory in its place) refuses the close on every OS: nothing is sent and the handle
+// is retained.
+#[test]
+fn an_owner_record_that_cannot_be_read_retains_the_handle() {
+    let fixture = Fixture::new("working", &complete_owner());
+    fixture.finish();
+    let owner = fixture.store().record(CoreRecord::Owner).path().to_owned();
+    fs::remove_file(&owner).unwrap();
+    fs::create_dir(&owner).unwrap();
+    fixture.core.clear_calls();
+    assert!(fixture.close(exited, false).is_err());
+    assert_eq!(fixture.mutations(), (0, 0));
+    fixture.assert_retained("an unreadable owner record", SessionState::Working);
 }

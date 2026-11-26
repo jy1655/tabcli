@@ -28,6 +28,7 @@ use crate::native::terminal::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use authority::{Basis, Grant};
+use framed::Framed;
 use identity::{CLOSE_STOPPED, Launch, Recorded, Requirement, binding_names_host, target};
 use linked::{Linked, Permit, link};
 use serde_json::{Value, json};
@@ -40,6 +41,7 @@ use std::{
 };
 
 mod authority;
+mod framed;
 mod identity;
 mod linked;
 #[cfg(windows)]
@@ -57,14 +59,6 @@ pub(in crate::native::terminal) use unix::Installed;
 
 const HOST_COMMAND: &str = TerminalKind::Herdr.registration().host_command;
 const GENERATION: u64 = 1;
-const REQUIRED_METHODS: [&str; 6] = [
-    "terminal.run",
-    "terminal.get",
-    "terminal.kill",
-    "terminal.rm",
-    "terminal.send",
-    "terminal.read",
-];
 /// The labels TAB gives its terminals: the session, and the launch attempt.
 const SESSION_LABEL: &str = "tabcli-session";
 const LAUNCH_LABEL: &str = "tabcli-launch";
@@ -260,95 +254,6 @@ fn timed_out(error: &std::io::Error) -> bool {
     )
 }
 
-/// One request, then its one reply line, at a time over a bounded stream: the framing both
-/// installed transports share. A request is unsent only while none of its bytes was
-/// written; after that, a missing or invalid reply leaves it unanswered, never unsent.
-pub(super) struct Framed<S> {
-    stream: S,
-    next_id: u64,
-    pending: Vec<u8>,
-}
-
-impl<S> Framed<S> {
-    pub(super) fn new(stream: S) -> Self {
-        Self {
-            stream,
-            next_id: 1,
-            pending: Vec::new(),
-        }
-    }
-}
-
-impl<S: Stream> Framed<S> {
-    fn read_line(&mut self, deadline: Instant) -> Result<Vec<u8>> {
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            if let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-                let line = self.pending.drain(..=end).collect();
-                return Ok(line);
-            }
-            if self.pending.len() > MAX_REPLY {
-                bail!("Herdr reply exceeds {MAX_REPLY} bytes");
-            }
-            let read = match self.stream.read_before(&mut buffer, deadline) {
-                Ok(read) => read,
-                Err(error) if timed_out(&error) => bail!("Herdr reply timed out"),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error).context("lost the Herdr Core connection"),
-            };
-            if read == 0 {
-                bail!("the Herdr Core closed the connection");
-            }
-            self.pending.extend_from_slice(&buffer[..read]);
-        }
-    }
-}
-
-impl<S: Stream> Connection for Framed<S> {
-    fn call(
-        &mut self,
-        _: Permit,
-        method: &str,
-        params: Value,
-        deadline: Instant,
-    ) -> Result<Value, CallError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-            .to_string()
-            .into_bytes();
-        request.push(b'\n');
-        let lost = |written: usize, error: anyhow::Error| {
-            if written == 0 {
-                CallError::NotSent(error)
-            } else {
-                CallError::Unanswered(error)
-            }
-        };
-        let mut written = 0;
-        while written < request.len() {
-            match self.stream.write_before(&request[written..], deadline) {
-                Ok(0) => {
-                    return Err(lost(written, anyhow!("the Herdr Core stopped reading")));
-                }
-                Ok(count) => written += count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) if timed_out(&error) => {
-                    return Err(lost(written, anyhow!("Herdr request timed out")));
-                }
-                Err(error) => {
-                    return Err(lost(
-                        written,
-                        anyhow::Error::new(error).context("cannot write to the Herdr Core"),
-                    ));
-                }
-            }
-        }
-        let line = self.read_line(deadline).map_err(CallError::Unanswered)?;
-        parse_reply(&line, id)
-    }
-}
-
 /// One JSON-RPC reply line for request `id`.
 pub(super) fn parse_reply(line: &[u8], id: u64) -> Result<Value, CallError> {
     let reply: Value = serde_json::from_slice(line)
@@ -379,35 +284,6 @@ pub(super) fn parse_reply(line: &[u8], id: u64) -> Result<Value, CallError> {
         .get("result")
         .cloned()
         .ok_or_else(|| CallError::Unanswered(anyhow!("Herdr reply has neither result nor error")))
-}
-
-pub(super) fn validate_hello(hello: &Value) -> Result<String> {
-    if hello.get("generation").and_then(Value::as_u64) != Some(GENERATION) {
-        bail!("Herdr Core does not speak protocol generation {GENERATION}");
-    }
-    hello
-        .get("version")
-        .and_then(Value::as_str)
-        .context("Herdr hello has no version")?;
-    let methods: Vec<&str> = hello
-        .get("methods")
-        .and_then(Value::as_array)
-        .context("Herdr hello has no method list")?
-        .iter()
-        .map(|method| method.as_str().context("Herdr method name is not text"))
-        .collect::<Result<_>>()?;
-    if let Some(missing) = REQUIRED_METHODS
-        .iter()
-        .find(|method| !methods.contains(method))
-    {
-        bail!("Herdr Core does not offer {missing}");
-    }
-    let id = hello
-        .pointer("/core/id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .context("Herdr hello has no core id")?;
-    Ok(id.to_owned())
 }
 
 /// A local terminal address: `t` and lowercase letters or digits. A remote terminal's
@@ -716,11 +592,11 @@ fn remove_created(
     let mut handle = None;
     let removed = (|| -> Result<()> {
         let mut linked = link(core, socket, Some(core_id), deadline)?;
-        let Some(first) = get(&mut linked, address, deadline)? else {
+        let Some(first) = linked.observe(address, deadline)? else {
             return Ok(());
         };
-        launch.check_cleanup(&first, &first)?;
-        handle = launch.recover_handle(core, &linked, &first);
+        launch.check_cleanup(first.observed(), first.observed())?;
+        handle = launch.recover_handle(core, &linked, first.observed());
         let basis = Basis::Launch {
             launch,
             first: &first,
@@ -771,53 +647,19 @@ fn end_and_remove(
                 "Herdr terminal {address} did not end before the close deadline; handle retained"
             );
         }
-        let Some(observed) = get(linked, address, deadline)? else {
+        let Some(seen) = linked.observe(address, deadline)? else {
             return Ok(outcome);
         };
-        let core_id = linked.core_id().to_owned();
-        match authority::grant(core, basis, &core_id, &observed, killed).context(CLOSE_STOPPED)? {
+        match authority::grant(core, basis, &seen, killed).context(CLOSE_STOPPED)? {
             Grant::Kill(kill) => {
-                end_program(linked, kill, deadline)?;
+                linked.end_program(kill, deadline)?;
                 killed = true;
                 outcome = CloseOutcome::Closed;
             }
             Grant::Wait => core.pause(deadline),
-            Grant::Remove(remove) => return remove_once(linked, remove, deadline, outcome),
+            Grant::Remove(remove) => return linked.remove_confirmed(remove, deadline, outcome),
         }
     }
-}
-
-/// One `terminal.kill`, which only `authority::grant` can permit.
-fn end_program(linked: &mut Linked<'_>, kill: authority::Kill, deadline: Instant) -> Result<()> {
-    match linked.kill(kill, deadline) {
-        Ok(_) => Ok(()),
-        Err(CallError::Refused { kind, .. }) if kind == "not_found" || kind == "finished" => Ok(()),
-        Err(error) => Err(error.into_error("terminal.kill")),
-    }
-}
-
-/// One `terminal.rm`, which only `authority::grant` can permit, and one read to confirm it.
-/// `not_found` from the recorded core answers the removal itself: another client removed the
-/// terminal after the last read. A removal the core acknowledged while it still lists the
-/// terminal is not sent again; the handle is kept for the next close.
-fn remove_once(
-    linked: &mut Linked<'_>,
-    remove: authority::Remove,
-    deadline: Instant,
-    outcome: CloseOutcome,
-) -> Result<CloseOutcome> {
-    let address = remove.address().to_owned();
-    match linked.remove(remove, deadline) {
-        Ok(_) => {}
-        Err(CallError::Refused { kind, .. }) if kind == "not_found" => return Ok(outcome),
-        Err(error) => return Err(error.into_error("terminal.rm")),
-    }
-    if get(linked, &address, deadline)?.is_some() {
-        bail!(
-            "Herdr terminal {address} is still held by its core after terminal.rm; the handle is retained"
-        );
-    }
-    Ok(CloseOutcome::Closed)
 }
 
 /// The close of a live, attested owner of this session, or of the launcher that bound the

@@ -13,7 +13,8 @@
 //! A `not_found` from the recorded core settles a `Created` close only after the handle's
 //! creation record was validated (`Recorded::open` with `Requirement::Created`).
 use super::identity::{Launch, Recorded};
-use super::{Core, Observed, State};
+use super::linked::Seen;
+use super::{Core, State};
 use crate::native::terminal::close_authority::CreationEvidence;
 use anyhow::{Result, bail};
 
@@ -25,7 +26,7 @@ pub(super) enum Basis<'a> {
     /// The launch that created the terminal removes it before any binding.
     Launch {
         launch: &'a Launch<'a>,
-        first: &'a Observed,
+        first: &'a Seen,
     },
     /// No live owner of this session: the terminal's creation record decides, with the
     /// decision's admitted evidence.
@@ -52,14 +53,14 @@ pub(super) fn admit(evidence: CreationEvidence) -> Result<Admitted> {
 }
 
 /// The authority to send one `terminal.kill` to the terminal `grant` observed, on its core.
-/// Only `grant` constructs it, and only `Linked::kill` consumes it.
+/// Only `grant` constructs it, and only `Linked::end_program` consumes it.
 pub(super) struct Kill {
     core_id: String,
     address: String,
 }
 
 /// The authority to send one `terminal.rm` to the terminal `grant` observed, on its core.
-/// Only `grant` constructs it, and only `Linked::remove` consumes it.
+/// Only `grant` constructs it, and only `Linked::remove_confirmed` consumes it.
 pub(super) struct Remove {
     core_id: String,
     address: String,
@@ -92,20 +93,34 @@ pub(super) enum Grant {
     Wait,
 }
 
-/// The only function that grants `terminal.kill` or `terminal.rm`, for the terminal observed on
-/// the connection to core `core_id`.
+/// The only function that grants `terminal.kill` or `terminal.rm`. It mints from `seen`, an
+/// observation a verified connection produced, so the grant names the core that reported the
+/// terminal and that terminal's address; it refuses an observation from any core other than the
+/// one the basis is about.
 pub(super) fn grant(
     core: &dyn Core,
     basis: &Basis<'_>,
-    core_id: &str,
-    observed: &Observed,
+    seen: &Seen,
     killed: bool,
 ) -> Result<Grant> {
+    let expected = match basis {
+        Basis::Owned(recorded) | Basis::Created { recorded, .. } => recorded.core_id(),
+        Basis::Launch { first, .. } => first.core_id(),
+    };
+    let observed = seen.observed();
+    if seen.core_id() != expected {
+        bail!(
+            "Herdr terminal {} was observed on Herdr Core {}, not on the core {expected} this close acts on; nothing was sent",
+            observed.address,
+            seen.core_id()
+        );
+    }
     match basis {
         Basis::Owned(recorded) => recorded.check(core, observed)?,
-        Basis::Launch { launch, first } => launch.check_cleanup(first, observed)?,
+        Basis::Launch { launch, first } => launch.check_cleanup(first.observed(), observed)?,
         Basis::Created { recorded, .. } => recorded.check_creation_record(core, observed)?,
     }
+    let core_id = seen.core_id();
     match observed.state {
         State::Finished => Ok(Grant::Remove(Remove {
             core_id: core_id.to_owned(),

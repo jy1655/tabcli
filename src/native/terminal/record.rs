@@ -4,7 +4,7 @@
 //! even mixed-kind and incomplete legacy records retain every recognized field for equality.
 use super::{LinuxBirth, TerminalKind, WezTermMux, WindowsProcessIdentity};
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const fn legacy_iterm2_kind() -> TerminalKind {
     TerminalKind::Iterm2
@@ -35,8 +35,47 @@ pub(in crate::native) struct TerminalSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     herdr_core: Option<HerdrSurface>,
     // Older readers accept new top-level fields. Their flattened Herdr birth is strict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    herdr_launch_nonce: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "LaunchNonce::is_omitted",
+        deserialize_with = "LaunchNonce::present"
+    )]
+    herdr_launch_nonce: LaunchNonce,
+}
+
+/// The launch label a Herdr handle saved. The macOS and Linux writers of 0.4.45 and 0.4.46
+/// omitted it; every later writer saved the 32 lowercase hexadecimal digits it generated. No
+/// released writer saved an explicit `null`: one is kept as read, so that a close on the
+/// creation record never takes it for the legacy omission.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum LaunchNonce {
+    #[default]
+    Omitted,
+    Null,
+    Saved(String),
+}
+
+impl LaunchNonce {
+    fn is_omitted(&self) -> bool {
+        matches!(self, Self::Omitted)
+    }
+
+    /// Called only for a field that is present: `null` or a string.
+    fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<String>::deserialize(deserializer)? {
+            None => Self::Null,
+            Some(nonce) => Self::Saved(nonce),
+        })
+    }
+}
+
+impl Serialize for LaunchNonce {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Saved(nonce) => serializer.serialize_str(nonce),
+            Self::Omitted | Self::Null => serializer.serialize_none(),
+        }
+    }
 }
 
 /// A Herdr terminal's creation identity: the core that answered on `socket` with its
@@ -95,7 +134,7 @@ impl TerminalSession {
             linux_host: None,
             tmux_socket: None,
             herdr_core: None,
-            herdr_launch_nonce: None,
+            herdr_launch_nonce: LaunchNonce::Omitted,
         }
     }
 
@@ -148,7 +187,7 @@ impl TerminalSession {
         launch_nonce: &str,
     ) -> Self {
         self.herdr_core = Some(core);
-        self.herdr_launch_nonce = Some(launch_nonce.to_owned());
+        self.herdr_launch_nonce = LaunchNonce::Saved(launch_nonce.to_owned());
         self
     }
 
@@ -159,7 +198,16 @@ impl TerminalSession {
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native::terminal) fn herdr_launch_nonce(&self) -> Option<&str> {
-        self.herdr_launch_nonce.as_deref()
+        match &self.herdr_launch_nonce {
+            LaunchNonce::Saved(nonce) => Some(nonce),
+            LaunchNonce::Omitted | LaunchNonce::Null => None,
+        }
+    }
+
+    /// The handle saved an explicit `null` launch label, which no released writer did.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(in crate::native::terminal) fn herdr_launch_nonce_is_null(&self) -> bool {
+        self.herdr_launch_nonce == LaunchNonce::Null
     }
 
     #[cfg(target_os = "linux")]
@@ -245,6 +293,22 @@ mod tests {
             record.verify_managed_session("session-record").unwrap();
             assert!(record.verify_managed_session("session-other").is_err());
         }
+    }
+
+    // An explicit `null` launch label is kept as read: it is neither the legacy omission nor a
+    // label (review round 4, finding 3).
+    #[test]
+    fn a_null_launch_label_is_kept_apart_from_an_omitted_one() {
+        let mut wire = mixed_record();
+        wire["herdr_launch_nonce"] = Value::Null;
+        let null: TerminalSession = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&null).unwrap(), wire);
+        assert!(null.herdr_launch_nonce_is_null());
+        assert_eq!(null.herdr_launch_nonce(), None);
+        wire.as_object_mut().unwrap().remove("herdr_launch_nonce");
+        let omitted: TerminalSession = serde_json::from_value(wire).unwrap();
+        assert!(!omitted.herdr_launch_nonce_is_null());
+        assert_ne!(null, omitted);
     }
 
     #[test]

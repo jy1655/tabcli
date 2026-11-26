@@ -104,6 +104,17 @@ impl Show for NativeSessionOwner {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+impl Show for super::OwnerRead {
+    fn show(&self) -> String {
+        match self {
+            Self::Absent => "absent".to_owned(),
+            Self::Malformed => "malformed".to_owned(),
+            Self::Recorded(owner) => owner.show(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl Show for OwnerObservation {
     fn show(&self) -> String {
         format!(
@@ -160,6 +171,8 @@ pub(in crate::native) struct TestObservation<'a> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     owner_present: Member<'a, dyn FnMut() -> Result<bool> + 'a>,
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    read_owner: Member<'a, dyn FnMut() -> Result<super::OwnerRead> + 'a>,
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     launch: Member<'a, dyn FnMut() -> Result<Option<launch::Record>> + 'a>,
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     status: Member<'a, dyn FnMut() -> Result<SessionStatus> + 'a>,
@@ -199,6 +212,8 @@ impl<'a> TestObservation<'a> {
             teardown_intent: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             owner_present: RefCell::new(None),
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            read_owner: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             launch: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -253,8 +268,15 @@ impl<'a> TestObservation<'a> {
             launch,
         } = values;
         let present = owner.is_some();
+        let read = owner.clone();
         let observation = Self::empty(None)
             .with_owner_present(move || Ok(present))
+            .with_read_owner(move || {
+                Ok(match read.clone() {
+                    None => super::OwnerRead::Absent,
+                    Some(owner) => super::OwnerRead::Recorded(Box::new(owner)),
+                })
+            })
             .with_launch(move || Ok(launch.clone()))
             .with_status(move || {
                 Ok(SessionStatus {
@@ -350,6 +372,16 @@ impl<'a> TestObservation<'a> {
         f: impl FnMut() -> Result<bool> + 'a,
     ) -> Self {
         *self.owner_present.borrow_mut() = Some(Box::new(f));
+        self
+    }
+
+    /// The one typed read of the Owner record that a kind whose core keeps its terminals makes.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(in crate::native) fn with_read_owner(
+        self,
+        f: impl FnMut() -> Result<super::OwnerRead> + 'a,
+    ) -> Self {
+        *self.read_owner.borrow_mut() = Some(Box::new(f));
         self
     }
 
@@ -502,18 +534,17 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
-    // A test scripts the record's presence and its decoded owner separately; the typed read is
-    // composed from those two members, so the trace keeps naming them. A production-backed
-    // observation's two members read the same Record under the same policy.
+    // One typed read, as production makes it: a scripted result, or the Record-backed
+    // observation's own production read.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn read_owner(&self) -> Result<super::OwnerRead> {
-        if !self.owner_present()? {
-            return Ok(super::OwnerRead::Absent);
-        }
-        Ok(match self.owner() {
-            Ok(owner) => super::OwnerRead::Recorded(Box::new(owner)),
-            Err(_) => super::OwnerRead::Malformed,
-        })
+        let call = self.begin("read-owner");
+        let result = match self.read_owner.borrow_mut().as_mut() {
+            Some(f) => f(),
+            None => self.production("read-owner").read_owner(),
+        };
+        self.finish(call, &result);
+        result
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
