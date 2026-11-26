@@ -472,6 +472,10 @@ pub(super) struct Observed {
     pub(super) created_ms: u64,
     pub(super) launch: Option<String>,
     pub(super) name: Option<String>,
+    /// The exit code the core reports for a finished terminal, if any. Only a diagnostic:
+    /// the field name is read from the installed hc 0.1.22 (its `exit_code`), and nothing
+    /// is decided on it.
+    pub(super) exit_code: Option<i64>,
 }
 
 pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
@@ -529,6 +533,7 @@ pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
                 .to_owned(),
         ),
     };
+    let exit_code = value.get("exit_code").and_then(Value::as_i64);
     Ok(Observed {
         address,
         state,
@@ -538,6 +543,7 @@ pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
         created_ms,
         launch,
         name,
+        exit_code,
     })
 }
 
@@ -915,6 +921,41 @@ fn surface_present(
     Ok(Recorded::open(core, session, Requirement::Bound(directory), deadline)?.is_some())
 }
 
+/// The launcher's probe before startup is confirmed: the exact terminal this launch created,
+/// proved on its recorded core as for presence, and with the launch's own label when the
+/// handle records it. Only that core's `not_found` is absence; a finished terminal is the end
+/// of the launch host before the provider started, which the core keeps until it is removed.
+fn launch_surface(
+    core: &dyn Core,
+    session: &TerminalSession,
+    directory: &Path,
+    timeout: Duration,
+) -> Result<super::LaunchSurface> {
+    let deadline = deadline_after(timeout)?;
+    let Some(observed) = Recorded::observe(core, session, Requirement::Bound(directory), deadline)?
+    else {
+        return Ok(super::LaunchSurface::Absent);
+    };
+    if observed.state == State::Live {
+        return Ok(super::LaunchSurface::Present);
+    }
+    if let Some(expected) = session.herdr_launch_nonce()
+        && observed.launch.as_deref() != Some(expected)
+    {
+        bail!(
+            "finished Herdr terminal {} has a different launch label",
+            observed.address
+        );
+    }
+    Ok(super::LaunchSurface::Finished(match observed.exit_code {
+        Some(code) => format!(
+            "Herdr terminal {} exited with code {code}",
+            observed.address
+        ),
+        None => format!("Herdr terminal {} finished", observed.address),
+    }))
+}
+
 fn verify_surface(
     core: &dyn Core,
     session: &TerminalSession,
@@ -1162,6 +1203,15 @@ impl<C: Core> Adapter<C> {
         surface_present(&self.core, session, directory, timeout)
     }
 
+    pub(in crate::native::terminal) fn during_launch(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<super::LaunchSurface> {
+        launch_surface(&self.core, session, directory, timeout)
+    }
+
     pub(in crate::native::terminal) fn screen(
         &self,
         session: &TerminalSession,
@@ -1236,6 +1286,14 @@ mod posix_adapter {
             timeout: Duration,
         ) -> Result<bool> {
             self.present(directory, session, timeout)
+        }
+        fn launch_surface(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            timeout: Duration,
+        ) -> Result<crate::native::terminal::LaunchSurface> {
+            self.during_launch(directory, session, timeout)
         }
         fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
             self.screen(session, deadline)
@@ -1363,6 +1421,14 @@ mod windows_adapter {
             timeout: Duration,
         ) -> Result<bool> {
             self.present(directory, session, timeout)
+        }
+        fn launch_surface(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            timeout: Duration,
+        ) -> Result<crate::native::terminal::LaunchSurface> {
+            self.during_launch(directory, session, timeout)
         }
     }
 }

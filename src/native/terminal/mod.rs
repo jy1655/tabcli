@@ -711,6 +711,47 @@ pub(super) fn close_session_until(
     }
 }
 
+/// What the launcher's wait finds of the surface it launched, before startup is confirmed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) enum LaunchSurface {
+    Present,
+    Absent,
+    /// The surface remains but its program ended: a core that keeps a finished terminal
+    /// says so of the exact terminal the launch created. The text names it and, when the
+    /// core gives it, its exit code.
+    Finished(String),
+}
+
+impl LaunchSurface {
+    #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+    pub(in crate::native) fn from_presence(present: bool) -> Self {
+        if present { Self::Present } else { Self::Absent }
+    }
+}
+
+/// The read-only probe of the launcher's wait: presence, and for an adapter whose surface
+/// outlives its program, whether that program has finished (an inspection error proves
+/// neither absence nor an end).
+pub(super) fn launch_surface(
+    directory: &Path,
+    session: &TerminalSession,
+    timeout: std::time::Duration,
+) -> Result<LaunchSurface> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        posix::launch_surface(posix_installed(), directory, session, timeout)
+    }
+    #[cfg(windows)]
+    {
+        windows_dispatch::launch_surface(windows_installed(), directory, session, timeout)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (directory, session, timeout);
+        bail!("terminal surface probes are unsupported on this platform")
+    }
+}
+
 /// Read-only presence check. Unlike control authorization, absence and an inspection
 /// error have different meanings. Never open a terminal app merely to diagnose it.
 pub(super) fn surface_present(

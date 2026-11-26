@@ -293,7 +293,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   for the lifecycle lock. A refusal only the host can know goes to the launch log from the
   Herdr and tmux hosts and the macOS capture host on every platform (`run_logged_bound_host`),
   only into a real directory; the tty-bound hosts, Ghostty and Warp write nothing into a
-  directory they refuse. It owns the
+  directory they refuse. The launcher's wait probes its surface through the adapter's
+  `launch_surface` (by default its presence): Herdr reports its terminal finished, which fails
+  a launch not yet confirmed at the next probe, as an absent surface does; a confirmed
+  startup and a launch-host Record decide first under the lifecycle lock. It owns the
   registered launch-host dispatch, the shared binding wait, startup input flush and refusal
   log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
   before flushing input. The Windows Terminal tab host uses its own offer protocol.

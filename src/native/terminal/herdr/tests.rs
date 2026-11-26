@@ -749,6 +749,53 @@ fn creation_admits_the_directory_on_the_connection_that_runs_the_terminal() {
     assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), run)]);
 }
 
+// The launcher's probe before startup is confirmed reads the exact terminal this launch
+// created, with the presence proof: live is present, the core's `not_found` is absence, and a
+// finished terminal is the end of its program, with its exit code when the core gives one. A
+// finished terminal with another launch label, one set to keep, or one that is not this
+// launch's is an inspection error, which ends nothing.
+#[test]
+fn the_launch_probe_reports_a_finished_launch_terminal() {
+    let core = FakeCore::new();
+    let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
+    let probe = || adapter.during_launch(Path::new(DIRECTORY), &session, Duration::from_secs(5));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Present
+    );
+    core.set("t7", "state", json!("finished"));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Finished("Herdr terminal t7 finished".into())
+    );
+    core.set("t7", "exit_code", json!(3));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Finished(
+            "Herdr terminal t7 exited with code 3".into()
+        )
+    );
+    let labels = core.terminal("t7").unwrap()["labels"].clone();
+    core.set(
+        "t7",
+        "labels",
+        json!({SESSION_LABEL: SESSION, LAUNCH_LABEL: "another"}),
+    );
+    assert!(error_text(&probe().unwrap_err()).contains("different launch label"));
+    core.set("t7", "labels", labels);
+    core.set("t7", "keep", json!(true));
+    assert!(error_text(&probe().unwrap_err()).contains("set to keep"));
+    core.set("t7", "keep", json!(false));
+    core.set("t7", "created_ms", json!(1));
+    assert!(error_text(&probe().unwrap_err()).contains("is not the terminal this session created"));
+    core.0.borrow_mut().terminals.clear();
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Absent
+    );
+}
+
 #[test]
 fn a_refused_run_creates_nothing_and_is_not_recovered() {
     let core = FakeCore::new();

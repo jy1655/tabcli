@@ -185,8 +185,12 @@ start at once with the host's reason, recorded as `terminal launch failed: ...; 
 handle was recorded and no prompt was sent`; the failed session can be closed and pruned like
 any other. A refusal only the host can know, such as a directory changed after TAB's check, is
 written to the launch log by the Herdr, tmux, iTerm2 and WezTerm hosts (the Terminal.app,
-Ghostty and Warp hosts write nothing into a directory they refuse), and the start ends at the
-launch deadline. A workspace,
+Ghostty and Warp hosts write nothing into a directory they refuse). A Herdr start then fails
+within about a second, when the core reports the launch's terminal finished before startup was
+confirmed (`terminal surface finished before provider launch was confirmed`, with its exit
+code when the core gives one and the launch log when it holds the host's refusal), as a tmux
+start does when its surface disappears; other surfaces end at the launch deadline unless their
+surface disappears first. A workspace,
 state directory or TAB executable path that is not Unicode text is refused before the launch,
 because the launch carries these paths as text.
 

@@ -71,14 +71,32 @@
   this check, a program started under another token than the core's own, an I/O failure the
   host alone meets) is still the host's: every Herdr host, on macOS too, writes its admission
   refusal to the launch log, only into a real directory, as a diagnostic, not a Record. The
-  host has not verified that it owns the launch, so it publishes no Record, and its finished
-  terminal still reads as present until the launch deadline.
+  host has not verified that it owns the launch, so it publishes no Record.
+- The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
+  (`launch_surface`): the exact terminal with the presence proof, and the launch label when
+  the handle records one. A terminal its verified core reports finished before startup was
+  confirmed fails the launch at the next probe, about a second, on every platform, as a tmux
+  surface that disappears does (owner's decision 2026-11-26, option A). This reverses, for a
+  host that ended before startup, #409's choice to leave its admission, receipt, binding and
+  Pending-launch refusals to the launch deadline. The finished terminal can only fail a
+  launch: under the lifecycle lock a confirmed startup and a launch-host Record
+  (`input_flush_failed`, `launch_shell_exec_failed`) keep their own outcome, and a terminal
+  that finished after confirmation is not this case. The failure is `terminal surface finished
+  before provider launch was confirmed (Herdr terminal t7 exited with code N)`; the exit code
+  is the core's `exit_code` when it gives one (the field name is read from the installed hc
+  0.1.22's string table, not from a live core, and nothing is decided on it), and when the
+  launch log holds a host refusal the failure names that log. The launch ends as at the
+  deadline: failed status with that reason, the Claim released, the receipt pending, the
+  launch log line, and the surface handle kept, so `close-session` removes the finished
+  terminal (`terminal.rm`) as for any finished Herdr terminal.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface
   under the lifecycle lock. Launch wait and repair read it through the same settlement as
   the macOS host. A missing or different birth keeps the refusal in the launch log. A
-  PowerShell wait error after successful spawn also reaches only the launch log.
+  PowerShell wait error after successful spawn also reaches only the launch log. When such a
+  host then exits, the wait below ends at its finished terminal; a provider spawn that had not
+  begun is then refused by the wrapper's fence, and one that had keeps its own outcome.
 - The core gives programs its own environment, not the caller's, and it can carry another
   session's markers: the core on the owner's Mac on 2026-11-18 carried Claude Code's
   child-session and messaging variables. Every launch host removes the adapters' caller markers

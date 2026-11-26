@@ -39,10 +39,10 @@ struct Probes<F> {
 }
 
 impl<F: FnMut(u64) -> Result<bool>> SurfacePresence for Probes<F> {
-    fn present(&mut self, timeout: Duration) -> Result<bool> {
+    fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface> {
         let at = ms(self.now.get() - self.start);
         self.calls.push((at, ms(timeout)));
-        (self.answer)(at)
+        (self.answer)(at).map(terminal::LaunchSurface::from_presence)
     }
 }
 

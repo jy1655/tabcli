@@ -397,6 +397,10 @@ mod herdr_core {
         errors.push(
             surface_present(&dispatch, &directory, &handle, Duration::from_secs(5)).unwrap_err(),
         );
+        // The launcher's probe: an unanswered core is neither absence nor an end.
+        errors.push(
+            launch_surface(&dispatch, &directory, &handle, Duration::from_secs(5)).unwrap_err(),
+        );
         for error in errors {
             assert!(format!("{error:#}").contains(UNANSWERED), "{error:#}");
         }
@@ -412,7 +416,7 @@ mod herdr_core {
 
         assert!(dispatch.console.calls().is_empty());
         let mut expected = vec![created_at];
-        expected.extend(vec![recorded; 5]);
+        expected.extend(vec![recorded; 6]);
         assert_eq!(*connects.borrow(), expected);
     }
 }

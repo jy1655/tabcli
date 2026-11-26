@@ -765,6 +765,7 @@ fn repair_with_owner(
 const LAUNCH_DEADLINE: &str = "provider launch timed out before startup was confirmed";
 const SURFACE_DISAPPEARED: &str =
     "terminal surface disappeared before provider launch was confirmed";
+const SURFACE_FINISHED: &str = "terminal surface finished before provider launch was confirmed";
 /// The wait inspects the surface this often, first one interval after it starts.
 const SURFACE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// One inspection may take this long, and never past the deadline.
@@ -773,9 +774,10 @@ const SURFACE_PROBE_BOUND: Duration = Duration::from_secs(2);
 const WAIT_POLL: Duration = Duration::from_millis(100);
 
 /// The surface observation port of the launcher's wait: whether the launch's terminal
-/// surface is still present. An inspection error does not prove absence.
+/// surface is still present, or remains with its program finished. An inspection error
+/// proves neither absence nor an end.
 trait SurfacePresence {
-    fn present(&mut self, timeout: Duration) -> Result<bool>;
+    fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface>;
 }
 
 /// Production: the terminal's read-only presence check of the launch's surface.
@@ -785,9 +787,32 @@ struct TerminalSurface<'a> {
 }
 
 impl SurfacePresence for TerminalSurface<'_> {
-    fn present(&mut self, timeout: Duration) -> Result<bool> {
-        terminal::surface_present(self.directory, self.surface, timeout)
+    fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface> {
+        terminal::launch_surface(self.directory, self.surface, timeout)
     }
+}
+
+// The failure of a launch whose surface remains but whose program finished before startup
+// was confirmed (a Herdr terminal): what the probe saw, and where the launch host's own
+// reason is when it logged a refusal. The log is only pointed to; its text is no evidence.
+fn finished_reason(reader: &Reader, finished: &str) -> String {
+    use std::io::Read;
+    let log = reader.private(LOG).path().to_owned();
+    let mut text = Vec::new();
+    let refused = std::fs::File::open(&log)
+        .and_then(|file| file.take(1024 * 1024).read_to_end(&mut text))
+        .is_ok()
+        && String::from_utf8_lossy(&text)
+            .lines()
+            .any(|line| line.contains("_host_refused"));
+    let mut reason = format!("{SURFACE_FINISHED} ({finished})");
+    if refused {
+        reason.push_str(&format!(
+            "; its launch host logged a refusal in {}",
+            log.display()
+        ));
+    }
+    reason
 }
 
 pub(in crate::native) fn wait(
@@ -807,9 +832,10 @@ pub(in crate::native) fn wait(
 }
 
 /// The launcher's wait for a confirmed launch. Each poll reads the records, then decides on
-/// the time and the surface: at the deadline, or when a due probe finds the surface gone,
-/// the wait settles the launch under the lifecycle lock. Every reading of time and every
-/// sleep goes through `clock`.
+/// the time and the surface: at the deadline, or when a due probe finds the surface gone or
+/// its program finished (a Herdr terminal, owner's decision 2026-11-26), the wait settles the
+/// launch under the lifecycle lock, where a confirmed startup or a launch-host Record keeps
+/// its own outcome. Every reading of time and every sleep goes through `clock`.
 fn wait_with(
     store: &Store,
     deadline: Instant,
@@ -828,9 +854,12 @@ fn wait_with(
         } else if clock.now() >= next_probe {
             next_probe = clock.now() + SURFACE_PROBE_INTERVAL;
             match presence.present(remaining.min(SURFACE_PROBE_BOUND)) {
-                Ok(false) => Some(SURFACE_DISAPPEARED.to_owned()),
+                Ok(terminal::LaunchSurface::Absent) => Some(SURFACE_DISAPPEARED.to_owned()),
+                Ok(terminal::LaunchSurface::Finished(finished)) => {
+                    Some(finished_reason(store, &finished))
+                }
                 // Inspection errors (including permissions/timeouts) do not prove absence.
-                Ok(true) | Err(_) => None,
+                Ok(terminal::LaunchSurface::Present) | Err(_) => None,
             }
         } else {
             None
