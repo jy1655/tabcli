@@ -8,8 +8,8 @@ use super::trust::{
 };
 use super::turn::read_pending_turn;
 use super::{
-    AGY_LOG_FILE, APPLIED_MARKER, FULL_TRANSCRIPT_FILE, SESSION_SETTINGS_FILE, TRANSCRIPT_FILE,
-    TRUST_RECOVERY, TRUST_STORE_MISSING,
+    AGY_LOG_FILE, APPLIED_MARKER, FULL_TRANSCRIPT_FILE, TRANSCRIPT_FILE, TRUST_RECOVERY,
+    TRUST_STORE_MISSING,
 };
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::session::{Reader, SessionState};
@@ -109,7 +109,7 @@ pub(super) fn workspace_trust_check(
     let mut evidence =
         serde_json::json!({ "workspace": workspace, "store": home.settings, "log": log_path });
     if configured {
-        evidence["session_settings"] = serde_json::json!(directory.join(SESSION_SETTINGS_FILE));
+        evidence["session_settings"] = serde_json::json!(super::session_settings_files(directory));
     }
     Check::new(
         CheckId::AGY_WORKSPACE_TRUST,

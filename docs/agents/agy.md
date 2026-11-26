@@ -19,11 +19,20 @@
   the version that the wrapper's own probe returned for this launch (`LaunchContext::
   provider_version`) at 1.5.17 or newer (the text must be the version alone), the launch hands
   Agy the exact workspace through its own `--settings` ("Settings for this session only,
-  never saved"): a private `agy-session-trust.json` in the session directory holding
+  never saved"): a private file in the session directory holding
   `{"trustedWorkspaces":[<native key>]}`, then the applied marker `agy-settings-override`.
-  The plan carries that option and the workspace it was granted for to the spawn fence, which
-  asks the authority about this command again immediately before the provider starts. The
-  version is
+  The command's workspace is checked against the consent record before the file is written,
+  and each granted plan has a file of its own, `agy-session-trust-<random>.json`, created new
+  so that no other planning attempt for the session replaces it (review r5, finding 1). The
+  plan carries the option, the workspace it was granted for and that file's path and digest to
+  the spawn fence, which asks the authority about this command again immediately before the
+  provider starts and refuses a file that is not the one the plan wrote. Removal: a plan refused
+  after the file was written removes it; a plan refused before (the workspace check) writes
+  none. The files stay with the session's other records after it ends, as do those of a plan
+  refused at the spawn fence and of a wrapper that crashed before recording the marker (inert:
+  no Agy was started with them), until `tabcli prune-sessions` removes the session directory.
+  0.4.49 ignores them, as every file it does not name, and its prune removes the directory
+  whole. The version is
   judged before any consent work. An Agy positively identified as older records only
   `launch-option-unavailable` and is the one Agy launch whose exact consent may still take the
   guarded dialog answer; a version that identifies nothing, or a refused or failing check on a

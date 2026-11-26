@@ -6,6 +6,7 @@ use crate::native::session::{Reader, RecordReader, RecordStore, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -139,6 +140,22 @@ fn listed(path: &Path, env: &Environment, pin: Option<&Evidence>) -> Result<bool
         })),
     }
 }
+
+/// Provider or Git evidence that a recheck could not read: a pinned source's store, the
+/// registration and the main working tree that a `.git` file names, the source's reading of the
+/// worktree. The authority reports it as a refusal marked unreadable (review r4, finding 1). Any
+/// other error, such as TAB's own shared consent record that cannot be read or decoded, or the
+/// workspace that cannot be identified, propagates as in 0.4.49 (review r5, finding 2).
+#[derive(Debug)]
+pub(in crate::native) struct EvidenceUnreadable(&'static str);
+
+impl std::fmt::Display for EvidenceUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for EvidenceUnreadable {}
 
 // Whether `error` says that evidence could not be read, rather than that a fact does not hold:
 // an I/O error other than a missing file. A missing registration, main working tree or `.git`
@@ -314,7 +331,9 @@ fn decide(
                     Ok(Trust::Trusted(now)) => now == *source,
                     Ok(_) => false,
                     Err(error) if mode == Mode::Recheck => {
-                        return Err(error.context("the pinned source's trust cannot be read"));
+                        return Err(error.context(EvidenceUnreadable(
+                            "the pinned source's trust cannot be read",
+                        )));
                     }
                     Err(_) => false,
                 }
@@ -382,7 +401,16 @@ fn inherited(
     pin: Option<&Evidence>,
 ) -> Result<Option<(Evidence, Identity)>> {
     let strict = mode == Mode::Recheck;
+    // At a recheck, provider and Git evidence that cannot be read is typed as such, and the main
+    // working tree's own assessment passes its errors on as they are.
     let unread = |error: anyhow::Error| if strict { Err(error) } else { Ok(None) };
+    let evidence = |error: anyhow::Error, what: &'static str| {
+        if strict {
+            Err(error.context(EvidenceUnreadable(what)))
+        } else {
+            Ok(None)
+        }
+    };
     let mut screen_error = None;
     let verified = worktree::main_worktree(workspace, &mut |main| {
         listed(main, env, pin).unwrap_or_else(|error| {
@@ -395,15 +423,19 @@ fn inherited(
         Ok(None) => return Ok(None),
         Err(error) => {
             return match screen_error {
-                Some(error) => unread(error),
-                None if unreadable(&error) => unread(error),
+                Some(error) => evidence(error, "the pinned source's store cannot be read"),
+                None if unreadable(&error) => {
+                    evidence(error, "the worktree's registration cannot be read")
+                }
                 None => Ok(None),
             };
         }
     };
     let main_identity = match identity(&main) {
         Ok(identity) => identity,
-        Err(error) if unreadable(&error) => return unread(error),
+        Err(error) if unreadable(&error) => {
+            return evidence(error, "the main working tree cannot be identified");
+        }
         Err(_) => return Ok(None),
     };
     // Two records under one lock file would wait on each other.
@@ -430,7 +462,7 @@ fn inherited(
     match provider::workspace_trust(cli, workspace, env, Some(&source.store)) {
         Ok(Trust::Absent | Trust::Trusted(_)) => Ok(Some((source, main_identity))),
         Ok(Trust::Declined) => Ok(None),
-        Err(error) => unread(error),
+        Err(error) => evidence(error, "the source's trust of the worktree cannot be read"),
     }
 }
 
@@ -535,26 +567,48 @@ fn with_session_record<T>(
 /// for (the wrapper's snapshot that gives it its working directory and its option): a consent
 /// record for another directory, or one whose identity is not that directory's now, grants
 /// nothing (review r4, finding 2).
+/// `option_file` is a file the option names (Agy's settings) and the bytes the plan wrote to it:
+/// the grant names it, and the spawn fence refuses a command whose file is not that one.
 pub(in crate::native) fn apply_option(
     directory: &Path,
     provider: FirstPartyCli,
     marker: &'static str,
     workspace: &Path,
+    option_file: Option<(&Path, &[u8])>,
 ) -> Result<super::authority::LaunchGrant> {
     with_session_record(directory, None, |path, mut assessment| {
-        if assessment.identity.path != workspace || identity(workspace)? != assessment.identity {
-            bail!(
-                "the session's consent names another workspace than the command's, so its launch option is not granted"
-            );
-        }
+        command_workspace(&assessment, workspace)?;
         assessment.applied = Some(marker.to_owned());
         RecordStore::at(path).write_json(&assessment)?;
         Ok(super::authority::LaunchGrant {
             provider,
             marker,
             workspace: assessment.identity,
+            option_file: option_file.map(|(file, bytes)| super::authority::OptionFile {
+                path: file.to_owned(),
+                sha256: sha2::Sha256::digest(bytes).into(),
+            }),
         })
     })
+}
+
+/// Checks, before a plan publishes anything for its option, that the session's consent record
+/// was assessed for `workspace`, the directory the command was built for (review r5, finding 1).
+pub(in crate::native) fn check_command_workspace(directory: &Path, workspace: &Path) -> Result<()> {
+    let path = Reader::open_unchecked(directory)
+        .private(SESSION_FILE)
+        .path()
+        .to_owned();
+    command_workspace(&RecordReader::at(&path).json()?, workspace)
+}
+
+fn command_workspace(assessment: &Assessment, workspace: &Path) -> Result<()> {
+    if assessment.identity.path != workspace || identity(workspace)? != assessment.identity {
+        bail!(
+            "the session's consent names another workspace than the command's, so its launch option is not granted"
+        );
+    }
+    Ok(())
 }
 
 pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
@@ -564,9 +618,23 @@ pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
     })
 }
 
+/// The step's deadline had passed once the session record's lock was taken, so the record was
+/// not changed (review r5, finding 5).
+#[derive(Debug)]
+pub(in crate::native) struct RecordDeadlinePassed;
+
+impl std::fmt::Display for RecordDeadlinePassed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the deadline had passed when the session's consent record could be changed, so it was not changed")
+    }
+}
+
+impl std::error::Error for RecordDeadlinePassed {}
+
 /// Changes the session record's applied marker from `from` to `to` only while it still is
-/// `from`, under the record's lock taken by `deadline`; whether it did. A lock that stays held
-/// until then is `SessionRecordBusy`, and the record is unchanged.
+/// `from`, under the record's lock taken by `deadline`, and only while `deadline` has not passed
+/// once the lock is held; whether it did. A lock that stays held until then is
+/// `SessionRecordBusy`, a deadline passed is `RecordDeadlinePassed`, and the record is unchanged.
 pub(in crate::native) fn transition(
     directory: &Path,
     from: Option<&str>,
@@ -574,12 +642,49 @@ pub(in crate::native) fn transition(
     deadline: Instant,
 ) -> Result<bool> {
     with_session_record(directory, Some(deadline), |path, mut assessment| {
+        if Instant::now() > deadline {
+            return Err(RecordDeadlinePassed.into());
+        }
         if assessment.applied.as_deref() != from {
             return Ok(false);
         }
         assessment.applied = to.map(str::to_owned);
         RecordStore::at(path).write_json(&assessment)?;
         Ok(true)
+    })
+}
+
+/// What a restore found in the session record's applied value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) enum Restore {
+    /// It held `pending`, and now holds the assessed value.
+    Restored,
+    /// It already held the assessed value.
+    Assessed,
+    /// Another writer changed it; its value is kept.
+    ChangedBy(Option<String>),
+}
+
+/// Returns the applied value from `pending` to `assessed`, under the record's lock taken by
+/// `deadline` (at least one attempt, also after the deadline: a cleanup, not a commit), and says
+/// what it found (review r5, finding 6).
+pub(in crate::native) fn restore(
+    directory: &Path,
+    pending: &str,
+    assessed: Option<&str>,
+    deadline: Instant,
+) -> Result<Restore> {
+    with_session_record(directory, Some(deadline), |path, mut assessment| {
+        let found = assessment.applied.clone();
+        if found.as_deref() == assessed {
+            return Ok(Restore::Assessed);
+        }
+        if found.as_deref() != Some(pending) {
+            return Ok(Restore::ChangedBy(found));
+        }
+        assessment.applied = assessed.map(str::to_owned);
+        RecordStore::at(path).write_json(&assessment)?;
+        Ok(Restore::Restored)
     })
 }
 

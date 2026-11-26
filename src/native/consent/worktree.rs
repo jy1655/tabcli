@@ -107,11 +107,16 @@ pub(super) fn main_worktree(
                 == object_id(workspace)?,
         "the worktree registration names a .git file in another folder"
     );
-    let named_common = walk(
-        &registration,
-        Path::new(one_line(&read_git_file(&registration.join("commondir"))?)?),
-        Kind::Directory,
-    )?;
+    // Review r5, finding 3: the registration's `commondir` must designate the main working
+    // tree's `.git` lexically (Git writes `../..`, or an absolute path) before anything on its
+    // path is walked; the identity comparison below still follows.
+    let common_text = read_git_file(&registration.join("commondir"))?;
+    let common_target = Path::new(one_line(&common_text)?);
+    ensure!(
+        lexical(&registration, common_target)? == common,
+        "the worktree registration names another common directory"
+    );
+    let named_common = walk(&registration, common_target, Kind::Directory)?;
     ensure!(
         object_id(&named_common)? == object_id(common)?,
         "the worktree registration names another common directory"

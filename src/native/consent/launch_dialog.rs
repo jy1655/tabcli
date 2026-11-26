@@ -1,12 +1,12 @@
 use super::authority::{Authority, Consented, authority};
-use super::record::{LAUNCH_OPTION_UNAVAILABLE, transition};
+use super::record::{self, LAUNCH_OPTION_UNAVAILABLE, RecordDeadlinePassed, Restore, transition};
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
 use crate::native::session::{Reader, schema::SessionManifest};
 use crate::native::{provider, terminal};
 use agent_bridge::FirstPartyCli;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -312,8 +312,14 @@ impl LaunchDialog<'_> {
             require_launch_dialog_live(directory, responded)?;
             if trusted {
                 if responded {
-                    // Within the step's deadline (review r4, finding 5): a record held past it
-                    // reports the confirmed trust and the failed record, and nothing is sent again.
+                    // Recorded only within the step's deadline (review r4, finding 5; review r5,
+                    // finding 5): a confirmation first observed after it, or a record that the
+                    // deadline passes before it can be written, is reported as such; a record held
+                    // past it reports the failed record. Nothing is sent again either way.
+                    const LATE: &str = "provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried";
+                    if clock.now() >= deadline {
+                        bail!(LATE);
+                    }
                     transition(
                         directory,
                         Some(RESPONSE_PENDING),
@@ -327,7 +333,13 @@ impl LaunchDialog<'_> {
                         );
                         Ok(())
                     })
-                    .context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")?;
+                    .map_err(|error| {
+                        if error.is::<RecordDeadlinePassed>() {
+                            anyhow::anyhow!(LATE)
+                        } else {
+                            error.context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")
+                        }
+                    })?;
                 }
                 return Ok(());
             }
@@ -388,19 +400,22 @@ impl LaunchDialog<'_> {
                     // the deadline, the record not writable) ends the step and says so with the
                     // unsent key (review r4, finding 6); the pending value then refuses any later
                     // attempt.
-                    let restore = || {
-                        transition(
-                            directory,
-                            Some(RESPONSE_PENDING),
-                            assessed.as_deref(),
-                            deadline,
-                        )
-                        .err()
-                        .map(|error| {
-                            format!(
-                                "the key was not sent, and the pending response marker could not be restored ({error:#})"
-                            )
-                        })
+                    // A value another writer put there is kept, and the step stops (review r5,
+                    // finding 6).
+                    let restore = || match record::restore(
+                        directory,
+                        RESPONSE_PENDING,
+                        assessed.as_deref(),
+                        deadline,
+                    ) {
+                        Ok(Restore::Restored | Restore::Assessed) => None,
+                        Ok(Restore::ChangedBy(value)) => Some(format!(
+                            "the key was not sent, and the pending response marker was changed by another writer (now {})",
+                            value.as_deref().unwrap_or("none")
+                        )),
+                        Err(error) => Some(format!(
+                            "the key was not sent, and the pending response marker could not be restored ({error:#})"
+                        )),
                     };
                     let unsent = |error: anyhow::Error| match restore() {
                         Some(failed) => error.context(failed),

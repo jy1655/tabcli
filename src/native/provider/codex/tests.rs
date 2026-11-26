@@ -1250,3 +1250,79 @@ fn a_grant_for_another_workspace_than_the_command_refuses_the_plan() {
         "{error:#}"
     );
 }
+
+// Review r5, finding 2: TAB's own shared consent record that cannot be read or decoded after the
+// session's resolution is an error for the plan, as in 0.4.49; only provider stores and Git's
+// registration evidence become a refusal marked unreadable.
+#[test]
+fn a_damaged_shared_consent_record_after_resolution_is_an_error_for_the_plan() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: "codex".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: workspace.clone(),
+            title: "damaged".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &workspace, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    let shared = std::fs::read_dir(root.join("workspace-consent"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    std::fs::remove_file(&shared).unwrap();
+    crate::native::session::primitives::write_private(&shared, b"{").unwrap();
+    assert!(
+        prepare_launch_for_platform(
+            LaunchContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                workspace: &workspace,
+                title: "damaged",
+                prompt: "damaged prompt",
+                yolo: false,
+                model: None,
+                effort: None,
+                provider_version: "fixture",
+            },
+            false,
+            crate::native::consent::authorized,
+        )
+        .is_err()
+    );
+}

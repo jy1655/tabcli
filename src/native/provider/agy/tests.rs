@@ -302,7 +302,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                     .unwrap();
                     let label =
                         format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
-                    assert!(!directory.join(SESSION_SETTINGS_FILE).exists(), "{label}");
+                    assert!(session_settings_files(&directory).is_empty(), "{label}");
                     assert!(
                         crate::native::consent::observe(&directory)
                             .value()
@@ -525,7 +525,10 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                     .unwrap();
                     let applies = support == "supported";
                     assert_eq!(asked, usize::from(applies), "{label}");
-                    let settings = directory.join(SESSION_SETTINGS_FILE);
+                    // One settings file of its own for a plan that applies the setting.
+                    let files = session_settings_files(&directory);
+                    assert_eq!(files.len(), usize::from(applies), "{label}");
+                    let settings = files.first().cloned().unwrap_or_default();
                     let mut expected = agy_policy(yolo, None, None);
                     if applies {
                         expected.extend([
@@ -567,9 +570,18 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                             crate::native::consent::identity(&workspace).unwrap(),
                             "{label}"
                         );
+                        let named = grant.option_file.as_ref().unwrap();
+                        assert_eq!(named.path, settings, "{label}");
+                        assert!(
+                            settings
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with("agy-session-trust-"),
+                            "{label}"
+                        );
                     } else {
                         assert!(plan.trust_grant.is_none(), "{label}");
-                        assert!(!settings.exists(), "{label}");
                         assert_eq!(
                             observed.applied_marker(),
                             (support == "older").then_some("launch-option-unavailable"),
@@ -606,7 +618,7 @@ fn the_authority_decides_the_setting_and_an_inconclusive_one_writes_nothing() {
     .err()
     .unwrap();
     assert_eq!(error.to_string(), "consent unreadable");
-    assert!(!directory.join(SESSION_SETTINGS_FILE).exists());
+    assert!(session_settings_files(&directory).is_empty());
     assert_eq!(
         crate::native::consent::observe(&directory).applied_marker(),
         None
@@ -699,5 +711,66 @@ fn a_source_store_unreadable_after_the_assessment_plans_no_setting() {
     .unwrap();
     assert!(plan.trust_grant.is_none());
     assert!(!plan.arguments.contains(&OsString::from("--settings")));
-    assert!(!directory.join(SESSION_SETTINGS_FILE).exists());
+    assert!(session_settings_files(&directory).is_empty());
+}
+
+// Review r5, finding 1: the command's workspace is checked against the consent record before any
+// settings file is published, and each granted plan has its own file. A later plan built for
+// another directory (a stale snapshot) is refused and leaves the earlier plan's settings bytes,
+// and the directory's other files, as they were.
+#[test]
+fn a_refused_plan_leaves_an_earlier_plans_settings_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let stale = root.join("stale");
+    std::fs::create_dir(&stale).unwrap();
+    let directory = consented_launch_session(&root, &workspace);
+    let settings_of = |plan: &LaunchPlan| {
+        let at = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "--settings")
+            .expect("the plan applies the setting");
+        std::path::PathBuf::from(&plan.arguments[at + 1])
+    };
+    let first = prepare_launch_for_platform(
+        launch_context(&directory, &workspace, false, "1.5.17"),
+        false,
+        &mut |_| Ok(consented(crate::native::consent::Consented::Exact)),
+    )
+    .unwrap();
+    let settings = settings_of(&first);
+    let bytes = std::fs::read(&settings).unwrap();
+    let names = |directory: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names(&directory);
+    let error = prepare_launch_for_platform(
+        launch_context(&directory, &stale, false, "1.5.17"),
+        false,
+        &mut |_| Ok(consented(crate::native::consent::Consented::Exact)),
+    )
+    .map(|plan| plan.arguments)
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another workspace than the command's"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), bytes);
+    let mut after = names(&directory);
+    // The refused plan installed its own pending turn as every plan does; no settings file.
+    after.retain(|name| !before.contains(name));
+    assert!(
+        after
+            .iter()
+            .all(|name| !name.to_string_lossy().starts_with("agy-session-trust")),
+        "{after:?}"
+    );
 }

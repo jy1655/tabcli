@@ -553,7 +553,8 @@ fn prepare_launch_for_platform(
 const APPLIED_MARKER: &str = "agy-settings-override";
 
 // Agy's `--settings` takes "a JSON object of" its settings keys, "inline or as a file path",
-// for that process only and never saved. TAB passes a private file in the session directory:
+// for that process only and never saved. TAB passes a private file in the session directory, one
+// per granted plan (`agy-session-trust-<random>.json`):
 // the workspace path then needs no quoting through a Windows command shim, and the argument is
 // a path like the log file's. Measured only with Agy 1.5.17 on macOS (2026-11-26): standalone,
 // with the exact canonical folder in `trustedWorkspaces`, inline or as a file, it showed no
@@ -563,7 +564,7 @@ const APPLIED_MARKER: &str = "agy-settings-override";
 // `--settings`, but earlier releases were not measured with `trustedWorkspaces`, and an Agy
 // without the option fails on it, so an earlier version launches as before. Lower this floor
 // only with a measurement, and delete the file when Agy offers a trust option of its own.
-const SESSION_SETTINGS_FILE: &str = "agy-session-trust.json";
+const SESSION_SETTINGS_PREFIX: &str = "agy-session-trust-";
 const SESSION_SETTINGS_FLOOR: semver::Version = semver::Version::new(1, 5, 17);
 
 // What the version text of this launch's wrapper probe says about the session-only setting.
@@ -611,17 +612,64 @@ fn session_trust_settings(
     if authority(context.directory)?.verdict.is_err() {
         return Ok(None);
     }
+    // Review r5, finding 1: the command's workspace is checked against the consent record before
+    // anything is published, and this plan's settings file is its own: created new under a random
+    // name, private, never replaced by another plan, and named in the grant with its bytes, which
+    // the spawn fence checks again. A plan refused after the file was written removes it.
+    super::super::consent::check_command_workspace(context.directory, context.workspace)?;
     let key = super::super::consent::native_key(context.workspace)?;
-    let file = crate::native::session::Store::open_unchecked(context.directory)
-        .private(SESSION_SETTINGS_FILE);
-    file.write_json(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
-    let grant = super::super::consent::apply_option(
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
+    let file = new_session_settings(context.directory, &bytes)?;
+    match super::super::consent::apply_option(
         context.directory,
         FirstPartyCli::Agy,
         APPLIED_MARKER,
         context.workspace,
-    )?;
-    Ok(Some((file.path().to_owned(), grant)))
+        Some((&file, &bytes)),
+    ) {
+        Ok(grant) => Ok(Some((file, grant))),
+        Err(error) => {
+            let _ = std::fs::remove_file(&file);
+            Err(error)
+        }
+    }
+}
+
+// A new private settings file in the session directory, `agy-session-trust-<random>.json`,
+// created only if no file has that name.
+fn new_session_settings(directory: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let created = tempfile::Builder::new()
+        .prefix(SESSION_SETTINGS_PREFIX)
+        .suffix(".json")
+        .rand_bytes(12)
+        .make_in(directory, |path| {
+            crate::native::session::primitives::write_private(path, bytes).map_err(|error| {
+                match error.downcast::<std::io::Error>() {
+                    Ok(error) => error,
+                    Err(error) => std::io::Error::other(format!("{error:#}")),
+                }
+            })
+        })?;
+    Ok(created.keep()?.1)
+}
+
+// The settings files that launches of this session wrote, sorted: one per granted plan.
+pub(super) fn session_settings_files(directory: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(SESSION_SETTINGS_PREFIX) && name.ends_with(".json")
+                })
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 // The unstarted transcript watcher a launch plan carries: Agy's own log file of the

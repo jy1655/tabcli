@@ -383,7 +383,7 @@ fn consented_session(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line() {
     use super::super::super::super::consent;
     use super::super::super::super::diagnostics::Availability;
-    use super::super::{APPLIED_MARKER, SESSION_SETTINGS_FILE};
+    use super::super::APPLIED_MARKER;
     use crate::native::session::primitives::write_json_atomic;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -426,7 +426,9 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     assert_eq!(evidence_keys(&check), ["log", "store", "workspace"]);
 
     // The setting with current consent and this process's load line opens the gate, with no
-    // Agy store at all.
+    // Agy store at all. The row names the settings file the launch wrote.
+    let settings = directory.join("agy-session-trust-fixture.json");
+    crate::native::session::primitives::write_private(&settings, b"{}").unwrap();
     consent::applied(&directory, APPLIED_MARKER).unwrap();
     let (outcome, check) = gate();
     assert_eq!(outcome, Ok(()));
@@ -442,7 +444,7 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     );
     assert_eq!(
         row["evidence"]["session_settings"],
-        serde_json::json!(directory.join(SESSION_SETTINGS_FILE))
+        serde_json::json!([settings])
     );
     // Agy's own store must still be readable: the authority asks the target whether it
     // declines the workspace. A read failure withholds the paste and is reported as unreadable

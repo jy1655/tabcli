@@ -17,8 +17,8 @@ pub(in crate::native) use launch_dialog::{
     LaunchFacts, ProviderStart, complete_launch,
 };
 pub(in crate::native) use record::{
-    Assessment, ConsentState, SessionConsentObservation, apply_option, assess, observe,
-    option_unavailable, record, run, session_applied,
+    Assessment, ConsentState, SessionConsentObservation, apply_option, assess,
+    check_command_workspace, observe, option_unavailable, record, run, session_applied,
 };
 #[cfg(test)]
 pub(in crate::native) use record::{applied, prepare, prepare_at_home};

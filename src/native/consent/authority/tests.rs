@@ -281,6 +281,7 @@ fn the_spawn_fence_asks_about_the_commands_own_launch_option() {
         FirstPartyCli::Agy,
         "agy-settings-override",
         &git.worktree,
+        None,
     )
     .unwrap();
     let admit = |grant: &LaunchGrant| {
@@ -386,6 +387,7 @@ fn the_spawn_fence_starts_nothing_for_a_launch_option_without_consent() {
         FirstPartyCli::Pi,
         "pi-approve-once",
         &workspace,
+        None,
     )
     .unwrap();
     fs::remove_file(&fixture.pi).unwrap();
@@ -475,5 +477,55 @@ fn the_bounded_question_refuses_without_time_and_after_its_deadline() {
             .unwrap_err()
             .to_string(),
         "refused"
+    );
+}
+
+// Review r5, finding 1: a grant names the file its option points at and the bytes its plan wrote
+// there. The fence refuses a command whose file was replaced, changed or removed.
+#[test]
+fn the_spawn_fence_refuses_a_grant_whose_option_file_is_not_the_one_its_plan_wrote() {
+    use super::super::record::apply_option;
+    let (_temp, workspace, fixture) = setup();
+    trust_pi(&fixture, &workspace);
+    let session = launched(&workspace, &fixture);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["provider"] = serde_json::json!("agy");
+    write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
+    let file = session.directory.join("agy-session-trust-fixture.json");
+    let bytes = br#"{"trustedWorkspaces":["fixture"]}"#;
+    write_private(&file, bytes).unwrap();
+    let grant = apply_option(
+        &session.directory,
+        FirstPartyCli::Agy,
+        "agy-settings-override",
+        &workspace,
+        Some((&file, bytes)),
+    )
+    .unwrap();
+    let admit = || {
+        admit_launch_with(&session.directory, &grant, &fixture.env).map_err(|e| format!("{e:#}"))
+    };
+    admit().unwrap();
+    for replacement in [&br#"{"trustedWorkspaces":["other"]}"#[..], &bytes[..]] {
+        fs::remove_file(&file).unwrap();
+        write_private(&file, replacement).unwrap();
+        let outcome = admit();
+        if replacement == &bytes[..] {
+            outcome.unwrap();
+        } else {
+            assert!(
+                outcome
+                    .unwrap_err()
+                    .contains("the launch option's file is not the one its plan wrote")
+            );
+        }
+    }
+    fs::remove_file(&file).unwrap();
+    assert!(
+        admit()
+            .unwrap_err()
+            .contains("the launch option's file is not the one its plan wrote")
     );
 }

@@ -669,6 +669,7 @@ fn prepare_launch_for_platform(
             FirstPartyCli::Codex,
             APPLIED_MARKER,
             context.workspace,
+            None,
         )?);
     }
     arguments.extend(own);

@@ -6,7 +6,7 @@
 //! spawn fence for a launch option, the dispatch of a guarded key, and the dispatch of an Agy
 //! paste. A trust-bearing launch option is asked about as the command that will start, carried
 //! from its plan (`LaunchGrant`). See AGENTS.md, Trust Store Boundary.
-use super::record::{Assessment, SESSION_FILE, assess_current};
+use super::record::{Assessment, EvidenceUnreadable, SESSION_FILE, assess_current};
 use super::store::{Environment, Identity, Trust, identity, user_home};
 use crate::native::provider;
 use crate::native::session::Reader;
@@ -114,6 +114,9 @@ fn authority_for(
     // granted command refuses to start.
     let now = match assess_current(root, &workspace, env) {
         Ok(now) => now,
+        // TAB's own records and the workspace's identity propagate, as in 0.4.49 (review r5,
+        // finding 2); only provider and Git evidence is a typed refusal.
+        Err(error) if !error.is::<EvidenceUnreadable>() => return Err(error),
         Err(error) => {
             return Ok((
                 Authority {
@@ -204,6 +207,14 @@ pub(in crate::native) struct LaunchGrant {
     pub(in crate::native) provider: FirstPartyCli,
     pub(in crate::native) marker: &'static str,
     pub(in crate::native) workspace: Identity,
+    pub(in crate::native) option_file: Option<OptionFile>,
+}
+
+/// A file that a launch option names, and the digest of the bytes its plan wrote there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) struct OptionFile {
+    pub(in crate::native) path: std::path::PathBuf,
+    pub(in crate::native) sha256: [u8; 32],
 }
 
 /// The spawn fence's check for a command that carries a trust-bearing launch option, under the
@@ -268,6 +279,19 @@ pub(super) fn admit_launch_with(
         provider == grant.provider,
         "the launch option belongs to another provider than the session's, so the provider was not started"
     );
+    // The file the option names is the one its plan wrote, private to the user and unchanged
+    // (review r5, finding 1).
+    if let Some(file) = &grant.option_file {
+        let unchanged = super::store::read_store(&file.path).is_ok_and(|text| {
+            text.is_some_and(|text| {
+                <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())[..] == file.sha256[..]
+            })
+        });
+        ensure!(
+            unchanged,
+            "the launch option's file is not the one its plan wrote, so the provider was not started"
+        );
+    }
     let (found, consented) = authority_for(directory, grant.provider, env)?;
     match found.verdict {
         Ok(_)

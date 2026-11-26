@@ -1542,3 +1542,128 @@ fn a_failed_restore_stops_the_step_and_reports_both_facts() {
         );
     }
 }
+
+// A clock that advances past every deadline, for good, at one chosen reading after the screen
+// was read.
+struct Advancing<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    at: usize,
+}
+
+impl Clock for Advancing<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            if self.readings == self.at {
+                self.clock.sleep(Duration::from_secs(3600));
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// Review r5, finding 5: a provider confirmation first observed after the step's deadline is not
+// recorded as timely, even with the record's lock free: the step reports the observed
+// confirmation, that the marker was not recorded and that no input was retried.
+#[test]
+fn a_confirmation_observed_after_the_deadline_is_not_recorded() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let armed = Cell::new(false);
+    // Readings after the screen: 1 observed, 2 before the pending write, 3 in the dispatch, 4 the
+    // wait after it, which passes the deadline before the next trust read.
+    let mut clock = Advancing {
+        clock: FakeClock::new(Instant::now()),
+        armed: &armed,
+        readings: 0,
+        at: 4,
+    };
+    let deadline = clock.clock.now() + Duration::from_secs(3);
+    let policy = FakePolicy::default();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = Cell::new(0);
+    let error = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline,
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        &mut clock,
+        &mut scripted(
+            GuardedKey::Taken,
+            || {
+                armed.set(true);
+                Ok(DIALOG.to_owned())
+            },
+            || {
+                dispatched.set(dispatched.get() + 1);
+                write_json_atomic(
+                    &c.stores.claude,
+                    &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        ),
+    )
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.starts_with("provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried"),
+        "{error}"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}
+
+// Review r5, finding 6: a restore that finds the marker changed by another writer keeps that
+// writer's value, stops the step and says that the key was not sent and the marker was changed.
+#[test]
+fn a_restore_that_finds_another_writers_value_keeps_it_and_stops() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let policy = FakePolicy::default();
+    let dispatched = Cell::new(0);
+    let error = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline: Instant::now() + Duration::from_secs(3),
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        &mut FakeClock::new(Instant::now()),
+        &mut scripted(
+            GuardedKey::Taken,
+            || Ok(DIALOG.to_owned()),
+            || {
+                dispatched.set(dispatched.get() + 1);
+                super::super::record::applied(&c.directory, RESPONSE_CONFIRMED).unwrap();
+                Ok(false)
+            },
+        ),
+    )
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(
+            "the key was not sent, and the pending response marker was changed by another writer"
+        ) && error.ends_with("no response sent"),
+        "{error}"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_CONFIRMED)
+    );
+}

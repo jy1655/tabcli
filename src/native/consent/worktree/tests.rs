@@ -726,3 +726,37 @@ fn a_back_pointer_into_a_third_tree_is_refused_before_any_io_there() {
         );
     }
 }
+
+// Review r5, finding 3: the registration's `commondir` is resolved lexically first and must
+// designate the main working tree's `.git` before anything on its path is walked. A valid
+// back-pointer with a stale `commondir` into a third tree is refused before any I/O there (the
+// tree does not even exist here: a walk would report it unreadable), absolute or relative;
+// Git's own `../..` and absolute spellings still verify.
+#[test]
+fn a_common_directory_into_a_third_tree_is_refused_before_any_io_there() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    let commondir = fixture.registration.join("commondir");
+    for stale in [
+        format!("{}\n", git_path(&root.join("third/repository/.git"))),
+        "../../../third/repository/.git\n".to_owned(),
+    ] {
+        fs::write(&commondir, &stale).unwrap();
+        assert_eq!(
+            error(&fixture.worktree),
+            "the worktree registration names another common directory",
+            "{stale}"
+        );
+    }
+    for valid in [
+        "../..\n".to_owned(),
+        format!("{}\n", git_path(&fixture.repository.join(".git"))),
+    ] {
+        fs::write(&commondir, &valid).unwrap();
+        assert_eq!(
+            verified(&fixture.worktree).unwrap(),
+            Some(fixture.repository.clone()),
+            "{valid}"
+        );
+    }
+}

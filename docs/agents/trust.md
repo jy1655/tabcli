@@ -52,8 +52,18 @@
   Git writes, absolute or relative to the registration, before anything on its path is walked,
   so a stale registration naming a former worktree in a third tree is refused without touching
   that tree) and then, walked the same way, by file identity, the file and its directory, so a
-  hard link to `W/.git` in another folder is not `W`; its `commondir`, walked the same way,
-  names `<main>/.git` by identity. On Windows an identity is
+  hard link to `W/.git` in another folder is not `W`; its `commondir` names `<main>/.git` the
+  same way, first lexically (Git writes `../..` or an absolute path), so a stale `commondir` into
+  a third tree is refused before any I/O there, and then by identity. A registration whose
+  recorded spelling of the worktree differs from the worktree's current path, including by case
+  only on a case-insensitive volume, does not inherit (a documented limit, router's ruling,
+  2026-11-26): the launch falls back to the provider's own trust dialog, the safe direction,
+  and distinct case-sensitive siblings stay refused. Deciding a volume's case rules would need
+  I/O that the lexical rule avoids. The remedy is Git's own: `git worktree repair <worktree>`
+  rewrites the registration of a moved worktree to its current path, but on a case-insensitive
+  volume (`core.ignorecase=true`) it compares paths without case and keeps a case-only
+  difference; `git -c core.ignorecase=false worktree repair <worktree>` rewrites that one too
+  (measured with Git 2.54 on macOS, 2026-11-26). On Windows an identity is
   the volume and the full 128-bit file id (`FileIdInfo`; the 64-bit index can repeat on ReFS),
   and where it cannot be read nothing is inherited. Pointer files are opened so that a FIFO
   cannot block the open (`O_NONBLOCK`), and the opened handle is checked. Relative-path
@@ -111,10 +121,13 @@
   at its start, so a `consent reset` of the worktree or of its main working tree refuses until
   a new `ask` or supported `reopen` acquires consent again), and asks the target provider
   whether it declines, or cannot read, the workspace or its main working tree. A session
-  record or manifest that cannot be read is an error. Evidence that the recheck cannot read
-  (the pinned source's store, a required read of the registration or of the main working tree;
-  a missing file is a fact: the worktree is no longer registered) and a target store that
-  cannot be read are refusals marked unreadable (review r4, finding 1): a consumer that does
+  record or manifest that cannot be read is an error, and so, as in 0.4.49, is TAB's own shared
+  consent record (`workspace-consent/<hash>.json`, the workspace's or its main working tree's)
+  that cannot be read or decoded, and a workspace that cannot be identified (review r5, finding
+  2). Provider and Git evidence that the recheck cannot read (the pinned source's store, a
+  required read of the registration or of the main working tree; a missing file is a fact: the
+  worktree is no longer registered) and a target store that cannot be read are refusals marked
+  unreadable (review r4, finding 1): a consumer that does
   not need the cause treats them as a missing consent was treated in 0.4.49 (Codex and Pi plan
   no option, Claude's dialog step sends no key, the Codex wait still tries its independent
   evidence), Agy reports the cause, and a command that carries a grant refuses to start. A
@@ -144,13 +157,19 @@
     changed screen, a stale claim) returns the record to the assessed value. If that
     restoration itself fails (the lock held until the deadline, the record not writable), the
     step stops and reports both facts, that the key was not sent and that its marker could not
-    be restored; a later attempt then refuses as for an unowned pending value. After the key,
-    the provider's confirmation is recorded within the same deadline; a record that cannot take
-    it reports that the provider's trust is confirmed and the recording failed, and no input is
-    retried.
+    be restored; a later attempt then refuses as for an unowned pending value. A restore that
+    finds the value already restored goes on; one that finds a value another writer put there
+    keeps it, stops, and reports that the key was not sent and the marker was changed by
+    another writer. After the key, the provider's confirmation is recorded only within the same
+    deadline, checked before the write and again once the lock is held: a confirmation first
+    observed after it reports that the provider's trust was observed confirmed, that the marker
+    was not recorded and that no input was retried; a record that cannot take it in time reports
+    that the provider's trust is confirmed and the recording failed. No input is retried.
   - A provider's start: the authority is asked only for a command that carries a
     trust-bearing option. The plan carries that option, its provider and the workspace identity
-    it was granted for (`LaunchGrant`) to the spawn fence, which asks about that command
+    it was granted for (`LaunchGrant`), and for an option that names a file (Agy's settings)
+    that file's path and digest, to the spawn fence, which refuses a file that is not the one
+    the plan wrote and asks about that command
     (`consent::admit_launch`) under the lifecycle lock immediately before its existing
     deadline check, so the order (deadline, `Spawning`, spawn) is unchanged; the question is
     bounded by the launch's remaining budget: no time left refuses a granted command without
@@ -193,7 +212,10 @@
   drops the field and keeps the source, which then stays revoked; its `consent reset`
   clears both. The assessment at a session's start writes the main working tree's own record
   only when that consent is verified, as an `ask` there would. A session directory gains
-  `workspace-consent.lock`, the session record's own lock; earlier binaries ignore it.
+  `workspace-consent.lock`, the session record's own lock, and, for an Agy launch that applied
+  its session-only setting, one `agy-session-trust-<random>.json` per granted plan; earlier
+  binaries ignore both, as they ignore every file they do not name, and their `prune` removes
+  the whole session directory with them.
 - A wait for workspace trust ends when its session has ended, and looks at the session
   before it looks at the evidence: the launcher of a closed session must not wait until
   its deadline, and an ended session is never pasted into. This holds for the Codex wait
