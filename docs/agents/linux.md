@@ -37,9 +37,14 @@
   to end owner/provider processes after close returns.
 - Read owner identity from procfs: boot id plus start ticks, process group, session,
   controlling TTY and foreground group. A zombie retains its incarnation until reaped. An
-  entry read while its reaper releases the task (state X, or process group and session -1)
-  is that incarnation gone, never a malformed entry (a real-tmux presence check once failed
-  on one, 2026-11-26).
+  entry printed for a task whose signal state was released (process group and session -1)
+  proves no exit: an exec in a thread other than the leader releases the old leader while
+  the PID and start time live on. Every procfs reader refuses it. The tmux server
+  observation holds a pidfd on the server before it reads: on that entry an exit the pidfd
+  reports proves the server gone, and otherwise the birth is read once more. The repeated
+  close of a real-tmux test failed once on the Ubuntu runner (2026-11-26) with only an
+  integer parse error in its log; such an entry is the explanation reproduced from the
+  kernel's code, not an observed line.
 - Measure Linux provider commands before spawn: each argument or environment string including
   NUL fits `MAX_ARG_STRLEN` (32 pages, 131072 bytes on 4 KiB pages), and argv plus environment
   fits `ARG_MAX`. Refuse oversized commands with nothing sent, including Codex queue messages.
