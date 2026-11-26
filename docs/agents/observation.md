@@ -16,9 +16,13 @@
   no row: no host ran, and a macOS capture kind keeps only its initial `awaiting_host` stage.
   The returned error holds the host's reason with the directory; the status and the launch log
   hold a fixed reason only when the settlement wrote them, and the log line is best effort. A
-  launch that is not this launch's own or cannot be read keeps its existing status, which may
-  already be `Failed` or `Closed`; a lifecycle lock held until the launch deadline leaves it
-  launching.
+  refusal that settles nothing (a launch that is not this launch's own or cannot be read, or a
+  lifecycle lock held until the launch deadline) adds no refusal line and leaves the status and
+  the launch log as they were: for example `Launching` with TAB's earlier `launch_pending` line,
+  or a status already `Failed` or `Closed`. The refusal does not decide the status afterwards:
+  reopen copies the full error into it only if it still finds `Launching` with the matching
+  Claim, and if repair settles the launch and releases its Claim before reopen obtains the
+  lock, the failed status repair wrote stays and reopen's fence copies nothing.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared

@@ -74,14 +74,17 @@
   at once; returning it can wait for the lifecycle lock up to the launch budget. It is judged
   once, from what was observed: a directory corrected while TAB waits for the lock is not
   examined again, and the remedy is to correct the directory and run the command again. The
-  caller's error names the directory and the host's reason. The Session records a fixed reason
-  that names no path (`terminal launch failed: the Herdr launch host would refuse the session
-  directory; no surface handle was recorded and no prompt was sent`), and the launch log gets
-  the same line on a best-effort basis. When the facts are not established (another holder
-  keeps the lock until the deadline, a launch that is not this launch's own or cannot be read),
-  the refusal writes nothing: the Session keeps its status, the launch log has no line from
-  TAB, and the returned error holds the refusal; `reopen` can still copy that error into the
-  status (below). No terminal exists either way. What the caller cannot know stays the host's, unchanged from
+  caller's error names the directory and the host's reason. Only when the settlement succeeds
+  does the Session record a fixed reason that names no path (`terminal launch failed: the Herdr
+  launch host would refuse the session directory; no surface handle was recorded and no prompt
+  was sent`), and the launch log gets the same line on a best-effort basis. When the facts are
+  not established (another holder keeps the lock until the deadline, a launch that is not this
+  launch's own or cannot be read), the refusal writes nothing and adds no refusal line: the
+  status and the launch log stay as they were (a `Launching` status, for example, and the
+  `launch_pending` line TAB wrote when the launch began), and only the returned error holds the
+  refusal. The refusal does not decide the status afterwards: `reopen` can copy that error into
+  it, and a repair that settles the launch first keeps its own (below). No terminal exists
+  either way. What the caller cannot know stays the host's, unchanged from
   0.4.49: the directory changed after the check, a program started under another token than
   the core's own, a read only the host can make. The host logs its refusal as before when it
   still can (a directory that is gone takes no line), and the launch ends as below when its
@@ -99,9 +102,11 @@
   failure (`input_flush_failed`, `launch_shell_exec_failed`) is left to the ordinary poll to
   publish, and a Record that cannot be read is no evidence (`host_record_pending`). Then the
   launch fails through the deadline's settlement (`settle_locked`). A deferred decision resumes
-  ordinary polling: a later confirmation still succeeds, a provider or host failure still ends
-  the wait with its own reason, and a lock held at every probe leaves the launch to its
-  deadline. The Session records the fixed reason
+  ordinary polling while the launch budget lasts, also when the receipt's deadline deferred it
+  (that deadline is not the launch deadline): a later confirmation still succeeds, a provider or
+  host failure still ends the wait with its own reason, a terminal the core then reports absent
+  ends it at that probe with the disappeared-surface failure, and a lock held at every probe
+  leaves the launch to its deadline. The Session records the fixed reason
   `terminal surface finished before provider launch was confirmed`; the error returned to the
   caller adds the core's report and the launch log's path, `(Herdr terminal t7 exited with code
   N); see the launch log <path>`; nothing is read from the log. The exit code is the core's
@@ -153,7 +158,10 @@
   lock (`fail_reopen_launch`, after `record_failed_launch`), for example when a reader held the
   lock through the refusal's deadline and then released it; and a later reopen of the same
   source (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`). An early
-  refusal leaves a launch so only when it wrote nothing.
+  refusal leaves a launch so only when it wrote nothing, and lock contention alone does not
+  decide whether reopen copies the detail: if a repair settles the launch and releases its
+  Claim before reopen obtains the lock, the failed status repair wrote stays and the fence
+  copies nothing.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface

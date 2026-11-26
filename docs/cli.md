@@ -189,12 +189,18 @@ read fails, for example because its token cannot read the directory's access lis
 decides. TAB detects a directory the host would refuse at once and fails the start as a Surface
 that cannot be opened does; the start returns when TAB has the session's lifecycle lock, which
 another command can hold for up to the launch timeout. The error names the directory and the
-host's reason, and the session records `terminal launch failed: the <host> launch host would
-refuse the session directory; no surface handle was recorded and no prompt was sent`. The
+host's reason. When TAB settles the start, the session records `terminal launch failed: the
+<host> launch host would refuse the session directory; no surface handle was recorded and no
+prompt was sent`, and the launch log gets the same line when it can be written. The
 directory is judged once, as TAB saw it: correcting it while the start waits does not change
-the outcome, so correct it and run the command again. If another command holds the lock for
-the whole launch timeout, the session stays launching with its claim, as for any Surface that
-cannot be opened, and only the returned error holds the reason. TAB cannot know a change made
+the outcome, so correct it and run the command again. When TAB cannot settle it, because
+another command holds the lock for the whole launch timeout or the session's records do not
+show this start's own pending launch or cannot be read, TAB writes nothing and adds no refusal
+line: the session's status, its claim and its launch log stay as they were (for example
+`launching`, with the `launch_pending` line TAB wrote when the launch began), and only the
+returned error holds the reason. What the status becomes afterwards is left to the launch
+repair that later commands such as `sessions` run, and to `reopen`, as for any Surface that
+cannot be opened while the lock is held. TAB cannot know a change made
 after its check, a host started under another account than the one it named, or an error only
 the host meets; the host still refuses those and appends to its launch log when it can. A
 Herdr start then fails at TAB's next check of the terminal, normally about a second after the
