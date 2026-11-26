@@ -1,4 +1,5 @@
-use super::record::{applied, authorized_with, observe};
+use super::authority::{Authority, Consented, authority};
+use super::record::applied;
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
@@ -207,21 +208,17 @@ impl LaunchDialog<'_> {
             directory, target, ..
         } = self;
         require_launch_dialog_live(directory, false)?;
-        if !authorized_with(directory, target, env)? {
-            return Ok(());
-        }
-        // No key for consent that the launch already applied through the provider's own
-        // process-local option (its applied marker): the provider was told to trust the
-        // workspace, and the adapter's input gate still waits for the provider's own evidence.
-        // Nor for consent inherited from a repository's main working tree: "Yes" would have the
-        // provider save the worktree as exact trust, and TAB writes no provider store.
-        let consent = observe(directory);
-        if consent.inherited()
-            || consent
-                .applied_marker()
-                .is_some_and(|marker| provider::launch_trust_markers().any(|m| m == marker))
+        // One typed answer decides the step. A key only for exact consent that the launch did
+        // not already apply through the target's own launch option: then the provider was told
+        // to trust the workspace and its adapter's input gate waits for its own evidence. Never
+        // for inherited consent: "Yes" would have the provider save the worktree as exact
+        // trust, and TAB writes no provider store.
+        let authority = authority(directory, target, env)?;
+        match dialog_consent(&authority, target)
+            .map_err(|error| launch_dialog_error(error, false))?
         {
-            return Ok(());
+            DialogConsent::Answerable => {}
+            DialogConsent::NoKey => return Ok(()),
         }
         let manifest = Reader::open_unchecked(directory).manifest()?;
         let bypass = if manifest.yolo {
@@ -331,13 +328,7 @@ impl LaunchDialog<'_> {
                 {
                     return Ok(());
                 }
-                if !authorized_with(directory, target, env)
-                    .map_err(|error| launch_dialog_error(error, false))?
-                {
-                    bail!(
-                        "workspace consent changed before trust dialog response; no response sent"
-                    );
-                }
+                self.require_answerable(env)?;
                 let screen = surface
                     .screen(&manifest.id, deadline)
                     .map_err(|error| launch_dialog_error(error, false))?;
@@ -356,13 +347,8 @@ impl LaunchDialog<'_> {
                         clock.sleep(Duration::from_millis(200).min(remaining));
                         continue;
                     }
-                    if !authorized_with(directory, target, env)
-                        .map_err(|error| launch_dialog_error(error, false))?
-                    {
-                        bail!(
-                            "workspace consent changed before trust dialog response; no response sent"
-                        );
-                    }
+                    // Again immediately before the one dispatch.
+                    self.require_answerable(env)?;
                     require_launch_dialog_live(directory, false)?;
                     if clock.now() >= deadline {
                         continue;
@@ -401,6 +387,48 @@ impl LaunchDialog<'_> {
             let remaining = deadline.saturating_duration_since(clock.now());
             clock.sleep(Duration::from_millis(200).min(remaining));
         }
+    }
+}
+
+// Whether the launch dialog step may answer the dialog with a key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DialogConsent {
+    Answerable,
+    NoKey,
+}
+
+// The step's reading of the authority: no consent, inherited consent and consent the launch
+// applied through the target's own option take no key; exact consent with no launch option
+// applied may. A record naming another adapter's launch option is refused outright.
+fn dialog_consent(authority: &Authority, target: FirstPartyCli) -> Result<DialogConsent> {
+    let Ok(consented) = authority.verdict else {
+        return Ok(DialogConsent::NoKey);
+    };
+    let applied = authority.applied.as_deref();
+    let launch_option = applied
+        .filter(|marker| provider::launch_trust_markers().any(|registered| registered == *marker));
+    if let Some(marker) = launch_option
+        && provider::applied_marker(target) != Some(marker)
+    {
+        bail!("the session's consent record names another provider's launch option ({marker})");
+    }
+    Ok(match (consented, launch_option) {
+        (Consented::Exact, None) => DialogConsent::Answerable,
+        _ => DialogConsent::NoKey,
+    })
+}
+
+impl LaunchDialog<'_> {
+    // Before reading the screen and again before the one dispatch: the authority still finds
+    // exact consent that no launch option applied.
+    fn require_answerable(&self, env: &Environment) -> Result<()> {
+        let consent = authority(self.directory, self.target, env)
+            .and_then(|authority| dialog_consent(&authority, self.target))
+            .map_err(|error| launch_dialog_error(error, false))?;
+        if consent != DialogConsent::Answerable {
+            bail!("workspace consent changed before trust dialog response; no response sent");
+        }
+        Ok(())
     }
 }
 

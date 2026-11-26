@@ -78,7 +78,7 @@ const FULL_TRANSCRIPT_FILE: &str = "transcript_full.jsonl";
 // leaves it to the user. See docs/verification/2026-10-01-bug-triage.md.
 const AGY_MODEL_LABEL_PREFIXES: [&str; 3] = ["Gemini ", "Claude ", "GPT-"];
 
-// The dialog answer is the fallback for an Agy older than `SESSION_SETTINGS_FLOOR`, launched with
+// The dialog answer is the fallback for an Agy older than `SESSION_SETTINGS_FLOOR` launched with
 // exact consent: answer only the exact managed dialog and verify the saved decision. A launch
 // that applied the session-only settings, or whose consent is inherited, takes no key. Remove
 // this fallback once the supported Agy versions all take the settings.
@@ -185,7 +185,8 @@ fn send_terminal_follow_up<R: Runtime>(
 ) -> terminal::TerminalSendResult {
     if cfg!(windows) {
         // The Windows initial paste already waited for startup readiness, so a
-        // follow-up only takes its receipt offset and pastes.
+        // follow-up waits only for the trust evidence, as every paste does, then takes its
+        // receipt offset and pastes.
         deliver_terminal_turn(session, prompt_path, deadline, None, runtime)
     } else {
         // Argument prompts run behind the trust dialog; each macOS follow-up needs trust, readiness
@@ -408,7 +409,7 @@ impl NativeProviderAdapter for AgyAdapter {
                 CheckId::AGY_FOLLOW_UP,
                 Unknown,
                 Reason::AGY_TERMINAL_FALLBACK,
-                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; the Windows initial prompt and every macOS follow-up also wait until Agy's own trust store lists the exact workspace, or the session was launched with Agy's session-only setting that trusts it, and the session's own log shows that it loaded the workspace customizations. The macOS initial prompt is a launch argument and never waits.",
+                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; every paste also waits until Agy's own trust store lists the exact workspace, or the session's launch configured Agy's session-only setting that trusts it while its consent still holds, and the session's own log shows that it loaded the workspace customizations. The macOS initial prompt is a launch argument and never waits.",
                 "Inspect the managed owner and terminal; retain this fallback until Agy offers a verified native path.",
             ),
             input_receipt_check(context.directory),
@@ -427,7 +428,19 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        prepare_launch_for_platform(context, cfg!(windows), super::super::consent::authorized)
+        let directory = context.directory;
+        prepare_launch_for_platform(
+            context,
+            cfg!(windows),
+            &mut || installed_version(directory),
+            &mut |directory| {
+                super::super::consent::authority(
+                    directory,
+                    FirstPartyCli::Agy,
+                    &super::super::consent::Environment::current(),
+                )
+            },
+        )
     }
 
     fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
@@ -466,14 +479,16 @@ fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
 
 // The complete launch command: the requested policy in Agy's flags (the bypass only when
 // requested, then effort, then model), Agy's session-only settings file that trusts the exact
-// workspace when consent authorizes it, the private log file, and off Windows the correlated
-// prompt as the interactive prompt argument. `authorized` is the consent gate; production
-// passes `consent::authorized`, and the applied marker is recorded right after the settings
+// workspace when the installed Agy takes it and consent holds, the private log file, and off
+// Windows the correlated prompt as the interactive prompt argument. `version` probes the
+// installed Agy for this launch and `authority` is consent's one answer; production passes the
+// live probe and `consent::authority`. The applied marker is recorded right after the settings
 // file, before the plan exists.
 fn prepare_launch_for_platform(
     context: LaunchContext<'_>,
     windows: bool,
-    authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
+    version: &mut dyn FnMut() -> Option<String>,
+    authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
 ) -> Result<LaunchPlan> {
     let claim_token =
         session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
@@ -501,7 +516,7 @@ fn prepare_launch_for_platform(
                 .map(OsString::from),
         );
     }
-    if let Some(settings) = session_trust_settings(&context, authorized)? {
+    if let Some(settings) = session_trust_settings(&context, version, authority)? {
         arguments.extend([OsString::from("--settings"), settings.into_os_string()]);
     }
     arguments.extend([
@@ -531,36 +546,55 @@ const APPLIED_MARKER: &str = "agy-settings-override";
 // Agy's `--settings` takes "a JSON object of" its settings keys, "inline or as a file path",
 // for that process only and never saved. TAB passes a private file in the session directory:
 // the workspace path then needs no quoting through a Windows command shim, and the argument is
-// a path like the log file's. Agy 1.5.17 is the only version measured (2026-11-26, macOS): with
-// the exact canonical folder in `trustedWorkspaces` it showed no trust dialog, logged the
-// workspace customization load off the main goroutine and left its own trust store
-// unchanged. The 1.5.8 changelog already names `--settings`, but whether earlier releases honour
-// `trustedWorkspaces` there was not measured, and an Agy without the option fails on it, so
-// an earlier version is launched as before. Lower this floor only with a measurement, and
-// delete the file when Agy offers a trust option of its own.
+// a path like the log file's. Measured only with Agy 1.5.17 on macOS (2026-11-26): standalone,
+// with the exact canonical folder in `trustedWorkspaces`, inline or as a file, it showed no
+// trust dialog, logged the workspace customization load off the main goroutine and left its
+// own trust store unchanged, also across a settings change (`/thinking`) that rewrote that
+// store; through TAB on Herdr the same for a new worktree. The 1.5.8 changelog already names
+// `--settings`, but earlier releases were not measured with `trustedWorkspaces`, and an Agy
+// without the option fails on it, so an earlier version launches as before. Lower this floor
+// only with a measurement, and delete the file when Agy offers a trust option of its own.
 const SESSION_SETTINGS_FILE: &str = "agy-session-trust.json";
 const SESSION_SETTINGS_FLOOR: semver::Version = semver::Version::new(1, 5, 17);
 
-// Whether the Agy version this session recorded at launch takes the session-only trust setting.
-fn session_settings_supported(version: &str) -> bool {
-    version
-        .split_whitespace()
-        .find_map(|word| semver::Version::parse(word.strip_prefix('v').unwrap_or(word)).ok())
-        .is_some_and(|version| version >= SESSION_SETTINGS_FLOOR)
+// How long the launch's own version probe may take.
+const VERSION_PROBE_BOUND: Duration = Duration::from_secs(10);
+
+// The version the installed Agy reports for this launch, probed right before its command is
+// built; `None` when it cannot be read.
+fn installed_version(directory: &Path) -> Option<String> {
+    let manifest = Reader::open_unchecked(directory).manifest().ok()?;
+    crate::native::provider_installation::check_provider_version_until(
+        FirstPartyCli::Agy,
+        &manifest.provider_path,
+        Some(Instant::now() + VERSION_PROBE_BOUND),
+    )
+    .ok()
 }
 
-// When consent authorizes the exact workspace and the recorded Agy version takes it, the
-// session-only settings file that trusts that workspace, written before the applied marker.
-// Otherwise nothing is written and Agy launches as before, with its own trust dialog.
+// Whether an Agy `--version` text names a version that takes the session-only trust setting.
+// Agy prints its version alone; any other text, such as a banner naming more than one version,
+// does not count.
+fn session_settings_supported(version: &str) -> bool {
+    let version = version.trim();
+    semver::Version::parse(version.strip_prefix('v').unwrap_or(version))
+        .is_ok_and(|version| version >= SESSION_SETTINGS_FLOOR)
+}
+
+// When the installed Agy takes the setting and consent holds for the workspace now (exact
+// trust from another provider's store, or inherited by a verified linked worktree; owner's
+// decision, 2026-11-26), the session-only settings file that trusts the workspace, written
+// before the applied marker. The version is judged first, so an older Agy launches exactly as
+// before and does no consent work here. Otherwise nothing is written.
 fn session_trust_settings(
     context: &LaunchContext<'_>,
-    authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
+    version: &mut dyn FnMut() -> Option<String>,
+    authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
 ) -> Result<Option<PathBuf>> {
-    if !authorized(context.directory, FirstPartyCli::Agy)? {
+    if !version().is_some_and(|version| session_settings_supported(&version)) {
         return Ok(None);
     }
-    let reader = Reader::open_unchecked(context.directory);
-    if !session_settings_supported(&reader.manifest()?.provider_version) {
+    if authority(context.directory)?.verdict.is_err() {
         return Ok(None);
     }
     let key = super::super::consent::native_key(context.workspace)?;
@@ -569,12 +603,6 @@ fn session_trust_settings(
     file.write_json(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
     super::super::consent::applied(context.directory, APPLIED_MARKER)?;
     Ok(Some(file.path().to_owned()))
-}
-
-// Whether this session's launch handed Agy its exact workspace through the session-only
-// settings, as its consent record says. It is configuration, not evidence that Agy took it.
-fn session_settings_applied(directory: &Path) -> bool {
-    super::super::consent::observe(directory).applied_marker() == Some(APPLIED_MARKER)
 }
 
 // The unstarted transcript watcher a launch plan carries: Agy's own log file of the

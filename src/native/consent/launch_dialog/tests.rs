@@ -357,7 +357,7 @@ fn complete_launch_reads_the_manifest_only_after_verified_consent() {
         fs::remove_file(&consent).unwrap();
         c.launch_complete(target).unwrap();
         replace_private(&consent, b"{");
-        let expected = super::super::record::authorized(&c.directory, target).unwrap_err();
+        let expected = crate::native::consent::authorized(&c.directory, target).unwrap_err();
         assert_eq!(
             format!("{:#}", c.launch_complete(target).unwrap_err()),
             format!("{expected:#}"),
@@ -374,7 +374,7 @@ fn an_authorization_error_propagates_before_the_manifest() {
     replace_private(&c.directory.join("manifest.json"), b"{");
     replace_private(&c.directory.join(SESSION_FILE), b"{");
     let expected =
-        super::super::record::authorized_with(&c.directory, FirstPartyCli::Claude, &c.stores.env)
+        super::super::authority::authority(&c.directory, FirstPartyCli::Claude, &c.stores.env)
             .unwrap_err();
     let policy = FakePolicy::with_start(&[Ok(ProviderStart::Started)]);
     let mut clock = FakeClock::new(Instant::now());
@@ -639,9 +639,9 @@ fn inherited(provider: FirstPartyCli, yolo: bool) -> Consented {
     }
 }
 
-// Consent that the launch already applied through the provider's own option, and consent
+// Consent that the launch already applied through the target's own option, and consent
 // inherited from a repository's main working tree, take no key on any surface: neither the
-// policy, the manifest, the store nor the surface is consulted. Before, a verified Agy launch
+// policy, the provider's store nor the surface is consulted. Before, a verified Agy launch
 // on a surface without a guarded key (Herdr, tmux, WezTerm) failed with the unguarded refusal,
 // and on one whose screen cannot be read (Ghostty, Warp) at the screen read.
 #[test]
@@ -651,16 +651,25 @@ fn applied_or_inherited_consent_takes_no_key() {
             let label = format!("{target:?} yolo={yolo}");
             let c = consented(target, yolo);
             super::super::record::applied(&c.directory, "agy-settings-override").unwrap();
-            replace_private(&c.directory.join("manifest.json"), b"{");
             let policy = FakePolicy::with_start(&[Ok(ProviderStart::NotStarted)]);
             let mut clock = FakeClock::new(Instant::now());
-            c.complete(
+            let result = c.complete(
                 target,
                 LaunchDialogSupport::Answered(&policy),
                 &mut clock,
                 &mut Untouched,
-            )
-            .unwrap();
+            );
+            // The target's own launch option skips the dialog; another adapter's option in
+            // this session's record is neither a reason to skip nor to answer.
+            if target == FirstPartyCli::Agy {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    format!("{:#}", result.unwrap_err()),
+                    "the session's consent record names another provider's launch option (agy-settings-override); no response sent",
+                    "{label}"
+                );
+            }
             assert!(policy.received.borrow().is_empty(), "{label}");
             assert_eq!(policy.start_reads.get(), 0, "{label}");
             assert_eq!(clock.slept, Duration::ZERO, "{label}");
@@ -696,6 +705,44 @@ fn applied_or_inherited_consent_takes_no_key() {
                 assert!(!store.exists(), "{label}: {}", store.display());
             }
         }
+    }
+}
+
+// Review finding 6: the step asks the one authority again before the screen read and
+// immediately before the one dispatch. Consent withdrawn, or a launch option recorded, after
+// the screen was read sends no key.
+#[test]
+fn consent_is_asked_again_immediately_before_the_dispatch() {
+    for change in ["withdrawn", "applied"] {
+        let c = consented(FirstPartyCli::Agy, false);
+        let reads = Cell::new(0);
+        let error = c
+            .complete(
+                FirstPartyCli::Agy,
+                provider::launch_dialog(FirstPartyCli::Agy),
+                &mut FakeClock::new(Instant::now()),
+                &mut scripted(
+                    GuardedKey::Taken,
+                    || {
+                        reads.set(reads.get() + 1);
+                        if change == "withdrawn" {
+                            let _ = fs::remove_file(&c.stores.pi);
+                        } else {
+                            super::super::record::applied(&c.directory, "agy-settings-override")
+                                .unwrap();
+                        }
+                        Ok(agy_dialog(&c.workspace))
+                    },
+                    || panic!("{change}: no key after consent changed"),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "workspace consent changed before trust dialog response; no response sent",
+            "{change}"
+        );
+        assert_eq!(reads.get(), 1, "{change}");
     }
 }
 

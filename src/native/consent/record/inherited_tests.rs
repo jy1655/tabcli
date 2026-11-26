@@ -1,11 +1,11 @@
-// The linked git worktree rule: a workspace that no provider trusts exactly inherits the exact
-// trust of its repository's main working tree, verified at every assessment and recheck.
+// The linked git worktree rule: a workspace that no provider trusts exactly inherits the
+// consent of its repository's main working tree, derived again at every assessment.
 use super::super::store::native_key;
 use super::super::tests::{Fixture, session, setup, trust_pi};
-use super::super::worktree::tests::{Registered, git_path, git_worktree, registered};
+use super::super::worktree::tests::{Registered, git_path, registered};
 use super::tests::{PROVIDERS, replace_store, store_of, trust};
 use super::*;
-use crate::native::session::primitives::{write_json_atomic, write_private};
+use crate::native::session::primitives::write_json_atomic;
 
 // The evidence that `provider`'s fixture store yields for `path` itself.
 fn exact(fixture: &Fixture, provider: FirstPartyCli, path: &Path) -> Evidence {
@@ -15,8 +15,8 @@ fn exact(fixture: &Fixture, provider: FirstPartyCli, path: &Path) -> Evidence {
     }
 }
 
-// A state root, a fixture home and a linked worktree registered as Git does, all under one
-// temporary directory.
+// A state root, a fixture home and a real repository with a linked worktree that Git
+// registered, all under one temporary directory.
 fn worktree_setup() -> (tempfile::TempDir, Fixture, Registered) {
     let (temp, _workspace, fixture) = setup();
     let git = registered(&temp.path().canonicalize().unwrap());
@@ -37,8 +37,29 @@ fn keys(path: &Path) -> Vec<String> {
     keys
 }
 
+// Pi's store with these decisions, written the way the provider's private store is.
+fn pi_decides(fixture: &Fixture, decisions: &[(&Path, bool)]) {
+    let decisions: serde_json::Map<_, _> = decisions
+        .iter()
+        .map(|(path, trusted)| (native_key(path).unwrap(), serde_json::json!(trusted)))
+        .collect();
+    replace_store(
+        &fixture.pi,
+        serde_json::Value::Object(decisions).to_string().as_bytes(),
+    )
+    .unwrap();
+}
+
+// `consent revoke` of `path` in the state root `root`, as the command writes it.
+fn revoke(root: &Path, path: &Path) {
+    with_record(root, path, |record_path, record| {
+        write_json_atomic(record_path, &changed(record, identity(path)?, true))
+    })
+    .unwrap();
+}
+
 #[test]
-fn a_verified_linked_worktree_inherits_the_exact_trust_of_its_main_working_tree() {
+fn a_verified_linked_worktree_inherits_the_consent_of_its_main_working_tree() {
     for provider in PROVIDERS {
         let (temp, fixture, git) = worktree_setup();
         let before = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
@@ -60,33 +81,32 @@ fn a_verified_linked_worktree_inherits_the_exact_trust_of_its_main_working_tree(
             Some(identity(&git.repository).unwrap()),
             "{provider:?}"
         );
-        // The recheck of the recorded source verifies the same, and no store was written.
-        let again = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
-        assert_eq!(again.state, "verified", "{provider:?}");
-        assert_eq!(again.source, first.source, "{provider:?}");
-        assert_eq!(again.repository_root, first.repository_root, "{provider:?}");
-        assert_eq!(stores(&fixture), written, "{provider:?}");
-        let shared = record_path(temp.path(), &git.worktree);
+        // The main working tree's own consent was assessed, and its source pinned, as an
+        // `ask` there would have.
         assert_eq!(
-            keys(&shared),
+            with_record(temp.path(), &git.repository, |_, record| Ok(record
+                .unwrap()
+                .source))
+            .unwrap(),
+            first.source,
+            "{provider:?}"
+        );
+        // The recheck verifies the same, with and without writing, and no store was written.
+        for again in [
+            assess_with(temp.path(), &git.worktree, &fixture.env).unwrap(),
+            assess_current(temp.path(), &git.worktree, &fixture.env).unwrap(),
+        ] {
+            assert_eq!(again.state, "verified", "{provider:?}");
+            assert_eq!(again.source, first.source, "{provider:?}");
+            assert_eq!(again.repository_root, first.repository_root, "{provider:?}");
+        }
+        assert_eq!(stores(&fixture), written, "{provider:?}");
+        assert_eq!(
+            keys(&record_path(temp.path(), &git.worktree)),
             ["identity", "repository_root", "revoked", "schema", "source"],
             "{provider:?}"
         );
     }
-}
-
-// Git's own worktrees, as `git worktree add` writes them on each platform.
-#[test]
-fn a_worktree_that_git_added_inherits_like_the_one_written_by_hand() {
-    let (temp, _workspace, fixture) = setup();
-    let (repository, worktree) = git_worktree(&temp.path().canonicalize().unwrap(), "added");
-    trust(&fixture, FirstPartyCli::Agy, &repository);
-    let assessment = assess_with(temp.path(), &worktree, &fixture.env).unwrap();
-    assert_eq!(assessment.state, "verified");
-    assert_eq!(
-        assessment.repository_root.map(|root| root.path),
-        Some(repository)
-    );
 }
 
 #[test]
@@ -106,7 +126,7 @@ fn exact_trust_comes_first_and_consent_extends_to_no_child_or_parent() {
         keys(&record_path(temp.path(), &git.worktree)),
         ["identity", "revoked", "schema", "source"]
     );
-    // A directory inside the worktree is no worktree, and the main working tree trusted only
+    // A directory inside the worktree is no worktree, and a main working tree trusted only
     // as a parent gives a worktree nothing.
     let child = git.worktree.join("child");
     fs::create_dir(&child).unwrap();
@@ -127,6 +147,112 @@ fn exact_trust_comes_first_and_consent_extends_to_no_child_or_parent() {
             .unwrap()
             .state,
         "unverified"
+    );
+}
+
+// Review finding 1: the main working tree's own consent decides, as TAB assesses that folder,
+// not the provider's store read past it. A revoke, a changed identity or a reset source of the
+// main working tree stops inheritance, before and after the worktree's first assessment.
+#[test]
+fn the_main_working_trees_own_consent_decides() {
+    // Revoked before the worktree's first assessment.
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.repository, &fixture.env)
+            .unwrap()
+            .state,
+        "verified"
+    );
+    revoke(temp.path(), &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "unverified"
+    );
+
+    // Revoked after it.
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "verified"
+    );
+    revoke(temp.path(), &git.repository);
+    for state in [
+        assess_with(temp.path(), &git.worktree, &fixture.env).unwrap(),
+        assess_current(temp.path(), &git.worktree, &fixture.env).unwrap(),
+    ]
+    .map(|assessment| assessment.state)
+    {
+        assert_eq!(state, "source-reset");
+    }
+
+    // The main working tree's record names another identity.
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    with_record(temp.path(), &git.repository, |path, record| {
+        let mut record = record.unwrap();
+        record.identity.owner = "another-owner".into();
+        write_json_atomic(path, &record)
+    })
+    .unwrap();
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "source-reset"
+    );
+
+    // The main working tree's pinned source no longer trusts it: another provider that does
+    // is not substituted for the main working tree, and so not for the worktree.
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    replace_store(&fixture.claude, b"{\"projects\":{}}").unwrap();
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.repository, &fixture.env)
+            .unwrap()
+            .state,
+        "source-reset"
+    );
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "source-reset"
+    );
+}
+
+// Review finding 2: a source provider's own decline of the worktree is never turned into an
+// approval by that provider's entry for the main working tree, at acquisition or later.
+#[test]
+fn a_source_that_declines_the_worktree_gives_it_nothing() {
+    let (temp, fixture, git) = worktree_setup();
+    pi_decides(&fixture, &[(&git.repository, true), (&git.worktree, false)]);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "unverified"
+    );
+
+    let (temp, fixture, git) = worktree_setup();
+    pi_decides(&fixture, &[(&git.repository, true)]);
+    let first = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(first.state, "verified");
+    assert_eq!(first.source.unwrap().provider, "pi");
+    pi_decides(&fixture, &[(&git.repository, true), (&git.worktree, false)]);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "source-reset"
     );
 }
 
@@ -154,37 +280,28 @@ fn inherited_consent_is_rechecked_against_the_registration_and_the_main_working_
     fs::write(&backlink, &saved).unwrap();
     assert_eq!(state(), "verified");
 
-    // The source's store no longer trusts the main working tree: no other provider is
-    // substituted, not even one that trusts the worktree exactly, until it trusts it again.
-    replace_store(&fixture.claude, b"{\"projects\":{}}").unwrap();
-    assert_eq!(state(), "source-reset");
-    trust_pi(&fixture, &git.worktree);
-    trust(&fixture, FirstPartyCli::Codex, &git.repository);
-    assert_eq!(state(), "source-reset");
-    trust(&fixture, FirstPartyCli::Claude, &git.repository);
-    let again = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
-    assert_eq!(again.state, "verified");
-    assert_eq!(again.source, verified.source);
-
-    // The main working tree replaced at the same path, with the same registration in it.
+    // The main working tree replaced at the same path, with the same repository in it: a new
+    // identity, which neither the worktree's record nor the main working tree's accepts.
     let old = git.repository.with_file_name("repository-old");
     fs::rename(&git.repository, &old).unwrap();
     fs::create_dir(&git.repository).unwrap();
     fs::rename(old.join(".git"), git.repository.join(".git")).unwrap();
     assert_eq!(state(), "source-reset");
-    // Reset clears the source and the main working tree; a later assessment takes the
-    // current one, and exact trust of the worktree comes first again.
-    with_record(temp.path(), &git.worktree, |path, record| {
-        write_json_atomic(path, &changed(record, identity(&git.worktree)?, false))
-    })
-    .unwrap();
+    // Reset clears the worktree's source and main working tree; with the main working tree's
+    // own record reset too, a later assessment takes the current one.
+    for path in [&git.worktree, &git.repository] {
+        with_record(temp.path(), path, |record_path, record| {
+            write_json_atomic(record_path, &changed(record, identity(path)?, false))
+        })
+        .unwrap();
+    }
     let fresh = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
     assert_eq!(fresh.state, "verified");
-    assert_eq!(fresh.repository_root, None);
     assert_eq!(
-        fresh.source,
-        Some(exact(&fixture, FirstPartyCli::Pi, &git.worktree))
+        fresh.repository_root,
+        Some(identity(&git.repository).unwrap())
     );
+    assert_eq!(fresh.source, verified.source);
 }
 
 #[test]
@@ -304,44 +421,4 @@ fn records_keep_the_shape_an_earlier_binary_reads_and_an_inherited_one_never_ver
             .get("repository_root")
             .is_none()
     );
-}
-
-#[test]
-fn a_target_that_declines_the_worktree_or_its_main_working_tree_takes_no_inherited_consent() {
-    let (_temp, fixture, git) = worktree_setup();
-    trust(&fixture, FirstPartyCli::Codex, &git.repository);
-    let (root, directory) = session(&git.worktree, "launching");
-    let assessment = assess_with(root.path(), &git.worktree, &fixture.env).unwrap();
-    assert!(assessment.repository_root.is_some());
-    record(&directory, &assessment).unwrap();
-    for target in PROVIDERS {
-        assert!(
-            authorized_with(&directory, target, &fixture.env).unwrap(),
-            "{target:?}"
-        );
-    }
-    for declined in [&git.repository, &git.worktree] {
-        if fixture.pi.exists() {
-            fs::remove_file(&fixture.pi).unwrap();
-        }
-        write_private(
-            &fixture.pi,
-            serde_json::json!({ native_key(declined).unwrap(): false })
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        assert!(
-            !authorized_with(&directory, FirstPartyCli::Pi, &fixture.env).unwrap(),
-            "{}",
-            declined.display()
-        );
-        assert!(authorized_with(&directory, FirstPartyCli::Codex, &fixture.env).unwrap());
-    }
-    // A session record whose main working tree differs from the current assessment's is not
-    // authorized.
-    let mut forged = assessment.clone();
-    forged.repository_root.as_mut().unwrap().owner = "another-owner".into();
-    record(&directory, &forged).unwrap();
-    assert!(!authorized_with(&directory, FirstPartyCli::Codex, &fixture.env).unwrap());
 }

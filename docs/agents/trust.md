@@ -29,41 +29,62 @@
   the one worktree rule below.
 - Consent has one rule for every provider (owner's decision, 2026-11-26): exact trust of
   the workspace in a provider's own store, or, only when no provider trusts the workspace
-  exactly, exact trust of the main working tree of the repository that registered the
-  workspace as a linked git worktree. `consent/worktree.rs` reads Git's files and runs no
-  `git`: the workspace's `.git` is a regular file naming `<common>/worktrees/<id>` by an
-  absolute path, that registration's `commondir` is Git's `../..` and its `gitdir` names
-  the workspace's `.git` back, no path on the way has a link (on Windows, any reparse
-  point), the common directory is the `.git` directory of its parent (which rules out a
-  submodule and a bare repository), and its `config` and `config.worktree` neither set
-  `core.bare` nor `core.worktree` nor include another file. Git's relative-path
-  registrations (`worktree.useRelativePaths`) are not followed. Anything else is no
-  worktree and keeps the exact rule. A child or parent directory still gets nothing.
+  exactly, the consent of the main working tree of the repository that registered the
+  workspace as a linked git worktree. That main working tree's consent is assessed exactly
+  as TAB assesses an exact folder, with its own record: its pinned source, identity and
+  revocation decide, never a provider store read past them. Its source provider must not
+  decline, or fail to read, the worktree itself. A child or parent directory gets nothing.
+- `consent/worktree.rs` states the subset of Git's layout and configuration that TAB
+  interprets, reads it as Git defines it, runs no `git`, and refuses everything outside it,
+  including anything it cannot read or parse. In short: `.git` is a regular file `gitdir:
+  <path>`, the path absolute or relative to the worktree as Git resolves it; lexically, before
+  any I/O on it, it names `<main>/.git/worktrees/<id>` on the worktree's own volume (drive or
+  UNC share on Windows); that registration's `commondir` names `<main>/.git` and its `gitdir`
+  names the worktree's `.git` back, absolute or relative to the registration (Git 2.48
+  `--relative-paths`), both compared lexically; no directory or file on the way is a link
+  (on Windows, any reparse point), checked again on each opened handle; both Git
+  directories are usable as Git's `is_git_directory` checks them (`HEAD`, `objects`,
+  `refs`); and `<main>/.git/config`, plus both `config.worktree` files when
+  `extensions.worktreeConfig` is true (only "not found" is absence), are in Git's syntax
+  (a byte order mark is skipped as Git skips it) without `include`/`includeIf`,
+  `core.worktree`, a true `core.bare` (last value wins), a format version other than 0 or
+  1, an extension Git does not define, or a value continued on the next line.
+- `consent/authority.rs` is the one answer to "may this target provider treat this
+  session's workspace as consented now". Every use asks it: a provider's launch plan (the
+  Codex, Pi and Agy options), the launch dialog step (before the policy, before the screen
+  read and immediately before the one dispatch), the Agy paste gate, and doctor. It reads the
+  session's assessment as a typed record, binds it to the manifest's workspace by path and
+  identity, assesses that workspace again without writing (records, stores and Git files as
+  they are now), and asks the target provider whether it declines, or cannot read, the
+  workspace or its main working tree. A record or manifest that cannot be read is an error;
+  anything else that does not hold is a refusal with its reason. An applied marker records
+  what a launch did and is never authority: an Agy paste with the marker still needs the
+  authority's yes, and a dialog step skips only for the target adapter's own marker; another
+  adapter's marker refuses the step.
 - An inherited source records the main working tree's identity (`repository_root` in the
-  shared record and the session's assessment). Every recheck verifies the registration
-  again, the main working tree's identity, and the recorded store's exact entry for it;
-  any change is `source-reset`, with no substitution, exactly as for an exact source. A
-  target provider that declines or cannot read the workspace or that main working tree
-  takes no consent. Who can make a worktree count: whoever can write the trusted
-  repository's `.git` (to register it) and the worktree's own `.git` file; a cloned or
-  fetched repository cannot, because Git never writes `.git/worktrees` from fetched
-  content. What such a writer gains is what trusting the main working tree already
-  accepts: any commit checked out there, including hooks and provider configuration in
-  it. Codex applies the same inheritance itself (measured, above); Claude Code 2.1.332's
-  bundled source resolves a worktree to its main root as well (read, not run).
+  shared record and the session's assessment). Who can make a worktree count: whoever can
+  write the trusted repository's `.git` (to register it) and the worktree's own `.git` file;
+  a cloned or fetched repository cannot, because Git never writes `.git/worktrees` from
+  fetched content. What such a writer gains is what trusting the main working tree already
+  accepts: any commit checked out there, including hooks and provider configuration in it.
+  Codex applies the same inheritance itself (measured, above); Claude Code 2.1.332's bundled
+  source resolves a worktree to its main root as well (read, not run). Between the authority
+  and the provider's start a few milliseconds remain in which a change is not seen; every
+  later paste asks again.
 - TAB writes no provider trust store. Consent is applied only through a provider's own
   process-local option, recorded as that adapter's applied marker (Codex `-c projects`,
-  Pi `--approve`, Agy's `--settings` file), or, for exact consent only, by the guarded
-  answer to the provider's own dialog, after which the provider saves its decision. A
-  launch that recorded an applied marker, and any launch with inherited consent, sends no
-  key: "Yes" would have the provider save the worktree as exact trust. Claude has no such
-  option, so with inherited consent it launches as with unverified consent.
+  Pi `--approve`, Agy's `--settings` file), or, for exact consent where no option was
+  applied, by the guarded answer to the provider's own dialog, after which the provider
+  saves its decision. Inherited consent never takes a key: "Yes" would have the provider
+  save the worktree as exact trust. Claude has no such option, so with inherited consent it
+  launches as with unverified consent.
 - Stored data: a record without `repository_root` keeps the bytes earlier binaries wrote,
   and their meaning. An earlier binary (0.4.49) ignores the field of an inherited record,
   rechecks its source with the workspace's own key, finds none, and reports
   `source-reset` without writing; it refuses consent, never grants it. Its `consent revoke`
   drops the field and keeps the source, which then stays revoked; its `consent reset`
-  clears both.
+  clears both. The assessment at a session's start may also write the main working tree's
+  own record (its first source), as an `ask` there would.
 - A wait for workspace trust ends when its session has ended, and looks at the session
   before it looks at the evidence: the launcher of a closed session must not wait until
   its deadline, and an ended session is never pasted into. This holds for the Codex wait

@@ -397,6 +397,11 @@ pub(super) fn launch_trust_markers() -> impl Iterator<Item = &'static str> {
         .filter_map(|provider| adapter(*provider).applied_marker())
 }
 
+// The marker that `provider`'s own launch records when it applies workspace trust.
+pub(super) fn applied_marker(provider: FirstPartyCli) -> Option<&'static str> {
+    adapter(provider).applied_marker()
+}
+
 pub(super) fn workspace_trust(
     provider: FirstPartyCli,
     workspace: &Path,

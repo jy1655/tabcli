@@ -543,9 +543,11 @@ Install and sign in to `agy` (Antigravity CLI) 1.1.12 or newer. Trust the exact 
 in Agy before launching it through TAB, or rely on
 [shared workspace consent](security-and-data.md#workspace-trust-and-consent): with Agy 1.5.17 or
 newer, a directory another provider trusts exactly, or a git worktree of a repository whose main
-working tree a provider trusts, is handed to Agy in a settings file for that session only
-(`--settings`). Agy then shows no trust dialog in any terminal, and its own trust store is left
-unchanged. Older versions launch without it and keep the dialog.
+working tree has verified consent, is handed to Agy in a settings file for that session only
+(`--settings`). No key is sent and Agy's own trust store is left unchanged; Agy no longer saves
+such a folder because of TAB. This was measured with Agy 1.5.17 on macOS only: no trust dialog.
+Older versions launch without it and keep the dialog, which TAB answers only with exact consent
+on iTerm2, Terminal.app and the Windows console.
 
 On macOS and Linux, TAB passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
 behind its workspace-trust dialog, so receiving the first result does not prove it is ready for
@@ -557,9 +559,9 @@ period in the session's `agy.log`; the Windows initial paste also requires a ful
 follow-ups take a fresh log offset before delivery rather than repeating those readiness checks.
 Every paste requires a matching input receipt afterward.
 
-The Windows initial paste and macOS follow-ups also require Agy's trust entry for the exact
-workspace, or the session-only setting above, and a log entry showing that this session loaded
-the workspace customizations. Trusting the directory in another Agy session does not establish
+Every paste, the Windows initial paste and every follow-up on any platform, also requires Agy's
+trust entry for the exact workspace, or the session-only setting above while its consent still
+holds, and a log entry showing that this session loaded the workspace customizations. Trusting the directory in another Agy session does not establish
 that this session is ready, and neither does the setting alone: an Agy that ignored it shows its
 dialog and logs no such entry.
 

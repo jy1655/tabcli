@@ -1539,7 +1539,7 @@ fn hold_check_reports_each_part_without_changing_other_checks() {
 fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     const OBSERVATION: &str =
         "Observation only: doctor never answers the dialog or edits Agy's settings.";
-    const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
+    const WITHHELD: &str = "Every paste (the Windows initial prompt and every follow-up) is withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
     const RECOVERY: &str = "If the managed terminal shows the trust dialog, approve it there and send the prompt again; if it shows the composer or the prompt is still withheld afterwards, close this session and start a new one";
     let fixture = Fixture::new("agy");
     let home = tempfile::tempdir().unwrap();

@@ -306,11 +306,18 @@ user can change.
 _Avoid_: approval, permission (TAB's own permission mode is a different axis)
 
 **Inherited consent**:
-Consent for a linked git worktree that no provider trusts exactly, taken from the exact
-Workspace trust of its repository's main working tree once Git's own files prove the
-registration in both directions. It is rechecked like any consent and never answered with a
-dialog key.
+Consent for a linked git worktree that no provider trusts exactly, taken from the consent of its
+repository's main working tree (that folder's own record, source and revocation) once Git's own
+files prove the registration in both directions. It is derived again at every use, like any
+consent, and never answered with a dialog key.
 _Avoid_: parent trust, repository trust (a parent directory never supplies consent)
+
+**Consent authority**:
+The one answer to whether a target provider may treat a session's workspace as consented now,
+derived again from current records, stores and Git files at every use (a launch option, the
+launch dialog step, a paste gate, doctor) and never written. A launch's applied marker records
+what it did and is never authority.
+_Avoid_: authorized flag, consent cache
 
 **Launch dialog**:
 The dialog a provider shows at startup, asking whether to trust the workspace. TAB answers

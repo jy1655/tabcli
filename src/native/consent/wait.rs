@@ -1,4 +1,5 @@
-use super::record::{authorized, observe};
+use super::authority::authority;
+use super::record::observe;
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::provider;
@@ -93,7 +94,7 @@ fn wait_for_native_trust_with(
     ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
     wait_for_native_trust_authorized_with(directory, target, deadline, env, ready, &mut || {
-        authorized(directory, target)
+        Ok(authority(directory, target, env)?.verdict.is_ok())
     })
 }
 

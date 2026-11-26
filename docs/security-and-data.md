@@ -46,22 +46,40 @@ its decision, TAB does not silently choose another provider as the source.
 
 Git worktrees are the one exception, for every provider. When no provider trusts a directory
 exactly, and Git's own files prove that it is a linked worktree of a repository whose main
-working tree a provider trusts exactly, TAB reuses that decision for the worktree; Codex does the
-same by itself. TAB reads those files without running `git` and checks the registration in both
-directions. A path through a symbolic link, a submodule, a bare repository, a main working tree
-moved by `core.worktree`, and worktrees registered with relative paths do not count. The record
-then also names the main working tree (`repository_root`), and every later use checks its
-identity and the registration again. Anyone who can write that repository's `.git` directory can
-register a worktree, whose files are then trusted like any commit checked out in the main working
-tree. A cloned or fetched repository cannot register a worktree by itself.
+working tree has verified consent in TAB, the worktree inherits that consent; Codex does the same
+by itself. The main working tree's own consent decides, with its source, identity and revocation:
+`tabcli consent revoke` on the main working tree also stops its worktrees. A provider that
+declines the worktree itself, either the source of that consent or the provider being launched,
+stops it too. TAB reads Git's files without running `git`, accepts only a stated subset of Git's
+layout and configuration, and checks the registration in both directions; absolute and relative
+registrations (`git worktree add --relative-paths`) both count. A path through a symbolic link
+or junction, a pointer to another drive or network share, a submodule, a bare repository, a
+repository without `HEAD`, objects or refs, a main working tree moved by `core.worktree`, and a
+configuration TAB cannot read as Git does (for example one that includes another file) do not
+count. The record then also names the main working tree (`repository_root`). Anyone who can
+write that repository's `.git` directory can register a worktree, whose files are then trusted
+like any commit checked out in the main working tree. A cloned or fetched repository cannot
+register a worktree by itself.
+
+TAB checks consent again at every use, not only at launch: before a provider option is applied,
+before and during a trust-dialog answer, before every Agy paste, and in `doctor`. Each check
+reads the records, provider stores and Git files as they are now and writes nothing. What a
+launch recorded is history: a revoked consent, a source that no longer trusts the directory or a
+worktree that is no longer registered stops TAB from pasting into a running Agy session.
 
 TAB never writes a provider trust store. With verified consent, Codex receives a process-local
 configuration override, Pi receives its one-run approval option, and Agy 1.5.17 or newer receives
-a settings file for that session only (`--settings`, never saved by Agy), so Agy shows no trust
-dialog in any terminal and no key is sent. Without such an option, and only with exact consent,
-TAB can answer Claude's startup trust dialog, or that of an Agy older than 1.5.17, once in
-iTerm2, Terminal.app, and the native Windows console; the provider saves the decision after the
-guarded response. See
+a settings file for that session only (`--settings`, which Agy documents as never saved), so no
+key is sent and Agy's own store is not written. Only Agy 1.5.17 on macOS has been measured
+(standalone, and through TAB on Herdr in a new worktree): no trust dialog, and its store
+unchanged. For an ordinary folder that only another provider trusts, this changes what 0.4.49
+did with Agy: in iTerm2, Terminal.app and the native Windows console TAB used to answer Agy's
+dialog, after which Agy saved the folder in its own store; in Herdr, tmux and WezTerm the launch
+failed because no guarded key can be sent there; in Ghostty and Warp it failed at the screen
+read. Now all of them launch with the setting, and Agy no longer saves such a folder because of
+TAB. Without such an option, and only with exact consent, TAB can answer Claude's startup trust
+dialog, or that of an Agy older than 1.5.17, once in iTerm2, Terminal.app, and the native
+Windows console; the provider saves the decision after the guarded response. See
 [terminal requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts)
 for the terminal-specific limits.
 
@@ -100,10 +118,11 @@ Some initial prompts wait rather than risk typing a submission key onto a trust 
 - Codex on native Windows waits for exact trust, verified shared consent, or its empty composer.
   An empty screen or missing dialog text is not enough.
 - Agy on native Windows waits for its exact trust entry, or the session-only setting TAB passed
-  at launch, and this session's customization-load log entry, then startup readiness. On macOS
-  its initial prompt is an argument and can run behind the dialog; follow-ups wait for the same
-  trust and log evidence before input. The setting alone is not enough: if Agy ignored it, the
-  log entry is missing and nothing is pasted.
+  at launch while consent still holds, and this session's customization-load log entry, then
+  startup readiness. On macOS and Linux its initial prompt is an argument and can run behind the
+  dialog. Every follow-up, on Windows too, waits for the same trust and log evidence before
+  input. The setting alone is not enough: if Agy ignored it, the log entry is missing and
+  nothing is pasted.
 - Pi on native Windows waits for the current turn's startup event after the trust procedure.
   That event can follow a decline; it is not shared consent.
 - Claude on native Windows delivers the initial prompt through official cross-session messaging

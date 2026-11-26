@@ -466,11 +466,14 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/self_test.rs` runs the explicit public self-test through bounded commands, checks
   initial and follow-up results, and closes only its own sessions. It uses the ordinary state
   root unless isolation is requested; it is not called implicitly by another command.
-- `src/native/consent.rs` preserves the public consent path and re-exports four concerns:
+- `src/native/consent.rs` preserves the public consent path and re-exports its concerns:
   `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
   `consent/record.rs` owns TAB's consent Record and command, with the one consent rule for
-  every provider (exact trust, else the exact trust of the main working tree of a linked git
-  worktree that `consent/worktree.rs` verifies from Git's own files);
+  every provider (exact trust, else the consent of the main working tree of a linked git
+  worktree that `consent/worktree.rs` verifies from a stated subset of Git's own files);
+  `consent/authority.rs` owns the one answer whether a target provider may treat a session's
+  workspace as consented now, which every launch option, the dialog step, the Agy paste gate
+  and doctor ask, without writing;
   `consent/launch_dialog.rs` owns
   a launch's workspace dialog step in one entry, from the decision whether to wait for the
   dialog at all (never for consent a launch applied through an adapter's own option, or for

@@ -329,9 +329,56 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     );
 }
 
-// A session launched with Agy's session-only setting needs no entry in Agy's store, and it
-// still needs its own log line: the setting is TAB's configuration, the line is Agy's evidence
-// that this process took it. Only this session's own record of the Agy setting counts.
+// A launching session in `root` (its state root and its user home) whose workspace Codex
+// trusts exactly, with its consent recorded as `ask` records it.
+fn consented_session(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use crate::native::session::primitives::{write_json_atomic, write_private};
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let key = super::super::super::super::consent::native_key(&workspace).unwrap();
+    let key = if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    };
+    fs::create_dir_all(root.join(".codex")).unwrap();
+    write_private(
+        &root.join(".codex/config.toml"),
+        format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(&key).unwrap()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let directory = session_with_status(root, "session-trust2", "running");
+    write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-trust2".to_owned(),
+            provider: "agy".to_owned(),
+            provider_path: "agy".into(),
+            provider_version: "1.5.17".to_owned(),
+            workspace: workspace.clone(),
+            title: "Agy trust".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    crate::native::consent::prepare_at_home(&directory, &workspace, root).unwrap();
+    (workspace, directory)
+}
+
+// A session whose launch configured Agy's session-only setting needs no entry in Agy's store,
+// and it still needs its own log line: the setting is TAB's configuration, the line is Agy's
+// evidence that this process took it. The marker grants nothing by itself: consent's authority
+// decides at every paste (review finding 8), and only this session's own record of the Agy
+// setting counts.
 #[test]
 fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line() {
     use super::super::super::super::consent;
@@ -340,19 +387,10 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     use crate::native::session::primitives::write_json_atomic;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    let workspace = root.join("workspace");
-    fs::create_dir(&workspace).unwrap();
-    let directory = session_with_status(&root, "session-trust2", "running");
+    let (workspace, directory) = consented_session(&root);
     let log_path = directory.join(AGY_LOG_FILE);
     let env = consent::Environment::at_home(&root);
     let consent_record = directory.join("workspace-consent.json");
-    let applied = |marker: serde_json::Value| {
-        write_json_atomic(
-            &consent_record,
-            &serde_json::json!({"state": "verified", "applied": marker}),
-        )
-        .unwrap();
-    };
     let start = Instant::now();
     let wait = Duration::from_secs(30);
     let gate = || {
@@ -369,10 +407,27 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
             "Agy workspace trust was not verified before the deadline, so the prompt was not pasted: {reason}. {TRUST_RECOVERY}"
         ))
     };
+    let evidence_keys = |check: &crate::native::diagnostics::Check| {
+        let row = serde_json::to_value(check).unwrap();
+        let mut keys: Vec<_> = row["evidence"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
 
-    // No Agy store at all: the setting alone with this process's load line opens the gate.
-    applied(serde_json::json!(APPLIED_MARKER));
+    // No marker: the store rule as before, here an absent entry.
     fs::write(&log_path, REAL_SUCCESS_STARTUP).unwrap();
+    let (outcome, check) = gate();
+    assert_eq!(outcome, refused(TRUST_STORE_MISSING));
+    assert_eq!(evidence_keys(&check), ["log", "store", "workspace"]);
+
+    // The setting with current consent and this process's load line opens the gate, with no
+    // Agy store at all.
+    consent::applied(&directory, APPLIED_MARKER).unwrap();
     let (outcome, check) = gate();
     assert_eq!(outcome, Ok(()));
     assert_eq!(check.availability, Availability::Available);
@@ -382,21 +437,24 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
         row["detail"]
             .as_str()
             .unwrap()
-            .contains("session-only setting"),
+            .contains("launch configured Agy's session-only setting"),
         "{row}"
     );
     assert_eq!(
         row["evidence"]["session_settings"],
         serde_json::json!(directory.join(SESSION_SETTINGS_FILE))
     );
-    // Nor does an unreadable store matter then: it is not read.
+    // Agy's own store must still be readable: the authority asks the target whether it
+    // declines the workspace, and a read failure refuses.
     fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
     let store = root.join(".gemini/antigravity-cli/settings.json");
     fs::write(&store, b"{\"trustedWorkspaces\":true}").unwrap();
+    assert_eq!(gate().0, refused(TRUST_SETTING_WITHOUT_CONSENT));
+    fs::remove_file(&store).unwrap();
+    write_json_atomic(&store, &serde_json::json!({"trustedWorkspaces": []})).unwrap();
     assert_eq!(gate().0, Ok(()));
 
-    // Without the load line Agy may have ignored the setting: no paste, and the report says
-    // which fact is missing.
+    // Without the load line Agy may not have taken the setting: no paste.
     fs::write(&log_path, REAL_FAILURE_STARTUP).unwrap();
     let (outcome, check) = gate();
     assert_eq!(outcome, refused(TRUST_SETTING_UNVERIFIED));
@@ -404,13 +462,43 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     assert_eq!(check.reason_code, "agy_session_trust_unverified");
     fs::remove_file(&log_path).unwrap();
     assert_eq!(gate().0, refused(TRUST_SETTING_UNVERIFIED));
+    fs::write(&log_path, REAL_SUCCESS_STARTUP).unwrap();
+    assert_eq!(gate().0, Ok(()));
 
-    // Another adapter's marker, the dialog's own markers, a marker that is not a string and an
-    // unreadable record are not this setting: the store rule applies, here an absent entry.
-    crate::native::session::primitives::write_private(&log_path, REAL_SUCCESS_STARTUP.as_bytes())
+    // Consent withdrawn after launch: the marker and the load line remain, and nothing is
+    // pasted. First the source's own trust, then a revoke.
+    let codex = root.join(".codex/config.toml");
+    let saved = fs::read(&codex).unwrap();
+    fs::remove_file(&codex).unwrap();
+    let (outcome, check) = gate();
+    assert_eq!(outcome, refused(TRUST_SETTING_WITHOUT_CONSENT));
+    assert_eq!(check.availability, Availability::Unavailable);
+    assert_eq!(check.reason_code, "agy_workspace_untrusted");
+    crate::native::session::primitives::write_private(&codex, &saved).unwrap();
+    assert_eq!(gate().0, Ok(()));
+    let shared = fs::read_dir(root.join("workspace-consent"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
         .unwrap();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&shared).unwrap()).unwrap();
+    record["revoked"] = serde_json::json!(true);
+    write_json_atomic(&shared, &record).unwrap();
+    assert_eq!(gate().0, refused(TRUST_SETTING_WITHOUT_CONSENT));
+    record["revoked"] = serde_json::json!(false);
+    write_json_atomic(&shared, &record).unwrap();
+    assert_eq!(gate().0, Ok(()));
+
+    // Another adapter's marker, the dialog's own markers and a marker that is not a string
+    // are not this setting: the store rule applies, here an absent entry.
     fs::remove_file(&store).unwrap();
     write_json_atomic(&store, &serde_json::json!({"trustedWorkspaces": []})).unwrap();
+    let assessment: serde_json::Value =
+        serde_json::from_slice(&fs::read(&consent_record).unwrap()).unwrap();
     for marker in [
         serde_json::json!("codex-config-override"),
         serde_json::json!("pi-approve-once"),
@@ -419,16 +507,28 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
         serde_json::json!(true),
         serde_json::Value::Null,
     ] {
-        applied(marker.clone());
+        let mut changed = assessment.clone();
+        changed["applied"] = marker.clone();
+        write_json_atomic(&consent_record, &changed).unwrap();
         let (outcome, check) = gate();
         assert_eq!(outcome, refused(TRUST_STORE_MISSING), "{marker}");
         assert_eq!(check.reason_code, "agy_workspace_untrusted", "{marker}");
-        // The evidence any earlier binary gave: no settings file is named.
-        let row = serde_json::to_value(&check).unwrap();
-        let mut keys: Vec<_> = row["evidence"].as_object().unwrap().keys().collect();
-        keys.sort();
-        assert_eq!(keys, ["log", "store", "workspace"], "{marker}");
+        assert_eq!(
+            evidence_keys(&check),
+            ["log", "store", "workspace"],
+            "{marker}"
+        );
     }
-    fs::write(&consent_record, b"{").unwrap();
-    assert_eq!(gate().0, refused(TRUST_STORE_MISSING));
+    // A record that carries the marker but is not a whole assessment cannot be read: the
+    // paste waits and reports why, and is never sent.
+    write_json_atomic(
+        &consent_record,
+        &serde_json::json!({"state": "verified", "applied": APPLIED_MARKER}),
+    )
+    .unwrap();
+    let outcome = gate().0.unwrap_err();
+    assert!(
+        outcome.contains("Agy's trust evidence could not be read"),
+        "{outcome}"
+    );
 }

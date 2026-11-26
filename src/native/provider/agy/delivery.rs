@@ -138,8 +138,10 @@ impl<'a> PreparedTerminalTurn<'a> {
     }
 }
 
-// A Windows follow-up has already passed startup trust/readiness in its initial
-// paste; all other pastes wait for both gates here before preparing the turn.
+// Every paste waits for the trust evidence first: Agy's own store or this session's applied
+// setting with current consent, and this process's own log line. A Windows follow-up has
+// already passed startup readiness in its initial paste and skips only that wait; all other
+// pastes also wait for readiness before preparing the turn.
 pub(super) fn deliver_terminal_turn<R: Runtime>(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
@@ -161,11 +163,8 @@ pub(super) fn deliver_terminal_turn<R: Runtime>(
         &directory,
         runtime,
         |runtime| {
-            if readiness.is_some() {
-                let (clock, io) = runtime.split();
-                wait_for_workspace_trust(&directory, deadline, &io.environment(), clock)?;
-            }
-            Ok(())
+            let (clock, io) = runtime.split();
+            wait_for_workspace_trust(&directory, deadline, &io.environment(), clock)
         },
         |runtime| {
             let (clock, io) = runtime.split();

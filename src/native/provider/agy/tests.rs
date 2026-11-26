@@ -269,8 +269,8 @@ fn probes_drop_caller_identities_and_keep_configuration() {
 
 // The complete launch command for every policy combination and both platform branches:
 // policy, the private log file, and off Windows the correlated interactive prompt. Without
-// consent (the production gate, which finds no consent record) the command is the one every
-// earlier release built, and no settings file or applied marker is written.
+// consent the command is the one every earlier release built, and no settings file or applied
+// marker is written, even for an Agy that takes the setting.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
     for windows in [false, true] {
@@ -296,7 +296,8 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                             effort,
                         },
                         windows,
-                        crate::native::consent::authorized,
+                        &mut || Some("1.5.17".into()),
+                        &mut |_| Ok(refused()),
                     )
                     .unwrap();
                     let label =
@@ -384,7 +385,8 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
             effort: None,
         },
         false,
-        crate::native::consent::authorized,
+        &mut || None,
+        &mut |_| panic!("no consent work for an Agy that does not take the setting"),
     )
     .unwrap();
     assert_eq!(
@@ -410,8 +412,22 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
     );
 }
 
-// A session directory with its manifest and claim, in a state root of its own, for a launch
-// in `workspace` by the recorded Agy `version`.
+fn refused() -> crate::native::consent::Authority {
+    crate::native::consent::Authority {
+        applied: None,
+        verdict: Err("no consent".into()),
+    }
+}
+
+fn consented(kind: crate::native::consent::Consented) -> crate::native::consent::Authority {
+    crate::native::consent::Authority {
+        applied: None,
+        verdict: Ok(kind),
+    }
+}
+
+// A session directory with its manifest, claim and consent record, in a state root of its
+// own, for a launch in `workspace` by the recorded Agy `version`.
 fn consented_launch_session(root: &Path, workspace: &Path, version: &str) -> std::path::PathBuf {
     use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
     let directory = root.join("session-safe123");
@@ -437,122 +453,151 @@ fn consented_launch_session(root: &Path, workspace: &Path, version: &str) -> std
     session_turn::claim(&Store::open_unchecked(&directory), &[])
         .unwrap()
         .retain();
+    crate::native::consent::prepare_at_home(&directory, workspace, root).unwrap();
     directory
 }
 
-// With consent, an Agy that takes the session-only settings gets the exact workspace in a
-// private settings file of the session, named by `--settings` before the log file, on both
-// platforms and whatever the bypass; the applied marker follows the file. An older or
-// unreadable version, like no consent, launches as before and writes neither.
+fn launch_context<'a>(directory: &'a Path, workspace: &'a Path, yolo: bool) -> LaunchContext<'a> {
+    LaunchContext {
+        bridge_executable: Path::new("/opt/agent-bridge"),
+        directory,
+        workspace,
+        title: "Agy test",
+        prompt: "agy prompt",
+        yolo,
+        model: None,
+        effort: None,
+    }
+}
+
+// With consent, exact or inherited (owner's decision, 2026-11-26), an Agy that takes the
+// session-only settings gets the exact workspace in a private settings file of the session,
+// named by `--settings` before the log file, on both platforms and whatever the bypass; the
+// applied marker follows the file. The version is the launch's own probe, judged before any
+// consent work: an older or unreadable one launches as before, writes nothing and asks
+// consent nothing.
 #[test]
 fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
+    use crate::native::consent::Consented;
     for (version, applies) in [
         ("1.5.17", true),
         ("1.6.0", true),
-        ("agy 2.0.1", true),
+        ("v1.5.17", true),
+        (" 1.5.18\n", true),
         ("1.5.16", false),
         ("1.5.17-rc.1", false),
+        ("agy 2.0.1 (go 1.25.0)", false),
         ("unknown", false),
     ] {
-        for windows in [false, true] {
-            for yolo in [false, true] {
-                let label = format!("version={version} windows={windows} yolo={yolo}");
-                let home = tempfile::tempdir().unwrap();
-                let root = home.path().canonicalize().unwrap();
-                // Characters that a command shim would interpret: none reaches an argument.
-                let workspace = root.join("work 'q' ü & %PATH% $HOME ^");
-                std::fs::create_dir(&workspace).unwrap();
-                let directory = consented_launch_session(&root, &workspace, version);
-                crate::native::consent::prepare_at_home(&directory, &workspace, &root).unwrap();
-                let plan = prepare_launch_for_platform(
-                    LaunchContext {
-                        bridge_executable: Path::new("/opt/agent-bridge"),
-                        directory: &directory,
-                        workspace: &workspace,
-                        title: "Agy test",
-                        prompt: "agy prompt",
-                        yolo,
-                        model: None,
-                        effort: None,
-                    },
-                    windows,
-                    |_, _| Ok(true),
-                )
-                .unwrap();
-                let settings = directory.join(SESSION_SETTINGS_FILE);
-                let mut expected = agy_policy(yolo, None, None);
-                if applies {
+        for kind in [Consented::Exact, Consented::Inherited] {
+            for windows in [false, true] {
+                for yolo in [false, true] {
+                    let label =
+                        format!("version={version:?} {kind:?} windows={windows} yolo={yolo}");
+                    let home = tempfile::tempdir().unwrap();
+                    let root = home.path().canonicalize().unwrap();
+                    // Characters that a command shim would interpret: none reaches an argument.
+                    let workspace = root.join("work 'q' ü & %PATH% $HOME ^");
+                    std::fs::create_dir(&workspace).unwrap();
+                    let directory = consented_launch_session(&root, &workspace, "fixture");
+                    let mut asked = 0;
+                    let plan = prepare_launch_for_platform(
+                        launch_context(&directory, &workspace, yolo),
+                        windows,
+                        &mut || Some(version.into()),
+                        &mut |asked_for| {
+                            assert_eq!(asked_for, directory);
+                            asked += 1;
+                            Ok(consented(kind))
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(asked, usize::from(applies), "{label}");
+                    let settings = directory.join(SESSION_SETTINGS_FILE);
+                    let mut expected = agy_policy(yolo, None, None);
+                    if applies {
+                        expected.extend([
+                            OsString::from("--settings"),
+                            settings.clone().into_os_string(),
+                        ]);
+                    }
                     expected.extend([
-                        OsString::from("--settings"),
-                        settings.clone().into_os_string(),
+                        OsString::from("--log-file"),
+                        directory.join(AGY_LOG_FILE).into_os_string(),
                     ]);
-                }
-                expected.extend([
-                    OsString::from("--log-file"),
-                    directory.join(AGY_LOG_FILE).into_os_string(),
-                ]);
-                assert_eq!(plan.arguments[..expected.len()], expected[..], "{label}");
-                let observed = crate::native::consent::observe(&directory);
-                if applies {
-                    let written: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
-                    assert_eq!(
-                        written,
-                        serde_json::json!({
-                            "trustedWorkspaces": [crate::native::consent::native_key(&workspace).unwrap()]
-                        }),
-                        "{label}"
-                    );
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(plan.arguments[..expected.len()], expected[..], "{label}");
+                    let observed = crate::native::consent::observe(&directory);
+                    if applies {
+                        let written: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
                         assert_eq!(
-                            std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
-                            0o600,
+                            written,
+                            serde_json::json!({
+                                "trustedWorkspaces": [crate::native::consent::native_key(&workspace).unwrap()]
+                            }),
                             "{label}"
                         );
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            assert_eq!(
+                                std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+                                0o600,
+                                "{label}"
+                            );
+                        }
+                        assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
+                    } else {
+                        assert!(!settings.exists(), "{label}");
+                        assert_eq!(observed.applied_marker(), None, "{label}");
                     }
-                    assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
-                    assert!(session_settings_applied(&directory), "{label}");
-                } else {
-                    assert!(!settings.exists(), "{label}");
-                    assert_eq!(observed.applied_marker(), None, "{label}");
-                    assert!(!session_settings_applied(&directory), "{label}");
+                    // No provider store was created or written under this home.
+                    assert!(!root.join(".gemini").exists(), "{label}");
                 }
-                // No provider store was created or written under this home.
-                assert!(!root.join(".gemini").exists(), "{label}");
             }
         }
     }
-    // A consent gate that refuses, or fails, writes nothing and adds no option.
-    for gate in [
-        (|_, _| Ok(false)) as fn(&Path, FirstPartyCli) -> Result<bool>,
-        |_, _| Err(anyhow::anyhow!("consent unreadable")),
-    ] {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().canonicalize().unwrap();
-        let directory = consented_launch_session(&root, &root, "1.5.17");
-        crate::native::consent::prepare_at_home(&directory, &root, &root).unwrap();
-        let context = LaunchContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            workspace: &root,
-            title: "Agy test",
-            prompt: "agy prompt",
-            yolo: false,
-            model: None,
-            effort: None,
-        };
-        match prepare_launch_for_platform(context, false, gate) {
-            Ok(plan) => assert!(!plan.arguments.contains(&OsString::from("--settings"))),
-            Err(error) => assert_eq!(error.to_string(), "consent unreadable"),
-        }
-        assert!(!directory.join(SESSION_SETTINGS_FILE).exists());
-        assert_eq!(
-            crate::native::consent::observe(&directory).applied_marker(),
-            None
-        );
+}
+
+// Review finding 11: the floor is judged on the version this launch probes, not on the one
+// the session recorded earlier; a refused or failing authority writes nothing.
+#[test]
+fn the_launchs_own_probe_and_the_authority_decide_the_setting() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let directory = consented_launch_session(&root, &root, "1.5.17");
+    for probe in [None, Some("1.5.16".to_owned())] {
+        let plan = prepare_launch_for_platform(
+            launch_context(&directory, &root, false),
+            false,
+            &mut || probe.clone(),
+            &mut |_| panic!("no consent work below the floor"),
+        )
+        .unwrap();
+        assert!(!plan.arguments.contains(&OsString::from("--settings")));
     }
+    let plan = prepare_launch_for_platform(
+        launch_context(&directory, &root, false),
+        false,
+        &mut || Some("1.5.17".into()),
+        &mut |_| Ok(refused()),
+    )
+    .unwrap();
+    assert!(!plan.arguments.contains(&OsString::from("--settings")));
+    let error = prepare_launch_for_platform(
+        launch_context(&directory, &root, false),
+        false,
+        &mut || Some("1.5.17".into()),
+        &mut |_| Err(anyhow::anyhow!("consent unreadable")),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.to_string(), "consent unreadable");
+    assert!(!directory.join(SESSION_SETTINGS_FILE).exists());
+    assert_eq!(
+        crate::native::consent::observe(&directory).applied_marker(),
+        None
+    );
 }
 
 #[test]
@@ -562,7 +607,8 @@ fn the_session_settings_floor_is_the_measured_version() {
     for (version, supported) in [
         ("1.5.17", true),
         ("v1.5.17", true),
-        ("antigravity 1.5.18\n", true),
+        ("1.5.18\n", true),
+        ("antigravity 1.5.18\n", false),
         ("1.5.16", false),
         ("1.1.12", false),
         ("", false),
