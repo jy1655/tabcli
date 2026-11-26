@@ -1,6 +1,7 @@
 //! The macOS and Linux transport of the Herdr adapter: the core's protected Unix socket,
 //! located as `hc` locates it (herdr-core 0.1.21 `paths.rs`), and this machine's processes.
 use super::{Core, Framed, Stream, core_session, not_running};
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::terminal::record::HerdrHostBirth;
 use anyhow::{Context, Result, bail};
@@ -14,7 +15,7 @@ use std::{
         net::UnixStream,
     },
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 // sockaddr_un.sun_path reserves one byte for the trailing NUL.
@@ -262,24 +263,29 @@ fn receive_before(
     deadline: Instant,
 ) -> std::io::Result<usize> {
     wait_and_receive(
+        &mut SystemClock,
         buffer,
         deadline,
-        |deadline| wait_readable(stream, deadline),
+        |timeout| wait_readable(stream, timeout),
         |buffer| receive_now(stream, buffer),
     )
 }
 
-/// The loop of `receive_before`, with its two steps as parameters so that a test can script
-/// them: `wait` returns once the socket is readable or fails at the deadline, and `receive`
-/// takes what is there without blocking. The loop itself never reads the clock.
+/// The loop of `receive_before`, with its clock and its two steps as parameters so that a
+/// test can script them. Before each wait it reads the time left before `deadline` from the
+/// clock and ends with `TimedOut` when none is left. `wait` waits at most that long and tells
+/// whether the socket became readable; `receive` takes what is there without blocking.
 pub(super) fn wait_and_receive(
+    clock: &mut dyn Clock,
     buffer: &mut [u8],
     deadline: Instant,
-    mut wait: impl FnMut(Instant) -> std::io::Result<()>,
+    mut wait: impl FnMut(Duration) -> std::io::Result<bool>,
     mut receive: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
 ) -> std::io::Result<usize> {
     loop {
-        wait(deadline)?;
+        if !wait(time_left(clock, deadline)?)? {
+            continue;
+        }
         let error = match receive(buffer) {
             Ok(count) => return Ok(count),
             Err(error) => error,
@@ -297,7 +303,17 @@ pub(super) fn wait_and_receive(
     }
 }
 
-/// One receive of what `stream` holds, without blocking: `WouldBlock` when it holds nothing.
+/// The time left before `deadline` on `clock`, or `TimedOut` once none is left.
+fn time_left(clock: &mut dyn Clock, deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(clock.now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+}
+
+/// One receive of what `stream` holds, without blocking: the number of bytes received, or
+/// `Ok(0)` once the peer has closed its end and every byte it sent has been received. An open
+/// stream that holds nothing to receive gives `WouldBlock`.
 fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize> {
     let received = unsafe {
         libc::recv(
@@ -310,25 +326,26 @@ fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize>
     usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
 }
 
-/// Returns once `stream` is readable (bytes, the end of the stream or an error is waiting, or,
-/// on Linux, an urgent byte), or `TimedOut` at the deadline.
-fn wait_readable(stream: &UnixStream, deadline: Instant) -> std::io::Result<()> {
-    loop {
-        // Rounded up to whole milliseconds, so that no wait ends before the deadline.
-        let timeout = super::remaining(deadline)?.as_micros().div_ceil(1000);
-        let mut poll = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        match unsafe { libc::poll(&mut poll, 1, i32::try_from(timeout).unwrap_or(i32::MAX)) } {
-            0 => {}
-            ready if ready > 0 => return Ok(()),
-            _ => {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
+/// Waits at most `timeout` for `stream` to become readable (bytes, the end of the stream or an
+/// error is waiting, or, on Linux, an urgent byte): `true` once it is, `false` when the time
+/// passed or a signal interrupted the wait.
+fn wait_readable(stream: &UnixStream, timeout: Duration) -> std::io::Result<bool> {
+    // Rounded up to whole milliseconds, so that no wait ends before the deadline.
+    let timeout = timeout.as_micros().div_ceil(1000);
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut poll, 1, i32::try_from(timeout).unwrap_or(i32::MAX)) } {
+        0 => Ok(false),
+        ready if ready > 0 => Ok(true),
+        _ => {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
             }
         }
     }

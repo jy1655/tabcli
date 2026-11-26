@@ -1631,94 +1631,103 @@ fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
     drop(core);
 }
 
-// After a receive that finds nothing, the read's next step is the wait, at once and against
-// its original deadline, so that a reply the core sends in the last milliseconds is read.
-// Both steps are scripted here; the socket tests above cover what the kernels do. The wait
-// reports readable each time. The receive first finds nothing, as on Linux for a queue that
-// holds only an urgent byte, is then interrupted, and then returns the reply. The deadline is
-// already reached when the read starts and the scripted wait ignores it, so a read that acts
-// on the deadline itself between an empty receive and the next wait ends there instead.
-// 8f316da did: it paused for up to 10 ms of the time left and returned `TimedOut` when none
-// was left, which lost a reply the core sent during its last pause. Finally, a wait that
-// reports the deadline ends the read without another receive.
+// After a receive that finds nothing, the read waits again at once for the time left before
+// its original deadline, so that a reply the core sends while time is left is read. The clock
+// is simulated and the read's two steps are scripted on it; the socket tests above cover what
+// the kernels do. The deadline is 10 ms away. The socket becomes readable at 2 ms with nothing
+// to receive, as on Linux for a queue that holds only an urgent byte, and the reply arrives at
+// 5 ms. A read that pauses through its clock after the empty receive spends time asleep while
+// time is left, and is late or misses the reply: 8f316da paused for up to 10 ms of the time
+// left, here all 8 ms, and then found its deadline passed. Without a reply, the read ends at
+// its deadline without another receive.
 #[cfg(unix)]
 #[test]
-fn after_an_empty_receive_the_read_waits_again_at_once_against_its_deadline() {
+fn after_an_empty_receive_the_read_waits_again_at_once_for_the_time_left() {
+    use crate::native::clock::FakeClock;
+    use std::collections::VecDeque;
     use std::io::ErrorKind;
+    // Each step with its simulated time since the read began.
     #[derive(Debug, PartialEq)]
     enum Step {
-        Wait(Instant),
-        Receive,
+        Wait { at: Duration, up_to: Duration },
+        Receive { at: Duration },
     }
+    let ms = Duration::from_millis;
+    let (wait, receive) = (
+        |at, up_to| Step::Wait { at, up_to },
+        |at| Step::Receive { at },
+    );
     let reply = [
         br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
         b"\n",
     ]
     .concat();
-    let deadline = Instant::now();
-    let mut buffer = [0_u8; 256];
-
-    let steps = RefCell::new(Vec::new());
-    let mut received = [
-        Err(ErrorKind::WouldBlock),
-        Err(ErrorKind::Interrupted),
-        Ok(reply.as_slice()),
-    ]
-    .into_iter();
-    let result = super::unix::wait_and_receive(
-        &mut buffer,
-        deadline,
-        |waited| {
-            steps.borrow_mut().push(Step::Wait(waited));
-            Ok(())
-        },
-        |buffer| {
-            steps.borrow_mut().push(Step::Receive);
-            let bytes = received.next().expect("a receive after the reply")?;
-            buffer[..bytes.len()].copy_from_slice(bytes);
-            Ok(bytes.len())
-        },
-    )
-    .map(|read| buffer[..read].to_vec())
-    .map_err(|error| error.kind());
+    // One read with a 10 ms deadline. The socket becomes readable at each time in `readable`,
+    // and a receive at `arrives` or later returns the reply. Returns the outcome, the steps
+    // and the time the read spent asleep on its clock.
+    let read = |readable: &[Duration], arrives: Option<Duration>| {
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let steps = RefCell::new(Vec::new());
+        let mut readable = readable.iter().copied().collect::<VecDeque<_>>();
+        let mut buffer = [0_u8; 256];
+        let result = super::unix::wait_and_receive(
+            &mut clock,
+            &mut buffer,
+            start + ms(10),
+            |up_to| {
+                let at = now.get() - start;
+                steps.borrow_mut().push(Step::Wait { at, up_to });
+                match readable.front().copied() {
+                    Some(ready) if ready <= at + up_to => {
+                        readable.pop_front();
+                        now.set(start + ready.max(at));
+                        Ok(true)
+                    }
+                    _ => {
+                        now.set(start + at + up_to);
+                        Ok(false)
+                    }
+                }
+            },
+            |buffer| {
+                let at = now.get() - start;
+                steps.borrow_mut().push(Step::Receive { at });
+                match arrives {
+                    Some(arrives) if at >= arrives => {
+                        buffer[..reply.len()].copy_from_slice(&reply);
+                        Ok(reply.len())
+                    }
+                    _ => Err(ErrorKind::WouldBlock.into()),
+                }
+            },
+        )
+        .map(|read| buffer[..read].to_vec())
+        .map_err(|error| error.kind());
+        (result, steps.into_inner(), clock.slept)
+    };
     assert_eq!(
-        steps.into_inner(),
-        [
-            Step::Wait(deadline),
-            Step::Receive,
-            Step::Wait(deadline),
-            Step::Receive,
-            Step::Wait(deadline),
-            Step::Receive,
-        ],
-        "{result:?}"
+        read(&[ms(2), ms(5)], Some(ms(5))),
+        (
+            Ok(reply.clone()),
+            vec![
+                wait(ms(0), ms(10)),
+                receive(ms(2)),
+                wait(ms(2), ms(8)),
+                receive(ms(5)),
+            ],
+            Duration::ZERO,
+        )
     );
-    assert_eq!(result.as_deref(), Ok(reply.as_slice()));
-
-    let steps = RefCell::new(Vec::new());
-    let mut waited = [Ok(()), Err(ErrorKind::TimedOut)].into_iter();
-    let result = super::unix::wait_and_receive(
-        &mut buffer,
-        deadline,
-        |deadline| {
-            steps.borrow_mut().push(Step::Wait(deadline));
-            waited
-                .next()
-                .expect("a wait after the deadline")
-                .map_err(std::io::Error::from)
-        },
-        |_| {
-            steps.borrow_mut().push(Step::Receive);
-            Err(ErrorKind::WouldBlock.into())
-        },
-    )
-    .map_err(|error| error.kind());
     assert_eq!(
-        steps.into_inner(),
-        [Step::Wait(deadline), Step::Receive, Step::Wait(deadline)],
-        "{result:?}"
+        read(&[ms(2)], None),
+        (
+            Err(ErrorKind::TimedOut),
+            vec![wait(ms(0), ms(10)), receive(ms(2)), wait(ms(2), ms(8))],
+            Duration::ZERO,
+        )
     );
-    assert_eq!(result, Err(ErrorKind::TimedOut));
 }
 
 // --- Review regressions (2026-11-18): each was written and run before its fix. ---
