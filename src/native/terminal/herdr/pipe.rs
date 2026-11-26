@@ -11,6 +11,8 @@
 //! out of time is cancelled and its completion collected before its buffer is released.
 use super::windows_endpoint::{WindowsEndpointInputs, local_pipe_name, resolve_pipe};
 use super::{Connection, Core, Framed, Stream, not_running};
+use crate::native::terminal::TerminalKind;
+use crate::native::terminal::bound_host::HostAccount;
 use crate::native::terminal::record::HerdrHostBirth;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -76,7 +78,7 @@ impl Core for Installed {
         std::process::id()
     }
 
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    fn parent_pid(&self, pid: u32) -> Result<super::Parent> {
         parent_of(pid)
     }
 
@@ -100,6 +102,18 @@ impl Core for Installed {
         }
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
     }
+
+    fn admit_launch_directory(
+        &self,
+        directory: &Path,
+        account: Option<&HostAccount>,
+    ) -> Result<()> {
+        crate::native::terminal::bound_host::refuse_before_core_launch(
+            directory,
+            TerminalKind::Herdr,
+            account,
+        )
+    }
 }
 
 /// The creation time of a live process; `None` when it has exited or no process holds the
@@ -113,23 +127,36 @@ pub(super) fn creation_time(pid: u32) -> Result<Option<u64>> {
 
 /// The parent of a live process. Windows keeps a child's parent PID after the parent ends,
 /// and that PID can then name a later process: only a live process created no later than
-/// the child is its parent. A parent this process may not inspect ends the walk; the walk
-/// can then only refuse, never accept.
-pub(super) fn parent_of(pid: u32) -> Result<Option<u32>> {
-    let Some(parent) = snapshot_parent(pid)? else {
-        return Ok(None);
+/// the child is its parent. A parent that ended, a reused PID and a parent this process may
+/// not inspect are unknown, never a root: the walk can then only refuse, never accept, and
+/// it does not claim that the command runs outside the terminal.
+pub(super) fn parent_of(pid: u32) -> Result<super::Parent> {
+    use super::Parent;
+    let parent = match snapshot_parent(pid)? {
+        None => return Ok(Parent::Unknown(format!("process {pid} is not running"))),
+        Some(None) => return Ok(Parent::Root),
+        Some(Some(parent)) => parent,
     };
     let Some(child_created) = creation_time(pid)? else {
-        return Ok(None);
+        return Ok(Parent::Unknown(format!(
+            "process {pid} is no longer running"
+        )));
     };
-    match creation_time(parent) {
-        Ok(Some(parent_created)) if parent_created <= child_created => Ok(Some(parent)),
-        Ok(_) | Err(_) => Ok(None),
-    }
+    Ok(match creation_time(parent) {
+        Ok(Some(parent_created)) if parent_created <= child_created => Parent::Process(parent),
+        Ok(Some(_)) => Parent::Unknown(format!(
+            "the parent {parent} of process {pid} ended and its PID names a later process"
+        )),
+        Ok(None) => Parent::Unknown(format!("the parent {parent} of process {pid} ended")),
+        Err(error) => Parent::Unknown(format!(
+            "the parent {parent} of process {pid} cannot be inspected: {error:#}"
+        )),
+    })
 }
 
-/// The parent PID that a process snapshot records for `pid`, if the snapshot lists it.
-fn snapshot_parent(pid: u32) -> Result<Option<u32>> {
+/// The parent PID that a process snapshot records for `pid`: `None` when the snapshot does
+/// not list `pid`, `Some(None)` when it records no parent.
+fn snapshot_parent(pid: u32) -> Result<Option<Option<u32>>> {
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if raw == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error()).context("cannot list Windows processes");
@@ -142,10 +169,10 @@ fn snapshot_parent(pid: u32) -> Result<Option<u32>> {
     let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
     while more != 0 {
         if entry.th32ProcessID == pid {
-            return Ok(
+            return Ok(Some(
                 (entry.th32ParentProcessID != 0 && entry.th32ParentProcessID != pid)
                     .then_some(entry.th32ParentProcessID),
-            );
+            ));
         }
         more = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
     }
@@ -230,7 +257,11 @@ pub(super) fn open(pipe: &Path, deadline: Instant) -> Result<Framed<Pipe>> {
             .with_context(|| format!("cannot identify the process serving {pipe_display}"));
     }
     let own = crate::native::terminal::windows::process_user_sid()?;
-    let served_by = crate::native::terminal::windows::process_user_sid_of(server)
+    // Held for the connection, so that the account read later is this process's own.
+    let server = crate::native::terminal::windows::QueriedProcess::open(server)
+        .with_context(|| format!("cannot identify the user serving {pipe_display}"))?;
+    let served_by = server
+        .user_sid()
         .with_context(|| format!("cannot identify the user serving {pipe_display}"))?;
     if !same_user(&own, &served_by) {
         bail!("the process serving {pipe_display} is not this user's");
@@ -238,7 +269,7 @@ pub(super) fn open(pipe: &Path, deadline: Instant) -> Result<Framed<Pipe>> {
     if Instant::now() >= deadline {
         bail!("Herdr connection timed out");
     }
-    Ok(Framed::new(Pipe::new(handle)?))
+    Ok(Framed::new(Pipe::new(handle, server)?))
 }
 
 /// Whether two string SIDs name one account: SIDs compare without regard to case.
@@ -246,14 +277,19 @@ pub(super) fn same_user(own: &str, other: &str) -> bool {
     own.eq_ignore_ascii_case(other)
 }
 
-/// The client end of the core's pipe, with the event its overlapped operations signal.
+/// The client end of the core's pipe, with the event its overlapped operations signal and the
+/// process that serves it.
 pub(super) struct Pipe {
     handle: OwnedHandle,
     event: OwnedHandle,
+    server: crate::native::terminal::windows::QueriedProcess,
 }
 
 impl Pipe {
-    pub(super) fn new(handle: OwnedHandle) -> Result<Self> {
+    pub(super) fn new(
+        handle: OwnedHandle,
+        server: crate::native::terminal::windows::QueriedProcess,
+    ) -> Result<Self> {
         let raw = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if raw.is_null() {
             return Err(std::io::Error::last_os_error()).context("cannot create a pipe event");
@@ -261,6 +297,7 @@ impl Pipe {
         Ok(Self {
             handle,
             event: unsafe { OwnedHandle::from_raw_handle(raw) },
+            server,
         })
     }
 
@@ -337,5 +374,17 @@ impl Stream for Pipe {
                 overlapped,
             )
         })
+    }
+
+    /// The account of the process serving the pipe, whose user `open` already required to be
+    /// this process's. Its default owner and elevation can differ: an elevated TAB can use the
+    /// pipe of a core that is not elevated. It is read from the process handle that the user
+    /// check opened, so it is that process's, even after the process ended.
+    fn peer_account(&self) -> Result<HostAccount> {
+        Ok(HostAccount::of_windows(
+            self.server
+                .account()
+                .context("cannot read the account of the Herdr Core")?,
+        ))
     }
 }

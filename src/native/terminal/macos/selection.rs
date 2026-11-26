@@ -1,6 +1,8 @@
 //! Which macOS terminal a launch uses: the explicit choice, else the host that the
-//! caller's environment names, else Terminal.app. Pure: the macOS module reads the
-//! environment, every target compiles and tests the decision.
+//! caller's environment names, else Terminal.app. Inside hc, whose programs get
+//! `TERM_PROGRAM=ghostty`, that host is Ghostty: the fallback of an automatic Herdr choice,
+//! which `terminal::select_for` makes the same way on every platform. Pure: the macOS module
+//! reads the environment, every target compiles and tests the decision.
 use super::TerminalKind;
 
 pub(super) fn classify_macos_terminal(
@@ -51,83 +53,22 @@ pub(super) fn select_macos_terminal(
     }
 }
 
-/// Herdr Core gives every program it starts `TERM_PROGRAM=ghostty` (herdr-core 0.1.21), so
-/// its own terminal marker `HC_TERMINAL_ID` decides first, and only together with that
-/// identity: another `TERM_PROGRAM` names the terminal that a marker was inherited into.
-/// Launch admission then proves the marker before anything is created.
-pub(super) fn select_macos_host(
-    preferred: Option<TerminalKind>,
-    hc_terminal: bool,
-    term_program: Option<&str>,
-    term: Option<&str>,
-    has_iterm_session_id: bool,
-    has_term_session_id: bool,
-) -> TerminalKind {
-    if preferred.is_none() && super::herdr_environment(hc_terminal, term_program) {
-        return TerminalKind::Herdr;
-    }
-    select_macos_terminal(
-        preferred,
-        term_program,
-        term,
-        has_iterm_session_id,
-        has_term_session_id,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // hc 0.1.21 gives its programs TERM_PROGRAM=ghostty and TERM=xterm-256color, so the
+    // fallback of an automatic Herdr choice on a Mac is Ghostty, whichever session variables
+    // the core inherited.
     #[test]
-    fn a_herdr_marker_selects_herdr_only_with_its_ghostty_identity_and_no_choice() {
+    fn inside_hc_this_mac_chooses_ghostty() {
         let xterm = Some("xterm-256color");
-        // hc 0.1.21 gives its programs TERM_PROGRAM=ghostty and TERM=xterm-256color.
-        assert_eq!(
-            select_macos_host(None, true, Some("ghostty"), xterm, false, false),
-            TerminalKind::Herdr
-        );
-        // Without the marker the same identity is the Ghostty application.
-        assert_eq!(
-            select_macos_host(None, false, Some("ghostty"), xterm, false, false),
-            TerminalKind::Ghostty
-        );
-        // A marker inherited into another terminal names that terminal, not Herdr.
-        for (program, expected) in [
-            (Some("WezTerm"), TerminalKind::WezTerm),
-            (Some("iTerm.app"), TerminalKind::Iterm2),
-            (Some("vscode"), TerminalKind::AppleTerminal),
-            (None, TerminalKind::AppleTerminal),
-        ] {
+        for (iterm, apple) in [(false, false), (true, true), (true, false), (false, true)] {
             assert_eq!(
-                select_macos_host(None, true, program, xterm, false, false),
-                expected,
-                "{program:?}"
+                select_macos_terminal(None, Some("ghostty"), xterm, iterm, apple),
+                TerminalKind::Ghostty
             );
         }
-        // An explicit choice wins inside Herdr, and Herdr can be chosen from anywhere.
-        assert_eq!(
-            select_macos_host(
-                Some(TerminalKind::Iterm2),
-                true,
-                Some("ghostty"),
-                xterm,
-                false,
-                false
-            ),
-            TerminalKind::Iterm2
-        );
-        assert_eq!(
-            select_macos_host(
-                Some(TerminalKind::Herdr),
-                false,
-                Some("iTerm.app"),
-                xterm,
-                true,
-                true
-            ),
-            TerminalKind::Herdr
-        );
     }
 
     #[test]

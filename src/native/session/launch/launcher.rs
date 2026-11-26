@@ -48,24 +48,45 @@ pub(in crate::native) fn start(
     let bridge_command =
         launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
     initial_claim.fence_launch();
-    let terminal_session = match terminal::open_bound_tab(
-        terminal_kind,
-        &bridge_command,
-        &created.directory,
-        launch_deadline,
-        |session| {
-            session.managed_session_id = Some(created.id.clone());
-            Store::open_unchecked(&created.directory).write_terminal(session)
-        },
-        || {
-            Store::open_unchecked(&created.directory)
-                .record(CoreRecord::Terminal)
-                .remove()
-        },
-    ) {
+    // The launch host's verdict on the session directory, reproduced before any Surface
+    // exists: a refusal is a failure to open the Surface and settles as one, for this launch
+    // only (`launch::refused_before_surface`).
+    let opened = terminal::refuse_before_launch(terminal_kind, &created.directory).and_then(|()| {
+        terminal::open_bound_tab(
+            terminal_kind,
+            &bridge_command,
+            &created.directory,
+            launch_deadline,
+            |session| {
+                session.managed_session_id = Some(created.id.clone());
+                Store::open_unchecked(&created.directory).write_terminal(session)
+            },
+            || {
+                Store::open_unchecked(&created.directory)
+                    .record(CoreRecord::Terminal)
+                    .remove()
+            },
+        )
+    });
+    let terminal_session = match opened {
         Ok(session) => session,
         Err(error) => {
-            let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
+            #[cfg(test)]
+            open_failure_hook::run(&created.directory);
+            let store = Store::open_unchecked(&created.directory);
+            let refused = error
+                .downcast_ref::<terminal::DirectoryRefusal>()
+                .map(terminal::DirectoryRefusal::recorded);
+            let error = match refused {
+                Some(recorded) => launch::refused_before_surface(
+                    &store,
+                    expected_claim_token,
+                    error,
+                    &recorded,
+                    launch_deadline,
+                ),
+                None => launch::terminal_failure(&store, error),
+            };
             return Err(error).with_context(|| {
                 format!(
                     "failed to open {} surface for session {}",
@@ -78,6 +99,7 @@ pub(in crate::native) fn start(
     launch::wait(
         &Store::open_unchecked(&created.directory),
         &terminal_session,
+        expected_claim_token,
         launch_deadline,
     )?;
     Ok(terminal_session)
@@ -162,4 +184,28 @@ pub(in crate::native) fn validate_shell_command_component(
         );
     }
     Ok(())
+}
+
+/// A test's step between a failure to open the Surface and its settlement, run once on this
+/// thread: what another process does at that moment, such as a reader taking the lock.
+#[cfg(test)]
+pub(in crate::native) mod open_failure_hook {
+    use std::{cell::RefCell, path::Path};
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(in crate::native) fn set(hook: impl FnOnce(&Path) + 'static) {
+        HOOK.with(|slot| assert!(slot.borrow_mut().replace(Box::new(hook)).is_none()));
+    }
+
+    pub(super) fn run(directory: &Path) {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(directory);
+        }
+    }
 }

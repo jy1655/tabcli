@@ -55,6 +55,125 @@
   If saving the binding for a confirmed terminal fails and removal also fails, the adapter
   returns that same confirmed handle to the launcher. The launcher uses the current Claim
   and Close records to decide whether to save it. A later close checks its identity again.
+- The launch host runs as the core's account and refuses a session directory it does not find
+  private to that account. The caller reproduces that verdict before any Surface exists
+  (owner's decision 2026-11-26, option 3a): before the core is reached it judges what needs no
+  account (`bound_host::refuse_before_launch`: an absolute path that can be sent as text
+  exactly, a session-id name, a real directory, and on macOS and Linux the permission bits);
+  on the connection that sends `terminal.run`, right before it (after the caller check, which
+  can replace the connection), the adapter judges the rest for the core's account
+  (`Core::admit_launch_directory`, `bound_host::refuse_before_core_launch`): on macOS and Linux
+  the socket peer's uid, which the connection already required to be TAB's; on Windows the
+  token user and default owner read from the pipe server's process handle that the user check
+  opened and the connection keeps. A connection that cannot name the account leaves the owner
+  and, on Windows, the access list to the host. A refusal names the host's reason and, when
+  TAB's own account would be admitted, how the accounts differ. Observed 2026-11-26 (Windows
+  11, hc 0.1.21): an elevated TAB (an administrator's SSH session) gave the session directory
+  the Administrators group as owner, which the host of a core that is not elevated refused
+  only in the launch log, and the caller timed out after 31.7 s. The caller refuses only what
+  a read showed (an absent directory included): a read that fails otherwise, such as TAB's own
+  token denied `READ_CONTROL` or a transient I/O error, refuses nothing, and the host decides
+  as in 0.4.49. A refusal is an early decision (below) and settles as a failure to open the
+  Surface (`launch::refused_before_surface`, with `terminal_failed`'s wording). It is detected
+  at once; returning it can wait for the lifecycle lock up to the launch budget. It is judged
+  once, from what was observed: a directory corrected while TAB waits for the lock is not
+  examined again, and the remedy is to correct the directory and run the command again. The
+  caller's error names the directory and the host's reason. If the facts are not established
+  (below), the refusal writes nothing: the status, the Claim and the launch log stay as they
+  were (for example a `Launching` status and the `launch_pending` line TAB wrote when the launch
+  began), and the returned error holds the refusal. On established facts the refusal settles the
+  launch through the existing settlement (`fail_locked`, as in 0.4.49) with a fixed reason that
+  names no path (`terminal launch failed: the Herdr launch host would refuse the session
+  directory; no surface handle was recorded and no prompt was sent`): it writes the failed status
+  with that reason, then releases the Claim, then appends the same line to the launch log. An
+  error writing the status or releasing the Claim ends the settlement there and is returned with
+  the refusal (`terminal launch failure handoff: ...`). The log append is best effort: its
+  failure is not reported and changes nothing else. What the status becomes after a refusal that
+  wrote nothing is left to the existing paths: `reopen` can copy the returned error into it, and
+  repair can settle the launch first (below). No terminal exists either way. What the caller
+  cannot know stays the host's, unchanged from 0.4.49: the directory changed after the check,
+  a program started under another token than the core's own, a read only the host can make.
+  The host logs its refusal as before when it still can (a directory that is gone takes no
+  line), and the launch ends as below when its terminal finishes.
+- The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
+  (`launch_surface`): the exact terminal with the presence proof, and the launch label when
+  the handle records one. A terminal its verified core reports finished before startup was
+  confirmed fails the launch at the next successful probe, on every platform, as a tmux
+  surface that disappears does (owner's decision 2026-11-26, option A); this reverses, for a
+  host that ended before startup, #409's choice to leave its admission, receipt, binding and
+  Pending-launch refusals to the launch deadline. It is an early decision (below,
+  `finished_before_startup`): a `Pending` receipt also means that no provider was started that
+  could still confirm, so a `Spawning` receipt is left to its confirmation or its deadline. The
+  ordinary poll's reading that it requires is read without its write: a launch-host Record's
+  failure (`input_flush_failed`, `launch_shell_exec_failed`) is left to the ordinary poll to
+  publish, and a Record that cannot be read is no evidence (`host_record_pending`). Then the
+  launch fails through the deadline's settlement (`settle_locked`). A deferred decision writes
+  nothing and returns the wait to its ordinary polling, as in 0.4.49, while the launch budget
+  lasts, also when the receipt's deadline deferred it (that deadline is not the launch
+  deadline). A terminal the core then reports absent is handled by the ordinary settlement
+  (`settle`), as in 0.4.49: it keeps a confirmed or ended outcome it reads under the lock, can
+  return a record error, and uses the disappeared-surface reason for a launch that is still
+  pending and that it can settle. Finished-terminal probes that keep deferring leave the launch
+  to the ordinary poll and its deadline. On a completed settlement the Session records the
+  fixed reason `terminal surface finished before provider launch was confirmed`, and the error
+  returned to the caller adds the core's report and the launch log's path, `(Herdr terminal t7
+  exited with code N); see the launch log <path>`; nothing is read from the log. The exit code
+  is the core's `exit_code` when it gives one (the field name is read from the installed hc
+  0.1.22's string table, not from a live core, and nothing is decided on it). The settlement
+  writes as the refusal's does (above): an error writing the status or releasing the Claim ends
+  it there and is the wait's error, and the log append is best effort. When it completes, the
+  launch ends failed, its Claim released, its receipt pending and its surface handle kept, so
+  `close-session` removes the finished terminal (`terminal.rm`). Creation removes a created
+  terminal that its last live read finds finished; one that finishes after that read is bound
+  and left to this probe.
+- Early launch decisions: the directory refusal before any Surface (every bound host) and the
+  finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
+  owner's decision, a different outcome from waiting for the deadline whenever the world
+  changes in between; the bar for both (2026-11-26):
+  (a) An early decision is taken only from facts read under the lifecycle lock at the moment of
+  the decision, about this launch's own records: the Claim at the path is this launch's token,
+  the launch receipt carries the same token and is pending, the status is `Launching`
+  (`pending::judge`), and the ordinary poll's reading says pending. Nothing is written,
+  created or re-permissioned before that is established.
+  (b) When any of those facts cannot be read, or is not as required, the early decision does
+  nothing: the wait goes on to its next ordinary poll, and the existing paths decide (a refusal
+  is returned without writing). An observation that is inconclusive is never evidence.
+  (c) Once taken on those facts, the decision stands, even if the world changes afterwards.
+  That is what "fails at once" means, and it is the owner's decision.
+  (d) An early decision never acts after the launch deadline; from then on only the existing
+  deadline path acts.
+  One function establishes these facts for both decisions, in this order, writing nothing
+  (`launch::establish_early_facts`): the existing lifecycle lock file, opened for reading and
+  writing without creating or truncating it or changing its permissions, without blocking on
+  a special file (macOS, Linux), and accepted only when the opened handle is a regular file
+  (`Store::try_lock_existing`); one lock attempt; under it, this launch's Claim token at the
+  path; the receipt of that token, still `Pending`, and the status `Launching` without a
+  tombstone (`pending::judge`); the launch-host Record, read without the ordinary poll's
+  publication of a recorded failure (`host_record_pending`; the refusal needs it too, because
+  a macOS capture host's Record exists before the directory is checked); the ordinary poll's
+  reading of the status and the receipt (`read_confirmation`); and last, the monotonic launch
+  budget and the receipt's deadline. A read that fails or is inconclusive, a fact not as
+  required, a busy or unavailable lock, or a clock that has run out establishes nothing. Each
+  decision writes only on established facts, at once, under that same lock. Otherwise the
+  finished-terminal probe defers to the ordinary poll, and the refusal returns the original
+  refusal; it adds that the Claim is retained only when the budget ran out while another holder
+  kept the lock and this launch's Claim is still seen at the path.
+  The fixed reasons are in the failed `status.json` and, on a best-effort basis, in
+  `launch.log`; `residual_surface()` and the status readers interpret the status. A later
+  successful close without a terminal handle writes its closed record and status without that
+  error. The returned refusal keeps the directory, the error of a completed finished-terminal
+  settlement keeps the terminal and the launch log's path, and reopen's refusal record can keep
+  that full error as its detail (`record_failed_launch`), as for a failed launch since 0.4.49.
+  Reopen can copy that detail into the status error of a refused launch still launching with
+  its Claim in two places: the original `reopen` command itself, which passes the detail to
+  `fence_failed_start` once it gets the lifecycle lock (`fail_reopen_launch`, after
+  `record_failed_launch`), for example when a reader held the lock through the refusal's
+  deadline and then released it; and a later reopen of the same source
+  (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`). Whether reopen
+  copies it is decided by `fence_failed_start_locked` when reopen holds the lock, not by the
+  refusal or by lock contention: it can copy the detail when it finds `Launching` with the
+  matching Claim and otherwise copies nothing, so a repair that settles the launch and
+  releases its Claim first keeps its own failed status.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface
@@ -109,18 +228,57 @@
   client of the same user can still change the terminal between TAB's last read and its action.
   hc does not sweep detached processes. TAB touches no other terminal and calls no core operation.
 - An explicit `--terminal` wins. Otherwise `HC_TERMINAL_ID` with `TERM_PROGRAM=ghostty` (the
-  identity hc gives every program) selects Herdr, on Windows only for a provider whose adapter
-  runs there;
-  the marker under another `TERM_PROGRAM` was inherited and is ignored. Selection reads only
-  the environment and, on Windows, the requested provider. Launch admission
-  (`terminal::admit_selection`) then requires the caller's terminal to be live on the
-  addressed core with this process among its program's descendants, and refuses otherwise
-  without opening another terminal. `ask` and `reopen` choose through one entry,
-  `session_start::choose_launch_surface`: selection with the provider's pre-probe answer, then
-  this admission; a reopen passes no provider, as it selects before reading its source. The
-  provider's own admission follows in `resolve`. `doctor` reports `select_surface`, the
-  selection without any admission, so it can name an automatic Herdr that `ask` then refuses
-  (no verified caller, or a provider version below the Herdr floor).
+  identity hc gives every program) selects Herdr, with the terminal the platform chooses
+  outside Herdr as its fallback (`terminal::Selection::Herdr`; Ghostty on macOS, from that
+  same `TERM_PROGRAM`, tmux on Linux, the managed console on Windows); the marker under another
+  `TERM_PROGRAM` was inherited and is ignored. This rule is the same on every OS (owner's
+  decision 2A, 2026-11-26) and reads only the environment. `ask` and `reopen` select through
+  one entry, `session_start::choose_launch_surface`, at the place where 0.4.49 selected and
+  checked: `ask` after its attached results, `reopen` before it reads its source. There an
+  automatic Herdr choice is checked against its caller (`terminal::admit_selection`), as in
+  0.4.49, for every provider that can end on Herdr. A failed check refuses the launch there
+  where the choice is already known to be Herdr: for `ask`, Claude, Agy and Pi; for `reopen`,
+  which does not know its provider yet, always (every provider that supports reopen runs on
+  Herdr, so no reopen that would take the fallback is refused). Where the version decides
+  (Codex off Windows), the outcome is kept (`session_start::CallerCheck`). `resolve` then
+  decides with the provider (`session_start::admit_choice`), before the workspace and again
+  with the probed version: an automatic choice is Herdr where the adapter admits it and its
+  fallback otherwise (Codex below stable 0.169.0 off Windows, any Codex on Windows), and an
+  explicit `--terminal herdr` it does not admit is refused with the adapter's text. An
+  automatic choice that ends on Herdr launches there only if its check passed, and is
+  otherwise refused with the check's error; one that takes the fallback ignores the check.
+  So every later step runs in 0.4.49's order, after the same refusals and clock reads: the
+  caller check's reads and writes on the core share its own ten-second deadline, not the
+  request's, while its endpoint discovery and its walk of parents are not bounded and can take
+  longer, as in 0.4.49; the version probe reads the deadline before it starts; and nothing
+  after it reads the deadline before the Session exists, as in 0.4.49 (bounding every step by
+  the deadline is a separate, later change). The check's deadline ends its waits, not its
+  calls: a reply whose last byte arrives just before it is still decoded afterwards, and on
+  Windows a pipe operation cancelled there is waited for before its buffer is released, so a
+  call can return after the ten seconds. Two differences remain, both from the owner's
+  decision on the automatic choice: a Codex off Windows whose check failed goes on to the
+  workspace, the admission and its probe, and its version then refuses it with the check's
+  error or gives it the fallback, where 0.4.49 refused at the check; and an automatic reopen
+  inside hc on Windows is checked, where 0.4.49 chose the managed console without a check.
+  That added check can also change which of two truthful contention verdicts a concurrent
+  reopen gets, because the probes after it happen later.
+  For `reopen`, the settlement of an interrupted launch failure of the source's last child
+  (`retry_interrupted_launch_fence`) runs after the selection, the caller check and the
+  lookup of the source directory, as in 0.4.49. The judgment of the source's marker, the
+  other source gates, the provider's reopen support and the rest of the resolution, the
+  consent assessment included, can still refuse afterwards and leave that child `Failed`, as
+  in 0.4.49. The caller's terminal must be live on the addressed
+  core with this process among its program's descendants, or the launch is refused without
+  opening another terminal. Up to 64 parent links are compared; only a chain that ends at a
+  root (no parent, or init) proves the command is outside, while reaching that bound or a
+  parent that cannot be established (on Windows: it ended, its PID was reused, or it may not
+  be inspected) is reported as unverified, and both refuse. So a caller that cannot be
+  verified never refuses an `ask` on the fallback, on any OS. `doctor` reports the same
+  decision (`session_start::automatic_surface`) without the caller check: see Observation and
+  Self-Test Boundary.
+  The fallback is not checked for presence before a session exists, as with any other
+  terminal: a Mac without Ghostty, Linux without tmux 3.2 or Windows without PowerShell 7
+  fails at that terminal's open with its own refusal.
   An explicit `--terminal herdr` can launch outside Herdr.
   On macOS and Linux both selection modes check the caller on the connection that creates the child before
   naming a parent.
@@ -157,7 +315,11 @@
   read again from a handle opened on the directory itself (`FILE_FLAG_OPEN_REPARSE_POINT`): no
   reparse point, and the trust store's access-list rule, where `FILE_DELETE_CHILD` and `DELETE`
   also count as changing a directory (`consent::windows_directory_is_private`; the store's own
-  rule is unchanged). After the same binding wait, launch judgment and locked
+  rule is unchanged). The caller judges the same rule for the core's owners
+  (`consent::windows_directory_is_private_to`, read through `windows/process.rs`
+  `QueriedProcess`); without the account it opens the directory for attribute access only.
+  The core's elevation is read only to word a refusal. After the same binding wait, launch
+  judgment and locked
   re-check as the Linux host (`bound_host`), it flushes `CONIN$` (a
   console it cannot flush refuses the launch), keeps itself running through Ctrl+C and
   Ctrl+Break with a handler routine (not inherited, unlike ignoring them), and starts PowerShell
@@ -168,7 +330,7 @@
 - Each provider adapter answers whether it runs on a surface and returns its selected
   initial `Transport` (`surface_support`, required, no default), before anything is
   created (`provider::admit_surface`): first without a version
-  before resolution and probing (and for terminal selection via `provider::surface_support`),
+  before resolution and probing,
   and again with the probed version right after the CLI version probe, handing the
   admitted `Transport` straight into initial delivery. On Windows Herdr, Codex
   refuses immediately: its initial prompt is the injected console paste (#124), text without Return and one
@@ -179,8 +341,10 @@
   refusing older or prerelease versions before any session or terminal exists. Claude (official
   messaging; its dialog is left to the user, as on macOS and Linux), Agy (paste through the
   surface behind its log readiness and receipt) and Pi run there. Inside an hc terminal the
-  automatic choice is Herdr when the provider's adapter runs there and the managed console
-  otherwise; a reopen, whose provider is unknown at selection, keeps the console.
+  automatic choice follows the rule above: Herdr for them and the managed console for Codex.
+  A `reopen` reaches that choice only for an eligible closed Claude source (Agy, Pi and Codex
+  cannot reopen), which now gets Herdr after the caller check; 0.4.49 and earlier gave it the
+  console.
 - A Herdr handle on Windows never reaches the console control helper: the seven surface
   operations resolve its adapter through the one Windows lookup (`windows/dispatch.rs`), and
   guarded dialog input answers with Herdr's declared refusal first, as on the other platforms.
@@ -204,7 +368,9 @@
   Windows lookup's routing and declared refusals over recording adapters run on every
   platform; the lookup over the Herdr adapter on a scripted core runs on macOS, Linux and
   Windows, including Repair with a scripted owner observation and the real close transaction.
-  The pipe transport (a real pipe of this user), process births, parents, tokens, the installed
+  The pipe transport (a real pipe of this user, and the account it reads for its server),
+  the caller's check of a session directory for a core's account (elevated runner), process
+  births, parents, tokens, the installed
   lookup against an absent pipe, the directory admission, the Windows-only Repair tests,
   the attach line under PowerShell 7 and the
   binding wait run on the Windows CI runner. Live (reported by the

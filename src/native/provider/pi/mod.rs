@@ -385,6 +385,11 @@ impl NativeProviderAdapter for PiAdapter {
     ) -> super::SurfaceSupport {
         Ok(initial_transport_for_platform(cfg!(windows)))
     }
+
+    // Pi runs on every surface at every supported version.
+    fn surface_version_requirement(&self, _surface: terminal::TerminalKind) -> Option<String> {
+        None
+    }
 }
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {

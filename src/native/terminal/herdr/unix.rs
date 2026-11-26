@@ -3,6 +3,8 @@
 use super::{Core, Framed, Stream, core_session, not_running};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
+use crate::native::terminal::TerminalKind;
+use crate::native::terminal::bound_host::HostAccount;
 use crate::native::terminal::record::HerdrHostBirth;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -47,14 +49,19 @@ impl Core for Installed {
         std::process::id()
     }
 
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    // A process that is not running has no parent to show; orphans are adopted by init, so a
+    // live process always names one.
+    fn parent_pid(&self, pid: u32) -> Result<super::Parent> {
         #[cfg(target_os = "macos")]
-        return Ok(
-            crate::native::terminal::macos::process::macos_process_info(pid)?
-                .map(|info| info.parent_pid),
-        );
+        let parent = crate::native::terminal::macos::process::macos_process_info(pid)?
+            .map(|info| info.parent_pid);
         #[cfg(target_os = "linux")]
-        return crate::native::terminal::linux::process::parent_pid(pid);
+        let parent = crate::native::terminal::linux::process::parent_pid(pid)?;
+        Ok(match parent {
+            Some(0) => super::Parent::Root,
+            Some(parent) => super::Parent::Process(parent),
+            None => super::Parent::Unknown(format!("process {pid} is absent or invisible to TAB")),
+        })
     }
 
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
@@ -76,6 +83,18 @@ impl Core for Installed {
         let mut bytes = [0_u8; 16];
         fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn admit_launch_directory(
+        &self,
+        directory: &Path,
+        account: Option<&HostAccount>,
+    ) -> Result<()> {
+        crate::native::terminal::bound_host::refuse_before_core_launch(
+            directory,
+            TerminalKind::Herdr,
+            account,
+        )
     }
 }
 
@@ -359,5 +378,12 @@ impl Stream for UnixStream {
 
     fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize> {
         receive_before(self, buffer, deadline)
+    }
+
+    /// The peer's effective uid, which `open` already required to be this process's.
+    fn peer_account(&self) -> Result<HostAccount> {
+        Ok(HostAccount::of_uid(
+            peer_uid(self).context("cannot identify the Herdr Core socket's user")?,
+        ))
     }
 }

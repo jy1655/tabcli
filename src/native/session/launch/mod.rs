@@ -8,7 +8,9 @@ use crate::native::session::state::{
 use crate::native::clock::Clock;
 use crate::native::failure_kind::TimedOut;
 use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record, turn};
+use crate::native::session::{
+    CoreRecord, ExistingLock, Reader, RecordReader, RecordStore, Store, record, turn,
+};
 use crate::native::terminal;
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
@@ -450,8 +452,21 @@ fn fail_deciding(
     wording: impl FnOnce(&Record, &str) -> Result<String>,
 ) -> Result<()> {
     let Some(_lock) = store.try_lock()? else {
-        bail!("{reason}; provider startup is in progress; the claim is retained");
+        return Err(startup_in_progress(reason));
     };
+    fail_deciding_locked(store, reason, wording)
+}
+
+// What `fail_deciding` returns when another holder keeps the lifecycle lock.
+fn startup_in_progress(reason: &str) -> anyhow::Error {
+    anyhow::anyhow!("{reason}; provider startup is in progress; the claim is retained")
+}
+
+fn fail_deciding_locked(
+    store: &Store,
+    reason: &str,
+    wording: impl FnOnce(&Record, &str) -> Result<String>,
+) -> Result<()> {
     if let Some(record) = read(store)?
         && record.phase != Phase::Spawned
     {
@@ -490,18 +505,7 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
         // proves that nothing was sent. A bound surface keeps its handle, and a spawn in
         // progress has its own wording. Decided under the lock, on the records as they are.
         return fail_deciding(store, &reason, |record, reason| {
-            let reader = Reader::open_unchecked(store.directory());
-            // Only the records' presence counts here; their content is not interpreted.
-            let unbound = reader.record(CoreRecord::Terminal).bytes()?.is_none()
-                && reader
-                    .record(CoreRecord::TerminalClosing)
-                    .bytes()?
-                    .is_none();
-            Ok(if unbound && record.phase == Phase::Pending {
-                format!("{reason}; no surface handle was recorded and no prompt was sent")
-            } else {
-                reason.to_owned()
-            })
+            unbound_wording(store, record, reason)
         });
     };
     let _lock = store.lock()?;
@@ -573,6 +577,162 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
         fail_locked_with_residual(store, &record, &reason, residual)?;
     }
     persisted.context("failed to persist the retained launch surface")
+}
+
+// The recorded wording of a failure to open a Surface that left none.
+fn unbound_wording(store: &Store, record: &Record, reason: &str) -> Result<String> {
+    let reader = Reader::open_unchecked(store.directory());
+    // Only the records' presence counts here; their content is not interpreted.
+    let unbound = reader.record(CoreRecord::Terminal).bytes()?.is_none()
+        && reader
+            .record(CoreRecord::TerminalClosing)
+            .bytes()?
+            .is_none();
+    Ok(if unbound && record.phase == Phase::Pending {
+        format!("{reason}; no surface handle was recorded and no prompt was sent")
+    } else {
+        reason.to_owned()
+    })
+}
+
+/// Settles a launch whose session directory the launch host would refuse, which the launcher
+/// established before any Surface existed (`terminal::DirectoryRefusal`), as the failure to
+/// open a Surface that it is (`terminal_failed`). An early decision (docs/agents/herdr.md,
+/// "Early launch decisions"): it writes only when `establish_early_facts` finds the facts hold,
+/// at once, under the lock that established them, and waits out another holder of the lock
+/// until `deadline`, the launch's own. Otherwise it writes nothing and returns the refusal; only
+/// when the budget ran out while another holder kept the lock and this launch's Claim is still
+/// seen at the path does it add that the Claim is retained, as every failure to open a Surface
+/// does. The refusal is judged once, as observed: a directory corrected while the lock is
+/// awaited is not examined again. The Session records `recorded`, a fixed reason that names no
+/// path (`DirectoryRefusal::recorded`); the refusal, which names the directory, is returned to
+/// the caller.
+pub(in crate::native) fn refused_before_surface(
+    store: &Store,
+    token: &str,
+    refusal: anyhow::Error,
+    recorded: &str,
+    deadline: Instant,
+) -> anyhow::Error {
+    refused_before_surface_with(
+        store,
+        token,
+        refusal,
+        recorded,
+        deadline,
+        &mut crate::native::clock::SystemClock,
+    )
+}
+
+fn refused_before_surface_with(
+    store: &Store,
+    token: &str,
+    refusal: anyhow::Error,
+    recorded: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> anyhow::Error {
+    let reason = format!("terminal launch failed: {recorded}");
+    loop {
+        match establish_early_facts(store, token, deadline, clock) {
+            EarlyFacts::Hold(_lock) => {
+                return match fail_deciding_locked(store, &reason, |record, reason| {
+                    unbound_wording(store, record, reason)
+                }) {
+                    Ok(()) => refusal,
+                    Err(handoff) => {
+                        refusal.context(format!("terminal launch failure handoff: {handoff:#}"))
+                    }
+                };
+            }
+            EarlyFacts::Busy => {
+                let remaining = deadline.saturating_duration_since(clock.now());
+                if !remaining.is_zero() {
+                    clock.sleep(remaining.min(WAIT_POLL));
+                    continue;
+                }
+                let held = turn::current_claim_token(store)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|claim| claim == token);
+                return if held {
+                    let contended = startup_in_progress(&reason);
+                    refusal.context(format!("terminal launch failure handoff: {contended:#}"))
+                } else {
+                    refusal
+                };
+            }
+            EarlyFacts::NotEstablished => return refusal,
+        }
+    }
+}
+
+/// What `establish_early_facts` found.
+enum EarlyFacts {
+    /// The facts hold: the lifecycle lock under which they were read, for the decision's write.
+    Hold(std::fs::File),
+    /// Another holder has the lifecycle lock.
+    Busy,
+    /// Anything else: nothing is decided.
+    NotEstablished,
+}
+
+/// The facts of the bar for both early launch decisions (docs/agents/herdr.md, "Early launch
+/// decisions"), established in one order and nowhere else, writing nothing: the existing
+/// lifecycle lock (`Store::try_lock_existing`), tried once; under it, this launch's Claim at the
+/// path; the receipt of this Claim, still `Pending`, and the status `Launching` without a
+/// tombstone (`pending::judge`); the launch-host Record, read without its publication
+/// (`host_record_pending`); the ordinary poll's reading of the status and the receipt
+/// (`read_confirmation`); and last, both clocks: the monotonic launch `deadline` on `clock` and
+/// the receipt's deadline. A read that fails or is inconclusive, a fact not as required, a busy
+/// or unavailable lock, or a clock that has run out establishes nothing.
+fn establish_early_facts(
+    store: &Store,
+    token: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> EarlyFacts {
+    let lock = match store.try_lock_existing() {
+        Ok(ExistingLock::Held(lock)) => lock,
+        Ok(ExistingLock::Busy) => return EarlyFacts::Busy,
+        Ok(ExistingLock::Unavailable) | Err(_) => return EarlyFacts::NotEstablished,
+    };
+    let receipt = (|| -> Result<Option<Record>> {
+        if turn::current_claim_token(store)?.as_deref() != Some(token) {
+            return Ok(None);
+        }
+        let Some(receipt) = read(store)? else {
+            return Ok(None);
+        };
+        if pending::judge(store, &receipt, token, pending::Expiry::Unchecked)?.is_err()
+            || !host_record_pending(store, &receipt)
+            || read_confirmation(store)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    })();
+    let Ok(Some(receipt)) = receipt else {
+        return EarlyFacts::NotEstablished;
+    };
+    #[cfg(test)]
+    early_facts_hook::run();
+    if clock.now() >= deadline || unix_ms() >= receipt.deadline_unix_ms {
+        return EarlyFacts::NotEstablished;
+    }
+    EarlyFacts::Hold(lock)
+}
+
+/// The ordinary poll's reading of the launch-host Record (`host_decision_locked`), without the
+/// write that publishes a failure: `true` only when it leaves the launch pending. A Record that
+/// cannot be read, or whose schema TAB does not know, is no evidence; a recorded failure is the
+/// ordinary poll's to publish.
+fn host_record_pending(reader: &Reader, receipt: &Record) -> bool {
+    match host::observe(reader, Some(receipt)) {
+        host::HostObservation::NotRecorded | host::HostObservation::IdentityMismatch => true,
+        host::HostObservation::Recorded(record) => record.failure.is_none(),
+        host::HostObservation::Unreadable(_) | host::HostObservation::SchemaUnsupported(_) => false,
+    }
 }
 
 fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
@@ -718,6 +878,7 @@ fn repair_with_owner(
 const LAUNCH_DEADLINE: &str = "provider launch timed out before startup was confirmed";
 const SURFACE_DISAPPEARED: &str =
     "terminal surface disappeared before provider launch was confirmed";
+const SURFACE_FINISHED: &str = "terminal surface finished before provider launch was confirmed";
 /// The wait inspects the surface this often, first one interval after it starts.
 const SURFACE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// One inspection may take this long, and never past the deadline.
@@ -728,7 +889,7 @@ const WAIT_POLL: Duration = Duration::from_millis(100);
 /// The surface observation port of the launcher's wait: whether the launch's terminal
 /// surface is still present. An inspection error does not prove absence.
 trait SurfacePresence {
-    fn present(&mut self, timeout: Duration) -> Result<bool>;
+    fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface>;
 }
 
 /// Production: the terminal's read-only presence check of the launch's surface.
@@ -738,18 +899,20 @@ struct TerminalSurface<'a> {
 }
 
 impl SurfacePresence for TerminalSurface<'_> {
-    fn present(&mut self, timeout: Duration) -> Result<bool> {
-        terminal::surface_present(self.directory, self.surface, timeout)
+    fn present(&mut self, timeout: Duration) -> Result<terminal::LaunchSurface> {
+        terminal::launch_surface(self.directory, self.surface, timeout)
     }
 }
 
 pub(in crate::native) fn wait(
     store: &Store,
     surface: &terminal::TerminalSession,
+    token: &str,
     deadline: Instant,
 ) -> Result<()> {
     wait_with(
         store,
+        token,
         deadline,
         &mut crate::native::clock::SystemClock,
         &mut TerminalSurface {
@@ -760,11 +923,14 @@ pub(in crate::native) fn wait(
 }
 
 /// The launcher's wait for a confirmed launch. Each poll reads the records, then decides on
-/// the time and the surface: at the deadline, or when a due probe finds the surface gone,
-/// the wait settles the launch under the lifecycle lock. Every reading of time and every
+/// the time and the surface: at the deadline, or when a due probe finds the surface gone, the
+/// wait settles the launch under the lifecycle lock. A due probe that finds the program of
+/// this launch's surface finished (a Herdr terminal; owner's decision 2026-11-26) settles it
+/// only when that is certain (`finished_before_startup`). Every reading of time and every
 /// sleep goes through `clock`.
 fn wait_with(
     store: &Store,
+    token: &str,
     deadline: Instant,
     clock: &mut dyn Clock,
     presence: &mut dyn SurfacePresence,
@@ -781,9 +947,17 @@ fn wait_with(
         } else if clock.now() >= next_probe {
             next_probe = clock.now() + SURFACE_PROBE_INTERVAL;
             match presence.present(remaining.min(SURFACE_PROBE_BOUND)) {
-                Ok(false) => Some(SURFACE_DISAPPEARED.to_owned()),
+                Ok(terminal::LaunchSurface::Absent) => Some(SURFACE_DISAPPEARED.to_owned()),
+                Ok(terminal::LaunchSurface::Finished(finished)) => {
+                    if let Some(outcome) =
+                        finished_before_startup(store, token, &finished, deadline, clock)
+                    {
+                        return outcome;
+                    }
+                    None
+                }
                 // Inspection errors (including permissions/timeouts) do not prove absence.
-                Ok(true) | Err(_) => None,
+                Ok(terminal::LaunchSurface::Present) | Err(_) => None,
             }
         } else {
             None
@@ -800,33 +974,47 @@ fn wait_with(
 // decision runs only when the lifecycle lock is free; the status and the receipt are read
 // on every poll.
 fn recorded_confirmation(store: &Store) -> Result<bool> {
-    if let Some(_lock) = store.try_lock()? {
-        match host_decision_locked(store)? {
-            HostDecision::Confirmed => return Ok(true),
-            HostDecision::Failed => bail!(
-                "{}",
-                store
-                    .status()?
-                    .error
-                    .unwrap_or_else(|| "launch host failed".into())
-            ),
-            HostDecision::Ended => {
-                let status = store.status()?;
-                bail!(
-                    "{}",
-                    status.error.unwrap_or_else(|| format!(
-                        "launch entered {}",
-                        if store.closed_if_present().ok().flatten().is_some() {
-                            SessionState::Closed
-                        } else {
-                            status.state
-                        }
-                    ))
-                );
-            }
-            HostDecision::Pending => {}
-        }
+    if let Some(_lock) = store.try_lock()?
+        && decided_locked(store)?
+    {
+        return Ok(true);
     }
+    read_confirmation(store)
+}
+
+// The poll's reading under the lifecycle lock: the locked host decision, in its precedence
+// (an ended status before a confirmation, a launch-host Record's failure, which it records,
+// before a pending launch). `true` for a confirmed launch, `false` while it is pending.
+fn decided_locked(store: &Store) -> Result<bool> {
+    match host_decision_locked(store)? {
+        HostDecision::Confirmed => Ok(true),
+        HostDecision::Failed => bail!(
+            "{}",
+            store
+                .status()?
+                .error
+                .unwrap_or_else(|| "launch host failed".into())
+        ),
+        HostDecision::Ended => {
+            let status = store.status()?;
+            bail!(
+                "{}",
+                status.error.unwrap_or_else(|| format!(
+                    "launch entered {}",
+                    if store.closed_if_present().ok().flatten().is_some() {
+                        SessionState::Closed
+                    } else {
+                        status.state
+                    }
+                ))
+            );
+        }
+        HostDecision::Pending => Ok(false),
+    }
+}
+
+// The poll's reading of the status and the receipt, with or without the lock.
+fn read_confirmation(store: &Store) -> Result<bool> {
     let status: SessionStatus = store.status()?;
     if status.state.ended() {
         bail!(
@@ -852,6 +1040,10 @@ fn settle(store: &Store, reason: String, deadline_reached: bool) -> Result<()> {
         }
         bail!("{message}");
     };
+    settle_locked(store, reason, deadline_reached)
+}
+
+fn settle_locked(store: &Store, reason: String, deadline_reached: bool) -> Result<()> {
     let record = read(store)?.context("launch receipt disappeared")?;
     let status: SessionStatus = store.status()?;
     if confirmed(store, &record, &status) {
@@ -882,6 +1074,62 @@ fn settle(store: &Store, reason: String, deadline_reached: bool) -> Result<()> {
         bail!(TimedOut::new(message));
     }
     bail!("{message}");
+}
+
+/// The decision on a launch whose surface's program its verified core reports finished before
+/// startup was confirmed (a Herdr terminal; owner's decision 2026-11-26, option A). An early
+/// decision (docs/agents/herdr.md, "Early launch decisions"): only when
+/// `establish_early_facts` finds the facts hold (a `Pending` receipt also means that no provider
+/// was started that could still confirm) does the launch fail, at once, under the lock that
+/// established them, through the deadline's settlement, with a fixed reason that names no path;
+/// the error returned to the caller adds the core's report and the launch log's path. Otherwise
+/// this probe decides nothing (`None`) and writes nothing: the wait goes on to its next ordinary
+/// poll, and the existing paths decide.
+fn finished_before_startup(
+    store: &Store,
+    token: &str,
+    finished: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Option<Result<()>> {
+    let EarlyFacts::Hold(_lock) = establish_early_facts(store, token, deadline, clock) else {
+        return None;
+    };
+    Some(
+        settle_locked(store, SURFACE_FINISHED.to_owned(), false).map_err(|error| {
+            if format!("{error:#}") != SURFACE_FINISHED {
+                return error;
+            }
+            anyhow::anyhow!(
+                "{SURFACE_FINISHED} ({finished}); see the launch log {}",
+                store.private(LOG).path().display()
+            )
+        }),
+    )
+}
+
+/// A test's step after the last required read of `establish_early_facts`, before its clocks,
+/// run once on this thread: what happens while that read takes its time, such as the launch
+/// deadline passing.
+#[cfg(test)]
+pub(in crate::native) mod early_facts_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(in crate::native) fn set(hook: impl FnOnce() + 'static) {
+        HOOK.with(|slot| assert!(slot.borrow_mut().replace(Box::new(hook)).is_none()));
+    }
+
+    pub(super) fn run() {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
@@ -1241,7 +1489,13 @@ mod tests {
         // This wait's own deadline, recorded by its own failure write.
         let (directory, _) = fixture();
         let store = Store::open_unchecked(directory.path());
-        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let error = wait(
+            &store,
+            &surface,
+            &turn::current_claim_token(&store).unwrap().unwrap(),
+            Instant::now(),
+        )
+        .unwrap_err();
         assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
         assert_eq!(format!("{error:#?}"), format!("{LAUNCH_DEADLINE:?}"));
         assert_eq!(classify(&error), Some(FailureKind::TimedOut));
@@ -1258,7 +1512,13 @@ mod tests {
             .record(CoreRecord::Launch)
             .write_json(&record)
             .unwrap();
-        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let error = wait(
+            &store,
+            &surface,
+            &turn::current_claim_token(&store).unwrap().unwrap(),
+            Instant::now(),
+        )
+        .unwrap_err();
         let recorded = store.status().unwrap().error.unwrap();
         assert_ne!(recorded, LAUNCH_DEADLINE);
         assert_eq!(format!("{error:#}"), recorded);
@@ -1268,7 +1528,13 @@ mod tests {
         let store = Store::open_unchecked(directory.path());
         let before = fs::read(directory.path().join(STATUS_FILE)).unwrap();
         let lock = store.lock().unwrap();
-        let error = wait(&store, &surface, Instant::now()).unwrap_err();
+        let error = wait(
+            &store,
+            &surface,
+            &turn::current_claim_token(&store).unwrap().unwrap(),
+            Instant::now(),
+        )
+        .unwrap_err();
         drop(lock);
         assert_eq!(
             format!("{error:#}"),
@@ -1918,7 +2184,13 @@ mod host_decision_tests {
                     .unwrap()
                 );
             } else {
-                let error = wait(&store, &surface(), start + Duration::from_secs(20)).unwrap_err();
+                let error = wait(
+                    &store,
+                    &surface(),
+                    &turn::current_claim_token(&store).unwrap().unwrap(),
+                    start + Duration::from_secs(20),
+                )
+                .unwrap_err();
                 assert!(error.downcast_ref::<TimedOut>().is_none());
             }
             assert!(start.elapsed() < Duration::from_secs(1));
@@ -2049,7 +2321,13 @@ mod host_decision_tests {
             } else {
                 LAUNCH_DEADLINE.into()
             };
-            let error = wait(&store, &surface(), Instant::now()).unwrap_err();
+            let error = wait(
+                &store,
+                &surface(),
+                &turn::current_claim_token(&store).unwrap().unwrap(),
+                Instant::now(),
+            )
+            .unwrap_err();
             assert!(error.downcast_ref::<TimedOut>().is_some());
             assert_eq!(error.to_string(), expected);
             assert_eq!(

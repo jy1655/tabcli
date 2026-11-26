@@ -15,10 +15,13 @@ pub(in crate::native) use record::{
     Assessment, ConsentState, SessionConsentObservation, applied, assess, authorized, observe,
     record, run,
 };
-#[cfg(windows)]
-pub(in crate::native) use store::windows_directory_is_private;
 pub(in crate::native) use store::{
     Environment, Evidence, Identity, Trust, identity, native_key, read_store, user_home,
+};
+#[cfg(windows)]
+pub(in crate::native) use store::{
+    WindowsAccount, windows_current_account, windows_directory_is_private,
+    windows_directory_is_private_to, windows_process_account,
 };
 pub(in crate::native) use wait::{
     SleepBound, TrustPoll, TrustReadiness, wait_for_native_trust, wait_until_trusted,

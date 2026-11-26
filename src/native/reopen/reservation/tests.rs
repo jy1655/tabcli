@@ -4191,3 +4191,323 @@ fn consent_failure_after_a_reopened_launch_keeps_the_source_reservation() {
         "a second reopen was admitted"
     );
 }
+
+// The three reopen cases of the seventh review of #413, each with 0.4.49's outcome. A reopen
+// checks an automatic Herdr choice against its caller before it reads its source, settles an
+// interrupted launch failure of the source's last child, and then judges the source's
+// marker, all before its version probe, which reads the request's clock before it starts;
+// only then is the workspace-consent store written. Each case runs in a child process with
+// its own state root, a Claude stand-in on PATH, and an hc terminal whose core is absent;
+// Claude reopen is let past its platform gate (`allow_reopen_for_test`), as on native Windows.
+// They run on macOS, Linux and Windows, as the launch-surface tests do: on any other OS the
+// selection refuses before the caller check or the recovery.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn in_review_case(test: &str, case: impl FnOnce(&Path)) {
+    const CHILD_PROCESS: &str = "TABCLI_REOPEN_REVIEW_CASE_CHILD";
+    if std::env::var_os(CHILD_PROCESS).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let bin = base.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // A Claude whose `--version` succeeds; once `claude.slow` exists beside it, it first
+        // leaves `claude.started` there and then takes 2 s.
+        #[cfg(windows)]
+        fs::write(
+            bin.join("claude.cmd"),
+            "@echo off\r\nif exist \"%~dpn0.slow\" (type nul > \"%~dpn0.started\" & ping -n 3 127.0.0.1 >nul)\r\necho 2.1.302\r\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let claude = bin.join("claude");
+            fs::write(
+                &claude,
+                "#!/bin/sh\nif [ -f \"$0.slow\" ]; then : > \"$0.started\"; sleep 2; fi\necho 2.1.302\n",
+            )
+            .unwrap();
+            fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut path = vec![bin];
+        #[cfg(windows)]
+        path.push(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"));
+        #[cfg(unix)]
+        path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        #[cfg(windows)]
+        let absent_core = format!(r"\\.\pipe\tabcli-reopen-review-{}", std::process::id());
+        #[cfg(unix)]
+        let absent_core = base.path().join("absent.sock").display().to_string();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("native::reopen::reservation::tests::{test}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_PROCESS, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
+            .env("CODEX_HOME", base.path().join("codex"))
+            .env("CLAUDE_CONFIG_DIR", base.path().join("claude"))
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("HC_TERMINAL_ID", "t7")
+            .env("TERM_PROGRAM", "ghostty")
+            .env("HC_SOCKET", absent_core)
+            .env_remove("HC_SESSION")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let registry = root.parent().unwrap().join("claude-sessions");
+    fs::create_dir_all(&registry).unwrap();
+    provider::claude::override_session_registry_for_test(Some(registry));
+    provider::claude::allow_reopen_for_test(true);
+    case(&root);
+    provider::claude::allow_reopen_for_test(false);
+    provider::claude::override_session_registry_for_test(None);
+}
+
+// A closed source whose last reopen's launch failed before that failure was settled: its child
+// still launches under the refused launch's Claim.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn interrupted_reopen(root: &Path, source_id: &str, child_id: &str) -> (PathBuf, PathBuf) {
+    let source = write_closed_reopen_source(
+        root,
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let child = write_reopen_launch_session(root, child_id, Path::new("claude"));
+    Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION)
+        .unwrap()
+        .finalize(child_id)
+        .unwrap();
+    let store = Store::open_unchecked(&child);
+    let claim = turn::claim(&store, &[]).unwrap();
+    let token = claim.token().to_owned();
+    claim.retain();
+    launch::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+    store
+        .record(CoreRecord::ReopenRefusal)
+        .write_json(
+            &serde_json::json!({"schema":3,"phase":"launch","gate":"launch-failed",
+            "detail":"interrupted launch failure","created_unix_ms":1,"claim_token":token}),
+        )
+        .unwrap();
+    (source, child)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn review_request(id: &str, terminal: Option<terminal::TerminalKind>) -> ReopenRequest {
+    ReopenRequest {
+        id: id.into(),
+        prompt: "new prompt".into(),
+        title: None,
+        model: None,
+        effort: None,
+        terminal,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+    }
+}
+
+// The terminal this platform chooses outside Herdr, named explicitly: no caller check.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn review_explicit_terminal() -> terminal::TerminalKind {
+    if cfg!(target_os = "macos") {
+        terminal::TerminalKind::Ghostty
+    } else if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else {
+        terminal::TerminalKind::Tmux
+    }
+}
+
+// 1. A recovery that is slow (each sync of the child waits 1 s) with 650 ms left: the child is
+//    settled, the probe does not start, and no consent is written (0.4.49: the same).
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn a_slow_recovery_leaves_the_probe_no_time_and_writes_no_consent() {
+    in_review_case(
+        "a_slow_recovery_leaves_the_probe_no_time_and_writes_no_consent",
+        |root| {
+            use crate::native::failure_kind::{FailureKind, classify};
+            let (_, child) = interrupted_reopen(
+                root,
+                "session-review-slow-source",
+                "session-review-slow-child",
+            );
+            let deadline = Instant::now() + Duration::from_millis(650);
+            let error = crate::native::session::test_support::with_sync_delay(
+                &child,
+                Duration::from_secs(1),
+                || {
+                    ResolvedReopen::resolve(
+                        review_request(
+                            "session-review-slow-source",
+                            Some(review_explicit_terminal()),
+                        ),
+                        deadline,
+                    )
+                },
+            )
+            .err()
+            .expect("the slow recovery leaves the probe no time");
+            assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+            assert_eq!(
+                Reader::open_unchecked(&child).status().unwrap().state,
+                SessionState::Failed,
+                "{error:#}"
+            );
+            assert!(
+                !root.join("workspace-consent").exists(),
+                "consent was written"
+            );
+        },
+    );
+}
+
+// 2. The child's lifecycle lock held until the provider's probe has started (so for the whole
+//    reopen where nothing probes with the lock held): the settlement does not wait for the
+//    lock, the marker still names a launching child, and the reopen is refused as already
+//    reopened before the probe; the child stays launching and nothing is written (0.4.49: the
+//    same). A build that probes before the recovery is caught by the `claude.started` file its
+//    probe leaves, whether or not the holder has let the lock go by the time that probe
+//    returns. A build whose recovery waits for the lock before any probe would wait for ever,
+//    since neither release signal can come: after `WATCHDOG` the holder lets go of the lock
+//    and the case fails, reporting that the holder saw neither the probe marker nor the
+//    reopen-return signal. A healthy reopen returns within milliseconds and is
+//    released through `release`, far inside that bound, so the bound decides nothing there.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
+    const WATCHDOG: Duration = Duration::from_secs(120);
+    in_review_case(
+        "a_busy_child_lock_refuses_the_reopen_as_already_reopened",
+        |root| {
+            let (_, child) = interrupted_reopen(
+                root,
+                "session-review-busy-source",
+                "session-review-busy-child",
+            );
+            let slow = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .next()
+                .unwrap()
+                .join("claude.slow");
+            fs::write(&slow, b"").unwrap();
+            let started = slow.with_extension("started");
+            let (held, wait) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let child = child.clone();
+                let started = started.clone();
+                thread::spawn(move || {
+                    let lock = Store::open_unchecked(&child).lock().unwrap();
+                    held.send(()).unwrap();
+                    let watchdog = Instant::now() + WATCHDOG;
+                    let mut expired = false;
+                    while !started.exists()
+                        && released.recv_timeout(Duration::from_millis(10)).is_err()
+                    {
+                        if Instant::now() >= watchdog {
+                            expired = true;
+                            break;
+                        }
+                    }
+                    drop(lock);
+                    expired
+                })
+            };
+            wait.recv().unwrap();
+            let outcome = ResolvedReopen::resolve(
+                review_request(
+                    "session-review-busy-source",
+                    Some(review_explicit_terminal()),
+                ),
+                Instant::now() + Duration::from_secs(30),
+            );
+            // The holder may already have exited, so a failed send is harmless.
+            let _ = release.send(());
+            let expired = holder.join().unwrap();
+            assert!(
+                !expired,
+                "the test's watchdog released the child's lock after {WATCHDOG:?}, before the holder saw either the probe marker or the reopen-return signal; the reopen then returned {}",
+                match &outcome {
+                    Ok(_) => "a resolution".to_owned(),
+                    Err(error) => format!("{error:#}"),
+                }
+            );
+            assert!(!started.exists(), "the provider was probed");
+            fs::remove_file(&slow).unwrap();
+            let error = outcome.err().expect("the busy child refuses the reopen");
+            assert_eq!(
+                reopen_refusal_gate(&error),
+                Some(ReopenGate::AlreadyReopened),
+                "{error:#}"
+            );
+            assert_eq!(
+                Reader::open_unchecked(&child).status().unwrap().state,
+                SessionState::Launching,
+                "{error:#}"
+            );
+            assert!(
+                !root.join("workspace-consent").exists(),
+                "consent was written"
+            );
+        },
+    );
+}
+
+// 3. An already failed child without its lock file, an expired deadline and no core: the
+//    caller check refuses first, and the lock file is not created, on all three platforms.
+//    0.4.49 did the same on macOS and Linux only: on Windows its selector chose the managed
+//    console without a caller check, and the lock file was created before the expired
+//    version probe refused.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn a_refused_caller_creates_no_lock_file_on_a_failed_child() {
+    in_review_case(
+        "a_refused_caller_creates_no_lock_file_on_a_failed_child",
+        |root| {
+            let (source, child) = interrupted_reopen(
+                root,
+                "session-review-failed-source",
+                "session-review-failed-child",
+            );
+            update_status(&child, SessionState::Failed, None, None).unwrap();
+            let lock = child.join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE);
+            fs::remove_file(&lock).unwrap();
+            let before_source = snapshot_directory(&source);
+            let before_child = snapshot_directory(&child);
+            let error = ResolvedReopen::resolve(
+                review_request("session-review-failed-source", None),
+                Instant::now(),
+            )
+            .err()
+            .expect("the caller check refuses");
+            assert!(
+                format!("{error:#}").contains("the automatic choice of Herdr was refused"),
+                "{error:#}"
+            );
+            assert!(!lock.exists(), "the child's lock file was created");
+            assert_eq!(snapshot_directory(&child), before_child);
+            assert_eq!(snapshot_directory(&source), before_source);
+            assert!(
+                !root.join("workspace-consent").exists(),
+                "consent was written"
+            );
+        },
+    );
+}

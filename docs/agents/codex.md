@@ -9,7 +9,13 @@
   `--no-daemon`, so tool processes retain the hc terminal identity instead of running
   in the shared app-server. Pre-creation admission (`provider::admit_surface`) refuses
   Codex below stable 0.169.0 on Herdr right after the CLI version probe, before any
-  session or terminal exists; `prepare_launch` applies the same decision from the recorded
+  session or terminal exists: an explicit `--terminal herdr` fails with that refusal, and an
+  automatic Herdr choice inside hc takes the OS's own terminal instead
+  (`session_start::admit_choice`). Its caller check has already run by then, once, before the
+  probe, as in 0.4.49; the fallback ignores its outcome. `surface_version_requirement` declares that this
+  choice depends on the version (stable 0.169.0 or newer), so `doctor` decides it with the
+  launch's own probe (`provider_installation::read_installed_version`). `prepare_launch`
+  applies the same decision from the recorded
   surface (never an inherited `HC_TERMINAL_ID`) and the recorded version. That gate reads
   the version text by one grammar (`herdr_codex_version`). The label is the word
   `codex-cli`, the start of every Codex `--version` output this repository records
@@ -19,12 +25,85 @@
   before the label (a warning, a timestamp, another program's version) and after the field
   are never read as the version and are only scanned for a second label, so `0.170.0--` is a
   prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
-  refused. Without a label, only a text of one word is read as the field. A second label, a
-  label without a field on its line and longer unlabelled text are refused. Compared with the
-  launch-time check of 0.4.48, which took the first token that parsed once punctuation was
-  trimmed, each rule only refuses more except one: a labelled stable field at or above the
-  floor is admitted even when noise before the label held a version that check would have
-  read first (below the floor or a prerelease).
+  refused. Without a label (`unlabelled_codex_version`, the one place of that rule), the text
+  is read only when exactly one version-like word is present (owner's decisions 4B and B2,
+  2026-11-26). The text is split on whitespace, and a word counts when it contains three
+  dot-separated numbers anywhere in it; no word is exempt. With exactly one such word, its
+  enclosing punctuation is removed (opening brackets and quotes before it; closing brackets,
+  quotes and `.`, `,`, `;`, `:`, `!`, `?` after it), and the rest must read whole as the
+  labelled field does: one optional `v`, then SemVer. `OpenAI Codex (v0.170.0)`, `(0.170.0)`
+  and `Codex 0.170.0.` are 0.170.0, `0.170.0--` and `0.168.0-rc-.` are prereleases, and
+  `0.170.0+`, `0.170.0-`, `<0.169.0`, `codex/0.168.0`, `v0.168.0.1-rc.1` and `0.168.0.1--` do
+  not read. With no such word, with two or more (the same version printed twice included), or
+  with one that does not read, the text is not read for Herdr. Where the general provider
+  probe has accepted a supported version from the same text, an automatic choice then takes
+  its fallback and an explicit `--terminal herdr` is refused; text the general probe cannot
+  parse (`unknown`, `codex/0.168.0` alone) or refuses (`0.146.0+`, below TAB's 0.147.0
+  minimum) is refused there, before any surface is chosen. The rule
+  refuses whenever more than one word could be the version, since a misread version could let
+  a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can already have
+  reported the request accepted when Codex refuses the option. Its accepted cost: a banner that
+  also shows an address, a URL with a numeric host, a four-part build number or another
+  program's version is not read, including banners 0.4.48 admitted such as
+  `OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)`. What it establishes is limited to the one
+  word it reads: it does not read the words around that word, so a sole version-like word is
+  read whatever program it names (`unknown (runtime 22.0.0)` is 22.0.0), and a comparison
+  written apart from its version is not seen (`Codex < 0.169.0` is 0.169.0). A second label
+  and a label without a field on its line are refused.
+  The wrapper reads the recorded version by the same rule, so a pending launch that another
+  release's binary starts (the executable at its path replaced in between) can be refused
+  there, after its Session and terminal exist. Do not replace the binary while a Herdr launch
+  is pending. What each release's wrapper does with a recorded text is this table, which
+  `pending_herdr_launches_across_the_wrapper_handoff` reads and checks against the frozen
+  0.4.48 and 0.4.49 readers and this build's (`\n` is a line break):
+
+  <!-- herdr-version-handoff -->
+  | `--version` text | Codex meets the floor | 0.4.48 | 0.4.49 | this build |
+  | --- | --- | --- | --- | --- |
+  | `codex-cli 0.170.0` | yes | launches | launches | launches |
+  | `codex-cli 0.168.0` | no | refuses | refuses | refuses |
+  | `codex-cli 0.170.0-alpha.1` | no | refuses | refuses | refuses |
+  | `0.170.0` | yes | launches | launches | launches |
+  | `OpenAI Codex (v0.170.0)` | yes | launches | refuses | launches |
+  | `(0.170.0)` | yes | launches | refuses | launches |
+  | `0.170.0+` | yes | launches | refuses | refuses |
+  | `codex 0.170.0` | yes | launches | refuses | launches |
+  | `unknown (runtime 22.0.0)` | unknown | launches | refuses | launches |
+  | `plugin 0.160.0\ncodex-cli 0.170.0` | yes | refuses | launches | launches |
+  | `codex-cli 0.170.0+` | yes | launches | refuses | refuses |
+  | `node v22.0.0\ncodex-cli 0.168.0` | no | launches | refuses | refuses |
+  | `node v22.0.0\nOpenAI Codex (v0.170.0)` | yes | launches | refuses | refuses |
+  | `codex 0.170.0 (v0.170.0)` | yes | launches | refuses | refuses |
+  | `0.170.0-01 (runtime 22.0.0)` | no | launches | refuses | refuses |
+  | `0.170.0--` | no | launches | refuses | refuses |
+  | `(0.170.0--)` | no | launches | refuses | refuses |
+  | `0.170.0-` | unknown | launches | refuses | refuses |
+  | `0.168.0- runtime 22.0.0` | no | refuses | refuses | refuses |
+  | `OpenAI Codex 0.168.0-rc-. (runtime 22.0.0)` | no | refuses | refuses | refuses |
+  | `OpenAI Codex (v0.168.0)` | no | refuses | refuses | refuses |
+  | `unknown` | unknown | refuses | refuses | refuses |
+  | `OpenAI Codex 0.170.0 (proxy 127.0.0.1:8080)` | yes | launches | refuses | refuses |
+  | `OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)` | yes | launches | refuses | refuses |
+  | `OpenAI Codex (v0.170.0) (proxy http://127.0.0.1:8080/)` | yes | launches | refuses | refuses |
+  | `codex 0.170.0 build 1.2.3.4` | yes | launches | refuses | refuses |
+  | `Codex <0.169.0` | no | launches | refuses | refuses |
+  | `Codex < 0.169.0` | no | launches | refuses | launches |
+  | `OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)` | no | launches | refuses | refuses |
+  | `OpenAI Codex (0.168.0.1--) (runtime 22.0.0)` | no | launches | refuses | refuses |
+  | `codex/0.168.0 (node 22.0.0)` | no | launches | refuses | refuses |
+  <!-- /herdr-version-handoff -->
+
+  Notes on the table. The Codex column says whether the Codex the text describes meets the
+  floor (stable 0.169.0 or newer): `yes`, `no`, or `unknown` where the text does not show
+  Codex's own version. This build launches a labelled row only when its `codex-cli` field is a
+  stable version at or above the floor, whatever other versions the text holds
+  (`plugin 0.160.0\ncodex-cli 0.170.0` launches from its field), and an unlabelled row only
+  when its one version-like word, read alone, is. The test checks that the rows it launches
+  whose Codex is not shown to meet the floor are exactly `unknown (runtime 22.0.0)` and
+  `Codex < 0.169.0`, the limits stated above. A `<` written onto the version is part of the
+  word and no enclosing punctuation, so `Codex <0.169.0`, which 0.4.48 read as 0.169.0 and
+  launched, does not read here.
+
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases
   wrote and admitted launch records.
@@ -38,8 +117,10 @@
   `terminal.send` cannot do, and the launch-argument route above would put the multi-line
   framed prompt on a Windows command line (32,767 characters; 8,191 and no line break
   through an npm `codex.cmd`).
-  Inside an hc terminal the automatic choice for Codex stays the managed console. Replace the
-  refusal with a Windows Herdr route that keeps argument semantics and size, or a
+  Inside an hc terminal the automatic choice for Codex is therefore the managed console, the
+  fallback every OS uses for a provider Herdr does not admit (on macOS and Linux, a Codex below
+  stable 0.169.0 gets Ghostty or tmux the same way; an explicit `--terminal herdr` is refused).
+  Replace the refusal with a Windows Herdr route that keeps argument semantics and size, or a
   first-party addressed input.
 
 - The injected Windows initial paste is a bounded best-effort console fallback (#124),
