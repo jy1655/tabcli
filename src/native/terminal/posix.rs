@@ -22,7 +22,8 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 /// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
 /// work for a live owner only. `CreatedSurface` reaches only a kind whose core keeps its
 /// terminals, with no live owner of this session left: it carries the decision's evidence, and
-/// the adapter's one granting function decides from it and its own observation.
+/// the adapter's one granting function decides from it and its own observation. Such a kind
+/// closes `SurfaceOnly` on its creation record as well, never ending a running terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::native) enum OwnedSurfaceClose {
     LiveOwner,

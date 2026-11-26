@@ -267,24 +267,72 @@ fn ended_close_checks_the_launch_label_with_current_and_legacy_records() {
     }
 }
 
-// A Herdr terminal is closed with its live owner or on its creation record, never on the
-// surface alone: that authority is refused before anything is sent.
+// A Herdr terminal is never closed on the surface alone (review round 8, finding 1): when the
+// decision leaves the close to the surface alone, the adapter closes on the creation record. It
+// refuses a running terminal with nothing sent, removes a finished one and settles an absent
+// one on `not_found` from the recorded core.
 #[test]
-fn a_herdr_terminal_is_never_closed_on_the_surface_alone() {
-    let fixture = Fixture::new();
-    let surface = fixture.store().terminal().unwrap();
-    let error = posix::close_owned_session(
-        &Adapter::with_core(fixture.core.clone()),
-        &fixture.directory,
-        SESSION,
-        &surface,
-        posix::OwnedSurfaceClose::SurfaceOnly,
-        session::close::budget::close_deadline(),
-    )
-    .unwrap_err();
-    assert!(
-        error_text(&error).contains("closed with its live owner or on its creation record"),
-        "{error:#}"
+fn a_herdr_terminal_left_to_the_surface_alone_closes_on_its_creation_record() {
+    type Change = fn(&Fixture);
+    type Row = (
+        &'static str,
+        Change,
+        Result<CloseOutcome, &'static str>,
+        (usize, usize),
     );
-    assert_eq!(fixture.mutations(), (0, 0));
+    let rows: [Row; 3] = [
+        (
+            "running",
+            |_| {},
+            Err("is still running, and TAB could not verify a live owner for this session"),
+            (0, 0),
+        ),
+        (
+            "finished",
+            Fixture::finish,
+            Ok(CloseOutcome::Closed),
+            (0, 1),
+        ),
+        (
+            "absent",
+            |fixture| {
+                fixture.core.0.borrow_mut().terminals.remove("t7");
+            },
+            Ok(CloseOutcome::Missing),
+            (0, 0),
+        ),
+    ];
+    for (label, change, expected, mutations) in rows {
+        let fixture = Fixture::new();
+        change(&fixture);
+        let surface = fixture.store().terminal().unwrap();
+        let result = posix::close_owned_session(
+            &Adapter::with_core(fixture.core.clone()),
+            &fixture.directory,
+            SESSION,
+            &surface,
+            posix::OwnedSurfaceClose::SurfaceOnly,
+            session::close::budget::close_deadline(),
+        );
+        match expected {
+            Ok(outcome) => assert_eq!(
+                result.map_err(|error| error_text(&error)).ok(),
+                Some(outcome),
+                "{label}"
+            ),
+            Err(text) => {
+                let error = error_text(&result.unwrap_err());
+                assert!(error.contains(text), "{label}: {error}");
+            }
+        }
+        assert!(
+            fixture
+                .core
+                .methods()
+                .iter()
+                .any(|method| method == "terminal.get"),
+            "{label}: the recorded core is asked"
+        );
+        assert_eq!(fixture.mutations(), mutations, "{label}");
+    }
 }

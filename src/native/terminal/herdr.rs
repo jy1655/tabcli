@@ -690,10 +690,11 @@ fn close_owned(
 
 /// With no live owner of this session to close with, on every OS: the terminal's creation
 /// record decides, through `authority::grant`, which removes a finished terminal and never ends
-/// a running one. A cleanup gets nothing. The handle's creation record is validated before its
-/// core is asked, so only a whole record can be settled as absent by `not_found`. A running
-/// terminal, one set to keep, or one that is not this session's, is left alone with its handle
-/// retained.
+/// a running one. A cleanup that `core_kept` sent here gets nothing; a close the decision left to
+/// the surface alone is admitted (`authority::admit`). The handle's creation record is validated
+/// before its core is asked, so only a whole record can be settled as absent by `not_found`. A
+/// running terminal, one set to keep, or one that is not this session's, is left alone with its
+/// handle retained.
 fn close_created(
     core: &dyn Core,
     session: &TerminalSession,
@@ -1097,10 +1098,16 @@ mod posix_adapter {
                     record_live_owner_intent(directory, id, session, deadline)?;
                     self.close(directory, session, deadline)
                 }
-                // The decision never leaves a Herdr terminal to the surface alone: it is closed
-                // with its live owner or on its creation record.
-                OwnedSurfaceClose::SurfaceOnly => anyhow::bail!(
-                    "a Herdr terminal is closed with its live owner or on its creation record; no close was sent and the handle is retained"
+                // The decision, 0.4.49's code, left the close to the surface alone: a replayed
+                // teardown intent whose owner record is then found absent, in a launching or
+                // failed session. The terminal is closed on its creation record: settled on
+                // `not_found` and removed when finished, as 0.4.49 did, and never ended while
+                // it runs (the owner's decision of 2026-11-26).
+                OwnedSurfaceClose::SurfaceOnly => self.close_created(
+                    directory,
+                    session,
+                    crate::native::terminal::close_authority::CreationEvidence::surface_only(),
+                    deadline,
                 ),
             }
         }

@@ -634,12 +634,18 @@ pub(in crate::native) fn close_windows_owned_surface_with(
             )
             .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated))
         }
-        // The decision never leaves a terminal its core keeps to the surface alone.
+        // A terminal its core keeps is never closed on the surface alone: as on macOS and Linux,
+        // the close the decision left to the surface alone acts on its creation record, with
+        // that decision's result (no Windows decision reaches it for Herdr today).
         TerminalCloseAuthority::SurfaceOnly if owner_exit::core_retains_finished(session.kind) => {
-            bail!(
-                "a {} terminal is closed with its live owner or on its creation record; no close was sent and the handle is retained",
-                session.kind.display_name()
+            windows_dispatch::close_created_surface(
+                adapters,
+                directory,
+                session,
+                CreationEvidence::surface_only(),
+                deadline,
             )
+            .map(Into::into)
         }
         _ => windows_dispatch::close_session_until(adapters, directory, session, deadline)
             .map(Into::into),

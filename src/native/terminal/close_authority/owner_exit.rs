@@ -11,7 +11,9 @@
 //! function decides from its own observation of the terminal. A close on the creation record
 //! never ends a running terminal (the owner's decision of 2026-11-26): the person ends it or
 //! waits for it to finish, and closes again. Only an explicit close acts on such a terminal; a
-//! close that cleans up after another command does not.
+//! close that cleans up after another command does not. A saved teardown intent (macOS and
+//! Linux) keeps 0.4.49's decision; when that decision leaves the close to the surface alone, the
+//! terminal is closed on its creation record as well (`CreationEvidence::surface_only`).
 //!
 //! Other kinds keep their platform's rule: macOS and Linux Repair retain a handle that can
 //! outlive the owner, and a close intent; Windows Repair closes the managed console of an
@@ -46,23 +48,36 @@ pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> 
 }
 
 /// The decision's evidence for a close on a terminal's creation record. Its fields are private
-/// to this module, so only `core_kept` can establish it (and, in tests, `scripted`). A close on
-/// the creation record removes a finished terminal and settles an absent one, and never ends a
-/// running one (the owner's decision of 2026-11-26): nothing here permits that, and nothing
-/// about the owner permits or refuses anything on this path. The evidence says why the close
-/// runs, and, for messages only: the PID of this session's owner when the OS reported its
-/// recorded process gone (the closed record's diagnosis), and why a live owner could not be
-/// verified when the owner record or its process could not be read (the refusal of a running
-/// terminal).
+/// to this module, so only `core_kept` and, for a close the decision left to the surface alone,
+/// `surface_only` establish it (and, in tests, `scripted`). A close on the creation record
+/// removes a finished terminal and settles an absent one, and never ends a running one (the
+/// owner's decision of 2026-11-26): nothing here permits that, and nothing about the owner
+/// permits or refuses anything on this path. The evidence says why the close runs, and, for
+/// messages only: the PID of this session's owner when the OS reported its recorded process
+/// gone (the closed record's diagnosis), and why a live owner could not be verified when the
+/// owner record or its process could not be read (the refusal of a running terminal).
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", windows)),
     allow(dead_code)
 )]
 pub(in crate::native) struct CreationEvidence {
-    cause: super::CloseCause,
+    source: Source,
     gone_owner: Option<u32>,
     unverified: Option<String>,
+}
+
+/// Which decision sent the close to the creation record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
+enum Source {
+    /// `core_kept`, for a close run for this cause.
+    Decided(super::CloseCause),
+    /// The decision, 0.4.49's code, left the close to the surface alone (`SurfaceOnly`).
+    SurfaceOnly,
 }
 
 #[cfg_attr(
@@ -70,9 +85,32 @@ pub(in crate::native) struct CreationEvidence {
     allow(dead_code)
 )]
 impl CreationEvidence {
-    /// Whether `close-session --explicit` asked for this close.
+    /// The evidence for a close that the decision, 0.4.49's code, left to the surface alone
+    /// (`SurfaceOnly`) on a kind whose core keeps its terminals. For Herdr this is reached only on
+    /// macOS and Linux, by a replayed teardown intent whose owner record is then found absent in
+    /// a launching or failed session. 0.4.49 closed the terminal on the surface alone, ending a
+    /// running one; the close on the creation record keeps its settlement of an absent terminal
+    /// and its removal of a finished one, and never ends a running one (the owner's decision of
+    /// 2026-11-26). Only the mapping of that decision constructs it.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(in crate::native::terminal) fn surface_only() -> Self {
+        Self {
+            source: Source::SurfaceOnly,
+            gone_owner: None,
+            unverified: None,
+        }
+    }
+
+    /// Whether `close-session --explicit` asked for this close, as `core_kept` found it.
     pub(in crate::native::terminal) fn explicit(&self) -> bool {
-        self.cause == super::CloseCause::Explicit
+        self.source == Source::Decided(super::CloseCause::Explicit)
+    }
+
+    /// Whether this close may act on the creation record: one that `close-session --explicit`
+    /// asked for, or one that the decision left to the surface alone, whatever its cause (0.4.49
+    /// acted on the surface for it).
+    pub(in crate::native::terminal) fn admitted(&self) -> bool {
+        self.explicit() || self.source == Source::SurfaceOnly
     }
 
     /// The reason the closed record carries when the session stored none: the end of this
@@ -92,7 +130,7 @@ impl CreationEvidence {
     #[cfg(test)]
     pub(in crate::native) fn scripted(cause: super::CloseCause) -> Self {
         Self {
-            cause,
+            source: Source::Decided(cause),
             gone_owner: None,
             unverified: None,
         }
@@ -142,7 +180,7 @@ pub(super) fn core_kept(
     let cause = observation.cause();
     let created = |gone_owner: Option<u32>, unverified: Option<String>| {
         Ok(CoreKept::Created(CreationEvidence {
-            cause,
+            source: Source::Decided(cause),
             gone_owner,
             unverified,
         }))

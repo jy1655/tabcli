@@ -8,7 +8,7 @@
 //! | --- | --- | --- | --- |
 //! | `Owned`: a live, attested owner of this session, or the launcher that bound the terminal | Recorded identity | Yes | Yes |
 //! | `Launch`: the launch that created the terminal, before any binding | The launch's argv, label, name, creation time and PID | Yes | Yes |
-//! | `Created`: no live owner of this session; admitted only for an explicit close | Recorded identity and launch label, from a handle whose creation record is whole | Yes | Never |
+//! | `Created`: no live owner of this session; admitted for an explicit close, or for a close the decision left to the surface alone | Recorded identity and launch label, from a handle whose creation record is whole | Yes | Never |
 //!
 //! A `not_found` from the recorded core settles a `Created` close only after the handle's
 //! creation record was validated (`Recorded::open` with `Requirement::Created`). A close on the
@@ -39,7 +39,8 @@ pub(super) enum Basis<'a> {
     },
 }
 
-/// A close on the creation record that `admit` let through: only an explicit close. It keeps why
+/// A close on the creation record that `admit` let through: an explicit close, or a close that
+/// the decision left to the surface alone (`CreationEvidence::surface_only`). It keeps why
 /// a live owner could not be verified, for the refusal of a running terminal and for
 /// `explain`, which the close attaches once around everything it does after admission.
 pub(super) struct Admitted {
@@ -61,10 +62,11 @@ impl std::fmt::Display for StillRunning {
 impl std::error::Error for StillRunning {}
 
 /// Admits the decision's evidence before anything is read from the core: a cleanup after
-/// another command (a refused reopen) acts on no terminal that no live owner holds, and settles
-/// no absent one either.
+/// another command (a refused reopen) that `core_kept` sent here acts on no terminal that no live
+/// owner holds, and settles no absent one either. A close that the decision left to the surface
+/// alone is admitted whatever its cause, because 0.4.49 acted on the surface for it.
 pub(super) fn admit(evidence: CreationEvidence) -> Result<Admitted> {
-    if !evidence.explicit() {
+    if !evidence.admitted() {
         let why = evidence
             .unverified()
             .map(|why| format!(" ({why})"))
