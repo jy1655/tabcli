@@ -1523,8 +1523,18 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         "{error:#}"
     );
 
-    // A resolution that outlives the request's deadline creates no Session: the clock is read
-    // right before the Session directory is allocated.
+    // A resolution that outlives the request's deadline writes nothing at creation: the clock
+    // is read before the creation callback, so the state root keeps its mode and gains no
+    // durability receipt, and no Session directory is allocated.
+    let receipt = root.join("state-root.durable");
+    assert!(!receipt.exists());
+    #[cfg(unix)]
+    let mode = || {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777
+    };
+    #[cfg(unix)]
+    let mode_before = mode();
     let ask = request(FirstPartyCli::Pi, &project, None);
     let resolved = resolve_with(
         fresh_resolution(
@@ -1548,7 +1558,103 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         .err()
         .expect("the deadline refuses creation");
     assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("nothing was created"),
+        "{error:#}"
+    );
+    assert!(!receipt.exists(), "a durability receipt was written");
+    #[cfg(unix)]
+    assert_eq!(mode(), mode_before, "the state root's mode changed");
     assert_no_sessions();
+}
+
+// A caller check that succeeds only after the request's deadline ends the resolution there,
+// at the boundary where 0.4.49's version probe, which followed the caller check, stopped it:
+// nothing is written, the shared workspace-consent store included.
+#[test]
+fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::session::primitives::STATE_DIR_ENV;
+    use std::process::Command;
+
+    const CHILD: &str = "TABCLI_START_LATE_CALLER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let codex_home = base.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let root = base.path().join("state");
+        fs::create_dir(&root).unwrap();
+        let test_name = format!(
+            "{}::a_caller_check_that_ends_after_the_deadline_writes_nothing",
+            module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, rest)| rest)
+        );
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
+            .env("CODEX_HOME", &codex_home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let root = Reader::state_root().unwrap();
+    let project = root.parent().unwrap().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let fallback = platform_fallback();
+    // Claude's caller is checked before its probe, Codex's after it (off Windows).
+    let mut cases = vec![(FirstPartyCli::Claude, "2.1.302")];
+    if !cfg!(windows) {
+        cases.push((FirstPartyCli::Codex, "codex-cli 0.170.0"));
+    }
+    for (provider, version) in cases {
+        let ask = AskRequest {
+            provider,
+            workspace: project.clone(),
+            prompt: "fixture prompt".into(),
+            title: None,
+            model: None,
+            effort: None,
+            terminal: None,
+            yolo: false,
+            timeout: Duration::from_secs(30),
+            detach: false,
+            json: false,
+            context_results: Vec::new(),
+        };
+        let error = resolve_with(
+            fresh_resolution(
+                &ask,
+                context::resolve(&[]).unwrap(),
+                terminal::Selection::Herdr { fallback },
+            ),
+            Instant::now() + Duration::from_millis(100),
+            |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+            |_, _| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+        )
+        .err()
+        .expect("the deadline ends the resolution");
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+        assert!(
+            !root.join("workspace-consent").exists(),
+            "{provider:?}: the workspace-consent store was written"
+        );
+    }
 }
 
 // A deadline no test reaches.

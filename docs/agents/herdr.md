@@ -120,20 +120,27 @@
   the choice is known to be Herdr. Where the adapter's answer does not depend on the version
   (Claude, Agy, Pi), that is before the workspace and the probe, as in 0.4.49 for `ask` and
   right after the source and its provider's reopen support for `reopen`; where it does (Codex
-  off Windows), after the probe, and only for a choice that ends on Herdr. The request's
-  deadline bounds exactly these steps: the caller check's calls to the core (`hello`,
-  `terminal.get`), each of which waits for a reply only until the deadline, a failure after it
-  being reported as timed out; the reservation of a reopen's source, which waits for the
-  source's lock only until the deadline and reads the clock again before it releases a stale
-  marker and before it writes the marker (`Reservation::claim_until`); and the creation of a
-  Session, which reads the clock right before the Session directory is allocated, after the
-  state root is prepared (`state_root::create_directory`). Nothing else is bounded by it, as
-  in 0.4.49: the caller check's own steps other than its calls to the core (endpoint
-  discovery, the connection, whose Windows wait for a free pipe instance alone ends by the
-  deadline, and the walk of parents), state-root preparation, and, once the
-  child exists, its provenance and the reservation's finalization, which waits for the
-  source's lock so that the child stays bound to its source. A write that starts before the
-  deadline is not interrupted. The caller's terminal must be live on the addressed
+  off Windows), after the probe, and only for a choice that ends on Herdr. Of the Herdr and
+  creation steps (the provider's version probe is held to the request's deadline as well),
+  the request's deadline limits these:
+  the caller check's calls to the core (`hello`, `terminal.get`), whose wait for reply bytes
+  ends at the deadline (on Windows a pipe operation cancelled there is waited for before its
+  buffer is released, and a reply received just before the deadline can finish decoding after
+  it), a failure after the deadline being reported as timed out; the clock read when the
+  caller check returns successfully, where 0.4.49's version probe, which followed the caller
+  check, would have stopped the request, so a late check writes nothing (not the
+  workspace-consent store either); the clock read before the creation callback, so an expired
+  request leaves the state root's mode and durability receipt as they were; the reservation of
+  a reopen's source, which waits for the source's lock only until the deadline and reads the
+  clock again before it releases a stale marker and before it writes the marker
+  (`Reservation::claim_until`); and the clock read right before the Session directory is
+  allocated, after the state root is prepared (`state_root::create_directory`). The steps
+  themselves are not bounded by it, as in 0.4.49: the caller check's own steps other than its
+  calls to the core (endpoint discovery, the connection, whose Windows wait for a free pipe
+  instance alone ends by the deadline, and the walk of parents), state-root preparation once
+  begun, and, once the child exists, its provenance and the reservation's finalization, which
+  waits for the source's lock so that the child stays bound to its source. A write that starts
+  before the deadline is not interrupted. The caller's terminal must be live on the addressed
   core with this process among its program's descendants, or the launch is refused without
   opening another terminal. Up to 64 parent links are compared; only a chain that ends at a
   root (no parent, or init) proves the command is outside, while reaching that bound or a

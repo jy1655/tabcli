@@ -214,10 +214,21 @@ pub(in crate::native) fn create_directory(
     durable_directories: &[PathBuf],
     deadline: Option<std::time::Instant>,
 ) -> Result<(PathBuf, String, Option<String>)> {
-    let ancestry_error = create_state_root(root, durable_directories)?;
+    create_directory_after(root, deadline, || {
+        create_state_root(root, durable_directories)
+    })
+}
+
+// The Session directory once `prepare` has readied the state root; tests time `prepare`.
+pub(in crate::native) fn create_directory_after(
+    root: &Path,
+    deadline: Option<std::time::Instant>,
+    prepare: impl FnOnce() -> Result<Option<String>>,
+) -> Result<(PathBuf, String, Option<String>)> {
+    let ancestry_error = prepare()?;
     if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
         bail!(crate::native::failure_kind::TimedOut::new(
-            "the request's deadline passed before its Session was created; nothing was created"
+            "the request's deadline passed while its state root was prepared; no Session was created"
         ));
     }
     let temp = tempfile::Builder::new()

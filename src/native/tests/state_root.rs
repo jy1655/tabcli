@@ -522,3 +522,42 @@ fn state_root_faults_preserve_repair_and_prune_interleaving() {
     assert_eq!(error.to_string(), "injected entry failure");
     assert!(!closed.exists());
 }
+
+// The clock is read after the state root is prepared and right before the Session directory is
+// allocated: a request that enters in time and whose preparation crosses its deadline
+// allocates no Session directory. Were the clock read before preparation instead, this
+// allocation would go through.
+#[test]
+fn a_preparation_that_crosses_the_deadline_allocates_no_session_directory() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::session::primitives::{create_directory_after, create_state_root};
+    use std::time::{Duration, Instant};
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("state");
+    let durable = [base.path().to_owned()];
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let error = create_directory_after(&root, Some(deadline), || {
+        assert!(Instant::now() < deadline, "the request entered in time");
+        let prepared = create_state_root(&root, &durable);
+        std::thread::sleep(Duration::from_millis(200));
+        prepared
+    })
+    .unwrap_err();
+    assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("no Session was created"),
+        "{error:#}"
+    );
+    let sessions = fs::read_dir(&root)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session-")
+        })
+        .count();
+    assert_eq!(sessions, 0);
+}

@@ -26,7 +26,8 @@ the OS chooses with the Herdr marker ignored: Ghostty on macOS (hc names it in
 to Codex below stable 0.169.0 on macOS and Linux, and to every Codex on Windows. Before it uses
 Herdr, TAB verifies that the command runs in that Herdr terminal on the running core: at once
 for Claude, Agy and Pi, whose version cannot change the choice, and after reading the
-installed version for Codex. Its requests to the core end by the request's timeout. Failed verification refuses the launch
+installed version for Codex. The request's timeout limits how long it waits for the core's
+replies, and a check that returns after it writes nothing. Failed verification refuses the launch
 instead of opening another terminal. A launch on the fallback needs no verification. An explicit `--terminal herdr` that the provider cannot use is refused
 instead. The fallback terminal must be usable: a Mac without Ghostty, for example, fails when
 TAB opens it, as an explicit `--terminal ghostty` would. `tabcli doctor --provider <provider>

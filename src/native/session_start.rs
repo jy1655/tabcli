@@ -83,9 +83,10 @@ impl Resolved {
         &mut self.spec
     }
 
-    // `create` receives the request's deadline: `create_session` reads it right before the
-    // Session directory is allocated, and a reopen's reservation right before its marker is
-    // written, so that nothing is created after it.
+    // The clock is read before `create` runs, so that a request whose deadline passed during
+    // the resolution writes nothing (the state root's mode and durability receipt included).
+    // `create` receives the deadline: a reopen's reservation reads it again before it writes
+    // its marker, and `create_session` right before it allocates the Session directory.
     pub(super) fn create_with<T>(
         self,
         create: impl FnOnce(
@@ -94,6 +95,11 @@ impl Resolved {
             Instant,
         ) -> Result<(CreatedSession, T)>,
     ) -> Result<(Prepared, T)> {
+        if Instant::now() >= self.deadline {
+            bail!(TimedOut::new(
+                "the request's deadline passed before its Session was created; nothing was created"
+            ));
+        }
         let provider = self.spec.provider;
         let (created, source) = create(self.spec, self.consent.as_ref(), self.deadline)?;
         Ok((
@@ -257,10 +263,12 @@ pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<R
 // provider's reopen support for `reopen`, whose resolution starts here. Where it depends on
 // the version, it is after the probe, and only for a choice that then ends on Herdr. A
 // fallback and an explicit choice are never checked against the caller. The request's
-// deadline bounds the check's calls to the core only, and a check that fails after it is
-// reported as timed out; the check's other steps and what the resolution reads besides are
-// not bounded by it, as in 0.4.49. Creation reads it again (`state_root::create_directory`,
-// `Reservation::claim_until`); docs/agents/herdr.md states the whole guarantee.
+// deadline limits the check's wait for the core's replies, a check that fails after it is
+// reported as timed out, and the clock is read when the check returns successfully, the
+// boundary where 0.4.49's version probe stopped a late request before any write. The check's
+// other steps and what the resolution reads besides are not bounded by it, as in 0.4.49.
+// Creation reads it again (`Resolved::create_with`, `Reservation::claim_until`,
+// `state_root::create_directory`); docs/agents/herdr.md states the whole guarantee.
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
     deadline: Instant,
@@ -297,6 +305,14 @@ pub(super) fn resolve_with(
                     error
                 }
             })?;
+            // 0.4.49 ran the deadline-aware version probe after the caller check, so a check
+            // that returns after the deadline stopped the request before anything was written;
+            // the clock is read here for the same boundary.
+            if Instant::now() >= deadline {
+                bail!(TimedOut::new(
+                    "the request's deadline passed during the Herdr caller check; nothing was written"
+                ));
+            }
         }
         Ok(())
     };
