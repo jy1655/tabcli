@@ -2689,6 +2689,27 @@ fn mode_open_fixture(
     bound: &Cell<bool>,
     force_new_window: bool,
 ) -> Result<TerminalSession> {
+    open_fixture_within(
+        runner,
+        client,
+        directory,
+        attempt,
+        bound,
+        force_new_window,
+        Duration::from_millis(450),
+    )
+}
+
+// `launch` bounds the whole fake launch, its title proof included.
+fn open_fixture_within(
+    runner: &mut FakeRunner,
+    client: &ControlClient,
+    directory: &Path,
+    attempt: &str,
+    bound: &Cell<bool>,
+    force_new_window: bool,
+    launch: Duration,
+) -> Result<TerminalSession> {
     open_bound_tab_with(
         runner,
         OpenRequest {
@@ -2696,7 +2717,7 @@ fn mode_open_fixture(
             clients: std::slice::from_ref(client),
             command: "ignored",
             directory,
-            deadline: Instant::now() + Duration::from_millis(450),
+            deadline: Instant::now() + launch,
             cleanup_deadline: Instant::now() + Duration::from_secs(1),
             attempt,
         },
@@ -2712,6 +2733,13 @@ fn mode_open_fixture(
 
 #[test]
 fn warp_r2_proof_uncertain_executed_reply_reacquires_same_title() {
+    // A hung first proof call spends a third of what the launch deadline leaves, by design,
+    // and the launch's work after the proof has the rest. With 450 ms that rest was about
+    // 250 ms on an idle Mac, and a macOS runner ran out of it once ("Warp launch deadline
+    // expired after binding and before provider start"); 300 ms more work after the proof
+    // reproduces that for the timeout case alone. The cases test the reacquisition, not the
+    // deadline: 3 s leaves about 2 s after the hung call.
+    const LAUNCH: Duration = Duration::from_secs(3);
     for code in ["lost", "malformed", "timeout"] {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
@@ -2720,7 +2748,16 @@ fn warp_r2_proof_uncertain_executed_reply_reacquires_same_title() {
         runner.proof_failures = 1;
         runner.proof_reply = Some(code);
         let bound = Cell::new(false);
-        proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).unwrap();
+        open_fixture_within(
+            &mut runner,
+            &client,
+            &directory,
+            &attempt,
+            &bound,
+            false,
+            LAUNCH,
+        )
+        .unwrap();
         assert!(bound.get());
         assert_eq!(runner.proof_calls, 2);
         assert_eq!(runner.proof_executed, 2);
