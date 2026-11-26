@@ -21,9 +21,13 @@ pub(in crate::native) enum Expiry<'a> {
     Unchecked,
     /// The receipt's recorded deadline.
     Receipt,
-    /// The caller's own budget on its clock, then the receipt's recorded deadline: the macOS
-    /// binding wait and the launcher's early decisions, which never act after the launch
-    /// deadline.
+    /// The caller's own budget on its clock, then the receipt's recorded deadline. Only the
+    /// macOS binding wait has a budget of its own.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows, test)),
+        allow(dead_code)
+    )]
+    #[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
     BudgetOrReceipt(&'a mut dyn FnMut() -> bool),
 }
 

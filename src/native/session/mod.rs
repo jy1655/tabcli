@@ -84,17 +84,17 @@ pub(in crate::native) struct Reader {
     directory: PathBuf,
 }
 
-/// A writable view. Lifecycle convergence remains with the command in step one.
 /// What `Store::try_lock_existing` found.
 pub(in crate::native) enum ExistingLock {
     /// The lifecycle lock, held until this is dropped.
     Held(File),
     /// Another holder has it.
     Busy,
-    /// The directory has no lifecycle lock file.
-    Absent,
+    /// No regular file is at the lock's path.
+    Unavailable,
 }
 
+/// A writable view. Lifecycle convergence remains with the command in step one.
 pub(in crate::native) struct Store {
     reader: Reader,
 }
@@ -369,17 +369,32 @@ impl Store {
         try_lock(&self.directory)
     }
     /// The lifecycle lock for a decision that changes nothing before it knows the directory is
-    /// its own (the launcher's early decisions): the existing lock file, opened as
-    /// `lock_shared` opens it, without creating it or changing its permissions, and locked
-    /// exclusively in one attempt.
+    /// its own (the launcher's early decisions): the existing lock file, opened for reading and
+    /// writing without creating or truncating it or changing its permissions (on macOS and
+    /// Linux without blocking, so that a special file cannot hold the open), accepted only when
+    /// the opened handle is a regular file, and locked exclusively in one attempt.
     pub(in crate::native) fn try_lock_existing(&self) -> Result<ExistingLock> {
-        let file = match File::open(self.directory.join(TURN_CLAIM_LOCK_FILE)) {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = match options.open(self.directory.join(TURN_CLAIM_LOCK_FILE)) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ExistingLock::Absent);
+                return Ok(ExistingLock::Unavailable);
             }
-            Err(error) => return Err(error).context("failed to observe native lifecycle lock"),
+            Err(error) => return Err(error).context("failed to open native lifecycle lock"),
         };
+        if !file
+            .metadata()
+            .context("failed to inspect native lifecycle lock")?
+            .is_file()
+        {
+            return Ok(ExistingLock::Unavailable);
+        }
         match file.try_lock() {
             Ok(()) => Ok(ExistingLock::Held(file)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(ExistingLock::Busy),

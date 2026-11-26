@@ -598,12 +598,12 @@ fn unbound_wording(store: &Store, record: &Record, reason: &str) -> Result<Strin
 /// Settles a launch whose session directory the launch host would refuse, which the launcher
 /// established before any Surface existed (`terminal::DirectoryRefusal`), as the failure to
 /// open a Surface that it is (`terminal_failed`). An early decision (docs/agents/herdr.md,
-/// "Early launch decisions"): it takes the existing lifecycle lock (`try_lock_existing`),
-/// waiting out another holder until `deadline`, the launch's own, and never accepting the lock
-/// at or after it; then it writes only on this launch's own pending launch, read under that
-/// lock (`early_facts`). Past the deadline the held lock keeps the Claim, as for every failure
-/// to open a Surface; without a lock file, or on facts that are not this launch's, nothing is
-/// written. The refusal is judged once, as observed: a directory corrected while the lock is
+/// "Early launch decisions"): it writes only when `establish_early_facts` finds the facts hold,
+/// at once, under the lock that established them, and waits out another holder of the lock
+/// until `deadline`, the launch's own. Otherwise it writes nothing and returns the refusal; only
+/// when the budget ran out while another holder kept the lock and this launch's Claim is still
+/// seen at the path does it add that the Claim is retained, as every failure to open a Surface
+/// does. The refusal is judged once, as observed: a directory corrected while the lock is
 /// awaited is not examined again. The Session records `recorded`, a fixed reason that names no
 /// path (`DirectoryRefusal::recorded`); the refusal, which names the directory, is returned to
 /// the caller.
@@ -633,71 +633,94 @@ fn refused_before_surface_with(
     clock: &mut dyn Clock,
 ) -> anyhow::Error {
     let reason = format!("terminal launch failed: {recorded}");
-    let settled = (|| {
-        let _lock = loop {
-            match store.try_lock_existing()? {
-                ExistingLock::Held(lock) if clock.now() < deadline => break lock,
-                ExistingLock::Held(_) => return Err(startup_in_progress(&reason)),
-                ExistingLock::Absent => return Ok(()),
-                ExistingLock::Busy => {
-                    let remaining = deadline.saturating_duration_since(clock.now());
-                    if remaining.is_zero() {
-                        return Err(startup_in_progress(&reason));
-                    }
-                    clock.sleep(remaining.min(WAIT_POLL));
-                }
-            }
-        };
-        match early_facts(store, token, deadline, clock)? {
-            EarlyFacts::Pending(_) => {
-                #[cfg(test)]
-                early_facts_hook::run();
-                fail_deciding_locked(store, &reason, |record, reason| {
+    loop {
+        match establish_early_facts(store, token, deadline, clock) {
+            EarlyFacts::Hold(_lock) => {
+                return match fail_deciding_locked(store, &reason, |record, reason| {
                     unbound_wording(store, record, reason)
-                })
+                }) {
+                    Ok(()) => refusal,
+                    Err(handoff) => {
+                        refusal.context(format!("terminal launch failure handoff: {handoff:#}"))
+                    }
+                };
             }
-            EarlyFacts::Expired => Err(startup_in_progress(&reason)),
-            EarlyFacts::NotPending => Ok(()),
+            EarlyFacts::Busy => {
+                let remaining = deadline.saturating_duration_since(clock.now());
+                if !remaining.is_zero() {
+                    clock.sleep(remaining.min(WAIT_POLL));
+                    continue;
+                }
+                let held = turn::current_claim_token(store)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|claim| claim == token);
+                return if held {
+                    let contended = startup_in_progress(&reason);
+                    refusal.context(format!("terminal launch failure handoff: {contended:#}"))
+                } else {
+                    refusal
+                };
+            }
+            EarlyFacts::NotEstablished => return refusal,
         }
-    })();
-    match settled {
-        Ok(()) => refusal,
-        Err(handoff) => refusal.context(format!("terminal launch failure handoff: {handoff:#}")),
     }
 }
 
-/// What an early launch decision reads of this launch's own records, under the lifecycle lock it
-/// holds, before it may write: the pending-launch judgment for `token` (the status `Launching`
-/// and no tombstone, the receipt of this Claim, still `Pending`, the launch's budget on `clock`
-/// and the receipt's deadline, and this Claim at the path).
+/// What `establish_early_facts` found.
 enum EarlyFacts {
-    Pending(Record),
-    Expired,
-    NotPending,
+    /// The facts hold: the lifecycle lock under which they were read, for the decision's write.
+    Hold(std::fs::File),
+    /// Another holder has the lifecycle lock.
+    Busy,
+    /// Anything else: nothing is decided.
+    NotEstablished,
 }
 
-fn early_facts(
+/// The facts of the bar for both early launch decisions (docs/agents/herdr.md, "Early launch
+/// decisions"), established in one order and nowhere else, writing nothing: the existing
+/// lifecycle lock (`Store::try_lock_existing`), tried once; under it, this launch's Claim at the
+/// path; the receipt of this Claim, still `Pending`, and the status `Launching` without a
+/// tombstone (`pending::judge`); the launch-host Record, read without its publication
+/// (`host_record_pending`); the ordinary poll's reading of the status and the receipt
+/// (`read_confirmation`); and last, both clocks: the monotonic launch `deadline` on `clock` and
+/// the receipt's deadline. A read that fails or is inconclusive, a fact not as required, a busy
+/// or unavailable lock, or a clock that has run out establishes nothing.
+fn establish_early_facts(
     store: &Store,
     token: &str,
     deadline: Instant,
     clock: &mut dyn Clock,
-) -> Result<EarlyFacts> {
-    let Some(receipt) = read(store)? else {
-        return Ok(EarlyFacts::NotPending);
+) -> EarlyFacts {
+    let lock = match store.try_lock_existing() {
+        Ok(ExistingLock::Held(lock)) => lock,
+        Ok(ExistingLock::Busy) => return EarlyFacts::Busy,
+        Ok(ExistingLock::Unavailable) | Err(_) => return EarlyFacts::NotEstablished,
     };
-    let mut spent = || clock.now() >= deadline;
-    Ok(
-        match pending::judge(
-            store,
-            &receipt,
-            token,
-            pending::Expiry::BudgetOrReceipt(&mut spent),
-        )? {
-            Ok(()) => EarlyFacts::Pending(receipt),
-            Err(pending::NotPending::Expired) => EarlyFacts::Expired,
-            Err(_) => EarlyFacts::NotPending,
-        },
-    )
+    let receipt = (|| -> Result<Option<Record>> {
+        if turn::current_claim_token(store)?.as_deref() != Some(token) {
+            return Ok(None);
+        }
+        let Some(receipt) = read(store)? else {
+            return Ok(None);
+        };
+        if pending::judge(store, &receipt, token, pending::Expiry::Unchecked)?.is_err()
+            || !host_record_pending(store, &receipt)
+            || read_confirmation(store)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    })();
+    let Ok(Some(receipt)) = receipt else {
+        return EarlyFacts::NotEstablished;
+    };
+    #[cfg(test)]
+    early_facts_hook::run();
+    if clock.now() >= deadline || unix_ms() >= receipt.deadline_unix_ms {
+        return EarlyFacts::NotEstablished;
+    }
+    EarlyFacts::Hold(lock)
 }
 
 /// The ordinary poll's reading of the launch-host Record (`host_decision_locked`), without the
@@ -1055,15 +1078,13 @@ fn settle_locked(store: &Store, reason: String, deadline_reached: bool) -> Resul
 
 /// The decision on a launch whose surface's program its verified core reports finished before
 /// startup was confirmed (a Herdr terminal; owner's decision 2026-11-26, option A). An early
-/// decision (docs/agents/herdr.md, "Early launch decisions"): it acts only on facts read under
-/// the existing lifecycle lock (`try_lock_existing`), at the moment of the decision, about this
-/// launch's own records: its own pending launch within the budget (`early_facts`; a `Pending`
-/// receipt means no provider was started that could still confirm) and the ordinary poll's
-/// reading of the launch-host Record, still pending (`host_record_pending`). Then the launch
-/// fails through the deadline's settlement, with a fixed reason that names no path; the error
-/// returned to the caller adds the core's report and the launch log's path. Otherwise, and when
-/// anything cannot be read, this probe decides nothing (`None`) and writes nothing: the wait
-/// goes on to its next ordinary poll, and the existing paths decide.
+/// decision (docs/agents/herdr.md, "Early launch decisions"): only when
+/// `establish_early_facts` finds the facts hold (a `Pending` receipt also means that no provider
+/// was started that could still confirm) does the launch fail, at once, under the lock that
+/// established them, through the deadline's settlement, with a fixed reason that names no path;
+/// the error returned to the caller adds the core's report and the launch log's path. Otherwise
+/// this probe decides nothing (`None`) and writes nothing: the wait goes on to its next ordinary
+/// poll, and the existing paths decide.
 fn finished_before_startup(
     store: &Store,
     token: &str,
@@ -1071,17 +1092,9 @@ fn finished_before_startup(
     deadline: Instant,
     clock: &mut dyn Clock,
 ) -> Option<Result<()>> {
-    let Ok(ExistingLock::Held(_lock)) = store.try_lock_existing() else {
+    let EarlyFacts::Hold(_lock) = establish_early_facts(store, token, deadline, clock) else {
         return None;
     };
-    let Ok(EarlyFacts::Pending(receipt)) = early_facts(store, token, deadline, clock) else {
-        return None;
-    };
-    if !host_record_pending(store, &receipt) {
-        return None;
-    }
-    #[cfg(test)]
-    early_facts_hook::run();
     Some(
         settle_locked(store, SURFACE_FINISHED.to_owned(), false).map_err(|error| {
             if format!("{error:#}") != SURFACE_FINISHED {
@@ -1095,8 +1108,9 @@ fn finished_before_startup(
     )
 }
 
-/// A test's step after an early decision's last required read, run once on this thread: what
-/// happens while that read takes its time, such as the launch deadline passing.
+/// A test's step after the last required read of `establish_early_facts`, before its clocks,
+/// run once on this thread: what happens while that read takes its time, such as the launch
+/// deadline passing.
 #[cfg(test)]
 pub(in crate::native) mod early_facts_hook {
     use std::cell::RefCell;
