@@ -4464,7 +4464,10 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
 }
 
 // 3. An already failed child without its lock file, an expired deadline and no core: the
-//    caller check refuses first, and the lock file is not created (0.4.49: the same).
+//    caller check refuses first, and the lock file is not created, on all three platforms.
+//    0.4.49 did the same on macOS and Linux only: on Windows its selector chose the managed
+//    console without a caller check, and the lock file was created before the expired
+//    version probe refused.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_refused_caller_creates_no_lock_file_on_a_failed_child() {

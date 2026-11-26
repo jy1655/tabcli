@@ -417,7 +417,10 @@ fn ask_checks_the_caller_first_where_no_version_can_change_the_choice() {
 
 // A caller that cannot be verified (the core is absent) refuses a launch that would use Herdr,
 // and nothing else: on every OS a provider version Herdr does not admit takes the OS's own
-// terminal without the check, as Codex on Windows does for every version.
+// terminal. On macOS and Linux an automatic Codex choice still makes its caller check, one
+// connection to the core before the probe, and the fallback ignores its outcome (counted in
+// `an_automatic_herdr_gives_way_to_the_fallback_where_the_provider_version_is_not_admitted`);
+// on Windows, where no Codex version runs on Herdr, Codex skips the check.
 #[test]
 fn a_stale_caller_refuses_only_a_launch_that_uses_herdr() {
     let fixture = Fixture::new();

@@ -125,11 +125,14 @@
   automatic choice that ends on Herdr launches there only if its check passed, and is
   otherwise refused with the check's error; one that takes the fallback ignores the check.
   So every later step runs in 0.4.49's order, after the same refusals and clock reads: the
-  caller check's calls to the core end by its own ten-second bound, not by the request's
-  deadline, while its endpoint discovery and its walk of parents are not bounded and can take
+  caller check's reads and writes on the core share its own ten-second deadline, not the
+  request's, while its endpoint discovery and its walk of parents are not bounded and can take
   longer, as in 0.4.49; the version probe reads the deadline before it starts; and nothing
   after it reads the deadline before the Session exists, as in 0.4.49 (bounding every step by
-  the deadline is a separate, later change). Two differences remain, both from the owner's
+  the deadline is a separate, later change). The check's deadline ends its waits, not its
+  calls: a reply whose last byte arrives just before it is still decoded afterwards, and on
+  Windows a pipe operation cancelled there is waited for before its buffer is released, so a
+  call can return after the ten seconds. Two differences remain, both from the owner's
   decision on the automatic choice: a Codex off Windows whose check failed goes on to the
   workspace, the admission and its probe, and its version then refuses it with the check's
   error or gives it the fallback, where 0.4.49 refused at the check; and an automatic reopen
