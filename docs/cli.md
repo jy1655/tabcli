@@ -189,11 +189,13 @@ read fails, for example because its token cannot read the directory's access lis
 decides. TAB detects a directory the host would refuse at once and fails the start as a Surface
 that cannot be opened does; the start returns when TAB has the session's lifecycle lock, which
 another command can hold for up to the launch timeout. The error names the directory and the
-host's reason. When TAB settles the start, the session records `terminal launch failed: the
+host's reason. When TAB settles the start, it first records `terminal launch failed: the
 <host> launch host would refuse the session directory; no surface handle was recorded and no
-prompt was sent`, and the launch log gets the same line when it can be written. The
+prompt was sent` as the session's failed status, then releases the claim, then appends the
+same line to the launch log when it can; a step that fails ends the settlement there, keeps
+what was already written, and adds its error to the returned one. The
 directory is judged once, as TAB saw it: correcting it while the start waits does not change
-the outcome, so correct it and run the command again. When TAB cannot settle it, because
+the outcome, so correct it and run the command again. When TAB does not settle it, because
 another command holds the lock for the whole launch timeout or the session's records do not
 show this start's own pending launch or cannot be read, TAB writes nothing and adds no refusal
 line: the session's status, its claim and its launch log stay as they were (for example
@@ -208,9 +210,12 @@ core reports it finished, when TAB can read that the launch is still its own and
 that no provider was started (the session records `terminal surface finished before provider
 launch was confirmed`; the error adds the terminal, its exit code when the core gives one, and
 the launch log's path), as a tmux start does when its surface disappears. Otherwise TAB keeps
-waiting as for any surface: a later confirmation still succeeds, a provider or launch-host
-failure ends the start with its own reason, a surface that disappears ends it at the next
-check, and without any of these the start ends at the launch deadline.
+waiting as for any surface: a later confirmation still succeeds, and a provider or launch-host
+failure ends the start with its own reason. A surface that disappears ends the wait at the
+next check: the start fails with that reason unless TAB, reading again under the lifecycle
+lock, finds a confirmation (the start succeeds) or a recorded failure (which keeps its own
+reason), or another command holds the lock (the error says so and the claim is retained).
+Without any of these the start ends at the launch deadline.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort

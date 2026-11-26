@@ -15,7 +15,10 @@
   to the macOS capture host. A session directory the caller refused before any Surface adds
   no row: no host ran, and a macOS capture kind keeps only its initial `awaiting_host` stage.
   The returned error holds the host's reason with the directory; the status and the launch log
-  hold a fixed reason only when the settlement wrote them, and the log line is best effort. A
+  hold a fixed reason only when the settlement wrote them. It writes the failed status first,
+  then releases the Claim, then appends the log line on a best-effort basis, and a step that
+  fails ends it there: a Claim that cannot be removed leaves the fixed reason in the status, the
+  Claim in place and no line in the log, and its error is added to the returned one. A
   refusal that settles nothing (a launch that is not this launch's own or cannot be read, or a
   lifecycle lock held until the launch deadline) adds no refusal line and leaves the status and
   the launch log as they were: for example `Launching` with TAB's earlier `launch_pending` line,

@@ -74,12 +74,18 @@
   at once; returning it can wait for the lifecycle lock up to the launch budget. It is judged
   once, from what was observed: a directory corrected while TAB waits for the lock is not
   examined again, and the remedy is to correct the directory and run the command again. The
-  caller's error names the directory and the host's reason. Only when the settlement succeeds
-  does the Session record a fixed reason that names no path (`terminal launch failed: the Herdr
-  launch host would refuse the session directory; no surface handle was recorded and no prompt
-  was sent`), and the launch log gets the same line on a best-effort basis. When the facts are
-  not established (another holder keeps the lock until the deadline, a launch that is not this
-  launch's own or cannot be read), the refusal writes nothing and adds no refusal line: the
+  caller's error names the directory and the host's reason. On established facts the settlement
+  writes in this order (`fail_locked`): the failed status with a fixed reason that names no path
+  (`terminal launch failed: the Herdr launch host would refuse the session directory; no surface
+  handle was recorded and no prompt was sent`), then the release of the Claim, then the same
+  line appended to the launch log on a best-effort basis. A step that fails ends the settlement
+  there, keeps what was already written, and adds its error to the returned refusal (`terminal
+  launch failure handoff: ...`): a Claim that cannot be removed leaves the status `Failed` with
+  the fixed reason, the Claim at its path and no refusal line in the log. The refusal writes
+  nothing only when the facts are not established; a settlement that has started is not undone.
+  When the facts are not established (another holder keeps the lock until the deadline, a
+  launch that is not this launch's own or cannot be read), the refusal writes nothing and adds
+  no refusal line: the
   status and the launch log stay as they were (a `Launching` status, for example, and the
   `launch_pending` line TAB wrote when the launch began), and only the returned error holds the
   refusal. The refusal does not decide the status afterwards: `reopen` can copy that error into
@@ -103,17 +109,23 @@
   publish, and a Record that cannot be read is no evidence (`host_record_pending`). Then the
   launch fails through the deadline's settlement (`settle_locked`). A deferred decision resumes
   ordinary polling while the launch budget lasts, also when the receipt's deadline deferred it
-  (that deadline is not the launch deadline): a later confirmation still succeeds, a provider or
-  host failure still ends the wait with its own reason, a terminal the core then reports absent
-  ends it at that probe with the disappeared-surface failure, and a lock held at every probe
-  leaves the launch to its deadline. The Session records the fixed reason
+  (that deadline is not the launch deadline): a later confirmation still succeeds, and a provider
+  or host failure still ends the wait with its own reason. A terminal the core then reports
+  absent ends the wait at that probe through the ordinary settlement (`settle`), which keeps its
+  precedence: a confirmation read again under the lock returns success, a recorded failure or
+  an ended launch keeps its own reason, a lifecycle lock that is still held returns at that
+  probe with the Claim retained, and only otherwise does the launch fail with the
+  disappeared-surface reason. Finished-terminal probes that keep deferring, for example because
+  another holder keeps the lock at every probe, leave the launch to the ordinary poll and then
+  to its deadline. The Session records the fixed reason
   `terminal surface finished before provider launch was confirmed`; the error returned to the
   caller adds the core's report and the launch log's path, `(Herdr terminal t7 exited with code
   N); see the launch log <path>`; nothing is read from the log. The exit code is the core's
   `exit_code` when it gives one (the field name is read from the installed hc 0.1.22's string
-  table, not from a live core, and nothing is decided on it). The launch ends failed, its Claim
-  released, its receipt pending and its surface handle kept, so `close-session` removes the
-  finished terminal (`terminal.rm`). Creation removes a created terminal that its last live read
+  table, not from a live core, and nothing is decided on it). The settlement writes in the
+  refusal's order (above), and its own error is returned if a step fails. When it completes, the
+  launch ends failed, its Claim released, its receipt pending and its surface handle kept, so
+  `close-session` removes the finished terminal (`terminal.rm`). Creation removes a created terminal that its last live read
   finds finished; one that finishes after that read is bound, and this probe ends the launch.
 - Early launch decisions: the directory refusal before any Surface (every bound host) and the
   finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
