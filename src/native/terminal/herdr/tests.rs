@@ -211,7 +211,13 @@ impl FakeConnection {
 }
 
 impl Connection for FakeConnection {
-    fn call(&mut self, method: &str, params: Value, _: Instant) -> Result<Value, CallError> {
+    fn call(
+        &mut self,
+        _: Permit,
+        method: &str,
+        params: Value,
+        _: Instant,
+    ) -> Result<Value, CallError> {
         self.0
             .borrow_mut()
             .calls
@@ -1397,7 +1403,12 @@ fn the_socket_connection_bounds_every_reply() {
     let mut connection = super::unix::open(&socket, later()).unwrap();
     assert_eq!(
         connection
-            .call("hello", json!({"generation": 1}), later())
+            .call(
+                Permit::for_test(),
+                "hello",
+                json!({"generation": 1}),
+                later()
+            )
             .unwrap(),
         json!({"ok": true})
     );
@@ -1405,6 +1416,7 @@ fn the_socket_connection_bounds_every_reply() {
     let started = Instant::now();
     let error = connection
         .call(
+            Permit::for_test(),
             "terminal.send",
             json!({}),
             Instant::now() + Duration::from_millis(200),
@@ -1414,7 +1426,7 @@ fn the_socket_connection_bounds_every_reply() {
     assert!(started.elapsed() < Duration::from_millis(550));
     let mut connection = super::unix::open(&socket, later()).unwrap();
     let error = connection
-        .call("terminal.get", json!({}), later())
+        .call(Permit::for_test(), "terminal.get", json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();
@@ -1740,7 +1752,12 @@ fn the_shared_framing_reports_unsent_only_before_any_byte_was_written() {
     use std::io::ErrorKind::{BrokenPipe, Interrupted, TimedOut, WouldBlock};
     let call = |stream: ScriptedStream| {
         let mut framed = Framed::new(stream);
-        let result = framed.call("terminal.send", json!({"text": "x"}), later());
+        let result = framed.call(
+            Permit::for_test(),
+            "terminal.send",
+            json!({"text": "x"}),
+            later(),
+        );
         (result, framed.stream.written)
     };
     let reply =
@@ -1902,7 +1919,12 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     assert_eq!(
         connection
-            .call("hello", json!({"generation": 1}), later())
+            .call(
+                Permit::for_test(),
+                "hello",
+                json!({"generation": 1}),
+                later()
+            )
             .unwrap(),
         json!({"ok": true})
     );
@@ -1911,6 +1933,7 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     let started = Instant::now();
     let error = connection
         .call(
+            Permit::for_test(),
             "terminal.send",
             json!({}),
             Instant::now() + Duration::from_millis(200),
@@ -1921,7 +1944,7 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     drop(connection);
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     let error = connection
-        .call("terminal.get", json!({}), later())
+        .call(Permit::for_test(), "terminal.get", json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();

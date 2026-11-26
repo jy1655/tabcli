@@ -121,21 +121,33 @@ impl<'a> Recorded<'a> {
         self.check(core, observed)
     }
 
-    /// The handle's own creation record is whole: its launch label is one TAB generates, and
-    /// on Windows, where every writer (0.4.47 on) saved it, it is present. The macOS and Linux
-    /// handles of 0.4.45 and 0.4.46 omitted it; their label is compared with the name.
+    /// The handle's own creation record is whole: a host PID; this platform's host birth with
+    /// values the platform can report; and a launch label in the form every writer produced
+    /// (16 random bytes as 32 lowercase hexadecimal digits), which on Windows, where every
+    /// writer (0.4.47 on) saved it, must be present. The macOS and Linux handles of 0.4.45 and
+    /// 0.4.46 omitted it; their label is compared with the name.
     fn check_creation_record_whole(&self) -> Result<()> {
         let address = &self.session.id;
+        let damaged = |what: &str| {
+            anyhow::anyhow!(
+                "Herdr handle for terminal {address} records {what}; the handle is retained"
+            )
+        };
+        if self.surface.host_pid == 0 {
+            return Err(damaged("no host PID"));
+        }
+        if !host_birth_is_possible(&self.surface.birth) {
+            return Err(damaged("a host birth this platform cannot report"));
+        }
         match self.session.herdr_launch_nonce() {
-            Some(nonce) => launch_name(nonce)
-                .map(|_| ())
-                .with_context(|| format!("Herdr handle for terminal {address} records a damaged launch label; the handle is retained")),
+            Some(nonce) if written_launch_label(nonce) => Ok(()),
+            Some(_) => Err(damaged("a damaged launch label")),
             #[cfg(unix)]
             None => Ok(()),
             #[cfg(windows)]
-            None => bail!(
-                "Herdr handle for terminal {address} records no launch label, which every Windows Herdr handle TAB wrote has; the handle is retained"
-            ),
+            None => Err(damaged(
+                "no launch label, which every Windows Herdr handle TAB wrote has",
+            )),
         }
     }
 
@@ -340,14 +352,45 @@ impl<'a> Launch<'a> {
     ) -> TerminalSession {
         TerminalSession::new(TerminalKind::Herdr, observed.address.clone()).with_herdr_core(
             HerdrSurface {
-                socket: linked.socket.to_string_lossy().into_owned(),
-                core_id: linked.core_id.clone(),
+                socket: linked.socket().to_string_lossy().into_owned(),
+                core_id: linked.core_id().to_owned(),
                 created_ms: observed.created_ms,
                 host_pid: pid,
                 birth,
             },
             self.nonce,
         )
+    }
+}
+
+/// The form both launch-token writers produce (`unix.rs` and `pipe.rs`, since 0.4.46): 16 random
+/// bytes as 32 lowercase hexadecimal digits.
+fn written_launch_label(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A host birth of this platform's kind with values it can report: macOS seconds above zero and
+/// microseconds below a second; a Linux boot identity that is not all zero and a positive start
+/// tick count; a Windows creation time above zero.
+fn host_birth_is_possible(birth: &HerdrHostBirth) -> bool {
+    match *birth {
+        HerdrHostBirth::Macos {
+            host_start_seconds,
+            host_start_microseconds,
+        } => {
+            cfg!(target_os = "macos")
+                && host_start_seconds > 0
+                && host_start_microseconds < 1_000_000
+        }
+        HerdrHostBirth::Linux { linux_birth } => {
+            cfg!(target_os = "linux")
+                && !linux_birth.boot_id.is_nil()
+                && linux_birth.starttime_ticks > 0
+        }
+        HerdrHostBirth::Windows { host_creation_time } => cfg!(windows) && host_creation_time > 0,
     }
 }
 

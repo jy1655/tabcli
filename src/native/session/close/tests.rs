@@ -340,9 +340,8 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
         crate::native::session::close::budget::close_deadline(),
         |_| {
             Ok(terminal::CloseResult {
-                outcome: terminal::CloseOutcome::Missing,
                 reason: Some("the tab was already gone".to_owned()),
-                keeps_diagnosis: false,
+                ..terminal::CloseOutcome::Missing.into()
             })
         },
     )

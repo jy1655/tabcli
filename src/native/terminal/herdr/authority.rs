@@ -51,11 +51,39 @@ pub(super) fn admit(evidence: CreationEvidence) -> Result<Admitted> {
     Ok(Admitted(evidence))
 }
 
-/// The authority to send one `terminal.kill`.
-pub(super) struct Kill(());
+/// The authority to send one `terminal.kill` to the terminal `grant` observed, on its core.
+/// Only `grant` constructs it, and only `Linked::kill` consumes it.
+pub(super) struct Kill {
+    core_id: String,
+    address: String,
+}
 
-/// The authority to send one `terminal.rm`.
-pub(super) struct Remove(());
+/// The authority to send one `terminal.rm` to the terminal `grant` observed, on its core.
+/// Only `grant` constructs it, and only `Linked::remove` consumes it.
+pub(super) struct Remove {
+    core_id: String,
+    address: String,
+}
+
+impl Kill {
+    pub(super) fn core_id(&self) -> &str {
+        &self.core_id
+    }
+
+    pub(super) fn address(&self) -> &str {
+        &self.address
+    }
+}
+
+impl Remove {
+    pub(super) fn core_id(&self) -> &str {
+        &self.core_id
+    }
+
+    pub(super) fn address(&self) -> &str {
+        &self.address
+    }
+}
 
 pub(super) enum Grant {
     Kill(Kill),
@@ -64,10 +92,12 @@ pub(super) enum Grant {
     Wait,
 }
 
-/// The only function that grants `terminal.kill` or `terminal.rm`.
+/// The only function that grants `terminal.kill` or `terminal.rm`, for the terminal observed on
+/// the connection to core `core_id`.
 pub(super) fn grant(
     core: &dyn Core,
     basis: &Basis<'_>,
+    core_id: &str,
     observed: &Observed,
     killed: bool,
 ) -> Result<Grant> {
@@ -77,7 +107,10 @@ pub(super) fn grant(
         Basis::Created { recorded, .. } => recorded.check_creation_record(core, observed)?,
     }
     match observed.state {
-        State::Finished => Ok(Grant::Remove(Remove(()))),
+        State::Finished => Ok(Grant::Remove(Remove {
+            core_id: core_id.to_owned(),
+            address: observed.address.clone(),
+        })),
         State::Live if killed => Ok(Grant::Wait),
         State::Live => {
             if let Basis::Created { recorded, evidence } = basis {
@@ -89,7 +122,10 @@ pub(super) fn grant(
                 }
                 recorded.program_observed(core, observed)?;
             }
-            Ok(Grant::Kill(Kill(())))
+            Ok(Grant::Kill(Kill {
+                core_id: core_id.to_owned(),
+                address: observed.address.clone(),
+            }))
         }
     }
 }

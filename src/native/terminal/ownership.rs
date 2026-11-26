@@ -882,9 +882,8 @@ pub(in crate::native::terminal) fn teardown_absent_owner_with(
     )?;
     close_remaining(deadline)?;
     Ok(terminal::CloseResult {
-        outcome: CloseOutcome::Missing,
         reason: Some(OWNER_TEARDOWN_REASON.to_owned()),
-        keeps_diagnosis: false,
+        ..CloseOutcome::Missing.into()
     })
 }
 

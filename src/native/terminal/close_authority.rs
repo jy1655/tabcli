@@ -60,65 +60,19 @@ pub(in crate::native) enum TerminalCloseAuthority {
     Absent,
 }
 
-/// The decision's evidence for a close on a terminal's creation record. Its fields are private
-/// to this module and its children, so only `owner_exit::core_kept` can establish it, from why
-/// the close runs and from what is positively known about this session's owner. Nothing that
-/// is not positively established grants anything.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) use owner_exit::CreationEvidence;
+
+/// What `CloseObservation::read_owner` found at the Owner record: one typed read, under the
+/// record's read policy. A record that cannot be read is the read's error.
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", windows)),
     allow(dead_code)
 )]
-pub(in crate::native) struct CreationEvidence {
-    cause: CloseCause,
-    owner: OwnerFinding,
-}
-
-/// What is positively known about this session's owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", windows)),
-    allow(dead_code)
-)]
-enum OwnerFinding {
-    /// A record bound to this session names an incarnation that the platform can produce, and
-    /// the OS observed it exited, or its PID held by a process created after it.
-    IncarnationGone,
-    /// The session's own wrapper recorded its end: state `exited`, which only the wrapper
-    /// writes, after its provider has exited.
-    EndRecorded,
-    /// Nothing positive: no owner record, a damaged or impossible one, another session's or an
-    /// unbound one, a PID-only one, or a reuse that the live process contradicts.
-    NotEstablished,
-}
-
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", windows)),
-    allow(dead_code)
-)]
-impl CreationEvidence {
-    /// Whether `close-session --explicit` asked for this close.
-    pub(in crate::native::terminal) fn explicit(self) -> bool {
-        self.cause == CloseCause::Explicit
-    }
-
-    /// Whether this session's owner is positively gone.
-    pub(in crate::native::terminal) fn owner_gone(self) -> bool {
-        self.owner != OwnerFinding::NotEstablished
-    }
-
-    /// Evidence as a test states it, for tests of what the adapter grants from it.
-    #[cfg(test)]
-    pub(in crate::native) fn scripted(cause: CloseCause, owner_gone: bool) -> Self {
-        Self {
-            cause,
-            owner: if owner_gone {
-                OwnerFinding::IncarnationGone
-            } else {
-                OwnerFinding::NotEstablished
-            },
-        }
-    }
+pub(in crate::native) enum OwnerRead {
+    Absent,
+    /// The bytes are not an Owner record.
+    Malformed,
+    Recorded(Box<NativeSessionOwner>),
 }
 
 /// Why a close runs. Only `close-session --explicit` (and the sessions it lists with
@@ -154,6 +108,10 @@ pub(in crate::native) trait CloseObservation {
     fn teardown_intent(&self) -> Result<Option<session::close::TerminalTeardownIntent>>;
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner_present(&self) -> Result<bool>;
+    /// The Owner record in one typed read: absent, malformed or recorded; unreadable is the
+    /// error.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn read_owner(&self) -> Result<OwnerRead>;
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn launch(&self) -> Result<Option<launch::Record>>;
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -289,6 +247,18 @@ impl CloseObservation for Production<'_> {
                 OwnerRecord::Absent => false,
                 OwnerRecord::Unreadable(error) => return Err(error),
                 OwnerRecord::Malformed { .. } | OwnerRecord::Recorded(_) => true,
+            },
+        )
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn read_owner(&self) -> Result<OwnerRead> {
+        Ok(
+            match crate::native::session::owner::observe(&self.reader()) {
+                OwnerRecord::Absent => OwnerRead::Absent,
+                OwnerRecord::Unreadable(error) => return Err(error),
+                OwnerRecord::Malformed { .. } => OwnerRead::Malformed,
+                OwnerRecord::Recorded(recorded) => OwnerRead::Recorded(Box::new(recorded.owner)),
             },
         )
     }
@@ -669,7 +639,9 @@ pub(in crate::native) fn close_windows_owned_surface_with(
             windows_dispatch::close_created_surface(
                 adapters, directory, session, evidence, deadline,
             )
-            .map(terminal::CloseResult::keeping_diagnosis)
+            .map(|outcome| {
+                terminal::CloseResult::keeping_diagnosis(outcome, evidence.generated_reason())
+            })
         }
         // The decision never leaves a terminal its core keeps to the surface alone.
         TerminalCloseAuthority::SurfaceOnly if owner_exit::core_retains_finished(session.kind) => {
@@ -741,9 +713,8 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
     match authority {
         TerminalCloseAuthority::OwnerTeardown => teardown(),
         TerminalCloseAuthority::TeardownComplete(reason) => Ok(terminal::CloseResult {
-            outcome: CloseOutcome::Missing,
             reason: Some(reason),
-            keeps_diagnosis: false,
+            ..CloseOutcome::Missing.into()
         }),
         TerminalCloseAuthority::Absent => Ok(CloseOutcome::Missing.into()),
         TerminalCloseAuthority::LiveOwner => {
@@ -753,8 +724,9 @@ pub(in crate::native::terminal) fn close_owned_surface_with(
             close_surface(OwnedSurfaceClose::SurfaceOnly).map(Into::into)
         }
         TerminalCloseAuthority::CreatedSurface(evidence) => {
-            close_surface(OwnedSurfaceClose::CreatedSurface(evidence))
-                .map(terminal::CloseResult::keeping_diagnosis)
+            close_surface(OwnedSurfaceClose::CreatedSurface(evidence)).map(|outcome| {
+                terminal::CloseResult::keeping_diagnosis(outcome, evidence.generated_reason())
+            })
         }
     }
 }
@@ -1217,6 +1189,40 @@ mod projected_authority_tests {
                 None,
                 CloseCause::Explicit,
                 Answer::Refused,
+            ),
+            // Review round 3, finding 4: only this session's process refuses when it cannot be
+            // inspected; another session's or an unbound record's process is not inspected.
+            (
+                "another session's owner, uninspectable",
+                Record::Foreign,
+                unknown,
+                false,
+                SessionState::Ready,
+                None,
+                CloseCause::Explicit,
+                created(false),
+            ),
+            (
+                "unbound owner, uninspectable",
+                Record::Unbound,
+                unknown,
+                false,
+                SessionState::Ready,
+                None,
+                CloseCause::Explicit,
+                created(false),
+            ),
+            // A verified live owner of this session still permits the cleanup after a refused
+            // reopen, through the close with a live owner; only the creation record refuses it.
+            (
+                "cleanup, bound, live",
+                Record::Bound,
+                live,
+                false,
+                SessionState::Ready,
+                None,
+                CloseCause::Cleanup,
+                Answer::LiveOwner,
             ),
             (
                 "cleanup, bound, exited",

@@ -512,10 +512,12 @@ where
         }
     };
     if result.reason.is_some() || result.keeps_diagnosis {
-        close_error = merge_close_reason(
-            merge_close_reason(close_error, status.error.clone()),
-            result.reason,
-        );
+        let diagnosis = if result.keeps_diagnosis {
+            status.error.clone().or(result.generated_reason)
+        } else {
+            status.error.clone()
+        };
+        close_error = merge_close_reason(merge_close_reason(close_error, diagnosis), result.reason);
     }
 
     let consume_result =
@@ -540,22 +542,16 @@ fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<
         })
 }
 
+// Every OS records the close's reason in the consumption marker, so that a close interrupted
+// after it and before the closed record keeps that reason (os-parity).
 fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read
-        // is strict, and an undecodable tombstone never keeps a close from finishing.
-        Ok(store
-            .record(CoreRecord::TerminalClosed)
-            .bytes()?
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| super::record::terminal_consumption_reason(&text)))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = store;
-        Ok(None)
-    }
+    // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read is
+    // strict, and an undecodable tombstone never keeps a close from finishing.
+    Ok(store
+        .record(CoreRecord::TerminalClosed)
+        .bytes()?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| super::record::terminal_consumption_reason(&text)))
 }
 
 fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<String> {
@@ -574,13 +570,11 @@ fn consume_terminal_handle(
         "consumed": true,
         "terminal": terminal_kind,
     });
-    if cfg!(any(target_os = "macos", target_os = "linux"))
-        && let Some(reason) = reason
-    {
+    if let Some(reason) = reason {
         marker["reason"] = reason.into();
     }
     let tombstone_result = store.write_terminal_closed(&marker);
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(test)]
     if tombstone_result.is_ok() {
         interruption::at(interruption::Point::ConsumptionMarkerWritten);
     }
@@ -589,7 +583,7 @@ fn consume_terminal_handle(
     budget::check()?;
     let active_result = RecordStore::at(store.record(CoreRecord::Terminal).path()).remove();
     let closing_result = RecordStore::at(store.record(CoreRecord::TerminalClosing).path()).remove();
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(test)]
     if active_result.is_ok() && closing_result.is_ok() {
         interruption::at(interruption::Point::HandleRemoved);
     }
@@ -947,8 +941,10 @@ mod tests;
 
 // A panic models interruption, not an operation error: no caller's restore/settle
 // handler runs. File locks unwind; only the selected thread's one checkpoint fires.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Additional macOS interruption scenarios stay application-local.
+// Every OS interrupts at the consumption marker and the handle removal; the other points and
+// the expiry checkpoint serve macOS scenarios.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(in crate::native) mod interruption {
     use std::{
         cell::{Cell, RefCell},

@@ -708,10 +708,7 @@ fn an_explicit_close_leaves_anything_but_its_created_terminal_alone() {
             label: "owner not inspectable",
             change: |_| {},
             observe: unknown,
-            #[cfg(unix)]
             refusal: "owner inspection failed",
-            #[cfg(windows)]
-            refusal: "the owner is not proven live (scripted)",
             recover: |_| {},
             again: exited,
             closed: CloseOutcome::Closed,
@@ -1018,8 +1015,22 @@ fn an_explicit_close_keeps_the_sessions_diagnosis() {
         Some("provider exited with status 7")
     );
 
-    // Without a stored diagnosis the closed record adds none, as before os-parity.
+    // Without a stored diagnosis, a positively established death records its generated reason,
+    // as 0.4.49's Repair did (review round 3, finding 8).
     let fixture = Fixture::new("working", &complete_owner());
+    fixture.close(exited, false).unwrap();
+    let closed = fixture.store().closed_if_present().unwrap().unwrap();
+    assert_eq!(
+        closed.error.as_deref(),
+        Some("native session process 4242 is no longer running")
+    );
+
+    // A close that only removes a finished terminal, with nothing establishing this session's
+    // end, adds no reason of its own.
+    let mut foreign = complete_owner();
+    foreign.managed_session_id = Some("session-foreign".into());
+    let fixture = Fixture::new("working", &foreign);
+    fixture.finish();
     fixture.close(exited, false).unwrap();
     let closed = fixture.store().closed_if_present().unwrap().unwrap();
     assert_eq!(closed.error, None);
@@ -1429,19 +1440,119 @@ fn an_impossible_recorded_birth_is_no_evidence_that_the_owner_is_gone() {
 type Damage = fn(&mut serde_json::Map<String, Value>);
 
 // Review round 2, finding 6: absence is accepted only from a handle whose creation record is
-// whole. A launch label that is not one TAB generates, and on Windows a missing one, refuse the
-// close before the core's `not_found` can settle the handle.
+// whole: a host PID, this platform's host birth with possible values, and a launch label in the
+// form both writers produce (32 lowercase hexadecimal digits), or, on macOS and Linux only, none
+// at all (the handles of 0.4.45 and 0.4.46). Anything else refuses the close before the core's
+// `not_found` can settle the handle, and the refusal names the field (review round 3, finding 6).
 #[test]
 fn an_absent_terminal_settles_only_a_whole_creation_record() {
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut damage: Vec<(&str, Damage)> = vec![("a launch label TAB never generates", |handle| {
-        handle.insert("herdr_launch_nonce".into(), json!("not-a-launch-label"));
-    })];
+    const LABEL: &str = "records a damaged launch label";
+    const BIRTH: &str = "records a host birth this platform cannot report";
+    let mut damage: Vec<(&str, Damage, &str)> = vec![
+        (
+            "a launch label TAB never generates",
+            |handle| {
+                handle.insert("herdr_launch_nonce".into(), json!("not-a-launch-label"));
+            },
+            LABEL,
+        ),
+        (
+            "a launch label of 24 digits",
+            |handle| {
+                handle.insert(
+                    "herdr_launch_nonce".into(),
+                    json!("0123456789abcdef01234567"),
+                );
+            },
+            LABEL,
+        ),
+        (
+            "an upper-case launch label",
+            |handle| {
+                handle.insert(
+                    "herdr_launch_nonce".into(),
+                    json!("0123456789ABCDEF0123456789ABCDEF"),
+                );
+            },
+            LABEL,
+        ),
+        (
+            "host PID zero",
+            |handle| {
+                handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(0);
+            },
+            "records no host PID",
+        ),
+    ];
+    // This platform's host birth with values it cannot report.
+    #[cfg(target_os = "macos")]
+    damage.push((
+        "microseconds of a whole second",
+        |handle| {
+            handle.get_mut("herdr_core").unwrap()["host_start_microseconds"] = json!(1_000_000);
+        },
+        BIRTH,
+    ));
+    #[cfg(target_os = "linux")]
+    damage.push((
+        "no start ticks",
+        |handle| {
+            handle.get_mut("herdr_core").unwrap()["linux_birth"]["starttime_ticks"] = json!(0);
+        },
+        BIRTH,
+    ));
     #[cfg(windows)]
-    damage.push(("no launch label on Windows", |handle| {
-        handle.remove("herdr_launch_nonce");
-    }));
-    for (label, damage) in damage {
+    damage.push((
+        "no creation time",
+        |handle| {
+            handle.get_mut("herdr_core").unwrap()["host_creation_time"] = json!(0);
+        },
+        BIRTH,
+    ));
+    // Another platform's host birth in place of this one's.
+    #[cfg(unix)]
+    damage.push((
+        "another platform's host birth",
+        |handle| {
+            let core = handle
+                .get_mut("herdr_core")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            core.retain(|key, _| {
+                !matches!(
+                    key.as_str(),
+                    "host_start_seconds" | "host_start_microseconds" | "linux_birth"
+                )
+            });
+            core.insert("host_creation_time".into(), json!(1));
+        },
+        BIRTH,
+    ));
+    #[cfg(windows)]
+    damage.push((
+        "another platform's host birth",
+        |handle| {
+            let core = handle
+                .get_mut("herdr_core")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            core.remove("host_creation_time");
+            core.insert("host_start_seconds".into(), json!(1_800_000_000));
+            core.insert("host_start_microseconds".into(), json!(1));
+        },
+        BIRTH,
+    ));
+    #[cfg(windows)]
+    damage.push((
+        "no launch label on Windows",
+        |handle| {
+            handle.remove("herdr_launch_nonce");
+        },
+        "records no launch label",
+    ));
+    for (label, damage, refusal) in damage {
         let fixture = Fixture::new("ready", &complete_owner());
         let store = fixture.store();
         let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
@@ -1451,8 +1562,28 @@ fn an_absent_terminal_settles_only_a_whole_creation_record() {
             .write_json(&value)
             .unwrap();
         fixture.remove();
-        assert!(fixture.close(exited, false).is_err(), "{label}");
+        let text = error_text(&fixture.close(exited, false).unwrap_err());
+        assert!(text.contains(refusal), "{label}: {text}");
         fixture.assert_retained(label, SessionState::Ready);
+    }
+
+    // The documented legacy exception: a macOS or Linux handle without a launch label settles.
+    #[cfg(unix)]
+    {
+        let fixture = Fixture::new("ready", &complete_owner());
+        let store = fixture.store();
+        let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("herdr_launch_nonce");
+        store
+            .record(CoreRecord::Terminal)
+            .write_json(&value)
+            .unwrap();
+        fixture.remove();
+        assert_eq!(
+            fixture.close(exited, false).map_err(|e| error_text(&e)),
+            Ok(CloseOutcome::Missing)
+        );
+        fixture.assert_closed("a legacy handle without a launch label");
     }
 }
 
@@ -1650,11 +1781,21 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
                 },
                 None => Basis::Owned(&recorded),
             };
-            Ok(match authority::grant(core, &basis, &observed, killed)? {
-                Grant::Kill(_) => "kill",
-                Grant::Remove(_) => "remove",
-                Grant::Wait => "wait",
-            })
+            let core_id = linked.core_id().to_owned();
+            Ok(
+                match authority::grant(core, &basis, &core_id, &observed, killed)? {
+                    // A grant names the terminal it observed, on the core that answered.
+                    Grant::Kill(kill) => {
+                        assert_eq!((kill.core_id(), kill.address()), ("core-a", "t7"));
+                        "kill"
+                    }
+                    Grant::Remove(remove) => {
+                        assert_eq!((remove.core_id(), remove.address()), ("core-a", "t7"));
+                        "remove"
+                    }
+                    Grant::Wait => "wait",
+                },
+            )
         })();
         match answer {
             Ok(answer) => assert_eq!(answer, expected, "{label}"),
@@ -1666,4 +1807,105 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
         // Granting sends nothing by itself.
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
     }
+}
+
+// Review round 3, finding 4: a record of another session, or an unbound one, identifies no
+// process of this session, so its process is not inspected at all. That process staying
+// uninspectable never blocks the close: the running terminal is kept, and once it has been
+// ended on its recorded core the same command removes it; an absent one is settled. Only a
+// record bound to this session refuses when its process cannot be inspected.
+#[test]
+fn an_uninspectable_process_of_another_session_never_strands_the_session() {
+    let mut foreign = complete_owner();
+    foreign.managed_session_id = Some("session-foreign".into());
+    let mut unbound = complete_owner();
+    unbound.managed_session_id = None;
+    for (label, owner) in [
+        ("another session's record", foreign),
+        ("an unbound record", unbound),
+    ] {
+        let fixture = Fixture::new("working", &owner);
+        let text = error_text(&fixture.close(unknown, false).unwrap_err());
+        assert!(text.contains(OWNER_NOT_PROVEN), "{label}: {text}");
+        assert_eq!(fixture.mutations(), (0, 0), "{label}");
+        fixture.assert_retained(label, SessionState::Working);
+        fixture.finish();
+        fixture.core.clear_calls();
+        assert_eq!(
+            fixture.close(unknown, false).map_err(|e| error_text(&e)),
+            Ok(CloseOutcome::Closed),
+            "{label}"
+        );
+        assert_eq!(fixture.mutations(), (0, 1), "{label}");
+        fixture.assert_closed(label);
+
+        let fixture = Fixture::new("working", &owner);
+        fixture.remove();
+        assert_eq!(
+            fixture.close(unknown, false).map_err(|e| error_text(&e)),
+            Ok(CloseOutcome::Missing),
+            "{label}, absent"
+        );
+        fixture.assert_closed(label);
+    }
+}
+
+// Review round 3, finding 8: the stored diagnosis survives a close interrupted after its handle
+// consumption marker and before its closed record. The retry finishes from the marker without
+// the adapter, and the marker carries the reason on every OS.
+#[test]
+fn an_interrupted_close_keeps_the_diagnosis_across_its_consumption_marker() {
+    use crate::native::session::close::interruption::{self, Point};
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.failed_start();
+    fixture.finish();
+    let interrupted = interruption::during(Point::ConsumptionMarkerWritten, || {
+        fixture.close(exited, false)
+    });
+    assert!(interrupted.is_err(), "the close must stop at the marker");
+    let store = fixture.store();
+    assert!(store.record(CoreRecord::TerminalClosed).present().unwrap());
+    assert!(store.closed_if_present().unwrap().is_none());
+    fixture.core.clear_calls();
+    fixture.close(exited, false).unwrap();
+    assert!(
+        fixture.core.methods().is_empty(),
+        "{:?}",
+        fixture.core.methods()
+    );
+    let closed = fixture.store().closed_if_present().unwrap().unwrap();
+    assert_eq!(closed.error.as_deref(), Some("provider launch timed out"));
+}
+
+// Review round 3, finding 7: the verified connection sends `terminal.kill` and `terminal.rm`
+// only for a grant over a terminal observed on its own core; a plain call naming either is not
+// sent, nor is a grant minted for another core.
+#[test]
+fn a_mutation_reaches_the_core_only_through_a_grant_for_its_terminal() {
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.finish();
+    let session = fixture.store().terminal().unwrap();
+    let core: &dyn Core = &fixture.core;
+    let (recorded, mut linked) = Recorded::open(
+        core,
+        &session,
+        Requirement::Bound(&fixture.directory),
+        later(),
+    )
+    .unwrap()
+    .expect("present");
+    for method in ["terminal.kill", "terminal.rm"] {
+        let sent = linked.call(method, json!({"terminal": "t7"}), later());
+        assert!(matches!(sent, Err(CallError::NotSent(_))), "{method}");
+    }
+    assert_eq!(fixture.mutations(), (0, 0));
+    let observed = get(&mut linked, "t7", later()).unwrap().expect("present");
+    let Grant::Remove(remove) =
+        authority::grant(core, &Basis::Owned(&recorded), "core-b", &observed, false).unwrap()
+    else {
+        panic!("a finished terminal is removed");
+    };
+    let sent = linked.remove(remove, later());
+    assert!(matches!(sent, Err(CallError::NotSent(_))));
+    assert_eq!(fixture.mutations(), (0, 0));
 }

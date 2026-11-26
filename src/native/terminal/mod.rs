@@ -283,6 +283,8 @@ pub(in crate::native) struct CloseResult {
     /// The closed record keeps the session's stored diagnosis, read under the lifecycle lock:
     /// a close on a terminal's creation record, which no live owner reported on.
     pub keeps_diagnosis: bool,
+    /// What the closed record says when the session stored no diagnosis.
+    pub generated_reason: Option<String>,
 }
 
 impl From<CloseOutcome> for CloseResult {
@@ -291,6 +293,7 @@ impl From<CloseOutcome> for CloseResult {
             outcome,
             reason: None,
             keeps_diagnosis: false,
+            generated_reason: None,
         }
     }
 }
@@ -300,11 +303,15 @@ impl CloseResult {
         not(any(target_os = "macos", target_os = "linux", windows)),
         allow(dead_code)
     )]
-    pub(in crate::native) fn keeping_diagnosis(outcome: CloseOutcome) -> Self {
+    pub(in crate::native) fn keeping_diagnosis(
+        outcome: CloseOutcome,
+        generated_reason: Option<String>,
+    ) -> Self {
         Self {
             outcome,
             reason: None,
             keeps_diagnosis: true,
+            generated_reason,
         }
     }
 }

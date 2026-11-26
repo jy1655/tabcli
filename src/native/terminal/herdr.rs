@@ -29,6 +29,7 @@ use crate::native::terminal::{
 use anyhow::{Context, Result, anyhow, bail};
 use authority::{Basis, Grant};
 use identity::{CLOSE_STOPPED, Launch, Recorded, Requirement, binding_names_host, target};
+use linked::{Linked, Permit, link};
 use serde_json::{Value, json};
 use std::{
     ffi::OsStr,
@@ -40,6 +41,7 @@ use std::{
 
 mod authority;
 mod identity;
+mod linked;
 #[cfg(windows)]
 mod pipe;
 #[cfg(unix)]
@@ -127,9 +129,16 @@ impl CallError {
     }
 }
 
-/// One connection to a core: one request, then its one reply line.
+/// One connection to a core: one request, then its one reply line. Only `linked` holds the
+/// `Permit` a call takes, so every request goes through the verified connection there.
 pub(in crate::native::terminal) trait Connection {
-    fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError>;
+    fn call(
+        &mut self,
+        permit: Permit,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, CallError>;
 }
 
 /// What the adapter reads from this process and the system.
@@ -296,7 +305,13 @@ impl<S: Stream> Framed<S> {
 }
 
 impl<S: Stream> Connection for Framed<S> {
-    fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError> {
+    fn call(
+        &mut self,
+        _: Permit,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, CallError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
@@ -366,41 +381,6 @@ pub(super) fn parse_reply(line: &[u8], id: u64) -> Result<Value, CallError> {
         .ok_or_else(|| CallError::Unanswered(anyhow!("Herdr reply has neither result nor error")))
 }
 
-/// A connection whose `hello` named this core: generation 1, the methods TAB uses, and,
-/// when one is expected, the recorded core id.
-struct Linked<'a> {
-    connection: Box<dyn Connection + 'a>,
-    socket: PathBuf,
-    core_id: String,
-}
-
-fn link<'a>(
-    core: &'a dyn Core,
-    socket: &Path,
-    expected_core: Option<&str>,
-    deadline: Instant,
-) -> Result<Linked<'a>> {
-    let mut connection = core.connect(socket, deadline)?;
-    let hello = connection
-        .call("hello", json!({"generation": GENERATION}), deadline)
-        .map_err(|error| error.into_error("hello"))?;
-    let core_id = validate_hello(&hello)?;
-    if let Some(expected) = expected_core
-        && expected != core_id
-    {
-        bail!(
-            "a different Herdr Core (id {core_id}) answers at {}; the recorded core {expected} is not reachable there, so the state of this terminal is unknown",
-            socket.display()
-        );
-    }
-    Ok(Linked {
-        connection,
-        socket: socket.to_path_buf(),
-        core_id,
-    })
-}
-
-/// The core id of a `hello` result that speaks generation 1 and offers TAB's methods.
 pub(super) fn validate_hello(hello: &Value) -> Result<String> {
     if hello.get("generation").and_then(Value::as_u64) != Some(GENERATION) {
         bail!("Herdr Core does not speak protocol generation {GENERATION}");
@@ -531,10 +511,7 @@ pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
 /// One terminal, by its address or by its local name; the answer must be the terminal asked
 /// for (that address, or a terminal that carries that name).
 fn get(linked: &mut Linked<'_>, terminal: &str, deadline: Instant) -> Result<Option<Observed>> {
-    match linked
-        .connection
-        .call("terminal.get", json!({"terminal": terminal}), deadline)
-    {
+    match linked.call("terminal.get", json!({"terminal": terminal}), deadline) {
         Ok(value) => {
             let observed = parse_terminal(&value)?;
             let answers = if valid_address(terminal) {
@@ -621,7 +598,8 @@ fn create(
                 // A failed read can leave a partial reply on this connection. No run has
                 // been sent. An explicit launch can still proceed without a parent if the
                 // same core answers on a fresh connection.
-                linked = link(core, &socket, Some(&linked.core_id), startup_deadline)
+                let core_id = linked.core_id().to_owned();
+                linked = link(core, &socket, Some(&core_id), startup_deadline)
                     .context("the Herdr terminal was not created")?;
                 None
             }
@@ -633,13 +611,10 @@ fn create(
     } else {
         params["no_parent"] = json!(true);
     }
-    let core_id = linked.core_id.clone();
+    let core_id = linked.core_id().to_owned();
     let reconcile =
         |cause: anyhow::Error| reconcile(core, &socket, &core_id, &launch, cleanup_deadline, cause);
-    let address = match linked
-        .connection
-        .call("terminal.run", params, startup_deadline)
-    {
+    let address = match linked.call("terminal.run", params, startup_deadline) {
         Ok(result) => result
             .get("address")
             .and_then(Value::as_str)
@@ -799,31 +774,22 @@ fn end_and_remove(
         let Some(observed) = get(linked, address, deadline)? else {
             return Ok(outcome);
         };
-        match authority::grant(core, basis, &observed, killed).context(CLOSE_STOPPED)? {
+        let core_id = linked.core_id().to_owned();
+        match authority::grant(core, basis, &core_id, &observed, killed).context(CLOSE_STOPPED)? {
             Grant::Kill(kill) => {
-                end_program(linked, address, kill, deadline)?;
+                end_program(linked, kill, deadline)?;
                 killed = true;
                 outcome = CloseOutcome::Closed;
             }
             Grant::Wait => core.pause(deadline),
-            Grant::Remove(remove) => {
-                return remove_once(linked, address, remove, deadline, outcome);
-            }
+            Grant::Remove(remove) => return remove_once(linked, remove, deadline, outcome),
         }
     }
 }
 
 /// One `terminal.kill`, which only `authority::grant` can permit.
-fn end_program(
-    linked: &mut Linked<'_>,
-    address: &str,
-    _: authority::Kill,
-    deadline: Instant,
-) -> Result<()> {
-    match linked
-        .connection
-        .call("terminal.kill", json!({"terminal": address}), deadline)
-    {
+fn end_program(linked: &mut Linked<'_>, kill: authority::Kill, deadline: Instant) -> Result<()> {
+    match linked.kill(kill, deadline) {
         Ok(_) => Ok(()),
         Err(CallError::Refused { kind, .. }) if kind == "not_found" || kind == "finished" => Ok(()),
         Err(error) => Err(error.into_error("terminal.kill")),
@@ -836,20 +802,17 @@ fn end_program(
 /// terminal is not sent again; the handle is kept for the next close.
 fn remove_once(
     linked: &mut Linked<'_>,
-    address: &str,
-    _: authority::Remove,
+    remove: authority::Remove,
     deadline: Instant,
     outcome: CloseOutcome,
 ) -> Result<CloseOutcome> {
-    match linked
-        .connection
-        .call("terminal.rm", json!({"terminal": address}), deadline)
-    {
+    let address = remove.address().to_owned();
+    match linked.remove(remove, deadline) {
         Ok(_) => {}
         Err(CallError::Refused { kind, .. }) if kind == "not_found" => return Ok(outcome),
         Err(error) => return Err(error.into_error("terminal.rm")),
     }
-    if get(linked, address, deadline)?.is_some() {
+    if get(linked, &address, deadline)?.is_some() {
         bail!(
             "Herdr terminal {address} is still held by its core after terminal.rm; the handle is retained"
         );
@@ -935,7 +898,6 @@ fn verify_surface(
 fn read_screen(core: &dyn Core, session: &TerminalSession, deadline: Instant) -> Result<String> {
     let mut linked = live_target(core, session, deadline)?;
     let read = linked
-        .connection
         .call(
             "terminal.read",
             json!({"terminal": session.id, "lines": 0}),
@@ -967,7 +929,7 @@ fn send_file(
         })
         .map_err(TerminalSendFailure::not_sent)?;
     let mut linked = live_target(core, session, deadline).map_err(TerminalSendFailure::not_sent)?;
-    match linked.connection.call(
+    match linked.call(
         "terminal.send",
         json!({"terminal": session.id, "text": text}),
         deadline,
@@ -1010,7 +972,7 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
     let Some(observed) = get(linked, &address, deadline)? else {
         return Ok(Caller::Outside(format!(
             "HC_TERMINAL_ID names {address}, which the Herdr Core at {} does not hold",
-            linked.socket.display()
+            linked.socket().display()
         )));
     };
     let (State::Live, Some(program)) = (observed.state, observed.pid) else {

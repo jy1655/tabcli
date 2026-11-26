@@ -502,6 +502,20 @@ impl CloseObservation for TestObservation<'_> {
         result
     }
 
+    // A test scripts the record's presence and its decoded owner separately; the typed read is
+    // composed from those two members, so the trace keeps naming them. A production-backed
+    // observation's two members read the same Record under the same policy.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn read_owner(&self) -> Result<super::OwnerRead> {
+        if !self.owner_present()? {
+            return Ok(super::OwnerRead::Absent);
+        }
+        Ok(match self.owner() {
+            Ok(owner) => super::OwnerRead::Recorded(Box::new(owner)),
+            Err(_) => super::OwnerRead::Malformed,
+        })
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn launch(&self) -> Result<Option<launch::Record>> {
         let call = self.begin("launch");
