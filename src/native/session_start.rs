@@ -70,6 +70,18 @@ impl Resolved {
         }
     }
 
+    // The request's deadline, which a source's own creation steps read again before writing.
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    // A fixture whose request ends at `deadline`.
+    #[cfg(test)]
+    pub(super) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     // Only the Windows launch-recovery fixtures adjust a resolved spec.
     #[cfg(all(test, windows))]
     pub(super) fn spec_mut(&mut self) -> &mut SessionSpec {
@@ -82,7 +94,9 @@ impl Resolved {
     ) -> Result<(Prepared, T)> {
         let provider = self.spec.provider;
         // A resolution that outlived the request's deadline (a slow caller check, consent
-        // read) creates nothing: no Session, consent record or reopen reservation.
+        // read) creates nothing: no Session, consent record or reopen reservation. A source
+        // that waits for a lock before it writes (a reopen's reservation) reads the clock again
+        // after that wait; a write that starts before the deadline is not interrupted.
         if Instant::now() >= self.deadline {
             bail!(TimedOut::new(
                 "the request's deadline passed before its Session was created; nothing was created"
@@ -249,8 +263,11 @@ pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<R
 // workspace and the probe, as early as in 0.4.49 for `ask` and right after the source and its
 // provider's reopen support for `reopen`, whose resolution starts here. Where it depends on
 // the version, it is after the probe, and only for a choice that then ends on Herdr. A
-// fallback and an explicit choice are never checked against the caller. The check ends by
-// the request's deadline, and a check that fails after it is reported as timed out.
+// fallback and an explicit choice are never checked against the caller. The check is held
+// to the request's deadline step by step (`herdr::verify_caller` lists what is bounded and
+// what is not), and a check that fails after it is reported as timed out. What the
+// resolution reads besides (workspace, consent stores) is local and not bounded; creation
+// reads the clock again (`Resolved::create_with`).
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
     deadline: Instant,

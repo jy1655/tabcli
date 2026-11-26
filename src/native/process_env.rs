@@ -206,7 +206,17 @@ pub(super) fn probe(
     let scratch = tempfile::tempdir()?;
     let mut command = probe_command(executable, arguments, scratch.path(), environment_removals)?;
     command.current_dir(workspace.unwrap_or(scratch.path()));
-    provider_process::configure_process_tree(&mut command);
+    probe_output(&mut command, deadline)
+}
+
+// A prepared command run under the diagnostic limits: its process tree contained and ended
+// with it, its output capped, its time bounded by `deadline`. `probe` prepares its own command;
+// doctor runs the launch's version command through this when that version decides a Surface.
+pub(super) fn probe_output(command: &mut Command, deadline: Instant) -> Result<Output> {
+    if Instant::now() >= deadline {
+        anyhow::bail!("diagnostic probe deadline exhausted");
+    }
+    provider_process::configure_process_tree(command);
     let execution = Execution::Probe;
     let storage = OutputStorage::new(&execution)?;
     if Instant::now() >= deadline {
@@ -214,7 +224,7 @@ pub(super) fn probe(
     }
     let child_streams = storage.child_streams(&execution)?;
     bounded_output(
-        &mut command,
+        command,
         Stdio::null(),
         deadline,
         execution,

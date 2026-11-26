@@ -75,7 +75,8 @@ fn creation_binds_both_sessions_or_releases_the_source_reservation() {
         let source = inspect_reopen_source(&directory, source_id).unwrap();
         let before = snapshot_directory(&directory);
         let mut created_directory = None;
-        let result = create_reopened_session(&directory, source_id, &source, || {
+        let far = Instant::now() + Duration::from_secs(3600);
+        let result = create_reopened_session(&directory, source_id, &source, far, || {
             // The source must already exclude another Reopen before creation starts.
             assert!(Reservation::claim(&directory, source_id, REOPEN_TEST_CONVERSATION).is_err());
             if failure == Some("create") {
@@ -3751,7 +3752,8 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         true,
     );
     let inspected = inspect_reopen_source(&died_source, died_id).unwrap();
-    let (died, _) = create_reopened_session(&died_source, died_id, &inspected, || {
+    let far = Instant::now() + Duration::from_secs(3600);
+    let (died, _) = create_reopened_session(&died_source, died_id, &inspected, far, || {
         create_session_within(
             &root,
             std::slice::from_ref(&root),
@@ -4189,6 +4191,52 @@ fn an_eligible_reopen_reaches_the_surface_decision_before_the_caller_check() {
     }
     assert_eq!(snapshot_directory(&directory), before);
     assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());
+}
+
+// A reopen whose source lock is held past the request's deadline reserves and creates
+// nothing: its wait for the lock ends at the deadline, and the clock is checked again before
+// the marker and before the Session are written.
+#[test]
+fn a_contended_reopen_creates_nothing_after_its_deadline() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    let root = tempfile::tempdir().unwrap();
+    let fixture = start_source_fixture(root.path());
+    let fixture = ResolvedReopen {
+        start: fixture
+            .start
+            .with_deadline(Instant::now() + Duration::from_millis(300)),
+        ..fixture
+    };
+    let directory = fixture.source_directory.clone();
+    let (locked, wait) = std::sync::mpsc::channel();
+    let holder = {
+        let directory = directory.clone();
+        thread::spawn(move || {
+            let _lock = Store::open_unchecked(&directory).lock().unwrap();
+            locked.send(()).unwrap();
+            thread::sleep(Duration::from_millis(1200));
+        })
+    };
+    wait.recv().unwrap();
+    let before = snapshot_directory(&directory);
+    let started = Instant::now();
+    let error = fixture
+        .create_with(|_, _| -> Result<CreatedSession> {
+            panic!("nothing is created after the deadline")
+        })
+        .err()
+        .expect("the deadline refuses the reopen");
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+    holder.join().unwrap();
+    assert_eq!(snapshot_directory(&directory), before);
+    assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());
+    let entries = fs::read_dir(root.path()).unwrap().count();
+    assert_eq!(entries, 1, "only the source exists");
 }
 
 // A follow-up refused before anything was sent settles as the receipt's failed event, so

@@ -166,11 +166,12 @@ struct Installation {
 // How doctor runs a provider's `--version` probe.
 #[derive(Clone, Copy)]
 enum VersionRun {
-    // Isolated like doctor's other probes: a scratch directory, without TAB's session
-    // variables.
+    // Isolated like doctor's other `--version` probes (`process_env::probe`): a scratch
+    // directory, and `AGENT_BRIDGE_NATIVE_SESSION_DIR` removed besides the adapter's removals.
     Isolated,
     // As the launch runs it, because its version decides the Surface `ask` would choose: the
-    // launch's own probe (`read_installed_version`), in the invoking directory and environment.
+    // launch's own command and reading (`read_installed_version`), in the invoking directory
+    // and environment, under doctor's diagnostic limits (`process_env::probe_output`).
     Launch,
 }
 
@@ -200,7 +201,9 @@ fn observe_installation(
                 deadline,
             )
             .map(|output| read_version_probe(provider, &output)),
-            VersionRun::Launch => read_installed_version(provider, path, Some(deadline)),
+            VersionRun::Launch => read_installed_version(provider, path, |command, _| {
+                crate::native::process_env::probe_output(command, deadline)
+            }),
         };
         match report {
             Ok(report) => VersionProbe::Completed(report),

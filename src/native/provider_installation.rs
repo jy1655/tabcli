@@ -177,34 +177,36 @@ pub(in crate::native) fn check_provider_version(
 
 // The launch's `--version` probe of an installed executable and its reading: the command of
 // `version_probe_command`, run in the invoking directory and environment less the adapter's
-// removals, and read by `read_version_probe`. `ask` and `reopen` decide with it, and `doctor`
-// reads through it the version that decides a launch's Surface, so that report sees what the
-// launch sees; doctor's other probes keep their own isolation. With a deadline the probe runs
-// through the bounded executor; without one it runs unbounded.
+// removals, and read by `read_version_probe`. `ask` and `reopen` decide with it through the
+// launch's executor (`check_provider_version_until`), and `doctor` reads through it the version
+// that decides a launch's Surface, run under its own diagnostic limits (`run`), so that report
+// sees what the launch sees; doctor's other probes keep their own isolation.
 pub(in crate::native) fn read_installed_version(
     provider: FirstPartyCli,
     executable: &Path,
-    deadline: Option<Instant>,
+    run: impl FnOnce(&mut Command, &str) -> Result<Output>,
 ) -> Result<VersionReport> {
     let mut command = version_probe_command(provider, executable)?;
     let label = format!("{} --version", executable.display());
-    let output = match deadline {
-        Some(deadline) => process_env::command_output_until(&mut command, deadline, &label),
-        None => command
-            .output()
-            .with_context(|| format!("failed to query {label}")),
-    }?;
+    let output = run(&mut command, &label)?;
     Ok(read_version_probe(provider, &output))
 }
 
 // The launch gate: a supported version returns its text; anything else refuses, and only a
-// version below the minimum is `Unsupported`.
+// version below the minimum is `Unsupported`. With a deadline the probe runs through the
+// bounded executor; without one it runs unbounded.
 pub(in crate::native) fn check_provider_version_until(
     provider: FirstPartyCli,
     executable: &Path,
     deadline: Option<Instant>,
 ) -> Result<String> {
-    match read_installed_version(provider, executable, deadline)? {
+    let report = read_installed_version(provider, executable, |command, label| match deadline {
+        Some(deadline) => process_env::command_output_until(command, deadline, label),
+        None => command
+            .output()
+            .with_context(|| format!("failed to query {label}")),
+    })?;
+    match report {
         VersionReport::Exited(status) => {
             bail!("{} --version exited with {}", executable.display(), status)
         }

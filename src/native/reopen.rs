@@ -340,11 +340,13 @@ impl ResolvedReopen {
         self,
         create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<CreatedSession>,
     ) -> Result<ReopenAttempt> {
+        let deadline = self.start.deadline();
         let (prepared, resumed_from) = self.start.create_with(|spec, consent| {
             create_reopened_session(
                 &self.source_directory,
                 &self.source_id,
                 &self.source,
+                deadline,
                 || create(spec, consent),
             )
         })?;
@@ -444,13 +446,28 @@ fn fail_reopen_launch(
     reopen_refusal(gate, detail)
 }
 
+// Nothing is reserved or created once the request's `deadline` has passed: the reservation
+// reads the clock after its lock wait and before its writes, and the Session's creation reads
+// it again after the reservation (an unfinalized reservation releases its marker).
 fn create_reopened_session(
     source_directory: &Path,
     source_id: &str,
     source: &ReopenSource,
+    deadline: Instant,
     create: impl FnOnce() -> Result<CreatedSession>,
 ) -> Result<(CreatedSession, ResumedFrom)> {
-    let marker = Reservation::claim(source_directory, source_id, &source.provider_session_id)?;
+    let marker = Reservation::claim_until(
+        source_directory,
+        source_id,
+        &source.provider_session_id,
+        deadline,
+    )?;
+    if Instant::now() >= deadline {
+        drop(marker);
+        bail!(crate::native::failure_kind::TimedOut::new(format!(
+            "the request's deadline passed before the reopen of session {source_id} created its Session; nothing was created"
+        )));
+    }
     let created = create()?;
     let resumed_from = ResumedFrom {
         session: source_id.to_owned(),

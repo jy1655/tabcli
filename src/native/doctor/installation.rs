@@ -175,7 +175,7 @@ pub(super) fn workspace_check(workspace: &Path, is_directory: std::io::Result<bo
         CheckId::WORKSPACE,
         availability,
         reason,
-        "Working directory observation; CLI version checks do not depend on this directory.",
+        "Working directory observation; CLI version checks do not depend on this directory, except the one that decides an automatic Herdr choice, which runs where doctor runs, as ask's does.",
         "Restore or inspect the recorded directory before workspace-relative operations.",
     )
     .evidence(json!({"path": workspace}))

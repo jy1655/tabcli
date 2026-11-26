@@ -88,7 +88,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the adapter's minimum (supported, too old, unrecognized). Each caller runs the probe with its own executor and keeps its own
   vocabulary: the `ask`/`reopen` preflight (bounded by the start deadline) and the wrapper's
   re-check refuse through `check_provider_version_until`, a version below the minimum as
-  `Unsupported`; `doctor` runs `process_env::probe` and reports rows. The wrapper's re-check
+  `Unsupported`; `doctor` runs `process_env::probe` and reports rows, except the version that
+  decides a version-dependent Surface choice inside hc, which it reads with the launch's own
+  command and reading (`read_installed_version`) under its diagnostic limits
+  (`process_env::probe_output`). The wrapper's re-check
   is bounded by the launch record's deadline plus a short grace, so that the launcher's
   deadline settles the launch first, through the preflight's executor, which ends only the
   probe's direct child at that bound (a runtime under a shim script can outlive it); a
@@ -154,7 +157,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
   explicit choice is refused. An automatic choice gets the caller check
   (`terminal::admit_selection`) once, as soon as it is known to be Herdr, by the rule stated at
-  `resolve_with`, within the request's deadline; nothing is created after that deadline.
+  `resolve_with`, within the request's deadline as Current Herdr Surface Boundary states it;
+  `create_with`, and for a reopen the reservation and the Session's creation, read the clock
+  again right before they write, so nothing is created after that deadline.
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option

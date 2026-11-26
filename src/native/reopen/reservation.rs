@@ -1,6 +1,7 @@
 //! Reopen's exclusive source reservation and launch-refusal settlement.
 //! A finalized marker is consumed until the refused provider is proven gone; queries only observe.
 use super::gate::{ReopenGate, reopen_refusal, reopen_refusal_gate};
+use crate::native::failure_kind::TimedOut;
 use crate::native::session::primitives::{unix_ms, valid_session_id};
 use crate::native::session::schema::{ProviderProcessRecord, RecordedReopenRefusal, ReopenMarker};
 use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
@@ -13,7 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod marker;
@@ -654,21 +655,66 @@ impl Drop for Reservation {
     }
 }
 
+// How long a reservation waits before it tries a held source lock again.
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
 // Serializes concurrent reopens of one closed source under the source's own turn-claim lock:
 // the closed gates are re-checked under the lock and the marker is created with
 // `create_new`, so exactly one attempt can hold it.
 impl Reservation {
+    // A claim without a request deadline, for tests of the reservation itself.
+    #[cfg(test)]
     pub(super) fn claim(
         directory: &Path,
         id: &str,
         provider_session_id: &str,
     ) -> Result<Reservation> {
+        Self::claim_until(
+            directory,
+            id,
+            provider_session_id,
+            Instant::now() + Duration::from_secs(3600),
+        )
+    }
+
+    // Nothing is reserved once the request's `deadline` has passed: the wait for the source's
+    // lock ends by it, and the clock is read again under the lock right before each write (the
+    // release of a stale marker, the new marker).
+    pub(super) fn claim_until(
+        directory: &Path,
+        id: &str,
+        provider_session_id: &str,
+        deadline: Instant,
+    ) -> Result<Reservation> {
         let path = Reader::open_unchecked(directory)
             .record(CoreRecord::ReopenMarker)
             .path()
             .to_owned();
-        let _lock = Store::open_unchecked(directory).lock()?;
+        let expired = || {
+            anyhow::Error::new(TimedOut::new(format!(
+                "the request's deadline passed before session {id} could be reserved for reopen; nothing was reserved"
+            )))
+        };
+        let store = Store::open_unchecked(directory);
+        let _lock = loop {
+            if let Some(lock) = store.try_lock()? {
+                break lock;
+            }
+            let Some(left) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                return Err(expired());
+            };
+            std::thread::sleep(left.min(LOCK_RETRY));
+        };
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
         if let Some(stale) = verify_reopen_source_is_closed(directory, id)? {
+            if Instant::now() >= deadline {
+                return Err(expired());
+            }
             // The gate re-ran under the lock, so the stale marker still names a refused launch
             // whose cleanup is verified now; releasing it here is the reconciliation the
             // crashed or timed-out parent never performed.
@@ -692,6 +738,9 @@ impl Reservation {
             reopened_by: None,
             created_unix_ms: unix_ms(),
         };
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
         session::RecordStore::at(&path)
             .write_private(&serde_json::to_vec_pretty(&marker)?)
             .map_err(|error| {
