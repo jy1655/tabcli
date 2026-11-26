@@ -269,8 +269,8 @@ _Avoid_: kill, teardown, cleanup
 **Close authority**:
 What a close may do to a surface, decided from the session's records and what is observed
 now: act with a live attested owner, act on the surface alone, remove a surface that its own
-creation record proves when no live owner is left (ending it while it runs only when this
-session's owner is positively gone), end a live attested owner whose surface is proven absent,
+creation record proves when no live owner is left (never ending it while it runs), end a live
+attested owner whose surface is proven absent,
 or do nothing because the surface is proven absent. Anything else
 refuses the close and keeps the surface handle.
 _Avoid_: permission, ownership check

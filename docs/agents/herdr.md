@@ -116,14 +116,17 @@
     lifecycle lock before it settles a session, so a handle that a concurrent close restored
     is never consumed. The steps Repair takes before that decision still run: publishing a
     completed result, and settling a launch that was never confirmed.
-  - `owner_exit::core_kept` gathers the close decision's evidence for every owner record and
-    returns evidence, never an action, from one typed read of the owner record. Only a record
-    bound to this session whose incarnation is attested live leads to the close with a live
-    owner, and only such a record refuses when its process cannot be inspected. Another
-    session's record or an unbound one identifies no process of this session: its process is
-    not inspected, so it can neither refuse nor permit anything. Everything else (no record, a
-    damaged or conflicting one, another session's, an unbound or PID-only one, a gone owner, a
-    failed start) is a close on the creation record (`CreatedSurface`).
+  - `owner_exit::core_kept` chooses between the close with a live owner and the close on the
+    creation record, for every owner record, and returns evidence, never an action. Its deciding
+    observation is the OS's attestation of the process an owner record bound to this session
+    names, from one typed read of the record. An attested live incarnation leads to the close
+    with a live owner. When that attestation cannot be made (the process cannot be inspected),
+    the close refuses, sends nothing and keeps the handle, since a live owner cannot be ruled
+    out; a record whose own fields conflict names nothing to inspect. Everything else (no
+    record, a damaged or conflicting one, another session's or an unbound one, whose process is
+    not inspected, a PID-only one, a gone owner, a failed start) is a close on the creation
+    record (`CreatedSurface`). Nothing else about the owner's process permits or refuses
+    anything on that path.
   - Only `close-session --explicit`, and the sessions it lists with `--with-started-from`, act on
     the creation record. On that path the cleanup after a refused reopen (`CloseCause::Cleanup`)
     is refused before the core is asked, a failed start included. With a verified live owner of
@@ -142,22 +145,18 @@
     removed and an absent one settled whatever the owner record says, including one that names
     a live process of another session or a recycled PID. The state of the owner record never
     strands a session.
-  - A running terminal is ended (one `terminal.kill`) only when this session's owner is
-    positively gone and its program is observed with its recorded birth. Positively gone means
-    a record bound to this session names an incarnation the platform can produce (a valid
-    birth, a Windows creation time and image path), and the OS observed it exited, or a process
-    created after it at its PID. A reuse that the live process contradicts (born no later, or
-    on Windows the same creation time under another path) proves nothing. It also means the
-    session's own wrapper recorded its end: state `exited`, which only the wrapper writes
-    after its provider has exited.
-  - When nothing establishes that this session has ended, TAB keeps the running terminal and
-    sends nothing (the owner's decision, 2026-11-26). The user ends it on its recorded core, and
-    the next close removes it. Process-tree evidence was examined and not used. On every OS it
-    would need the wrapper identified among the launch host's descendants by command line, and
-    reparenting or a failed read makes absence there no proof of an end.
+  - A close on the creation record never ends a running terminal, whatever is known about the
+    session's owner (the owner's decision of 2026-11-26, which replaced the kill on positive
+    evidence of the owner's death). `grant` refuses with the terminal's `hc get` and `hc kill`
+    commands for the recorded core in the platform's form; nothing is sent and the handle is
+    kept. The person waits for the terminal to finish or ends it there, and the next close
+    removes it. The close with a live owner keeps its kill. This changes 0.4.49 on macOS and
+    Linux, where an explicit close also ended the running terminal of an exited owner; up to
+    0.4.49 Windows Repair and listing did.
   - The closed record keeps the stored diagnosis, read under the lifecycle lock, when this close
-    acts on the creation record. Without one, an owner positively gone by its incarnation records
-    `native session process <pid> is no longer running`, as 0.4.49's Repair wrote it. Every OS
+    acts on the creation record. Without one, an owner record bound to this session whose
+    process the OS reports gone records `native session process <pid> is no longer running`, as
+    0.4.49's Repair wrote it; that observation is the diagnosis only. Every OS
     writes that reason into the handle's consumption marker, so a close interrupted after the
     marker and before the closed record keeps it. A committed marker is never rewritten, and a
     reason the closed record already carries, whole or as a `; `-joined part, is not added

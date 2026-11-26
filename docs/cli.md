@@ -701,7 +701,8 @@ unbound legacy record and to one of another managed session as well. Its dead-ow
 usually closes such a session, but may leave it open for an explicit `close-session`. On macOS and
 Linux this happens when a close is already pending, or when the terminal can outlive its owner
 (Terminal.app, Ghostty, Warp, WezTerm, tmux). On every platform it happens for a Herdr terminal,
-which only an explicit `close-session` ends, and for a launch that was never confirmed, which
+which only an explicit `close-session` removes once it has finished (TAB does not end it while it
+runs), and for a launch that was never confirmed, which
 launch repair settles instead. `recovery_required` means a completion journal is pending, and
 recovery can change every later gate. `owner_unverified` means the recorded owner's process could
 not be inspected (whatever session the record names), which dead-owner repair also cannot judge,

@@ -174,16 +174,18 @@ finished terminal and closes the session record. TAB first proves from its own r
 terminal's creation (core, address, creation time, program, session directory and launch
 label) that it is this session's terminal. A finished or removed terminal is then cleaned up
 whatever the session's owner record says, including an owner whose process ID now belongs to
-another process. A terminal that still runs is ended only when TAB can establish that the session has
-ended, and when it can still see the terminal's program as the one it started. The session has
-ended when the owner record names this session's own TAB process and the system shows that
-process gone, or when the session recorded its own end. Otherwise the close keeps the session and
-says so. Listing sessions, `tell` and waiting for a result never close a Herdr terminal on their
-own; an attached `ask` or `tell` stops waiting once the owner is gone.
+another process. When the session's owner is not live, TAB never ends a terminal that still
+runs: the close keeps the session, sends nothing and says so, with the `hc` commands for the
+recorded core. Wait for the terminal to finish, or end it there with `hc kill <address>`, then
+run the close again: it removes the finished terminal and closes the session record. Closing a
+session whose owner is alive is unchanged. Listing sessions, `tell` and waiting for a result
+never close a Herdr terminal on their own; an attached `ask` or `tell` stops waiting once the
+owner is gone.
 
-When TAB cannot establish that the session has ended, it keeps a running terminal and asks you
-to end it first. Then run the close again: it removes the finished terminal and closes the
-session record, whatever the session's owner record says.
+This is a change from 0.4.49 on macOS and Linux, where an explicit close also ended a running
+Herdr terminal whose session's owner had exited. A session left that way now needs the terminal
+ended first: `HC_SOCKET='<socket>' hc kill <address>` with the socket from `attach_command`,
+then `tabcli close-session <session> --explicit` again.
 
 To act on the terminal yourself, first run `tabcli doctor <session> --probe`; without
 `--probe` doctor asks no core. Its `terminal_surface` check connects to the recorded socket and
@@ -253,11 +255,13 @@ Pi and Agy keep their Windows input rules (a one-line prompt, their startup chec
 receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. Codex is refused:
 its Windows initial prompt is pasted and then submitted against the exact console screen, which
 Herdr cannot do, so use `--terminal windows-console` for it. The returned `attach_command` is a
-PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close ends the
-whole terminal. Closing follows the rules for macOS and Linux above: when a provider ends on
-its own, run `tabcli close-session <session> --explicit` to remove its finished terminal. Up
-to 0.4.49 on Windows, listing sessions, `tell` or an attached `ask` or `tell` removed it
-themselves, and ended a still running terminal of a session whose owner was gone. If the
+PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close with a
+live owner ends the whole terminal. Closing follows the rules for macOS and Linux above: when a
+provider ends on its own, run `tabcli close-session <session> --explicit` to remove its finished
+terminal, and a terminal that still runs after its session's owner is gone is never ended by
+TAB: end it with the `hc kill` command the refusal names, then close again. Up to 0.4.49 on
+Windows, listing sessions, `tell` or an attached `ask` or `tell` removed it themselves, and
+ended a still running terminal of a session whose owner was gone. If the
 core cannot be reached, the session keeps its handle and a later close finishes it. Only Pi
 has been run live on Windows Herdr.
 

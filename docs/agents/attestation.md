@@ -19,14 +19,10 @@
   binding, and never ends a terminal whose core keeps it (Herdr): only `close-session
   --explicit` does, on every OS (os-parity). That close proves the terminal by its own creation
   record, so a reused PID or an unbound, foreign or incomplete record neither grants nor blocks
-  the removal of a finished terminal. A Gone answer about another session's owner, an unbound
-  owner or a PID-only record does not show that this session has ended. Ending a running
-  terminal therefore also needs this session's owner positively gone. That means a bound record
-  naming an incarnation the platform can produce (`records_incarnation`: a valid birth, a
-  Windows creation time and path), observed exited, or reused by a process created after it
-  (`reuse_corroborated`). Reuse classification compares for equality only, so an impossible or
-  damaged birth reads as reuse; the corroboration does not. A PID-only Gone rests on the
-  liveness bool and never ends one. The ordinary macOS and Linux
+  the removal of a finished terminal. No owner observation lets that close end a running
+  terminal (the owner's decision of 2026-11-26): only a bound record's attested live
+  incarnation, which leads to the close with a live owner, or its failed inspection, which
+  refuses, changes what the close does. The ordinary macOS and Linux
   dead-owner Close of the other kinds still requires an exited, bound owner with complete
   recorded control. Only the form of that identity is a platform fact (controlling TTY, process
   groups and birth on macOS and Linux, the recorded process identity on Windows).

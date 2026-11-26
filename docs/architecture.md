@@ -711,9 +711,8 @@ evidence from a `warp_control_cli` build or an upstream change.
 
 `terminal::close_authority` decides explicit Close over its observation seam. Close can act
 with a live attested owner, act on a proven Surface alone, remove a Surface that its creation
-record proves when no live owner is left (and end it only when this session's owner is
-positively gone), end a live attested owner whose Surface is proven absent, or settle a proven
-absence or
+record proves when no live owner is left (never ending it while it runs), end a live attested
+owner whose Surface is proven absent, or settle a proven absence or
 completed teardown. An ambiguous identity retains the handle. The platform adapters perform
 surface close, and `terminal::ownership` performs owner teardown. `session::close` claims the
 handle, records the transition and tombstones, and converges interrupted Close.
@@ -732,9 +731,8 @@ one from another core; the connection sends either call only by consuming that g
 transport's stream is private to it. On the creation
 record it admits only an explicit `CloseCause` and requires the creation record in the
 handle; a close with a live attested owner, the cleanup after a refused reopen included, keeps
-its own proof. It removes a finished terminal whatever the owner record says. It ends a running
-one only when this session's owner is positively gone and the program is observed with its
-recorded birth. On macOS and
+its own proof. It removes a finished terminal whatever the owner record says and never ends a
+running one (the owner's decision of 2026-11-26). On macOS and
 Linux, Repair also preserves an intent or another Surface that can outlive its owner. Their
 ordinary dead-owner branch keeps requiring an exited, bound owner with complete control,
 apart from two earlier routes. A Linux tmux server is closed by its creation-time incarnation
