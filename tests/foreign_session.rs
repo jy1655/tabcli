@@ -555,6 +555,14 @@ fn failure(output: &Output) -> String {
         .to_owned()
 }
 
+// The marker of an expected answer that is the read error of a missing record: the record's
+// name and the error code (`os error 2`) are the same on every OS, the OS's wording is not.
+const MISSING: &str = "missing record: ";
+
+fn missing_record(record: &str) -> String {
+    format!("{MISSING}{record}")
+}
+
 // What a command answers for this fixture. `Ok(None)` is a success whose details the caller
 // checks; `Err(text)` a failure whose error is `text` or ends with it.
 fn expected(command: &str, case: &Case, fixture: &Fixture) -> Result<Option<Value>, String> {
@@ -563,7 +571,9 @@ fn expected(command: &str, case: &Case, fixture: &Fixture) -> Result<Option<Valu
     match command {
         // The proof refuses an active handle; without one, `tell` reads no handle, as before.
         "tell" if case.active() => Err(refusal),
-        "tell" => Err("terminal.json: No such file or directory (os error 2)".to_owned()),
+        // The OS words the missing file its own way: only the record and the error code are
+        // the same everywhere (`missing_record`).
+        "tell" => Err(missing_record("terminal.json")),
         "screen" if case.closed => Err(format!(
             "session {ID} is closed; its terminal surface is not read"
         )),
@@ -683,10 +693,15 @@ fn a_session_of_another_os_is_refused_settled_or_answered_from_its_records() {
                 Err(answer) => {
                     check(!output.status.success(), "succeeded");
                     let error = failure(&output);
-                    check(
-                        error == answer || error.ends_with(&answer),
-                        &format!("not `{answer}`"),
-                    );
+                    let matched = match answer.strip_prefix(MISSING) {
+                        Some(record) => {
+                            error.starts_with("failed to read ")
+                                && error.contains(record)
+                                && error.ends_with("(os error 2)")
+                        }
+                        None => error == answer || error.ends_with(&answer),
+                    };
+                    check(matched, &format!("not `{answer}`"));
                     if answer == fixture.refusal(&case.head) && *command != "close-session" {
                         check(
                             value["failure_kind"] == "unsupported",
