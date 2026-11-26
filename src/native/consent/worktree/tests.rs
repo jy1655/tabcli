@@ -268,7 +268,7 @@ fn a_relative_path_registration_names_its_main_working_tree() {
 }
 
 // Review rulings, round 3: the claimed main working tree is screened, lexically and before any
-// I/O on it, against exact consent evidence; a destination without it is never touched.
+// I/O on it, against the providers' stores alone; a destination no store lists is never touched.
 #[test]
 fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
     let (_temp, root) = canonical_root();
@@ -291,9 +291,31 @@ fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
         main_worktree(&fixture.worktree, &mut screen(false))
             .unwrap_err()
             .to_string(),
-        "the main working tree that the .git file names has no exact consent evidence"
+        "no provider's store lists the main working tree that the .git file names as trusted"
     );
     assert_eq!(asked.borrow().as_slice(), std::slice::from_ref(&unknown));
+    // On Windows the screen is asked with the spelling `canonicalize` gives (`\\?\C:\...`, the
+    // drive letter in upper case whatever case Git's file gives it), so the providers' stores
+    // are keyed for it exactly as for an exact folder (Windows CI, 2026-11-26).
+    #[cfg(windows)]
+    {
+        assert!(
+            unknown.to_str().unwrap().starts_with(r"\\?\"),
+            "{unknown:?}"
+        );
+        asked.borrow_mut().clear();
+        let pointer = git_path(&unknown.join(".git/worktrees/worktree"));
+        point(
+            &fixture,
+            &(pointer[..1].to_ascii_lowercase() + &pointer[1..]),
+        );
+        main_worktree(&fixture.worktree, &mut screen(false)).unwrap_err();
+        assert_eq!(asked.borrow().as_slice(), std::slice::from_ref(&unknown));
+        point(
+            &fixture,
+            &git_path(&unknown.join(".git/worktrees/worktree")),
+        );
+    }
     // Only past the screen is it touched.
     assert!(
         format!(
@@ -332,30 +354,60 @@ fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
 }
 
 // Each component is inspected before the next is taken: `..` steps back only over a
-// directory that exists and is no link, as Git's own lookup needs it.
+// directory that exists and is no link, as Git's own lookup needs it. The pointers are spelled
+// as text: on Windows `Path::join` onto the canonical (verbatim) root would remove `x/..` before
+// the file is written (Windows CI, 2026-11-26).
 #[test]
 fn a_component_is_inspected_before_dotdot_steps_back_over_it() {
     let (_temp, root) = canonical_root();
     let fixture = registered(&root);
+    let spelled = |rest: &str| format!("{}/{rest}", git_path(&root));
     point(
         &fixture,
-        &git_path(&root.join("missing/../repository/.git/worktrees/worktree")),
+        &spelled("missing/../repository/.git/worktrees/worktree"),
     );
     assert!(error(&fixture.worktree).contains("missing cannot be read"));
     fs::write(root.join("file"), "").unwrap();
     point(
         &fixture,
-        &git_path(&root.join("file/../repository/.git/worktrees/worktree")),
+        &spelled("file/../repository/.git/worktrees/worktree"),
     );
     assert!(error(&fixture.worktree).ends_with("is not a directory"));
     point(
         &fixture,
-        &git_path(&root.join("worktree/../repository/.git/worktrees/worktree")),
+        &spelled("worktree/../repository/.git/worktrees/worktree"),
     );
     assert_eq!(
         verified(&fixture.worktree).unwrap(),
         Some(fixture.repository.clone())
     );
+    // A verbatim spelling is walked the same way, and a name in it that holds `/` (which a
+    // verbatim path does not split at) is refused instead of being pushed as two names.
+    #[cfg(windows)]
+    {
+        let verbatim = |rest: &str| format!(r"{}\{rest}", root.display());
+        point(
+            &fixture,
+            &verbatim(r"missing\..\repository\.git\worktrees\worktree"),
+        );
+        assert!(error(&fixture.worktree).contains("missing cannot be read"));
+        point(
+            &fixture,
+            &verbatim(r"worktree/..\repository\.git\worktrees\worktree"),
+        );
+        assert_eq!(
+            error(&fixture.worktree),
+            "a name in a path in Git's files holds a separator"
+        );
+        point(
+            &fixture,
+            &verbatim(r"worktree\..\repository\.git\worktrees\worktree"),
+        );
+        assert_eq!(
+            verified(&fixture.worktree).unwrap(),
+            Some(fixture.repository.clone())
+        );
+    }
 }
 
 #[test]
@@ -540,7 +592,7 @@ fn a_junction_on_the_way_is_a_link() {
 }
 
 // On Windows the claimed main working tree on another drive or share is screened like any
-// other: refused without exact consent evidence before any I/O on it, so a local workspace
+// other: refused unless a store lists it, before any I/O on it, so a local workspace
 // cannot make TAB reach an untrusted network share. Runs on the Windows CI runner only.
 #[cfg(windows)]
 #[test]
@@ -560,8 +612,17 @@ fn a_share_without_consent_evidence_is_never_touched() {
     .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "the main working tree that the .git file names has no exact consent evidence"
+        "no provider's store lists the main working tree that the .git file names as trusted"
     );
-    assert_eq!(asked.len(), 1);
+    // Asked with the share spelled as `canonicalize` spells it, whose key is `\\server\share\...`
+    // as for an exact folder there.
+    assert_eq!(
+        asked,
+        [PathBuf::from(r"\\?\UNC\tab-test.invalid\share\repository")]
+    );
+    assert_eq!(
+        native_key(&asked[0]).unwrap(),
+        r"\\tab-test.invalid\share\repository"
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }

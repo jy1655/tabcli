@@ -620,3 +620,42 @@ fn the_session_settings_floor_is_the_measured_version() {
         assert_eq!(setting_support(version), support, "{version:?}");
     }
 }
+
+// Consent's worktree screen asks only Agy's store: the answer about a path that nothing may touch
+// comes from the store alone and is the store's exact decision. Agy's full lookup reads only the
+// store too, so it answers the same for that path, unchanged.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent::{self, Trust};
+    let fixture = super::super::UntouchedPath::new();
+    std::fs::create_dir_all(fixture.home.join(".gemini/antigravity-cli")).unwrap();
+    let store = fixture.home.join(".gemini/antigravity-cli/settings.json");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, expected) in [(&fixture.path, true), (&parent, false)] {
+        crate::native::session::primitives::write_json_atomic(
+            &store,
+            &serde_json::json!({"trustedWorkspaces":[consent::native_key(listed).unwrap()]}),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            matches!(
+                ADAPTER
+                    .workspace_trust(&fixture.path, &fixture.env, None)
+                    .unwrap(),
+                Trust::Trusted(_)
+            ),
+            expected
+        );
+    }
+}

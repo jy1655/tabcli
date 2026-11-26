@@ -328,6 +328,19 @@ impl NativeProviderAdapter for PiAdapter {
         }
     }
 
+    // `workspace_trust` is already store-only: it resolves the store from `env`, reads that
+    // file, and compares `workspace` and its lexical ancestors as string keys.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::super::consent::Environment,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.workspace_trust(workspace, env, None)?,
+            super::super::consent::Trust::Trusted(_)
+        ))
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // Pi's descendants and a bundled agent-detection dependency can read caller context:
         // an independent launch drops Codex identity/shutdown context and Claude identity/inbox.

@@ -169,6 +169,19 @@ impl NativeProviderAdapter for ClaudeAdapter {
         trust::workspace_trust(workspace, env, store)
     }
 
+    // The store-only body: `workspace_trust` first probes the path's ancestors for `.git` and
+    // may run `git` there, which the screen must not.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::super::consent::Environment,
+    ) -> Result<bool> {
+        Ok(matches!(
+            trust::store_trust(workspace, env, None)?,
+            super::super::consent::Trust::Trusted(_)
+        ))
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // A `claude --version` or doctor probe is not an interactive session, but it is
         // still a `claude` started by TAB: it drops the same markers so that no

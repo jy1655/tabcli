@@ -41,17 +41,34 @@
   `core.worktree` or unusual extensions is judged by its registration alone. Its steps:
   `W/.git` is a regular file `gitdir: <path>` (absolute, or relative to `W` as Git resolves
   it); lexically, with no I/O on it, the path claims `<main>/.git/worktrees/<id>`; before
-  any I/O on `<main>`, consent's screen requires exact consent evidence for exactly that path
-  (the evidence an exact folder needs), so an untrusted or unknown destination is never
-  traversed; then the same path is walked component by component (each inspected before the
+  any I/O on `<main>`, consent's screen asks each provider, in the order of the exact sources,
+  whether its own store lists exactly this path as trusted, answered from the store alone, with
+  no I/O on the path or its ancestors and no `git`, so a destination no store lists is never
+  touched; then the same path is walked component by component (each inspected before the
   next, none a link or, on Windows, a reparse point, every one a directory, `..` stepping back
   only over a directory just inspected); `<main>/.git` has no `commondir` of its own; and the
   registration's `gitdir` and `commondir`, walked the same way, name `W/.git` and
   `<main>/.git` by file identity, never by name. Relative-path registrations (Git 2.48
-  `--relative-paths`) are resolved from the locations Git defines. The screen asks the
-  providers' own readers; Claude's reader probes `.git` in the claimed path's ancestors and
-  can run `git rev-parse` there before it reads its store, as it does for any exact folder
-  (an open question to the owner, see the ticket report).
+  `--relative-paths`) are resolved from the locations Git defines. On Windows an absolute path
+  is rebuilt on its volume's root as `canonicalize` spells it (`\\?\C:\` with the drive letter
+  in upper case, `\\?\UNC\server\share\`), the spelling a relative path inherits from the
+  canonical workspace, so the screen is asked with the path an exact-folder lookup would key
+  (`native_key` gives `C:\...` or `\\server\share\...`) and every walk addresses the file
+  system without Win32's rewriting of names; a device or object-name root is refused, and so is
+  a name that holds `/` (a verbatim path does not split there). Tests that write a pointer with
+  `..` spell it as text: `Path::join` onto a verbatim root removes `x/..` lexically before the
+  file is written (Windows CI, 2026-11-26).
+- The screen is a necessary condition only, never consent (router's ruling, 2026-11-26):
+  after it passes and the registration is verified physically, the main working tree's own
+  consent is assessed by the full readers exactly as an exact folder is, and a path that a store
+  lists but its reader then refuses gives no inheritance. Each adapter states its store-only
+  answer (`store_lists_trusted`, no default body). Codex, Agy and Pi answer with their full
+  lookup, which resolves the store from the caller's home, reads only that file and compares the
+  path (and, for Pi, its lexical ancestors) as string keys. Claude's full lookup first probes
+  `.git` in the path's ancestors and may run `git rev-parse` in the path, so Claude answers with
+  its store-only body (`claude/trust.rs` `store_trust`). A reader that touches the path must
+  never answer the screen: the full readers would let a hostile `.git` file make TAB stat
+  ancestors of an untrusted share or run `git` there before anyone trusted it.
 - `consent/authority.rs` is the one answer to "may this target provider treat this
   session's workspace as consented now". It reads the session's assessment as a typed record,
   binds it to the manifest's workspace by path and identity, assesses that workspace again

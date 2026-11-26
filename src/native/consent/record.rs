@@ -100,22 +100,35 @@ fn alias_free(requested: &Path, canonical: &Path) -> Result<bool> {
     Ok(absolute.canonicalize()? == canonical)
 }
 
-// The first provider, in the order Codex, Claude, Agy, Pi, whose own store trusts `path`
-// exactly. One provider's error does not stop the next from being asked.
+// The order in which providers' stores are asked.
+const SOURCES: [FirstPartyCli; 4] = [
+    FirstPartyCli::Codex,
+    FirstPartyCli::Claude,
+    FirstPartyCli::Agy,
+    FirstPartyCli::Pi,
+];
+
+// The first provider, in the order of `SOURCES`, whose own store trusts `path` exactly. One
+// provider's error does not stop the next from being asked.
 fn exact_source(path: &Path, env: &Environment) -> Option<Evidence> {
-    [
-        FirstPartyCli::Codex,
-        FirstPartyCli::Claude,
-        FirstPartyCli::Agy,
-        FirstPartyCli::Pi,
-    ]
-    .into_iter()
-    .find_map(
+    SOURCES.into_iter().find_map(
         |cli| match provider::workspace_trust(cli, path, env, None) {
             Ok(Trust::Trusted(source)) => Some(source),
             _ => None,
         },
     )
+}
+
+// The worktree screen: whether some provider's own store, asked in the order of `SOURCES`, lists
+// exactly `path` as trusted, each answered from the store alone, with no I/O on `path` or its
+// ancestors and no `git`. A main working tree that a `.git` file names is therefore never
+// touched before a store lists it. The screen is a necessary condition only, never consent: the
+// main working tree that passes it is assessed afterwards by the full readers, exactly as an
+// exact folder is, and a path a store lists but its reader refuses gives no inheritance.
+fn listed(path: &Path, env: &Environment) -> bool {
+    SOURCES
+        .into_iter()
+        .any(|cli| matches!(provider::store_lists_trusted(cli, path, env), Ok(true)))
 }
 
 fn record_path(root: &Path, workspace: &Path) -> PathBuf {
@@ -326,19 +339,18 @@ fn decide(
 }
 
 // The source and the main working tree that `workspace` inherits consent from, derived from
-// current truth: the claimed main working tree screened against exact consent evidence before
-// any I/O on it, Git's registration of `workspace` there verified by identity, the main
-// working tree's own consent exactly as TAB assesses that folder (its pinned source, identity
-// and revocation), and a source provider that neither declines nor fails to read the worktree
-// itself. Anything that does not hold, or cannot be read, inherits nothing.
+// current truth: the claimed main working tree screened (`listed`) before any I/O on it, Git's
+// registration of `workspace` there verified by identity, the main working tree's own consent
+// exactly as TAB assesses that folder (its pinned source, identity and revocation), and a source
+// provider that neither declines nor fails to read the worktree itself. Anything that does not
+// hold, or cannot be read, inherits nothing.
 fn inherited(
     root: &Path,
     workspace: &Path,
     env: &Environment,
     mode: Mode,
 ) -> Option<(Evidence, Identity)> {
-    let main = worktree::main_worktree(workspace, &mut |main| exact_source(main, env).is_some())
-        .ok()??;
+    let main = worktree::main_worktree(workspace, &mut |main| listed(main, env)).ok()??;
     let main_identity = identity(&main).ok()?;
     // Two records under one lock file would wait on each other.
     if record_path(root, &main) == record_path(root, workspace) {

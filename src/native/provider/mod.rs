@@ -329,6 +329,16 @@ trait NativeProviderAdapter: Sync {
         env: &super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
+    // Whether the provider's own store, resolved from its home in `env`, lists exactly
+    // `workspace` as trusted, answered from the store alone: no I/O on `workspace` or its
+    // ancestors and no `git`. Consent's worktree screen asks it about a main working tree that a
+    // `.git` file names, before anything touches that path; it is a necessary condition only,
+    // never consent. No default: each adapter states how its answer stays store-only.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::consent::Environment,
+    ) -> Result<bool>;
     fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
     // Caller-environment variables removed from every short-lived provider query that
@@ -413,6 +423,14 @@ pub(super) fn workspace_trust(
     store: Option<&Path>,
 ) -> Result<super::consent::Trust> {
     adapter(provider).workspace_trust(workspace, env, store)
+}
+
+pub(super) fn store_lists_trusted(
+    provider: FirstPartyCli,
+    workspace: &Path,
+    env: &super::consent::Environment,
+) -> Result<bool> {
+    adapter(provider).store_lists_trusted(workspace, env)
 }
 
 // The Codex memory workspace that the launch admission protects. Only the Codex adapter
@@ -519,6 +537,59 @@ fn transport_test_context<'a>(
         bridge_executable: Path::new("bridge"),
         prompt: "provider transport framing",
         deadline: Instant::now() + std::time::Duration::from_secs(30),
+    }
+}
+
+// A path that a store-only answer never touches, and a caller home for the stores. The path lies
+// below a `.git` file that is no repository, so a reader that probes the path's ancestors finds
+// it and runs `git` in the path, which fails; on Unix it also lies below a directory that may not
+// be searched while the fixture lives, so any stat or open under it fails (for a user other than
+// root). Each adapter's own test writes its store and asks its store-only answer about it.
+#[cfg(test)]
+pub(super) struct UntouchedPath {
+    pub(super) home: PathBuf,
+    pub(super) env: super::consent::Environment,
+    pub(super) path: PathBuf,
+    #[cfg(unix)]
+    locked: PathBuf,
+    _temp: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl UntouchedPath {
+    pub(super) fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let outer = root.join("outer");
+        let locked = outer.join("locked");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(outer.join(".git"), "not a repository\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        Self {
+            env: super::consent::Environment::at_home(&home),
+            home,
+            path: locked.join("main"),
+            #[cfg(unix)]
+            locked,
+            _temp: temp,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for UntouchedPath {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.locked, std::fs::Permissions::from_mode(0o700));
+        }
     }
 }
 

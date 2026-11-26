@@ -221,35 +221,45 @@ fn launch_dialog_resets_on_full_screen_nonmatch_and_prewrite_changed() {
     }
 }
 
+// Agy's zero settle answers its first observation. The guarded key is the legacy answer for an
+// Agy positively identified as older than the session-only setting's floor, whose launch records
+// the option as unavailable (review round 3, ruling A). A launch that recorded nothing, such as
+// one whose version check was inconclusive, takes no key on this surface either: the step leaves
+// the dialog to Agy and the paste gate waits for Agy's own trust evidence.
 #[test]
 fn launch_dialog_zero_settle_keeps_agy_first_observation() {
-    let h = Harness::new();
-    let start = Instant::now();
-    let mut clock = FakeClock::new(start);
-    let now = clock.shared();
-    let screen = format!(
-        "Accessing workspace:\n{}\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\nNo, exit\n↑/↓ Navigate · enter Confirm",
-        native_key(&h.workspace).unwrap()
-    );
-    let calls = Cell::new(0);
-    h.run(
-        FirstPartyCli::Agy,
-        &mut clock,
-        Duration::from_secs(1),
-        || Ok(screen.clone()),
-        |_| {
-            calls.set(calls.get() + 1);
-            assert_eq!(now.get(), start);
-            write_json_atomic(
-                &h.stores.agy,
-                &serde_json::json!({"trustedWorkspaces":[native_key(&h.workspace).unwrap()]}),
-            )
-            .unwrap();
-            Ok(true)
-        },
-    )
-    .unwrap();
-    assert_eq!(calls.get(), 1);
+    for older in [false, true] {
+        let h = Harness::new();
+        if older {
+            super::record::option_unavailable(&h.directory).unwrap();
+        }
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let screen = format!(
+            "Accessing workspace:\n{}\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\nNo, exit\n↑/↓ Navigate · enter Confirm",
+            native_key(&h.workspace).unwrap()
+        );
+        let calls = Cell::new(0);
+        h.run(
+            FirstPartyCli::Agy,
+            &mut clock,
+            Duration::from_secs(1),
+            || Ok(screen.clone()),
+            |_| {
+                calls.set(calls.get() + 1);
+                assert_eq!(now.get(), start);
+                write_json_atomic(
+                    &h.stores.agy,
+                    &serde_json::json!({"trustedWorkspaces":[native_key(&h.workspace).unwrap()]}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), usize::from(older), "older: {older}");
+    }
 }
 
 #[test]

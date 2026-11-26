@@ -1290,3 +1290,50 @@ fn pending_install_requires_a_live_session_and_cancel_is_unconditional() {
     cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
     assert!(read_pending_turn(directory.path()).unwrap().is_none());
 }
+
+// Consent's worktree screen asks only Pi's store: the answer about a path that nothing may touch
+// comes from the store alone and is the store's exact, positive decision; a parent's decision,
+// positive or not, lists nothing. Pi's full lookup reads only the store too (its parent walk is
+// lexical), so it answers the same for that path, unchanged.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent::{self, Trust};
+    let fixture = super::super::UntouchedPath::new();
+    std::fs::create_dir_all(fixture.home.join(".pi/agent")).unwrap();
+    let store = fixture.home.join(".pi/agent").join("trust.json");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, decision, expected) in [
+        (&fixture.path, true, true),
+        (&fixture.path, false, false),
+        (&parent, true, false),
+        (&parent, false, false),
+    ] {
+        write_json_atomic(
+            &store,
+            &serde_json::json!({consent::native_key(listed).unwrap():decision}),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env)
+                .unwrap(),
+            expected,
+            "{decision}"
+        );
+        assert_eq!(
+            matches!(
+                ADAPTER
+                    .workspace_trust(&fixture.path, &fixture.env, None)
+                    .unwrap(),
+                Trust::Trusted(_)
+            ),
+            expected,
+            "{decision}"
+        );
+    }
+}

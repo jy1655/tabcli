@@ -470,7 +470,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
   `consent/record.rs` owns TAB's consent Record and command, with the one consent rule for
   every provider (exact trust, else the consent of the main working tree of a linked git
-  worktree that `consent/worktree.rs` verifies from a stated subset of Git's own files);
+  worktree that `consent/worktree.rs` verifies from a stated subset of Git's own files, once a
+  screen that asks only each adapter's store-only `store_lists_trusted` has passed);
   `consent/authority.rs` owns the one answer whether a target provider may treat a session's
   workspace as consented now, which every launch option, the dialog step, the Agy paste gate
   and doctor ask, without writing, and `admit_spawn`, which the spawn fence in

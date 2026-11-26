@@ -485,3 +485,172 @@ fn a_recheck_requires_the_pins_and_acquires_nothing() {
         );
     }
 }
+
+// A FIFO at `path`, so that opening it is observable.
+#[cfg(unix)]
+fn fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+// Whether anything opened the FIFO at `path` for reading while it was watched: a writer opened
+// without blocking succeeds only while a reader has the FIFO open, and then lets that reader
+// go on as a real `HEAD` would.
+#[cfg(unix)]
+struct Opened {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    watcher: std::thread::JoinHandle<bool>,
+}
+
+#[cfg(unix)]
+impl Opened {
+    fn watch(path: &Path) -> Self {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (stop, path) = (stop.clone(), path.to_owned());
+            std::thread::spawn(move || {
+                let mut opened = false;
+                while !stop.load(Ordering::SeqCst) {
+                    match fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                    {
+                        Ok(mut reader_present) => {
+                            opened = true;
+                            let _ = reader_present.write_all(b"ref: refs/heads/main\n");
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    }
+                }
+                opened
+            })
+        };
+        Self { stop, watcher }
+    }
+
+    fn stop(self) -> bool {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.watcher.join().unwrap()
+    }
+}
+
+// Router's answer to the open question of round 3: the screen asks each provider's own store
+// alone, never a reader that touches the path. A `.git` file that names a main working tree no
+// store lists makes TAB open nothing and run nothing there. A reader that probes the claimed
+// path's ancestors would find the `.git` above this destination and run `git` in it, and Git
+// opens the `HEAD` it finds there: here a FIFO, whose opening is observable. A stat leaves no
+// trace a test can observe; each adapter's own test shows that its store-only answer needs
+// none.
+#[cfg(unix)]
+#[test]
+fn a_destination_that_no_store_lists_is_never_opened_and_runs_no_git() {
+    let (temp, fixture, git) = worktree_setup();
+    let root = temp.path().canonicalize().unwrap();
+    let share = root.join("share");
+    let destination = share.join("repository");
+    let gitdir = destination.join(".git");
+    fs::create_dir_all(share.join(".git")).unwrap();
+    for directory in ["objects", "refs", "worktrees/worktree"] {
+        fs::create_dir_all(gitdir.join(directory)).unwrap();
+    }
+    let head = gitdir.join("HEAD");
+    fifo(&head);
+    fs::write(
+        git.worktree.join(".git"),
+        format!("gitdir: {}\n", git_path(&gitdir.join("worktrees/worktree"))),
+    )
+    .unwrap();
+    // The stores list other folders only: the worktree's real main working tree, the
+    // destination's parent, and (for Pi, positively) an ancestor of it.
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    trust(&fixture, FirstPartyCli::Claude, &share);
+    trust_pi(&fixture, &root);
+    let opened = Opened::watch(&head);
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert!(!opened.stop(), "the destination's HEAD was opened");
+    assert_eq!(assessment.state, "unverified");
+    assert_eq!(assessment.repository_root, None);
+    assert!(!record_path(temp.path(), &destination).exists());
+}
+
+// On Windows a destination on a network share that no store lists is refused by the composed
+// screen before any I/O on it: the assessment does not wait on the network. Runs on the Windows
+// CI runner only.
+#[cfg(windows)]
+#[test]
+fn a_share_that_no_store_lists_is_never_reached() {
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    trust(
+        &fixture,
+        FirstPartyCli::Claude,
+        Path::new(r"\\tab-test.invalid\share"),
+    );
+    fs::write(
+        git.worktree.join(".git"),
+        "gitdir: //tab-test.invalid/share/repository/.git/worktrees/worktree\n",
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(assessment.state, "unverified");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+// A main working tree that only Claude's store lists passes the screen, and Claude's own reader
+// then decides its consent as for any exact folder: the worktree inherits it.
+#[test]
+fn a_main_working_tree_that_only_claude_trusts_still_gives_inheritance() {
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    trust_pi(
+        &fixture,
+        &temp.path().canonicalize().unwrap().join("elsewhere"),
+    );
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert_eq!(assessment.detail, INHERITED_DETAIL);
+    assert_eq!(
+        assessment.source,
+        Some(exact(&fixture, FirstPartyCli::Claude, &git.repository))
+    );
+    assert_eq!(
+        assessment.repository_root,
+        Some(identity(&git.repository).unwrap())
+    );
+}
+
+// The screen is a necessary condition only, never consent. Claude's store lists the main working
+// tree, but Claude's own reader refuses it as an exact folder: a repository above it makes the
+// reader ask Git, which cannot read this repository's format. The worktree inherits nothing and
+// nothing is recorded for the main working tree; once the reader accepts it, the same store
+// gives inheritance.
+#[test]
+fn a_main_working_tree_that_a_store_lists_but_its_reader_refuses_gives_nothing() {
+    let (temp, fixture, git) = worktree_setup();
+    let root = temp.path().canonicalize().unwrap();
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    let config = git.repository.join(".git/config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("[core]\n\trepositoryformatversion = 99\n");
+    fs::write(&config, text).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    assert!(
+        provider::workspace_trust(FirstPartyCli::Claude, &git.repository, &fixture.env, None)
+            .is_err()
+    );
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(assessment.state, "unverified");
+    assert_eq!(assessment.repository_root, None);
+    assert!(!record_path(temp.path(), &git.repository).exists());
+    fs::remove_dir(root.join(".git")).unwrap();
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert_eq!(assessment.detail, INHERITED_DETAIL);
+    assert!(record_path(temp.path(), &git.repository).exists());
+}

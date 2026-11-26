@@ -9,8 +9,10 @@
 //! 1. `W/.git` is a regular file, reached without a link, holding `gitdir: <path>` and only line
 //!    endings after it. The path is absolute, or relative to `W` as Git resolves it.
 //! 2. Lexically, with no I/O on what it names, the path claims `<main>/.git/worktrees/<id>`.
-//!    The caller's screen must find exact consent evidence for exactly `<main>` before any I/O
-//!    on it, so an untrusted or unknown destination (a share, an automount) is never touched.
+//!    Before any I/O on `<main>`, the caller's screen must find a provider whose own store lists
+//!    exactly `<main>` as trusted, answered from the store alone (no I/O on the path or its
+//!    ancestors, no `git`), so a destination no store lists (a share, an automount) is never
+//!    touched. The screen is a necessary condition only; consent is assessed afterwards.
 //! 3. The same path is walked component by component from `W` (or from its root): each
 //!    component is inspected before the next, none is a link (on Windows, no reparse point),
 //!    every one is a directory, and `..` steps back only over a directory just inspected.
@@ -20,6 +22,7 @@
 //!    is walked the same way from the registration and compared by file identity, never by
 //!    name.
 use anyhow::{Context, Result, bail, ensure};
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -30,8 +33,8 @@ const POINTER_LIMIT: u64 = 64 * 1024;
 /// The main working tree of the repository that registered `workspace` as a linked worktree.
 /// `Ok(None)` is a workspace without a `.git` file: no worktree root, or a main working tree.
 /// An `Err` is a `.git` file whose registration does not verify, or whose claimed main working
-/// tree `trusted` does not find exact consent evidence for. `trusted` is asked with the main
-/// working tree's lexical path before any I/O on it. `workspace` is canonical.
+/// tree the screen `trusted` refuses. `trusted` is asked with the main working tree's lexical
+/// path before any I/O on it, and must itself do none. `workspace` is canonical.
 pub(super) fn main_worktree(
     workspace: &Path,
     trusted: &mut dyn FnMut(&Path) -> bool,
@@ -54,7 +57,7 @@ pub(super) fn main_worktree(
         .context("the gitdir is not a linked worktree registration of a main working tree")?;
     ensure!(
         trusted(&main),
-        "the main working tree that the .git file names has no exact consent evidence"
+        "no provider's store lists the main working tree that the .git file names as trusted"
     );
     let registration = walk(workspace, target, Kind::Directory)?;
     let common = registration
@@ -112,7 +115,7 @@ fn claimed_main(base: &Path, target: &Path) -> Result<Option<PathBuf>> {
     let (mut path, components) = start(base, target)?;
     for component in components {
         match component {
-            Component::Normal(part) => path.push(part),
+            Component::Normal(part) => path.push(name(part)?),
             Component::CurDir => {}
             Component::ParentDir => {
                 ensure!(path.pop(), "a path in Git's files leaves its volume")
@@ -138,7 +141,11 @@ fn claimed_main(base: &Path, target: &Path) -> Result<Option<PathBuf>> {
 }
 
 // The directory a walk or a lexical resolution starts from, and the components after it: an
-// absolute `target` from its own root, a relative one from `base`.
+// absolute `target` from its own root, a relative one from `base`. On Windows an absolute root
+// is spelled as `canonicalize` spells it (`\\?\C:\`, `\\?\UNC\server\share\`), the spelling the
+// relative case inherits from the canonical `base`, so the screen is asked about the path an
+// exact-folder lookup would key, and every walk addresses the file system without Win32's
+// rewriting of the names.
 fn start<'a>(
     base: &Path,
     target: &'a Path,
@@ -147,14 +154,46 @@ fn start<'a>(
     if !target.is_absolute() {
         return Ok((base.to_owned(), components));
     }
-    let mut root = PathBuf::new();
-    while let Some(component @ (Component::Prefix(_) | Component::RootDir)) =
-        components.peek().copied()
-    {
-        root.push(component.as_os_str());
+    #[cfg(windows)]
+    let root = match components.next() {
+        Some(Component::Prefix(prefix)) => verbatim_root(prefix.kind())?,
+        _ => bail!("an absolute path in Git's files has no volume"),
+    };
+    #[cfg(not(windows))]
+    let root = PathBuf::from("/");
+    if components.peek() == Some(&Component::RootDir) {
         components.next();
     }
     Ok((root, components))
+}
+
+// The verbatim root of a volume as `canonicalize` spells it: the drive letter in upper case, a
+// share by its server and share names. A device namespace or a volume named by its object name
+// is no root Git writes for a working tree.
+#[cfg(windows)]
+fn verbatim_root(prefix: std::path::Prefix<'_>) -> Result<PathBuf> {
+    use std::path::Prefix::{Disk, UNC, VerbatimDisk, VerbatimUNC};
+    Ok(PathBuf::from(match prefix {
+        Disk(letter) | VerbatimDisk(letter) => {
+            format!(r"\\?\{}:\", char::from(letter.to_ascii_uppercase()))
+        }
+        UNC(server, share) | VerbatimUNC(server, share) => format!(
+            r"\\?\UNC\{}\{}\",
+            server.to_str().context("a share name is not UTF-8")?,
+            share.to_str().context("a share name is not UTF-8")?
+        ),
+        _ => bail!("a path in Git's files names a device or a volume by its object name"),
+    }))
+}
+
+// One name of a path in Git's files. A verbatim Windows path does not split at `/`, but pushing
+// such a name would add components that were never inspected one by one.
+fn name(part: &OsStr) -> Result<&OsStr> {
+    ensure!(
+        !part.as_encoded_bytes().contains(&b'/'),
+        "a name in a path in Git's files holds a separator"
+    );
+    Ok(part)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -178,7 +217,7 @@ fn walk(base: &Path, target: &Path, kind: Kind) -> Result<PathBuf> {
     for (index, component) in components.into_iter().enumerate() {
         match component {
             Component::Normal(part) => {
-                path.push(part);
+                path.push(name(part)?);
                 let metadata = fs::symlink_metadata(&path)
                     .with_context(|| format!("{} cannot be read", path.display()))?;
                 ensure!(!is_link(&metadata), "{} is a link", path.display());

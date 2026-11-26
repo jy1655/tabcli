@@ -1767,3 +1767,48 @@ fn resume_plan_is_the_complete_command_for_every_policy() {
         }
     }
 }
+
+// Consent's worktree screen asks only Claude's store. Claude's full lookup first probes `.git` in
+// the path's ancestors and runs Git there, which fails for this path; the store-only answer
+// touches neither the path nor its ancestors and is the store's exact, positive decision.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent;
+    let fixture = super::super::UntouchedPath::new();
+    let store = fixture.home.join(".claude.json");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, accepted, expected) in [
+        (&fixture.path, true, true),
+        (&fixture.path, false, false),
+        (&parent, true, false),
+    ] {
+        let native = consent::native_key(listed).unwrap();
+        let key = if cfg!(windows) {
+            native.replace('\\', "/")
+        } else {
+            native
+        };
+        crate::native::session::primitives::write_json_atomic(
+            &store,
+            &serde_json::json!({"projects":{key:{"hasTrustDialogAccepted":accepted}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env)
+                .unwrap(),
+            expected,
+            "{accepted}"
+        );
+        assert!(
+            ADAPTER
+                .workspace_trust(&fixture.path, &fixture.env, None)
+                .is_err()
+        );
+    }
+}

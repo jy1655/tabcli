@@ -393,6 +393,19 @@ impl NativeProviderAdapter for AgyAdapter {
         })
     }
 
+    // `workspace_trust` is already store-only: it resolves the store from `env`, reads that
+    // file, and compares `workspace` as a string key.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::super::consent::Environment,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.workspace_trust(workspace, env, None)?,
+            super::super::consent::Trust::Trusted(_)
+        ))
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // An independent Agy launch and its descendants must not carry the caller's
         // Codex identity/shutdown context or Claude identity/inbox.

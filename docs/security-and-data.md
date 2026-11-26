@@ -56,15 +56,19 @@ worktrees. A provider that declines the worktree itself, either the source of th
 the provider being launched, stops it too.
 
 TAB reads the worktree's `.git` file and the registration it names without running `git`. Before
-it touches the main working tree that the file names, a provider must already trust exactly that
-path, so a `.git` file cannot make TAB reach an untrusted folder or network share. It then checks
-the registration in both directions by file identity, absolute and relative registrations
+it touches the main working tree that the file names, TAB asks each provider whether its own
+store lists exactly that path as trusted, answered from the store alone, with no I/O on the path
+or its ancestors and no `git`; a path that no store lists is never touched, so a `.git` file
+cannot make TAB reach an untrusted folder or network share. TAB then checks the registration in
+both directions by file identity, absolute and relative registrations
 (`git worktree add --relative-paths`) alike, and refuses a path through a symbolic link or
 junction, a submodule, a bare repository, and a main working tree whose `.git` points to a common
-directory of its own. TAB does not evaluate Git configuration, `HEAD`, objects or refs: a
-repository whose configuration moves its working tree (`core.worktree`) or uses unusual extensions
-is judged by its registration alone. The record then also names the main working tree
-(`repository_root`).
+directory of its own. The screen is a necessary condition only, never consent: after these checks
+the main working tree's own consent is assessed as for any exact folder, and a path that a store
+lists but its provider's reader refuses gives no inheritance. TAB does not evaluate Git
+configuration, `HEAD`, objects or refs: a repository whose configuration moves its working tree
+(`core.worktree`) or uses unusual extensions is judged by its registration alone. The record
+then also names the main working tree (`repository_root`).
 
 TAB checks consent again at every use, not only at launch, and consumes it at the act: when a
 provider option is planned and again immediately before the provider starts, immediately before

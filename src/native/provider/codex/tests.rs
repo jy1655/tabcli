@@ -1067,3 +1067,57 @@ fn lifecycle_binding_and_stop_keep_the_claim_pending() {
         Some(claim.token())
     );
 }
+
+// Consent's worktree screen asks only Codex's store: the answer about a path that nothing may
+// touch comes from the store alone and is the store's exact, positive decision. Codex's full
+// lookup reads only the store too, so it answers the same for that path, unchanged.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent::{self, Trust};
+    let fixture = super::super::UntouchedPath::new();
+    std::fs::create_dir(fixture.home.join(".codex")).unwrap();
+    let store = fixture.home.join(".codex").join("config.toml");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, level, expected) in [
+        (&fixture.path, "trusted", true),
+        (&fixture.path, "untrusted", false),
+        (&parent, "trusted", false),
+    ] {
+        let mut key = consent::native_key(listed).unwrap();
+        if cfg!(windows) {
+            key = key.to_lowercase();
+        }
+        let _ = std::fs::remove_file(&store);
+        crate::native::session::primitives::write_private(
+            &store,
+            format!(
+                "[projects.{}]\ntrust_level = \"{level}\"\n",
+                serde_json::to_string(&key).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env)
+                .unwrap(),
+            expected,
+            "{level}"
+        );
+        assert_eq!(
+            matches!(
+                ADAPTER
+                    .workspace_trust(&fixture.path, &fixture.env, None)
+                    .unwrap(),
+                Trust::Trusted(_)
+            ),
+            expected,
+            "{level}"
+        );
+    }
+}
