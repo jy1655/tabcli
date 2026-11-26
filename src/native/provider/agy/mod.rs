@@ -659,24 +659,25 @@ fn new_session_settings(directory: &Path) -> Result<(std::fs::File, PathBuf)> {
     Ok((file, path.to_path_buf()))
 }
 
-// Removes a settings file that no plan was granted, and returns the plan's `error`, naming the
-// file when it could not be removed: no Agy was started with it, and it stays with the session's
-// records until `prune-sessions` removes the session directory.
+// Removes a settings file that no plan was granted, durably (the session directory is synced
+// after the unlink; review r7, finding 2), and returns the plan's `error`, naming the file when
+// it could not be removed or its removal could not be made durable: no Agy was started with it,
+// and a file left stays with the session's records until `prune-sessions` removes the session
+// directory.
 fn discard_ungranted(file: &Path, error: anyhow::Error) -> anyhow::Error {
-    let removed = crate::native::session::primitives::fault_point(
-        "removing a settings file that no plan was granted",
-    )
-    .and_then(|()| match std::fs::remove_file(file) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-        _ => Ok(()),
-    });
-    match removed {
-        Ok(()) => error,
-        Err(removal) => error.context(format!(
-            "the settings file {} that no plan was granted could not be removed ({removal:#}); no Agy was started with it",
-            file.display()
-        )),
-    }
+    let Err(removal) = crate::native::session::primitives::remove_file_if_present(file) else {
+        return error;
+    };
+    let outcome = match std::fs::symlink_metadata(file) {
+        Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {
+            "was removed, but its removal could not be made durable"
+        }
+        _ => "could not be removed",
+    };
+    error.context(format!(
+        "the settings file {} that no plan was granted {outcome} ({removal:#}); no Agy was started with it",
+        file.display()
+    ))
 }
 
 // The single settings file of a session that this change's earlier build (a52af49) launched,

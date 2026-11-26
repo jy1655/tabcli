@@ -27,10 +27,16 @@
   plan carries the option, the workspace it was granted for and that file's path and digest to
   the spawn fence, which asks the authority about this command again immediately before the
   provider starts and refuses the command unless the file at that path holds bytes of that
-  digest (a byte-identical replacement at the same path is accepted). Removal: the plan owns the
-  file from its exclusive creation until the grant is made (review r6, finding 2), so a write
-  that fails once the file exists (a failed directory sync can follow a complete file) or a grant
-  that is not made removes it, and a removal that fails is reported with the file's path; a plan
+  digest and passes the provider store reader's check (owner and access; Trust Store Boundary): a
+  replacement with the same bytes passes only if it is a regular file that no other account can
+  change, and a refusal by the reader names the file and the reader's reason (review r7, finding
+  5). Removal: the plan owns the file from its exclusive creation until the grant is made (review
+  r6, finding 2), so a write that fails once the file exists (a failed directory sync can follow
+  a complete file) or a grant that is not made removes it; the removal is made durable (the
+  session directory is synced after it), and a removal that fails or whose sync fails is reported
+  with the file's path (review r7, finding 2). A grant whose record write fails after the record
+  was replaced returns the applied marker to its earlier value under the record's lock, keeping
+  an earlier plan's marker, and reports a return that fails (review r7, finding 1). A plan
   refused before (the workspace check) writes none. The files stay with the session's other
   records after it ends, as do those of a plan refused at the spawn fence and of a wrapper that
   crashed before recording the marker (inert: no Agy was started with them), until

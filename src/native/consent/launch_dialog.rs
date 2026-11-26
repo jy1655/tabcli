@@ -193,7 +193,29 @@ struct OpenDialog<'a> {
     guarded_key: GuardedKey,
 }
 
+// A test's hook that runs at the start of every liveness check of the dialog step, with whether
+// the step has responded: a test lets time pass during that check there.
+#[cfg(test)]
+type LivenessHook = Box<dyn FnMut(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    static DURING_LIVENESS_CHECK: std::cell::RefCell<Option<LivenessHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn during_liveness_check(hook: Option<LivenessHook>) {
+    DURING_LIVENESS_CHECK.with(|slot| *slot.borrow_mut() = hook);
+}
+
 fn require_launch_dialog_live(directory: &Path, responded: bool) -> Result<()> {
+    #[cfg(test)]
+    DURING_LIVENESS_CHECK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(responded);
+        }
+    });
     let status = Reader::open_unchecked(directory)
         .status()
         .map_err(|error| launch_dialog_error(error, responded))?;
@@ -315,17 +337,21 @@ impl LaunchDialog<'_> {
                     .map_err(|error| launch_dialog_error(error, responded))?,
                 Trust::Trusted(_)
             );
+            // The time of a confirmation is the time of the store read that shows it, taken before
+            // the liveness check that follows (review r7, finding 3).
+            let confirmed_at = (trusted && responded).then(|| clock.now());
             require_launch_dialog_live(directory, responded)?;
             if trusted {
-                if responded {
+                if let Some(confirmed_at) = confirmed_at {
                     // Recorded only within the step's deadline (review r4, finding 5; review r5,
                     // finding 5): a confirmation first observed at or after it is reported as
                     // observed late. A confirmation observed in time whose record cannot take it
                     // in time (the lock held until the deadline, or the deadline reached once the
-                    // lock is held, checked on the same clock and boundary as here) is reported as
-                    // confirmed with its recording failed (review r6, finding 4). Nothing is sent
-                    // again either way, and the pending marker stays.
-                    if clock.now() >= deadline {
+                    // lock is held, on the same clock and boundary as here, also during the
+                    // liveness check above) is reported as confirmed with its recording failed
+                    // (review r6, finding 4). Nothing is sent again either way, and the pending
+                    // marker stays.
+                    if confirmed_at >= deadline {
                         bail!(
                             "provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried"
                         );

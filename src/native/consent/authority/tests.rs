@@ -529,3 +529,48 @@ fn the_spawn_fence_refuses_a_grant_whose_option_file_is_not_the_one_its_plan_wro
             .contains("the launch option's file is not the one its plan wrote")
     );
 }
+
+// Review r7, finding 5: the spawn fence reads the option's file as a provider trust store is read
+// before it compares the digest. A replacement with the plan's own bytes that another account
+// could change is refused, and the refusal names the file and the reader's reason, so that it is
+// not mistaken for changed contents.
+#[cfg(unix)]
+#[test]
+fn the_spawn_fence_names_an_option_file_that_another_account_could_change() {
+    use super::super::record::apply_option;
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, workspace, fixture) = setup();
+    trust_pi(&fixture, &workspace);
+    let session = launched(&workspace, &fixture);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["provider"] = serde_json::json!("agy");
+    write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
+    let file = session.directory.join("agy-session-trust-fixture.json");
+    let bytes = br#"{"trustedWorkspaces":["fixture"]}"#;
+    write_private(&file, bytes).unwrap();
+    let grant = apply_option(
+        &session.directory,
+        FirstPartyCli::Agy,
+        "agy-settings-override",
+        &workspace,
+        Some((&file, bytes)),
+    )
+    .unwrap();
+    let admit = || {
+        admit_launch_with(&session.directory, &grant, &fixture.env).map_err(|e| format!("{e:#}"))
+    };
+    admit().unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o660)).unwrap();
+    let error = admit().unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "the launch option's file {} cannot be read as a regular file that only this user can change",
+            file.display()
+        )) && error.contains("not owned and writable only by the current user"),
+        "{error}"
+    );
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    admit().unwrap();
+}

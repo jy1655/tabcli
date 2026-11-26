@@ -110,12 +110,15 @@ a settings file for that session only (`--settings`, which Agy documents as neve
 key is sent and Agy's own store is not written. TAB creates that file in the session directory as
 `agy-session-trust-<random>.json`, a new one for each launch plan granted the setting, so one
 session can hold several. Immediately before Agy starts, TAB checks the file at the path the plan
-named against the digest of the bytes the plan wrote: a changed or missing file stops the launch,
-while a byte-identical replacement at the same path is accepted. If a plan fails after creating
-its file and before the setting is granted, it removes the file again; if that removal fails, its
-error names the file. Every other such file stays with the session's records after the session
-ends, until `prune-sessions` removes the session directory.
-Only Agy 1.5.17 on macOS has been measured
+named against the digest of the bytes the plan wrote, and reads it only as it reads a provider
+trust store: a regular file, not a link, that you own and that no other account can change (on
+Unix without group or other write permission; on Windows under the owner and access-list rule for
+trust stores in [Local records](#local-records)). A changed or missing file stops the launch. A replacement at the same path with the same bytes is accepted only if it passes that
+check too; otherwise the error names the file and the reason. If a plan fails after creating its
+file and before the setting is granted, it removes the file again and leaves the session's
+record as it was; if that removal fails or cannot be made durable, its error names the file.
+Every other such file stays with the session's records after the session ends, until
+`prune-sessions` removes the session directory. Only Agy 1.5.17 on macOS has been measured
 (standalone, and through TAB on Herdr in a new worktree): no trust dialog, and its store
 unchanged. For an ordinary folder that only another provider trusts, this changes what 0.4.49
 did with Agy: in iTerm2, Terminal.app and the native Windows console TAB used to answer Agy's

@@ -407,8 +407,11 @@ fn decide(
 // be read inherits nothing while a start looks for inheritance; at a recheck it is an error, so
 // the authority reports it as unreadable rather than as missing trust (review r3, finding 12).
 // A missing file or folder is a fact, not unreadable evidence: the worktree is no longer
-// registered, or its main working tree is gone. TAB's own shared record of the main working tree
-// that cannot be read or decoded is an error at a recheck, as the workspace's own record is.
+// registered, or its main working tree is gone, as the verifier's own reads find it. A pinned
+// source's reader that touches the main working tree itself (Claude's scope probe) and fails is
+// the source's evidence that cannot be read, also when the folder went during that probe (review
+// r7, finding 4). TAB's own shared record of the main working tree that cannot be read or
+// decoded is an error at a recheck, as the workspace's own record is.
 fn inherited(
     root: &Path,
     workspace: &Path,
@@ -614,6 +617,10 @@ fn with_session_record<T>(
 /// nothing (review r4, finding 2).
 /// `option_file` is a file the option names (Agy's settings) and the bytes the plan wrote to it:
 /// the grant names it, and the spawn fence refuses a command whose file is not that one.
+/// A write that fails can already have replaced the record (the replacement comes before the
+/// syncs that make it durable): the record is then returned to its earlier value under the same
+/// lock, so no marker names a command that is never built, and an earlier plan's marker stays
+/// (review r7, finding 1).
 pub(in crate::native) fn apply_option(
     directory: &Path,
     provider: FirstPartyCli,
@@ -623,8 +630,17 @@ pub(in crate::native) fn apply_option(
 ) -> Result<super::authority::LaunchGrant> {
     with_session_record(directory, None, |path, mut assessment| {
         command_workspace(&assessment, workspace)?;
+        let earlier = assessment.clone();
         assessment.applied = Some(marker.to_owned());
-        RecordStore::at(path).write_json(&assessment)?;
+        if let Err(error) = RecordStore::at(path).write_json(&assessment) {
+            return Err(match restore_earlier(path, &earlier) {
+                Ok(()) => error,
+                Err(restore) => error.context(format!(
+                    "the session's consent record may still name the launch option {marker}, which no command carries: returning it to {} failed ({restore:#})",
+                    earlier.applied.as_deref().unwrap_or("none")
+                )),
+            });
+        }
         Ok(super::authority::LaunchGrant {
             provider,
             marker,
@@ -635,6 +651,18 @@ pub(in crate::native) fn apply_option(
             }),
         })
     })
+}
+
+// Returns the session record at `path`, whose lock the caller holds, to `earlier` unless it
+// already holds `earlier`'s applied value.
+fn restore_earlier(path: &Path, earlier: &Assessment) -> Result<()> {
+    if RecordReader::at(path)
+        .json::<Assessment>()
+        .is_ok_and(|now| now.applied == earlier.applied)
+    {
+        return Ok(());
+    }
+    RecordStore::at(path).write_json(earlier)
 }
 
 /// Checks, before a plan publishes anything for its option, that the session's consent record

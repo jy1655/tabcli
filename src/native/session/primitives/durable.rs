@@ -56,6 +56,8 @@ pub(in crate::native) fn rename_session_file(from: &Path, to: &Path) -> Result<(
 #[cfg(test)]
 thread_local! {
     static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The one boundary that fails, once, while `with_fault_at` runs.
+    static FAULT_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
         const { std::cell::RefCell::new(None) };
     /// Directories whose sync fails with an injected error while `with_sync_failure` runs.
@@ -82,6 +84,10 @@ pub(in crate::native) enum SyncRecord {
 pub(in crate::native) fn fault_point(label: &str) -> Result<()> {
     #[cfg(test)]
     {
+        if FAULT_AT.with(|at| at.borrow().as_deref() == Some(label)) {
+            FAULT_AT.with(|at| at.borrow_mut().take());
+            bail!("injected fault before {label}");
+        }
         FAULT_BUDGET.with(|budget| match budget.get() {
             None => Ok(()),
             Some(0) => bail!("injected fault before {label}"),
@@ -108,6 +114,17 @@ pub(in crate::native) fn with_fault_budget<T>(budget: usize, run: impl FnOnce() 
     FAULT_BUDGET.with(|cell| cell.set(Some(budget)));
     let outcome = run();
     FAULT_BUDGET.with(|cell| cell.set(None));
+    outcome
+}
+
+/// Runs `run` while the first boundary named `label` fails, once, with an injected error; every
+/// other boundary passes. Unlike a fault budget, which models a process that stopped, this models
+/// one step that failed while the process goes on.
+#[cfg(test)]
+pub(in crate::native) fn with_fault_at<T>(label: &str, run: impl FnOnce() -> T) -> T {
+    FAULT_AT.with(|at| *at.borrow_mut() = Some(label.to_owned()));
+    let outcome = run();
+    FAULT_AT.with(|at| at.borrow_mut().take());
     outcome
 }
 

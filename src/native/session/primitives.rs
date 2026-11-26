@@ -15,7 +15,7 @@ pub(in crate::native) use durable::{
 };
 #[cfg(test)]
 pub(in crate::native) use durable::{
-    SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
+    SyncRecord, injected_fault, injected_sync_failure, with_fault_at, with_fault_budget,
     with_publication_read_log, with_sync_failure, with_sync_log,
 };
 #[cfg(any(unix, windows))]

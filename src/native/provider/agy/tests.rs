@@ -867,3 +867,117 @@ fn a_settings_file_that_no_plan_was_granted_is_removed_or_named() {
     );
     assert_eq!(applied().as_deref(), Some(APPLIED_MARKER));
 }
+
+// A session directory for one Agy launch in its own state root, the launch context's workspace,
+// and the plan of `session_trust_settings` with consent granted, returning the file it applied.
+struct SettingsPlan {
+    _home: tempfile::TempDir,
+    directory: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+}
+
+impl SettingsPlan {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let directory = consented_launch_session(&root, &workspace);
+        Self {
+            _home: home,
+            directory,
+            workspace,
+        }
+    }
+
+    fn plan(&self) -> Result<Option<std::path::PathBuf>> {
+        session_trust_settings(
+            &launch_context(&self.directory, &self.workspace, false, "1.5.17"),
+            &mut |_| Ok(consented(crate::native::consent::Consented::Exact)),
+        )
+        .map(|planned| planned.map(|(file, _)| file))
+    }
+
+    fn applied(&self) -> Option<String> {
+        crate::native::consent::observe(&self.directory)
+            .applied_marker()
+            .map(str::to_owned)
+    }
+}
+
+// Review r7, finding 1: a grant that fails after the session record was replaced (the existing
+// fault point after the rename, before the syncs that make it durable) returns the record's
+// applied marker to what it held before, under the record's lock, so no marker names a command
+// that was never built; an earlier plan's marker stays, with its file. A return that fails too
+// (a process that stopped there) is reported with the marker it may leave.
+#[test]
+fn a_failed_grant_returns_the_applied_marker_to_its_earlier_value() {
+    use crate::native::session::primitives::{injected_fault, with_fault_at, with_fault_budget};
+    const AFTER_RENAME: &str = "syncing a renamed record";
+    let s = SettingsPlan::new();
+    let error = with_fault_at(AFTER_RENAME, || s.plan()).unwrap_err();
+    assert!(injected_fault(&error), "{error:#}");
+    assert_eq!(s.applied(), None);
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+
+    // The return fails as well: the error says which marker the record may still show.
+    let error = with_fault_budget(6, || s.plan()).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(&format!("injected fault before {AFTER_RENAME}"))
+            && text.contains(&format!(
+                "may still name the launch option {APPLIED_MARKER}"
+            )),
+        "{text}"
+    );
+    for name in settings_names(&s.directory) {
+        std::fs::remove_file(s.directory.join(name)).unwrap();
+    }
+
+    // An earlier plan's marker and file stay when a later plan's grant fails.
+    let s = SettingsPlan::new();
+    let first = s.plan().unwrap().unwrap();
+    let error = with_fault_at(AFTER_RENAME, || s.plan()).unwrap_err();
+    assert!(injected_fault(&error), "{error:#}");
+    assert_eq!(s.applied().as_deref(), Some(APPLIED_MARKER));
+    assert_eq!(
+        settings_names(&s.directory),
+        [first.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+}
+
+// Review r7, finding 2: the removal of a settings file that no plan was granted is made durable:
+// the session directory is synced after the unlink, as after the file's creation. A removal
+// whose sync fails names the file in the plan's error.
+#[test]
+fn the_removal_of_an_ungranted_settings_file_is_durable_or_named() {
+    use crate::native::session::primitives::{SyncRecord, with_sync_failure, with_sync_log};
+    let s = SettingsPlan::new();
+    // The grant is not made (the session record's lock is not a file).
+    let lock = s.directory.join("workspace-consent.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let (outcome, log) = with_sync_log(|| s.plan());
+    assert!(
+        format!("{:#}", outcome.unwrap_err()).contains("invalid workspace consent lock"),
+        "{log:?}"
+    );
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+    let directory_syncs = log
+        .iter()
+        .filter(|record| **record == SyncRecord::Directory(s.directory.clone()))
+        .count();
+    // The file's creation, then its removal.
+    assert_eq!(directory_syncs, 2, "{log:?}");
+    std::fs::remove_dir(&lock).unwrap();
+
+    // Every sync of the session directory fails: the file is written and removed, and the error
+    // says that its removal could not be made durable, naming the file.
+    let error = with_sync_failure(&s.directory, || s.plan()).unwrap_err();
+    let text = format!("{error:#}");
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+    assert!(
+        text.contains(&*s.directory.join("agy-session-trust-").to_string_lossy())
+            && text.contains("could not be made durable"),
+        "{text}"
+    );
+}

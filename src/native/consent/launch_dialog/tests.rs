@@ -1805,3 +1805,68 @@ fn a_recording_at_exactly_the_deadline_is_not_made() {
         Some(RESPONSE_PENDING)
     );
 }
+
+// Review r7, finding 3: the time of the provider's confirmation is taken right after the store
+// read that shows it, before the liveness check that follows. A liveness check during which the
+// deadline passes (here an hour passes in it) does not make that observation late: the check
+// once the record's lock is held then refuses the recording, and the step reports the trust
+// confirmed and its recording failed. One dispatch; the pending marker stays.
+#[test]
+fn a_liveness_check_that_crosses_the_deadline_does_not_make_the_observation_late() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let mut clock = FakeClock::new(Instant::now());
+    let deadline = clock.now() + Duration::from_secs(3);
+    let shared = clock.shared();
+    // The liveness checks after the response: after the dispatch, at the top of the next round,
+    // and after the store read that shows the confirmation, which takes the hour.
+    let mut after_response = 0;
+    during_liveness_check(Some(Box::new(move |responded| {
+        if responded {
+            after_response += 1;
+            if after_response == 3 {
+                shared.set(shared.get() + Duration::from_secs(3600));
+            }
+        }
+    })));
+    let policy = FakePolicy::default();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = Cell::new(0);
+    let result = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline,
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        &mut clock,
+        &mut scripted(
+            GuardedKey::Taken,
+            || Ok(DIALOG.to_owned()),
+            || {
+                dispatched.set(dispatched.get() + 1);
+                write_json_atomic(
+                    &c.stores.claude,
+                    &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        ),
+    );
+    during_liveness_check(None);
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.starts_with(RECORDING_FAILED)
+            && error.contains(
+                "the deadline was reached when the session's consent record could be changed"
+            ),
+        "{error}"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}
