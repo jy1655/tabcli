@@ -1,5 +1,5 @@
 use super::authority::{Authority, Consented, authority};
-use super::record::{self, LAUNCH_OPTION_UNAVAILABLE, RecordDeadlinePassed, Restore, transition};
+use super::record::{self, LAUNCH_OPTION_UNAVAILABLE, Restore, transition};
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
@@ -104,7 +104,13 @@ fn respond_to_workspace_dialog(
         );
     }
     if assessed == Some(RESPONSE_PENDING)
-        || !transition(directory, assessed, Some(RESPONSE_PENDING), deadline)?
+        || !transition(
+            directory,
+            assessed,
+            Some(RESPONSE_PENDING),
+            deadline,
+            Instant::now,
+        )?
     {
         bail!("workspace consent changed before trust dialog response");
     }
@@ -313,18 +319,23 @@ impl LaunchDialog<'_> {
             if trusted {
                 if responded {
                     // Recorded only within the step's deadline (review r4, finding 5; review r5,
-                    // finding 5): a confirmation first observed after it, or a record that the
-                    // deadline passes before it can be written, is reported as such; a record held
-                    // past it reports the failed record. Nothing is sent again either way.
-                    const LATE: &str = "provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried";
+                    // finding 5): a confirmation first observed at or after it is reported as
+                    // observed late. A confirmation observed in time whose record cannot take it
+                    // in time (the lock held until the deadline, or the deadline reached once the
+                    // lock is held, checked on the same clock and boundary as here) is reported as
+                    // confirmed with its recording failed (review r6, finding 4). Nothing is sent
+                    // again either way, and the pending marker stays.
                     if clock.now() >= deadline {
-                        bail!(LATE);
+                        bail!(
+                            "provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried"
+                        );
                     }
                     transition(
                         directory,
                         Some(RESPONSE_PENDING),
                         Some(RESPONSE_CONFIRMED),
                         deadline,
+                        || clock.now(),
                     )
                     .and_then(|recorded| {
                         ensure!(
@@ -334,11 +345,7 @@ impl LaunchDialog<'_> {
                         Ok(())
                     })
                     .map_err(|error| {
-                        if error.is::<RecordDeadlinePassed>() {
-                            anyhow::anyhow!(LATE)
-                        } else {
-                            error.context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")
-                        }
+                        error.context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")
                     })?;
                 }
                 return Ok(());

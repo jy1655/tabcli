@@ -107,7 +107,15 @@ workspace Agy's own trust store lists exactly keeps its pastes.
 TAB never writes a provider trust store. With verified consent, Codex receives a process-local
 configuration override, Pi receives its one-run approval option, and Agy 1.5.17 or newer receives
 a settings file for that session only (`--settings`, which Agy documents as never saved), so no
-key is sent and Agy's own store is not written. Only Agy 1.5.17 on macOS has been measured
+key is sent and Agy's own store is not written. TAB creates that file in the session directory as
+`agy-session-trust-<random>.json`, a new one for each launch plan granted the setting, so one
+session can hold several. Immediately before Agy starts, TAB checks the file at the path the plan
+named against the digest of the bytes the plan wrote: a changed or missing file stops the launch,
+while a byte-identical replacement at the same path is accepted. If a plan fails after creating
+its file and before the setting is granted, it removes the file again; if that removal fails, its
+error names the file. Every other such file stays with the session's records after the session
+ends, until `prune-sessions` removes the session directory.
+Only Agy 1.5.17 on macOS has been measured
 (standalone, and through TAB on Herdr in a new worktree): no trust dialog, and its store
 unchanged. For an ordinary folder that only another provider trusts, this changes what 0.4.49
 did with Agy: in iTerm2, Terminal.app and the native Windows console TAB used to answer Agy's
@@ -189,23 +197,25 @@ The code uses `HOME` first, then `USERPROFILE`, on both platforms. The override 
 entire root. `settings.json` in that root holds TAB's surface-creation preferences.
 
 Inside a session directory, these are the records most useful when checking a request. Some
-exist only during a turn or after close; `agy.log` and `agy-session-trust.json` are specific to Agy.
+exist only during a turn or after close; `agy.log` and the `agy-session-trust-<random>.json` files
+are specific to Agy. A session holds one such file for each launch plan that was granted the
+session-only setting, so it can hold several.
 
 ```text
 session-example/
-├── manifest.json          Provider, workspace, and launch choices
-├── initial-prompt.txt     Initial prompt as retained for delivery
-├── status.json            Recorded state and error reason
-├── launch.json            Launch claim, deadline, and spawn phase
-├── launch.log             Launch stages, errors, and exit codes
-├── native-session.json    Owner identity used to check the surface
-├── terminal.json          The bound surface
-├── workspace-consent.json Workspace trust source and application
-├── requests/              Receipts connecting requests to results
-├── events/                Recorded turn results
-├── agy.log                Agy readiness, input receipts, and errors
-├── agy-session-trust.json Agy's session-only trust of the workspace, when applied
-└── closed.json            Recorded closed status
+├── manifest.json                   Provider, workspace, and launch choices
+├── initial-prompt.txt              Initial prompt as retained for delivery
+├── status.json                     Recorded state and error reason
+├── launch.json                     Launch claim, deadline, and spawn phase
+├── launch.log                      Launch stages, errors, and exit codes
+├── native-session.json             Owner identity used to check the surface
+├── terminal.json                   The bound surface
+├── workspace-consent.json          Workspace trust source and application
+├── requests/                       Receipts connecting requests to results
+├── events/                         Recorded turn results
+├── agy.log                         Agy readiness, input receipts, and errors
+├── agy-session-trust-<random>.json Agy's session-only workspace trust, one per granted plan
+└── closed.json                     Recorded closed status
 ```
 
 For launch failure details, read `status.json` and `launch.log` alongside `launch.json` and the

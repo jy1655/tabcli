@@ -444,7 +444,7 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     );
     assert_eq!(
         row["evidence"]["session_settings"],
-        serde_json::json!([settings])
+        serde_json::json!({"complete": true, "files": [settings]})
     );
     // Agy's own store must still be readable: the authority asks the target whether it
     // declines the workspace. A read failure withholds the paste and is reported as unreadable
@@ -592,4 +592,55 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
             .unwrap()
             .contains("Repair or restore"),
     );
+}
+
+// Review r6, finding 3: the doctor row of a session whose launch configured the setting lists
+// every settings file the session holds, regular files only: one per granted plan, and the
+// single `agy-session-trust.json` that this change's earlier build wrote. A listing that cannot
+// be completed says so; it is never shown as an observed empty list.
+#[test]
+fn the_doctor_row_lists_the_sessions_settings_files_or_says_the_listing_failed() {
+    use super::super::super::super::consent;
+    use super::super::APPLIED_MARKER;
+    use crate::native::session::primitives::write_private;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (workspace, directory) = consented_session(&root);
+    let env = consent::Environment::at_home(&root);
+    consent::applied(&directory, APPLIED_MARKER).unwrap();
+    let row = || {
+        serde_json::to_value(workspace_trust_check(&workspace, &env, &directory)).unwrap()
+            ["evidence"]["session_settings"]
+            .clone()
+    };
+    let former = directory.join("agy-session-trust.json");
+    let plan = directory.join("agy-session-trust-abc.json");
+    write_private(&former, b"{}").unwrap();
+    write_private(&plan, b"{}").unwrap();
+    fs::create_dir(directory.join("agy-session-trust-dir.json")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&plan, directory.join("agy-session-trust-link.json")).unwrap();
+    assert_eq!(
+        row(),
+        serde_json::json!({"complete": true, "files": [plan, former]})
+    );
+    fs::remove_file(&former).unwrap();
+    fs::remove_file(&plan).unwrap();
+    assert_eq!(row(), serde_json::json!({"complete": true, "files": []}));
+
+    // The directory's entries cannot be listed, while each file can still be opened by name.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o300)).unwrap();
+        let listed = fs::read_dir(&directory).is_ok();
+        let observed = row();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        // A user that may read anything (root) lists the directory anyway.
+        if !listed {
+            assert_eq!(observed["complete"], false, "{observed}");
+            assert!(observed["error"].is_string(), "{observed}");
+            assert!(observed.get("files").is_none(), "{observed}");
+        }
+    }
 }

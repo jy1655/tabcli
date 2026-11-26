@@ -615,61 +615,93 @@ fn session_trust_settings(
     // Review r5, finding 1: the command's workspace is checked against the consent record before
     // anything is published, and this plan's settings file is its own: created new under a random
     // name, private, never replaced by another plan, and named in the grant with its bytes, which
-    // the spawn fence checks again. A plan refused after the file was written removes it.
+    // the spawn fence checks again. Review r6, finding 2: the plan owns the file from its
+    // exclusive creation until the grant is made. A write that fails after the file exists, or a
+    // grant that is not made, removes it, and a removal that fails is reported with its path.
     super::super::consent::check_command_workspace(context.directory, context.workspace)?;
     let key = super::super::consent::native_key(context.workspace)?;
     let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
-    let file = new_session_settings(context.directory, &bytes)?;
-    match super::super::consent::apply_option(
-        context.directory,
-        FirstPartyCli::Agy,
-        APPLIED_MARKER,
-        context.workspace,
-        Some((&file, &bytes)),
-    ) {
+    let (created, file) = new_session_settings(context.directory)?;
+    let granted = crate::native::session::primitives::fill_private(created, &file, &bytes)
+        .and_then(|()| {
+            super::super::consent::apply_option(
+                context.directory,
+                FirstPartyCli::Agy,
+                APPLIED_MARKER,
+                context.workspace,
+                Some((&file, &bytes)),
+            )
+        });
+    match granted {
         Ok(grant) => Ok(Some((file, grant))),
-        Err(error) => {
-            let _ = std::fs::remove_file(&file);
-            Err(error)
-        }
+        Err(error) => Err(discard_ungranted(&file, error)),
     }
 }
 
-// A new private settings file in the session directory, `agy-session-trust-<random>.json`,
-// created only if no file has that name.
-fn new_session_settings(directory: &Path, bytes: &[u8]) -> Result<PathBuf> {
+// A new file in the session directory, `agy-session-trust-<random>.json`, created only if no
+// file has that name, and still empty: the caller owns it from here on.
+fn new_session_settings(directory: &Path) -> Result<(std::fs::File, PathBuf)> {
     let created = tempfile::Builder::new()
         .prefix(SESSION_SETTINGS_PREFIX)
         .suffix(".json")
         .rand_bytes(12)
+        // The plan removes the file itself, and reports a removal that fails.
+        .disable_cleanup(true)
         .make_in(directory, |path| {
-            crate::native::session::primitives::write_private(path, bytes).map_err(|error| {
+            crate::native::session::primitives::create_private(path).map_err(|error| {
                 match error.downcast::<std::io::Error>() {
                     Ok(error) => error,
                     Err(error) => std::io::Error::other(format!("{error:#}")),
                 }
             })
         })?;
-    Ok(created.keep()?.1)
+    let (file, path) = created.into_parts();
+    Ok((file, path.to_path_buf()))
 }
 
-// The settings files that launches of this session wrote, sorted: one per granted plan.
-pub(super) fn session_settings_files(directory: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<_> = std::fs::read_dir(directory)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(SESSION_SETTINGS_PREFIX) && name.ends_with(".json")
-                })
-        })
-        .collect();
+// Removes a settings file that no plan was granted, and returns the plan's `error`, naming the
+// file when it could not be removed: no Agy was started with it, and it stays with the session's
+// records until `prune-sessions` removes the session directory.
+fn discard_ungranted(file: &Path, error: anyhow::Error) -> anyhow::Error {
+    let removed = crate::native::session::primitives::fault_point(
+        "removing a settings file that no plan was granted",
+    )
+    .and_then(|()| match std::fs::remove_file(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    });
+    match removed {
+        Ok(()) => error,
+        Err(removal) => error.context(format!(
+            "the settings file {} that no plan was granted could not be removed ({removal:#}); no Agy was started with it",
+            file.display()
+        )),
+    }
+}
+
+// The single settings file of a session that this change's earlier build (a52af49) launched,
+// before each granted plan had a file of its own; listed by doctor only.
+const FORMER_SESSION_SETTINGS_FILE: &str = "agy-session-trust.json";
+
+// The settings files that launches of this session wrote, sorted: one per granted plan, and
+// the former single file. Only regular files count, never a link or a directory with such a
+// name. An entry that cannot be read makes the listing an error, never a shorter list.
+pub(super) fn session_settings_files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let settings = name == FORMER_SESSION_SETTINGS_FILE
+            || (name.starts_with(SESSION_SETTINGS_PREFIX) && name.ends_with(".json"));
+        if settings && entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
     files.sort();
-    files
+    Ok(files)
 }
 
 // The unstarted transcript watcher a launch plan carries: Agy's own log file of the

@@ -1326,3 +1326,83 @@ fn a_damaged_shared_consent_record_after_resolution_is_an_error_for_the_plan() {
         .is_err()
     );
 }
+
+// Review r6, finding 1: the main working tree of an inherited source lost between its
+// identification and the rest of its assessment while the plan rechecks consent withdraws the
+// inheritance. The plan goes on with a plain command through the production gate, as with a
+// registration that is gone; it does not stop. The recheck reads only the pinned fixture store.
+#[test]
+fn a_main_working_tree_lost_during_the_recheck_plans_a_plain_command() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let nest = root.join("nest");
+    std::fs::create_dir(&nest).unwrap();
+    let git = crate::native::consent::registered(&nest);
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: "codex".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: git.worktree.clone(),
+            title: "worktree".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&git.repository).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &git.worktree, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert!(assessment.repository_root.is_some());
+    let (from, to) = (git.repository.clone(), nest.join("moved"));
+    crate::native::consent::after_main_identified(move |_| std::fs::rename(&from, &to).unwrap());
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &git.worktree,
+            title: "worktree",
+            prompt: "worktree prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .map_err(|error| format!("{error:#}"))
+    .unwrap();
+    assert!(!git.repository.exists());
+    assert!(plan.trust_grant.is_none());
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("projects=")),
+        "{:?}",
+        plan.arguments
+    );
+}

@@ -280,12 +280,24 @@ pub(in crate::native) fn fault_point_keeping_temporary(
 }
 
 pub(in crate::native) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    fill_private(create_private(path)?, path, bytes)
+}
+
+/// The first step of `write_private`: creates `path` only if nothing is there. Once it returns,
+/// the file exists at its final path, empty and not yet private; a caller that must not leave it
+/// behind owns its removal from here on.
+pub(in crate::native) fn create_private(path: &Path) -> Result<File> {
     fault_point("creating a private record file")?;
-    let mut file = OpenOptions::new()
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// The rest of `write_private` for the file `create_private` made at `path`: its private
+/// permissions, `bytes`, and the syncs that make both durable. The file is closed on return.
+pub(in crate::native) fn fill_private(mut file: File, path: &Path, bytes: &[u8]) -> Result<()> {
     // The file now exists at its final path; a fault here leaves it empty, as a stop would.
     fault_point("writing a private record's permissions and content")?;
     set_private_file_permissions(&file)?;

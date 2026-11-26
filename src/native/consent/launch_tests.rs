@@ -123,9 +123,13 @@ impl Harness {
     }
 }
 
+// Claude's one-second settle on Windows: a budget below it sends nothing. The one dispatch comes
+// at 1,000 ms, and the provider's confirmation it causes is first observed one 200 ms polling
+// interval later, at 1,200 ms; a confirmation observed at the deadline is late (review r5, finding
+// 5), so the successful budget is longer than 1,200 ms.
 #[test]
 fn launch_dialog_settle_boundary_and_pending_intent_precede_one_response() {
-    for timeout_ms in [999, 1200] {
+    for timeout_ms in [999, 1201] {
         let h = Harness::new();
         let start = Instant::now();
         let mut clock = FakeClock::new(start);

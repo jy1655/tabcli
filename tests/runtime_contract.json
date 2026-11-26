@@ -58,6 +58,7 @@
     "agy.log": 1,
     "const APPLIED_MARKER: &str = \"agy-settings-override\";": 1,
     "const SESSION_SETTINGS_PREFIX: &str = \"agy-session-trust-\";": 1,
+    "const FORMER_SESSION_SETTINGS_FILE: &str = \"agy-session-trust.json\";": 1,
     "transcript.jsonl": 1,
     "transcript_full.jsonl": 1,
     "const HOOKS_LOADED_SOURCE: &str = \"hooks_manager.go\";": 1,

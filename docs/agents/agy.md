@@ -26,13 +26,20 @@
   so that no other planning attempt for the session replaces it (review r5, finding 1). The
   plan carries the option, the workspace it was granted for and that file's path and digest to
   the spawn fence, which asks the authority about this command again immediately before the
-  provider starts and refuses a file that is not the one the plan wrote. Removal: a plan refused
-  after the file was written removes it; a plan refused before (the workspace check) writes
-  none. The files stay with the session's other records after it ends, as do those of a plan
-  refused at the spawn fence and of a wrapper that crashed before recording the marker (inert:
-  no Agy was started with them), until `tabcli prune-sessions` removes the session directory.
-  0.4.49 ignores them, as every file it does not name, and its prune removes the directory
-  whole. The version is
+  provider starts and refuses the command unless the file at that path holds bytes of that
+  digest (a byte-identical replacement at the same path is accepted). Removal: the plan owns the
+  file from its exclusive creation until the grant is made (review r6, finding 2), so a write
+  that fails once the file exists (a failed directory sync can follow a complete file) or a grant
+  that is not made removes it, and a removal that fails is reported with the file's path; a plan
+  refused before (the workspace check) writes none. The files stay with the session's other
+  records after it ends, as do those of a plan refused at the spawn fence and of a wrapper that
+  crashed before recording the marker (inert: no Agy was started with them), until
+  `tabcli prune-sessions` removes the session directory. Doctor's `agy_workspace_trust` row of a
+  session whose launch applied the setting lists them as `session_settings`: regular files only,
+  including the single `agy-session-trust.json` of a session that this change's earlier build
+  launched, and a listing that could not be completed is marked so, never shown as an empty list
+  (review r6, finding 3). 0.4.49 ignores them, as every file it does not name, and its prune
+  removes the directory whole. The version is
   judged before any consent work. An Agy positively identified as older records only
   `launch-option-unavailable` and is the one Agy launch whose exact consent may still take the
   guarded dialog answer; a version that identifies nothing, or a refused or failing check on a

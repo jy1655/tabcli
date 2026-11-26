@@ -21,7 +21,7 @@ pub(in crate::native) use record::{
     check_command_workspace, observe, option_unavailable, record, run, session_applied,
 };
 #[cfg(test)]
-pub(in crate::native) use record::{applied, prepare, prepare_at_home};
+pub(in crate::native) use record::{after_main_identified, applied, prepare, prepare_at_home};
 #[cfg(windows)]
 pub(in crate::native) use store::windows_directory_is_private;
 pub(in crate::native) use store::{
@@ -30,6 +30,8 @@ pub(in crate::native) use store::{
 pub(in crate::native) use wait::{
     SleepBound, TrustPoll, TrustReadiness, wait_for_native_trust, wait_until_trusted,
 };
+#[cfg(test)]
+pub(in crate::native) use worktree::tests::registered;
 
 #[cfg(all(test, windows))]
 #[path = "consent/launch_tests.rs"]

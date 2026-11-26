@@ -139,14 +139,14 @@ fn canonical_root() -> (tempfile::TempDir, PathBuf) {
 
 // A real repository and a linked worktree that Git registered at `root/worktree` with absolute
 // paths; each refusal below changes one fact of it.
-pub(in crate::native::consent) struct Registered {
-    pub(in crate::native::consent) repository: PathBuf,
-    pub(in crate::native::consent) worktree: PathBuf,
+pub(in crate::native) struct Registered {
+    pub(in crate::native) repository: PathBuf,
+    pub(in crate::native) worktree: PathBuf,
     pub(in crate::native::consent) registration: PathBuf,
     pub(in crate::native::consent) _git: Git,
 }
 
-pub(in crate::native::consent) fn registered(root: &Path) -> Registered {
+pub(in crate::native) fn registered(root: &Path) -> Registered {
     let git = Git::new();
     let (repository, worktree) = git_worktree(&git, root, "worktree", false);
     let registration = repository

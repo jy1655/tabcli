@@ -8,9 +8,10 @@ mod state_root;
 // Preserve the existing namespace, including helpers now used only inside a child.
 #[allow(unused_imports)]
 pub(in crate::native) use durable::{
-    SyncKind, fault_point, fault_point_keeping_temporary, persist_record, record_publication_read,
-    record_sync, remove_file_if_present, rename_session_file, sync_directory,
-    sync_directory_entries, sync_file, sync_parent_directory, write_json_atomic, write_private,
+    SyncKind, create_private, fault_point, fault_point_keeping_temporary, fill_private,
+    persist_record, record_publication_read, record_sync, remove_file_if_present,
+    rename_session_file, sync_directory, sync_directory_entries, sync_file, sync_parent_directory,
+    write_json_atomic, write_private,
 };
 #[cfg(test)]
 pub(in crate::native) use durable::{

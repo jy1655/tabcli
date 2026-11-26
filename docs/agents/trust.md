@@ -132,7 +132,11 @@
   no option, Claude's dialog step sends no key, the Codex wait still tries its independent
   evidence), Agy reports the cause, and a command that carries a grant refuses to start. A
   start records a reset for an unreadable source, as every earlier release did. Anything else
-  that does not hold is a refusal with its reason. Agy's marker read decodes the session record
+  that does not hold is a refusal with its reason. The main working tree is identified once per
+  assessment, and a failure of its assessment is classified where it arises (review r6, finding
+  1): the folder gone, also after it was identified, withdraws the inheritance like a missing
+  registration; a folder that cannot be inspected is unreadable evidence; TAB's own shared record
+  of it keeps its error. Agy's marker read decodes the session record
   as its typed assessment (`session_applied`): valid JSON of another shape is unreadable there,
   never an absent marker. The Codex wait keeps its existing reading: `observe` only selects
   whether to ask the typed authority, and a record that supplies no marker leaves it to its
@@ -161,15 +165,20 @@
     finds the value already restored goes on; one that finds a value another writer put there
     keeps it, stops, and reports that the key was not sent and the marker was changed by
     another writer. After the key, the provider's confirmation is recorded only within the same
-    deadline, checked before the write and again once the lock is held: a confirmation first
-    observed after it reports that the provider's trust was observed confirmed, that the marker
-    was not recorded and that no input was retried; a record that cannot take it in time reports
-    that the provider's trust is confirmed and the recording failed. No input is retried.
+    deadline, checked before the write and again once the lock is held, on the step's clock and
+    with the same boundary (a reading at the deadline is late): a confirmation first observed at
+    or after it reports that the provider's trust was observed confirmed after the deadline, that
+    the marker was not recorded and that no input was retried; a confirmation observed in time
+    that the record cannot take in time (the lock held until the deadline, or the deadline
+    reached once it is held) reports that the provider's trust is confirmed and the recording
+    failed, with that cause (review r6, finding 4). The pending marker stays, and no input is
+    retried.
   - A provider's start: the authority is asked only for a command that carries a
     trust-bearing option. The plan carries that option, its provider and the workspace identity
     it was granted for (`LaunchGrant`), and for an option that names a file (Agy's settings)
-    that file's path and digest, to the spawn fence, which refuses a file that is not the one
-    the plan wrote and asks about that command
+    that file's path and digest, to the spawn fence, which refuses the command unless the file at
+    that path holds bytes of that digest (a byte-identical replacement at the same path is
+    accepted) and asks about that command
     (`consent::admit_launch`) under the lifecycle lock immediately before its existing
     deadline check, so the order (deadline, `Spawning`, spawn) is unchanged; the question is
     bounded by the launch's remaining budget: no time left refuses a granted command without

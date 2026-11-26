@@ -302,7 +302,10 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                     .unwrap();
                     let label =
                         format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
-                    assert!(session_settings_files(&directory).is_empty(), "{label}");
+                    assert!(
+                        session_settings_files(&directory).unwrap().is_empty(),
+                        "{label}"
+                    );
                     assert!(
                         crate::native::consent::observe(&directory)
                             .value()
@@ -526,7 +529,7 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                     let applies = support == "supported";
                     assert_eq!(asked, usize::from(applies), "{label}");
                     // One settings file of its own for a plan that applies the setting.
-                    let files = session_settings_files(&directory);
+                    let files = session_settings_files(&directory).unwrap();
                     assert_eq!(files.len(), usize::from(applies), "{label}");
                     let settings = files.first().cloned().unwrap_or_default();
                     let mut expected = agy_policy(yolo, None, None);
@@ -618,7 +621,7 @@ fn the_authority_decides_the_setting_and_an_inconclusive_one_writes_nothing() {
     .err()
     .unwrap();
     assert_eq!(error.to_string(), "consent unreadable");
-    assert!(session_settings_files(&directory).is_empty());
+    assert!(session_settings_files(&directory).unwrap().is_empty());
     assert_eq!(
         crate::native::consent::observe(&directory).applied_marker(),
         None
@@ -711,7 +714,7 @@ fn a_source_store_unreadable_after_the_assessment_plans_no_setting() {
     .unwrap();
     assert!(plan.trust_grant.is_none());
     assert!(!plan.arguments.contains(&OsString::from("--settings")));
-    assert!(session_settings_files(&directory).is_empty());
+    assert!(session_settings_files(&directory).unwrap().is_empty());
 }
 
 // Review r5, finding 1: the command's workspace is checked against the consent record before any
@@ -773,4 +776,94 @@ fn a_refused_plan_leaves_an_earlier_plans_settings_untouched() {
             .all(|name| !name.to_string_lossy().starts_with("agy-session-trust")),
         "{after:?}"
     );
+}
+
+// The names of the session's Agy settings files, sorted, read without the adapter's own listing.
+fn settings_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("agy-session-trust"))
+        .collect();
+    names.sort();
+    names
+}
+
+// Review r6, finding 2: the plan owns its settings file from the file's exclusive creation until
+// its grant is made. A write that fails after the file was created removes it, here the sync of
+// the session directory after the whole file was written, and so does a grant that is not made.
+// A removal that fails is reported with the file's path; the file is then left as it is.
+#[test]
+fn a_settings_file_that_no_plan_was_granted_is_removed_or_named() {
+    use crate::native::session::primitives::{
+        injected_fault, injected_sync_failure, with_fault_budget, with_sync_failure,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let directory = consented_launch_session(&root, &workspace);
+    let context = launch_context(&directory, &workspace, false, "1.5.17");
+    let plan = || {
+        session_trust_settings(&context, &mut |_| {
+            Ok(consented(crate::native::consent::Consented::Exact))
+        })
+        .map(|planned| planned.map(|(file, _)| file))
+    };
+    let applied = || {
+        crate::native::consent::observe(&directory)
+            .applied_marker()
+            .map(str::to_owned)
+    };
+
+    // The session directory's sync fails after the whole file was written: no file is left.
+    let error = with_sync_failure(&directory, plan).unwrap_err();
+    assert!(injected_sync_failure(&error), "{error:#}");
+    assert_eq!(settings_names(&directory), Vec::<String>::new());
+    assert_eq!(applied(), None);
+
+    // The removal fails too (a fault at every later boundary): the error names the file.
+    let error = with_fault_budget(2, plan).unwrap_err();
+    let text = format!("{error:#}");
+    let left = settings_names(&directory);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(injected_fault(&error), "{text}");
+    assert!(
+        text.contains(&*directory.join(&left[0]).to_string_lossy())
+            && text.contains("could not be removed"),
+        "{text}"
+    );
+    std::fs::remove_file(directory.join(&left[0])).unwrap();
+
+    // The grant is not made (the session record's lock is not a file): the file is removed, and
+    // a removal that fails is reported with its path.
+    let lock = directory.join("workspace-consent.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let error = plan().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid workspace consent lock"),
+        "{error:#}"
+    );
+    assert_eq!(settings_names(&directory), Vec::<String>::new());
+    let error = with_fault_budget(3, plan).unwrap_err();
+    let text = format!("{error:#}");
+    let left = settings_names(&directory);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        text.contains("invalid workspace consent lock")
+            && text.contains(&*directory.join(&left[0]).to_string_lossy())
+            && text.contains("could not be removed"),
+        "{text}"
+    );
+    std::fs::remove_file(directory.join(&left[0])).unwrap();
+    std::fs::remove_dir(&lock).unwrap();
+    assert_eq!(applied(), None);
+
+    // A granted plan keeps its file.
+    let file = plan().unwrap().unwrap();
+    assert_eq!(
+        settings_names(&directory),
+        [file.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+    assert_eq!(applied().as_deref(), Some(APPLIED_MARKER));
 }

@@ -241,6 +241,19 @@ pub(super) fn assess_current(
 
 fn assess_in(root: &Path, requested: &Path, env: &Environment, mode: Mode) -> Result<Assessment> {
     let identity = identity(requested)?;
+    let alias_free = alias_free(requested, &identity.path)?;
+    assess_identified(root, identity, alias_free, env, mode)
+}
+
+// The assessment of a workspace already identified, and whether the path it was requested by
+// reaches it without an alias.
+fn assess_identified(
+    root: &Path,
+    identity: Identity,
+    alias_free: bool,
+    env: &Environment,
+    mode: Mode,
+) -> Result<Assessment> {
     let mut assessment = Assessment {
         schema: 1,
         identity: identity.clone(),
@@ -252,7 +265,7 @@ fn assess_in(root: &Path, requested: &Path, env: &Environment, mode: Mode) -> Re
         applied: None,
         repository_root: None,
     };
-    if !alias_free(requested, &identity.path)? {
+    if !alias_free {
         assessment.state = "alias".into();
         assessment.detail =
             "Workspace aliases do not inherit shared consent. Use the canonical path.".into();
@@ -393,6 +406,9 @@ fn decide(
 // read the worktree itself. Anything that does not hold inherits nothing. Evidence that cannot
 // be read inherits nothing while a start looks for inheritance; at a recheck it is an error, so
 // the authority reports it as unreadable rather than as missing trust (review r3, finding 12).
+// A missing file or folder is a fact, not unreadable evidence: the worktree is no longer
+// registered, or its main working tree is gone. TAB's own shared record of the main working tree
+// that cannot be read or decoded is an error at a recheck, as the workspace's own record is.
 fn inherited(
     root: &Path,
     workspace: &Path,
@@ -438,18 +454,31 @@ fn inherited(
         }
         Err(_) => return Ok(None),
     };
+    #[cfg(test)]
+    if let Some(hook) = AFTER_MAIN_IDENTIFIED.with(|slot| slot.borrow_mut().take()) {
+        hook(&main);
+    }
+    // The main working tree is identified once, and the rest of its assessment uses that
+    // identity. A failure is classified where it arises (review r6, finding 1): the folder gone
+    // since it was identified withdraws the inheritance, as a registration that is gone does, and
+    // a folder that cannot be inspected is unreadable evidence; neither is an error that would stop
+    // a plain launch. TAB's own shared record of the main working tree keeps its error below.
+    let main_alias_free = match alias_free(&main, &main_identity.path) {
+        Ok(alias_free) => alias_free,
+        Err(error) if unreadable(&error) => {
+            return evidence(error, "the main working tree cannot be inspected");
+        }
+        Err(_) => return Ok(None),
+    };
     // Two records under one lock file would wait on each other.
     if record_path(root, &main) == record_path(root, workspace) {
         return Ok(None);
     }
-    let consent = match assess_in(root, &main, env, mode) {
+    let consent = match assess_identified(root, main_identity.clone(), main_alias_free, env, mode) {
         Ok(consent) => consent,
         Err(error) => return unread(error),
     };
-    if consent.state != "verified"
-        || consent.repository_root.is_some()
-        || consent.identity != main_identity
-    {
+    if consent.state != "verified" || consent.repository_root.is_some() {
         return Ok(None);
     }
     let Some(source) = consent.source else {
@@ -464,6 +493,22 @@ fn inherited(
         Ok(Trust::Declined) => Ok(None),
         Err(error) => evidence(error, "the source's trust of the worktree cannot be read"),
     }
+}
+
+// A test's hook that runs once, right after the main working tree of an inherited source was
+// identified and before anything else reads it: a test places a change of that folder there.
+#[cfg(test)]
+type MainIdentifiedHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_MAIN_IDENTIFIED: std::cell::RefCell<Option<MainIdentifiedHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::native) fn after_main_identified(hook: impl FnOnce(&Path) + 'static) {
+    AFTER_MAIN_IDENTIFIED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 // Assess before anything is created: the assessment reads the shared record and the provider
@@ -618,14 +663,14 @@ pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
     })
 }
 
-/// The step's deadline had passed once the session record's lock was taken, so the record was
+/// The step's deadline was reached once the session record's lock was taken, so the record was
 /// not changed (review r5, finding 5).
 #[derive(Debug)]
 pub(in crate::native) struct RecordDeadlinePassed;
 
 impl std::fmt::Display for RecordDeadlinePassed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the deadline had passed when the session's consent record could be changed, so it was not changed")
+        f.write_str("the deadline was reached when the session's consent record could be changed, so it was not changed")
     }
 }
 
@@ -634,15 +679,18 @@ impl std::error::Error for RecordDeadlinePassed {}
 /// Changes the session record's applied marker from `from` to `to` only while it still is
 /// `from`, under the record's lock taken by `deadline`, and only while `deadline` has not passed
 /// once the lock is held; whether it did. A lock that stays held until then is
-/// `SessionRecordBusy`, a deadline passed is `RecordDeadlinePassed`, and the record is unchanged.
+/// `SessionRecordBusy`, a deadline reached is `RecordDeadlinePassed`, and the record is unchanged.
+/// `now` is the caller's clock, and the deadline is reached at it, as in the caller's own check
+/// before the call (review r6, finding 4).
 pub(in crate::native) fn transition(
     directory: &Path,
     from: Option<&str>,
     to: Option<&str>,
     deadline: Instant,
+    mut now: impl FnMut() -> Instant,
 ) -> Result<bool> {
     with_session_record(directory, Some(deadline), |path, mut assessment| {
-        if Instant::now() > deadline {
+        if now() >= deadline {
             return Err(RecordDeadlinePassed.into());
         }
         if assessment.applied.as_deref() != from {

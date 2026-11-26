@@ -1667,3 +1667,141 @@ fn a_restore_that_finds_another_writers_value_keeps_it_and_stops() {
         Some(RESPONSE_CONFIRMED)
     );
 }
+
+// A clock for the recording of a provider confirmation. Readings after the screen: 1 observed,
+// 2 before the pending write, 3 in the dispatch, 4 the wait after it, 5 the check before the
+// record is changed, 6 the check once the record's lock is held. Reading 5 is within the
+// deadline; reading 6 is `late`. With `real_wait`, reading 5 also waits until the system's
+// clock has passed the deadline, for a lock-held check that reads the system's clock.
+struct RecordingLate<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    deadline: Instant,
+    late: Instant,
+    real_wait: bool,
+}
+
+impl Clock for RecordingLate<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            match self.readings {
+                5 if self.real_wait => {
+                    while Instant::now() <= self.deadline {
+                        std::thread::sleep(
+                            self.deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(1),
+                        );
+                    }
+                }
+                6 => return self.late,
+                _ => {}
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// Runs a Claude dialog step whose provider confirms the answer at once, with `clock`, and returns
+// its error and how often it dispatched.
+fn confirmed_at_once(c: &Consented, clock: &mut RecordingLate<'_>) -> (String, usize) {
+    let policy = FakePolicy::default();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = Cell::new(0);
+    let armed = clock.armed;
+    let deadline = clock.deadline;
+    let error = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline,
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        clock,
+        &mut scripted(
+            GuardedKey::Taken,
+            || {
+                armed.set(true);
+                Ok(DIALOG.to_owned())
+            },
+            || {
+                dispatched.set(dispatched.get() + 1);
+                write_json_atomic(
+                    &c.stores.claude,
+                    &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        ),
+    )
+    .unwrap_err();
+    (format!("{error:#}"), dispatched.get())
+}
+
+const RECORDING_FAILED: &str =
+    "provider trust is confirmed; recording the TAB applied marker failed; no input was retried";
+
+// Review r6, finding 4: a confirmation observed within the step's deadline whose recording misses
+// it (the deadline passes while the record is locked and read) is reported as confirmed with its
+// recording failed, never as observed after the deadline. The pending marker stays and nothing is
+// sent again.
+#[test]
+fn a_timely_confirmation_whose_recording_misses_the_deadline_is_not_reported_late() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let armed = Cell::new(false);
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(300);
+    let mut clock = RecordingLate {
+        clock: FakeClock::new(start),
+        armed: &armed,
+        readings: 0,
+        deadline,
+        late: deadline + Duration::from_secs(3600),
+        real_wait: true,
+    };
+    let (error, dispatched) = confirmed_at_once(&c, &mut clock);
+    assert!(
+        error.starts_with(RECORDING_FAILED)
+            && error.contains(
+                "the deadline was reached when the session's consent record could be changed"
+            ),
+        "{error}"
+    );
+    assert_eq!(dispatched, 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}
+
+// Review r6, finding 4: the check once the record's lock is held has the same boundary as the
+// check before it: a recording at exactly the deadline is not made.
+#[test]
+fn a_recording_at_exactly_the_deadline_is_not_made() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let armed = Cell::new(false);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(3);
+    let mut clock = RecordingLate {
+        clock: FakeClock::new(start),
+        armed: &armed,
+        readings: 0,
+        deadline,
+        late: deadline,
+        real_wait: false,
+    };
+    let (error, dispatched) = confirmed_at_once(&c, &mut clock);
+    assert!(error.starts_with(RECORDING_FAILED), "{error}");
+    assert_eq!(dispatched, 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}

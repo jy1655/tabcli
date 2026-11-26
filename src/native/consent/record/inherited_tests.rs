@@ -728,3 +728,76 @@ fn an_unreadable_registration_is_an_error_at_a_recheck() {
         "source-reset"
     );
 }
+
+// A repository and its linked worktree inside `root/nest`, whose permissions a test may change
+// without touching the state root or the fixture stores at `root`.
+fn nested_worktree_setup() -> (tempfile::TempDir, Fixture, Registered, PathBuf) {
+    let (temp, _workspace, fixture) = setup();
+    let nest = temp.path().canonicalize().unwrap().join("nest");
+    fs::create_dir(&nest).unwrap();
+    let git = registered(&nest);
+    (temp, fixture, git, nest)
+}
+
+// Review r6, finding 1: the main working tree lost between its identification and the rest of its
+// assessment during a recheck withdraws the inheritance, as a registration that is gone does; it
+// is no error that would stop a plain launch's planning.
+#[test]
+fn a_main_working_tree_lost_during_a_recheck_withdraws_inheritance() {
+    let (temp, fixture, git, nest) = nested_worktree_setup();
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "verified"
+    );
+    let (from, to) = (git.repository.clone(), nest.join("moved"));
+    after_main_identified(move |_| fs::rename(&from, &to).unwrap());
+    let recheck = assess_current(temp.path(), &git.worktree, &fixture.env)
+        .map(|assessment| assessment.state)
+        .map_err(|error| format!("{error:#}"));
+    assert_eq!(recheck, Ok("source-reset".to_owned()));
+    assert!(!git.repository.exists());
+}
+
+// Review r6, finding 1: evidence of the main working tree that cannot be read between its
+// identification and the rest of its assessment is typed as unreadable at a recheck, never a raw
+// error; TAB's own shared record of the main working tree that cannot be decoded keeps its error.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_main_working_tree_is_typed_and_a_damaged_main_record_keeps_its_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, fixture, git, nest) = nested_worktree_setup();
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "verified"
+    );
+    let locked = nest.clone();
+    after_main_identified(move |_| {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap()
+    });
+    let recheck = assess_current(temp.path(), &git.worktree, &fixture.env);
+    fs::set_permissions(&nest, fs::Permissions::from_mode(0o755)).unwrap();
+    // A user that may read anything (root) cannot observe an unreadable directory.
+    if unsafe { libc::geteuid() } != 0 {
+        let error = recheck.unwrap_err();
+        assert!(error.is::<EvidenceUnreadable>(), "{error:#}");
+    }
+
+    let main_record = record_path(temp.path(), &git.repository);
+    let saved = fs::read(&main_record).unwrap();
+    replace_store(&main_record, b"{").unwrap();
+    let error = assess_current(temp.path(), &git.worktree, &fixture.env).unwrap_err();
+    assert!(!error.is::<EvidenceUnreadable>(), "{error:#}");
+    replace_store(&main_record, &saved).unwrap();
+    assert_eq!(
+        assess_current(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "verified"
+    );
+}
