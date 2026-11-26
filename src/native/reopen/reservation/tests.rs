@@ -4401,8 +4401,9 @@ fn a_slow_recovery_leaves_the_probe_no_time_and_writes_no_consent() {
 //    same). A build that probes before the recovery is caught by the `claude.started` file its
 //    probe leaves, whether or not the holder has let the lock go by the time that probe
 //    returns. A build whose recovery waits for the lock before any probe would wait for ever,
-//    since neither release signal can come: after `WATCHDOG` the holder lets go and the case
-//    fails as blocked before probing. A healthy reopen returns within milliseconds and is
+//    since neither release signal can come: after `WATCHDOG` the holder lets go of the lock
+//    and the case fails, reporting that the holder saw neither the probe marker nor the
+//    reopen-return signal. A healthy reopen returns within milliseconds and is
 //    released through `release`, far inside that bound, so the bound decides nothing there.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
