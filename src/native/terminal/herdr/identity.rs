@@ -42,8 +42,7 @@ fn usable_endpoint(endpoint: &str) -> bool {
 /// | Presence, close with a live owner, cleanup after binding fails | Exact path | Either | |
 /// | Close with no live owner (`Created`) | Exact path | Either | A whole creation record, launch label |
 ///
-/// A `Created` close also observes a running terminal's program with its recorded birth before
-/// `authority::grant` lets it end the terminal (`program_observed`).
+/// A `Created` close never ends a running terminal (`still_running`).
 pub(super) enum Requirement<'a> {
     Live,
     Bound(&'a Path),
@@ -165,20 +164,17 @@ impl<'a> Recorded<'a> {
         }
     }
 
-    /// A close with no live owner left ends a running terminal only after observing its
-    /// program with the recorded birth: a program the OS no longer reports may be one the
-    /// core still lists while it winds down, and proves nothing about what would be ended.
-    pub(super) fn program_observed(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
-        let address = &observed.address;
-        match core.process_start(self.surface.host_pid)? {
-            Some(birth) if birth == self.surface.birth => Ok(()),
-            Some(_) => bail!(
-                "the program of Herdr terminal {address} is another process than the one recorded"
-            ),
-            None => bail!(
-                "the program of Herdr terminal {address} cannot be observed although its core reports it running; nothing was ended and the handle is retained"
-            ),
-        }
+    /// The refusal of a close on the creation record for a running terminal: TAB does not end
+    /// it (the owner's decision of 2026-11-26). It names what works, in this platform's `hc`
+    /// form on the recorded core: look at the terminal, wait for it to finish or end it there,
+    /// then close the session again, which removes the finished terminal.
+    pub(super) fn still_running(&self, address: &str) -> anyhow::Error {
+        let socket = &self.surface.socket;
+        let get = hc_command(socket, "get", address, cfg!(windows));
+        let kill = hc_command(socket, "kill", address, cfg!(windows));
+        anyhow::anyhow!(
+            "Herdr terminal {address} is still running, and TAB does not end the terminal of a session whose owner is not live; nothing was sent and the handle is retained. See it with `{get}`. Once it has finished, or after you end it with `{kill}`, run close-session again: it removes the finished terminal and closes the session"
+        )
     }
 
     fn check_identity(&self, core: &dyn Core, observed: &Observed) -> Result<()> {

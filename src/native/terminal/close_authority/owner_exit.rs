@@ -6,12 +6,12 @@
 //! terminal by its own creation record once the owner is verified gone; the owner record
 //! neither grants nor blocks it. A finished terminal is removed and an absent one settled
 //! whatever the record says (exited or PID reused; bound, unbound or another session's;
-//! complete or not). `core_kept` gathers that evidence for every owner record and returns it,
-//! never an action; the Herdr adapter's one granting function decides from it and from its own
-//! observation of the terminal. A running terminal is ended only when this session's owner is
-//! positively gone (`core_kept` says when) and its program is observed with its recorded
-//! birth. Only an explicit close acts on such a terminal; a close that cleans up after another
-//! command does not.
+//! complete or not). `core_kept` chooses between the close with a live owner and that close for
+//! every owner record and returns evidence, never an action; the Herdr adapter's one granting
+//! function decides from its own observation of the terminal. A close on the creation record
+//! never ends a running terminal (the owner's decision of 2026-11-26): the person ends it or
+//! waits for it to finish, and closes again. Only an explicit close acts on such a terminal; a
+//! close that cleans up after another command does not.
 //!
 //! Other kinds keep their platform's rule: macOS and Linux Repair retain a handle that can
 //! outlive the owner, and a close intent; Windows Repair closes the managed console of an
@@ -46,9 +46,12 @@ pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> 
 }
 
 /// The decision's evidence for a close on a terminal's creation record. Its fields are private
-/// to this module, so only `core_kept` can establish it (and, in tests, `scripted`), from why
-/// the close runs and from what is positively known about this session's owner. Nothing that
-/// is not positively established grants anything.
+/// to this module, so only `core_kept` can establish it (and, in tests, `scripted`). A close on
+/// the creation record removes a finished terminal and settles an absent one, and never ends a
+/// running one (the owner's decision of 2026-11-26): nothing here permits that, and nothing
+/// about the owner's process permits or refuses anything on this path. The evidence says why
+/// the close runs, and, for the closed record's diagnosis only, the PID of this session's owner
+/// when the OS reported its recorded process gone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", windows)),
@@ -56,25 +59,7 @@ pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> 
 )]
 pub(in crate::native) struct CreationEvidence {
     cause: super::CloseCause,
-    owner: OwnerFinding,
-}
-
-/// What is positively known about this session's owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux", windows)),
-    allow(dead_code)
-)]
-enum OwnerFinding {
-    /// A record bound to this session names an incarnation that the platform can produce, and
-    /// the OS observed it exited, or its PID held by a process created after it.
-    IncarnationGone { pid: u32 },
-    /// The session's own wrapper recorded its end: state `exited`, which only the wrapper
-    /// writes, after its provider has exited.
-    EndRecorded,
-    /// Nothing positive: no owner record, a damaged or impossible one, another session's or an
-    /// unbound one, a PID-only one, or a reuse that the live process contradicts.
-    NotEstablished,
+    gone_owner: Option<u32>,
 }
 
 #[cfg_attr(
@@ -87,32 +72,19 @@ impl CreationEvidence {
         self.cause == super::CloseCause::Explicit
     }
 
-    /// Whether this session's owner is positively gone.
-    pub(in crate::native::terminal) fn owner_gone(self) -> bool {
-        self.owner != OwnerFinding::NotEstablished
-    }
-
-    /// The reason the closed record carries when the session stored none: the death of this
-    /// session's owner, when it was positively established, as 0.4.49's Repair wrote it.
+    /// The reason the closed record carries when the session stored none: the end of this
+    /// session's owner, as 0.4.49's Repair wrote it.
     pub(in crate::native::terminal) fn generated_reason(self) -> Option<String> {
-        match self.owner {
-            OwnerFinding::IncarnationGone { pid } => {
-                Some(format!("native session process {pid} is no longer running"))
-            }
-            OwnerFinding::EndRecorded | OwnerFinding::NotEstablished => None,
-        }
+        self.gone_owner
+            .map(|pid| format!("native session process {pid} is no longer running"))
     }
 
     /// Evidence as a test states it, for tests of what the adapter grants from it.
     #[cfg(test)]
-    pub(in crate::native) fn scripted(cause: super::CloseCause, owner_gone: bool) -> Self {
+    pub(in crate::native) fn scripted(cause: super::CloseCause) -> Self {
         Self {
             cause,
-            owner: if owner_gone {
-                OwnerFinding::IncarnationGone { pid: 4242 }
-            } else {
-                OwnerFinding::NotEstablished
-            },
+            gone_owner: None,
         }
     }
 }
@@ -133,16 +105,19 @@ pub(super) enum CoreKept {
     ),
 }
 
-/// The one place the close decision establishes its evidence for a kind whose core keeps its
-/// terminals (Herdr), on every OS and for every owner record: absent, damaged, another
-/// session's, unbound, PID-only, live, gone. It returns evidence, never an action. Only a
-/// record bound to this session that names an attested live incarnation leads to the
-/// live-owner rules; an owner that cannot be inspected refuses. Everything else is a close on
-/// the creation record, whose owner finding is positive only when:
-/// - the record is bound to this session and names an incarnation the platform can produce,
-///   which the OS observed exited, or whose PID a later process holds (a reuse that the live
-///   process contradicts proves nothing); or
-/// - the session's own wrapper recorded its end (state `exited`).
+/// The one place the close decision chooses, for a kind whose core keeps its terminals (Herdr),
+/// between the close with a live owner and the close on the creation record, on every OS and
+/// for every owner record. It returns evidence, never an action.
+///
+/// The deciding observation is the OS's attestation of the process that an owner record bound to
+/// this session names, read in one typed read of the record:
+/// - an attested live incarnation leads to the close with a live owner;
+/// - when it cannot be made (the process cannot be inspected), the close refuses: nothing is
+///   sent and the handle is retained, since the close with a live owner cannot be ruled out;
+///   a record whose own fields conflict names nothing to inspect and takes the creation record;
+/// - everything else takes the creation record: no record or one that cannot be decoded,
+///   another session's or an unbound record (whose process is not inspected), a PID-only record
+///   of a live process, a gone process.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(super) fn core_kept(
     observation: &dyn super::CloseObservation,
@@ -150,59 +125,36 @@ pub(super) fn core_kept(
     session: &TerminalSession,
 ) -> Result<CoreKept> {
     use super::OwnerRead;
-    use crate::native::process_identity::{Attested, Gone};
-    use crate::native::session::owner::{record_conflicts, records_incarnation};
+    use crate::native::process_identity::Attested;
+    use crate::native::session::owner::record_conflicts;
     use terminal::ownership::OwnerBinding;
 
     session.verify_managed_session(expected_session_id)?;
     let cause = observation.cause();
-    let created = |owner: OwnerFinding| Ok(CoreKept::Created(CreationEvidence { cause, owner }));
-    // Only the session's wrapper writes `exited`, after its provider has exited.
-    let end_recorded = || -> Result<OwnerFinding> {
-        Ok(if observation.status()?.state == SessionState::Exited {
-            OwnerFinding::EndRecorded
-        } else {
-            OwnerFinding::NotEstablished
-        })
-    };
-    // One typed read of the Owner record. A record that cannot be read is refused; one that is
-    // absent (a wrapper may still be registering) or cannot be decoded names no owner.
+    let created =
+        |gone_owner: Option<u32>| Ok(CoreKept::Created(CreationEvidence { cause, gone_owner }));
+    // A record that cannot be read is refused; one that is absent (a wrapper may still be
+    // registering) or cannot be decoded names no owner.
     let owner = match observation.read_owner()? {
-        OwnerRead::Absent | OwnerRead::Malformed => return created(end_recorded()?),
+        OwnerRead::Absent | OwnerRead::Malformed => return created(None),
         OwnerRead::Recorded(owner) => *owner,
     };
-    // A record of another session, or an unbound one, identifies no process of this session:
-    // its process is not inspected, and nothing about it can refuse or permit this close.
     if owner.binding(expected_session_id) != OwnerBinding::Bound {
-        return created(end_recorded()?);
+        return created(None);
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let attestation = observation.posix_owner_live(&owner);
     #[cfg(windows)]
     let attestation = observation.observe_owner_record(&owner);
     match &attestation.process {
-        // A record whose own fields conflict names nothing to inspect.
-        ProcessObservation::Unknown(_) if record_conflicts(&owner) => created(end_recorded()?),
-        // This session's own owner cannot be inspected: refuse.
+        ProcessObservation::Unknown(_) if record_conflicts(&owner) => created(None),
         ProcessObservation::Unknown(reason) => bail!("{reason}"),
         ProcessObservation::Live(Attested::Incarnation) => {
             Ok(CoreKept::LiveOwner(Box::new((owner, attestation))))
         }
-        // A PID-only record of a live process: nothing shows that this session's owner is live
-        // or gone.
-        ProcessObservation::Live(Attested::PidOnly) => created(end_recorded()?),
-        ProcessObservation::Gone(gone) => {
-            let incarnation_gone = records_incarnation(&owner)
-                && match gone {
-                    Gone::Exited => true,
-                    Gone::Reused(_) => observation.reuse_corroborated(&owner),
-                };
-            if incarnation_gone {
-                created(OwnerFinding::IncarnationGone { pid: owner.pid })
-            } else {
-                created(end_recorded()?)
-            }
-        }
+        ProcessObservation::Live(Attested::PidOnly) => created(None),
+        // For the diagnosis only.
+        ProcessObservation::Gone(_) => created(Some(owner.pid)),
     }
 }
 

@@ -687,10 +687,11 @@ fn close_owned(
 }
 
 /// With no live owner of this session to close with, on every OS: the terminal's creation
-/// record and the decision's evidence decide, through `authority::grant`. A cleanup gets
-/// nothing. The handle's creation record is validated before its core is asked, so only a
-/// whole record can be settled as absent by `not_found`. A terminal set to keep, or one that is
-/// not this session's, is left alone with its handle retained.
+/// record decides, through `authority::grant`, which removes a finished terminal and never ends
+/// a running one. A cleanup gets nothing. The handle's creation record is validated before its
+/// core is asked, so only a whole record can be settled as absent by `not_found`. A running
+/// terminal, one set to keep, or one that is not this session's, is left alone with its handle
+/// retained.
 fn close_created(
     core: &dyn Core,
     session: &TerminalSession,
@@ -698,7 +699,7 @@ fn close_created(
     evidence: CreationEvidence,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    let evidence = authority::admit(evidence)?;
+    let admitted = authority::admit(evidence)?;
     close_remaining(deadline)?;
     let Some((recorded, mut linked)) =
         Recorded::open(core, session, Requirement::Created(directory), deadline)?
@@ -713,7 +714,7 @@ fn close_created(
         deadline,
         &Basis::Created {
             recorded: &recorded,
-            evidence,
+            admitted,
         },
     )
 }

@@ -68,12 +68,7 @@ fn scripted_dead_owner_close_refuses_the_installed_ownership_probe() {
         .with_binding(Some("session-foreign".into()));
     let adapters = Adapter::with_core(fixture.core.clone());
     let observation = Production::new(&fixture.directory, SESSION, &surface, later())
-        .with_posix_dead_owner_observations(
-            &adapters,
-            &|_| gone(Gone::Exited),
-            &|_| false,
-            &|_| panic!("an exited owner needs no reuse corroboration"),
-        );
+        .with_posix_dead_owner_observations(&adapters, &|_| gone(Gone::Exited), &|_| false);
     let _ = observation.ownership_proof();
 }
 
@@ -120,7 +115,7 @@ impl Fixture {
         let adapters = Adapter::with_core(self.core.clone());
         session::close::close_with_attestation(&self.store(), None, deadline, observe, |surface| {
             Production::new(&self.directory, SESSION, surface, deadline)
-                .with_posix_dead_owner_observations(&adapters, &observe, &pid_is_alive, &|_| true)
+                .with_posix_dead_owner_observations(&adapters, &observe, &pid_is_alive)
                 .close_posix_surface()
         })
     }

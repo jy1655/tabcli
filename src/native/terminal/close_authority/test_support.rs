@@ -184,8 +184,6 @@ pub(in crate::native) struct TestObservation<'a> {
     ownership_proof: Member<'a, dyn FnMut() -> Result<()> + 'a>,
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     owner_record: Member<'a, dyn FnMut(&NativeSessionOwner) -> OwnerAttestation + 'a>,
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    reuse: Member<'a, dyn FnMut(&NativeSessionOwner) -> bool + 'a>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pid_alive: Member<'a, dyn FnMut(u32) -> bool + 'a>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -226,8 +224,6 @@ impl<'a> TestObservation<'a> {
             ownership_proof: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             owner_record: RefCell::new(None),
-            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-            reuse: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             pid_alive: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -437,16 +433,6 @@ impl<'a> TestObservation<'a> {
         self
     }
 
-    /// The OS's answer whether the process now at a reused owner PID began after the record.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    pub(in crate::native) fn with_reuse(
-        self,
-        f: impl FnMut(&NativeSessionOwner) -> bool + 'a,
-    ) -> Self {
-        *self.reuse.borrow_mut() = Some(Box::new(f));
-        self
-    }
-
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(in crate::native) fn with_pid_alive(self, f: impl FnMut(u32) -> bool + 'a) -> Self {
         *self.pid_alive.borrow_mut() = Some(Box::new(f));
@@ -606,17 +592,6 @@ impl CloseObservation for TestObservation<'_> {
         let result = match self.ownership_proof.borrow_mut().as_mut() {
             Some(f) => f(),
             None => self.production("proof").ownership_proof(),
-        };
-        self.finish(call, &result);
-        result
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn reuse_corroborated(&self, owner: &NativeSessionOwner) -> bool {
-        let call = self.begin("reuse");
-        let result = match self.reuse.borrow_mut().as_mut() {
-            Some(f) => f(owner),
-            None => self.production("reuse").reuse_corroborated(owner),
         };
         self.finish(call, &result);
         result

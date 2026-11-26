@@ -122,10 +122,6 @@ pub(in crate::native) trait CloseObservation {
     fn ownership_proof(&self) -> Result<()>;
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation;
-    /// Whether the process now at the recorded owner's PID was created after the recorded
-    /// incarnation, which a reused-PID answer must show before it counts as the owner's death.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn reuse_corroborated(&self, owner: &NativeSessionOwner) -> bool;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -152,8 +148,6 @@ pub(in crate::native) struct Production<'a> {
     observe_owner: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pid_is_alive: &'a dyn Fn(u32) -> bool,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    reuse: &'a dyn Fn(&NativeSessionOwner) -> bool,
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     scripted_dead_owner: bool,
 }
@@ -177,8 +171,6 @@ impl<'a> Production<'a> {
             observe_owner: &attest_owner,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             pid_is_alive: &process_is_alive,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            reuse: &crate::native::session::owner::reuse_corroborated,
             #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
             scripted_dead_owner: false,
         }
@@ -195,14 +187,12 @@ impl<'a> Production<'a> {
         adapters: &'a dyn terminal::posix::Adapters,
         observe: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
         pid_is_alive: &'a dyn Fn(u32) -> bool,
-        reuse: &'a dyn Fn(&NativeSessionOwner) -> bool,
     ) -> Self {
         // Herdr's presence evidence does not probe an app or host incarnation.
         assert_eq!(self.session.kind, terminal::TerminalKind::Herdr);
         self.posix_adapters = adapters;
         self.observe_owner = observe;
         self.pid_is_alive = pid_is_alive;
-        self.reuse = reuse;
         self.scripted_dead_owner = true;
         self
     }
@@ -327,14 +317,6 @@ impl CloseObservation for Production<'_> {
         attest_owner(owner)
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn reuse_corroborated(&self, owner: &NativeSessionOwner) -> bool {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        return (self.reuse)(owner);
-        #[cfg(windows)]
-        crate::native::session::owner::reuse_corroborated(owner)
-    }
-
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool {
         (self.pid_is_alive)(pid)
@@ -370,8 +352,8 @@ impl CloseObservation for Production<'_> {
 // intent first, owner presence by text, the launch record before the failed-start tests,
 // then status and owner in that branch, resumability as a fresh call, the owner again
 // before attestation, and status only in the no-owner branch. A kind whose core keeps its
-// terminals reads owner presence, the owner, its attestation and, when needed, the reuse
-// corroboration and the status, in `owner_exit::core_kept`.
+// terminals reads the owner record once and, for a record bound to this session, its
+// attestation, in `owner_exit::core_kept`.
 pub(in crate::native) fn decide(
     observation: &dyn CloseObservation,
     expected_session_id: &str,
@@ -890,8 +872,6 @@ mod projected_authority_tests {
         Damaged,
         /// Bound to this session, naming an incarnation this platform can produce.
         Bound,
-        /// Bound, with an incarnation this platform cannot produce.
-        ImpossibleBirth,
         /// Bound, with another platform's birth beside its own: attestation answers Unknown.
         Conflicting,
         /// Bound, PID only.
@@ -906,34 +886,33 @@ mod projected_authority_tests {
             managed_session_id: Some("session-test".into()),
             ..Default::default()
         };
-        let incarnation = |owner: &mut NativeSessionOwner, possible: bool| {
+        let incarnation = |owner: &mut NativeSessionOwner| {
             #[cfg(target_os = "macos")]
             {
                 owner.process_start_seconds = Some(1_790_000_000);
-                owner.process_start_microseconds = Some(if possible { 42 } else { 1_000_000 });
+                owner.process_start_microseconds = Some(42);
             }
             #[cfg(target_os = "linux")]
             {
                 owner.linux_birth = Some(crate::native::terminal::LinuxBirth {
                     boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
-                    starttime_ticks: u64::from(possible) * 42,
+                    starttime_ticks: 42,
                 });
             }
             #[cfg(windows)]
             {
                 owner.windows_process_identity =
                     Some(crate::native::terminal::WindowsProcessIdentity {
-                        creation_time: u64::from(possible) * 42,
+                        creation_time: 42,
                         executable_path: r"C:\tabcli\tabcli.exe".into(),
                     });
             }
         };
         match record {
             Record::Absent | Record::Damaged => return None,
-            Record::Bound | Record::Unbound | Record::Foreign => incarnation(&mut owner, true),
-            Record::ImpossibleBirth => incarnation(&mut owner, false),
+            Record::Bound | Record::Unbound | Record::Foreign => incarnation(&mut owner),
             Record::Conflicting => {
-                incarnation(&mut owner, true);
+                incarnation(&mut owner);
                 #[cfg(any(target_os = "macos", windows))]
                 {
                     owner.linux_birth = Some(crate::native::terminal::LinuxBirth {
@@ -967,24 +946,24 @@ mod projected_authority_tests {
     /// What the decision answers for a row.
     #[derive(Debug, Eq, PartialEq)]
     enum Answer {
-        /// A close on the creation record, explicit or not, and whether this session's owner
-        /// is positively gone.
+        /// A close on the creation record, explicit or not, and whether the closed record gets
+        /// the generated diagnosis (this session's owner observed gone). Neither permits ending
+        /// a running terminal.
         Created {
             explicit: bool,
-            owner_gone: bool,
+            diagnosed: bool,
         },
         LiveOwner,
         Refused,
     }
 
-    // os-parity, review round 2: every branch of the decision for a kind whose core keeps its
-    // terminals, on every OS, against the one function that establishes the evidence
-    // (`owner_exit::core_kept`). Each OS reaches it through its own owner observation. Only a
-    // record bound to this session whose attested incarnation lives reaches the live-owner
-    // rules; an owner that cannot be inspected refuses. Every other row is a close on the
-    // creation record, and only positive evidence marks this session's owner gone: a bound,
-    // possible incarnation observed exited or reused by a later process, or the session's own
-    // recorded end (`exited`). A cleanup's evidence is never explicit. The ownership proof and
+    // os-parity: every branch of the decision for a kind whose core keeps its terminals, on
+    // every OS, against the one function that chooses (`owner_exit::core_kept`). Each OS reaches
+    // it through its own owner observation. Only a record bound to this session whose attested
+    // incarnation lives reaches the live-owner rules; this session's owner that cannot be
+    // inspected refuses. Every other row is a close on the creation record, which never ends a
+    // running terminal (the owner's decision of 2026-11-26); an owner observed gone only adds the
+    // closed record's diagnosis. A cleanup's evidence is never explicit. The ownership proof and
     // the presence query are asked only on the live-owner row.
     #[test]
     fn every_herdr_branch_returns_evidence_from_one_function_on_every_os() {
@@ -993,15 +972,14 @@ mod projected_authority_tests {
         let live = || ProcessObservation::Live(Attested::Incarnation);
         let live_pid = || ProcessObservation::Live(Attested::PidOnly);
         let unknown = || ProcessObservation::Unknown("owner inspection failed".into());
-        let created = |owner_gone| Answer::Created {
+        let created = |diagnosed| Answer::Created {
             explicit: true,
-            owner_gone,
+            diagnosed,
         };
         type Row = (
             &'static str,
             Record,
             fn() -> ProcessObservation,
-            bool,
             SessionState,
             Option<launch::Phase>,
             CloseCause,
@@ -1012,7 +990,6 @@ mod projected_authority_tests {
                 "no owner record",
                 Record::Absent,
                 exited,
-                false,
                 SessionState::Failed,
                 None,
                 CloseCause::Explicit,
@@ -1022,17 +999,15 @@ mod projected_authority_tests {
                 "no owner record, the session ended",
                 Record::Absent,
                 exited,
-                false,
                 SessionState::Exited,
                 None,
                 CloseCause::Explicit,
-                created(true),
+                created(false),
             ),
             (
                 "damaged owner record",
                 Record::Damaged,
                 exited,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1042,7 +1017,6 @@ mod projected_authority_tests {
                 "bound, live",
                 Record::Bound,
                 live,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1052,57 +1026,24 @@ mod projected_authority_tests {
                 "bound, exited",
                 Record::Bound,
                 exited,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
                 created(true),
             ),
             (
-                "bound, reused and corroborated",
+                "bound, reused",
                 Record::Bound,
                 reused,
-                true,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
                 created(true),
-            ),
-            (
-                "bound, reuse the live process contradicts",
-                Record::Bound,
-                reused,
-                false,
-                SessionState::Ready,
-                None,
-                CloseCause::Explicit,
-                created(false),
-            ),
-            (
-                "impossible birth, reused",
-                Record::ImpossibleBirth,
-                reused,
-                true,
-                SessionState::Ready,
-                None,
-                CloseCause::Explicit,
-                created(false),
-            ),
-            (
-                "impossible birth, exited",
-                Record::ImpossibleBirth,
-                exited,
-                true,
-                SessionState::Ready,
-                None,
-                CloseCause::Explicit,
-                created(false),
             ),
             (
                 "conflicting record",
                 Record::Conflicting,
                 unknown,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1112,17 +1053,15 @@ mod projected_authority_tests {
                 "PID-only, exited",
                 Record::PidOnly,
                 exited,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
-                created(false),
+                created(true),
             ),
             (
                 "PID-only, a live process",
                 Record::PidOnly,
                 live_pid,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1132,7 +1071,6 @@ mod projected_authority_tests {
                 "unbound, exited",
                 Record::Unbound,
                 exited,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1142,7 +1080,6 @@ mod projected_authority_tests {
                 "another session's live owner",
                 Record::Foreign,
                 live,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1152,17 +1089,15 @@ mod projected_authority_tests {
                 "another session's owner, the session ended",
                 Record::Foreign,
                 live,
-                false,
                 SessionState::Exited,
                 None,
                 CloseCause::Explicit,
-                created(true),
+                created(false),
             ),
             (
                 "failed start, bound, exited",
                 Record::Bound,
                 exited,
-                false,
                 SessionState::Failed,
                 Some(launch::Phase::Spawning),
                 CloseCause::Explicit,
@@ -1172,17 +1107,15 @@ mod projected_authority_tests {
                 "failed start, PID-only",
                 Record::PidOnly,
                 exited,
-                false,
                 SessionState::Failed,
                 Some(launch::Phase::Spawning),
                 CloseCause::Explicit,
-                created(false),
+                created(true),
             ),
             (
                 "uninspectable owner",
                 Record::Bound,
                 unknown,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1194,7 +1127,6 @@ mod projected_authority_tests {
                 "another session's owner, uninspectable",
                 Record::Foreign,
                 unknown,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1204,7 +1136,6 @@ mod projected_authority_tests {
                 "unbound owner, uninspectable",
                 Record::Unbound,
                 unknown,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Explicit,
@@ -1216,7 +1147,6 @@ mod projected_authority_tests {
                 "cleanup, bound, live",
                 Record::Bound,
                 live,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Cleanup,
@@ -1226,32 +1156,30 @@ mod projected_authority_tests {
                 "cleanup, bound, exited",
                 Record::Bound,
                 exited,
-                false,
                 SessionState::Ready,
                 None,
                 CloseCause::Cleanup,
                 Answer::Created {
                     explicit: false,
-                    owner_gone: true,
+                    diagnosed: true,
                 },
             ),
             (
                 "cleanup, failed start",
                 Record::Bound,
                 exited,
-                false,
                 SessionState::Failed,
                 Some(launch::Phase::Spawning),
                 CloseCause::Cleanup,
                 Answer::Created {
                     explicit: false,
-                    owner_gone: true,
+                    diagnosed: true,
                 },
             ),
         ];
         let surface = TerminalSession::new(terminal::TerminalKind::Herdr, "t7".into())
             .with_binding(Some("session-test".into()));
-        for (label, record, process, corroborated, state, phase, cause, expected) in rows {
+        for (label, record, process, state, phase, cause, expected) in rows {
             let observation = TestObservation::from_values(RecordValues {
                 owner: owner_record(record),
                 state,
@@ -1264,7 +1192,6 @@ mod projected_authority_tests {
             })
             .with_cause(cause)
             .with_owner_record(move |_| attestation(process))
-            .with_reuse(move |_| corroborated)
             .with_presence(|| panic!("no Herdr row asks presence"));
             let observation = if matches!(record, Record::Damaged) {
                 observation.with_read_owner(|| Ok(OwnerRead::Malformed))
@@ -1299,7 +1226,7 @@ mod projected_authority_tests {
             ) {
                 Ok(TerminalCloseAuthority::CreatedSurface(evidence)) => Answer::Created {
                     explicit: evidence.explicit(),
-                    owner_gone: evidence.owner_gone(),
+                    diagnosed: evidence.generated_reason().is_some(),
                 },
                 Ok(TerminalCloseAuthority::LiveOwner) => Answer::LiveOwner,
                 Ok(other) => panic!("{label}: {other:?}"),

@@ -8,10 +8,13 @@
 //! | --- | --- | --- | --- |
 //! | `Owned`: a live, attested owner of this session, or the launcher that bound the terminal | Recorded identity | Yes | Yes |
 //! | `Launch`: the launch that created the terminal, before any binding | The launch's argv, label, name, creation time and PID | Yes | Yes |
-//! | `Created`: no live owner of this session; admitted only for an explicit close | Recorded identity and launch label, from a handle whose creation record is whole | Yes | Only when this session's owner is positively gone and the program is observed with its recorded birth |
+//! | `Created`: no live owner of this session; admitted only for an explicit close | Recorded identity and launch label, from a handle whose creation record is whole | Yes | Never |
 //!
 //! A `not_found` from the recorded core settles a `Created` close only after the handle's
-//! creation record was validated (`Recorded::open` with `Requirement::Created`).
+//! creation record was validated (`Recorded::open` with `Requirement::Created`). A close on the
+//! creation record never ends a running terminal, whatever is known about the session's owner
+//! (the owner's decision of 2026-11-26): it refuses, and the person ends the terminal or waits
+//! for it to finish before closing again.
 use super::identity::{Launch, Recorded};
 use super::linked::Seen;
 use super::{Core, State};
@@ -28,17 +31,17 @@ pub(super) enum Basis<'a> {
         launch: &'a Launch<'a>,
         first: &'a Seen,
     },
-    /// No live owner of this session: the terminal's creation record decides, with the
-    /// decision's admitted evidence.
+    /// No live owner of this session: the terminal's creation record decides, for an admitted
+    /// close.
     Created {
         recorded: &'a Recorded<'a>,
-        evidence: Admitted,
+        admitted: Admitted,
     },
 }
 
-/// Evidence admitted for a close on the creation record: only an explicit close's.
+/// A close on the creation record that `admit` let through: only an explicit close.
 #[derive(Clone, Copy)]
-pub(super) struct Admitted(CreationEvidence);
+pub(super) struct Admitted(());
 
 /// Admits the decision's evidence before anything is read from the core: a cleanup after
 /// another command (a refused reopen) acts on no terminal that no live owner holds, and settles
@@ -46,10 +49,10 @@ pub(super) struct Admitted(CreationEvidence);
 pub(super) fn admit(evidence: CreationEvidence) -> Result<Admitted> {
     if !evidence.explicit() {
         bail!(
-            "no live owner of this session holds its Herdr terminal; only close-session --explicit ends, removes or settles it, so nothing was sent and the handle is retained"
+            "no live owner of this session holds its Herdr terminal; only close-session --explicit removes or settles it, so nothing was sent and the handle is retained"
         );
     }
-    Ok(Admitted(evidence))
+    Ok(Admitted(()))
 }
 
 /// The authority to send one `terminal.kill` to the terminal `grant` observed, on its core.
@@ -118,7 +121,10 @@ pub(super) fn grant(
     match basis {
         Basis::Owned(recorded) => recorded.check(core, observed)?,
         Basis::Launch { launch, first } => launch.check_cleanup(first.observed(), observed)?,
-        Basis::Created { recorded, .. } => recorded.check_creation_record(core, observed)?,
+        Basis::Created {
+            recorded,
+            admitted: Admitted(()),
+        } => recorded.check_creation_record(core, observed)?,
     }
     let core_id = seen.core_id();
     match observed.state {
@@ -128,14 +134,8 @@ pub(super) fn grant(
         })),
         State::Live if killed => Ok(Grant::Wait),
         State::Live => {
-            if let Basis::Created { recorded, evidence } = basis {
-                if !evidence.0.owner_gone() {
-                    bail!(
-                        "Herdr terminal {} is still running and nothing shows that this session's owner is gone, so TAB does not end it; nothing was sent and the handle is retained",
-                        observed.address
-                    );
-                }
-                recorded.program_observed(core, observed)?;
+            if let Basis::Created { recorded, .. } = basis {
+                return Err(recorded.still_running(&observed.address));
             }
             Ok(Grant::Kill(Kill {
                 core_id: core_id.to_owned(),

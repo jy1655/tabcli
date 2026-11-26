@@ -510,7 +510,6 @@ mod tests {
                 OwnedSurfaceClose::CreatedSurface(
                     super::super::close_authority::CreationEvidence::scripted(
                         super::super::close_authority::CloseCause::Explicit,
-                        true,
                     ),
                 ),
                 deadline,
