@@ -649,9 +649,13 @@ fn refused_before_surface_with(
             }
         };
         match early_facts(store, token, deadline, clock)? {
-            EarlyFacts::Pending(_) => fail_deciding_locked(store, &reason, |record, reason| {
-                unbound_wording(store, record, reason)
-            }),
+            EarlyFacts::Pending(_) => {
+                #[cfg(test)]
+                early_facts_hook::run();
+                fail_deciding_locked(store, &reason, |record, reason| {
+                    unbound_wording(store, record, reason)
+                })
+            }
             EarlyFacts::Expired => Err(startup_in_progress(&reason)),
             EarlyFacts::NotPending => Ok(()),
         }
@@ -1076,6 +1080,8 @@ fn finished_before_startup(
     if !host_record_pending(store, &receipt) {
         return None;
     }
+    #[cfg(test)]
+    early_facts_hook::run();
     Some(
         settle_locked(store, SURFACE_FINISHED.to_owned(), false).map_err(|error| {
             if format!("{error:#}") != SURFACE_FINISHED {
@@ -1087,6 +1093,29 @@ fn finished_before_startup(
             )
         }),
     )
+}
+
+/// A test's step after an early decision's last required read, run once on this thread: what
+/// happens while that read takes its time, such as the launch deadline passing.
+#[cfg(test)]
+pub(in crate::native) mod early_facts_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(in crate::native) fn set(hook: impl FnOnce() + 'static) {
+        HOOK.with(|slot| assert!(slot.borrow_mut().replace(Box::new(hook)).is_none()));
+    }
+
+    pub(super) fn run() {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {

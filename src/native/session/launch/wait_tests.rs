@@ -960,7 +960,8 @@ fn a_finished_reply_after_the_deadline_is_left_to_the_deadline() {
 }
 
 // A refusal whose lifecycle lock is freed only after the launch deadline never settles: the
-// budget is spent, and the held lock's outcome stands.
+// budget is spent, nothing is written, and as the expired decision establishes nothing about
+// the Claim, the caller is given the original refusal alone.
 #[test]
 fn a_refusal_never_settles_after_its_launch_budget() {
     let (_dir, store, token) = fixture();
@@ -986,9 +987,9 @@ fn a_refusal_never_settles_after_its_launch_budget() {
         &mut clock,
     );
     assert_eq!(clock.sleeps, [100, 100, 50]);
-    assert!(
-        format!("{error:#}").contains("provider startup is in progress; the claim is retained"),
-        "{error:#}"
+    assert_eq!(
+        format!("{error:#}"),
+        "the Herdr launch host would refuse the session directory /state/x"
     );
     let status = store.status().unwrap();
     assert_eq!(
@@ -1093,6 +1094,240 @@ fn the_early_decisions_take_only_an_existing_lock_file() {
         );
         unchanged(&store, lock);
     }
+}
+
+fn refusal() -> anyhow::Error {
+    anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x")
+}
+
+const REFUSAL_RECORDED: &str = "the Herdr launch host would refuse the session directory";
+
+// The refusal of `fixture`'s launch on a simulated clock with the deadline `deadline_ms` after
+// its start.
+fn refuse(store: &Store, token: &str, now: &Rc<Cell<Instant>>, deadline_ms: u64) -> String {
+    let start = now.get();
+    let mut clock = Simulated {
+        now: Rc::clone(now),
+        sleeps: Vec::new(),
+    };
+    format!(
+        "{:#}",
+        refused_before_surface_with(
+            store,
+            token,
+            refusal(),
+            REFUSAL_RECORDED,
+            start + Duration::from_millis(deadline_ms),
+            &mut clock,
+        )
+    )
+}
+
+fn untouched(store: &Store, token: &str) {
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert!(claim_is(store, token));
+}
+
+// The refusal reads the launch-host Record as the finished terminal does: on macOS a capture
+// host's Record exists before the directory is checked, and one that cannot be read is no
+// evidence, so nothing is written and the caller is given the refusal.
+#[test]
+fn a_refusal_with_an_unreadable_host_record_writes_nothing() {
+    let (_dir, store, token) = fixture();
+    host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
+    std::fs::write(store.directory().join(CoreRecord::LaunchHost.name()), b"{").unwrap();
+    let now = Rc::new(Cell::new(Instant::now()));
+    assert_eq!(
+        refuse(&store, &token, &now, 20_000),
+        "the Herdr launch host would refuse the session directory /state/x"
+    );
+    untouched(&store, &token);
+}
+
+// The caller is told that the Claim is retained only when TAB saw this launch's Claim held.
+// An expired receipt with the Claim already gone establishes nothing: the original refusal.
+#[test]
+fn a_refusal_reports_a_retained_claim_only_when_it_saw_it() {
+    let (_dir, store, token) = fixture();
+    test_support::apply(
+        &store,
+        &[
+            test_support::Change::ReceiptExpired,
+            test_support::Change::ClaimAbsent,
+        ],
+    );
+    let now = Rc::new(Cell::new(Instant::now()));
+    assert_eq!(
+        refuse(&store, &token, &now, 20_000),
+        "the Herdr launch host would refuse the session directory /state/x"
+    );
+    let status = store.status().unwrap();
+    assert_eq!(
+        (status.state, status.error),
+        (SessionState::Launching, None)
+    );
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+}
+
+// Both clocks are checked after the last required read, right before an early decision acts:
+// a deadline that passes while the facts are read leaves the outcome to the existing paths.
+// The finished terminal, the launch budget: the deadline path settles the launch.
+#[test]
+fn a_finished_terminal_never_acts_when_the_budget_ends_during_its_last_read() {
+    let (_dir, store, token) = fixture();
+    let start = Instant::now();
+    let now = Rc::new(Cell::new(start));
+    let deadline = start + Duration::from_millis(1500);
+    let ran = Rc::new(Cell::new(false));
+    let (late, seen) = (Rc::clone(&now), Rc::clone(&ran));
+    early_facts_hook::set(move || {
+        late.set(deadline);
+        seen.set(true);
+    });
+    let mut clock = Simulated {
+        now: Rc::clone(&now),
+        sleeps: Vec::new(),
+    };
+    let mut presence = Probes {
+        start,
+        now: Rc::clone(&now),
+        calls: Vec::new(),
+        answer: |_| finished(),
+    };
+    let error = wait_with(&store, &token, deadline, &mut clock, &mut presence).unwrap_err();
+    assert!(ran.get());
+    assert_eq!(format!("{error:#}"), LAUNCH_DEADLINE);
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(LAUNCH_DEADLINE)
+    );
+}
+
+// The finished terminal, the receipt's deadline: the probe decides nothing, and so does the
+// next one; the launch deadline settles the launch.
+#[test]
+fn a_finished_terminal_never_acts_when_the_receipt_expires_during_its_last_read() {
+    let (_dir, store, _) = fixture();
+    let mut record = read(&store).unwrap().unwrap();
+    record.deadline_unix_ms = unix_ms() + 1500;
+    let receipt_deadline = record.deadline_unix_ms;
+    store
+        .record(CoreRecord::Launch)
+        .write_json(&record)
+        .unwrap();
+    early_facts_hook::set(move || {
+        while unix_ms() <= receipt_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let run = run_probed(&store, 2500, |_| finished());
+    assert_eq!(format!("{:#}", run.result.unwrap_err()), LAUNCH_DEADLINE);
+    assert_eq!(run.probes.len(), 2);
+}
+
+// The refusal, the launch budget: nothing is written, and the caller is given the refusal.
+#[test]
+fn a_refusal_never_acts_when_the_budget_ends_during_its_last_read() {
+    let (_dir, store, token) = fixture();
+    let now = Rc::new(Cell::new(Instant::now()));
+    let late = Rc::clone(&now);
+    let deadline = now.get() + Duration::from_millis(20_000);
+    early_facts_hook::set(move || late.set(deadline));
+    assert_eq!(
+        refuse(&store, &token, &now, 20_000),
+        "the Herdr launch host would refuse the session directory /state/x"
+    );
+    untouched(&store, &token);
+}
+
+// The lifecycle lock is taken only from a regular file: an entry of another kind at the lock's
+// path establishes nothing, so neither decision writes, even with this launch's own records.
+#[test]
+fn the_early_decisions_take_the_lock_only_from_a_regular_file() {
+    let lock = |store: &Store| {
+        store
+            .directory()
+            .join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE)
+    };
+    let (_dir, store, token) = fixture();
+    std::fs::remove_file(lock(&store)).unwrap();
+    std::fs::create_dir(lock(&store)).unwrap();
+    let now = Rc::new(Cell::new(Instant::now()));
+    let mut clock = Simulated {
+        now: Rc::clone(&now),
+        sleeps: Vec::new(),
+    };
+    assert!(
+        finished_before_startup(
+            &store,
+            &token,
+            "t7",
+            now.get() + Duration::from_secs(20),
+            &mut clock
+        )
+        .is_none()
+    );
+    untouched(&store, &token);
+    assert_eq!(
+        refuse(&store, &token, &now, 20_000),
+        "the Herdr launch host would refuse the session directory /state/x"
+    );
+    untouched(&store, &token);
+}
+
+// A FIFO at the lock's path never blocks either decision: the lock file is opened without
+// blocking, and a FIFO is no regular file. Each decision runs on its own thread so that a
+// blocked open fails the test instead of hanging it.
+#[cfg(unix)]
+#[test]
+fn the_early_decisions_never_block_on_a_fifo_at_the_lock_path() {
+    use std::sync::mpsc;
+    let (_dir, store, token) = fixture();
+    let fifo = store
+        .directory()
+        .join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE);
+    std::fs::remove_file(&fifo).unwrap();
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let directory = store.directory().to_owned();
+    let (sender, receiver) = mpsc::channel();
+    let refusing = token.clone();
+    std::thread::spawn(move || {
+        let store = Store::open_unchecked(&directory);
+        let now = Rc::new(Cell::new(Instant::now()));
+        let refused = refuse(&store, &refusing, &now, 20_000);
+        let start = Instant::now();
+        let probe_now = Rc::new(Cell::new(start));
+        let mut clock = Simulated {
+            now: Rc::clone(&probe_now),
+            sleeps: Vec::new(),
+        };
+        let decided = finished_before_startup(
+            &store,
+            &refusing,
+            "t7",
+            start + Duration::from_secs(20),
+            &mut clock,
+        )
+        .is_some();
+        let _ = sender.send((refused, decided));
+    });
+    let outcome = receiver.recv_timeout(Duration::from_secs(5));
+    if outcome.is_err() {
+        // Unblock an open that waits for a writer, so that the thread ends.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let (refused, decided) = outcome.expect("an early decision blocked on the FIFO");
+    assert_eq!(
+        refused,
+        "the Herdr launch host would refuse the session directory /state/x"
+    );
+    assert!(!decided);
+    untouched(&store, &token);
 }
 
 // The production surface observation reaches the terminal's presence check: a surface that
