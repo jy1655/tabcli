@@ -174,21 +174,30 @@ finished terminal and closes the session record. TAB first proves from its own r
 terminal's creation (core, address, creation time, program, session directory and launch
 label) that it is this session's terminal. A finished or removed terminal is then cleaned up
 whatever the session's owner record says, including an owner whose process ID now belongs to
-another process. A terminal that still runs is ended only when the owner record names this
-session's own TAB process and the system shows that process gone, and when TAB can still see
-the terminal's program as the one it started. Otherwise the close keeps the session and says
-so. Listing sessions, `tell` and waiting for a result never close a Herdr terminal on their
+another process. A terminal that still runs is ended only when TAB can establish that the session has
+ended, and when it can still see the terminal's program as the one it started. The session has
+ended when the owner record names this session's own TAB process and the system shows that
+process gone, or when the session recorded its own end. Otherwise the close keeps the session and
+says so. Listing sessions, `tell` and waiting for a result never close a Herdr terminal on their
 own; an attached `ask` or `tell` stops waiting once the owner is gone.
 
-If the close is refused, run hc against the recorded core only. The session's `attach_command`
-names that core's socket: on macOS and Linux use the same form, `HC_SOCKET='<socket>' hc get
-<address>`, and on Windows the PowerShell block of `attach_command` with `get` in place of
-`attach`. A plain `hc get <address>` uses whichever core your environment selects, where the
-same address can be another terminal. Check that the program arguments `hc get` shows name
-this session's directory, whose last part is the session ID. When TAB refused the match,
-deciding that this is the session's terminal is yours. Once you are sure, end it with
-`hc kill <address>` and remove it with `hc rm <address>`, both in the same form. The next close
-then finds it gone and closes the session record.
+When TAB cannot establish that the session has ended, it keeps a running terminal and asks you
+to end it first. Then run the close again: it removes the finished terminal and closes the
+session record, whatever the session's owner record says.
+
+To act on the terminal yourself, first run `tabcli doctor <session>`. Its surface check asks
+the core at the recorded socket for the permanent core ID that TAB recorded. If it reports a
+different Herdr Core, that socket now belongs to another core. Do not run hc there: restore the
+original core and close again. Then run hc against the recorded core only. The session's
+`attach_command` names its socket: on macOS and Linux use the same form, `HC_SOCKET='<socket>'
+hc get <address>`, and on Windows the PowerShell block of `attach_command` with `get` in place
+of `attach`. A plain `hc get <address>` uses whichever core your environment selects, where the
+same address can be another terminal. Check that the program arguments `hc get` shows name this
+session's directory, whose last part is the session ID. When TAB refused the match, deciding
+that this is the session's terminal is yours. Once you are sure, end it with `hc kill
+<address>` and remove it with `hc rm <address>`, both in the same form. Refusals that name an hc
+command, such as turning keep off, already use that form. The next close then finds the
+terminal gone and closes the session record.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for

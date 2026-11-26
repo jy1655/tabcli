@@ -723,10 +723,13 @@ Surface decision in Repair. The owner's rule is one behavior on every OS, with a
 only where it is unavoidable (2026-11-26, os-parity). Repair scans active then claimed handles
 through the same reader and retains damaged evidence, and scans again under the lifecycle
 lock before it settles a session. On every OS, Repair leaves a registered core-retained
-terminal (Herdr) for explicit Close. Only a close whose `CloseCause` is `Explicit` acts on it:
-`CreatedSurface` removes it after the adapter proves it by the creation record in the handle,
-whatever the owner record says. It ends a running one (`Running::End`) only when this session's
-owner is positively gone and the program is observed with its recorded birth. On macOS and
+terminal (Herdr) for explicit Close. `owner_exit::core_kept` gathers the decision's evidence
+for every owner record into `CreationEvidence`, which only that module can construct. The Herdr
+adapter's `authority::grant` is the only function that permits `terminal.kill` or
+`terminal.rm`. It admits only an explicit `CloseCause` and requires the creation record in the
+handle. It removes a finished terminal whatever the owner record says. It ends a running one only
+when this session's owner is positively gone and the program is observed with its recorded
+birth. On macOS and
 Linux, Repair also preserves an intent or another Surface that can outlive its owner. Their
 ordinary dead-owner branch keeps requiring an exited, bound owner with complete control,
 apart from two earlier routes. A Linux tmux server is closed by its creation-time incarnation

@@ -90,39 +90,55 @@
   checked against the recorded creation and program again, so a terminal set to keep or
   running a replacement in between is left alone and its handle retained. A close whose kill
   reply was lost fails instead of repeating it, and the next close finishes from what it
-  reads (a finished terminal is only removed). Every close checks the launch label as part
-  of the creation record, the close with a live owner included, and sends at most one
-  `terminal.rm` with one confirming read; `not_found` from the recorded core answers it.
-  Herdr's registration declares that its core retains a finished terminal, and
-  `terminal::close_authority::owner_exit` applies one rule to it on every OS (the owner's
-  decision, 2026-11-26, os-parity):
+  reads (a finished terminal is only removed). A close sends at most one `terminal.rm` with one
+  confirming read; `not_found` from the recorded core answers it. Only `authority::grant`
+  (`terminal/herdr/authority.rs`) can permit a `terminal.kill` or a `terminal.rm`: it mints
+  the only values those calls take, from the basis of the close and the observation it acts
+  on. Herdr's registration declares that its core retains a finished terminal, and one rule
+  applies to it on every OS (the owner's decisions of 2026-11-26, os-parity):
   - Repair's dead-owner decision never ends, removes or reads a gone owner's terminal: it keeps
     the handle for `close-session --explicit` and checks both handle paths again under the
     lifecycle lock before it settles a session, so a handle that a concurrent close restored
     is never consumed. The steps Repair takes before that decision still run: publishing a
     completed result, and settling a launch that was never confirmed.
+  - `owner_exit::core_kept` gathers the close decision's evidence for every owner record and
+    returns evidence, never an action. Only a record bound to this session whose incarnation
+    is attested live leads to the close with a live owner; an owner that cannot be inspected
+    refuses. Everything else (no record, a damaged or conflicting one, another session's, an
+    unbound or PID-only one, a gone owner, a failed start) is a close on the creation record
+    (`CreatedSurface`).
   - Only `close-session --explicit`, and the sessions it lists with `--with-started-from`, act on
-    a gone owner's terminal. The cleanup after a refused reopen (`CloseCause::Cleanup`) gains
-    nothing here.
-  - That close proves the terminal by its creation record and nothing else: the recorded core,
-    address, creation time, program PID, the exact session directory in the argv and the
-    launch label. The owner record neither grants nor blocks it. A finished terminal is then
-    removed and an absent one settled, whatever the record says (exited or PID reused; bound,
-    unbound or another session's; complete or not).
+    the creation record. The cleanup after a refused reopen (`CloseCause::Cleanup`) is refused
+    before the core is asked, a failed start included.
+  - The creation record proves the terminal and nothing else does: the recorded core, address,
+    creation time, program PID, the exact session directory in the argv and the launch label,
+    from a handle whose own record is whole (a label TAB generates, and on Windows a label at
+    all) before even `not_found` settles it. A finished terminal is then removed and an absent
+    one settled whatever the owner record says, including one that names a live process of
+    another session or a recycled PID. The state of the owner record never strands a session.
   - A running terminal is ended (one `terminal.kill`) only when this session's owner is
-    positively gone: a record bound to this session, naming an incarnation the OS observed
-    exited or reused. The program must also be observed with its recorded birth. An unbound,
-    foreign or PID-only record, or a program the OS no longer reports, keeps the handle: the
-    user ends the terminal on its recorded core, and the next close removes it. An owner that
-    cannot be inspected is not gone and keeps the live-owner rules.
-  - A failed start closes the same way, with or without an owner record.
-  - The closed record keeps the session's diagnosis: its stored error, or that the owner's
-    process is no longer running.
+    positively gone and its program is observed with its recorded birth. Positively gone means
+    a record bound to this session names an incarnation the platform can produce (a valid
+    birth, a Windows creation time and image path), and the OS observed it exited, or a process
+    created after it at its PID. A reuse that the live process contradicts (born no later, or
+    on Windows the same creation time under another path) proves nothing. It also means the
+    session's own wrapper recorded its end: state `exited`, which only the wrapper writes
+    after its provider has exited.
+  - When nothing establishes that this session has ended, TAB keeps the running terminal and
+    sends nothing (the owner's decision, 2026-11-26). The user ends it on its recorded core, and
+    the next close removes it. Process-tree evidence was examined and not used. On every OS it
+    would need the wrapper identified among the launch host's descendants by command line, and
+    reparenting or a failed read makes absence there no proof of an end.
+  - The closed record keeps the stored diagnosis, read under the lifecycle lock, when this close
+    acts on the creation record. Other closes keep their earlier outcome.
+  - The close with a live owner, the cleanup after a failed binding and the read-only presence
+    probe keep the identity without the launch label, as before.
 
   Handles created by 0.4.45 and 0.4.46 on macOS and Linux omit the nonce. For those, the launch
-  label must agree with the terminal's generated name. A Windows handle without it is refused,
-  because every Windows writer saved it. A failed read, kill or removal keeps the handle for
-  retry. Cleanup after binding fails uses the ordinary close proof. Cleanup
+  label must agree with the terminal's generated name. A failed read, kill or removal keeps the
+  handle for retry. A refusal that names an hc command names the recorded endpoint; the user
+  checks with `tabcli doctor` that the core there is the one TAB recorded before changing
+  anything. Cleanup after binding fails uses the ordinary close proof. Cleanup
   before confirmation checks the full launch argv, label and name, plus the creation
   time and PID from its first read at that address. It refuses a terminal set to keep. A birth
   is needed to retain a handle for retry. The core has no conditional kill or remove, so another
@@ -212,8 +228,8 @@
   identity. The owner's death proves nothing about the terminal, and Windows follows the
   rule above: Repair leaves a gone owner's Herdr terminal for `close-session --explicit`.
   0.4.49 and earlier closed it during Repair, including a running one, without the
-  launch-label check and whatever the owner record said. The explicit close observes the
-  owner before the ownership proof, which a gone owner never passes, and closes by the
+  launch-label check and whatever the owner record said. The explicit close gathers the same
+  evidence before the ownership proof, which a gone owner never passes, and closes by the
   creation record through the Windows lookup (`close_created_surface`). An attached `ask` or
   `tell` stops waiting once the owner is verified gone, as on macOS and Linux. A close that
   fails (no core, another core, a changed terminal) restores the handle and leaves state and
