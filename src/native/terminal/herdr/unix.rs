@@ -261,20 +261,29 @@ fn receive_before(
     buffer: &mut [u8],
     deadline: Instant,
 ) -> std::io::Result<usize> {
+    wait_and_receive(
+        buffer,
+        deadline,
+        |deadline| wait_readable(stream, deadline),
+        |buffer| receive_now(stream, buffer),
+    )
+}
+
+/// The loop of `receive_before`, with its two steps as parameters so that a test can script
+/// them: `wait` returns once the socket is readable or fails at the deadline, and `receive`
+/// takes what is there without blocking. The loop itself never reads the clock.
+pub(super) fn wait_and_receive(
+    buffer: &mut [u8],
+    deadline: Instant,
+    mut wait: impl FnMut(Instant) -> std::io::Result<()>,
+    mut receive: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
     loop {
-        wait_readable(stream, deadline)?;
-        let received = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                libc::MSG_DONTWAIT,
-            )
+        wait(deadline)?;
+        let error = match receive(buffer) {
+            Ok(count) => return Ok(count),
+            Err(error) => error,
         };
-        if let Ok(count) = usize::try_from(received) {
-            return Ok(count);
-        }
-        let error = std::io::Error::last_os_error();
         match error.kind() {
             // Readable with nothing to receive: wait again at once, so that a reply the core
             // sends before the deadline is read. This cannot spin. On Linux the ordinary
@@ -286,6 +295,19 @@ fn receive_before(
             _ => return Err(error),
         }
     }
+}
+
+/// One receive of what `stream` holds, without blocking: `WouldBlock` when it holds nothing.
+fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let received = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
 }
 
 /// Returns once `stream` is readable (bytes, the end of the stream or an error is waiting, or,

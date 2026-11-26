@@ -1631,54 +1631,94 @@ fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
     drop(core);
 }
 
-// After a receive that found nothing, the read goes back to waiting against its deadline, so
-// a reply the core sends in the last milliseconds is read. The urgent byte makes the socket
-// readable with nothing to receive; the read starts with 10 ms left, so a read that paused
-// before it waited again (up to 10 ms, cab25db to 8f316da) slept past its deadline and missed
-// the reply sent 3 ms in. Without out-of-band data there is no empty receive, and the same
-// reply is read as any other.
+// After a receive that finds nothing, the read's next step is the wait, at once and against
+// its original deadline, so that a reply the core sends in the last milliseconds is read.
+// Both steps are scripted here; the socket tests above cover what the kernels do. The wait
+// reports readable each time. The receive first finds nothing, as on Linux for a queue that
+// holds only an urgent byte, is then interrupted, and then returns the reply. The deadline is
+// already reached when the read starts and the scripted wait ignores it, so a read that acts
+// on the deadline itself between an empty receive and the next wait ends there instead.
+// 8f316da did: it paused for up to 10 ms of the time left and returned `TimedOut` when none
+// was left, which lost a reply the core sent during its last pause. Finally, a wait that
+// reports the deadline ends the read without another receive.
 #[cfg(unix)]
 #[test]
-fn a_reply_that_follows_an_empty_receive_before_the_deadline_is_read() {
-    use std::io::{ErrorKind, Write};
-    use std::os::unix::net::UnixStream;
+fn after_an_empty_receive_the_read_waits_again_at_once_against_its_deadline() {
+    use std::io::ErrorKind;
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Wait(Instant),
+        Receive,
+    }
     let reply = [
         br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
         b"\n",
     ]
     .concat();
-    let (mut tab, mut core) = UnixStream::pair().unwrap();
-    let urgent = send_urgent_byte(&core);
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(10);
-    let sent = reply.clone();
-    let writer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(3));
-        core.write_all(&sent).unwrap();
-        (core, Instant::now())
-    });
+    let deadline = Instant::now();
     let mut buffer = [0_u8; 256];
-    let result = super::Stream::read_before(&mut tab, &mut buffer, deadline)
-        .map(|read| buffer[..read].to_vec());
-    let (core, written) = writer.join().unwrap();
-    if written + Duration::from_millis(1) < deadline {
-        assert_eq!(
-            result.as_deref().ok(),
-            Some(reply.as_slice()),
-            "{result:?} (urgent byte sent: {urgent})"
-        );
-    } else {
-        // The writer itself ran late, past the point this test can judge: the read may only
-        // return the reply or time out at its deadline.
-        assert!(
-            result.as_deref().ok() == Some(reply.as_slice())
-                || result
-                    .as_ref()
-                    .is_err_and(|error| error.kind() == ErrorKind::TimedOut),
-            "{result:?}"
-        );
-    }
-    drop(core);
+
+    let steps = RefCell::new(Vec::new());
+    let mut received = [
+        Err(ErrorKind::WouldBlock),
+        Err(ErrorKind::Interrupted),
+        Ok(reply.as_slice()),
+    ]
+    .into_iter();
+    let result = super::unix::wait_and_receive(
+        &mut buffer,
+        deadline,
+        |waited| {
+            steps.borrow_mut().push(Step::Wait(waited));
+            Ok(())
+        },
+        |buffer| {
+            steps.borrow_mut().push(Step::Receive);
+            let bytes = received.next().expect("a receive after the reply")?;
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        },
+    )
+    .map(|read| buffer[..read].to_vec())
+    .map_err(|error| error.kind());
+    assert_eq!(
+        steps.into_inner(),
+        [
+            Step::Wait(deadline),
+            Step::Receive,
+            Step::Wait(deadline),
+            Step::Receive,
+            Step::Wait(deadline),
+            Step::Receive,
+        ],
+        "{result:?}"
+    );
+    assert_eq!(result.as_deref(), Ok(reply.as_slice()));
+
+    let steps = RefCell::new(Vec::new());
+    let mut waited = [Ok(()), Err(ErrorKind::TimedOut)].into_iter();
+    let result = super::unix::wait_and_receive(
+        &mut buffer,
+        deadline,
+        |deadline| {
+            steps.borrow_mut().push(Step::Wait(deadline));
+            waited
+                .next()
+                .expect("a wait after the deadline")
+                .map_err(std::io::Error::from)
+        },
+        |_| {
+            steps.borrow_mut().push(Step::Receive);
+            Err(ErrorKind::WouldBlock.into())
+        },
+    )
+    .map_err(|error| error.kind());
+    assert_eq!(
+        steps.into_inner(),
+        [Step::Wait(deadline), Step::Receive, Step::Wait(deadline)],
+        "{result:?}"
+    );
+    assert_eq!(result, Err(ErrorKind::TimedOut));
 }
 
 // --- Review regressions (2026-11-18): each was written and run before its fix. ---
