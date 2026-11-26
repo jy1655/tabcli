@@ -666,18 +666,18 @@ fn new_session_settings(directory: &Path) -> Result<(std::fs::File, PathBuf)> {
 
 // Removes a settings file that no plan was granted, durably (the session directory is synced
 // after the unlink; review r7, finding 2), and returns the plan's `error`, naming the file when
-// it could not be removed or its removal could not be made durable: no Agy was started with it,
-// and a file left stays with the session's records until `prune-sessions` removes the session
-// directory.
+// it could not be removed or its removal could not be made durable, as the removal itself says
+// (review r8, finding 1): no Agy was started with it, and a file left stays with the session's
+// records until `prune-sessions` removes the session directory.
 fn discard_ungranted(file: &Path, error: anyhow::Error) -> anyhow::Error {
-    let Err(removal) = crate::native::session::primitives::remove_file_if_present(file) else {
-        return error;
-    };
-    let outcome = match std::fs::symlink_metadata(file) {
-        Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {
-            "was removed, but its removal could not be made durable"
-        }
-        _ => "could not be removed",
+    use crate::native::session::primitives::{RemovalFailure, remove_file_durably};
+    let (outcome, removal) = match remove_file_durably(file) {
+        Ok(()) => return error,
+        Err(RemovalFailure::NotRemoved(removal)) => ("could not be removed", removal),
+        Err(RemovalFailure::NotDurable(removal)) => (
+            "was removed, but its removal could not be made durable",
+            removal,
+        ),
     };
     error.context(format!(
         "the settings file {} that no plan was granted {outcome} ({removal:#}); no Agy was started with it",

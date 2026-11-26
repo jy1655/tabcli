@@ -25,23 +25,33 @@
   and each granted plan has a file of its own, `agy-session-trust-<random>.json`, created new
   so that no other planning attempt for the session replaces it (review r5, finding 1). The
   plan carries the option, the workspace it was granted for and that file's path and digest to
-  the spawn fence, which asks the authority about this command again immediately before the
-  provider starts and refuses the command unless the file at that path holds bytes of that
-  digest and passes the provider store reader's check (owner and access; Trust Store Boundary): a
-  replacement with the same bytes passes only if it is a regular file that no other account can
-  change, and a refusal by the reader names the file and the reader's reason (review r7, finding
-  5). Removal: the plan owns the file from its exclusive creation until the grant is made (review
-  r6, finding 2), so a write that fails once the file exists (a failed directory sync can follow
-  a complete file) or a grant that is not made removes it; the removal is made durable (the
-  session directory is synced after it), and a removal that fails or whose sync fails is reported
-  with the file's path (review r7, finding 2). A grant whose record write fails after the record
-  was replaced returns the applied marker to its earlier value under the record's lock, keeping
-  an earlier plan's marker, and reports a return that fails (review r7, finding 1). A plan
-  refused before (the workspace check) writes none. The files stay with the session's other
-  records after it ends, as do those of a plan refused at the spawn fence and of a wrapper that
-  crashed before recording the marker (inert: no Agy was started with them), until
-  `tabcli prune-sessions` removes the session directory. Doctor's `agy_workspace_trust` row of a
-  session whose launch applied the setting lists them as `session_settings`: regular files only,
+  the spawn fence, which asks the authority about this command again under the session's
+  lifecycle lock, just before the fence's deadline check and its durable `Spawning` record, and
+  refuses the command unless the provider store reader (`consent::read_store`) accepts the file
+  at that path and its bytes have that digest. The reader refuses a final path component that is
+  a symbolic link or not a regular file (the directories above it are not inspected), more than
+  8 MiB or text that is not UTF-8, on Unix a file that the effective user does not own or whose
+  mode has a group or other write bit (owner and mode bits only, no access control list), and on
+  Windows a file that fails the owner and access-list rule (Trust Store Boundary). A replacement
+  with the same bytes that the reader accepts passes; a refusal by the reader names the file and
+  the reader's reason (review r7, finding 5; review r8, finding 4). Removal: the plan owns the
+  file from its exclusive creation until the grant is made (review r6, finding 2), so a write
+  that fails once the file exists (a failed directory sync can follow a complete file) or a grant
+  that is not made has the plan remove it and sync the session directory
+  (`remove_file_durably`). The plan's error names the file when the unlink failed ("could not be
+  removed") or when the unlink succeeded and the sync failed ("was removed, but its removal
+  could not be made durable"), as the removal itself reports (review r7, finding 2; review r8,
+  finding 1). When the grant's write of the applied marker fails, the plan, still under the
+  record's lock, rewrites the earlier record unless the record already shows the earlier marker
+  (so an earlier plan's marker stays); if that rewrite fails too, the record can keep the
+  attempted marker, and the error says that this attempt received no grant and that the record
+  may still name the option (review r7, finding 1; review r8, finding 2). A plan refused before
+  the file (an unsupported or unidentified version, a refusing authority, the workspace check)
+  writes none. The files stay with the session's other records after it ends, as do those of a
+  plan refused at the spawn fence, of a removal that failed and of a wrapper that stopped before
+  the grant (inert: no Agy was started with them), until `tabcli prune-sessions` removes the
+  session directory. Doctor's `agy_workspace_trust` row of a
+  session whose record names the setting lists them as `session_settings`: regular files only,
   including the single `agy-session-trust.json` of a session that this change's earlier build
   launched, and a listing that could not be completed is marked so, never shown as an empty list
   (review r6, finding 3). 0.4.49 ignores them, as every file it does not name, and its prune
@@ -78,8 +88,8 @@
   (router's limit, 2026-11-26). The backends are not changed, so a revocation that lands after
   that point does not stop the paste already handed to the backend. The request trace's paste
   timestamps surround the send itself and stay empty when that check refuses. An
-  Agy store that TAB's reader refuses (malformed, or its access list lets another account
-  change it) withholds even a paste that relies on the setting alone: the authority asks every
+  Agy store that TAB's reader refuses (malformed, or failing the reader's owner and permission
+  check) withholds even a paste that relies on the setting alone: the authority asks every
   target whether its store declines the workspace, and a store it cannot read is a refusal
   marked unreadable, not a missing entry (consent's authority, Trust Store Boundary). An
   unreadable store, session record or log is reported as unreadable evidence, never as an

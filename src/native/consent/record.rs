@@ -620,7 +620,9 @@ fn with_session_record<T>(
 /// A write that fails can already have replaced the record (the replacement comes before the
 /// syncs that make it durable): the record is then returned to its earlier value under the same
 /// lock, so no marker names a command that is never built, and an earlier plan's marker stays
-/// (review r7, finding 1).
+/// (review r7, finding 1). When that return fails too, the record can keep the attempted marker,
+/// and the error says that this attempt received no grant and which marker may remain (review r8,
+/// finding 2).
 pub(in crate::native) fn apply_option(
     directory: &Path,
     provider: FirstPartyCli,
@@ -636,7 +638,7 @@ pub(in crate::native) fn apply_option(
             return Err(match restore_earlier(path, &earlier) {
                 Ok(()) => error,
                 Err(restore) => error.context(format!(
-                    "the session's consent record may still name the launch option {marker}, which no command carries: returning it to {} failed ({restore:#})",
+                    "this attempt received no grant for the launch option {marker}, and the session's consent record may still name it: returning the record to {} failed ({restore:#})",
                     earlier.applied.as_deref().unwrap_or("none")
                 )),
             });

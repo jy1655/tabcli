@@ -316,10 +316,10 @@ _Avoid_: parent trust, repository trust (a parent directory never supplies conse
 The one answer to whether a target provider may treat a session's workspace as consented now,
 derived again from current records, stores and Git files at every use and never written. Its yes
 is asked again at the last point TAB's own code controls: a launch option in its plan and, for
-that command, in the spawn fence; a dialog key inside its dispatch; an Agy paste immediately
-before the terminal backend's send. A change after that point takes effect for the next act. A
-session's recheck needs the pins recorded at its start. A launch's applied marker records what it
-did and is never authority.
+that command, in the spawn fence; a dialog key inside its dispatch; an Agy paste that relies on
+the session-only setting immediately before the terminal backend's send. A change after that
+point takes effect for the next act. A session's recheck needs the pins recorded at its start. A
+launch's applied marker records what it configured and is never authority.
 _Avoid_: authorized flag, consent cache
 
 **Launch dialog**:

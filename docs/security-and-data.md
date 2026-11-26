@@ -51,9 +51,10 @@ the same by itself. The rule is about who can register a worktree in a trusted r
 who can write that repository's `.git` directory can, and the worktree's files are then trusted
 like any commit checked out in the main working tree. A cloned or fetched repository cannot
 register a worktree by itself. The main working tree's own consent decides, with its source,
-identity and revocation: `tabcli consent revoke` on the main working tree also stops its
-worktrees. A provider that declines the worktree itself, either the source of that consent or
-the provider being launched, stops it too.
+identity and revocation: `tabcli consent revoke` on the main working tree also withdraws the
+consent TAB derives for its worktrees. A provider that declines the worktree itself, either the
+source of that consent or the provider being launched, withdraws it too. A provider's own trust
+of a worktree, such as an entry in Agy's own store or Codex's own repository rule, is unchanged.
 
 TAB reads the worktree's `.git` file and the registration it names without running `git`. Before
 the worktree check touches the main working tree that the file names, TAB asks each provider
@@ -86,39 +87,50 @@ configuration, `HEAD`, objects or refs: a repository whose configuration moves i
 then also names the main working tree (`repository_root`).
 
 TAB checks consent again at every use, not only at launch, and consumes it at the act: when a
-provider option is planned and again for that command immediately before the provider starts,
-immediately before a trust-dialog key, and immediately before every Agy paste is handed to the
-terminal; `doctor` reports the same check. That is the last point TAB's own code controls, and a
+provider option is planned; again for that command in the spawn fence, under the session's
+lifecycle lock, just before the fence's deadline check and the durable record of the spawn that
+precede the start; immediately before a trust-dialog key; and immediately before an Agy paste
+that relies on the session-only setting is handed to the terminal (a session whose workspace
+Agy's own store lists exactly is checked against that store there instead). For such an Agy
+session `doctor` reports the same check. That is the last point TAB's own code controls, and a
 change after it takes effect for the next act, not the one in flight: a revocation that lands
 while the terminal already carries out a paste does not stop that paste. The final check before
 a provider starts reads no consent for a command that carries no trust option, as before; every
 `ask` and supported `reopen` still assesses consent while the session is resolved. Each check
 reads the records, provider stores and Git files as they are now and writes nothing. Provider or
 Git evidence it cannot read gives no trust option and no dialog key, as missing consent did
-before; `doctor` and the Agy paste gate report it as unreadable, and a command that already
-carries a trust option does not start. TAB's own consent record that cannot be read or decoded
-is an error, as before. A session's check needs the source recorded at its
-start: after `tabcli consent reset` of the workspace or of its main working tree, only a new
-`ask` or a supported `reopen` acquires consent again. What a launch recorded is history. A revoked consent, a source that no longer trusts the directory or a worktree
-that is no longer registered stops a TAB paste into a running Agy session that relies on its
-session-only setting. It does not change what the running Agy trusts, and a session whose
-workspace Agy's own trust store lists exactly keeps its pastes.
+before; for an Agy session that relies on the session-only setting, `doctor` and the paste gate
+report it as unreadable; and a command that already carries a trust option does not start.
+TAB's own consent record that cannot be read or decoded is an error, as before. A session's
+check needs the source recorded at its start: after `tabcli consent reset` of the workspace or of
+its main working tree, only a new `ask` or a supported `reopen` acquires consent again. What a
+launch recorded is history. A revoked consent, a source that no longer trusts the directory, or a
+worktree that is no longer registered or whose main working tree is gone stops a TAB paste into a
+running Agy session that relies on its session-only setting. It does not change what the running
+Agy trusts, and a session whose workspace Agy's own trust store lists exactly keeps its pastes.
 
 TAB never writes a provider trust store. With verified consent, Codex receives a process-local
 configuration override, Pi receives its one-run approval option, and Agy 1.5.17 or newer receives
 a settings file for that session only (`--settings`, which Agy documents as never saved), so no
 key is sent and Agy's own store is not written. TAB creates that file in the session directory as
 `agy-session-trust-<random>.json`, a new one for each launch plan granted the setting, so one
-session can hold several. Immediately before Agy starts, TAB checks the file at the path the plan
-named against the digest of the bytes the plan wrote, and reads it only as it reads a provider
-trust store: a regular file, not a link, that you own and that no other account can change (on
-Unix without group or other write permission; on Windows under the owner and access-list rule for
-trust stores in [Local records](#local-records)). A changed or missing file stops the launch. A replacement at the same path with the same bytes is accepted only if it passes that
-check too; otherwise the error names the file and the reason. If a plan fails after creating its
-file and before the setting is granted, it removes the file again and leaves the session's
-record as it was; if that removal fails or cannot be made durable, its error names the file.
-Every other such file stays with the session's records after the session ends, until
-`prune-sessions` removes the session directory. Only Agy 1.5.17 on macOS has been measured
+session can hold several. In the spawn fence, just before Agy starts, TAB reads the file at the
+path the plan named with the reader it uses for provider trust stores and compares the digest of
+its bytes with the bytes the plan wrote. That reader refuses a path whose last component is a
+symbolic link or not a regular file (it does not inspect the directories above that component),
+a file larger than 8 MiB or not valid UTF-8, and, on macOS and Linux, a file that your effective
+user does not own or whose mode lets its group or others write (it reads the owner and the mode
+bits, not an access control list). On Windows it applies the owner and access-list rule for trust
+stores in [Local records](#local-records). A changed, missing or refused file stops the launch,
+and a refusal by the reader names the file and the reader's reason; a replacement at the same
+path with the same bytes that passes the reader is accepted. If a plan fails after creating its
+file and before the setting is granted, TAB removes the file and syncs the session directory; its
+error names the file if the removal failed, or if the file was removed but its removal could not
+be made durable. If the plan's write of its applied marker failed, TAB tries to return the
+session's consent record to the marker it held before; if that also fails, the error says that
+this attempt received no grant and that the record may still name the attempted option. Every
+other such file stays with the session's records after the session ends, until `prune-sessions`
+removes the session directory. Only Agy 1.5.17 on macOS has been measured
 (standalone, and through TAB on Herdr in a new worktree): no trust dialog, and its store
 unchanged. For an ordinary folder that only another provider trusts, this changes what 0.4.49
 did with Agy: in iTerm2, Terminal.app and the native Windows console TAB used to answer Agy's
@@ -202,7 +214,7 @@ entire root. `settings.json` in that root holds TAB's surface-creation preferenc
 Inside a session directory, these are the records most useful when checking a request. Some
 exist only during a turn or after close; `agy.log` and the `agy-session-trust-<random>.json` files
 are specific to Agy. A session holds one such file for each launch plan that was granted the
-session-only setting, so it can hold several.
+session-only setting, so it can hold several, and keeps one that a failed plan could not remove.
 
 ```text
 session-example/

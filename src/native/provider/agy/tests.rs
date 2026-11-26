@@ -926,7 +926,7 @@ fn a_failed_grant_returns_the_applied_marker_to_its_earlier_value() {
     assert!(
         text.contains(&format!("injected fault before {AFTER_RENAME}"))
             && text.contains(&format!(
-                "may still name the launch option {APPLIED_MARKER}"
+                "this attempt received no grant for the launch option {APPLIED_MARKER}, and the session's consent record may still name it"
             )),
         "{text}"
     );
@@ -980,4 +980,37 @@ fn the_removal_of_an_ungranted_settings_file_is_durable_or_named() {
             && text.contains("could not be made durable"),
         "{text}"
     );
+}
+
+// Review r8, finding 1: the removal says which of its steps failed. The unlink of an ungranted
+// settings file succeeds; then the session directory loses its permissions (a volume that fails
+// from that moment), so its sync fails and so would any later look at the path. The plan reports a
+// file that was removed but whose removal could not be made durable, never a file that could not
+// be removed.
+#[cfg(unix)]
+#[test]
+fn an_unlinked_settings_file_whose_sync_fails_is_not_reported_as_kept() {
+    use crate::native::session::primitives::with_step_at;
+    use std::os::unix::fs::PermissionsExt;
+    let s = SettingsPlan::new();
+    // The grant is not made (the session record's lock is not a file), so the file is removed.
+    std::fs::create_dir(s.directory.join("workspace-consent.lock")).unwrap();
+    let locked = s.directory.clone();
+    let error = with_step_at(
+        "syncing a removed record's directory",
+        move || std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap(),
+        || s.plan(),
+    )
+    .unwrap_err();
+    std::fs::set_permissions(&s.directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+    // A user that may read anything (root) syncs the directory anyway.
+    if unsafe { libc::geteuid() } != 0 {
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("was removed, but its removal could not be made durable")
+                && !text.contains("could not be removed"),
+            "{text}"
+        );
+    }
 }

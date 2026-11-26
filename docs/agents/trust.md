@@ -144,28 +144,40 @@
   unreadable (review r4, finding 1): a consumer that does
   not need the cause treats them as a missing consent was treated in 0.4.49 (Codex and Pi plan
   no option, Claude's dialog step sends no key, the Codex wait still tries its independent
-  evidence), Agy reports the cause, and a command that carries a grant refuses to start. A
+  evidence), Agy's paste gate and doctor report the cause for a session that relies on the
+  session-only setting (a session whose workspace Agy's own store lists exactly takes that entry
+  first and does not ask), and a command that carries a grant refuses to start. A
   start records a reset for an unreadable source, as every earlier release did. Anything else
   that does not hold is a refusal with its reason. The main working tree is identified once per
   assessment, and a failure of its assessment is classified where it arises (review r6, finding
   1): when the verifier's own reads (its identification and alias check) find the folder gone,
-  also after it was identified, the inheritance is withdrawn like a missing registration, and
-  Agy and doctor report consent that no longer holds; a folder they cannot inspect is unreadable
-  evidence; TAB's own shared record of it keeps its error. A pinned source's own reader that
-  touches the folder is the source's evidence, not the verifier's: Claude's reader probes for
-  `.git` and may run `git rev-parse` there (its scope probe, unchanged), and a folder that goes
-  during that probe is the source's trust that cannot be read, a refusal marked unreadable, which
-  Agy and doctor report as unreadable evidence (review r7, finding 4). Both withhold the grant
-  and the key, and a plain command still starts. Agy's marker read decodes the session record
-  as its typed assessment (`session_applied`): valid JSON of another shape is unreadable there,
+  also after it was identified, the inheritance is withdrawn like a missing registration (a
+  refusal: the consent no longer holds); a folder they cannot inspect is unreadable evidence (a
+  refusal marked unreadable); TAB's own shared record of it keeps its error. A folder that goes
+  after the verifier's reads is not seen by that recheck, and the next one finds it gone, unless
+  a pinned source's own reader touches it first. That reader is the source's evidence, not the
+  verifier's: Claude's reader looks for `.git` in the directories above the folder and runs `git
+  rev-parse` in the folder only when one holds it (its scope probe, unchanged), and a failure
+  there, also one caused by the folder going, is the source's trust that cannot be read, a
+  refusal marked unreadable (review r7, finding 4). Each refusal withholds the grant and the
+  key, and a plain command still starts. What Agy reports depends on its route (review r8,
+  finding 3): Agy's own store entry for the exact workspace is read first, so a session whose
+  workspace that store lists keeps its pastes, and doctor reports `agy_workspace_trusted` once
+  the session's load line is there; only a session that relies on the session-only setting has
+  its paste withheld, and doctor reports `agy_workspace_untrusted` for consent that no longer
+  holds and `agy_trust_evidence_unreadable` for a refusal marked unreadable. Agy's marker read
+  decodes the session record as its typed assessment (`session_applied`): valid JSON of another
+  shape is unreadable there,
   never an absent marker. The Codex wait keeps its existing reading: `observe` only selects
   whether to ask the typed authority, and a record that supplies no marker leaves it to its
   independent readiness evidence.
 - When the authority is asked (router's limit, 2026-11-26). Consent is asked again at the last
   point the provider-neutral code controls, and a change after that point takes effect for the
   next act, not the one in flight:
-  - A paste: in the delivery step, after every wait, immediately before the terminal backend's
-    send is called, with the customization-load line required in the same log contents that
+  - An Agy paste that relies on the session-only setting (a session whose workspace Agy's own
+    store lists exactly is checked against that store at the same point, without the authority):
+    in the delivery step, after every wait, immediately before the terminal backend's send is
+    called, with the customization-load line required in the same log contents that
     supply the receipt offset. The terminal backends are not changed: a revocation that lands
     after that point does not stop the paste already handed to the backend (tmux's pane check
     and `load-buffer`, Herdr's target lookup and the Windows console helper's screen read run
@@ -198,17 +210,23 @@
   - A provider's start: the authority is asked only for a command that carries a
     trust-bearing option. The plan carries that option, its provider and the workspace identity
     it was granted for (`LaunchGrant`), and for an option that names a file (Agy's settings)
-    that file's path and digest, to the spawn fence, which refuses the command unless the file at
-    that path holds bytes of that digest and passes the provider store reader's check (a regular
-    file reached without a link, owned by the user and changeable by no other account: on Unix
-    no group or other write permission, on Windows the access-list rule above); a replacement at
-    the same path with the same bytes passes, one that fails the reader's check is refused with
-    the file's path and the reader's reason (review r7, finding 5), and it asks about that command
+    that file's path and digest, to the spawn fence, which refuses the command unless the
+    provider store reader (`read_store`) accepts the file at that path and its bytes have that
+    digest. The reader refuses a final path component that is a symbolic link or not a regular
+    file (the directories above it are not inspected), more than 8 MiB or text that is not UTF-8,
+    on Unix a file that the effective user does not own or whose mode has a group or other write
+    bit (owner and mode bits only: an access control list, such as a macOS ACL entry, is not
+    read), and on Windows a file that fails the owner and access-list rule above. A replacement
+    at the same path with the same bytes that the reader accepts passes; a refusal by the reader
+    names the file and the reader's reason (review r7, finding 5; review r8, finding 4). The
+    fence also asks about that command
     (`consent::admit_launch`) under the lifecycle lock immediately before its existing
-    deadline check, so the order (deadline, `Spawning`, spawn) is unchanged; the question is
-    bounded by the launch's remaining budget: no time left refuses a granted command without
-    asking, one absolute deadline is taken before the question starts, and an answer that
-    arrives after it refuses, so it cannot push a start past the receipt's expiry. The grant is
+    deadline check, so the order (deadline, `Spawning`, spawn) is unchanged; for a launch with a
+    receipt the question is bounded by the receipt's remaining time: no time left refuses a
+    granted command without asking, one absolute deadline is taken before the question starts,
+    and an answer that arrives after it refuses, so it cannot push a start past the receipt's
+    expiry (a launch without a receipt, which the fence judges on its status alone, asks without
+    a bound). The grant is
     made only for the workspace the command was built for (the wrapper's snapshot that gives it
     its working directory and its option), and the fence requires the authority to find that
     same identity consented. At the spawn fence a command without such an option follows
@@ -218,7 +236,9 @@
     consent during the
     durable `Spawning` write that follows, and the child's working directory between the check
     and the exec, are beyond the limit.
-  An applied marker records what a launch did and is never authority: every gate takes the
+  An applied marker records what a launch configured and is never authority (after a failed
+  grant whose restoration also failed it can name an option that attempt was not granted; review
+  r8, finding 2): every gate takes the
   target's own marker from the one typed authority result, and the dialog step refuses another
   adapter's marker or a value it does not know.
 - An inherited source records the main working tree's identity (`repository_root` in the
@@ -246,8 +266,9 @@
   drops the field and keeps the source, which then stays revoked; its `consent reset`
   clears both. The assessment at a session's start writes the main working tree's own record
   only when that consent is verified, as an `ask` there would. A session directory gains
-  `workspace-consent.lock`, the session record's own lock, and, for an Agy launch that applied
-  its session-only setting, one `agy-session-trust-<random>.json` per granted plan; earlier
+  `workspace-consent.lock`, the session record's own lock, and Agy's settings files,
+  `agy-session-trust-<random>.json`: one per granted plan, and any that a plan left when its
+  removal failed or its wrapper stopped before the grant; earlier
   binaries ignore both, as they ignore every file they do not name, and their `prune` removes
   the whole session directory with them.
 - A wait for workspace trust ends when its session has ended, and looks at the session
