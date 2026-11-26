@@ -21,12 +21,17 @@ The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmu
 Each operating system runs only its own terminals: macOS iTerm2, Terminal.app, Ghostty, Warp,
 WezTerm and Herdr; Linux tmux and Herdr; Windows its managed console and Herdr. Another terminal
 is refused the same way on all three, before any session exists: `<Name> is not available on
-<system>; use <the terminals it runs>`. A session record can also name such a terminal, for
-example in a state directory copied from another operating system. Its records stay readable
-and `screen` and `doctor` report the terminal as unsupported. A `tell` that reaches the
-terminal gets that same refusal and sends nothing. `close-session` first repairs a session
-whose owner has ended, which can close it from its records alone; otherwise it gets that same
-refusal and keeps the terminal handle, so the session can be closed where its terminal runs.
+<system>; use <the terminals it runs>`.
+
+A state directory copied from another operating system can hold sessions that belong to it:
+their terminal is one this system does not run, or their owner was recorded there. TAB on this
+system cannot observe their processes or terminals, so it does not act on them and nothing it
+sees here closes them. `inspect`, `status`, `result`, `search` and `doctor` still read them;
+`doctor` and `status` report the owner as unverified. `tell`, `screen`, `close-session` and
+`reopen` refuse them with that refusal, or with `a session recorded on <system> is not
+available on <this system>` when their terminal runs here too (Herdr) or is no longer recorded,
+and change nothing; `sessions` leaves them as they are. A session whose own records already finished its close still closes. Close the others
+on the operating system they came from; `prune-sessions` does not remove them here.
 
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Automatic selection verifies a Herdr caller when both

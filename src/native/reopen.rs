@@ -302,6 +302,13 @@ impl ResolvedReopen {
         // The source, and so its provider, is not read yet.
         let terminal_kind = session_start::choose_launch_surface(request.terminal, None)?;
         let source_directory = Reader::session_directory(&request.id)?;
+        // A source recorded on another OS is not continued here: its conversation and its
+        // processes are on that OS, and nothing of it is read or changed.
+        if let Some(refusal) =
+            terminal::foreign::of_records(&Reader::open_unchecked(&source_directory), None)
+        {
+            return Err(refusal);
+        }
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not

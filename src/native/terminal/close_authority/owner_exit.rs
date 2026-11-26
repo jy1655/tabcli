@@ -211,8 +211,9 @@ impl WindowsClose<'_> {
         surface: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        if !core_retains_finished(surface.kind) && surface.kind != TerminalKind::WindowsConsole {
-            bail!("dead Windows native owner has a non-Windows terminal handle");
+        // A handle of a kind Windows does not run gets the one refusal, as everywhere else.
+        if !terminal::OsTerminals::WINDOWS.runs(surface.kind) {
+            return Err(terminal::OsTerminals::WINDOWS.unavailable(surface.kind));
         }
         close_remaining(deadline)?;
         let outcome = (self.close)(surface)?;

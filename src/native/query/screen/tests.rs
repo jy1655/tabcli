@@ -613,13 +613,22 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
                 )
             );
         } else {
-            assert_eq!(
-                text,
-                format!(
-                    "the recorded terminal, {}, is not supported on this platform",
-                    kind.display_name()
-                )
-            );
+            // The refusal every other command gives a kind this OS does not run.
+            let expected = if cfg!(target_os = "macos") {
+                "is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"
+            } else if cfg!(target_os = "linux") {
+                "is not available on Linux; use tmux or herdr"
+            } else if cfg!(windows) {
+                "is not available on Windows; use windows-console or herdr"
+            } else {
+                "is not supported on this platform"
+            };
+            let subject = if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+                kind.display_name().to_owned()
+            } else {
+                format!("the recorded terminal, {},", kind.display_name())
+            };
+            assert_eq!(text, format!("{subject} {expected}"), "{kind:?}");
         }
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
         assert!(access.calls.borrow().is_empty(), "{kind:?}");

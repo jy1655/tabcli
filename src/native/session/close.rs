@@ -881,6 +881,16 @@ fn repair_dead_owner_with(
         Some(error) => Err(error),
         None => Ok(false),
     };
+    // A session whose Owner record another OS wrote is not judged from this machine's
+    // processes, neither its launch wrapper nor its owner: it is left as it is, with the one
+    // refusal (`terminal::foreign`). A state Repair does not examine keeps its own answer.
+    if store
+        .status()
+        .is_ok_and(|status| repair_examines_owner(&status.state))
+        && let Some(refusal) = terminal::foreign::owner_of_another_os(store)
+    {
+        return Err(recovery_damage.unwrap_or(refusal));
+    }
     if launch::repair(store)? {
         return untouched(recovery_damage);
     }

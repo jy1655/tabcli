@@ -1391,9 +1391,15 @@ fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
         budget::close_deadline(),
     )
     .unwrap_err();
+    // The refusal Windows gives every kind it does not run.
     assert!(
         format!("{error:#}")
-            .contains("dead Windows native owner has a non-Windows terminal handle")
+            .contains("iTerm2 is not available on Windows; use windows-console or herdr"),
+        "{error:#}"
+    );
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::Unsupported)
     );
     assert_eq!(record.bytes().unwrap(), before);
     assert_eq!(store.status().unwrap().state, SessionState::Working);

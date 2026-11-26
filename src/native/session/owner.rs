@@ -206,6 +206,9 @@ fn recorded_birth(owner: &NativeSessionOwner) -> std::result::Result<Option<Proc
         if owner.linux_birth.is_some() {
             return Err("foreign Linux owner birth on macOS".into());
         }
+        if owner.windows_process_identity.is_some() {
+            return Err("foreign Windows owner identity on macOS".into());
+        }
         Ok(owner
             .process_start_seconds
             .zip(owner.process_start_microseconds)
@@ -269,11 +272,13 @@ pub(in crate::native) fn attest_owner_with(
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let recorded_birth = recorded_birth.ok().flatten();
-    // A Linux birth names an incarnation this platform cannot observe; it is never
+    // A Linux or macOS birth names an incarnation this platform cannot observe; it is never
     // compared as PID-only evidence.
     #[cfg(windows)]
     let process = if owner.linux_birth.is_some() {
         ProcessObservation::Unknown("foreign Linux owner birth on Windows".into())
+    } else if owner.process_start_seconds.is_some() || owner.process_start_microseconds.is_some() {
+        ProcessObservation::Unknown("foreign macOS owner birth on Windows".into())
     } else {
         use crate::native::terminal::WindowsIncarnation;
         classify(

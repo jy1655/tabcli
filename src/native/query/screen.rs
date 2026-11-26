@@ -252,11 +252,18 @@ fn bound_surface(
             },
             SurfaceRecord::Active(Ok(Some(handle))),
         ) => match ActiveHandle::of(supported, bound, empty_id) {
+            // A Herdr terminal whose Owner record another OS wrote is refused by the ownership
+            // check, before any terminal call.
             ActiveHandle::Bound => Ok(handle),
-            ActiveHandle::Unsupported => Err(anyhow::Error::new(Unsupported::new(format!(
-                "the recorded terminal, {}, is not supported on this platform",
-                kind.display_name()
-            )))),
+            // The refusal every command gives a kind this OS does not run.
+            ActiveHandle::Unsupported => {
+                Err(terminal::foreign::kind_refusal(kind).unwrap_or_else(|| {
+                    anyhow::Error::new(Unsupported::new(format!(
+                        "the recorded terminal, {}, is not supported on this platform",
+                        kind.display_name()
+                    )))
+                }))
+            }
             ActiveHandle::BindingUnverified => {
                 bail!("the recorded terminal handle is not bound to session {id}")
             }

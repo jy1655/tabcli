@@ -251,16 +251,25 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   every other kind with `OsTerminals::unavailable` before any adapter is reached:
   `<Name> is not available on <OS>; use <its kinds>`, unsupported, the same on macOS, Linux
   and Windows. Each OS's selection refuses an explicit such kind with the same text before a
-  session exists. A stored handle can name another OS's terminal (a moved state directory);
-  its records stay readable, and every surface operation gets this refusal (after the kind's
-  declared screen or guarded-input refusal) and keeps the handle. The entry points answer
-  with it before their own OS's rules: guarded input before the macOS and Linux claim check,
-  and the explicit close (`close_authority::close_owned_surface`) after the binding check and
-  before any owner, intent or launch record is read, since this OS's processes are no
-  evidence about another OS's terminal. The close's Repair runs before it and still settles
-  some such handles from their records; that decision is `owner_exit`'s and differs by OS.
-  On macOS and Windows a tmux handle also gets the refusal at its created-host close
-  evidence. `supported_on_this_platform` reads the same list.
+  session exists. `supported_on_this_platform` reads the same list.
+  A state directory can be copied between machines. `terminal::foreign` decides once, from a
+  Session's Records alone, whether it belongs to another OS: its handle names a kind this OS
+  does not run, or its Owner record carries the identity another OS's writer records (macOS:
+  the process start time; Linux: the Linux birth; Windows: the Windows process identity).
+  This machine's processes are no evidence about such a Session. Owner attestation reads any
+  other OS's identity as unknown, never as a PID-only record. Repair, in every command that
+  runs it (`sessions`, `tell`, `close-session`), leaves a Session whose Owner record another
+  OS wrote as it is and answers with the one refusal, before launch repair or the owner check.
+  The explicit close (`close_authority::close_owned_surface`), the ownership proof, `screen`'s
+  record gate and `reopen`'s source check refuse such a Session with the same refusal: the
+  kind's when the handle names a kind this OS does not run, otherwise `a session recorded on
+  <OS> is not available on <this OS>`. Guarded input refuses a kind this OS does not run
+  before the macOS and Linux claim check. What the Records alone settle still settles: a
+  close that a tombstone or a closed status already finished, and a Session with no handle.
+  An Owner record that names no identity (a legacy PID-only record) is judged by its handle
+  at the surface entry points only; Repair still attests it. The created-host close evidence
+  of a tmux handle on macOS or Windows answers with the kind's refusal only when the close
+  decision is reached without `close_owned_surface`, which refuses first.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types with the

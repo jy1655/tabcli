@@ -145,6 +145,64 @@ fn windows_refuses_a_linux_owner_birth_as_pid_only_evidence() {
     }
 }
 
+// A Windows process identity names an incarnation that macOS cannot observe. It is never read
+// as PID-only evidence: an unrelated local PID, alive or absent, says nothing about it.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_refuses_a_windows_owner_identity_as_pid_only_evidence() {
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        windows_process_identity: Some(crate::native::terminal::WindowsProcessIdentity {
+            creation_time: 1,
+            executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
+        }),
+        ..NativeSessionOwner::default()
+    };
+    for alive in [false, true] {
+        let a = attest_owner_with(
+            &owner,
+            OwnerObservers {
+                pid_alive: &|_| alive,
+                birth: &|_| panic!("a foreign identity must not be compared"),
+                control: &|_| panic!("a foreign identity has no control observation"),
+            },
+        );
+        assert_eq!(
+            a.process,
+            ProcessObservation::Unknown("foreign Windows owner identity on macOS".into())
+        );
+        assert!(prune_blocked_by(&a));
+        assert!(repair_owner_is_live(&a).is_err());
+    }
+}
+
+// A macOS process start time names an incarnation that Windows cannot observe, as a Linux
+// birth does: never PID-only evidence.
+#[cfg(windows)]
+#[test]
+fn windows_refuses_a_macos_owner_birth_as_pid_only_evidence() {
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        process_start_seconds: Some(1),
+        process_start_microseconds: Some(2),
+        ..NativeSessionOwner::default()
+    };
+    for alive in [false, true] {
+        let a = attest_owner_with(
+            &owner,
+            OwnerObservers {
+                pid_alive: &|_| alive,
+                identity: &|_| panic!("a foreign birth must not be compared"),
+            },
+        );
+        assert_eq!(
+            a.process,
+            ProcessObservation::Unknown("foreign macOS owner birth on Windows".into())
+        );
+        assert!(prune_blocked_by(&a));
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn r1_c1_windows_legacy_dead_does_not_block_prune() {

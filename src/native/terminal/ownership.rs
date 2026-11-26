@@ -636,6 +636,13 @@ pub(in crate::native) fn verified_terminal_surface_owner(
     timeout: Option<Duration>,
 ) -> Result<Option<NativeSessionOwner>> {
     session.verify_managed_session(expected_session_id)?;
+    // A session of another OS is refused before any surface or owner observation here.
+    if let Some(refusal) = terminal::foreign::of_records(
+        &crate::native::session::Reader::open_unchecked(directory),
+        Some(session),
+    ) {
+        return Err(refusal);
+    }
     #[cfg(windows)]
     let owner = {
         // The kind's adapter proves its surface before the owner, as on macOS and Linux:
