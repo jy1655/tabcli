@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 // `repository_root` is the identity of the main working tree whose exact trust `source` names,
 // for a workspace that is a verified linked git worktree of that repository. It is absent for
@@ -74,12 +75,6 @@ impl SessionConsentObservation {
         self.value.get("applied").and_then(|marker| marker.as_str())
     }
 
-    // Whether the session's record exists but cannot be read.
-    pub(in crate::native) fn unreadable(&self) -> bool {
-        self.value.get("state").and_then(|state| state.as_str()) == Some("unreadable")
-            && self.value.get("schema").is_none()
-    }
-
     pub(in crate::native) fn value(&self) -> &serde_json::Value {
         &self.value
     }
@@ -124,11 +119,37 @@ fn exact_source(path: &Path, env: &Environment) -> Option<Evidence> {
 // ancestors and no `git`. A main working tree that a `.git` file names is therefore never
 // touched before a store lists it. The screen is a necessary condition only, never consent: the
 // main working tree that passes it is assessed afterwards by the full readers, exactly as an
-// exact folder is, and a path a store lists but its reader refuses gives no inheritance.
-fn listed(path: &Path, env: &Environment) -> bool {
-    SOURCES
-        .into_iter()
-        .any(|cli| matches!(provider::store_lists_trusted(cli, path, env), Ok(true)))
+// exact folder is, and a path a store lists but its reader refuses gives no inheritance. A
+// pinned source is screened in the one store its pin names (review r3, finding 9), whatever
+// stores the caller's environment names now; that store's read error is the screen's error.
+// Without a pin, one provider's error does not stop the next from being asked.
+fn listed(path: &Path, env: &Environment, pin: Option<&Evidence>) -> Result<bool> {
+    match pin {
+        Some(source) => provider::store_lists_trusted(
+            FirstPartyCli::from_str(&source.provider).map_err(anyhow::Error::msg)?,
+            path,
+            env,
+            Some(&source.store),
+        ),
+        None => Ok(SOURCES.into_iter().any(|cli| {
+            matches!(
+                provider::store_lists_trusted(cli, path, env, None),
+                Ok(true)
+            )
+        })),
+    }
+}
+
+// Whether `error` says that evidence could not be read, rather than that a fact does not hold:
+// an I/O error other than a missing file. A missing registration, main working tree or `.git`
+// file is a fact (the worktree is no longer registered), and so is content that is not what
+// Git writes.
+fn unreadable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() != std::io::ErrorKind::NotFound)
+    })
 }
 
 fn record_path(root: &Path, workspace: &Path) -> PathBuf {
@@ -285,14 +306,22 @@ fn decide(
         let cli = FirstPartyCli::from_str(&source.provider).map_err(anyhow::Error::msg)?;
         let holds = match &record.repository_root {
             // The one provider the record names rechecks the store it was read from, never
-            // the store its home resolves to now.
-            None => matches!(
-                provider::workspace_trust(cli, &identity.path, env, Some(&source.store)),
-                Ok(Trust::Trusted(now)) if now == *source
-            ),
+            // the store its home resolves to now. At a recheck a store that cannot be read is
+            // an error, never a reset (review r3, finding 12); a start records a reset, as every
+            // earlier release did.
+            None => {
+                match provider::workspace_trust(cli, &identity.path, env, Some(&source.store)) {
+                    Ok(Trust::Trusted(now)) => now == *source,
+                    Ok(_) => false,
+                    Err(error) if mode == Mode::Recheck => {
+                        return Err(error.context("the pinned source's trust cannot be read"));
+                    }
+                    Err(_) => false,
+                }
+            }
             // An inherited source is derived again: the same main working tree, by identity,
             // whose own consent still names this source.
-            Some(main) => inherited(root, &identity.path, env, main_mode)
+            Some(main) => inherited(root, &identity.path, env, main_mode, Some(source))?
                 .is_some_and(|(now, now_main)| now == *source && now_main == *main),
         };
         if holds {
@@ -310,9 +339,8 @@ fn decide(
         // exactly inherits the consent of its repository's main working tree.
         let found = match exact_source(&identity.path, env) {
             Some(source) => Some((source, None)),
-            None => {
-                inherited(root, &identity.path, env, main_mode).map(|(s, main)| (s, Some(main)))
-            }
+            None => inherited(root, &identity.path, env, main_mode, None)?
+                .map(|(s, main)| (s, Some(main))),
         };
         record.repository_root = None;
         if let Some((source, main)) = found {
@@ -339,35 +367,70 @@ fn decide(
 }
 
 // The source and the main working tree that `workspace` inherits consent from, derived from
-// current truth: the claimed main working tree screened (`listed`) before any I/O on it, Git's
-// registration of `workspace` there verified by identity, the main working tree's own consent
-// exactly as TAB assesses that folder (its pinned source, identity and revocation), and a source
-// provider that neither declines nor fails to read the worktree itself. Anything that does not
-// hold, or cannot be read, inherits nothing.
+// current truth: the claimed main working tree screened (`listed`, in the pinned store when
+// `pin` names one) before any I/O on it, Git's registration of `workspace` there verified by
+// identity, the main working tree's own consent exactly as TAB assesses that folder (its pinned
+// source, identity and revocation), and a source provider that neither declines nor fails to
+// read the worktree itself. Anything that does not hold inherits nothing. Evidence that cannot
+// be read inherits nothing while a start looks for inheritance; at a recheck it is an error, so
+// the authority reports it as unreadable rather than as missing trust (review r3, finding 12).
 fn inherited(
     root: &Path,
     workspace: &Path,
     env: &Environment,
     mode: Mode,
-) -> Option<(Evidence, Identity)> {
-    let main = worktree::main_worktree(workspace, &mut |main| listed(main, env)).ok()??;
-    let main_identity = identity(&main).ok()?;
+    pin: Option<&Evidence>,
+) -> Result<Option<(Evidence, Identity)>> {
+    let strict = mode == Mode::Recheck;
+    let unread = |error: anyhow::Error| if strict { Err(error) } else { Ok(None) };
+    let mut screen_error = None;
+    let verified = worktree::main_worktree(workspace, &mut |main| {
+        listed(main, env, pin).unwrap_or_else(|error| {
+            screen_error = Some(error);
+            false
+        })
+    });
+    let main = match verified {
+        Ok(Some(main)) => main,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            return match screen_error {
+                Some(error) => unread(error),
+                None if unreadable(&error) => unread(error),
+                None => Ok(None),
+            };
+        }
+    };
+    let main_identity = match identity(&main) {
+        Ok(identity) => identity,
+        Err(error) if unreadable(&error) => return unread(error),
+        Err(_) => return Ok(None),
+    };
     // Two records under one lock file would wait on each other.
     if record_path(root, &main) == record_path(root, workspace) {
-        return None;
+        return Ok(None);
     }
-    let consent = assess_in(root, &main, env, mode).ok()?;
+    let consent = match assess_in(root, &main, env, mode) {
+        Ok(consent) => consent,
+        Err(error) => return unread(error),
+    };
     if consent.state != "verified"
         || consent.repository_root.is_some()
         || consent.identity != main_identity
     {
-        return None;
+        return Ok(None);
     }
-    let source = consent.source?;
-    let cli = FirstPartyCli::from_str(&source.provider).ok()?;
+    let Some(source) = consent.source else {
+        return Ok(None);
+    };
+    let cli = match FirstPartyCli::from_str(&source.provider) {
+        Ok(cli) => cli,
+        Err(error) => return unread(anyhow::Error::msg(error)),
+    };
     match provider::workspace_trust(cli, workspace, env, Some(&source.store)) {
-        Ok(Trust::Absent | Trust::Trusted(_)) => Some((source, main_identity)),
-        Ok(Trust::Declined) | Err(_) => None,
+        Ok(Trust::Absent | Trust::Trusted(_)) => Ok(Some((source, main_identity))),
+        Ok(Trust::Declined) => Ok(None),
+        Err(error) => unread(error),
     }
 }
 
@@ -410,8 +473,27 @@ pub(in crate::native) fn prepare_at_home(
 // it applied and the dialog step that records its answer are serialized on it.
 const SESSION_LOCK: &str = "workspace-consent.lock";
 
+/// The session record's lock was held by another writer for the whole remaining budget, so the
+/// record was not changed.
+#[derive(Debug)]
+pub(in crate::native) struct SessionRecordBusy;
+
+impl std::fmt::Display for SessionRecordBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the session's consent record stayed locked by another writer for the remaining time, so it was not changed",
+        )
+    }
+}
+
+impl std::error::Error for SessionRecordBusy {}
+
+// `deadline` bounds the wait for the lock (review r3, finding 13): an operation with a deadline
+// takes the lock with its remaining budget, and at least one attempt, and its expiry changes
+// nothing. A launch plan records without one, as before.
 fn with_session_record<T>(
     directory: &Path,
+    deadline: Option<Instant>,
     f: impl FnOnce(&Path, Assessment) -> Result<T>,
 ) -> Result<T> {
     let reader = Reader::open_unchecked(directory);
@@ -426,27 +508,63 @@ fn with_session_record<T>(
         .write(true)
         .open(lock_path)?;
     RecordStore::set_file_private(&lock)?;
-    lock.lock()?;
+    match deadline {
+        None => lock.lock()?,
+        Some(deadline) => loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(SessionRecordBusy.into());
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        },
+    }
     let path = reader.private(SESSION_FILE).path().to_owned();
     let assessment: Assessment = RecordReader::at(&path).json()?;
     f(&path, assessment)
 }
 
+/// Records that a launch plan put `provider`'s trust-bearing option `marker` in its command, and
+/// returns the grant the plan carries to the spawn fence: the option and the identity of the
+/// workspace the session's assessment consented to.
+pub(in crate::native) fn apply_option(
+    directory: &Path,
+    provider: FirstPartyCli,
+    marker: &'static str,
+) -> Result<super::authority::LaunchGrant> {
+    with_session_record(directory, None, |path, mut assessment| {
+        assessment.applied = Some(marker.to_owned());
+        RecordStore::at(path).write_json(&assessment)?;
+        Ok(super::authority::LaunchGrant {
+            provider,
+            marker,
+            workspace: assessment.identity,
+        })
+    })
+}
+
 pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
-    with_session_record(directory, |path, mut assessment| {
+    with_session_record(directory, None, |path, mut assessment| {
         assessment.applied = Some(method.to_owned());
         RecordStore::at(path).write_json(&assessment)
     })
 }
 
 /// Changes the session record's applied marker from `from` to `to` only while it still is
-/// `from`, under the record's lock; whether it did.
+/// `from`, under the record's lock taken by `deadline`; whether it did. A lock that stays held
+/// until then is `SessionRecordBusy`, and the record is unchanged.
 pub(in crate::native) fn transition(
     directory: &Path,
     from: Option<&str>,
     to: Option<&str>,
+    deadline: Instant,
 ) -> Result<bool> {
-    with_session_record(directory, |path, mut assessment| {
+    with_session_record(directory, Some(deadline), |path, mut assessment| {
         if assessment.applied.as_deref() != from {
             return Ok(false);
         }
@@ -471,6 +589,19 @@ pub(in crate::native) fn option_unavailable(directory: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         _ => applied(directory, LAUNCH_OPTION_UNAVAILABLE),
     }
+}
+
+/// The applied value in the session's consent record, read as its typed record: none without a
+/// record, and an error for a record that cannot be read or is not a whole assessment. A gate
+/// that decides on the value reads it here, never through `observe`, whose view is for display.
+pub(in crate::native) fn session_applied(directory: &Path) -> Result<Option<String>> {
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(SESSION_FILE)
+        .text()?
+    else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str::<Assessment>(&text)?.applied)
 }
 
 pub(in crate::native) fn observe(directory: &Path) -> SessionConsentObservation {
@@ -723,8 +854,14 @@ mod tests {
                 "{provider:?}"
             );
 
-            // Unreadable, declined or absent in the original store: source-reset.
+            // Unreadable, declined or absent in the original store: source-reset at a start, as
+            // every earlier release recorded it. The recheck reports an unreadable source as an
+            // error, never as a reset (review r3, finding 12).
             replace_store(store_of(&fixture, provider), b"= =\n").unwrap();
+            assert!(
+                assess_current(temp.path(), &workspace, &fixture.env).is_err(),
+                "{provider:?}: unreadable at a recheck"
+            );
             assert_eq!(
                 assess_with(temp.path(), &workspace, &fixture.env)
                     .unwrap()

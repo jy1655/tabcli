@@ -124,6 +124,10 @@ pub(super) struct LaunchPlan {
     // Caller environment variables the adapter refuses to pass to its provider process.
     // Each adapter owns this list; the shared launcher only applies it.
     pub(super) environment_removals: &'static [&'static str],
+    // The trust-bearing launch option that the adapter put in the command, if any: the spawn
+    // fence asks the authority about exactly this command before it starts. A command without
+    // one is admitted as 0.4.49 admitted it, without reading consent.
+    pub(super) trust_grant: Option<super::consent::LaunchGrant>,
 }
 
 // Launch inputs for a session that continues a closed session's provider conversation.
@@ -329,15 +333,18 @@ trait NativeProviderAdapter: Sync {
         env: &super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
-    // Whether the provider's own store, resolved from its home in `env`, lists exactly
-    // `workspace` as trusted, answered from the store alone: no I/O on `workspace` or its
-    // ancestors and no `git`. Consent's worktree screen asks it about a main working tree that a
-    // `.git` file names, before anything touches that path; it is a necessary condition only,
-    // never consent. No default: each adapter states how its answer stays store-only.
+    // Whether the provider's own store, resolved from its home in `env` or the recorded source
+    // store `store` (a pinned recheck), lists exactly `workspace` as trusted, answered from the
+    // store alone: no I/O on `workspace` or its ancestors and no `git`. Consent's worktree screen
+    // asks it about a main working tree that a `.git` file names, before anything touches that
+    // path; it is a necessary condition only, never consent. Each adapter keys the path by its
+    // own rule, the one its exact-folder lookup uses. No default: each adapter states how its
+    // answer stays store-only.
     fn store_lists_trusted(
         &self,
         workspace: &Path,
         env: &super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<bool>;
     fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
@@ -429,8 +436,9 @@ pub(super) fn store_lists_trusted(
     provider: FirstPartyCli,
     workspace: &Path,
     env: &super::consent::Environment,
+    store: Option<&Path>,
 ) -> Result<bool> {
-    adapter(provider).store_lists_trusted(workspace, env)
+    adapter(provider).store_lists_trusted(workspace, env, store)
 }
 
 // The Codex memory workspace that the launch admission protects. Only the Codex adapter

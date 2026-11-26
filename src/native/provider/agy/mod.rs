@@ -399,9 +399,10 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         workspace: &Path,
         env: &super::super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<bool> {
         Ok(matches!(
-            self.workspace_trust(workspace, env, None)?,
+            self.workspace_trust(workspace, env, store)?,
             super::super::consent::Trust::Trusted(_)
         ))
     }
@@ -521,8 +522,10 @@ fn prepare_launch_for_platform(
                 .map(OsString::from),
         );
     }
-    if let Some(settings) = session_trust_settings(&context, authority)? {
+    let mut trust_grant = None;
+    if let Some((settings, grant)) = session_trust_settings(&context, authority)? {
         arguments.extend([OsString::from("--settings"), settings.into_os_string()]);
+        trust_grant = Some(grant);
     }
     arguments.extend([
         OsString::from("--log-file"),
@@ -535,6 +538,7 @@ fn prepare_launch_for_platform(
         ]);
     }
     Ok(LaunchPlan {
+        trust_grant,
         arguments,
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
@@ -593,7 +597,7 @@ fn setting_support(version: &str) -> SettingSupport {
 fn session_trust_settings(
     context: &LaunchContext<'_>,
     authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<(PathBuf, super::super::consent::LaunchGrant)>> {
     match setting_support(context.provider_version) {
         SettingSupport::Supported => {}
         SettingSupport::Older => {
@@ -611,8 +615,9 @@ fn session_trust_settings(
     let file = crate::native::session::Store::open_unchecked(context.directory)
         .private(SESSION_SETTINGS_FILE);
     file.write_json(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
-    super::super::consent::applied(context.directory, APPLIED_MARKER)?;
-    Ok(Some(file.path().to_owned()))
+    let grant =
+        super::super::consent::apply_option(context.directory, FirstPartyCli::Agy, APPLIED_MARKER)?;
+    Ok(Some((file.path().to_owned(), grant)))
 }
 
 // The unstarted transcript watcher a launch plan carries: Agy's own log file of the

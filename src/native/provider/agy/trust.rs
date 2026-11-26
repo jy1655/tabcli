@@ -105,14 +105,12 @@ pub(super) fn told_to_trust(
         Ok(Trust::Trusted(_)) => return Ok(Ok(TrustRoute::Store)),
         store => store,
     };
-    let observed = consent::observe(directory);
-    if observed.unreadable() {
-        bail!(
-            "this session's workspace consent record could not be read: {}",
-            observed.value()["detail"].as_str().unwrap_or_default()
-        );
-    }
-    if observed.applied_marker() != Some(APPLIED_MARKER) {
+    // A present record is decoded as the typed assessment (review r3, finding 12): valid JSON of
+    // another shape is unreadable evidence, never an absent marker.
+    let applied = consent::session_applied(directory).map_err(|error| {
+        anyhow::anyhow!("this session's workspace consent record could not be read: {error:#}")
+    })?;
+    if applied.as_deref() != Some(APPLIED_MARKER) {
         store?;
         return Ok(Err(TRUST_STORE_MISSING));
     }

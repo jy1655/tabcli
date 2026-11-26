@@ -474,8 +474,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   screen that asks only each adapter's store-only `store_lists_trusted` has passed);
   `consent/authority.rs` owns the one answer whether a target provider may treat a session's
   workspace as consented now, which every launch option, the dialog step, the Agy paste gate
-  and doctor ask, without writing, and `admit_spawn`, which the spawn fence in
-  `session/launch` calls under the lifecycle lock for an applied launch option;
+  and doctor ask, without writing, and `admit_launch`, which the spawn fence in
+  `session/launch` calls under the lifecycle lock, within the launch's remaining time, for a
+  command whose plan carries a trust-bearing option (`LaunchGrant`), and never for one without;
   `consent/launch_dialog.rs` owns
   a launch's workspace dialog step in one entry, from the decision whether to wait for the
   dialog at all (never for consent a launch applied through an adapter's own option, or for

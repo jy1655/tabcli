@@ -468,6 +468,14 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         } else {
                             assert!(observed.value().is_null(), "{label}: {observed:?}");
                         }
+                        // The plan carries the option it put in the command to the spawn
+                        // fence; a plain command carries none and reads no consent there.
+                        let grant = plan.trust_grant.as_ref();
+                        assert_eq!(grant.is_some(), consent, "{label}");
+                        if let Some(grant) = grant {
+                            assert_eq!(grant.provider, FirstPartyCli::Codex, "{label}");
+                            assert_eq!(grant.marker, APPLIED_MARKER, "{label}");
+                        }
                     }
                 }
             }
@@ -1079,7 +1087,7 @@ fn the_store_only_answer_reads_the_store_alone() {
     let store = fixture.home.join(".codex").join("config.toml");
     assert!(
         !ADAPTER
-            .store_lists_trusted(&fixture.path, &fixture.env)
+            .store_lists_trusted(&fixture.path, &fixture.env, None)
             .unwrap()
     );
     let parent = fixture.path.parent().unwrap().to_owned();
@@ -1104,7 +1112,7 @@ fn the_store_only_answer_reads_the_store_alone() {
         .unwrap();
         assert_eq!(
             ADAPTER
-                .store_lists_trusted(&fixture.path, &fixture.env)
+                .store_lists_trusted(&fixture.path, &fixture.env, None)
                 .unwrap(),
             expected,
             "{level}"

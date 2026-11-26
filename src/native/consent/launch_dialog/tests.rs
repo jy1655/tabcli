@@ -242,6 +242,7 @@ fn unsupported_dialog_response_preserves_consent_without_pending_input() {
             }
             .guarded_key(),
             None,
+            Instant::now() + Duration::from_secs(3),
             &terminal::GuardedDialogInput {
                 expected_claim: None,
                 expires_unix_ms: None,
@@ -270,6 +271,7 @@ fn the_unguarded_refusal_names_the_surface_and_records_nothing() {
             &c.directory,
             guarded_key_of(kind),
             None,
+            Instant::now() + Duration::from_secs(3),
             &terminal::GuardedDialogInput {
                 expected_claim: None,
                 expires_unix_ms: None,
@@ -1191,4 +1193,214 @@ fn windows_claude_under_bypass_reaches_only_an_authorized_dialog() {
             result.unwrap();
         }
     }
+}
+
+// Review r3, finding 4: a pending response in the session record is neither evidence of an older
+// Agy nor permission for another attempt. A step that finds one it did not write sends no key
+// and leaves the record as it found it.
+#[test]
+fn an_unowned_pending_response_refuses_the_step() {
+    for (target, older) in [
+        (FirstPartyCli::Claude, false),
+        (FirstPartyCli::Agy, false),
+        (FirstPartyCli::Agy, true),
+    ] {
+        let c = if older {
+            older_agy(false)
+        } else {
+            consented(target, false)
+        };
+        super::super::record::applied(&c.directory, RESPONSE_PENDING).unwrap();
+        let error = c
+            .complete(
+                target,
+                provider::launch_dialog(target),
+                &mut FakeClock::new(Instant::now()),
+                &mut Untouched,
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "a trust dialog response is already pending for this session (another attempt owns it, or its key may have been sent); no response sent",
+            "{target:?} older: {older}"
+        );
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some(RESPONSE_PENDING)
+        );
+    }
+}
+
+// A clock that returns a reading past every deadline at one chosen reading after the screen
+// was read, and can run a hook there first.
+struct Jumping<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    at: usize,
+    jump: Duration,
+    hook: Option<Box<dyn FnOnce() + 'a>>,
+}
+
+impl Clock for Jumping<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            if self.readings == self.at {
+                if let Some(hook) = self.hook.take() {
+                    hook();
+                }
+                return self.clock.now() + self.jump;
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// Review r3, finding 4: every path that proves the key unsent after the pending write returns the
+// record to what the step assessed: the deadline passing inside the dispatch callback, the
+// authority failing to read there, the surface reporting a changed screen (`Ok(false)`) and a
+// stale claim. Only a dispatch that may have sent the key keeps the pending value.
+#[test]
+fn every_proven_unsent_path_restores_the_assessed_record() {
+    for path in [
+        "expired",
+        "authority error",
+        "screen changed",
+        "stale claim",
+    ] {
+        for older in [false, true] {
+            let (c, target, assessed) = if older {
+                (
+                    older_agy(false),
+                    FirstPartyCli::Agy,
+                    Some("launch-option-unavailable"),
+                )
+            } else {
+                (
+                    consented(FirstPartyCli::Claude, false),
+                    FirstPartyCli::Claude,
+                    None,
+                )
+            };
+            let armed = Cell::new(false);
+            let manifest = c.directory.join("manifest.json");
+            // Reading 3 is the deadline check inside the dispatch callback.
+            let mut clock = Jumping {
+                clock: FakeClock::new(Instant::now()),
+                armed: &armed,
+                readings: 0,
+                at: if matches!(path, "expired" | "authority error") {
+                    3
+                } else {
+                    usize::MAX
+                },
+                jump: if path == "expired" {
+                    Duration::from_secs(3600)
+                } else {
+                    Duration::ZERO
+                },
+                hook: (path == "authority error").then(|| {
+                    Box::new(move || fs::write(&manifest, b"{").unwrap()) as Box<dyn FnOnce()>
+                }),
+            };
+            let deadline = clock.clock.now() + Duration::from_secs(3);
+            let dispatched = Cell::new(0);
+            let screen = if older {
+                agy_dialog(&c.workspace)
+            } else {
+                DIALOG.to_owned()
+            };
+            let support = if older {
+                provider::launch_dialog(FirstPartyCli::Agy)
+            } else {
+                LaunchDialogSupport::Answered(&FakePolicy::default())
+            };
+            let result = LaunchDialog {
+                directory: &c.directory,
+                target,
+                expected_claim: "1-2-3",
+                deadline,
+            }
+            .complete(
+                support,
+                &c.stores.env,
+                &mut clock,
+                &mut scripted(
+                    GuardedKey::Taken,
+                    || {
+                        armed.set(true);
+                        Ok(screen.clone())
+                    },
+                    || {
+                        dispatched.set(dispatched.get() + 1);
+                        match path {
+                            "screen changed" => Ok(false),
+                            "stale claim" => Err(anyhow::Error::new(terminal::StaleDialogClaim)),
+                            other => panic!("{other}: no dispatch"),
+                        }
+                    },
+                ),
+            );
+            let label = format!("{path}, older Agy: {older}");
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.ends_with("no response sent"), "{label}: {error}");
+            assert_eq!(observe(&c.directory).applied_marker(), assessed, "{label}");
+            if matches!(path, "screen changed" | "stale claim") {
+                assert!(dispatched.get() >= 1, "{label}");
+            }
+        }
+    }
+}
+
+// Review r3, finding 13: the session record's lock is taken with the step's remaining budget. A
+// writer that holds it past the deadline ends the step as proven unsent, by the deadline, and
+// the record is unchanged.
+#[test]
+fn a_held_session_record_lock_ends_the_step_unsent_by_its_deadline() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(c.directory.join("workspace-consent.lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    let before = fs::read(c.directory.join(SESSION_FILE)).unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let directory = c.directory.clone();
+    let env = c.stores.env.clone();
+    std::thread::spawn(move || {
+        let mut clock = FakeClock::new(Instant::now());
+        let deadline = clock.now() + Duration::from_secs(1);
+        let policy = FakePolicy::default();
+        let result = LaunchDialog {
+            directory: &directory,
+            target: FirstPartyCli::Claude,
+            expected_claim: "1-2-3",
+            deadline,
+        }
+        .complete(
+            LaunchDialogSupport::Answered(&policy),
+            &env,
+            &mut clock,
+            &mut scripted(
+                GuardedKey::Taken,
+                || Ok(DIALOG.to_owned()),
+                || panic!("no key while the record is held"),
+            ),
+        );
+        let _ = sent.send(result.map_err(|error| format!("{error:#}")));
+    });
+    let outcome = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the step ends by its deadline while the lock is held");
+    let error = outcome.unwrap_err();
+    assert!(error.ends_with("no response sent"), "{error}");
+    assert_eq!(fs::read(c.directory.join(SESSION_FILE)).unwrap(), before);
+    drop(holder);
 }

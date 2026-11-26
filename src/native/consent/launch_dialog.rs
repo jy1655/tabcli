@@ -87,12 +87,14 @@ const RESPONSE_PENDING: &str = "workspace-dialog-response-pending";
 const RESPONSE_CONFIRMED: &str = "provider-workspace-dialog";
 
 // The one guarded response. The pending transition is written only while the record still
-// holds the applied value the step assessed (`assessed`), and the dispatch callback asks the
-// authority again after that write.
+// holds the applied value the step assessed (`assessed`), never over a pending value, and under
+// the record's lock taken by the step's deadline (review r3, finding 13); the dispatch callback
+// asks the authority again after that write.
 fn respond_to_workspace_dialog(
     directory: &Path,
     guarded_key: GuardedKey,
     assessed: Option<&str>,
+    deadline: Instant,
     input: &terminal::GuardedDialogInput,
     dispatch: impl FnOnce(&terminal::GuardedDialogInput) -> Result<bool>,
 ) -> Result<bool> {
@@ -101,7 +103,9 @@ fn respond_to_workspace_dialog(
             "the workspace trust dialog cannot be answered with a guarded key in {surface}; no key was sent; use the provider's own workspace trust prompt, then launch again"
         );
     }
-    if !transition(directory, assessed, Some(RESPONSE_PENDING))? {
+    if assessed == Some(RESPONSE_PENDING)
+        || !transition(directory, assessed, Some(RESPONSE_PENDING), deadline)?
+    {
         bail!("workspace consent changed before trust dialog response");
     }
     dispatch(input)
@@ -363,10 +367,24 @@ impl LaunchDialog<'_> {
                         continue;
                     }
                     let mut attempted = false;
+                    // Every path that proves the key unsent returns the record from this step's
+                    // own pending value to what the step assessed (review r3, finding 4). A
+                    // restore that cannot take the lock leaves the pending value, which refuses
+                    // any later attempt; only a dispatch that may have sent the key keeps it.
+                    let unsent = |error: anyhow::Error| {
+                        let _ = transition(
+                            directory,
+                            Some(RESPONSE_PENDING),
+                            assessed.as_deref(),
+                            deadline,
+                        );
+                        error
+                    };
                     responded = respond_to_workspace_dialog(
                         directory,
                         guarded_key,
                         assessed.as_deref(),
+                        deadline,
                         &terminal::GuardedDialogInput {
                             screen,
                             key,
@@ -374,23 +392,35 @@ impl LaunchDialog<'_> {
                             expires_unix_ms: Some(expires_unix_ms),
                         },
                         |input| {
-                            require_launch_dialog_live(directory, false)?;
+                            require_launch_dialog_live(directory, false).map_err(unsent)?;
                             if clock.now() >= deadline {
-                                bail!("workspace trust response deadline expired before dispatch");
+                                return Err(unsent(anyhow::anyhow!(
+                                    "workspace trust response deadline expired before dispatch"
+                                )));
                             }
                             // The authority's yes is consumed here, after the pending write and
                             // immediately before the key: exact consent with this step's own
-                            // pending record. Otherwise the key is proven unsent, and the record
-                            // returns to what the step assessed.
-                            let now = authority(directory, target, env)?;
+                            // pending record. Otherwise the key is proven unsent.
+                            let now = authority(directory, target, env).map_err(unsent)?;
                             if now.verdict != Ok(Consented::Exact)
                                 || now.applied.as_deref() != Some(RESPONSE_PENDING)
                             {
-                                transition(directory, Some(RESPONSE_PENDING), assessed.as_deref())?;
-                                bail!("workspace consent changed before trust dialog response");
+                                return Err(unsent(anyhow::anyhow!(
+                                    "workspace consent changed before trust dialog response"
+                                )));
                             }
                             attempted = true;
-                            surface.answer(input, deadline)
+                            match surface.answer(input, deadline) {
+                                // The surface saw a changed screen and sent nothing.
+                                Ok(false) => {
+                                    let _ = unsent(anyhow::anyhow!("not sent"));
+                                    Ok(false)
+                                }
+                                Err(error) if error.is::<terminal::StaleDialogClaim>() => {
+                                    Err(unsent(error))
+                                }
+                                other => other,
+                            }
                         },
                     )
                     .map_err(|error| {
@@ -423,8 +453,10 @@ enum DialogConsent {
 // through the target's own option, or once the provider confirmed an earlier answer. For a
 // target whose adapter declares a launch option, the key remains only for a launch that
 // recorded the option as unavailable (a provider positively identified as older); an
-// inconclusive launch never falls back to it. Another adapter's launch option, or a value
-// the step does not know, refuses the step.
+// inconclusive launch never falls back to it. Eligibility comes from what the launch recorded,
+// never from the dialog step's own pending value: a pending response that this step reads here
+// is not its own (it reads the record only before its own write), so it refuses, as do another
+// adapter's launch option and a value the step does not know (review r3, finding 4).
 fn dialog_consent(authority: &Authority, target: FirstPartyCli) -> Result<DialogConsent> {
     let Ok(consented) = authority.verdict else {
         return Ok(DialogConsent::NoKey);
@@ -437,9 +469,11 @@ fn dialog_consent(authority: &Authority, target: FirstPartyCli) -> Result<Dialog
             bail!("the session's consent record names another provider's launch option ({marker})")
         }
         Some(RESPONSE_CONFIRMED) => return Ok(DialogConsent::NoKey),
+        Some(RESPONSE_PENDING) => bail!(
+            "a trust dialog response is already pending for this session (another attempt owns it, or its key may have been sent)"
+        ),
         None => false,
-        Some(LAUNCH_OPTION_UNAVAILABLE | RESPONSE_PENDING) if own.is_some() => true,
-        Some(RESPONSE_PENDING) => false,
+        Some(LAUNCH_OPTION_UNAVAILABLE) if own.is_some() => true,
         Some(other) => {
             bail!("the session's consent record holds an unknown launch value ({other})")
         }

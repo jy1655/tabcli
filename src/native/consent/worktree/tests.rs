@@ -353,35 +353,63 @@ fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
     assert!(asked.borrow().is_empty());
 }
 
-// Each component is inspected before the next is taken: `..` steps back only over a
-// directory that exists and is no link, as Git's own lookup needs it. The pointers are spelled
-// as text: on Windows `Path::join` onto the canonical (verbatim) root would remove `x/..` before
-// the file is written (Windows CI, 2026-11-26).
+// Review r3, finding 6: a pointer that names a component and later cancels it with `..` is
+// refused lexically, before any I/O and before the screen, so the walk never touches a path
+// outside both trees (an automount, say). Leading parent steps of a relative pointer stay
+// accepted (`a_relative_path_registration_names_its_main_working_tree`), and so does the
+// registration's own relative `commondir`. The pointers are spelled as text: on Windows
+// `Path::join` onto the canonical (verbatim) root would remove `x/..` before the file is
+// written (Windows CI, 2026-11-26).
 #[test]
-fn a_component_is_inspected_before_dotdot_steps_back_over_it() {
+fn a_pointer_that_steps_back_over_a_name_is_refused_before_any_io() {
+    const DETOUR: &str = "a path in Git's files steps back over a name it named";
     let (_temp, root) = canonical_root();
     let fixture = registered(&root);
+    let screened = RefCell::new(0);
+    let mut screen = |_: &Path| {
+        *screened.borrow_mut() += 1;
+        true
+    };
     let spelled = |rest: &str| format!("{}/{rest}", git_path(&root));
-    point(
-        &fixture,
-        &spelled("missing/../repository/.git/worktrees/worktree"),
-    );
-    assert!(error(&fixture.worktree).contains("missing cannot be read"));
     fs::write(root.join("file"), "").unwrap();
-    point(
-        &fixture,
-        &spelled("file/../repository/.git/worktrees/worktree"),
-    );
-    assert!(error(&fixture.worktree).ends_with("is not a directory"));
-    point(
-        &fixture,
-        &spelled("worktree/../repository/.git/worktrees/worktree"),
-    );
+    for detour in [
+        "missing/../repository/.git/worktrees/worktree",
+        "file/../repository/.git/worktrees/worktree",
+        "worktree/../repository/.git/worktrees/worktree",
+        "repository/.git/worktrees/../worktrees/worktree",
+    ] {
+        point(&fixture, &spelled(detour));
+        assert_eq!(
+            main_worktree(&fixture.worktree, &mut screen)
+                .unwrap_err()
+                .to_string(),
+            DETOUR,
+            "{detour}"
+        );
+    }
+    // The same for a relative pointer after its leading parent steps.
+    point(&fixture, "../missing/../repository/.git/worktrees/worktree");
+    assert_eq!(error(&fixture.worktree), DETOUR);
+    assert_eq!(*screened.borrow(), 0);
+    // A Git-written registration still verifies, absolute or relative, with the relative
+    // `commondir` (`../..`) that Git writes into the registration.
+    point(&fixture, &git_path(&fixture.registration));
     assert_eq!(
         verified(&fixture.worktree).unwrap(),
         Some(fixture.repository.clone())
     );
-    // A verbatim spelling is walked the same way, and a name in it that holds `/` (which a
+    assert_eq!(
+        fs::read_to_string(fixture.registration.join("commondir"))
+            .unwrap()
+            .trim_end(),
+        "../.."
+    );
+    make_relative(&fixture);
+    assert_eq!(
+        verified(&fixture.worktree).unwrap(),
+        Some(fixture.repository.clone())
+    );
+    // A verbatim spelling is refused the same way, and a name in it that holds `/` (which a
     // verbatim path does not split at) is refused instead of being pushed as two names.
     #[cfg(windows)]
     {
@@ -390,7 +418,7 @@ fn a_component_is_inspected_before_dotdot_steps_back_over_it() {
             &fixture,
             &verbatim(r"missing\..\repository\.git\worktrees\worktree"),
         );
-        assert!(error(&fixture.worktree).contains("missing cannot be read"));
+        assert_eq!(error(&fixture.worktree), DETOUR);
         point(
             &fixture,
             &verbatim(r"worktree/..\repository\.git\worktrees\worktree"),
@@ -398,14 +426,6 @@ fn a_component_is_inspected_before_dotdot_steps_back_over_it() {
         assert_eq!(
             error(&fixture.worktree),
             "a name in a path in Git's files holds a separator"
-        );
-        point(
-            &fixture,
-            &verbatim(r"worktree\..\repository\.git\worktrees\worktree"),
-        );
-        assert_eq!(
-            verified(&fixture.worktree).unwrap(),
-            Some(fixture.repository.clone())
         );
     }
 }
@@ -459,6 +479,26 @@ fn the_registration_must_name_this_worktree_and_its_common_directory_by_identity
     assert!(error(&fixture.worktree).contains("cannot be read"));
 }
 
+// Review r3, finding 7: the back-pointer must name `.git` in the assessed worktree directory. A
+// folder whose `.git` is a hard link to the registered worktree's `.git` shares that file's
+// identity but is not the folder Git registered.
+#[test]
+fn a_hard_linked_git_file_in_another_folder_is_not_the_registered_worktree() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    let other = root.join("other");
+    fs::create_dir(&other).unwrap();
+    fs::hard_link(fixture.worktree.join(".git"), other.join(".git")).unwrap();
+    assert_eq!(
+        error(&other.canonicalize().unwrap()),
+        "the worktree registration names a .git file in another folder"
+    );
+    assert_eq!(
+        verified(&fixture.worktree).unwrap(),
+        Some(fixture.repository.clone())
+    );
+}
+
 // TAB does not read Git's configuration: a repository that Git itself would treat differently
 // (here one whose `core.worktree` names another directory) is judged by its registration
 // alone. Only a writer of its `.git` can register a worktree there either way.
@@ -509,6 +549,31 @@ fn only_gits_pointer_form_is_read() {
         fs::write(&pointer, &content).unwrap();
         assert_eq!(error(&fixture.worktree), expected, "{content:?}");
     }
+}
+
+// Review r3, finding 8: a pointer file is opened so that a FIFO put in its place after it was
+// inspected cannot block the open, and the opened handle is then checked. The replacement is a
+// race; the open itself is tested here on a FIFO.
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_place_of_a_pointer_file_does_not_block_its_open() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_temp, root) = canonical_root();
+    let fifo = root.join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (sent, received) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = sent.send(open_pointer(&path).map(drop).map_err(|e| e.to_string()));
+    });
+    let outcome = received
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the open does not block on a FIFO");
+    assert_eq!(
+        outcome.unwrap_err(),
+        format!("{} is not a regular file", fifo.display())
+    );
 }
 
 #[cfg(unix)]

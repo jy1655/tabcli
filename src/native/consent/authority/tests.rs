@@ -1,4 +1,5 @@
 use super::super::record::{SESSION_FILE, applied, assess_with, record};
+use super::super::store::identity;
 use super::super::store::native_key;
 use super::super::tests::{Fixture, session, setup, trust_pi};
 use super::super::worktree::tests::{Registered, registered};
@@ -258,12 +259,15 @@ fn the_authority_writes_nothing_and_needs_the_pins() {
     }
 }
 
-// The spawn fence's check (review finding 3): an applied launch option must still have the
-// authority's yes for its own target, bound to the workspace; another adapter's option
-// refuses; a session without a record, without an applied option, or with only the dialog
-// step's or an older provider's value has nothing to check.
+// The spawn fence's check (review r3, findings 1 and 2): the plan's trust-bearing option, carried
+// to the fence as a grant, must still have the authority's yes for its own provider, bound to the
+// workspace the plan was granted for, and the session's record must still name it. A record that
+// is gone, that names another option, or a grant for another provider or workspace, refuses; so
+// does an answer that does not come within the launch's remaining time.
 #[test]
-fn the_spawn_fence_consumes_the_authority_for_an_applied_option() {
+fn the_spawn_fence_asks_about_the_commands_own_launch_option() {
+    use super::super::record::apply_option;
+    const REFUSED: &str = "workspace consent for the launch option does not hold now";
     let (_temp, fixture, git) = worktree();
     trust_pi(&fixture, &git.repository);
     let session = launched(&git.worktree, &fixture);
@@ -272,66 +276,112 @@ fn the_spawn_fence_consumes_the_authority_for_an_applied_option() {
             .unwrap();
     manifest["provider"] = serde_json::json!("agy");
     write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
-    admit_spawn_with(&session.directory, &fixture.env).unwrap();
-    for value in [
-        "launch-option-unavailable",
-        "workspace-dialog-response-pending",
-        "provider-workspace-dialog",
-    ] {
-        applied(&session.directory, value).unwrap();
-        admit_spawn_with(&session.directory, &fixture.env).unwrap();
-    }
-    applied(&session.directory, "agy-settings-override").unwrap();
-    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    let grant = apply_option(
+        &session.directory,
+        FirstPartyCli::Agy,
+        "agy-settings-override",
+    )
+    .unwrap();
+    let admit = |grant: &LaunchGrant| {
+        admit_launch_with(&session.directory, grant, &fixture.env).map_err(|e| format!("{e:#}"))
+    };
+    admit(&grant).unwrap();
     // Withdrawn between the plan and the start: nothing starts.
+    let pi = fs::read(&fixture.pi).unwrap();
     fs::remove_file(&fixture.pi).unwrap();
-    let error = admit_spawn_with(&session.directory, &fixture.env).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .starts_with("workspace consent for the launch option does not hold now"),
-        "{error:#}"
-    );
-    trust_pi(&fixture, &git.repository);
-    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    assert!(admit(&grant).unwrap_err().starts_with(REFUSED));
+    write_private(&fixture.pi, &pi).unwrap();
+    admit(&grant).unwrap();
     // The workspace replaced at the same path.
     let moved = git.worktree.with_file_name("worktree-moved");
     fs::rename(&git.worktree, &moved).unwrap();
     fs::create_dir(&git.worktree).unwrap();
     fs::copy(moved.join(".git"), git.worktree.join(".git")).unwrap();
-    assert!(admit_spawn_with(&session.directory, &fixture.env).is_err());
+    assert!(admit(&grant).is_err());
     fs::remove_dir_all(&git.worktree).unwrap();
     fs::rename(&moved, &git.worktree).unwrap();
-    admit_spawn_with(&session.directory, &fixture.env).unwrap();
-    // Another adapter's option.
+    admit(&grant).unwrap();
+    // A grant for another provider than the session's, or for another workspace.
+    let other_provider = LaunchGrant {
+        provider: FirstPartyCli::Pi,
+        marker: "pi-approve-once",
+        ..grant.clone()
+    };
+    assert!(
+        admit(&other_provider)
+            .unwrap_err()
+            .contains("another provider than the session's")
+    );
+    let other_workspace = LaunchGrant {
+        workspace: identity(&git.repository).unwrap(),
+        ..grant.clone()
+    };
+    assert!(
+        admit(&other_workspace)
+            .unwrap_err()
+            .contains("no longer names this command's launch option and workspace")
+    );
+    // The record names another option now.
     applied(&session.directory, "codex-config-override").unwrap();
     assert!(
-        admit_spawn_with(&session.directory, &fixture.env)
+        admit(&grant)
             .unwrap_err()
-            .to_string()
-            .contains("another provider's launch option")
+            .contains("no longer names this command's launch option and workspace")
     );
-    // No record: nothing to check.
+    applied(&session.directory, "agy-settings-override").unwrap();
+    admit(&grant).unwrap();
+    // No answer within the launch's remaining time.
+    assert!(
+        admit_launch_within(
+            &session.directory,
+            &grant,
+            Some(std::time::Duration::ZERO),
+            fixture.env.clone()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("could not be confirmed within the launch's remaining time")
+    );
+    // The bounded question runs while the spawn fence holds the lifecycle lock: it takes no
+    // lock of its own.
+    let lifecycle = crate::native::session::Store::open_unchecked(&session.directory)
+        .lock()
+        .unwrap();
+    admit_launch_within(
+        &session.directory,
+        &grant,
+        Some(std::time::Duration::from_secs(60)),
+        fixture.env.clone(),
+    )
+    .unwrap();
+    drop(lifecycle);
+    // The record gone: the command's option has nothing to stand on.
+    let saved = fs::read(session.directory.join(SESSION_FILE)).unwrap();
     fs::remove_file(session.directory.join(SESSION_FILE)).unwrap();
-    admit_spawn_with(&session.directory, &fixture.env).unwrap();
+    assert!(admit(&grant).unwrap_err().starts_with(REFUSED));
     // A record that cannot be read refuses.
     write_private(&session.directory.join(SESSION_FILE), b"{").unwrap();
-    assert!(admit_spawn_with(&session.directory, &fixture.env).is_err());
+    assert!(admit(&grant).is_err());
+    fs::remove_file(session.directory.join(SESSION_FILE)).unwrap();
+    write_private(&session.directory.join(SESSION_FILE), &saved).unwrap();
+    admit(&grant).unwrap();
 }
 
-// Review round 3, finding 3, through the spawn fence itself: a session whose record names a
-// launch option that is not its target's own starts nothing.
+// Through the spawn fence itself: a command whose launch option lost its consent starts nothing,
+// and the launch stays proven unstarted.
 #[test]
 fn the_spawn_fence_starts_nothing_for_a_launch_option_without_consent() {
+    use super::super::record::apply_option;
     let (_temp, workspace, fixture) = setup();
     trust_pi(&fixture, &workspace);
     let session = launched(&workspace, &fixture);
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(session.directory.join("manifest.json")).unwrap())
             .unwrap();
-    manifest["provider"] = serde_json::json!("agy");
+    manifest["provider"] = serde_json::json!("pi");
     write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
-    applied(&session.directory, "codex-config-override").unwrap();
+    let grant = apply_option(&session.directory, FirstPartyCli::Pi, "pi-approve-once").unwrap();
+    fs::remove_file(&fixture.pi).unwrap();
     let mut command = if cfg!(windows) {
         let mut command = std::process::Command::new("cmd");
         command.args(["/C", "exit", "0"]);
@@ -340,14 +390,51 @@ fn the_spawn_fence_starts_nothing_for_a_launch_option_without_consent() {
         std::process::Command::new("true")
     };
     let store = crate::native::session::Store::open_unchecked(&session.directory);
-    match crate::native::session::launch::spawn(&store, &mut command, |_| Ok(())) {
+    match crate::native::session::launch::spawn_granted(&store, &mut command, Some(&grant), |_| {
+        Ok(())
+    }) {
         Ok(mut child) => {
             let _ = child.wait();
             panic!("the provider was started");
         }
         Err(error) => assert!(
-            format!("{error:#}").contains("another provider's launch option"),
+            format!("{error:#}")
+                .contains("workspace consent for the launch option does not hold now"),
             "{error:#}"
         ),
+    }
+}
+
+// Review r3, finding 1: the spawn fence asks about the command it starts. A command without a
+// trust-bearing option follows 0.4.49's admission exactly: no consent is read for it, so a
+// damaged record, a record that names another adapter's option or no record at all does not
+// stop a plain launch (Claude's, a supported reopen, a plain Codex or Pi command).
+#[test]
+fn a_command_without_a_launch_option_starts_whatever_the_consent_record_holds() {
+    let records: [Option<&[u8]>; 4] = [
+        Some(b"{"),
+        Some(b"[]"),
+        Some(br#"{"state":"verified","applied":"codex-config-override"}"#),
+        None,
+    ];
+    for record in records {
+        let (_temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
+        let session = launched(&workspace, &fixture);
+        fs::remove_file(session.directory.join(SESSION_FILE)).unwrap();
+        if let Some(bytes) = record {
+            write_private(&session.directory.join(SESSION_FILE), bytes).unwrap();
+        }
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "exit", "0"]);
+            command
+        } else {
+            std::process::Command::new("true")
+        };
+        let store = crate::native::session::Store::open_unchecked(&session.directory);
+        let mut child = crate::native::session::launch::spawn(&store, &mut command, |_| Ok(()))
+            .unwrap_or_else(|error| panic!("{record:?}: {error:#}"));
+        let _ = child.wait();
     }
 }

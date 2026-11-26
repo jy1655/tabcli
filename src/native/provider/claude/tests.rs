@@ -1707,6 +1707,9 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                     );
                     assert_no_op_watcher(plan.watcher);
                     assert_eq!(plan.environment_removals, claude_launch_removals());
+                    // Claude puts no trust-bearing option in its command: its spawn reads no
+                    // consent, as 0.4.49 admitted it.
+                    assert!(plan.trust_grant.is_none(), "{label}");
                     let settings: serde_json::Value =
                         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())
                             .unwrap();
@@ -1778,7 +1781,7 @@ fn the_store_only_answer_reads_the_store_alone() {
     let store = fixture.home.join(".claude.json");
     assert!(
         !ADAPTER
-            .store_lists_trusted(&fixture.path, &fixture.env)
+            .store_lists_trusted(&fixture.path, &fixture.env, None)
             .unwrap()
     );
     let parent = fixture.path.parent().unwrap().to_owned();
@@ -1800,7 +1803,7 @@ fn the_store_only_answer_reads_the_store_alone() {
         .unwrap();
         assert_eq!(
             ADAPTER
-                .store_lists_trusted(&fixture.path, &fixture.env)
+                .store_lists_trusted(&fixture.path, &fixture.env, None)
                 .unwrap(),
             expected,
             "{accepted}"

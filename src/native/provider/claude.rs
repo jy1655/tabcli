@@ -175,9 +175,10 @@ impl NativeProviderAdapter for ClaudeAdapter {
         &self,
         workspace: &Path,
         env: &super::super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<bool> {
         Ok(matches!(
-            trust::store_trust(workspace, env, None)?,
+            trust::store_trust(workspace, env, store)?,
             super::super::consent::Trust::Trusted(_)
         ))
     }
@@ -389,6 +390,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
     ]);
     arguments.extend(completion_arguments);
     Ok(LaunchPlan {
+        trust_grant: None,
         arguments,
         initial_prompt: InitialPromptDisposition::of(&ClaudeMessage),
         watcher: Box::new(NoWatcher),

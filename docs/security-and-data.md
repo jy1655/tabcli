@@ -56,14 +56,22 @@ worktrees. A provider that declines the worktree itself, either the source of th
 the provider being launched, stops it too.
 
 TAB reads the worktree's `.git` file and the registration it names without running `git`. Before
-it touches the main working tree that the file names, TAB asks each provider whether its own
-store lists exactly that path as trusted, answered from the store alone, with no I/O on the path
-or its ancestors and no `git`; a path that no store lists is never touched, so a `.git` file
-cannot make TAB reach an untrusted folder or network share. TAB then checks the registration in
-both directions by file identity, absolute and relative registrations
-(`git worktree add --relative-paths`) alike, and refuses a path through a symbolic link or
-junction, a submodule, a bare repository, and a main working tree whose `.git` points to a common
-directory of its own. The screen is a necessary condition only, never consent: after these checks
+the worktree check touches the main working tree that the file names, TAB asks each provider
+whether its own store lists exactly that path as trusted, answered from the store alone, with no
+I/O on the path or its ancestors and no `git`; the worktree check never touches a path that no
+store lists. That describes the worktree check only: assessing the launch folder itself as an
+exact folder still runs each provider's reader there as 0.4.49 does, and Claude's reader runs
+`git rev-parse` in the launch folder when a repository encloses it, which follows the folder's
+own `.git` pointer (a known follow-up). A path that steps back with `..` over a name it named is
+refused before any I/O. TAB then checks the registration in both directions by file identity
+(the back-pointer must name `.git` in the launch folder itself, so a hard link elsewhere does not
+count), absolute and relative registrations (`git worktree add --relative-paths`) alike, and
+refuses a path through a symbolic link or junction, a submodule, a bare repository, and a main
+working tree whose `.git` points to a common directory of its own. The check defends this rule
+against whatever the launch folder holds and against any local user who cannot write the main
+working tree's `.git` or an ancestor directory of either tree; it does not defend against
+someone who can replace those ancestors while it runs, just as an exactly trusted folder is
+trusted by its path. The screen is a necessary condition only, never consent: after these checks
 the main working tree's own consent is assessed as for any exact folder, and a path that a store
 lists but its provider's reader refuses gives no inheritance. TAB does not evaluate Git
 configuration, `HEAD`, objects or refs: a repository whose configuration moves its working tree
@@ -71,12 +79,16 @@ configuration, `HEAD`, objects or refs: a repository whose configuration moves i
 then also names the main working tree (`repository_root`).
 
 TAB checks consent again at every use, not only at launch, and consumes it at the act: when a
-provider option is planned and again immediately before the provider starts, immediately before
-a trust-dialog key, and immediately before every Agy paste; `doctor` reports the same check.
-Each check reads the records, provider stores and Git files as they are now and writes nothing.
-A session's check needs the source recorded at its start: after `tabcli consent reset` of the
-workspace or of its main working tree, only a new `ask` acquires consent again. What a launch
-recorded is history. A revoked consent, a source that no longer trusts the directory or a worktree
+provider option is planned and again for that command immediately before the provider starts,
+immediately before a trust-dialog key, and immediately before every Agy paste is handed to the
+terminal; `doctor` reports the same check. That is the last point TAB's own code controls, and a
+change after it takes effect for the next act, not the one in flight: a revocation that lands
+while the terminal already carries out a paste does not stop that paste. A launch whose command
+carries no trust option reads no consent at its start, as before. Each check reads the records,
+provider stores and Git files as they are now and writes nothing, and evidence it cannot read is
+reported as unreadable, not as missing trust. A session's check needs the source recorded at its
+start: after `tabcli consent reset` of the workspace or of its main working tree, only a new
+`ask` or a supported `reopen` acquires consent again. What a launch recorded is history. A revoked consent, a source that no longer trusts the directory or a worktree
 that is no longer registered stops a TAB paste into a running Agy session that relies on its
 session-only setting. It does not change what the running Agy trusts, and a session whose
 workspace Agy's own trust store lists exactly keeps its pastes.

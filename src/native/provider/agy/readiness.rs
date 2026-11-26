@@ -381,6 +381,7 @@ impl ReadinessGate {
 
 // Return the ready, continuous read's length as the pre-paste receipt offset.
 // New activity or discontinuity requires a later qualifying read within the deadline.
+#[cfg(test)]
 pub(super) fn wait_for_startup_readiness_with<L, C>(
     read_log: &mut L,
     deadline: Instant,
@@ -388,6 +389,22 @@ pub(super) fn wait_for_startup_readiness_with<L, C>(
     poll_interval: Duration,
     clock: &mut C,
 ) -> Result<usize>
+where
+    L: FnMut() -> Result<Option<Vec<u8>>>,
+    C: Clock,
+{
+    Ok(wait_for_startup_readiness_observed(read_log, deadline, timing, poll_interval, clock)?.0)
+}
+
+// The receipt offset and the qualifying read it was measured on, which the paste gate checks
+// for this session's load line.
+pub(super) fn wait_for_startup_readiness_observed<L, C>(
+    read_log: &mut L,
+    deadline: Instant,
+    timing: ReadinessTiming,
+    poll_interval: Duration,
+    clock: &mut C,
+) -> Result<(usize, Option<Vec<u8>>)>
 where
     L: FnMut() -> Result<Option<Vec<u8>>>,
     C: Clock,
@@ -400,7 +417,7 @@ where
         if state == ReadinessState::Ready
             && let Some(observed_len) = gate.observed_len()
         {
-            return Ok(observed_len);
+            return Ok((observed_len, log));
         }
         if now >= deadline {
             bail!("{}", gate.deadline_report(state));

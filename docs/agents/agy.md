@@ -20,8 +20,10 @@
   provider_version`) at 1.5.17 or newer (the text must be the version alone), the launch hands
   Agy the exact workspace through its own `--settings` ("Settings for this session only,
   never saved"): a private `agy-session-trust.json` in the session directory holding
-  `{"trustedWorkspaces":[<native key>]}`, then the applied marker `agy-settings-override`,
-  which the spawn fence checks again immediately before the provider starts. The version is
+  `{"trustedWorkspaces":[<native key>]}`, then the applied marker `agy-settings-override`.
+  The plan carries that option and the workspace it was granted for to the spawn fence, which
+  asks the authority about this command again immediately before the provider starts. The
+  version is
   judged before any consent work. An Agy positively identified as older records only
   `launch-option-unavailable` and is the one Agy launch whose exact consent may still take the
   guarded dialog answer; a version that identifies nothing, or a refused or failing check on a
@@ -37,8 +39,11 @@
   (`/thinking on`, then off) rewrote that store with its own key while the saved
   `trustedWorkspaces` stayed as it was, and returned it to its original bytes; through TAB on
   Herdr, a new worktree of this repository launched without a dialog, answered a follow-up and
-  left the store unchanged. Not measured: Windows, Linux, the other surfaces, an exact-consent
-  ordinary folder through TAB, and other settings writes. The 1.5.8 changelog already names
+  left the store unchanged. The coordinator's authenticated runs through TAB on macOS Herdr at
+  commit `6eebb37` (2026-11-26) added an ordinary folder with exact consent that only Codex
+  lists (no dialog, Agy's store unchanged), absolute and relative worktree registrations, and a
+  revoke that refused the next follow-up. Not measured: Windows, Linux, the other surfaces, and
+  other settings writes. The 1.5.8 changelog already names
   `--settings`, but older versions were not measured with `trustedWorkspaces`, and an Agy
   without the option fails on it. Delete the file when Agy offers a trust option of its own.
 - Never paste without both trust facts: Agy was told to trust the exact workspace (its
@@ -46,7 +51,11 @@
   consent's authority finds the workspace consented now), and this session's own `agy.log`
   shows the workspace customization load, a `hooks_manager.go` line from a goroutine other
   than the main one, in the very log contents that supply the receipt offset. The first fact
-  is checked once more immediately before the dispatch, after every readiness wait. An
+  is checked once more in the delivery step, after every readiness wait, immediately before
+  the terminal backend's send is called: the last point the provider-neutral code controls
+  (router's limit, 2026-11-26). The backends are not changed, so a revocation that lands after
+  that point does not stop the paste already handed to the backend. The request trace's paste
+  timestamps surround the send itself and stay empty when that check refuses. An
   unreadable store, session record or log is reported as unreadable evidence, never as an
   absent entry. The store is shared by every Agy process, so a dialog approved in one
   session leaves another session's dialog open; the log line is per process and appears at

@@ -559,7 +559,16 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
                             );
                         }
                         assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
+                        let grant = plan.trust_grant.as_ref().unwrap();
+                        assert_eq!(grant.provider, FirstPartyCli::Agy, "{label}");
+                        assert_eq!(grant.marker, APPLIED_MARKER, "{label}");
+                        assert_eq!(
+                            grant.workspace,
+                            crate::native::consent::identity(&workspace).unwrap(),
+                            "{label}"
+                        );
                     } else {
+                        assert!(plan.trust_grant.is_none(), "{label}");
                         assert!(!settings.exists(), "{label}");
                         assert_eq!(
                             observed.applied_marker(),
@@ -632,7 +641,7 @@ fn the_store_only_answer_reads_the_store_alone() {
     let store = fixture.home.join(".gemini/antigravity-cli/settings.json");
     assert!(
         !ADAPTER
-            .store_lists_trusted(&fixture.path, &fixture.env)
+            .store_lists_trusted(&fixture.path, &fixture.env, None)
             .unwrap()
     );
     let parent = fixture.path.parent().unwrap().to_owned();
@@ -644,7 +653,7 @@ fn the_store_only_answer_reads_the_store_alone() {
         .unwrap();
         assert_eq!(
             ADAPTER
-                .store_lists_trusted(&fixture.path, &fixture.env)
+                .store_lists_trusted(&fixture.path, &fixture.env, None)
                 .unwrap(),
             expected
         );

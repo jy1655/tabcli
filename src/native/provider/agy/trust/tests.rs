@@ -501,8 +501,8 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     write_json_atomic(&shared, &record).unwrap();
     assert_eq!(gate().0, Ok(()));
 
-    // Another adapter's marker, the dialog's own markers and a marker that is not a string
-    // are not this setting: the store rule applies, here an absent entry.
+    // Another adapter's marker and the dialog's own markers are not this setting: the store
+    // rule applies, here an absent entry.
     fs::remove_file(&store).unwrap();
     write_json_atomic(&store, &serde_json::json!({"trustedWorkspaces": []})).unwrap();
     let assessment: serde_json::Value =
@@ -512,7 +512,6 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
         serde_json::json!("pi-approve-once"),
         serde_json::json!("provider-workspace-dialog"),
         serde_json::json!("workspace-dialog-response-pending"),
-        serde_json::json!(true),
         serde_json::Value::Null,
     ] {
         let mut changed = assessment.clone();
@@ -527,6 +526,39 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
             "{marker}"
         );
     }
+    // Review r3, finding 12: a present record is decoded as the typed assessment. Valid JSON of
+    // another shape (a marker that is not a string, a record that is not an object) is
+    // unreadable evidence, never an absent marker; Agy's own store entry still stands alone.
+    for record in [
+        {
+            let mut changed = assessment.clone();
+            changed["applied"] = serde_json::json!(true);
+            changed
+        },
+        serde_json::json!([]),
+        serde_json::json!({"applied": APPLIED_MARKER}),
+    ] {
+        write_json_atomic(&consent_record, &record).unwrap();
+        let (outcome, check) = gate();
+        let outcome = outcome.unwrap_err();
+        assert!(
+            outcome.contains("workspace consent record could not be read"),
+            "{record}: {outcome}"
+        );
+        assert_eq!(
+            check.reason_code, "agy_trust_evidence_unreadable",
+            "{record}"
+        );
+    }
+    fs::remove_file(&store).unwrap();
+    write_json_atomic(
+        &store,
+        &serde_json::json!({"trustedWorkspaces": [consent::native_key(&workspace).unwrap()]}),
+    )
+    .unwrap();
+    assert_eq!(gate().0, Ok(()));
+    fs::remove_file(&store).unwrap();
+    write_json_atomic(&store, &serde_json::json!({"trustedWorkspaces": []})).unwrap();
     // A record that carries the marker but is not a whole assessment cannot be read: the
     // paste waits and reports why, and is never sent.
     write_json_atomic(

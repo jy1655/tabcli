@@ -118,46 +118,61 @@ pub(in crate::native) fn provision_with(
     // adapter's resume plan with the new request's policy; the plan carries no prompt, and
     // the reopened process receives it through the same transport a fresh launch uses.
     let resumed_from = read_resumed_from(directory)?;
-    let (arguments, initial_prompt, watcher, environment_removals) = match &resumed_from {
-        Some(resumed_from) => {
-            let provider::ResumePlan {
-                arguments,
-                initial_prompt,
-                watcher,
-                environment_removals,
-            } = provider::reopen(provider)?.prepare(provider::ResumeContext {
-                bridge_executable: &executable,
-                directory,
-                provider_session_id: &resumed_from.provider_session_id,
-                yolo: manifest.yolo,
-                model: manifest.model.as_deref(),
-                effort: manifest.effort.as_deref(),
-            })?;
-            (arguments, initial_prompt, watcher, environment_removals)
-        }
-        None => {
-            let provider::LaunchPlan {
-                arguments,
-                initial_prompt,
-                watcher,
-                environment_removals,
-            } = provider::prepare_launch(
-                provider,
-                provider::LaunchContext {
+    let (arguments, initial_prompt, watcher, environment_removals, trust_grant) =
+        match &resumed_from {
+            Some(resumed_from) => {
+                let provider::ResumePlan {
+                    arguments,
+                    initial_prompt,
+                    watcher,
+                    environment_removals,
+                } = provider::reopen(provider)?.prepare(provider::ResumeContext {
                     bridge_executable: &executable,
                     directory,
-                    workspace: &manifest.workspace,
-                    title: &manifest.title,
-                    prompt: &prompt,
+                    provider_session_id: &resumed_from.provider_session_id,
                     yolo: manifest.yolo,
                     model: manifest.model.as_deref(),
                     effort: manifest.effort.as_deref(),
-                    provider_version: &provider_version,
-                },
-            )?;
-            (arguments, initial_prompt, watcher, environment_removals)
-        }
-    };
+                })?;
+                // A resume plan carries no trust-bearing option.
+                (
+                    arguments,
+                    initial_prompt,
+                    watcher,
+                    environment_removals,
+                    None,
+                )
+            }
+            None => {
+                let provider::LaunchPlan {
+                    arguments,
+                    initial_prompt,
+                    watcher,
+                    environment_removals,
+                    trust_grant,
+                } = provider::prepare_launch(
+                    provider,
+                    provider::LaunchContext {
+                        bridge_executable: &executable,
+                        directory,
+                        workspace: &manifest.workspace,
+                        title: &manifest.title,
+                        prompt: &prompt,
+                        yolo: manifest.yolo,
+                        model: manifest.model.as_deref(),
+                        effort: manifest.effort.as_deref(),
+                        provider_version: &provider_version,
+                    },
+                )?;
+                (
+                    arguments,
+                    initial_prompt,
+                    watcher,
+                    environment_removals,
+                    trust_grant,
+                )
+            }
+        };
 
     let watcher = watcher.start(directory)?;
     let mut provider_command = process_env::provider_command(
@@ -191,9 +206,10 @@ pub(in crate::native) fn provision_with(
     // Spawn and its durable identity are fenced against cancellation by the lifecycle
     // lock. Failed identity recording ends the child but stays delivery-uncertain: an
     // argument-delivered prompt could already have been consumed before cleanup.
-    let child = super::spawn(
+    let child = super::spawn_granted(
         &Store::open_unchecked(directory),
         &mut provider_command,
+        trust_grant.as_ref(),
         |child| {
             record_provider_process(directory, &manifest.id, child)?;
             match initial_prompt {

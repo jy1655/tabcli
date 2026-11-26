@@ -13,14 +13,25 @@
 //!    exactly `<main>` as trusted, answered from the store alone (no I/O on the path or its
 //!    ancestors, no `git`), so a destination no store lists (a share, an automount) is never
 //!    touched. The screen is a necessary condition only; consent is assessed afterwards.
+//!    A path that names a component and later cancels it with `..` is refused here, before any
+//!    I/O; only the leading parent steps of a relative path are taken.
 //! 3. The same path is walked component by component from `W` (or from its root): each
 //!    component is inspected before the next, none is a link (on Windows, no reparse point),
-//!    every one is a directory, and `..` steps back only over a directory just inspected.
+//!    and every one is a directory.
 //! 4. `<main>/.git` is therefore a real directory of `<main>`, and it has no `commondir` of its
 //!    own.
-//! 5. The registration's `gitdir` names `W/.git`, and its `commondir` names `<main>/.git`; each
-//!    is walked the same way from the registration and compared by file identity, never by
-//!    name.
+//! 5. The registration's `gitdir` names `.git` in `W` itself, and its `commondir` names
+//!    `<main>/.git`; each is walked the same way from the registration and compared by file
+//!    identity, never by name: the file and, for the back-pointer, its directory too, so a hard
+//!    link to `W/.git` in another folder is not `W`. On Windows the identity is the volume and
+//!    the full 128-bit file id; where it cannot be read, nothing is inherited.
+//!
+//! The limit (router's ruling, 2026-11-26): the check defends the property against whatever
+//! the launch folder holds, and against any local user who cannot write the main working tree's
+//! `.git` or an ancestor directory of either tree. It does not defend against someone who can
+//! replace those ancestors while it runs: it inspects by path and does not hold directory
+//! handles, as an exactly trusted folder is trusted by path. Pointer files are opened so that a
+//! FIFO cannot block the open, and the opened handle is checked.
 use anyhow::{Context, Result, bail, ensure};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -81,6 +92,12 @@ pub(super) fn main_worktree(
     ensure!(
         object_id(&back)? == object_id(&pointer)?,
         "the worktree registration names another .git file"
+    );
+    ensure!(
+        back.file_name() == Some(OsStr::new(".git"))
+            && object_id(back.parent().context("the back-pointer names no folder")?)?
+                == object_id(workspace)?,
+        "the worktree registration names a .git file in another folder"
     );
     let named_common = walk(
         &registration,
@@ -146,23 +163,36 @@ fn claimed_main(base: &Path, target: &Path) -> Result<Option<PathBuf>> {
 // relative case inherits from the canonical `base`, so the screen is asked about the path an
 // exact-folder lookup would key, and every walk addresses the file system without Win32's
 // rewriting of the names.
-fn start<'a>(
-    base: &Path,
-    target: &'a Path,
-) -> Result<(PathBuf, impl Iterator<Item = Component<'a>>)> {
+fn start<'a>(base: &Path, target: &'a Path) -> Result<(PathBuf, Vec<Component<'a>>)> {
     let mut components = target.components().peekable();
-    if !target.is_absolute() {
-        return Ok((base.to_owned(), components));
-    }
-    #[cfg(windows)]
-    let root = match components.next() {
-        Some(Component::Prefix(prefix)) => verbatim_root(prefix.kind())?,
-        _ => bail!("an absolute path in Git's files has no volume"),
+    let root = if !target.is_absolute() {
+        base.to_owned()
+    } else {
+        #[cfg(windows)]
+        let root = match components.next() {
+            Some(Component::Prefix(prefix)) => verbatim_root(prefix.kind())?,
+            _ => bail!("an absolute path in Git's files has no volume"),
+        };
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/");
+        if components.peek() == Some(&Component::RootDir) {
+            components.next();
+        }
+        root
     };
-    #[cfg(not(windows))]
-    let root = PathBuf::from("/");
-    if components.peek() == Some(&Component::RootDir) {
-        components.next();
+    let components: Vec<_> = components.collect();
+    // Review r3, finding 6: a name cancelled by a later `..` would make the walk touch a path
+    // outside both trees that the screen never approved. Only leading parent steps are taken,
+    // as Git writes them for relative paths.
+    let mut named = false;
+    for component in &components {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => {
+                bail!("a path in Git's files steps back over a name it named")
+            }
+            _ => {}
+        }
     }
     Ok((root, components))
 }
@@ -204,11 +234,10 @@ enum Kind {
 
 // `target`, resolved from `base` as Git resolves it, reached component by component: each
 // component is inspected before the next is taken, none is a link, every one but the last is
-// a directory, the last is of `kind`, and `..` steps back only over a directory just inspected.
-// `base` is a directory reached without a link.
+// a directory, and the last is of `kind`. A leading `..` steps back over an ancestor of `base`,
+// a directory reached without a link.
 fn walk(base: &Path, target: &Path, kind: Kind) -> Result<PathBuf> {
     let (mut path, components) = start(base, target)?;
-    let components: Vec<_> = components.collect();
     ensure!(
         !components.is_empty(),
         "a path in Git's files names nothing"
@@ -246,7 +275,9 @@ fn walk(base: &Path, target: &Path, kind: Kind) -> Result<PathBuf> {
 }
 
 // The identity of what `path` names, its last component not followed: the device and inode on
-// Unix, the volume and file index on Windows.
+// Unix; on Windows the volume and the full 128-bit file id (`FileIdInfo`), because the 64-bit
+// file index can repeat on ReFS (review r3, finding 11). An identity that cannot be read is an
+// error, so nothing is inherited.
 fn object_id(path: &Path) -> Result<(u64, u128)> {
     #[cfg(unix)]
     {
@@ -259,7 +290,8 @@ fn object_id(path: &Path) -> Result<(u64, u128)> {
         use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx,
         };
         let handle = OpenOptions::new()
             .access_mode(0)
@@ -275,9 +307,22 @@ fn object_id(path: &Path) -> Result<(u64, u128)> {
             "{} is a link",
             path.display()
         );
+        let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_raw_handle(),
+                FileIdInfo,
+                (&raw mut id).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot read the full file id of {}", path.display()));
+        }
         Ok((
-            u64::from(info.dwVolumeSerialNumber),
-            (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow),
+            id.VolumeSerialNumber,
+            u128::from_le_bytes(id.FileId.Identifier),
         ))
     }
 }
@@ -292,29 +337,11 @@ fn read_git_file(path: &Path) -> Result<String> {
         "{} is not a regular file",
         path.display()
     );
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path)?;
-    let opened = file.metadata()?;
-    ensure!(
-        opened.is_file() && !is_link(&opened),
-        "{} is not a regular file",
-        path.display()
-    );
+    let file = open_pointer(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
         ensure!(
             (opened.dev(), opened.ino()) == (before.dev(), before.ino()),
             "{} changed while it was opened",
@@ -329,6 +356,35 @@ fn read_git_file(path: &Path) -> Result<String> {
         path.display()
     );
     String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8", path.display()))
+}
+
+// Opens one of Git's pointer files without following a link and, on Unix, without blocking
+// on a FIFO put there after it was inspected (review r3, finding 8), then checks the handle it
+// opened: a regular file. A regular file reads the same with `O_NONBLOCK`.
+fn open_pointer(path: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("{} cannot be read", path.display()))?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.is_file() && !is_link(&opened),
+        "{} is not a regular file",
+        path.display()
+    );
+    Ok(file)
 }
 
 // The single line of a pointer file, without the line endings Git strips.

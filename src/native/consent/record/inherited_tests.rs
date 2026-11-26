@@ -654,3 +654,77 @@ fn a_main_working_tree_that_a_store_lists_but_its_reader_refuses_gives_nothing()
     assert_eq!(assessment.detail, INHERITED_DETAIL);
     assert!(record_path(temp.path(), &git.repository).exists());
 }
+
+// Review r3, finding 9: a pinned recheck screens the main working tree against the store its pin
+// names, not against the stores the caller's environment names now. A session that inherited
+// Pi's trust from one Pi home keeps it when a later command runs with another home whose stores
+// list nothing; acquisition (no pin yet) keeps discovering in the stores the environment names.
+#[test]
+fn a_pinned_recheck_screens_the_main_working_tree_against_the_pinned_store() {
+    let (temp, fixture, git) = worktree_setup();
+    trust_pi(&fixture, &git.repository);
+    let first = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(first.state, "verified");
+    assert_eq!(first.detail, INHERITED_DETAIL);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let moved = Environment::at_home(&elsewhere.path().canonicalize().unwrap());
+    for again in [
+        assess_current(temp.path(), &git.worktree, &moved).unwrap(),
+        assess_with(temp.path(), &git.worktree, &moved).unwrap(),
+    ] {
+        assert_eq!(again.state, "verified");
+        assert_eq!(again.source, first.source);
+        assert_eq!(again.repository_root, first.repository_root);
+    }
+    // Without a pin, the stores the environment names decide: none lists the main working tree.
+    let (other_temp, other_fixture, other_git) = worktree_setup();
+    trust_pi(&other_fixture, &other_git.repository);
+    assert_eq!(
+        assess_with(other_temp.path(), &other_git.worktree, &moved)
+            .unwrap()
+            .state,
+        "unverified"
+    );
+    // The pinned store that no longer lists the main working tree refuses.
+    trust_pi(
+        &fixture,
+        &temp.path().canonicalize().unwrap().join("elsewhere"),
+    );
+    assert_eq!(
+        assess_current(temp.path(), &git.worktree, &moved)
+            .unwrap()
+            .state,
+        "source-reset"
+    );
+}
+
+// Review r3, finding 12: at a recheck, a registration that cannot be read is an error, never a
+// refusal that reads as missing trust; a registration that is gone is a refusal.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_registration_is_an_error_at_a_recheck() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, fixture, git) = worktree_setup();
+    trust(&fixture, FirstPartyCli::Codex, &git.repository);
+    assert_eq!(
+        assess_with(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "verified"
+    );
+    let gitdir = git.registration.join("gitdir");
+    fs::set_permissions(&gitdir, fs::Permissions::from_mode(0o000)).unwrap();
+    // A user that may read anything (root) cannot observe an unreadable file.
+    if fs::read(&gitdir).is_err() {
+        let error = assess_current(temp.path(), &git.worktree, &fixture.env).unwrap_err();
+        assert!(format!("{error:#}").contains("gitdir"), "{error:#}");
+    }
+    fs::set_permissions(&gitdir, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&gitdir).unwrap();
+    assert_eq!(
+        assess_current(temp.path(), &git.worktree, &fixture.env)
+            .unwrap()
+            .state,
+        "source-reset"
+    );
+}
