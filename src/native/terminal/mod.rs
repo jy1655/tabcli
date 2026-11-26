@@ -200,14 +200,13 @@ impl FromStr for TerminalKind {
     }
 }
 
-/// The kinds one OS runs, and its one refusal of every other kind. A record can name a
-/// terminal of another OS (a state directory moved between machines), so each OS's adapter
-/// lookup answers such a handle with `unavailable` before any adapter is reached:
-/// `<Name> is not available on <OS>; use <its kinds>`, an unsupported failure, the same on
-/// macOS, Linux and Windows. Only a kind's declared screen or guarded-input refusal answers
-/// before it, on every OS alike. The entry points answer with it before their own OS's rules:
-/// each OS's selection for an explicit such kind, the explicit close (`close_owned_surface`,
-/// after its Repair) and guarded input (before the macOS and Linux claim check).
+/// The kinds one OS runs, and its refusals of every other kind, the same on macOS, Linux and
+/// Windows. Each OS's selection refuses an explicit such kind for a new launch with
+/// `unavailable` (`<Name> is not available on <OS>; use <its kinds>`). Each OS's adapter lookup
+/// refuses a stored handle of such a kind, or a Herdr handle born on another OS, with
+/// `not_here` (`<Name> is not available on <OS>`) before any adapter is reached; only a kind's
+/// declared screen or guarded-input refusal answers before it. Whether a whole Session belongs
+/// to another OS is judged in `foreign`.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native::terminal) struct OsTerminals {
     os: &'static str,
@@ -257,7 +256,19 @@ impl OsTerminals {
         false
     }
 
-    /// The refusal of a kind this OS does not run. Callers ask it only for such a kind.
+    /// The refusal of a stored handle of a kind this OS does not run. It names no terminal to
+    /// use instead: only a new launch could choose one.
+    pub(in crate::native::terminal) fn not_here(self, kind: TerminalKind) -> anyhow::Error {
+        debug_assert!(!self.runs(kind), "{} runs {kind:?}", self.os);
+        anyhow::Error::new(crate::native::failure_kind::Unsupported::new(format!(
+            "{} is not available on {}",
+            kind.display_name(),
+            self.os
+        )))
+    }
+
+    /// The refusal of a kind this OS does not run, requested for a new launch: it names the
+    /// kinds this OS runs. Callers ask it only for such a kind.
     pub(in crate::native::terminal) fn unavailable(self, kind: TerminalKind) -> anyhow::Error {
         debug_assert!(!self.runs(kind), "{} runs {kind:?}", self.os);
         let names: Vec<_> = self.kinds.iter().map(|kind| kind.as_str()).collect();
@@ -1010,6 +1021,7 @@ mod tests {
                 assert_eq!(TerminalKind::from_str(kind.as_str()), Ok(*kind), "{name}");
             }
             for kind in TerminalKind::ALL.into_iter().filter(|kind| !os.runs(*kind)) {
+                // A new launch is told the kinds this OS runs.
                 let error = os.unavailable(kind);
                 assert_eq!(
                     format!("{error:#}"),
@@ -1017,6 +1029,13 @@ mod tests {
                         "{} is not available on {name}; use {alternatives}",
                         kind.display_name()
                     )
+                );
+                assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{name}");
+                // A stored handle is not: only a new launch could choose another terminal.
+                let error = os.not_here(kind);
+                assert_eq!(
+                    format!("{error:#}"),
+                    format!("{} is not available on {name}", kind.display_name())
                 );
                 assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{name}");
             }
@@ -1039,23 +1058,18 @@ mod tests {
         }
     }
 
-    // The refusal this OS gives every kind it does not run, as the tests below expect it.
+    // The refusal this OS gives a stored handle of every kind it does not run, as the tests
+    // below expect it.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn this_os_refusal(kind: TerminalKind) -> String {
-        let (os, alternatives) = if cfg!(target_os = "macos") {
-            (
-                "macOS",
-                "iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
-            )
+        let os = if cfg!(target_os = "macos") {
+            "macOS"
         } else if cfg!(target_os = "linux") {
-            ("Linux", "tmux or herdr")
+            "Linux"
         } else {
-            ("Windows", "windows-console or herdr")
+            "Windows"
         };
-        format!(
-            "{} is not available on {os}; use {alternatives}",
-            kind.display_name()
-        )
+        format!("{} is not available on {os}", kind.display_name())
     }
 
     // The Owner record that `os`'s writer records, bound to `id`, for `pid`.
@@ -1129,13 +1143,14 @@ mod tests {
         cases
     }
 
-    // A Session of another OS, ready or failed, whose owner's PID is absent here: nothing on
-    // this machine is evidence about it. Repair (as `sessions`, `tell` and `close-session` run
-    // it) leaves it as it is and answers with the one refusal, the explicit close refuses it
-    // twice and keeps its handle, the ownership proof refuses it before any surface or owner
-    // check, and prune stays blocked: the same on every OS. Before, macOS read a Windows owner
-    // (and Windows a macOS owner) as a PID-only owner, so Repair settled a session from an
-    // unrelated local PID, and Repair answered with each OS's own attestation error.
+    // A Session of another OS whose owner's PID is absent here: nothing on this machine is
+    // evidence about it. Repair (as `sessions`, `tell` and `close-session` run it) leaves it
+    // exactly as it is, and the ownership proof refuses it before any surface or owner check,
+    // the same on every OS. The explicit close decides from its Records alone: a ready one is
+    // refused twice and keeps its handle, and prune stays blocked; a failed one is settled, its
+    // handle consumed with no terminal call, and prune may then remove it. Before, macOS read a
+    // Windows owner (and Windows a macOS owner) as a PID-only owner, so Repair settled a
+    // session from an unrelated local PID.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn a_session_of_another_os_is_never_judged_from_this_machine() {
@@ -1143,7 +1158,7 @@ mod tests {
         use crate::native::session::test_support::lifecycle::reaped_child_pid;
         use crate::native::session::{CoreRecord, Reader, SessionState, Store, update_status};
         let absent = reaped_child_pid();
-        for (kind, os, refusal) in sessions_of_other_oss() {
+        for (kind, os, head) in sessions_of_other_oss() {
             for state in [SessionState::Ready, SessionState::Failed] {
                 let root = tempfile::tempdir().unwrap();
                 let directory = root.path().join("session-foreign");
@@ -1158,6 +1173,11 @@ mod tests {
                 store.write_terminal(&surface).unwrap();
                 let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
                 let case = format!("{kind:?} recorded on {os}, {state}");
+                let refusal = format!(
+                    "{head}: TAB on this machine cannot judge or end this session; once its \
+                     records show it ended, an explicit close settles it (its records are in {})",
+                    directory.display()
+                );
                 let unchanged = |case: &str| {
                     assert_eq!(
                         store.record(CoreRecord::Terminal).bytes().unwrap(),
@@ -1169,36 +1189,79 @@ mod tests {
                     assert!(store.closed_if_present().unwrap().is_none(), "{case}");
                 };
                 let deadline = crate::native::session::close::budget::close_deadline();
-                let mut errors = vec![
-                    crate::native::session::close::repair_dead_owner(&store).unwrap_err(),
-                    store.converge_until(deadline).unwrap_err(),
-                    super::ownership::verified_terminal_surface_owner(
+                // Repair leaves it exactly as it is, and so does convergence.
+                assert!(
+                    !crate::native::session::close::repair_dead_owner(&store).unwrap(),
+                    "{case}"
+                );
+                unchanged(&case);
+                store.converge_until(deadline).unwrap();
+                unchanged(&case);
+                let proof = super::ownership::verified_terminal_surface_owner(
+                    &directory,
+                    "session-foreign",
+                    &surface,
+                    Some(std::time::Duration::from_secs(5)),
+                )
+                .unwrap_err();
+                assert_eq!(format!("{proof:#}"), refusal, "{case}");
+                assert_eq!(classify(&proof), Some(FailureKind::Unsupported), "{case}");
+                let close = || {
+                    crate::native::close::close_session_surface(
                         &directory,
                         "session-foreign",
-                        &surface,
-                        Some(std::time::Duration::from_secs(5)),
+                        None,
+                        crate::native::session::close::budget::close_deadline(),
                     )
-                    .unwrap_err(),
-                ];
-                for _attempt in 0..2 {
-                    errors.push(
-                        crate::native::close::close_session_surface(
-                            &directory,
-                            "session-foreign",
-                            None,
-                            crate::native::session::close::budget::close_deadline(),
-                        )
-                        .unwrap_err(),
+                };
+                if state == SessionState::Ready {
+                    for _attempt in 0..2 {
+                        let error = close().unwrap_err();
+                        assert_eq!(format!("{error:#}"), refusal, "{case}");
+                        assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
+                        unchanged(&case);
+                    }
+                    assert!(
+                        Reader::open_unchecked(&directory)
+                            .native_owner_blocks_prune()
+                            .unwrap(),
+                        "{case}"
                     );
-                    unchanged(&case);
+                    continue;
                 }
-                for error in errors {
-                    assert_eq!(format!("{error:#}"), refusal, "{case}");
-                    assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
-                }
-                unchanged(&case);
+                close().unwrap_or_else(|error| panic!("{case}: {error:#}"));
+                assert_eq!(
+                    store.status().unwrap().state,
+                    SessionState::Closed,
+                    "{case}"
+                );
+                assert!(store.closed_if_present().unwrap().is_some(), "{case}");
                 assert!(
-                    Reader::open_unchecked(&directory)
+                    !store.record(CoreRecord::Terminal).present().unwrap(),
+                    "{case}"
+                );
+                assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+                let tombstone: serde_json::Value = store
+                    .record(CoreRecord::TerminalClosed)
+                    .json_with(|text| serde_json::from_str(text))
+                    .unwrap();
+                assert_eq!(tombstone["consumed"], true, "{case}");
+                assert_eq!(tombstone["terminal"], serde_json::json!(kind), "{case}");
+                assert!(
+                    store
+                        .status()
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains(&format!("settled from its records alone ({head})")),
+                    "{case}"
+                );
+                // Settling again changes nothing, and prune is not kept back by the owner.
+                let closed = store.record(CoreRecord::Closed).bytes().unwrap();
+                close().unwrap();
+                assert_eq!(store.record(CoreRecord::Closed).bytes().unwrap(), closed);
+                assert!(
+                    !Reader::open_unchecked(&directory)
                         .native_owner_blocks_prune()
                         .unwrap(),
                     "{case}"

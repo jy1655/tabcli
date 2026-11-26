@@ -648,10 +648,12 @@ or `unknown`, with a stable `reason`:
 | state | reason |
 |---|---|
 | `admissible` | `admission_passed` |
-| `refused` | `state_not_running`, `no_active_claim`, `no_active_receipt`, `result_already_published`, `cancel_already_recorded` |
+| `refused` | `state_not_running`, `surface_unsupported`, `no_active_claim`, `no_active_receipt`, `result_already_published`, `cancel_already_recorded` |
 | `unsupported` | `provider_unsupported` |
 | `unknown` | `lifecycle_lock_absent`, `evidence_unreadable` |
 
+`surface_unsupported` means the session's records belong to another operating system: `cancel`
+refuses it after a closed session and before any other gate, and `detail` is its refusal text.
 `provider_unsupported` means the existing provider adapter refused cancel support for this
 admission. For Pi this includes startup readiness that is missing, unusable, or not current for the
 active claim; it does not prove that the provider lacks the feature. `unknown` means the shared
@@ -667,10 +669,13 @@ timeline output do not include capabilities.
 
 `capabilities.tell` evaluates only the gates `tell` decides from TAB records, in the command's
 order, and stops at the first gate that does not pass: the hold; what interrupted-update recovery
-and dead-owner repair would find about the owner's liveness, without performing either; the
-recorded terminal handle; the owner record's side of the surface ownership check, which `tell`'s
-probe verifies after it reads that handle; the stored state; an installed claim; and the provider
-adapter's own record gate. `state` is
+and dead-owner repair would find about the owner's liveness, without performing either; whether
+the session is closed (`state_not_ready`); the recorded terminal handle; the owner record's side
+of the surface ownership check, which `tell`'s probe verifies after it reads that handle; the
+stored state; an installed claim; and the provider adapter's own record gate. A session whose
+records belong to another operating system is refused at the terminal handle
+(`surface_unsupported`, with `tell`'s refusal as `detail`), after a closed session and a
+handle bound to another session, and dead-owner repair does not judge its owner. `state` is
 `admissible`, `refused` or `unknown`, never `available`, with a stable `reason` and an optional
 `detail`:
 
@@ -1682,7 +1687,8 @@ positive supported whole day count, and `--explicit` acknowledges deletion. Ther
 retention policy or dry-run flag.
 
 Both the close tombstone and status must say `closed` and be at or before the retention cutoff.
-Active capabilities or a blocking owner prevent pruning. Invalid, unsafe, or ineligible entries are
+Active capabilities or a blocking owner prevent pruning. An owner recorded on another operating
+system does not block a closed session copied from there: nothing on this machine can observe it. Invalid, unsafe, or ineligible entries are
 skipped; pruning never closes a running session to make it eligible.
 
 Human output says `pruned SESSION` per removal and gives a count, or `no eligible closed TAB
@@ -1714,6 +1720,11 @@ failed sessions. Repeating a completed close succeeds without closing another su
 process teardown, and terminal automation. It does not guarantee that the close finishes.
 A timeout means the close was not confirmed and may have partly happened. A rerun observes
 the session and establishes authority again; it may still refuse the close.
+
+A session copied from another operating system is closed from its records alone (see
+[copied sessions](terminals.md#selection-and-settings)): an exited or failed copy is settled without addressing any
+terminal or process, a running copy is refused, and the refusal names the directory of its
+records.
 
 For a tmux session, explicit close ends the session's entire tmux server, including windows you added.
 The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;

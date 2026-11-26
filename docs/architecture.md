@@ -247,31 +247,44 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `windows/mod.rs` for a managed console; screen and guarded key first answer with the kind's
   declared refusal. That module is compiled into every test build, so a test builds the lookup
   over recording adapters on every target.
-  `OsTerminals` (`terminal/mod.rs`) lists the kinds each OS runs. Each OS's lookup refuses
-  every other kind with `OsTerminals::unavailable` before any adapter is reached:
-  `<Name> is not available on <OS>; use <its kinds>`, unsupported, the same on macOS, Linux
-  and Windows. Each OS's selection refuses an explicit such kind with the same text before a
-  session exists. `supported_on_this_platform` reads the same list.
-  A state directory can be copied between machines. `terminal::foreign` decides once, from a
-  Session's Records alone, whether it belongs to another OS: its handle names a kind this OS
-  does not run, or its Owner record carries the identity another OS's writer records (macOS:
-  the process start time; Linux: the Linux birth; Windows: the Windows process identity).
-  This machine's processes are no evidence about such a Session. Owner attestation reads any
-  other OS's identity as unknown, never as a PID-only record. Repair, in every command that
-  runs it (`sessions`, `tell`, `close-session`), leaves a Session whose Owner record another
-  OS wrote as it is and answers with the one refusal, before launch repair or the owner check.
-  The explicit close (`close_authority::close_owned_surface`), the ownership proof, `screen`'s
-  record gate and `reopen`'s source check refuse such a Session with the same refusal: the
-  kind's when the handle names a kind this OS does not run, otherwise `a session recorded on
-  <OS> is not available on <this OS>`. Guarded input refuses a kind this OS does not run
-  before the macOS and Linux claim check. Facts that the Records establish the same way on
-  every OS answer before this refusal: a closed session is refused as closed, and a handle
-  bound to another session as unbound (`judgment::ActiveHandle`, read by `screen`, doctor
-  and the capabilities), so the same Records get the same answer on every OS. What the
-  Records alone settle still settles: a
-  close that a tombstone or a closed status already finished, and a Session with no handle.
-  An Owner record that names no identity (a legacy PID-only record) is judged by its handle
-  at the surface entry points only; Repair still attests it. The created-host close evidence
+  `OsTerminals` (`terminal/mod.rs`) lists the kinds each OS runs. Each OS's selection refuses
+  an explicit kind it does not run before a session exists with `OsTerminals::unavailable`:
+  `<Name> is not available on <OS>; use <its kinds>`. Each OS's lookup refuses a stored handle
+  of such a kind with `OsTerminals::not_here` before any adapter is reached:
+  `<Name> is not available on <OS>`, naming no terminal, since only a new launch could choose
+  one. Both are unsupported and the same on macOS, Linux and Windows.
+  `supported_on_this_platform` reads the same list.
+  A state directory can be copied between machines. `terminal::foreign` decides in one place,
+  from a Session's Records alone, whether it belongs to another OS: any Record that says so
+  positively (the kind of its active, claimed or consumed handle, a Herdr handle's recorded
+  host birth, or the identity its Owner record carries: macOS the process start time, Linux
+  the Linux birth, Windows the Windows process identity). A missing or null field is no
+  evidence, and a PID-only or absent Owner record does not hide such a terminal. The judgment
+  rides in the shared steps, so no command has its own call: the Owner record's one
+  observation (`session::owner::observe`, `required`, Origin's read) carries the handle
+  Records' verdict, and owner attestation (`attest_owner_with`) then makes and reports no
+  local process observation (`pid_alive` absent); Repair (`repair_dead_owner_with`) leaves
+  such a Session exactly as it is, before launch repair; the shared surface judgment
+  (`judgment::surface`, read by `screen`, doctor and the capabilities) judges the handle with
+  the Owner record beside it; and the ownership proof, the explicit close
+  (`close_authority::close_owned_surface`), the doctor probe and `reopen`'s source check refuse
+  it. `hold` and `cancel`, which change a Session without a handle, refuse it under the
+  lifecycle lock (`foreign::admit_session`). The refusal starts with the kind's refusal when a
+  handle names a kind this OS does not run, otherwise `a session recorded on <OS> is not
+  available on <this OS>`, and says that nothing here can judge or end the Session, that an
+  explicit close settles it once its Records show it ended, and where its Records are. The
+  explicit close and prune decide such a Session from its Records alone (owner's decision,
+  2026-11-26): the close transaction (`close_session_state_with_error`), after a closed
+  Session, a finished consumption and the handle's binding, settles one whose Records show it
+  ended (`foreign::ended`: exited or failed) by consuming its active or claimed handle with
+  no terminal call and no process observation, as an ordinary close consumes it, and closing
+  it; any other it refuses without writing. Prune does not count the owner of such a closed
+  Session (`native_owner_blocks_prune`). A close that finishes from its Records keeps the
+  consumed kind in the tombstone it rewrites (`kept_terminal_kind`). Every command admits a Session in one order: a closed Session first, then a
+  handle bound to another session (a legacy iTerm2 handle without a binding counts as bound),
+  then a Session of another OS, so the same Records get the same answer from every command and
+  on every OS. Guarded input refuses a kind this OS does not run before the macOS and Linux
+  claim check. The created-host close evidence
   of a tmux handle on macOS or Windows answers with the kind's refusal only when the close
   decision is reached without `close_owned_surface`, which refuses first.
   Its `close_authority` module owns the observation seam (the Records read when the decision

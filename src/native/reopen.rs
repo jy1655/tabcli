@@ -304,10 +304,10 @@ impl ResolvedReopen {
         let source_directory = Reader::session_directory(&request.id)?;
         // A source recorded on another OS is not continued here: its conversation and its
         // processes are on that OS, and nothing of it is read or changed.
-        if let Some(refusal) =
+        if let Some(elsewhere) =
             terminal::foreign::of_records(&Reader::open_unchecked(&source_directory), None)
         {
-            return Err(refusal);
+            return Err(elsewhere.refusal(&source_directory));
         }
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner

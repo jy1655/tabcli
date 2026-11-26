@@ -502,10 +502,10 @@ pub(in crate::native) fn close_owned_surface(
     // startup rule, a surface probe) answer for it first: this OS's processes say nothing
     // about it. What its Records alone settle was settled before this transaction claimed it.
     let reader = crate::native::session::Reader::open_unchecked(directory);
-    if let Some(refusal) = terminal::foreign::of_records(&reader, Some(session)) {
+    if let Some(elsewhere) = terminal::foreign::of_records(&reader, Some(session)) {
         close_remaining(deadline)?;
         session.verify_managed_session(id)?;
-        return Err(refusal);
+        return Err(elsewhere.refusal(directory));
     }
     let observation = Production::new(directory, id, session, deadline);
     #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -676,7 +676,7 @@ fn screen_refuses_closed_and_unbound_sessions_from_records_without_writing() {
     });
     // The handle names another session: that is the same fact on every OS, so it answers
     // before whether this OS runs the handle's kind (Terminal.app on Linux).
-    let unbound = "the recorded terminal handle is not bound to session session-observe";
+    let unbound = "terminal handle belongs to managed session session-other, not session-observe";
     for (record, value, expected) in [
         (
             None,

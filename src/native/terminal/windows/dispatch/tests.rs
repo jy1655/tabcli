@@ -191,10 +191,7 @@ fn every_other_kind_is_refused_by_the_lookup_before_any_adapter() {
             continue;
         }
         let dispatch = recording_dispatch();
-        let refusal = format!(
-            "{} is not available on Windows; use windows-console or herdr",
-            kind.display_name()
-        );
+        let refusal = format!("{} is not available on Windows", kind.display_name());
         let registration = kind.registration();
         let screen = registration
             .screen_read_refusal
@@ -276,10 +273,7 @@ fn an_expired_open_of_another_kind_gets_the_lookup_refusal() {
         || panic!("a refused kind is never unbound"),
     )
     .unwrap_err();
-    assert_eq!(
-        format!("{error:#}"),
-        "WezTerm is not available on Windows; use windows-console or herdr"
-    );
+    assert_eq!(format!("{error:#}"), "WezTerm is not available on Windows");
     assert!(dispatch.console.calls().is_empty());
 }
 
@@ -301,7 +295,7 @@ fn doctor_probe_of_another_kinds_handle_is_unverified() {
         &handle,
         Duration::from_secs(2),
     ));
-    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
+    let refusal = "WezTerm is not available on Windows";
     assert_eq!(presence, SurfacePresence::Unverified(refusal.into()));
     let check = doctor::surface_presence_check(&presence);
     assert_eq!(check.reason_code, "terminal_surface_unverified");

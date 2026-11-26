@@ -250,11 +250,13 @@ fn a_snapshot_without_the_lifecycle_lock_is_unknown() {
     assert!(!fixture.directory.join(TURN_CLAIM_LOCK_FILE).exists());
 }
 
-/// The terminal kind this platform supports. Linux supports none, so a handle of this kind
-/// is judged unsupported there.
+/// A terminal kind this platform runs. A handle of a kind it does not run would make the
+/// session one of another OS, whose owner is never judged here (`terminal::foreign`).
 fn supported_kind() -> terminal::TerminalKind {
     if cfg!(windows) {
         terminal::TerminalKind::WindowsConsole
+    } else if cfg!(target_os = "linux") {
+        terminal::TerminalKind::Tmux
     } else {
         terminal::TerminalKind::AppleTerminal
     }
@@ -346,6 +348,7 @@ fn bound_surface(observed: &mut observation::Observation) {
     observed.judgments.surface = observation::judgment::Surface::Active {
         kind: supported_kind(),
         supported: true,
+        elsewhere: None,
         bound: true,
         empty_id: false,
     };
@@ -1116,13 +1119,30 @@ fn inspect_owner_row_for_an_unbound_record_whose_pid_was_reused() {
 fn inspect_owner_rows_for_an_unbound_record_whose_birth_cannot_be_inspected() {
     let fixture = ready("codex");
     let directory = &fixture.directory;
+    // The birth this OS's writer records: another OS's would make the session one of another
+    // OS, whose owner is never judged here (`terminal::foreign`).
+    let mut owner = NativeSessionOwner {
+        pid: 4242,
+        ..NativeSessionOwner::default()
+    };
+    if cfg!(windows) {
+        owner.windows_process_identity = Some(terminal::WindowsProcessIdentity {
+            creation_time: 1,
+            executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
+        });
+    } else if cfg!(target_os = "linux") {
+        owner.linux_birth = Some(
+            serde_json::from_value(json!({
+                "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 1
+            }))
+            .unwrap(),
+        );
+    } else {
+        owner.process_start_seconds = Some(1);
+        owner.process_start_microseconds = Some(1);
+    }
     Store::open_unchecked(directory)
-        .write_owner(&NativeSessionOwner {
-            pid: 4242,
-            process_start_seconds: Some(1),
-            process_start_microseconds: Some(1),
-            ..NativeSessionOwner::default()
-        })
+        .write_owner(&owner)
         .unwrap();
     let unverified = json!({"state": "unknown", "reason": "owner_unverified",
         "detail": "birth denied"});
@@ -1142,8 +1162,8 @@ fn inspect_owner_rows_for_an_unbound_record_whose_birth_cannot_be_inspected() {
             observed
                 .evidence
                 .judge_owner_with(&observation::judgment::Observers {
-                    attest: &|owner| {
-                        assert_eq!(owner.process_start_seconds, Some(1));
+                    attest: &|recorded| {
+                        assert_eq!(recorded.pid, owner.pid);
                         crate::native::session::owner::OwnerAttestation {
                             process: crate::native::process_identity::ProcessObservation::Unknown(
                                 "birth denied".into(),

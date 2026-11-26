@@ -152,6 +152,9 @@ pub(in crate::native) fn change(store: &Store, release: bool) -> Result<Change> 
     if store.closed_if_present()?.is_some() {
         bail!("the session is closed; a hold cannot be set or released");
     }
+    // After the closed answer, under the lifecycle lock: a session of another OS is not
+    // changed here.
+    crate::native::terminal::foreign::admit_session(store)?;
     let record = store.record(CoreRecord::Hold);
     let text = record.bytes()?;
     let previous = text.as_deref().map(decode).transpose();

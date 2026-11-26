@@ -39,7 +39,7 @@ impl PartialObservation {
             }
             Err(error) => SessionEvidence::read(reader, Err(error)),
         };
-        let surface = judgment::surface(&evidence.surface, id);
+        let surface = judgment::surface(&evidence.surface, &evidence.owner, id);
         let hold = judgment::hold(&evidence.held, evidence.close_tombstone.as_ref(), None);
         Self {
             manifest: reader.manifest().ok(),
@@ -139,19 +139,23 @@ impl SessionEvidence {
         self.surface_presence.get_or_init(|| {
             let directory = reader.directory();
             SurfacePresence::of((|| -> Result<bool> {
+                let id = directory
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .context("invalid session path")?;
+                // The one admission order (`terminal::foreign`): a closed session, as `screen`
+                // answers it, then the handle's binding, then a session of another OS, whose
+                // surface is never observed from this machine.
+                if terminal::foreign::closed(reader) {
+                    bail!("session {id} is closed; its terminal surface is not read");
+                }
                 let session = Reader::open_unchecked(directory)
                     .record(CoreRecord::Terminal)
                     .optional_json_with(session::record::terminal)?
                     .context("no active terminal handle is recorded")?;
-                session.verify_managed_session(
-                    directory
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .context("invalid session path")?,
-                )?;
-                // No surface of a session of another OS is observed from this machine.
-                if let Some(refusal) = terminal::foreign::of_records(reader, Some(&session)) {
-                    return Err(refusal);
+                session.verify_managed_session(id)?;
+                if let Some(elsewhere) = terminal::foreign::of_records(reader, Some(&session)) {
+                    return Err(elsewhere.refusal(directory));
                 }
                 let budget = deadline
                     .saturating_duration_since(Instant::now())

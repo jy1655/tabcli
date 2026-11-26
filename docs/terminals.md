@@ -19,19 +19,34 @@ The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmu
 `console`, and `hc` or `herdr-core` (Herdr). Structured output names Terminal.app `apple-terminal`.
 
 Each operating system runs only its own terminals: macOS iTerm2, Terminal.app, Ghostty, Warp,
-WezTerm and Herdr; Linux tmux and Herdr; Windows its managed console and Herdr. Another terminal
-is refused the same way on all three, before any session exists: `<Name> is not available on
-<system>; use <the terminals it runs>`.
+WezTerm and Herdr; Linux tmux and Herdr; Windows its managed console and Herdr. A new launch that
+names another terminal is refused the same way on all three, before any session exists:
+`<Name> is not available on <system>; use <the terminals it runs>`.
 
-A state directory copied from another operating system can hold sessions that belong to it:
-their terminal is one this system does not run, or their owner was recorded there. TAB on this
-system cannot observe their processes or terminals, so it does not act on them and nothing it
-sees here closes them. `inspect`, `status`, `result`, `search` and `doctor` still read them;
-`doctor` and `status` report the owner as unverified. `tell`, `screen`, `close-session` and
-`reopen` refuse them with that refusal, or with `a session recorded on <system> is not
-available on <this system>` when their terminal runs here too (Herdr) or is no longer recorded,
-and change nothing; `sessions` leaves them as they are. A session whose own records already finished its close still closes. Close the others
-on the operating system they came from; `prune-sessions` does not remove them here.
+A state directory copied from another operating system can hold sessions that belong to it. A
+session belongs to another system when any of its records says so: its terminal (active, being
+closed, or the one its finished close recorded) is one this system does not run, its Herdr
+terminal was started there, or its owner was recorded there. A missing field says nothing either
+way. TAB on this system cannot observe their processes or terminals, so it never judges them
+from this machine. `inspect`, `status`, `result`, `wait`, `search` and `doctor` still read them
+and report no observation of a local process for their owner, and `sessions` leaves them as they
+are. `tell`, `hold`, `cancel`, `screen` and `reopen` refuse them and change nothing, with
+`<Name> is not available on <system>` when their terminal is one this system does not run,
+otherwise `a session recorded on <system> is not available on <this system>`, followed by the
+directory that holds the session's records. Only a new launch could choose another terminal, so
+the refusal names none. Every command answers in one order: a closed session first, then a
+terminal that is not this session's, then a session of another system.
+
+`close-session --explicit` and `prune-sessions` decide such a session from its records alone.
+The explicit close settles a session whose records show it ended (exited or failed): it consumes
+the recorded handle, active or left claimed by an interrupted close, without addressing any
+terminal or process, closes the session, and records in its closed status that it was settled
+from its records. A close that had already consumed the handle finishes the same way, as for
+any session. A session whose records leave it running is refused, and nothing is written; TAB
+has no way to end such a copy on this system. `prune-sessions` removes an eligible closed copy;
+its owner, recorded on another system, does not keep it. Closing or pruning a copy does not
+change the session on the system it came from, and closing that session there does not change
+the copy.
 
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Automatic selection verifies a Herdr caller when both

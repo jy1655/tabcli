@@ -140,13 +140,21 @@ pub(in crate::native) fn admission(
     let state = reader
         .closed_if_present()?
         .map_or_else(|| reader.status().map(|s| s.state), |s| Ok(s.state))?;
-    if !matches!(state, SessionState::Running | SessionState::Working) {
-        return Err(Refusal::new(
+    let not_running = |state: &SessionState| {
+        Refusal::new(
             RefusalReason::StateNotRunning,
             format!("session {id} is {state}; cancel requires the running or working state"),
             None,
         )
-        .into());
+    };
+    // The one admission order (`terminal::foreign`): a closed session answers first, then a
+    // session of another OS, which is not changed here; cancel binds no handle.
+    if state == SessionState::Closed {
+        return Err(not_running(&state).into());
+    }
+    crate::native::terminal::foreign::admit_session(reader)?;
+    if !matches!(state, SessionState::Running | SessionState::Working) {
+        return Err(not_running(&state).into());
     }
     let token = turn::current_claim_token(reader)?.ok_or_else(|| {
         Refusal::new(

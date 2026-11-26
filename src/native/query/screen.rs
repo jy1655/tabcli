@@ -241,31 +241,36 @@ fn bound_surface(
         bail!("session {id} is closed; its terminal surface is not read");
     }
     let record = SurfaceRecord::read(reader);
+    let owner = crate::native::session::owner::observe(reader);
     drop(snapshot);
-    match (judgment::surface(&record, id), record) {
+    match (judgment::surface(&record, &owner, id), record) {
         (
             Surface::Active {
                 kind,
                 supported,
+                elsewhere,
                 bound,
                 empty_id,
             },
             SurfaceRecord::Active(Ok(Some(handle))),
         ) => match ActiveHandle::of(supported, bound, empty_id) {
-            // A Herdr terminal whose Owner record another OS wrote is refused by the ownership
-            // check, before any terminal call.
             ActiveHandle::Bound => Ok(handle),
-            // The refusal every command gives a kind this OS does not run.
-            ActiveHandle::Unsupported => {
-                Err(terminal::foreign::kind_refusal(kind).unwrap_or_else(|| {
+            // The refusal every command gives a session of another OS (`terminal::foreign`).
+            ActiveHandle::Unsupported => Err(elsewhere.map_or_else(
+                || {
                     anyhow::Error::new(Unsupported::new(format!(
                         "the recorded terminal, {}, is not supported on this platform",
                         kind.display_name()
                     )))
-                }))
-            }
+                },
+                |elsewhere| elsewhere.refusal(reader.directory()),
+            )),
+            // The binding refusal `tell` and the close give the same handle; a bound handle
+            // with an empty id has none of its own.
             ActiveHandle::BindingUnverified => {
-                bail!("the recorded terminal handle is not bound to session {id}")
+                Err(handle.verify_managed_session(id).err().unwrap_or_else(|| {
+                    anyhow::anyhow!("the recorded terminal handle is not bound to session {id}")
+                }))
             }
         },
         (Surface::Missing, _) => bail!(

@@ -209,6 +209,7 @@
     "terminal_record_unreadable",
     "terminal_selected",
     "terminal_selection_failed",
+    "terminal_session_closed",
     "terminal_surface_missing",
     "terminal_surface_present",
     "terminal_surface_unverified",

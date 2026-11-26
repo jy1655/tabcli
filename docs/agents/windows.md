@@ -7,12 +7,14 @@
   does on macOS and Linux: the Herdr adapter for a Herdr terminal and `ManagedConsole`
   (`windows/mod.rs`) for a managed console. Screen and guarded key first answer with the kind's
   declared refusal, if it has one. The lookup refuses a kind Windows does not run (a record can
-  name another OS's terminal) with `OsTerminals::unavailable` (`terminal/mod.rs`), the refusal
-  macOS and Linux give such a kind (owner's principle, 2026-11-26: the same on every OS unless
-  a difference is unavoidable): `<Name> is not available on Windows; use windows-console or
-  herdr`, unsupported, a send known unsent. Selection refuses an explicit such kind with the
-  same text. Such a handle never reaches the console helper, which still refuses anything but
-  a managed console. Releases up to 0.4.49 sent it to the managed console: a started helper
+  name another OS's terminal) with `OsTerminals::not_here` (`terminal/mod.rs`), the refusal
+  macOS and Linux give such a handle (owner's principle, 2026-11-26: the same on every OS
+  unless a difference is unavoidable): `<Name> is not available on Windows`, unsupported, a
+  send known unsent. Selection refuses an explicit such kind for a new launch with
+  `OsTerminals::unavailable`, which adds `; use windows-console or herdr`. Whether a whole
+  Session belongs to another OS is judged in `terminal::foreign` (`docs/architecture.md`).
+  Such a handle never reaches the console helper, which still refuses anything but a managed
+  console. Releases up to 0.4.49 sent it to the managed console: a started helper
   refused it, and a send refused there was classified as delivery uncertain (a handle without
   its session binding was refused before the helper started, as not sent); the surface proof
   passed it to the owner check; and doctor's probe could read a pane id as a dead process and

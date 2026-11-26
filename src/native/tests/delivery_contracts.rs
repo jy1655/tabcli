@@ -403,8 +403,9 @@ fn initial_cross_session_uncertainty_keeps_its_own_claim_and_records_its_reason(
 #[test]
 fn unsupported_platform_send_is_not_sent() {
     let root = tempfile::tempdir().unwrap();
+    // A kind this platform does not run.
     let failure = terminal::send_file(
-        &close_test_terminal(),
+        &terminal::TerminalSession::new(terminal::TerminalKind::AppleTerminal, "4242".into()),
         &root.path().join("absent-prompt"),
         close_deadline(),
     )

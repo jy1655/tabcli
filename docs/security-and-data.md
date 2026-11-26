@@ -217,7 +217,8 @@ tabcli prune-sessions --closed-before-days 30 --explicit
 
 The day count must be positive. Prune requires both closed status and a closed tombstone older
 than the cutoff. It skips sessions with active surface handles, pending claims or completions,
-or owner records that prevent it from proving removal is safe. Legacy resume records also block
+or owner records that prevent it from proving removal is safe; an owner recorded on another
+operating system, in a closed session copied from there, does not prevent it. Legacy resume records also block
 removal. Prune does not close active sessions for you.
 
 Some transient delivery records are removed as turns settle, so retained history does not include

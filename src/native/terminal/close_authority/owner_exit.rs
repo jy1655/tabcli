@@ -213,7 +213,7 @@ impl WindowsClose<'_> {
     ) -> Result<CloseOutcome> {
         // A handle of a kind Windows does not run gets the one refusal, as everywhere else.
         if !terminal::OsTerminals::WINDOWS.runs(surface.kind) {
-            return Err(terminal::OsTerminals::WINDOWS.unavailable(surface.kind));
+            return Err(terminal::OsTerminals::WINDOWS.not_here(surface.kind));
         }
         close_remaining(deadline)?;
         let outcome = (self.close)(surface)?;

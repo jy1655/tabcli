@@ -103,7 +103,7 @@ impl<C: WindowsTerminalAdapter, H: WindowsTerminalAdapter> Adapters for Dispatch
             | TerminalKind::Ghostty
             | TerminalKind::Warp
             | TerminalKind::WezTerm
-            | TerminalKind::Tmux => Err(OsTerminals::WINDOWS.unavailable(kind)),
+            | TerminalKind::Tmux => Err(OsTerminals::WINDOWS.not_here(kind)),
         }
     }
 }

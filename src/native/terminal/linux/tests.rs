@@ -205,16 +205,23 @@ fn linux_registers_tmux_and_herdr() {
         if matches!(kind, TerminalKind::Tmux | TerminalKind::Herdr) {
             continue;
         }
-        let refusal = format!(
-            "{} is not available on Linux; use tmux or herdr",
-            kind.display_name()
-        );
+        // A new launch is told the kinds Linux runs; a stored handle is not, since only a
+        // new launch could choose one.
         let error = select(Some(kind)).unwrap_err();
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
-        assert_eq!(error.to_string(), refusal);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} is not available on Linux; use tmux or herdr",
+                kind.display_name()
+            )
+        );
         let error = INSTALLED.adapter(kind).err().unwrap();
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
-        assert_eq!(error.to_string(), refusal);
+        assert_eq!(
+            error.to_string(),
+            format!("{} is not available on Linux", kind.display_name())
+        );
     }
 }
 // Every surface operation on a stored handle of a kind Linux does not run gets the installed
@@ -238,10 +245,7 @@ fn the_installed_lookup_refuses_every_operation_on_a_kind_linux_does_not_run() {
         if matches!(kind, TerminalKind::Tmux | TerminalKind::Herdr) {
             continue;
         }
-        let refusal = format!(
-            "{} is not available on Linux; use tmux or herdr",
-            kind.display_name()
-        );
+        let refusal = format!("{} is not available on Linux", kind.display_name());
         let session = TerminalSession::new(kind, "surface".into())
             .with_binding(Some("session-foreign".into()));
         let failure = posix::send_file(&INSTALLED, &session, &directory, deadline).unwrap_err();
@@ -483,7 +487,7 @@ fn interrupted_created_host_close_consumes_records_without_a_second_signal() {
         std::fs::create_dir(&dir).unwrap();
         let store = Store::open_unchecked(&dir);
         update_status(&dir, SessionState::Ready, None, None).unwrap();
-        let surface:TerminalSession=serde_json::from_value(serde_json::json!({"terminal":"warp","session_id":"fixture","managed_session_id":"session-hostclose"})).unwrap();
+        let surface:TerminalSession=serde_json::from_value(serde_json::json!({"terminal":"tmux","session_id":"fixture","managed_session_id":"session-hostclose"})).unwrap();
         store
             .record(CoreRecord::Terminal)
             .write_json(&surface)

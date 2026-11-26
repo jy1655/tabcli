@@ -6,6 +6,7 @@ use crate::native::session::launch;
 use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::native::session::test_support::TERMINAL_CLOSING_FILE;
+use crate::native::session::test_support::lifecycle::native_kind_or;
 use crate::native::session::test_support::{
     CLOSED_STATUS_FILE, SESSION_OWNER_FILE, TERMINAL_HANDLE_FILE, TERMINAL_TOMBSTONE_FILE,
     TURN_CLAIM_FILE, TURN_COMPLETION_FILE,
@@ -169,7 +170,7 @@ fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
     write_json_atomic(
         &directory.path().join("terminal.json"),
         &terminal::TerminalSession::new(
-            terminal::TerminalKind::Iterm2,
+            native_kind_or(terminal::TerminalKind::Iterm2),
             "closing-iterm-session".to_owned(),
         ),
     )

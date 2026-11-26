@@ -75,10 +75,27 @@ pub(super) fn decode(bytes: &[u8], session: &str) -> serde_json::Result<Recorded
     Ok(RecordedOwner { owner, binding })
 }
 
-/// One observation of the Owner record of the Session whose directory `reader` opens.
+/// One observation of the Owner record of the Session whose directory `reader` opens. The
+/// owner it yields carries what the Session's handle Records say about the OS it belongs to,
+/// so that no reader can observe this machine's processes for the owner of a session of
+/// another OS.
 pub(in crate::native) fn observe(reader: &Reader) -> OwnerRecord {
     let path = reader.record(CoreRecord::Owner).path().to_owned();
-    judge(read(reader), &path, session_of(reader))
+    match judge(read(reader), &path, session_of(reader)) {
+        OwnerRecord::Recorded(recorded) => {
+            OwnerRecord::Recorded(with_handle_evidence(recorded, reader))
+        }
+        other => other,
+    }
+}
+
+/// The decoded Owner record with what the Session's handle Records say about the OS it
+/// belongs to (`terminal::foreign`). Every reader of the Owner record goes through it, so that
+/// `attest_owner_with` never observes this machine's processes for such an owner.
+pub(super) fn with_handle_evidence(mut recorded: RecordedOwner, reader: &Reader) -> RecordedOwner {
+    recorded.owner.recorded_elsewhere =
+        crate::native::terminal::foreign::of_surface_records(reader);
+    recorded
 }
 
 /// Whether the read found no Owner record. Only a missing record is absent: a linked,
@@ -105,6 +122,7 @@ pub(super) fn required(reader: &Reader) -> Result<RecordedOwner> {
     let bytes =
         read_policy(&path)?.with_context(|| format!("failed to read {}", path.display()))?;
     decode(&bytes, session_of(reader))
+        .map(|recorded| with_handle_evidence(recorded, reader))
         .with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
@@ -206,9 +224,6 @@ fn recorded_birth(owner: &NativeSessionOwner) -> std::result::Result<Option<Proc
         if owner.linux_birth.is_some() {
             return Err("foreign Linux owner birth on macOS".into());
         }
-        if owner.windows_process_identity.is_some() {
-            return Err("foreign Windows owner identity on macOS".into());
-        }
         Ok(owner
             .process_start_seconds
             .zip(owner.process_start_microseconds)
@@ -250,6 +265,18 @@ pub(in crate::native) fn attest_owner_with(
     owner: &NativeSessionOwner,
     observers: OwnerObservers<'_>,
 ) -> OwnerAttestation {
+    // The owner of a session of another OS, as its Records or its own identity say, is not
+    // observed here at all: no PID, birth or control observation is made or reported.
+    if let Some(elsewhere) = owner
+        .recorded_elsewhere
+        .or_else(|| crate::native::terminal::foreign::of_owner(owner))
+    {
+        return OwnerAttestation {
+            process: ProcessObservation::Unknown(elsewhere.reason()),
+            control: ControlAttestation::NotRecorded,
+            pid_alive: None,
+        };
+    }
     // One actual PID observation, including for projection of failed identity inspection.
     let pid_alive = (observers.pid_alive)(owner.pid);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -272,13 +299,11 @@ pub(in crate::native) fn attest_owner_with(
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let recorded_birth = recorded_birth.ok().flatten();
-    // A Linux or macOS birth names an incarnation this platform cannot observe; it is never
+    // A Linux birth names an incarnation this platform cannot observe; it is never
     // compared as PID-only evidence.
     #[cfg(windows)]
     let process = if owner.linux_birth.is_some() {
         ProcessObservation::Unknown("foreign Linux owner birth on Windows".into())
-    } else if owner.process_start_seconds.is_some() || owner.process_start_microseconds.is_some() {
-        ProcessObservation::Unknown("foreign macOS owner birth on Windows".into())
     } else {
         use crate::native::terminal::WindowsIncarnation;
         classify(

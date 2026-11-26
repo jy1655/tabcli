@@ -94,6 +94,11 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
     let directory = Reader::session_directory(&request.id)?;
     session::hold::permit(&Reader::open_unchecked(&directory), &request.id)?;
     Store::open_unchecked(&directory).converge_until(deadline)?;
+    // The one admission order (`terminal::foreign`): a closed session answers first; the
+    // ownership check below then judges the handle's binding and then a session of another OS.
+    if terminal::foreign::closed(&Reader::open_unchecked(&directory)) {
+        session::hold::ready_gate(&session::SessionState::Closed, &request.id)?;
+    }
     let manifest = Reader::open_unchecked(&directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let terminal_session: terminal::TerminalSession =

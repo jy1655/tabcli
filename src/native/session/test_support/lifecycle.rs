@@ -46,7 +46,9 @@ pub(in crate::native) fn reaped_child_pid() -> u32 {
 }
 
 // The surface and the owner are both bound to the Session the directory belongs to, as their
-// writers bind them; the owner records neither a birth nor a control identity.
+// writers bind them; the owner records neither a birth nor a control identity. The surface is
+// of a kind this OS runs whose terminal can outlive its owner (the managed console on Windows):
+// a kind of another OS would make the session one that Repair leaves alone.
 pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
     let session_id = directory.file_name().unwrap().to_str().unwrap().to_owned();
     fs::create_dir(directory.join("events")).unwrap();
@@ -64,6 +66,8 @@ pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &st
         &terminal::TerminalSession::new(
             if cfg!(windows) {
                 terminal::TerminalKind::WindowsConsole
+            } else if cfg!(target_os = "linux") {
+                terminal::TerminalKind::Tmux
             } else {
                 terminal::TerminalKind::AppleTerminal
             },
@@ -121,10 +125,30 @@ pub(in crate::native) fn assert_journal_settled(directory: &Path) {
     query::observe_snapshot(&Reader::open_unchecked(directory)).unwrap();
 }
 
+/// A terminal kind this OS runs, for a test whose kind is incidental: `kind` where this OS runs
+/// it, else this OS's own (tmux on Linux, the managed console on Windows). A handle of a kind
+/// this OS does not run would make the session one of another OS, which the close transaction,
+/// Repair, hold and cancel decide from its records alone.
+pub(in crate::native) fn native_kind_or(kind: terminal::TerminalKind) -> terminal::TerminalKind {
+    if kind.supported_on_this_platform() {
+        kind
+    } else if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else if cfg!(target_os = "linux") {
+        terminal::TerminalKind::Tmux
+    } else {
+        terminal::TerminalKind::AppleTerminal
+    }
+}
+
+// A handle of a kind this OS runs: a kind of another OS would make the session one that the
+// close transaction, Repair, hold and cancel decide from its records alone.
 pub(in crate::native) fn close_test_terminal() -> terminal::TerminalSession {
     terminal::TerminalSession::new(
         if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
+        } else if cfg!(target_os = "linux") {
+            terminal::TerminalKind::Tmux
         } else {
             terminal::TerminalKind::AppleTerminal
         },

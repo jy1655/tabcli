@@ -100,7 +100,7 @@ impl SurfaceAccess for Fake {
         if let Some(owner) = &owner {
             self.verified_owners
                 .borrow_mut()
-                .push((owner.pid, owner.process_start_seconds));
+                .push((owner.pid, birth(owner)));
         }
         Ok(owner)
     }
@@ -164,15 +164,44 @@ impl Fixture {
     }
 }
 
-/// An owner record of this session; a check of the fake verifies whichever the record names.
-fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
-    NativeSessionOwner {
+/// An owner record of this session in the shape this OS's writer records, `start` standing
+/// for the incarnation's birth: another OS's shape would make the session one of another OS
+/// (`terminal::foreign`). A check of the fake verifies whichever the record names.
+fn owner(pid: u32, start: u64) -> NativeSessionOwner {
+    let mut owner = NativeSessionOwner {
         pid,
         managed_session_id: Some(ID.into()),
-        process_start_seconds: Some(start_seconds),
-        process_start_microseconds: Some(0),
         ..NativeSessionOwner::default()
+    };
+    if cfg!(windows) {
+        owner.windows_process_identity = Some(terminal::WindowsProcessIdentity {
+            creation_time: start,
+            executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
+        });
+    } else if cfg!(target_os = "linux") {
+        owner.linux_birth = Some(
+            serde_json::from_value(json!({
+                "boot_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "starttime_ticks": start
+            }))
+            .unwrap(),
+        );
+    } else {
+        owner.process_start_seconds = Some(start);
+        owner.process_start_microseconds = Some(0);
     }
+    owner
+}
+
+/// The birth `owner` stands for, whichever OS's shape records it.
+fn birth(owner: &NativeSessionOwner) -> Option<u64> {
+    owner
+        .process_start_seconds
+        .or(owner.linux_birth.map(|birth| birth.starttime_ticks))
+        .or(owner
+            .windows_process_identity
+            .as_ref()
+            .map(|identity| identity.creation_time))
 }
 
 fn handle(kind: terminal::TerminalKind, bound_to: Option<&str>) -> terminal::TerminalSession {
@@ -570,19 +599,24 @@ fn a_handle_not_bound_to_this_session_is_refused_before_any_terminal_call() {
     };
     let mut empty = handle(kind, Some(ID));
     empty.id = String::new();
-    for surface in [
-        handle(kind, Some("session-other")),
-        handle(kind, None),
-        empty,
+    for (surface, expected) in [
+        (
+            handle(kind, Some("session-other")),
+            "terminal handle belongs to managed session session-other, not session-screen",
+        ),
+        (
+            handle(kind, None),
+            "terminal handle is missing its managed session binding",
+        ),
+        (
+            empty,
+            "the recorded terminal handle is not bound to session session-screen",
+        ),
     ] {
         let fixture = Fixture::new(SessionState::Working, Some(&surface));
         let access = Fake::new(&fixture);
         let error = refusal(fixture.observe(&access).0);
-        assert_eq!(
-            error.to_string(),
-            "the recorded terminal handle is not bound to session session-screen",
-            "{surface:?}"
-        );
+        assert_eq!(error.to_string(), expected, "{surface:?}");
         assert!(access.calls.borrow().is_empty());
     }
 }
@@ -604,7 +638,12 @@ fn an_unbound_handle_is_refused_as_unbound_whatever_os_its_kind_runs_on() {
             let error = refusal(fixture.observe(&access).0);
             assert_eq!(
                 error.to_string(),
-                "the recorded terminal handle is not bound to session session-screen",
+                match binding {
+                    Some(other) => format!(
+                        "terminal handle belongs to managed session {other}, not session-screen"
+                    ),
+                    None => "terminal handle is missing its managed session binding".to_owned(),
+                },
                 "{kind:?} {binding:?}"
             );
             assert!(access.calls.borrow().is_empty(), "{kind:?} {binding:?}");
@@ -640,20 +679,33 @@ fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
         } else {
             // The refusal every other command gives a kind this OS does not run.
             let expected = if cfg!(target_os = "macos") {
-                "is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"
+                "is not available on macOS"
             } else if cfg!(target_os = "linux") {
-                "is not available on Linux; use tmux or herdr"
+                "is not available on Linux"
             } else if cfg!(windows) {
-                "is not available on Windows; use windows-console or herdr"
+                "is not available on Windows"
             } else {
                 "is not supported on this platform"
             };
-            let subject = if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
-                kind.display_name().to_owned()
+            if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+                assert_eq!(
+                    text,
+                    format!(
+                        "{} {expected}: TAB on this machine cannot judge or end this session; \
+                         once its records show it ended, an explicit close settles it (its \
+                         records are in {})",
+                        kind.display_name(),
+                        fixture.directory.display()
+                    ),
+                    "{kind:?}"
+                );
             } else {
-                format!("the recorded terminal, {},", kind.display_name())
-            };
-            assert_eq!(text, format!("{subject} {expected}"), "{kind:?}");
+                assert_eq!(
+                    text,
+                    format!("the recorded terminal, {}, {expected}", kind.display_name()),
+                    "{kind:?}"
+                );
+            }
         }
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
         assert!(access.calls.borrow().is_empty(), "{kind:?}");

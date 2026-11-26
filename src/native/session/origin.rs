@@ -697,7 +697,10 @@ fn owner_verdict(
         Err(fault) => return (fault_target(fault, "owner_unverified"), None),
     };
     let verdict = match owner::decode(&bytes, id) {
-        Ok(recorded) => owner_attested(&recorded.owner, recorded.binding, attest),
+        Ok(recorded) => {
+            let recorded = owner::with_handle_evidence(recorded, reader);
+            owner_attested(&recorded.owner, recorded.binding, attest)
+        }
         Err(error) => target(
             None,
             "owner_unverified",
