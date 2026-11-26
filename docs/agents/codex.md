@@ -24,37 +24,56 @@
   before the label (a warning, a timestamp, another program's version) and after the field
   are never read as the version and are only scanned for a second label, so `0.170.0--` is a
   prerelease and `0.170.0+`, `0.170.0.` and `codex-cli unknown (runtime 22.0.0)` are
-  refused. Without a label (`unlabelled_codex_version`, the one place of that rule), the text
-  names a version only when exactly one of its words reads as one (owner's decisions 4B and
-  B2, 2026-11-26). A word reads, after one leading `v`, as SemVer once the surrounding
-  characters no SemVer has are removed, which keeps a prerelease (`0.170.0--` and
-  `(0.170.0--)` are the prerelease `-`, refused as after the label); otherwise as 0.4.48 read
-  it, all surrounding punctuation removed (`OpenAI Codex (v0.170.0)`, `(0.170.0)` and
-  `0.170.0+` are 0.170.0), unless that removes a `-` after the version, which would turn a
-  prerelease into a release (`0.170.0-` reads as none). With no such word it is refused; with
-  two or more it is refused as
-  ambiguous, because another program's version can come first (`node v22.0.0` before a Codex
-  banner) and a misread version could let a Codex that lacks `--no-daemon` start on Herdr,
-  where a detached `ask` can already have reported the request accepted when Codex refuses the
-  option. Words are counted, not versions, as the owner's rule reads: the same version printed
-  twice is refused too. A single version-shaped word is read whatever program it names
+  refused. Without a label (`unlabelled_codex_version`, the one place of that rule; owner's
+  decisions 4B and B2, 2026-11-26), ambiguity is judged by a word's shape, not by whether it
+  parses. A candidate is a word that, after its leading punctuation and one optional `v`,
+  begins with digits.digits.digits. The text names a version only when it has exactly one
+  candidate, whether or not the others would parse, and that candidate has a reading: its
+  rest, less trailing characters that cannot end a version (anything but a letter, a digit or
+  `-`), removed one at a time until it is SemVer. A valid prerelease or build stays:
+  `0.170.0--` and `0.168.0-rc-.` are prereleases, `OpenAI Codex (v0.170.0)`, `(0.170.0)`,
+  `0.170.0+` and `Codex 0.170.0.` are 0.170.0. No candidate, a candidate without a reading
+  (`0.170.0-`), and two or more candidates are refused: another program's version can come
+  first (`node v22.0.0` before a banner, `0.168.0- runtime 22.0.0`), and a misread version
+  could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
+  already have reported the request accepted when Codex refuses the option. The same version
+  printed twice is two candidates. A sole candidate is read whatever program it names
   (`unknown (runtime 22.0.0)` is 22.0.0). A second label and a label without a field on its
-  line are refused. Compared with the 0.4.48 check, which took the first token that parsed,
-  every rule only refuses more, except that a labelled stable field at or above the floor is
-  admitted even when noise before the label held a version that check would have read first
-  (below the floor or a prerelease).
+  line are refused.
   The wrapper reads the recorded version by the same rule, so a pending launch that another
   release's binary starts (the executable at its path replaced in between) can be refused
-  there, after its Session and terminal exist. This build refuses a 0.4.48 record that 0.4.48
-  admitted when its labelled field is not SemVer as written (`codex-cli 0.170.0+`), when
-  0.4.48 read a higher version before a labelled field below the floor (`node v22.0.0` before
-  `codex-cli 0.168.0`), when its unlabelled text holds several versions, or when 0.4.48's
-  trimming read a prerelease as a release (`0.170.0--`, `0.170.0-`); it launches a record
-  0.4.48 refused because 0.4.48 read a lower version before a labelled field at the floor
-  (`plugin 0.160.0` before `codex-cli 0.170.0`). A 0.4.49 wrapper refuses a record this build
-  admitted when its unlabelled text is not a single SemVer word (`OpenAI Codex (v0.170.0)`,
-  `(0.170.0)`, `0.170.0+`). Do not replace the binary while a Herdr launch is pending
-  (`pending_herdr_launches_across_the_wrapper_handoff`).
+  there, after its Session and terminal exist. Do not replace the binary while a Herdr launch
+  is pending. What each release's wrapper does with a recorded text is this table, which
+  `pending_herdr_launches_across_the_wrapper_handoff` reads and checks against the frozen
+  0.4.48 and 0.4.49 readers and this build's (`\n` is a line break):
+
+  <!-- herdr-version-handoff -->
+  | `--version` text | 0.4.48 | 0.4.49 | this build |
+  | --- | --- | --- | --- |
+  | `codex-cli 0.170.0` | launches | launches | launches |
+  | `codex-cli 0.168.0` | refuses | refuses | refuses |
+  | `codex-cli 0.170.0-alpha.1` | refuses | refuses | refuses |
+  | `0.170.0` | launches | launches | launches |
+  | `OpenAI Codex (v0.170.0)` | launches | refuses | launches |
+  | `(0.170.0)` | launches | refuses | launches |
+  | `0.170.0+` | launches | refuses | launches |
+  | `codex 0.170.0` | launches | refuses | launches |
+  | `unknown (runtime 22.0.0)` | launches | refuses | launches |
+  | `plugin 0.160.0\ncodex-cli 0.170.0` | refuses | launches | launches |
+  | `codex-cli 0.170.0+` | launches | refuses | refuses |
+  | `node v22.0.0\ncodex-cli 0.168.0` | launches | refuses | refuses |
+  | `node v22.0.0\nOpenAI Codex (v0.170.0)` | launches | refuses | refuses |
+  | `codex 0.170.0 (v0.170.0)` | launches | refuses | refuses |
+  | `0.170.0-01 (runtime 22.0.0)` | launches | refuses | refuses |
+  | `0.170.0--` | launches | refuses | refuses |
+  | `(0.170.0--)` | launches | refuses | refuses |
+  | `0.170.0-` | launches | refuses | refuses |
+  | `0.168.0- runtime 22.0.0` | refuses | refuses | refuses |
+  | `OpenAI Codex 0.168.0-rc-. (runtime 22.0.0)` | refuses | refuses | refuses |
+  | `OpenAI Codex (v0.168.0)` | refuses | refuses | refuses |
+  | `unknown` | refuses | refuses | refuses |
+  <!-- /herdr-version-handoff -->
+
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases
   wrote and admitted launch records.

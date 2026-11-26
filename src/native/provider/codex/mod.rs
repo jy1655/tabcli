@@ -143,51 +143,82 @@ fn herdr_codex_version(output: &str) -> Result<Version> {
 }
 
 // The Herdr gate's reading of text without the label, one word or more (owner's decisions
-// 4B and B2, 2026-11-26), and the one place of that rule. Every word is read by
-// `herdr_word_version`, and the text names a version only when exactly one word reads as one.
-// With none it is refused; with two or more it is refused as ambiguous, because another
-// program's version can come first (`node v22.0.0` on a line before Codex's own) and a misread
-// version could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
-// already have reported the request accepted. Words are counted, not versions: the owner's
-// rule accepts one version-shaped word, so the same version printed twice is refused too.
+// 4B and B2, 2026-11-26), and the one place of that rule. Ambiguity is judged by a word's
+// shape, never by whether it parses, so that a malformed word cannot leave another program's
+// version as the only one:
+//
+//   candidate = a word whose rest, after its leading non-alphanumeric characters and one
+//               optional `v`, begins with digits "." digits "." digits
+//   reading   = that rest, less trailing characters that cannot end a version (anything but a
+//               letter, a digit or `-`), removed one at a time until it is SemVer 2.0.0; none
+//               when a letter, a digit or `-` ends it first
+//
+// The text names a version only when it has exactly one candidate and that candidate has a
+// reading: `OpenAI Codex (v0.170.0)`, `(0.170.0)`, `0.170.0+` and `Codex 0.170.0.` are
+// 0.170.0, and `0.170.0--` and `0.168.0-rc-.` keep their prerelease. No candidate, a candidate
+// without a reading (`0.170.0-`), and two or more candidates are refused, whether or not the
+// others would parse (`0.168.0- runtime 22.0.0`, `node v22.0.0` before a banner, the same
+// version printed twice): another program's version can come first, and a misread version
+// could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
+// already have reported the request accepted. docs/agents/codex.md holds the table of texts
+// that `pending_herdr_launches_across_the_wrapper_handoff` checks against this reading.
 fn unlabelled_codex_version(output: &str) -> Result<Version> {
-    let versions = output
+    let candidates = output
         .split_whitespace()
-        .filter_map(herdr_word_version)
+        .filter_map(|word| version_candidate(word).map(|rest| (word, rest)))
         .collect::<Vec<_>>();
-    match versions.as_slice() {
-        [version] => Ok(version.clone()),
+    match candidates.as_slice() {
+        [(word, rest)] => candidate_reading(rest).with_context(|| {
+            format!(
+                "found no `{HERDR_VERSION_LABEL}` label, and its one version {word:?} is not a semantic version"
+            )
+        }),
         [] => bail!("found no `{HERDR_VERSION_LABEL}` label and no version in {output:?}"),
         _ => bail!(
             "found no `{HERDR_VERSION_LABEL}` label and {} versions ({}) in {output:?}; TAB does not guess which one is Codex's",
-            versions.len(),
-            versions
+            candidates.len(),
+            candidates
                 .iter()
-                .map(ToString::to_string)
+                .map(|(word, _)| format!("{word:?}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-// One unlabelled word as a version, the first of three readings that parses (each after one
-// leading `v`): the word without the surrounding characters that no SemVer contains (anything
-// but letters, digits, `.`, `-` and `+`), which keeps a prerelease (`0.170.0--` and
-// `(0.170.0--)` are the prerelease `-`); then the word as 0.4.48 read it, with all surrounding
-// punctuation removed (`0.170.0+` and `0.170.0.` are 0.170.0), unless that removes a `-` after
-// the version, which would turn a prerelease into a release (`0.170.0-` reads as none).
-fn herdr_word_version(word: &str) -> Option<Version> {
-    let parse = |text: &str| Version::parse(text.strip_prefix('v').unwrap_or(text)).ok();
-    let semver = word.trim_matches(|character: char| {
-        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
-    });
-    parse(semver).or_else(|| {
-        let kept = semver.trim_end_matches(|character: char| !character.is_ascii_alphanumeric());
-        if semver[kept.len()..].contains('-') {
+// The rest of a candidate word: after its leading non-alphanumeric characters and one
+// optional `v`, it begins with digits "." digits "." digits.
+fn version_candidate(word: &str) -> Option<&str> {
+    let rest = word.trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
+    let rest = rest.strip_prefix('v').unwrap_or(rest);
+    let mut remaining = rest;
+    for part in 0..3 {
+        let digits = remaining.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
             return None;
         }
-        word_version(word)
-    })
+        remaining = &remaining[digits..];
+        if part < 2 {
+            remaining = remaining.strip_prefix('.')?;
+        }
+    }
+    Some(rest)
+}
+
+// A candidate's version: trailing characters that cannot end a version are removed one at a
+// time until the rest is SemVer; a letter, a digit or `-` cannot be removed.
+fn candidate_reading(rest: &str) -> Option<Version> {
+    let mut text = rest;
+    loop {
+        if let Ok(version) = Version::parse(text) {
+            return Some(version);
+        }
+        let last = text.chars().last()?;
+        if last.is_ascii_alphanumeric() || last == '-' {
+            return None;
+        }
+        text = &text[..text.len() - last.len_utf8()];
+    }
 }
 
 // Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.
