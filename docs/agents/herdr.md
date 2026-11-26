@@ -237,7 +237,7 @@
   needs the terminal on the verified core to match it, and a settlement needs `not_found` from
   that core for the recorded address. The table holds when no teardown intent is saved: on
   macOS and Linux TAB finds the close-intent file absent, or reads it and establishes that it
-  holds no teardown payload (a file it cannot read or decode refuses the close). A close
+  holds no teardown payload (a file it cannot read, or that is not JSON, refuses the close). A close
   interrupted during a live owner's teardown resumes under 0.4.49's rules while the handle
   still needs a decision about its terminal, which can refuse a finished or absent terminal
   until the intent validates or is cleared; a replayed decision that leaves the close to the

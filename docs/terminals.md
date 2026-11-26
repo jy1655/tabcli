@@ -264,7 +264,7 @@ terminal depends on what TAB verifies about the session's owner at that moment:
   apply to this close; a handle with no usable terminal address or core is still refused
   before any core is asked.
 - On macOS and Linux, if a teardown intent is saved, the close resumes it under 0.4.49's rules,
-  and a close-intent file TAB cannot read or decode refuses the close (see above).
+  and a close-intent file TAB cannot read, or that is not JSON, refuses the close (see above).
 
 TAB has no command that repairs a handle: keep the session directory as it is for diagnosis.
 
