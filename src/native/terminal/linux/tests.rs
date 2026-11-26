@@ -194,6 +194,9 @@ fn linux_registers_tmux_and_herdr() {
         select(Some(TerminalKind::Tmux)).unwrap(),
         TerminalKind::Tmux
     );
+    // Without a request Linux chooses tmux; inside hc that is the fallback of the automatic
+    // Herdr choice (`terminal::select_for`).
+    assert_eq!(select(None).unwrap(), TerminalKind::Tmux);
     assert!(INSTALLED.adapter(TerminalKind::Tmux).is_ok());
     for kind in TerminalKind::ALL {
         if matches!(kind, TerminalKind::Tmux | TerminalKind::Herdr) {

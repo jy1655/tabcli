@@ -13,6 +13,10 @@ in the skill only: TAB does not launch the host session, so it has no system pro
 extend, and an integration adds no hook or MCP server to carry it. Do not build a TAB path
 that duplicates what a provider's own subagents do for a same-provider child.
 
+Behavior is the same on every OS by default (owner's decision, 2026-11-26). Keep a platform
+difference only where a platform fact makes it unavoidable, and state that fact where the
+difference lives. A difference inherited from earlier code is not a reason by itself.
+
 ## Change and Verification Rules
 
 - Public documentation and default plugin metadata use English. Run `python3 scripts/check_language.py`;

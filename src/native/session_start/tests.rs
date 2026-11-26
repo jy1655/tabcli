@@ -554,7 +554,12 @@ mod resolution {
                         context_results: Vec::new(),
                     };
                     resolve_with(
-                        fresh_resolution(&request, context::resolve(&[]).unwrap(), SELECTED),
+                        fresh_resolution(
+                            &request,
+                            context::resolve(&[]).unwrap(),
+                            terminal::Selection::Kind(SELECTED),
+                            CallerCheck::NotNeeded,
+                        ),
                         probe,
                     )
                 }
@@ -572,7 +577,13 @@ mod resolution {
                         json: false,
                     };
                     resolve_with(
-                        reopen::resolution(&request, FirstPartyCli::Codex, workspace, SELECTED),
+                        reopen::resolution(
+                            &request,
+                            FirstPartyCli::Codex,
+                            workspace,
+                            terminal::Selection::Kind(SELECTED),
+                            CallerCheck::NotNeeded,
+                        ),
                         probe,
                     )
                 }
@@ -1211,7 +1222,12 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         |provider, workspace: &Path, title: Option<&str>, surface, version: Option<&str>| {
             let ask = request(provider, workspace, title);
             resolve_with(
-                fresh_resolution(&ask, context::resolve(&[]).unwrap(), surface),
+                fresh_resolution(
+                    &ask,
+                    context::resolve(&[]).unwrap(),
+                    terminal::Selection::Kind(surface),
+                    CallerCheck::NotNeeded,
+                ),
                 |_| match version {
                     Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
                     None => panic!("probe must not run before early refusal"),
@@ -1346,7 +1362,331 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         )
         .unwrap();
     }
+
+    // An automatic Herdr choice (inside an hc terminal) is decided with the provider and its
+    // probed version, the same way on every platform: Herdr where the adapter admits it, and
+    // otherwise the Surface this platform chooses outside Herdr, with that Surface's own
+    // initial Transport. Neither admission refuses it.
+    //
+    // The caller check runs where 0.4.49 ran it, before the workspace and the probe, for every
+    // provider that can end on Herdr (Codex on Windows cannot). Where no version can change the
+    // choice (Claude, Agy, Pi) a failed check refuses there; where the version decides (Codex
+    // off Windows) its outcome waits for the version: it refuses a choice that ends on Herdr,
+    // after the probe and before the title, and is ignored by one that takes the fallback.
+    let fallback = platform_fallback();
+    let selection = terminal::Selection::Herdr { fallback };
+    let checks = std::cell::Cell::new(0);
+    let probes = std::cell::Cell::new(0);
+    let automatic = |provider, workspace: &Path, version: Option<&str>, caller_ok: bool| {
+        let ask = request(provider, workspace, Some("   "));
+        let caller = check_caller(selection, Some(provider), |given| {
+            assert_eq!(given, selection);
+            checks.set(checks.get() + 1);
+            if caller_ok {
+                Ok(())
+            } else {
+                bail!("the caller check refused")
+            }
+        })?;
+        resolve_with(
+            fresh_resolution(&ask, context::resolve(&[]).unwrap(), selection, caller),
+            |_| {
+                probes.set(probes.get() + 1);
+                match version {
+                    Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+                    None => panic!("the probe must not run before the workspace is resolved"),
+                }
+            },
+        )
+    };
+    // A missing workspace: Codex's failed check (off Windows) waits for its version, so the
+    // workspace refuses; Claude's refuses first, as in 0.4.49.
+    let error = automatic(FirstPartyCli::Codex, &missing, None, false)
+        .err()
+        .expect("a missing workspace refuses");
+    assert!(
+        error.to_string().contains("workspace does not exist"),
+        "{error:#}"
+    );
+    assert_eq!(checks.get(), usize::from(!cfg!(windows)));
+    let checked = checks.get();
+    let error = automatic(FirstPartyCli::Claude, &missing, None, false)
+        .err()
+        .expect("the caller check refuses first");
+    assert_eq!(error.to_string(), "the caller check refused");
+    assert_eq!((checks.get(), probes.get()), (checked + 1, 0));
+    for (provider, version, herdr) in [
+        (FirstPartyCli::Codex, "codex-cli 0.169.0", !cfg!(windows)),
+        (
+            FirstPartyCli::Codex,
+            "OpenAI Codex (v0.170.0)",
+            !cfg!(windows),
+        ),
+        (FirstPartyCli::Codex, "codex-cli 0.168.0", false),
+        (FirstPartyCli::Codex, "codex-cli 0.170.0-alpha.1", false),
+        (FirstPartyCli::Codex, "codex-cli 0.170.0+", false),
+        (FirstPartyCli::Claude, "2.1.302", true),
+        (FirstPartyCli::Agy, "fixture", true),
+        (FirstPartyCli::Pi, "fixture", true),
+    ] {
+        let case = format!("{provider:?} {version}");
+        let codex = provider == FirstPartyCli::Codex;
+        // A caller that fails the check refuses only a launch on Herdr: before the probe where
+        // no version can change the choice, after it where the version decides.
+        let (checked, probed) = (checks.get(), probes.get());
+        let refused = automatic(provider, &project, Some(version), false)
+            .err()
+            .expect("the blank title or the caller check refuses");
+        assert_eq!(
+            checks.get(),
+            checked + usize::from(!(codex && cfg!(windows))),
+            "{case}"
+        );
+        assert_eq!(probes.get(), probed + usize::from(codex), "{case}");
+        assert_eq!(
+            refused.to_string(),
+            if herdr {
+                "the caller check refused"
+            } else {
+                "--title cannot be empty"
+            },
+            "{case}"
+        );
+        // A verified caller: the Surface and its initial Transport.
+        let ask = request(provider, &project, None);
+        let caller = check_caller(selection, Some(provider), |_| Ok(())).unwrap();
+        let resolved = resolve_with(
+            fresh_resolution(&ask, context::resolve(&[]).unwrap(), selection, caller),
+            |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+        )
+        .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+        assert_eq!(
+            resolved.terminal_kind,
+            if herdr {
+                terminal::TerminalKind::Herdr
+            } else {
+                fallback
+            },
+            "{case}"
+        );
+        if codex {
+            assert_eq!(
+                resolved.initial_transport.facts().name,
+                if cfg!(windows) {
+                    "terminal-paste-fallback"
+                } else {
+                    "launch-argument"
+                },
+                "{case}"
+            );
+        }
+    }
+    // A reopen does not know its provider when it checks: a failed check refuses there.
+    let error = check_caller(selection, None, |_| bail!("the caller check refused"))
+        .err()
+        .expect("a reopen's caller check refuses");
+    assert_eq!(error.to_string(), "the caller check refused");
+    // Outside hc, or with an explicit choice, nothing is checked.
+    for explicit in [
+        terminal::Selection::Kind(fallback),
+        terminal::Selection::Kind(terminal::TerminalKind::Herdr),
+    ] {
+        assert!(matches!(
+            check_caller(explicit, Some(FirstPartyCli::Pi), |_| panic!("checked")).unwrap(),
+            CallerCheck::NotNeeded
+        ));
+    }
     assert_no_sessions();
+}
+
+// A caller check that returns only after the request's deadline is followed, as in 0.4.49, by
+// the version probe, which reads the clock before it starts: the request ends there as timed
+// out and nothing is written, the shared workspace-consent store included. Claude's failed
+// check would refuse at once; Codex's outcome waits for its version (off Windows).
+#[test]
+fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use crate::native::session::primitives::STATE_DIR_ENV;
+    use std::process::Command;
+
+    const CHILD: &str = "TABCLI_START_LATE_CALLER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let codex_home = base.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        let root = base.path().join("state");
+        fs::create_dir(&root).unwrap();
+        // Stand-ins that report a supported version.
+        let bin = base.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for (name, version) in [("claude", "2.1.302"), ("codex", "codex-cli 0.170.0")] {
+            #[cfg(windows)]
+            fs::write(
+                bin.join(format!("{name}.cmd")),
+                format!("@echo off\r\necho {version}\r\n"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let path = bin.join(name);
+                fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let mut path = vec![bin];
+        #[cfg(windows)]
+        path.push(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"));
+        #[cfg(unix)]
+        path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+        let test_name = format!(
+            "{}::a_caller_check_that_ends_after_the_deadline_writes_nothing",
+            module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, rest)| rest)
+        );
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("USERPROFILE", base.path())
+            .env("CODEX_HOME", &codex_home)
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let root = Reader::state_root().unwrap();
+    let project = root.parent().unwrap().join("project");
+    fs::create_dir_all(&project).unwrap();
+    // The canonical spelling: consent skips an aliased workspace without writing, and the
+    // temporary directory of macOS lies behind a link.
+    let project = project.canonicalize().unwrap();
+    let fallback = platform_fallback();
+    let selection = terminal::Selection::Herdr { fallback };
+    let ask = |provider| AskRequest {
+        provider,
+        workspace: project.clone(),
+        prompt: "fixture prompt".into(),
+        title: None,
+        model: None,
+        effort: None,
+        terminal: None,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+        context_results: Vec::new(),
+    };
+    let mut providers = vec![FirstPartyCli::Claude];
+    if !cfg!(windows) {
+        providers.push(FirstPartyCli::Codex);
+    }
+    for provider in providers {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let caller = check_caller(selection, Some(provider), |_| {
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(())
+        })
+        .unwrap();
+        let request = ask(provider);
+        let error = resolve(
+            fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
+            deadline,
+        )
+        .err()
+        .expect("the deadline ends the resolution");
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+        assert!(
+            !root.join("workspace-consent").exists(),
+            "{provider:?}: the workspace-consent store was written"
+        );
+    }
+    // The same resolution with time left writes the store: the assertion above can fail.
+    let request = ask(FirstPartyCli::Claude);
+    let caller = check_caller(selection, Some(FirstPartyCli::Claude), |_| Ok(())).unwrap();
+    resolve(
+        fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(root.join("workspace-consent").exists());
+}
+
+// The Surface this platform chooses outside Herdr, the fallback of an automatic Herdr choice
+// inside hc: Ghostty on macOS (hc gives `TERM_PROGRAM=ghostty`), tmux on Linux and the managed
+// console on Windows.
+fn platform_fallback() -> terminal::TerminalKind {
+    if cfg!(target_os = "macos") {
+        terminal::TerminalKind::Ghostty
+    } else if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else {
+        terminal::TerminalKind::Tmux
+    }
+}
+
+// The provider's admission of a selection: an automatic Herdr choice is Herdr where the
+// adapter admits it (before the probe and with the probed version) and its fallback with the
+// reason otherwise; an explicit Herdr keeps the refusal, in the same words; any other
+// selected kind is admitted as it is.
+#[test]
+fn admit_choice_gives_an_automatic_herdr_its_fallback_and_keeps_explicit_refusals() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    use terminal::{Selection, TerminalKind::Herdr};
+    let fallback = platform_fallback();
+    for provider in agent_bridge::supported_clis().iter().copied() {
+        for version in [
+            None,
+            Some("codex-cli 0.169.0"),
+            Some("codex-cli 0.168.0"),
+            Some("OpenAI Codex (v0.168.0)"),
+        ] {
+            let case = format!("{provider:?} {version:?}");
+            let refused = provider == FirstPartyCli::Codex
+                && (cfg!(windows) || version.is_some_and(|version| version.contains("0.168.0")));
+            let automatic = admit_choice(provider, Selection::Herdr { fallback }, version).unwrap();
+            assert_eq!(
+                automatic.kind,
+                if refused { fallback } else { Herdr },
+                "{case}"
+            );
+            assert_eq!(automatic.herdr_refusal.is_some(), refused, "{case}");
+            match admit_choice(provider, Selection::Kind(Herdr), version) {
+                Ok(explicit) => {
+                    assert!(!refused, "{case}");
+                    assert_eq!(explicit.kind, Herdr, "{case}");
+                    assert_eq!(
+                        explicit.initial_transport.facts().name,
+                        automatic.initial_transport.facts().name,
+                        "{case}"
+                    );
+                }
+                Err(error) => {
+                    assert!(refused, "{case}");
+                    assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
+                    assert_eq!(
+                        format!("{error:#}"),
+                        format!("{:#}", automatic.herdr_refusal.unwrap()),
+                        "{case}"
+                    );
+                }
+            }
+            let selected = admit_choice(provider, Selection::Kind(fallback), version).unwrap();
+            assert_eq!(selected.kind, fallback, "{case}");
+            assert!(selected.herdr_refusal.is_none(), "{case}");
+        }
+    }
 }
 
 // Post-probe surface admission hands its selected initial Transport straight into Resolved
@@ -1409,7 +1749,12 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
             context_results: Vec::new(),
         };
         resolve_with(
-            fresh_resolution(&ask, context::resolve(&[]).unwrap(), surface),
+            fresh_resolution(
+                &ask,
+                context::resolve(&[]).unwrap(),
+                terminal::Selection::Kind(surface),
+                CallerCheck::NotNeeded,
+            ),
             |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
         )
         .unwrap()

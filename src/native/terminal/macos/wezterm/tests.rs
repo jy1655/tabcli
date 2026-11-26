@@ -1164,10 +1164,12 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
         }
         return;
     }
-    let selected = crate::native::terminal::select_for(Some(TerminalKind::WezTerm), None).unwrap();
+    let selected = crate::native::terminal::select_for(Some(TerminalKind::WezTerm)).unwrap();
     let host = fake();
     let handle = match selected {
-        TerminalKind::WezTerm => create_tab(&host, soon()).unwrap(),
+        crate::native::terminal::Selection::Kind(TerminalKind::WezTerm) => {
+            create_tab(&host, soon()).unwrap()
+        }
         other => panic!("explicit target dispatched to {other:?}"),
     };
     let command = gui_command(env::vars_os().map(|(key, _)| key), &program());

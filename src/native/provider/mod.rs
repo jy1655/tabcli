@@ -340,7 +340,7 @@ trait NativeProviderAdapter: Sync {
     // Whether this adapter's launch and turn transports can run on a surface of `surface`
     // on this platform, decided before any session exists, and the initial-prompt Transport
     // selected for it. `version` is `None` before the CLI version has been probed (such as
-    // during terminal selection, unprobed doctor checks, or early platform admission) and
+    // during launch surface choice, unprobed doctor checks, or early platform admission) and
     // `Some` once the installed version is known. `Err` names the capability or version
     // requirement the surface lacks for this provider. No default: each adapter states its
     // own answer and initial Transport. `Ok` is a code path, not live evidence.
@@ -349,6 +349,13 @@ trait NativeProviderAdapter: Sync {
         surface: super::terminal::TerminalKind,
         version: Option<&str>,
     ) -> SurfaceSupport;
+    // The version requirement, beyond the general minimum, under which this adapter runs on
+    // `surface` on this platform (for example "stable Codex 0.169.0 or newer"), or `None` when
+    // `surface_support(surface, None)` is already the answer for every version. Diagnostics
+    // read it to say whether a version they did not read could change the launch's Surface.
+    // No default: each adapter states its own.
+    fn surface_version_requirement(&self, surface: super::terminal::TerminalKind)
+    -> Option<String>;
 }
 
 /// Why an adapter refuses to run on a surface.
@@ -452,13 +459,13 @@ pub(super) fn run_control(provider: FirstPartyCli, arguments: &[String]) -> Resu
     adapter(provider).run_control(arguments)
 }
 
-/// Whether `provider`'s adapter can run on `surface` on this platform before any CLI
-/// version probe. Terminal selection and unprobed diagnostics read this.
-pub(super) fn surface_support(
+/// The version requirement under which `provider` runs on `surface` here, when its answer
+/// depends on the version (`NativeProviderAdapter::surface_version_requirement`).
+pub(super) fn surface_version_requirement(
     provider: FirstPartyCli,
     surface: super::terminal::TerminalKind,
-) -> SurfaceSupport {
-    adapter(provider).surface_support(surface, None)
+) -> Option<String> {
+    adapter(provider).surface_version_requirement(surface)
 }
 
 /// The admission of a selected surface for a provider, before any session exists: returns
@@ -533,7 +540,7 @@ mod tests {
                     && provider == FirstPartyCli::Codex
                     && surface == TerminalKind::Herdr;
                 assert_eq!(
-                    surface_support(provider, surface).is_err(),
+                    adapter(provider).surface_support(surface, None).is_err(),
                     windows_codex_herdr,
                     "{provider:?} on {surface:?}"
                 );
@@ -571,6 +578,11 @@ mod tests {
                     ("codex-cli 0.168.0- (protocol 1.0.0)", false),
                     ("codex-cli 0.169.0", true),
                     ("codex-cli 0.170.0", true),
+                    // Unlabelled text names a version when exactly one word reads as one.
+                    ("OpenAI Codex (v0.170.0)", true),
+                    ("(0.170.0)", true),
+                    ("OpenAI Codex (v0.168.0)", false),
+                    ("node v22.0.0\nOpenAI Codex (v0.170.0)", false),
                     ("unknown", false),
                 ] {
                     let version_refused = !cfg!(windows)
@@ -653,6 +665,47 @@ mod tests {
             CODEX_WINDOWS_HERDR_REFUSAL_WORDS
                 .iter()
                 .all(|words| codex::windows_herdr_refusal().contains(words))
+        );
+    }
+
+    // An adapter that declares no version requirement on a surface answers there for every
+    // version as it does before the probe; one that declares a requirement admits the surface
+    // before the probe, and then refuses a version it reads and admits another. Only Codex on
+    // Herdr off Windows depends on the version.
+    #[test]
+    fn adapters_declare_where_a_surface_depends_on_the_version() {
+        use super::super::terminal::TerminalKind;
+        let samples = [
+            "codex-cli 0.146.0",
+            "codex-cli 0.168.0",
+            "codex-cli 0.169.0",
+            "codex-cli 0.170.0-alpha.1",
+            "OpenAI Codex (v0.170.0)",
+            "2.1.302",
+            "1.5.0",
+            "unknown",
+        ];
+        for provider in agent_bridge::supported_clis().iter().copied() {
+            for surface in TerminalKind::ALL {
+                let case = format!("{provider:?} on {surface:?}");
+                let unprobed = admit_surface(provider, surface, None).is_ok();
+                let answers = samples
+                    .iter()
+                    .map(|version| admit_surface(provider, surface, Some(version)).is_ok())
+                    .collect::<Vec<_>>();
+                match surface_version_requirement(provider, surface) {
+                    None => assert!(answers.iter().all(|&ok| ok == unprobed), "{case}"),
+                    Some(requirement) => {
+                        assert!(unprobed && !requirement.is_empty(), "{case}");
+                        assert!(answers.contains(&true), "{case}");
+                        assert!(answers.contains(&false), "{case}");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            surface_version_requirement(FirstPartyCli::Codex, TerminalKind::Herdr),
+            (!cfg!(windows)).then(|| "stable Codex 0.169.0 or newer".to_owned())
         );
     }
 

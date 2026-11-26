@@ -331,44 +331,73 @@ impl TerminalSendFailure {
 
 pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
 
-/// The terminal for a launch whose provider runs on Herdr here (`herdr_runs_provider`, its
-/// adapter's answer) or whose provider is not known yet (`None`, a reopen before it reads
-/// its source). Only on Windows does it change the automatic choice: inside an hc terminal
-/// it is Herdr when the provider runs there, and the managed console otherwise, as before
-/// Herdr reached Windows. An explicit choice wins; admission then asks the provider.
-/// Launches reach it through `session_start::choose_launch_surface`, which supplies the
-/// answer.
-pub(super) fn select_for(
-    preferred: Option<TerminalKind>,
-    herdr_runs_provider: Option<bool>,
-) -> Result<TerminalKind> {
-    #[cfg(windows)]
-    return windows::select(preferred, herdr_runs_provider.unwrap_or(false));
-    #[cfg(not(windows))]
-    {
-        let _ = herdr_runs_provider;
-        platform::select(preferred)
-    }
+/// The terminal a launch asked for or its caller's environment selects, before any provider
+/// is asked (`select_for`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum Selection {
+    /// An explicit `--terminal`, or the automatic choice outside an hc terminal.
+    Kind(TerminalKind),
+    /// The automatic choice inside an hc terminal, the same on every platform: Herdr where the
+    /// launch's provider is admitted there (`session_start::admit_choice`), and otherwise
+    /// `fallback`, what this platform chooses outside Herdr.
+    Herdr { fallback: TerminalKind },
 }
 
+/// The terminal of a launch from its request (`preferred`) and the caller's environment.
+/// Launches reach it through `session_start::choose_launch_surface`; it reads the
+/// environment only and opens nothing.
+pub(super) fn select_for(preferred: Option<TerminalKind>) -> Result<Selection> {
+    select_with(
+        preferred,
+        herdr_environment(
+            std::env::var_os("HC_TERMINAL_ID").is_some_and(|id| !id.is_empty()),
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+        ),
+        platform_select,
+    )
+}
+
+// This platform's own choice, Herdr's environment aside: an explicit kind it accepts, or its
+// default from the caller's terminal (macOS), tmux (Linux) or the managed console (Windows).
+fn platform_select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
+    #[cfg(windows)]
+    return windows::select(preferred);
+    #[cfg(not(windows))]
+    platform::select(preferred)
+}
+
+// An explicit choice wins, and is the platform's to accept. Without one, a caller inside an
+// hc terminal (`inside_herdr`) gets Herdr with the platform's own choice as its fallback, and
+// any other caller that choice.
+fn select_with(
+    preferred: Option<TerminalKind>,
+    inside_herdr: bool,
+    platform: impl FnOnce(Option<TerminalKind>) -> Result<TerminalKind>,
+) -> Result<Selection> {
+    let kind = platform(preferred)?;
+    Ok(if preferred.is_none() && inside_herdr {
+        Selection::Herdr { fallback: kind }
+    } else {
+        Selection::Kind(kind)
+    })
+}
+
+/// Herdr Core gives every program it starts `TERM_PROGRAM=ghostty` (herdr-core 0.1.21), so its
+/// terminal marker `HC_TERMINAL_ID` names Herdr only together with that identity: under another
+/// `TERM_PROGRAM` the marker was inherited into that terminal.
 fn herdr_environment(marker: bool, term_program: Option<&str>) -> bool {
     marker && term_program.is_some_and(|value| value.eq_ignore_ascii_case("ghostty"))
 }
 
-/// The launch admission of a selected surface, before any session is created. A kind that
-/// `select_for` chose from the caller's environment (`preferred` is the same request) proves
-/// that environment here: inside Herdr the caller's `HC_TERMINAL_ID` must name a live terminal
-/// of the running core that this process runs in. Selection itself reads only the
-/// environment and opens nothing.
-pub(super) fn admit_selection(
-    preferred: Option<TerminalKind>,
-    selected: TerminalKind,
-) -> Result<()> {
+/// The caller check of an automatic Herdr choice, before any session is created: the caller's
+/// `HC_TERMINAL_ID` must name a live terminal of the running core that this process runs in.
+/// Any other selection has nothing to prove here.
+pub(super) fn admit_selection(selection: Selection) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    if preferred.is_none() && selected == TerminalKind::Herdr {
+    if let Selection::Herdr { .. } = selection {
         return herdr::verify_caller_terminal();
     }
-    let _ = (preferred, selected);
+    let _ = selection;
     Ok(())
 }
 
@@ -936,14 +965,63 @@ mod tests {
     #[test]
     fn windows_selects_its_managed_console_transport() {
         assert_eq!(
-            super::windows::select_from(None, false, None, false).unwrap(),
+            super::windows::select(None).unwrap(),
             TerminalKind::WindowsConsole
         );
         assert_eq!(
-            super::select_for(Some(TerminalKind::WindowsConsole), None).unwrap(),
-            TerminalKind::WindowsConsole
+            super::select_for(Some(TerminalKind::WindowsConsole)).unwrap(),
+            super::Selection::Kind(TerminalKind::WindowsConsole)
         );
-        assert!(super::select_for(Some(TerminalKind::Iterm2), None).is_err());
+        assert!(super::select_for(Some(TerminalKind::Iterm2)).is_err());
+    }
+
+    // One rule on every platform: inside an hc terminal (hc gives every program
+    // `HC_TERMINAL_ID` and `TERM_PROGRAM=ghostty`) the automatic choice is Herdr, with the
+    // platform's own choice as its fallback; a marker inherited into another terminal is
+    // ignored; an explicit choice wins and is the platform's to accept or refuse.
+    #[test]
+    fn an_hc_caller_selects_herdr_with_the_platform_choice_as_its_fallback() {
+        use super::{Selection, herdr_environment, select_with};
+        use TerminalKind::{Ghostty, Herdr, Iterm2, Tmux, WindowsConsole};
+        // What each platform chooses with no request in hc's environment.
+        for default in [Ghostty, Tmux, WindowsConsole] {
+            let platform = |preferred: Option<TerminalKind>| match preferred {
+                None => Ok(default),
+                Some(Iterm2) => anyhow::bail!("refused by the platform"),
+                Some(kind) => Ok(kind),
+            };
+            for (preferred, marker, term_program, expected) in [
+                (
+                    None,
+                    true,
+                    Some("ghostty"),
+                    Selection::Herdr { fallback: default },
+                ),
+                (
+                    None,
+                    true,
+                    Some("Ghostty"),
+                    Selection::Herdr { fallback: default },
+                ),
+                (None, true, None, Selection::Kind(default)),
+                (None, true, Some("WezTerm"), Selection::Kind(default)),
+                (None, false, Some("ghostty"), Selection::Kind(default)),
+                (Some(Herdr), false, None, Selection::Kind(Herdr)),
+                (Some(Herdr), true, Some("ghostty"), Selection::Kind(Herdr)),
+                (Some(Tmux), true, Some("ghostty"), Selection::Kind(Tmux)),
+            ] {
+                assert_eq!(
+                    select_with(preferred, herdr_environment(marker, term_program), platform)
+                        .unwrap(),
+                    expected,
+                    "{default:?}: {preferred:?} {marker} {term_program:?}"
+                );
+            }
+            let error = select_with(Some(Iterm2), true, platform).unwrap_err();
+            assert_eq!(error.to_string(), "refused by the platform");
+        }
+        // A platform without terminal sessions refuses inside hc too.
+        assert!(select_with(None, true, |_| anyhow::bail!("unsupported")).is_err());
     }
 
     #[test]

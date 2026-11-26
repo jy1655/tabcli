@@ -139,14 +139,26 @@ pub(in crate::native::terminal) trait Core {
     /// The local Herdr caller marker when the terminal environment selects Herdr.
     fn caller_terminal(&self) -> Option<String>;
     fn current_pid(&self) -> u32;
-    /// The parent of a live process; `None` when there is no such process.
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>>;
+    /// What this machine shows of a process's parent.
+    fn parent_pid(&self, pid: u32) -> Result<Parent>;
     /// The birth of a live process; `None` when there is no such process.
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>>;
     fn launch_nonce(&self) -> Result<String>;
     fn pause(&self, deadline: Instant) {
         thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
+}
+
+/// A process's parent, as far as this machine shows it.
+#[derive(Debug, PartialEq)]
+pub(in crate::native::terminal) enum Parent {
+    /// Its parent process.
+    Process(u32),
+    /// It has no parent to follow: the system records none.
+    Root,
+    /// Its parent could not be established: the process or its parent ended, the parent's PID
+    /// now names a later process, or this process may not inspect it.
+    Unknown(String),
 }
 
 /// The `HC_TERMINAL_ID` of this process: the terminal hc says this process runs in.
@@ -613,7 +625,7 @@ fn create(
     } else {
         match caller_on(core, &mut linked, startup_deadline) {
             Ok(Caller::Verified(parent)) => Some(parent),
-            Ok(Caller::Outside(_)) => None,
+            Ok(Caller::Outside(_) | Caller::Unverified(_)) => None,
             Err(_) => {
                 // A failed read can leave a partial reply on this connection. No run has
                 // been sent. An explicit launch can still proceed without a parent if the
@@ -962,7 +974,10 @@ fn send_file(
 
 enum Caller {
     Verified(String),
+    // The command does not run inside the named terminal's program, or no such terminal holds it.
     Outside(String),
+    // Whether it does could not be established; it is treated as outside.
+    Unverified(String),
 }
 
 /// The terminal marker alone can be inherited. Verify that the local terminal holds an
@@ -987,14 +1002,33 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
             "HC_TERMINAL_ID names {address}, which is no longer running"
         )));
     };
+    // This process and up to MAX_ANCESTRY parent links above it are compared, the last one
+    // obtained included. Only a chain that ends at a root (no parent, or init) proves the
+    // command is outside the program; reaching the bound or a parent that could not be
+    // established proves nothing. All three refuse.
+    let unverified = |why: String| {
+        Caller::Unverified(format!(
+            "HC_TERMINAL_ID names Herdr terminal {address}, but TAB could not verify that this command runs inside its program: {why}"
+        ))
+    };
     let mut pid = core.current_pid();
-    for _ in 0..MAX_ANCESTRY {
+    let mut links = 0;
+    loop {
         if pid == program {
             return Ok(Caller::Verified(address));
         }
+        if links == MAX_ANCESTRY {
+            return Ok(unverified(format!(
+                "its program was not found within {MAX_ANCESTRY} parent processes of this command"
+            )));
+        }
         match core.parent_pid(pid)? {
-            Some(parent) if parent > 1 && parent != pid => pid = parent,
-            _ => break,
+            Parent::Process(parent) if parent > 1 && parent != pid => {
+                pid = parent;
+                links += 1;
+            }
+            Parent::Process(_) | Parent::Root => break,
+            Parent::Unknown(why) => return Ok(unverified(why)),
         }
     }
     Ok(Caller::Outside(format!(
@@ -1008,7 +1042,7 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
         let mut linked = link(core, &core.endpoint()?, None, deadline)?;
         match caller_on(core, &mut linked, deadline)? {
             Caller::Verified(_) => Ok(()),
-            Caller::Outside(reason) => bail!(reason),
+            Caller::Outside(reason) | Caller::Unverified(reason) => bail!(reason),
         }
     };
     verify().map_err(|error| anyhow!(

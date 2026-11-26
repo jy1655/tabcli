@@ -1268,14 +1268,31 @@ The report starts human output with `scope`, describing the inputs used by these
 - `model` and `effort` are the manifest's launch overrides, not effective runtime settings;
   both are null in provider-only mode.
 - `workspace` is the manifest workspace or the current directory, or null if the scope-only
-  current-directory lookup fails. The version probe runs in a scratch directory, so this
-  field does not name every probe's working directory.
+  current-directory lookup fails. The provider's `--version` probe runs in a scratch
+  directory, except the one that decides `terminal_selection` inside an hc terminal (below),
+  which runs as `ask`'s does, in the directory you run `doctor` from; some provider checks
+  run in this workspace. This field does not name every probe's working directory.
 - `probe` records whether `--probe` was requested. `probe_budget_ms` is the shared 5000 ms
   budget captured at report start, not a fresh allowance for each probe.
 - `consent_state` reuses the `state` from the existing `workspace_consent` observation, or
   is null when that state was not observed, including provider-only mode.
 
 Scope is not proof of an effective runtime configuration or of delivery.
+
+In provider mode the `terminal_selection` check reports, as `evidence.terminal`, the terminal
+`ask` would choose without `--terminal`. Inside an hc terminal it also has `evidence.fallback`,
+the terminal used where Herdr does not admit the provider. Where the provider's installed
+version decides between the two (today Codex on macOS and Linux), the check carries the
+outcome of the version check: with `--probe` and a version `ask` accepts, the chosen terminal;
+otherwise `terminal` is null, `evidence.herdr_requires` names Herdr's version requirement, and
+the reason is that of the `provider_version` check (`probe_not_requested`,
+`executable_unavailable`, `version_probe_failed`, `version_unsupported` or
+`version_unrecognized`). For that choice alone the version probe runs first, as `ask` runs
+it: the same command, in the directory and environment you run `doctor` from, read the same
+way, with doctor's output cap and process cleanup. Otherwise the `--version` probe runs in a
+scratch directory, with `AGENT_BRIDGE_NATIVE_SESSION_DIR` removed besides the provider's own
+removals, after the terminal checks. Doctor never checks that it runs inside the calling Herdr
+terminal, which `ask` does before it launches on Herdr.
 
 On Linux, the `platform` check reports a supported platform. When the default selection is tmux, the `tmux` check reports
 `tmux_found`, `tmux_too_old`, or `tmux_unavailable`. tmux must be executable on an absolute
@@ -1961,8 +1978,10 @@ Provider trust lookup follows these environment settings:
 - `CLAUDE_CONFIG_DIR`: read `.claude.json` here; the default directory is home.
 - `PI_CODING_AGENT_DIR`: read `trust.json` here; the default is `.pi/agent` under home.
 
-On Linux and macOS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr.
-On Windows they select Herdr for Claude, Agy and Pi; Codex keeps the managed console.
+On every OS, a nonempty `HC_TERMINAL_ID` together with `TERM_PROGRAM=ghostty` selects Herdr
+for a provider that can run there at its installed version, and otherwise the terminal the OS
+would choose with the Herdr marker ignored: Ghostty on macOS, tmux on Linux, the managed
+console on Windows (Codex below stable 0.169.0 on macOS and Linux, and Codex on Windows).
 Otherwise Linux uses tmux. On macOS,
 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, and `TERM_SESSION_ID` select the terminal as
 described under [terminal selection](terminals.md#selection-and-settings).

@@ -55,7 +55,9 @@ below explain its workspace-trust requirements and delivery limits.
 
 Install and sign in to `codex`. You need 0.147.0 or newer to launch, and 0.149.0 or newer for
 follow-ups. On Herdr, stable 0.169.0 or newer is required and TAB passes `--no-daemon` so
-tool processes stay inside the hc terminal. Other surfaces keep their existing launch flags.
+tool processes stay inside the hc terminal; inside an hc terminal an older Codex gets the OS's
+own terminal instead, and `--terminal herdr` refuses it. Other surfaces keep their existing
+launch flags.
 Open the project in Codex first and resolve its workspace-trust prompt.
 
 On macOS and Linux, TAB passes the initial prompt as a launch argument. On native Windows, it waits for
@@ -783,7 +785,8 @@ for those providers. Warp has automated tests. The [0.1.1 check][mac11] returned
 instance list; Warp was not exercised for [0.1.2][mac12] or the 0.4.9 and Ghostty 1.4.0 Mac runs (#63, #87).
 On Windows Herdr, Codex is refused before any session exists: its Windows initial prompt is a
 console paste submitted against the exact screen, and a Windows command line cannot carry the
-prompt as a launch argument. Claude, Agy and Pi run there; only Pi has a live run (an early
+prompt as a launch argument. Inside an hc terminal the automatic choice gives Codex the managed
+console. Claude, Agy and Pi run there; only Pi has a live run (an early
 candidate, 2026-11-18). Agy's Windows readiness needs a log line measured on the console only;
 without it the paste is withheld and reported not sent.
 Linux requires tmux 3.2 or later for tmux, or a running local Herdr Core for Herdr. Neither surface answers workspace-trust dialogs; trust the workspace

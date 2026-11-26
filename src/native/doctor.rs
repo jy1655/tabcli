@@ -10,7 +10,9 @@ use super::{NativeCommand, consent, provider, query, reopen, session_start, term
 use crate::native::clock::SystemClock;
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::process_env::{PROBE_TIMEOUT, probe};
-use crate::native::provider_installation::{Executable, read_version_probe, resolve_provider};
+use crate::native::provider_installation::{
+    Executable, read_installed_version, read_version_probe, resolve_provider,
+};
 use crate::native::query::request::RequestState;
 use crate::native::session::Reader;
 use crate::native::session::launch;
@@ -20,7 +22,9 @@ use crate::native::session::schema::SessionManifest;
 use agent_bridge::PUBLIC_COMMAND;
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Result, bail};
-use installation::{VersionProbe, executable_check, version_check, workspace_check};
+use installation::{
+    VersionOutcome, VersionProbe, executable_check, version_check, version_outcome, workspace_check,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::str::FromStr;
@@ -149,6 +153,222 @@ fn tmux_check(probe: bool, deadline: Instant) -> Check {
     }
 }
 
+// The provider-installation rows, and what they observed: the executable a probe may run,
+// the version text a --probe read, and the outcome of that probe.
+struct Installation {
+    executable_row: Check,
+    executable: Option<std::path::PathBuf>,
+    version_row: Check,
+    version: Option<String>,
+    outcome: VersionOutcome,
+}
+
+// How doctor runs a provider's `--version` probe.
+#[derive(Clone, Copy)]
+enum VersionRun {
+    // Isolated like doctor's other `--version` probes (`process_env::probe`): a scratch
+    // directory, and `AGENT_BRIDGE_NATIVE_SESSION_DIR` removed besides the adapter's removals.
+    Isolated,
+    // As the launch runs it, because its version decides the Surface `ask` would choose: the
+    // launch's own command and reading (`read_installed_version`), in the invoking directory
+    // and environment, under doctor's diagnostic limits (`process_env::probe_output`).
+    Launch,
+}
+
+// The executable is the manifest's in session mode and a PATH lookup otherwise; its version
+// is read only with --probe, within the shared deadline, as `run` says.
+fn observe_installation(
+    provider: FirstPartyCli,
+    manifest: Option<&SessionManifest>,
+    probe_requested: bool,
+    run: VersionRun,
+    deadline: Instant,
+) -> Installation {
+    let resolved = match manifest {
+        Some(manifest) => Ok(manifest.provider_path.clone()),
+        None => resolve_provider(provider),
+    };
+    let (executable_row, executable) = executable_check(resolved.map(Executable::observe));
+    let version_probe = if !probe_requested {
+        VersionProbe::NotRequested
+    } else if let Some(path) = &executable {
+        let report = match run {
+            VersionRun::Isolated => probe(
+                path,
+                &["--version"],
+                None,
+                provider::probe_environment_removals(provider),
+                deadline,
+            )
+            .map(|output| read_version_probe(provider, &output)),
+            VersionRun::Launch => read_installed_version(provider, path, |command, _| {
+                crate::native::process_env::probe_output(command, deadline)
+            }),
+        };
+        match report {
+            Ok(report) => VersionProbe::Completed(report),
+            Err(error) => VersionProbe::Failed(error),
+        }
+    } else {
+        VersionProbe::NoExecutable
+    };
+    let outcome = version_outcome(&version_probe);
+    let (version_row, version) = version_check(provider, version_probe);
+    Installation {
+        executable_row,
+        executable,
+        version_row,
+        version,
+        outcome,
+    }
+}
+
+// The Surface `ask` would start `provider` on without `--terminal`, decided by the decision
+// `ask` makes (`session_start::automatic_surface`, then `admit_choice` with the version), and
+// that Surface when one is known. Where the provider's version decides it, `version` is the
+// outcome of the launch's own version probe. The caller check of an automatic Herdr choice is
+// not run: doctor opens no connection to a core.
+fn terminal_selection_check(
+    provider: FirstPartyCli,
+    chosen: Result<(terminal::Selection, session_start::EarlyChoice)>,
+    version: Option<&VersionOutcome>,
+) -> (Check, Option<terminal::TerminalKind>) {
+    use Availability::*;
+    use session_start::EarlyChoice;
+    const DEFAULT: &str =
+        "Default terminal selection from the launch adapter; no app was opened or controlled.";
+    const NEXT: &str = "An explicit ask --terminal can select another supported host; live surface availability has not been tested.";
+    const CALLER: &str =
+        "ask also verifies that it runs in the calling Herdr terminal, which doctor does not check";
+    let failed = |error: anyhow::Error| {
+        (
+            Check::new(
+                CheckId::TERMINAL_SELECTION,
+                Unavailable,
+                Reason::TERMINAL_SELECTION_FAILED,
+                DEFAULT,
+                NEXT,
+            )
+            .evidence(json!({"error": format!("{error:#}")})),
+            None,
+        )
+    };
+    let (selection, admitted, by_version) = match chosen {
+        Err(error) => return failed(error),
+        Ok((selection, EarlyChoice::Known(admitted))) => (selection, admitted, false),
+        Ok((
+            selection,
+            EarlyChoice::ByVersion {
+                fallback,
+                requirement,
+            },
+        )) => {
+            let undecided = |availability, reason, why: &str, next: String| {
+                (
+                    Check::new(
+                        CheckId::TERMINAL_SELECTION,
+                        availability,
+                        reason,
+                        format!(
+                            "Inside Herdr the automatic choice is Herdr where the installed version is {requirement}, and {} otherwise; {why}. No app was opened or controlled.",
+                            fallback.display_name()
+                        ),
+                        next,
+                    )
+                    .evidence(json!({
+                        "terminal": null,
+                        "fallback": fallback,
+                        "herdr_requires": requirement,
+                    })),
+                    None,
+                )
+            };
+            match version {
+                Some(VersionOutcome::Supported(text)) => {
+                    match session_start::admit_choice(provider, selection, Some(text)) {
+                        Ok(admitted) => (selection, admitted, true),
+                        Err(error) => return failed(error),
+                    }
+                }
+                None | Some(VersionOutcome::NotRequested) => {
+                    return undecided(
+                        Unknown,
+                        Reason::PROBE_NOT_REQUESTED,
+                        "the version was not read",
+                        format!(
+                            "Add --probe to read the provider version as ask reads it, from the directory you launch from. {NEXT}"
+                        ),
+                    );
+                }
+                Some(VersionOutcome::NoExecutable) => {
+                    return undecided(
+                        Unknown,
+                        Reason::EXECUTABLE_UNAVAILABLE,
+                        "no executable could be probed, and ask fails before it chooses a terminal",
+                        "Inspect the provider_executable check.".to_owned(),
+                    );
+                }
+                Some(VersionOutcome::Failed) => {
+                    return undecided(
+                        Unknown,
+                        Reason::VERSION_PROBE_FAILED,
+                        "the version probe produced no version, and ask's own probe decides before it chooses a terminal",
+                        "Inspect the provider_version check.".to_owned(),
+                    );
+                }
+                Some(VersionOutcome::Refused { too_old }) => {
+                    return undecided(
+                        if *too_old { Unavailable } else { Unknown },
+                        if *too_old {
+                            Reason::VERSION_UNSUPPORTED
+                        } else {
+                            Reason::VERSION_UNRECOGNIZED
+                        },
+                        "ask refuses the version read here before it chooses a terminal",
+                        "Inspect the provider_version check.".to_owned(),
+                    );
+                }
+            }
+        }
+    };
+    let kind = admitted.kind;
+    let (availability, reason) = if kind.supported_on_this_platform() {
+        (Available, Reason::TERMINAL_SELECTED)
+    } else {
+        (Unavailable, Reason::TERMINAL_UNSUPPORTED)
+    };
+    let mut evidence = json!({"terminal": kind});
+    let detail = match selection {
+        terminal::Selection::Kind(_) => DEFAULT.to_owned(),
+        terminal::Selection::Herdr { fallback } => {
+            evidence["fallback"] = json!(fallback);
+            match (admitted.herdr_refusal, by_version) {
+                (Some(refusal), _) => format!(
+                    "Inside Herdr the automatic choice is {}, the terminal chosen outside Herdr, because {refusal:#}. No app was opened or controlled.",
+                    fallback.display_name()
+                ),
+                (None, true) => format!(
+                    "Inside Herdr the automatic choice is Herdr for the version read here; {CALLER}. No app was opened or controlled."
+                ),
+                (None, false) => format!(
+                    "Inside Herdr the automatic choice is Herdr for this provider; {CALLER}. No app was opened or controlled."
+                ),
+            }
+        }
+    };
+    (
+        Check::new(
+            CheckId::TERMINAL_SELECTION,
+            availability,
+            reason,
+            detail,
+            NEXT,
+        )
+        .evidence(evidence),
+        Some(kind),
+    )
+}
+
 // Keep record reads and probes interleaved in their original order. record_checks
 // releases its snapshot before any surface or provider probe uses the shared deadline.
 fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnosis> {
@@ -198,30 +418,32 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         });
     let mut observations = json!({});
     let mut selected_terminal = None;
-    if request.provider.is_some() {
-        // Selection only: an automatic Herdr choice is not admitted here.
-        let selected = session_start::select_surface(None, request.provider);
-        selected_terminal = selected.as_ref().ok().copied();
-        let (availability, reason, evidence) = match selected {
-            Ok(kind) if kind.supported_on_this_platform() => (
-                Available,
-                Reason::TERMINAL_SELECTED,
-                json!({"terminal": kind}),
-            ),
-            Ok(kind) => (
-                Unavailable,
-                Reason::TERMINAL_UNSUPPORTED,
-                json!({"terminal": kind}),
-            ),
-            Err(error) => (
-                Unavailable,
-                Reason::TERMINAL_SELECTION_FAILED,
-                json!({"error": format!("{error:#}")}),
-            ),
-        };
-        checks.push(Check::new(CheckId::TERMINAL_SELECTION, availability, reason,
-            "Default terminal selection from the launch adapter; no app was opened or controlled.",
-            "An explicit ask --terminal can select another supported host; live surface availability has not been tested.").evidence(evidence));
+    let mut installation = None;
+    if let Some(provider) = request.provider {
+        let chosen = session_start::automatic_surface(provider);
+        // Where the provider's version decides the Surface (inside hc), provider-only mode
+        // observes the executable and, with --probe, reads its version first, through the
+        // launch's own probe. Everywhere else the probe keeps its place and its isolation. The
+        // rows keep their places in the report.
+        if matches!(
+            chosen,
+            Ok((_, session_start::EarlyChoice::ByVersion { .. }))
+        ) {
+            installation = Some(observe_installation(
+                provider,
+                None,
+                request.probe,
+                VersionRun::Launch,
+                deadline,
+            ));
+        }
+        let (check, selected) = terminal_selection_check(
+            provider,
+            chosen,
+            installation.as_ref().map(|observed| &observed.outcome),
+        );
+        selected_terminal = selected;
+        checks.push(check);
         #[cfg(windows)]
         checks.push(match terminal::windows_powershell_executable() {
             Ok(path) => Check::new(
@@ -295,32 +517,20 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     let mut scope_workspace = None;
     let mut consent_state = Value::Null;
     if let Some(provider) = provider {
-        let resolved = match &manifest {
-            Some(manifest) => Ok(manifest.provider_path.clone()),
-            None => resolve_provider(provider),
-        };
-        let (check, usable) = executable_check(resolved.map(Executable::observe));
-        checks.push(check);
-        executable = usable;
-        let version_probe = if !request.probe {
-            VersionProbe::NotRequested
-        } else if let Some(path) = &executable {
-            match probe(
-                path,
-                &["--version"],
-                None,
-                provider::probe_environment_removals(provider),
+        let observed = match installation.take() {
+            Some(observed) => observed,
+            None => observe_installation(
+                provider,
+                manifest.as_ref(),
+                request.probe,
+                VersionRun::Isolated,
                 deadline,
-            ) {
-                Ok(output) => VersionProbe::Completed(read_version_probe(provider, &output)),
-                Err(error) => VersionProbe::Failed(error),
-            }
-        } else {
-            VersionProbe::NoExecutable
+            ),
         };
-        let (check, version) = version_check(provider, version_probe);
-        checks.push(check);
-        current_version = version;
+        checks.push(observed.executable_row);
+        executable = observed.executable;
+        checks.push(observed.version_row);
+        current_version = observed.version;
         let workspace = manifest
             .as_ref()
             .map(|m| m.workspace.clone())

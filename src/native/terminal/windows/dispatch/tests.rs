@@ -310,7 +310,7 @@ mod herdr_core {
         fn current_pid(&self) -> u32 {
             unreachable!("no caller is verified without a core")
         }
-        fn parent_pid(&self, _: u32) -> Result<Option<u32>> {
+        fn parent_pid(&self, _: u32) -> Result<herdr::Parent> {
             unreachable!("no caller is verified without a core")
         }
         fn process_start(&self, _: u32) -> Result<Option<HerdrHostBirth>> {
