@@ -478,6 +478,32 @@ fn a_session_directory_the_launcher_cannot_read_is_left_to_the_launch_host() {
     refuse_before_core_launch(&directory, TerminalKind::Herdr, None).unwrap();
 }
 
+// The Herdr adapter refuses on the core's connection under its own context; the refusal keeps
+// its type there, so the launcher settles it as a refusal and records only its fixed reason.
+#[cfg(unix)]
+#[test]
+fn a_refusal_keeps_its_type_and_fixed_reason_under_the_adapters_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let shared = temp.path().join("session-typed");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o750)).unwrap();
+    let own = HostAccount::of_uid(unsafe { libc::geteuid() });
+    let error = refuse_before_core_launch(&shared, TerminalKind::Herdr, Some(&own))
+        .unwrap_err()
+        .context("the Herdr terminal was not created");
+    let refusal = error
+        .downcast_ref::<super::super::DirectoryRefusal>()
+        .unwrap();
+    assert_eq!(
+        refusal.recorded(),
+        "the Herdr launch host would refuse the session directory"
+    );
+    assert!(
+        format!("{error:#}").contains(&shared.display().to_string()),
+        "{error:#}"
+    );
+}
+
 // A host that a core starts runs as the core: the check is made for the core's account, and
 // when this process's own account would be admitted the refusal names both accounts. When the
 // connection could not name the core's account, the owner is left to the host and only what

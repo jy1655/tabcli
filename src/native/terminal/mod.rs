@@ -389,10 +389,43 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
     }
 }
 
+/// The launch host's refusal of a session directory, which the launcher established before any
+/// Surface existed (`refuse_before_launch`, and the Herdr adapter on the connection that would
+/// create the terminal). It reads as the host's reason, naming the directory, for the caller;
+/// the Session records only `recorded`, a fixed text that names no path.
+#[derive(Debug)]
+pub(in crate::native) struct DirectoryRefusal {
+    host: &'static str,
+    reason: String,
+}
+
+impl DirectoryRefusal {
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn new(host: &'static str, reason: String) -> Self {
+        Self { host, reason }
+    }
+
+    pub(in crate::native) fn recorded(&self) -> String {
+        format!(
+            "the {} launch host would refuse the session directory",
+            self.host
+        )
+    }
+}
+
+impl std::fmt::Display for DirectoryRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for DirectoryRefusal {}
+
 /// The launcher's check before `open_bound_tab`: a session directory that the kind's launch
 /// host would refuse is refused with the host's own reason before any Surface exists, instead
-/// of by the host once its Surface runs (`bound_host::refuse_before_launch`). The launcher
-/// settles the refusal as a failure to open the Surface.
+/// of by the host once its Surface runs (`bound_host::refuse_before_launch`). Only what the
+/// launcher observed is refused; a read that fails leaves the directory to the host. The
+/// launcher settles the refusal (`DirectoryRefusal`) as a failure to open the Surface.
 pub(in crate::native) fn refuse_before_launch(kind: TerminalKind, directory: &Path) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     return bound_host::refuse_before_launch(directory, kind);

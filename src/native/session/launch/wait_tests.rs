@@ -738,6 +738,39 @@ fn a_finished_terminal_never_settles_another_launch_at_its_path() {
     assert!(turn::current_claim_token(&store).unwrap().is_none());
 }
 
+// A refusal before any Surface waits out a lifecycle lock that another holder keeps only until
+// the launch's own deadline; past it the held lock keeps the Claim and the records as they
+// are, as for every failure to open a Surface, and the caller is given the refusal with that
+// outcome.
+#[test]
+fn a_refusal_keeps_the_claim_once_its_launch_budget_is_spent_on_a_held_lock() {
+    let (_dir, store, token) = fixture();
+    let before = store.status().unwrap();
+    let lock = store.lock().unwrap();
+    let start = Instant::now();
+    let mut clock = Simulated {
+        now: Rc::new(Cell::new(start)),
+        sleeps: Vec::new(),
+    };
+    let error = refused_before_surface_with(
+        &store,
+        &token,
+        anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x"),
+        "the Herdr launch host would refuse the session directory",
+        start + Duration::from_millis(250),
+        &mut clock,
+    );
+    drop(lock);
+    assert_eq!(clock.sleeps, [100, 100, 50]);
+    assert_eq!(
+        format!("{error:#}"),
+        "terminal launch failure handoff: terminal launch failed: the Herdr launch host would refuse the session directory; provider startup is in progress; the claim is retained: the Herdr launch host would refuse the session directory /state/x"
+    );
+    let after = store.status().unwrap();
+    assert_eq!((after.state, after.error), (before.state, before.error));
+    assert!(claim_is(&store, &token));
+}
+
 // The production surface observation reaches the terminal's presence check: a surface that
 // no adapter of this platform inspects is an inspection error, never absence.
 #[cfg(not(windows))]

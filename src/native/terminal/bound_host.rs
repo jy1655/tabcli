@@ -246,7 +246,8 @@ fn admit_as_sent<'a>(
 /// The launcher's check before it creates a surface whose launch host runs `admit`: the
 /// same admission, as far as the launcher can establish the host's account
 /// (`judged_by_the_launcher`), on the text the host is given. A refusal here is one the host
-/// would make, so no Surface is created: the launcher settles it as a failure to open one.
+/// would make, so no Surface is created: the launcher settles it as a failure to open one. A
+/// read that fails other than by the directory's absence refuses nothing (`inconclusive`).
 pub(in crate::native::terminal) fn refuse_before_launch(
     directory: &Path,
     kind: TerminalKind,
@@ -259,8 +260,22 @@ pub(in crate::native::terminal) fn refuse_before_launch(
     };
     match admit_as_sent(directory, kind, &spec, judged) {
         Ok(_) => Ok(()),
+        Err(refusal) if inconclusive(&refusal) => Ok(()),
         Err(refusal) => Err(would_refuse(directory, &spec, &refusal, None)),
     }
+}
+
+/// Whether the launcher's admission failed on a read rather than on what a read showed: an I/O
+/// error other than the directory's absence (TAB's own token denied a right, a transient
+/// failure). It says nothing about what the host, which reads the directory again as its own
+/// account, will find, so the launcher leaves the directory to the host.
+fn inconclusive(refusal: &anyhow::Error) -> bool {
+    refusal.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+            || cause.is::<std::string::FromUtf16Error>()
+    })
 }
 
 /// The same check for a host that a running core starts as its own program, judged for
@@ -282,6 +297,9 @@ pub(in crate::native::terminal) fn refuse_before_core_launch(
     let Err(refusal) = admit_as_sent(directory, kind, &spec, judged) else {
         return Ok(());
     };
+    if inconclusive(&refusal) {
+        return Ok(());
+    }
     let advice = core.and_then(|core| {
         HostAccount::current()
             .ok()
@@ -306,7 +324,7 @@ fn would_refuse(
         message.push_str("; ");
         message.push_str(&advice);
     }
-    anyhow::anyhow!(message)
+    anyhow::Error::new(super::DirectoryRefusal::new(spec.name, message))
 }
 
 #[cfg(unix)]
