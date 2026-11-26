@@ -69,40 +69,38 @@
   only in the launch log, and the caller timed out after 31.7 s. The caller refuses only what
   a read showed (an absent directory included): a read that fails otherwise, such as TAB's own
   token denied `READ_CONTROL` or a transient I/O error, refuses nothing, and the host decides
-  as in 0.4.49. A refusal brings forward only the failure that the launch reaches at its
-  deadline without it, and settles as a failure to open the Surface
-  (`launch::refused_before_surface`, with `terminal_failed`'s wording): a reader that holds
-  the lifecycle lock is waited out until the launch's own deadline, and under the lock a Claim
-  that is not this launch's token means the directory at the path is not this launch's, so
-  nothing is written. The caller's error names the directory and the host's reason; the
-  Session records a fixed reason that names no path (`terminal launch failed: the Herdr launch
-  host would refuse the session directory; no surface handle was recorded and no prompt was
-  sent`), and the launch log gets the same line on a best-effort basis. A lock held past the
-  deadline leaves the Session launching and its Claim retained, as for every failure to open a
-  Surface; then only the returned error holds the refusal. No terminal exists either way.
-  What the caller cannot know stays the host's, unchanged from 0.4.49: the directory changed
-  after the check, a program started under another token than the core's own, a read only the
-  host can make. The host logs its refusal as before when it still can (a directory that is
-  gone takes no line), and the launch ends as below when its terminal finishes.
+  as in 0.4.49. A refusal is an early decision (below) and settles as a failure to open the
+  Surface (`launch::refused_before_surface`, with `terminal_failed`'s wording). It is detected
+  at once; returning it can wait for the lifecycle lock up to the launch budget. It is judged
+  once, from what was observed: a directory corrected while TAB waits for the lock is not
+  examined again, and the remedy is to correct the directory and run the command again. The
+  caller's error names the directory and the host's reason. The Session records a fixed reason
+  that names no path (`terminal launch failed: the Herdr launch host would refuse the session
+  directory; no surface handle was recorded and no prompt was sent`), and the launch log gets
+  the same line on a best-effort basis. A lock held until the deadline leaves the Session
+  launching and its Claim retained, as for every failure to open a Surface, and facts that are
+  not this launch's leave nothing written; then only the returned error holds the refusal. No
+  terminal exists either way. What the caller cannot know stays the host's, unchanged from
+  0.4.49: the directory changed after the check, a program started under another token than
+  the core's own, a read only the host can make. The host logs its refusal as before when it
+  still can (a directory that is gone takes no line), and the launch ends as below when its
+  terminal finishes.
 - The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
   (`launch_surface`): the exact terminal with the presence proof, and the launch label when
   the handle records one. A terminal its verified core reports finished before startup was
   confirmed fails the launch at the next successful probe, on every platform, as a tmux
   surface that disappears does (owner's decision 2026-11-26, option A); this reverses, for a
   host that ended before startup, #409's choice to leave its admission, receipt, binding and
-  Pending-launch refusals to the launch deadline. It brings forward only the failure that the
-  deadline records for the same launch, so it acts only on certainty
-  (`finished_before_startup`): it holds the lifecycle lock; the Claim at the path is this
-  launch's token; the poll's own reading under that lock, in its precedence (`decided_locked`,
-  then `read_confirmation`: an ended status before a confirmation, a launch-host Record's
-  failure such as `input_flush_failed` or `launch_shell_exec_failed` before a pending launch),
-  still finds the launch pending; and the receipt is still `Pending`, so no provider was started
-  that could still confirm. Then the launch fails through the deadline's settlement
-  (`settle_locked`). Otherwise that probe decides nothing and the wait goes on exactly as for a
-  present surface, whose next poll reads what the records then say: a confirmation, an ended
-  launch or a host Record published during the probe keeps its own outcome, and a lock held at
-  every probe, another launch's Claim at the path or a `Spawning` receipt leaves the launch to
-  its confirmation or its deadline, as in 0.4.49. The Session records the fixed reason
+  Pending-launch refusals to the launch deadline. It is an early decision (below,
+  `finished_before_startup`): a `Pending` receipt also means that no provider was started that
+  could still confirm, so a `Spawning` receipt is left to its confirmation or its deadline. The
+  ordinary poll's reading that it requires is read without its write: a launch-host Record's
+  failure (`input_flush_failed`, `launch_shell_exec_failed`) is left to the ordinary poll to
+  publish, and a Record that cannot be read is no evidence (`host_record_pending`). Then the
+  launch fails through the deadline's settlement (`settle_locked`). A deferred decision resumes
+  ordinary polling: a later confirmation still succeeds, a provider or host failure still ends
+  the wait with its own reason, and a lock held at every probe leaves the launch to its
+  deadline. The Session records the fixed reason
   `terminal surface finished before provider launch was confirmed`; the error returned to the
   caller adds the core's report and the launch log's path, `(Herdr terminal t7 exited with code
   N); see the launch log <path>`; nothing is read from the log. The exit code is the core's
@@ -111,6 +109,32 @@
   released, its receipt pending and its surface handle kept, so `close-session` removes the
   finished terminal (`terminal.rm`). Creation removes a created terminal that its last live read
   finds finished; one that finishes after that read is bound, and this probe ends the launch.
+- Early launch decisions: the directory refusal before any Surface (every bound host) and the
+  finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
+  owner's decision, a different outcome from waiting for the deadline whenever the world
+  changes in between; the bar for both (2026-11-26):
+  (a) An early decision is taken only from facts read under the lifecycle lock at the moment of
+  the decision, about this launch's own records: the Claim at the path is this launch's token,
+  the launch receipt carries the same token and is pending, the status is `Launching`
+  (`pending::judge`), and the ordinary poll's reading says pending. Nothing is written,
+  created or re-permissioned before that is established: the lock is taken from the existing
+  lock file, without creating it or changing its permissions (`Store::try_lock_existing`).
+  (b) When any of those facts cannot be read, or is not as required, the early decision does
+  nothing: the wait goes on to its next ordinary poll, and the existing paths decide (a refusal
+  is returned without writing). An observation that is inconclusive is never evidence.
+  (c) Once taken on those facts, the decision stands, even if the world changes afterwards.
+  That is what "fails at once" means, and it is the owner's decision.
+  (d) An early decision never acts after the launch deadline (`Expiry::BudgetOrReceipt`, also
+  checked after the core's reply and before a retried lock is accepted); from then on only the
+  existing deadline path acts.
+  The fixed reasons are what `status.json`, the closed record and `launch.log` hold, which is
+  what `residual_surface()` and the status readers interpret. The returned error keeps the
+  directory, the terminal and the launch log's path, and reopen's refusal record keeps that
+  full error as its detail, as for every failed launch since 0.4.49. A later reopen of the same
+  source that settles a refused launch still launching with its Claim
+  (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`) writes that detail into
+  the status error; an early refusal leaves a launch so only when it wrote nothing (a lock held
+  until the deadline, facts not this launch's).
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface

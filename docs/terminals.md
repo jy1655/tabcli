@@ -202,9 +202,9 @@ elevated TAB, such as an administrator's SSH session, normally gives the directo
 Administrators group as owner, which the host of a core that is not elevated refuses: run TAB
 without elevation, as the core runs. A refusal only the host can know, such as a directory
 changed after TAB's check, goes to the launch log when the host can still write it; once the
-core reports the terminal finished, the start fails at TAB's next successful check of the
-terminal, normally about a second later, and its error names the launch log. `close-session`
-removes the finished terminal.
+core reports the terminal finished, the start fails at TAB's next check of the terminal,
+normally about a second later, when TAB can read that the launch is still its own and pending,
+and its error names the launch log. `close-session` removes the finished terminal.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."
