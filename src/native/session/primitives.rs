@@ -15,7 +15,7 @@ pub(in crate::native) use durable::{
 #[cfg(test)]
 pub(in crate::native) use durable::{
     SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
-    with_publication_read_log, with_sync_failure, with_sync_log,
+    with_publication_read_log, with_sync_delay, with_sync_failure, with_sync_log,
 };
 #[cfg(any(unix, windows))]
 pub(in crate::native) use durable::{
@@ -26,10 +26,9 @@ pub(in crate::native) use locks::{
 };
 #[allow(unused_imports)]
 pub(in crate::native) use state_root::{
-    StateRootDurabilityReceipt, create_directory, create_directory_after, create_state_root,
-    default_state_root, home_directories, same_directory, session_directory, session_directory_in,
-    state_root, state_root_durability_receipt_present, sync_state_root_ancestry,
-    validate_hook_directory,
+    StateRootDurabilityReceipt, create_directory, create_state_root, default_state_root,
+    home_directories, same_directory, session_directory, session_directory_in, state_root,
+    state_root_durability_receipt_present, sync_state_root_ancestry, validate_hook_directory,
 };
 
 pub(in crate::native) const STATE_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_STATE_DIR";

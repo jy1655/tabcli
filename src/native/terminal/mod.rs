@@ -390,15 +390,14 @@ fn herdr_environment(marker: bool, term_program: Option<&str>) -> bool {
 }
 
 /// The caller check of an automatic Herdr choice, before any session is created: the caller's
-/// `HC_TERMINAL_ID` must name a live terminal of the running core that this process runs in,
-/// or the launch is refused without opening another terminal. Any other selection has nothing
-/// to prove here. The check ends by `deadline`, the request's, or sooner by its own bound.
-pub(super) fn admit_selection(selection: Selection, deadline: Instant) -> Result<()> {
+/// `HC_TERMINAL_ID` must name a live terminal of the running core that this process runs in.
+/// Any other selection has nothing to prove here.
+pub(super) fn admit_selection(selection: Selection) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     if let Selection::Herdr { .. } = selection {
-        return herdr::verify_caller_terminal(deadline);
+        return herdr::verify_caller_terminal();
     }
-    let _ = (selection, deadline);
+    let _ = selection;
     Ok(())
 }
 

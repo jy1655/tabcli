@@ -1050,14 +1050,8 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
     ))
 }
 
-/// The caller check with this machine's core. Its calls to the core wait for reply bytes only
-/// until the earlier of `deadline` (the request's) and its own bound (on Windows a pipe
-/// operation cancelled there is waited for before its buffer is released, and a reply
-/// received just before the deadline can finish decoding after it); its other steps
-/// (endpoint discovery, the connection apart from the Windows pipe's busy wait, the walk of
-/// parents) are not bounded by the deadline, as in 0.4.49.
-pub(in crate::native::terminal) fn verify_caller_terminal(deadline: Instant) -> Result<()> {
-    verify_caller(&Installed, deadline_after(CALLER_TIMEOUT)?.min(deadline))
+pub(in crate::native::terminal) fn verify_caller_terminal() -> Result<()> {
+    verify_caller(&Installed, deadline_after(CALLER_TIMEOUT)?)
 }
 
 /// The launch host's check, registered for Herdr: the bound surface names the terminal that

@@ -1,8 +1,8 @@
 use super::*;
+use crate::native::create_session_within;
 use crate::native::query;
 use crate::native::session::test_support::STATUS_LOCK_FILE;
 use crate::native::session::{CoreRecord, close};
-use crate::native::{create_session_until, create_session_within};
 use std::fs;
 
 struct Fixture {
@@ -66,7 +66,7 @@ impl Fixture {
                 .map(|requested| consent::assess(self.root.path(), requested))
                 .transpose()?,
         );
-        let (prepared, ()) = resolved.create_with(|spec, consent, _| {
+        let (prepared, ()) = resolved.create_with(|spec, consent| {
             let created =
                 create_session_within(self.root.path(), &[self.root.path().to_owned()], spec)?;
             // Stop before any terminal or provider could be launched.
@@ -558,10 +558,9 @@ mod resolution {
                             &request,
                             context::resolve(&[]).unwrap(),
                             terminal::Selection::Kind(SELECTED),
+                            CallerCheck::NotNeeded,
                         ),
-                        far(),
                         probe,
-                        explicit_caller,
                     )
                 }
                 Self::Reopen => {
@@ -583,11 +582,9 @@ mod resolution {
                             FirstPartyCli::Codex,
                             workspace,
                             terminal::Selection::Kind(SELECTED),
-                            None,
+                            CallerCheck::NotNeeded,
                         ),
-                        far(),
                         probe,
-                        explicit_caller,
                     )
                 }
             }
@@ -1229,13 +1226,12 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
                     &ask,
                     context::resolve(&[]).unwrap(),
                     terminal::Selection::Kind(surface),
+                    CallerCheck::NotNeeded,
                 ),
-                far(),
                 |_| match version {
                     Some(version) => Ok((PathBuf::from("provider-fixture"), version.to_owned())),
                     None => panic!("probe must not run before early refusal"),
                 },
-                explicit_caller,
             )
         };
     let assert_no_sessions = || {
@@ -1372,22 +1368,28 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
     // otherwise the Surface this platform chooses outside Herdr, with that Surface's own
     // initial Transport. Neither admission refuses it.
     //
-    // The caller check comes once, as soon as the choice is known to be Herdr: before the
-    // workspace and the probe where no version can change the choice (Claude, Agy, Pi; Codex
-    // never reaches Herdr on Windows), after the probe and only for Herdr where it can (Codex
-    // off Windows). Its refusal ends the resolution before the title.
+    // The caller check runs where 0.4.49 ran it, before the workspace and the probe, for every
+    // provider that can end on Herdr (Codex on Windows cannot). Where no version can change the
+    // choice (Claude, Agy, Pi) a failed check refuses there; where the version decides (Codex
+    // off Windows) its outcome waits for the version: it refuses a choice that ends on Herdr,
+    // after the probe and before the title, and is ignored by one that takes the fallback.
     let fallback = platform_fallback();
+    let selection = terminal::Selection::Herdr { fallback };
     let checks = std::cell::Cell::new(0);
     let probes = std::cell::Cell::new(0);
     let automatic = |provider, workspace: &Path, version: Option<&str>, caller_ok: bool| {
         let ask = request(provider, workspace, Some("   "));
+        let caller = check_caller(selection, Some(provider), |given| {
+            assert_eq!(given, selection);
+            checks.set(checks.get() + 1);
+            if caller_ok {
+                Ok(())
+            } else {
+                bail!("the caller check refused")
+            }
+        })?;
         resolve_with(
-            fresh_resolution(
-                &ask,
-                context::resolve(&[]).unwrap(),
-                terminal::Selection::Herdr { fallback },
-            ),
-            far(),
+            fresh_resolution(&ask, context::resolve(&[]).unwrap(), selection, caller),
             |_| {
                 probes.set(probes.get() + 1);
                 match version {
@@ -1395,19 +1397,10 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
                     None => panic!("the probe must not run before the workspace is resolved"),
                 }
             },
-            |selection, _| {
-                assert_eq!(selection, terminal::Selection::Herdr { fallback });
-                checks.set(checks.get() + 1);
-                if caller_ok {
-                    Ok(())
-                } else {
-                    bail!("the caller check refused")
-                }
-            },
         )
     };
-    // A missing workspace: Codex's choice needs the version, so nothing is checked before the
-    // workspace; Claude's does not, so its caller is checked first, as in 0.4.49.
+    // A missing workspace: Codex's failed check (off Windows) waits for its version, so the
+    // workspace refuses; Claude's refuses first, as in 0.4.49.
     let error = automatic(FirstPartyCli::Codex, &missing, None, false)
         .err()
         .expect("a missing workspace refuses");
@@ -1415,46 +1408,41 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         error.to_string().contains("workspace does not exist"),
         "{error:#}"
     );
-    assert_eq!(checks.get(), 0);
+    assert_eq!(checks.get(), usize::from(!cfg!(windows)));
+    let checked = checks.get();
     let error = automatic(FirstPartyCli::Claude, &missing, None, false)
         .err()
         .expect("the caller check refuses first");
     assert_eq!(error.to_string(), "the caller check refused");
-    assert_eq!((checks.get(), probes.get()), (1, 0));
-    for (provider, version, herdr, early) in [
-        (
-            FirstPartyCli::Codex,
-            "codex-cli 0.169.0",
-            !cfg!(windows),
-            false,
-        ),
+    assert_eq!((checks.get(), probes.get()), (checked + 1, 0));
+    for (provider, version, herdr) in [
+        (FirstPartyCli::Codex, "codex-cli 0.169.0", !cfg!(windows)),
         (
             FirstPartyCli::Codex,
             "OpenAI Codex (v0.170.0)",
             !cfg!(windows),
-            false,
         ),
-        (FirstPartyCli::Codex, "codex-cli 0.168.0", false, false),
-        (
-            FirstPartyCli::Codex,
-            "codex-cli 0.170.0-alpha.1",
-            false,
-            false,
-        ),
-        (FirstPartyCli::Codex, "codex-cli 0.170.0+", false, false),
-        (FirstPartyCli::Claude, "2.1.302", true, true),
-        (FirstPartyCli::Agy, "fixture", true, true),
-        (FirstPartyCli::Pi, "fixture", true, true),
+        (FirstPartyCli::Codex, "codex-cli 0.168.0", false),
+        (FirstPartyCli::Codex, "codex-cli 0.170.0-alpha.1", false),
+        (FirstPartyCli::Codex, "codex-cli 0.170.0+", false),
+        (FirstPartyCli::Claude, "2.1.302", true),
+        (FirstPartyCli::Agy, "fixture", true),
+        (FirstPartyCli::Pi, "fixture", true),
     ] {
         let case = format!("{provider:?} {version}");
-        // A caller that fails the check refuses only a launch on Herdr, before the probe where
-        // no version can change the choice.
+        let codex = provider == FirstPartyCli::Codex;
+        // A caller that fails the check refuses only a launch on Herdr: before the probe where
+        // no version can change the choice, after it where the version decides.
         let (checked, probed) = (checks.get(), probes.get());
         let refused = automatic(provider, &project, Some(version), false)
             .err()
             .expect("the blank title or the caller check refuses");
-        assert_eq!(checks.get(), checked + usize::from(herdr), "{case}");
-        assert_eq!(probes.get(), probed + usize::from(!early), "{case}");
+        assert_eq!(
+            checks.get(),
+            checked + usize::from(!(codex && cfg!(windows))),
+            "{case}"
+        );
+        assert_eq!(probes.get(), probed + usize::from(codex), "{case}");
         assert_eq!(
             refused.to_string(),
             if herdr {
@@ -1466,15 +1454,10 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
         );
         // A verified caller: the Surface and its initial Transport.
         let ask = request(provider, &project, None);
+        let caller = check_caller(selection, Some(provider), |_| Ok(())).unwrap();
         let resolved = resolve_with(
-            fresh_resolution(
-                &ask,
-                context::resolve(&[]).unwrap(),
-                terminal::Selection::Herdr { fallback },
-            ),
-            far(),
+            fresh_resolution(&ask, context::resolve(&[]).unwrap(), selection, caller),
             |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
-            |_, _| Ok(()),
         )
         .unwrap_or_else(|error| panic!("{case}: {error:#}"));
         assert_eq!(
@@ -1486,7 +1469,7 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             },
             "{case}"
         );
-        if provider == FirstPartyCli::Codex {
+        if codex {
             assert_eq!(
                 resolved.initial_transport.facts().name,
                 if cfg!(windows) {
@@ -1498,79 +1481,28 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             );
         }
     }
-
-    // The caller check is given the request's deadline, and one that fails once it has passed
-    // is reported as timed out.
-    let deadline = Instant::now();
-    let ask = request(FirstPartyCli::Pi, &project, None);
-    let error = resolve_with(
-        fresh_resolution(
-            &ask,
-            context::resolve(&[]).unwrap(),
-            terminal::Selection::Herdr { fallback },
-        ),
-        deadline,
-        |_| panic!("Pi's caller is checked before its probe"),
-        |_, given| {
-            assert_eq!(given, deadline);
-            bail!("the core did not answer")
-        },
-    )
-    .err()
-    .expect("the caller check refuses");
-    assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
-    assert!(
-        format!("{error:#}").ends_with("the core did not answer"),
-        "{error:#}"
-    );
-
-    // A resolution that outlives the request's deadline writes nothing at creation: the clock
-    // is read before the creation callback, so the state root keeps its mode and gains no
-    // durability receipt, and no Session directory is allocated.
-    let receipt = root.join("state-root.durable");
-    assert!(!receipt.exists());
-    #[cfg(unix)]
-    let mode = || {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(&root).unwrap().permissions().mode() & 0o777
-    };
-    #[cfg(unix)]
-    let mode_before = mode();
-    let ask = request(FirstPartyCli::Pi, &project, None);
-    let resolved = resolve_with(
-        fresh_resolution(
-            &ask,
-            context::resolve(&[]).unwrap(),
-            terminal::Selection::Kind(fallback),
-        ),
-        Instant::now() + Duration::from_millis(50),
-        |_| Ok((PathBuf::from("provider-fixture"), "fixture".to_owned())),
-        explicit_caller,
-    )
-    .unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    let error = resolved
-        .create_with(|spec, consent, deadline| {
-            let created =
-                create_session_until(&root, std::slice::from_ref(&root), spec, Some(deadline))?;
-            record_consent(&created, consent)?;
-            Ok((created, ()))
-        })
+    // A reopen does not know its provider when it checks: a failed check refuses there.
+    let error = check_caller(selection, None, |_| bail!("the caller check refused"))
         .err()
-        .expect("the deadline refuses creation");
-    assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
-    let text = format!("{error:#}");
-    assert!(text.contains("no Session was created"), "{text}");
-    assert!(!text.contains("nothing was"), "{text}");
-    assert!(!receipt.exists(), "a durability receipt was written");
-    #[cfg(unix)]
-    assert_eq!(mode(), mode_before, "the state root's mode changed");
+        .expect("a reopen's caller check refuses");
+    assert_eq!(error.to_string(), "the caller check refused");
+    // Outside hc, or with an explicit choice, nothing is checked.
+    for explicit in [
+        terminal::Selection::Kind(fallback),
+        terminal::Selection::Kind(terminal::TerminalKind::Herdr),
+    ] {
+        assert!(matches!(
+            check_caller(explicit, Some(FirstPartyCli::Pi), |_| panic!("checked")).unwrap(),
+            CallerCheck::NotNeeded
+        ));
+    }
     assert_no_sessions();
 }
 
-// A caller check that succeeds only after the request's deadline ends the resolution there,
-// at the boundary where 0.4.49's version probe, which followed the caller check, stopped it:
-// nothing is written, the shared workspace-consent store included.
+// A caller check that returns only after the request's deadline is followed, as in 0.4.49, by
+// the version probe, which reads the clock before it starts: the request ends there as timed
+// out and nothing is written, the shared workspace-consent store included. Claude's failed
+// check would refuse at once; Codex's outcome waits for its version (off Windows).
 #[test]
 fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
     use crate::native::failure_kind::{FailureKind, classify};
@@ -1584,6 +1516,29 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
         fs::create_dir_all(&codex_home).unwrap();
         let root = base.path().join("state");
         fs::create_dir(&root).unwrap();
+        // Stand-ins that report a supported version.
+        let bin = base.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for (name, version) in [("claude", "2.1.302"), ("codex", "codex-cli 0.170.0")] {
+            #[cfg(windows)]
+            fs::write(
+                bin.join(format!("{name}.cmd")),
+                format!("@echo off\r\necho {version}\r\n"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let path = bin.join(name);
+                fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let mut path = vec![bin];
+        #[cfg(windows)]
+        path.push(PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"));
+        #[cfg(unix)]
+        path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
         let test_name = format!(
             "{}::a_caller_check_that_ends_after_the_deadline_writes_nothing",
             module_path!()
@@ -1597,6 +1552,7 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
             .env("HOME", base.path())
             .env("USERPROFILE", base.path())
             .env("CODEX_HOME", &codex_home)
+            .env("PATH", std::env::join_paths(path).unwrap())
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("PI_CODING_AGENT_DIR")
             .output()
@@ -1617,50 +1573,9 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
     // temporary directory of macOS lies behind a link.
     let project = project.canonicalize().unwrap();
     let fallback = platform_fallback();
-    // Claude's caller is checked before its probe, Codex's after it (off Windows).
-    let mut cases = vec![(FirstPartyCli::Claude, "2.1.302")];
-    if !cfg!(windows) {
-        cases.push((FirstPartyCli::Codex, "codex-cli 0.170.0"));
-    }
-    for (provider, version) in cases {
-        let ask = AskRequest {
-            provider,
-            workspace: project.clone(),
-            prompt: "fixture prompt".into(),
-            title: None,
-            model: None,
-            effort: None,
-            terminal: None,
-            yolo: false,
-            timeout: Duration::from_secs(30),
-            detach: false,
-            json: false,
-            context_results: Vec::new(),
-        };
-        let error = resolve_with(
-            fresh_resolution(
-                &ask,
-                context::resolve(&[]).unwrap(),
-                terminal::Selection::Herdr { fallback },
-            ),
-            Instant::now() + Duration::from_millis(100),
-            |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
-            |_, _| {
-                std::thread::sleep(Duration::from_millis(200));
-                Ok(())
-            },
-        )
-        .err()
-        .expect("the deadline ends the resolution");
-        assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
-        assert!(
-            !root.join("workspace-consent").exists(),
-            "{provider:?}: the workspace-consent store was written"
-        );
-    }
-    // The same resolution with time left writes the store: the assertion above can fail.
-    let ask = AskRequest {
-        provider: FirstPartyCli::Claude,
+    let selection = terminal::Selection::Herdr { fallback };
+    let ask = |provider| AskRequest {
+        provider,
         workspace: project.clone(),
         prompt: "fixture prompt".into(),
         title: None,
@@ -1673,28 +1588,39 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
         json: false,
         context_results: Vec::new(),
     };
-    resolve_with(
-        fresh_resolution(
-            &ask,
-            context::resolve(&[]).unwrap(),
-            terminal::Selection::Herdr { fallback },
-        ),
-        far(),
-        |_| Ok((PathBuf::from("provider-fixture"), "2.1.302".to_owned())),
-        |_, _| Ok(()),
+    let mut providers = vec![FirstPartyCli::Claude];
+    if !cfg!(windows) {
+        providers.push(FirstPartyCli::Codex);
+    }
+    for provider in providers {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let caller = check_caller(selection, Some(provider), |_| {
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(())
+        })
+        .unwrap();
+        let request = ask(provider);
+        let error = resolve(
+            fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
+            deadline,
+        )
+        .err()
+        .expect("the deadline ends the resolution");
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+        assert!(
+            !root.join("workspace-consent").exists(),
+            "{provider:?}: the workspace-consent store was written"
+        );
+    }
+    // The same resolution with time left writes the store: the assertion above can fail.
+    let request = ask(FirstPartyCli::Claude);
+    let caller = check_caller(selection, Some(FirstPartyCli::Claude), |_| Ok(())).unwrap();
+    resolve(
+        fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
+        Instant::now() + Duration::from_secs(30),
     )
     .unwrap();
     assert!(root.join("workspace-consent").exists());
-}
-
-// A deadline no test reaches.
-fn far() -> Instant {
-    Instant::now() + Duration::from_secs(3600)
-}
-
-// An explicit choice, or an automatic one outside hc, is never checked against the caller.
-fn explicit_caller(selection: terminal::Selection, _: Instant) -> Result<()> {
-    panic!("{selection:?} is not checked against the caller")
 }
 
 // The Surface this platform chooses outside Herdr, the fallback of an automatic Herdr choice
@@ -1827,10 +1753,9 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
                 &ask,
                 context::resolve(&[]).unwrap(),
                 terminal::Selection::Kind(surface),
+                CallerCheck::NotNeeded,
             ),
-            far(),
             |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
-            explicit_caller,
         )
         .unwrap()
     };
@@ -1848,7 +1773,7 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
     };
     assert_eq!(resolved.initial_transport.facts().name, expected_name);
     let (prepared, ()) = resolved
-        .create_with(|spec, consent, _| {
+        .create_with(|spec, consent| {
             let created = create_session_within(&root, std::slice::from_ref(&root), spec)?;
             record_consent(&created, consent)?;
             Ok((created, ()))

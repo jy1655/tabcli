@@ -1,7 +1,6 @@
 //! Reopen's exclusive source reservation and launch-refusal settlement.
 //! A finalized marker is consumed until the refused provider is proven gone; queries only observe.
 use super::gate::{ReopenGate, reopen_refusal, reopen_refusal_gate};
-use crate::native::failure_kind::TimedOut;
 use crate::native::session::primitives::{unix_ms, valid_session_id};
 use crate::native::session::schema::{ProviderProcessRecord, RecordedReopenRefusal, ReopenMarker};
 use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
@@ -14,7 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 mod marker;
@@ -449,49 +448,35 @@ pub(super) fn settle_reopen_outcome(
     (outcome, gate)
 }
 
-// The settlement that an interrupted launch failure of the source's last reopen still owes its
-// child: the marker names that child, its refusal record is a launch failure, and the child is
-// still launching under that launch's Claim. Read without a lock; `retry` settles it under
-// the child's lock only while that still holds.
-pub(super) struct PendingLaunchFence {
-    child: PathBuf,
-    token: String,
-    detail: String,
-}
-
-pub(super) fn pending_launch_fence(source_directory: &Path) -> Option<PendingLaunchFence> {
-    let marker = Reader::open_unchecked(source_directory)
-        .reopen_marker_if_present()
-        .ok()??;
-    let child = marker.reopened_by.filter(|id| valid_session_id(id))?;
-    let child = source_directory.parent()?.join(child);
+pub(super) fn retry_interrupted_launch_fence(source_directory: &Path) -> Result<()> {
+    let marker = Reader::open_unchecked(source_directory).reopen_marker_if_present();
+    let Ok(Some(marker)) = marker else {
+        return Ok(());
+    };
+    let Some(child) = marker.reopened_by.filter(|id| valid_session_id(id)) else {
+        return Ok(());
+    };
+    let child = source_directory
+        .parent()
+        .context("session directory has no state root")?
+        .join(child);
     if !fs::symlink_metadata(&child).is_ok_and(|metadata| metadata.is_dir()) {
-        return None;
+        return Ok(());
     }
-    let refusal = read_reopen_launch_refusal(&child)?;
-    if refusal.gate != ReopenGate::LaunchFailed.as_str() {
-        return None;
-    }
-    let token = refusal.claim_token?;
-    let store = Store::open_unchecked(&child);
-    let launching = store.status().ok()?.state == SessionState::Launching;
-    let current = session::turn::current_claim_token(&store).ok()?;
-    let pending = launching && current.as_deref() == Some(token.as_str());
-    pending.then_some(PendingLaunchFence {
-        child,
-        token,
-        detail: refusal.detail,
-    })
-}
-
-impl PendingLaunchFence {
-    pub(super) fn retry(self) -> Result<()> {
+    let Some(refusal) = read_reopen_launch_refusal(&child) else {
+        return Ok(());
+    };
+    if refusal.gate == ReopenGate::LaunchFailed.as_str() {
         session::launch::retry_failed_start_fence(
-            &Store::open_unchecked(&self.child),
-            &self.token,
-            &self.detail,
-        )
+            &Store::open_unchecked(&child),
+            refusal
+                .claim_token
+                .as_deref()
+                .expect("validated launch token"),
+            &refusal.detail,
+        )?;
     }
+    Ok(())
 }
 
 // Release only the marker naming this refused launch, once its provider is verified gone.
@@ -585,15 +570,6 @@ pub(super) fn verify_reopen_source_is_closed(
     directory: &Path,
     id: &str,
 ) -> Result<Option<marker::StaleReopenMarker>> {
-    verify_reopen_source_is_closed_apart_from_its_marker(directory, id)?;
-    marker::observe(directory)?.into_stale(id)
-}
-
-// The closed tombstone and converged close of the source, without the judgment of its marker.
-pub(super) fn verify_reopen_source_is_closed_apart_from_its_marker(
-    directory: &Path,
-    id: &str,
-) -> Result<()> {
     let closed = Reader::open_unchecked(directory).closed_if_present()?;
     let status = Reader::open_unchecked(directory).status_if_present()?;
     let state = status
@@ -629,7 +605,7 @@ pub(super) fn verify_reopen_source_is_closed_apart_from_its_marker(
             ));
         }
     }
-    Ok(())
+    marker::observe(directory)?.into_stale(id)
 }
 
 // The winner's hold on a closed source. Dropping it before `finalize` removes the marker
@@ -678,66 +654,21 @@ impl Drop for Reservation {
     }
 }
 
-// How long a reservation waits before it tries a held source lock again.
-const LOCK_RETRY: Duration = Duration::from_millis(10);
-
 // Serializes concurrent reopens of one closed source under the source's own turn-claim lock:
 // the closed gates are re-checked under the lock and the marker is created with
 // `create_new`, so exactly one attempt can hold it.
 impl Reservation {
-    // A claim without a request deadline, for tests of the reservation itself.
-    #[cfg(test)]
     pub(super) fn claim(
         directory: &Path,
         id: &str,
         provider_session_id: &str,
     ) -> Result<Reservation> {
-        Self::claim_until(
-            directory,
-            id,
-            provider_session_id,
-            Instant::now() + Duration::from_secs(3600),
-        )
-    }
-
-    // Nothing is reserved once the request's `deadline` has passed: the wait for the source's
-    // lock ends by it, and the clock is read again under the lock right before each write (the
-    // release of a stale marker, the new marker).
-    pub(super) fn claim_until(
-        directory: &Path,
-        id: &str,
-        provider_session_id: &str,
-        deadline: Instant,
-    ) -> Result<Reservation> {
         let path = Reader::open_unchecked(directory)
             .record(CoreRecord::ReopenMarker)
             .path()
             .to_owned();
-        let expired = || {
-            anyhow::Error::new(TimedOut::new(format!(
-                "the request's deadline passed before session {id} could be reserved for reopen; nothing was reserved"
-            )))
-        };
-        let store = Store::open_unchecked(directory);
-        let _lock = loop {
-            if let Some(lock) = store.try_lock()? {
-                break lock;
-            }
-            let Some(left) = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|left| !left.is_zero())
-            else {
-                return Err(expired());
-            };
-            std::thread::sleep(left.min(LOCK_RETRY));
-        };
-        if Instant::now() >= deadline {
-            return Err(expired());
-        }
+        let _lock = Store::open_unchecked(directory).lock()?;
         if let Some(stale) = verify_reopen_source_is_closed(directory, id)? {
-            if Instant::now() >= deadline {
-                return Err(expired());
-            }
             // The gate re-ran under the lock, so the stale marker still names a refused launch
             // whose cleanup is verified now; releasing it here is the reconciliation the
             // crashed or timed-out parent never performed.
@@ -761,9 +692,6 @@ impl Reservation {
             reopened_by: None,
             created_unix_ms: unix_ms(),
         };
-        if Instant::now() >= deadline {
-            return Err(expired());
-        }
         session::RecordStore::at(&path)
             .write_private(&serde_json::to_vec_pretty(&marker)?)
             .map_err(|error| {

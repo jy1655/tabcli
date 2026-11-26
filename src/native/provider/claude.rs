@@ -290,9 +290,29 @@ impl NativeProviderAdapter for ClaudeAdapter {
 struct ClaudeReopen;
 static CLAUDE_REOPEN: ClaudeReopen = ClaudeReopen;
 
+#[cfg(test)]
+thread_local! {
+    static REOPEN_AVAILABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lets a test resolve a Claude reopen past its platform gate where reopen is not implemented
+/// (macOS, Linux), as on native Windows; nothing after the resolution is reached this way.
+#[cfg(test)]
+pub(in crate::native) fn allow_reopen_for_test(allow: bool) {
+    REOPEN_AVAILABLE_FOR_TEST.with(|cell| cell.set(allow));
+}
+
+fn reopen_platform() -> bool {
+    #[cfg(test)]
+    if REOPEN_AVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    cfg!(windows)
+}
+
 impl ReopenSupport for ClaudeReopen {
     fn verify_available(&self, provider_session_id: &str) -> Result<()> {
-        verify_reopen_available_for_platform(provider_session_id, cfg!(windows))?;
+        verify_reopen_available_for_platform(provider_session_id, reopen_platform())?;
         let registry =
             claude_sessions_registry_dir(&super::super::consent::Environment::current())?;
         if let Some(pid) =

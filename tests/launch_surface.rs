@@ -374,11 +374,11 @@ fn terminal_selection(report: &Value) -> &Value {
         .unwrap_or_else(|| panic!("{report}"))
 }
 
-// One rule places the caller check of an automatic Herdr choice. Where the adapter's answer
-// does not depend on the version (Claude, Agy, Pi), Herdr is the choice before anything is
-// resolved and the caller is checked first, before the workspace and the provider's probe, as
-// in 0.4.49. Where it does (Codex), the caller is checked after the probe and only for a
-// choice that ends on Herdr. An explicit Herdr is never checked against the caller.
+// The caller check of an automatic Herdr choice runs where 0.4.49 ran it, before the workspace
+// and the provider's probe. Where the adapter's answer does not depend on the version (Claude,
+// Agy, Pi) a failed check refuses there. Where it does (Codex off Windows) its outcome waits
+// for the version: the workspace and the probe come first, and the check's refusal applies
+// only to a choice that ends on Herdr. An explicit Herdr is never checked against the caller.
 #[test]
 fn ask_checks_the_caller_first_where_no_version_can_change_the_choice() {
     let fixture = Fixture::new();
@@ -403,7 +403,8 @@ fn ask_checks_the_caller_first_where_no_version_can_change_the_choice() {
         }
     }
     // A provider whose probe fails: Pi's choice needs no version, so the caller refusal comes
-    // first and Pi is never run; Codex's needs its version, so its probe's failure comes first.
+    // first and Pi is never run; Codex's needs its version, so its probe's failure comes before
+    // the caller check's refusal applies.
     let pi = fixture.failing("pi");
     let reply = refusal(fixture.ask_with("pi", &[], &[("PATH", pi.as_os_str())]));
     assert_caller_refused(&reply, "failing pi");
@@ -438,19 +439,16 @@ fn a_stale_caller_refuses_only_a_launch_that_uses_herdr() {
     }
 }
 
-// A reopen reads its source and its provider's reopen support before any caller check: an
-// absent source is reported as such inside a Herdr terminal whose caller cannot be verified.
+// A reopen checks an automatic Herdr choice against its caller before it reads its source, as
+// in 0.4.49: inside a Herdr terminal whose caller cannot be verified it is refused there, even
+// for an absent source. An explicit Herdr is not checked, and the absent source is reported.
 #[test]
-fn reopen_reports_its_source_before_any_caller_check() {
+fn reopen_checks_its_caller_before_it_reads_its_source() {
     let fixture = Fixture::new();
-    for terminal in [None, Some("herdr")] {
-        let reply = fixture.reopen(terminal);
-        assert!(
-            error(&reply).starts_with(NO_SOURCE),
-            "{terminal:?}: {reply}"
-        );
-        assert!(reply["gate"].is_null(), "{reply}");
-    }
+    assert_caller_refused(&fixture.reopen(None), "automatic reopen");
+    let reply = fixture.reopen(Some("herdr"));
+    assert!(error(&reply).starts_with(NO_SOURCE), "{reply}");
+    assert!(reply["gate"].is_null(), "{reply}");
 }
 
 // Without --probe, doctor reports the choice where the version does not decide it, with no
@@ -737,11 +735,6 @@ struct ScriptedCore {
 #[cfg(unix)]
 impl ScriptedCore {
     fn start() -> Self {
-        Self::start_with(std::time::Duration::ZERO)
-    }
-
-    // A core that waits `delay` before it answers `terminal.get`.
-    fn start_with(delay: std::time::Duration) -> Self {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let directory = private_directory()
@@ -761,7 +754,7 @@ impl ScriptedCore {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             connections.fetch_add(1, Ordering::SeqCst);
-                            Self::serve(stream, program, delay);
+                            Self::serve(stream, program);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -780,7 +773,7 @@ impl ScriptedCore {
         }
     }
 
-    fn serve(stream: std::os::unix::net::UnixStream, program: u32, delay: std::time::Duration) {
+    fn serve(stream: std::os::unix::net::UnixStream, program: u32) {
         use std::io::{BufRead, Write};
         // An accepted socket can inherit the listener's non-blocking mode.
         stream.set_nonblocking(false).unwrap();
@@ -799,17 +792,14 @@ impl ScriptedCore {
                         "terminal.send", "terminal.read"],
                     "core": {"id": "core-launch-surface-test"},
                 }}),
-                (Some("terminal.get"), Some("t7")) => {
-                    std::thread::sleep(delay);
-                    serde_json::json!({"result": {
-                        "address": "t7",
-                        "state": "live",
-                        "pid": program,
-                        "argv": ["sh"],
-                        "keep": false,
-                        "created_ms": 1,
-                    }})
-                }
+                (Some("terminal.get"), Some("t7")) => serde_json::json!({"result": {
+                    "address": "t7",
+                    "state": "live",
+                    "pid": program,
+                    "argv": ["sh"],
+                    "keep": false,
+                    "created_ms": 1,
+                }}),
                 (method, _) => serde_json::json!({"error": {
                     "code": -32601,
                     "message": format!("the test core does not answer {method:?}"),
@@ -837,32 +827,6 @@ impl Drop for ScriptedCore {
             let _ = server.join();
         }
     }
-}
-
-// The caller check runs within the request's deadline: a core that answers after the deadline
-// has passed refuses the launch as timed out, and nothing is created.
-#[cfg(unix)]
-#[test]
-fn the_caller_check_ends_at_the_request_deadline() {
-    let fixture = Fixture::new();
-    let core = ScriptedCore::start_with(std::time::Duration::from_secs(3));
-    let pi = fixture.printing("pi", "1.5.0");
-    let started = std::time::Instant::now();
-    let reply = refusal(fixture.ask_with(
-        "pi",
-        &["--timeout-secs", "1"],
-        &[
-            ("PATH", pi.as_os_str()),
-            ("HC_SOCKET", core.socket.as_os_str()),
-        ],
-    ));
-    assert!(error(&reply).ends_with(CALLER_REFUSAL), "{reply}");
-    assert_eq!(reply["failure_kind"], "timed_out", "{reply}");
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(2500),
-        "{:?}",
-        started.elapsed()
-    );
 }
 
 // The probe that decides doctor's terminal row runs the launch's command under doctor's
@@ -903,8 +867,9 @@ fn doctor_runs_the_deciding_probe_under_its_diagnostic_limits() {
 const CODEX_HERDR_FLOOR: &str = "codex on Herdr is unsupported: Herdr requires stable Codex 0.169.0 or newer with --no-daemon; version: ";
 
 // Inside a verified hc terminal the automatic choice is Herdr where the provider, with its
-// probed version, is admitted there, and this OS's fallback otherwise; only a launch that will
-// use Herdr asks the core about its caller. An explicit `--terminal herdr` is refused as before.
+// probed version, is admitted there, and this OS's fallback otherwise. Codex's caller is checked
+// before its probe, as in 0.4.49, whatever its version then decides. An explicit
+// `--terminal herdr` is refused as before.
 // A blank title, refused right after the Surface is admitted and before anything exists, ends
 // each case.
 #[cfg(unix)]
@@ -924,8 +889,8 @@ fn an_automatic_herdr_gives_way_to_the_fallback_where_the_provider_version_is_no
         assert_eq!(error(&reply), BLANK_TITLE, "{version}: {reply}");
         assert_eq!(
             core.connections(),
-            before + usize::from(admitted),
-            "{version}: the caller is verified only for a launch on Herdr"
+            before + 1,
+            "{version}: the caller is checked once, before the probe"
         );
         let reply = fixture.ask_blank_title("codex", Some("herdr"), &path, socket);
         if admitted {

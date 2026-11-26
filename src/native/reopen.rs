@@ -29,8 +29,8 @@ mod reservation;
 use gate::reopen_refusal;
 pub(super) use gate::{ReopenGate, reopen_refusal_gate};
 use reservation::{
-    Reservation, pending_launch_fence, record_failed_launch, settle_reopen_outcome,
-    verify_reopen_source_is_closed, verify_reopen_source_is_closed_apart_from_its_marker,
+    Reservation, record_failed_launch, retry_interrupted_launch_fence, settle_reopen_outcome,
+    verify_reopen_source_is_closed,
 };
 pub(super) use reservation::{marker_check, record_reopen_refusal};
 
@@ -275,7 +275,7 @@ pub(super) fn resolution<'a>(
     provider: FirstPartyCli,
     workspace: &'a Path,
     surface: terminal::Selection,
-    before_writes: Option<Box<dyn FnOnce() -> Result<()> + 'a>>,
+    caller: session_start::CallerCheck,
 ) -> session_start::Resolution<'a> {
     session_start::Resolution {
         provider,
@@ -290,32 +290,26 @@ pub(super) fn resolution<'a>(
         yolo: request.yolo,
         prompt: request.prompt.clone(),
         surface,
+        caller,
         context_sources: Vec::new(),
         workspace_noun: "source workspace",
         admission_refusal: |error| {
             reopen_refusal(ReopenGate::WorkspaceRefused, format!("{error:#}"))
         },
-        before_writes,
     }
 }
 
 impl ResolvedReopen {
     fn resolve(request: ReopenRequest, deadline: Instant) -> Result<Self> {
         // The source, and so its provider, is not read yet: an automatic Herdr choice is
-        // decided with the provider, and its caller checked, in the resolution below.
-        let surface = session_start::choose_launch_surface(request.terminal)?;
+        // checked against its caller here, as in 0.4.49, and refused here when that fails.
+        let (surface, caller) = session_start::choose_launch_surface(request.terminal, None)?;
         let source_directory = Reader::session_directory(&request.id)?;
-        // The settlement that an interrupted launch failure of the source's last reopen still
-        // owes its child is a write to that child. 0.4.49 ran it after its caller check; here it
-        // runs once every other refusal of the resolution has passed (the caller check, the
-        // provider's support and version, the deadline), right before the first write of the
-        // resolution, so that a refused or expired reopen leaves the child as it was. The
-        // judgment of the source's marker, which reads that child, waits for it.
-        let pending = pending_launch_fence(&source_directory);
+        let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not
         // alter the record it continues from.
-        let source = inspect_reopen_source_with(&source_directory, &request.id, pending.is_none())?;
+        let source = inspect_reopen_source(&source_directory, &request.id)?;
         provider::reopen(source.provider)
             .and_then(|support| support.verify_available(&source.provider_session_id))
             .map_err(|error| {
@@ -323,20 +317,13 @@ impl ResolvedReopen {
             })?;
         // The shared resolution fails before anything is created, so a failed consent
         // assessment leaves the source reopenable.
-        let before_writes = pending.map(|pending| {
-            let (directory, id) = (source_directory.clone(), request.id.clone());
-            Box::new(move || {
-                let _ = pending.retry();
-                verify_reopen_source_is_closed(&directory, &id).map(drop)
-            }) as Box<dyn FnOnce() -> Result<()>>
-        });
         let start = session_start::resolve(
             resolution(
                 &request,
                 source.provider,
                 &source.manifest.workspace,
                 surface,
-                before_writes,
+                caller,
             ),
             deadline,
         )?;
@@ -354,19 +341,14 @@ impl ResolvedReopen {
 
     fn create_with(
         self,
-        create: impl FnOnce(
-            SessionSpec,
-            Option<&consent::Assessment>,
-            Instant,
-        ) -> Result<CreatedSession>,
+        create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<CreatedSession>,
     ) -> Result<ReopenAttempt> {
-        let (prepared, resumed_from) = self.start.create_with(|spec, consent, deadline| {
+        let (prepared, resumed_from) = self.start.create_with(|spec, consent| {
             create_reopened_session(
                 &self.source_directory,
                 &self.source_id,
                 &self.source,
-                deadline,
-                || create(spec, consent, deadline),
+                || create(spec, consent),
             )
         })?;
         Ok(ReopenAttempt {
@@ -465,24 +447,13 @@ fn fail_reopen_launch(
     reopen_refusal(gate, detail)
 }
 
-// Nothing is reserved once the request's `deadline` has passed (`Reservation::claim_until`),
-// and `create` allocates no Session directory after it (`create_session`); an unfinalized
-// reservation releases its marker. Once the child exists, its provenance and the
-// reservation's finalization are written even if the deadline passes meanwhile (finalization
-// waits for the source's lock without a bound), so the child stays bound to its source.
 fn create_reopened_session(
     source_directory: &Path,
     source_id: &str,
     source: &ReopenSource,
-    deadline: Instant,
     create: impl FnOnce() -> Result<CreatedSession>,
 ) -> Result<(CreatedSession, ResumedFrom)> {
-    let marker = Reservation::claim_until(
-        source_directory,
-        source_id,
-        &source.provider_session_id,
-        deadline,
-    )?;
+    let marker = Reservation::claim(source_directory, source_id, &source.provider_session_id)?;
     let created = create()?;
     let resumed_from = ResumedFrom {
         session: source_id.to_owned(),
@@ -510,21 +481,10 @@ fn create_reopened_session(
 
 // Require a tombstoned, settled source with resolved receipts and a provider identity.
 // Validate receipts first so corrupt events consistently refuse as request-unresolved.
-#[cfg(test)]
 fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
-    inspect_reopen_source_with(directory, id, true)
-}
-
-// `marker`: whether the source's marker is judged here; a reopen that owes the marker's child
-// a pending settlement judges it after that settlement instead.
-fn inspect_reopen_source_with(directory: &Path, id: &str, marker: bool) -> Result<ReopenSource> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    if marker {
-        verify_reopen_source_is_closed(directory, id)?;
-    } else {
-        verify_reopen_source_is_closed_apart_from_its_marker(directory, id)?;
-    }
+    verify_reopen_source_is_closed(directory, id)?;
     // Reject linked or non-directory events paths before reads can escape the session.
     // An absent directory reaches the receipt/identity gates, which report what is missing.
     Reader::open_unchecked(directory)

@@ -110,51 +110,38 @@
   same `TERM_PROGRAM`, tmux on Linux, the managed console on Windows); the marker under another
   `TERM_PROGRAM` was inherited and is ignored. This rule is the same on every OS (owner's
   decision 2A, 2026-11-26) and reads only the environment. `ask` and `reopen` select through
-  one entry, `session_start::choose_launch_surface`, at their own place (`reopen` before it
-  reads its source). `resolve` then decides with the provider (`session_start::admit_choice`),
-  before the workspace and again with the probed version: an automatic choice is Herdr where
-  the adapter admits it and its fallback otherwise (Codex below stable 0.169.0 off Windows,
-  any Codex on Windows), and an explicit `--terminal herdr` it does not admit is refused with
-  the adapter's text. An automatic choice that is Herdr is admitted against its caller
-  (`terminal::admit_selection`) by one rule (`session_start::resolve_with`): once, as soon as
-  the choice is known to be Herdr. Where the adapter's answer does not depend on the version
-  (Claude, Agy, Pi), that is before the workspace and the probe, as in 0.4.49 for `ask` and
-  right after the source and its provider's reopen support for `reopen`; where it does (Codex
-  off Windows), after the probe, and only for a choice that ends on Herdr. What this change
-  owes the request's deadline is one thing, against 0.4.49: no change of order lets a
-  persisted write happen that 0.4.49's order would have prevented for the same request and
-  the same timing. Bounding every step by the deadline is a separate, later change. So the
-  clock is read when the caller check returns successfully, where 0.4.49's version probe,
-  which followed the caller check, would have stopped a late request before the
-  workspace-consent store is written; and a reopen settles an interrupted launch failure of
-  its source's last child (a write to that child, which 0.4.49 ran after its caller check)
-  only once every other refusal of its resolution has passed, right before that store is
-  written, so a refused or expired reopen leaves the child launching. Beyond that, the caller
-  check's calls to the core (`hello`, `terminal.get`) wait for reply bytes only until the
-  deadline (on Windows a pipe operation cancelled there is waited for before its buffer is
-  released, and a reply received just before the deadline can finish decoding after it), a
-  failure after the deadline being reported as timed out; creation reads the clock before it
-  begins, before the state root is prepared and again right before the Session directory is
-  allocated (`state_root::create_directory`), and a reopen's reservation waits for its
-  source's lock only until the deadline and reads the clock before it releases a stale marker
-  and before it writes the marker (`Reservation::claim_until`). The provider's version probe
-  is held to the deadline too. The rest is as in 0.4.49: the caller check's other steps
-  (endpoint discovery, the connection, whose Windows wait for a free pipe instance alone ends
-  by the deadline, and the walk of parents), the wait for the workspace-consent lock and the
-  write after it (a deadline that passes there is reported when creation begins: no Session
-  was created), state-root preparation once begun, and, once the child exists, its provenance
-  and the reservation's finalization, which waits for the source's lock so that the child
-  stays bound to its source. A write that starts before the deadline is not interrupted. The
-  caller's terminal must be live on the addressed
+  one entry, `session_start::choose_launch_surface`, at the place where 0.4.49 selected and
+  checked: `ask` after its attached results, `reopen` before it reads its source. There an
+  automatic Herdr choice is checked against its caller (`terminal::admit_selection`), as in
+  0.4.49, for every provider that can end on Herdr. A failed check refuses the launch there
+  where the choice is already known to be Herdr: for `ask`, Claude, Agy and Pi; for `reopen`,
+  which does not know its provider yet, always (every provider that supports reopen runs on
+  Herdr, so no reopen that would take the fallback is refused). Where the version decides
+  (Codex off Windows), the outcome is kept (`session_start::CallerCheck`). `resolve` then
+  decides with the provider (`session_start::admit_choice`), before the workspace and again
+  with the probed version: an automatic choice is Herdr where the adapter admits it and its
+  fallback otherwise (Codex below stable 0.169.0 off Windows, any Codex on Windows), and an
+  explicit `--terminal herdr` it does not admit is refused with the adapter's text. An
+  automatic choice that ends on Herdr launches there only if its check passed, and is
+  otherwise refused with the check's error; one that takes the fallback ignores the check.
+  So every later step runs in 0.4.49's order, after the same refusals and clock reads: the
+  caller check ends by its own bound, not by the request's deadline; the version probe reads
+  the deadline before it starts; and nothing after it reads the deadline before the Session
+  exists, as in 0.4.49 (bounding every step by the deadline is a separate, later change).
+  For `reopen`, the settlement of an interrupted launch failure of the source's last child
+  (`retry_interrupted_launch_fence`) runs after the selection, the caller check and the
+  lookup of the source directory, as in 0.4.49. The judgment of the source's marker, the
+  other source gates, the provider's reopen support and the rest of the resolution, the
+  consent assessment included, can still refuse afterwards and leave that child `Failed`, as
+  in 0.4.49. The caller's terminal must be live on the addressed
   core with this process among its program's descendants, or the launch is refused without
   opening another terminal. Up to 64 parent links are compared; only a chain that ends at a
   root (no parent, or init) proves the command is outside, while reaching that bound or a
   parent that cannot be established (on Windows: it ended, its PID was reused, or it may not
   be inspected) is reported as unverified, and both refuse. So a caller that cannot be
-  verified never refuses a launch on the fallback, on any OS, and a `reopen` reports a missing
-  source or a provider that cannot reopen first. `doctor` reports the same decision
-  (`session_start::automatic_surface`) without the caller check: see Observation and Self-Test
-  Boundary.
+  verified never refuses an `ask` on the fallback, on any OS. `doctor` reports the same
+  decision (`session_start::automatic_surface`) without the caller check: see Observation and
+  Self-Test Boundary.
   The fallback is not checked for presence before a session exists, as with any other
   terminal: a Mac without Ghostty, Linux without tmux 3.2 or Windows without PowerShell 7
   fails at that terminal's open with its own refusal.

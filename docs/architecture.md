@@ -153,14 +153,13 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `Start::run` and `turn_run::run_initial`. The surface it admits comes from one entry,
   `choose_launch_surface`, which creates nothing and is the same on every OS: the requested
   terminal, else the caller's environment (`terminal::select_for`: inside hc Herdr, with the
-  platform's own choice as its fallback). `resolve` decides that choice with the provider and
+  platform's own choice as its fallback). An automatic Herdr choice gets the caller check
+  (`terminal::admit_selection`) there, where 0.4.49 ran it, and its outcome
+  (`CallerCheck`) goes with the selection. `resolve` decides that choice with the provider and
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
-  explicit choice is refused. An automatic choice gets the caller check
-  (`terminal::admit_selection`) once, as soon as it is known to be Herdr, by the rule stated at
-  `resolve_with`. Current Herdr Surface Boundary states what the request's deadline owes this
-  order against 0.4.49 (no reordered step lets a write happen that 0.4.49's order prevented,
-  so a reopen settles an interrupted launch failure only after every other refusal) and where
-  the clock is read on the Herdr and creation steps.
+  explicit choice is refused; a Herdr choice whose check failed is refused. Every step after the
+  check therefore keeps 0.4.49's order and its refusals and clock reads (Current Herdr Surface
+  Boundary).
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option

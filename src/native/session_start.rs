@@ -3,7 +3,7 @@ use super::args::{
     CommonStartOptions, OptionSet, ValidatedStartOptions, option_value, parse_common_start_option,
     set_once, validate_start_options,
 };
-use crate::native::failure_kind::{DeliveryUncertain, TimedOut};
+use crate::native::failure_kind::DeliveryUncertain;
 use crate::native::provider_installation::{check_provider_version_until, resolve_provider};
 use crate::native::session::{Reader, SessionState, Store, launch, requests, turn, update_status};
 use crate::native::turn_report::TurnReport;
@@ -42,8 +42,6 @@ pub(super) struct Resolved {
     // aliases included; reopen: the canonical one), before anything is created; recorded
     // with the session once it exists. None records nothing.
     consent: Option<consent::Assessment>,
-    // The request's deadline: nothing is created once it has passed.
-    deadline: Instant,
 }
 
 // Resolution and creation are completed before the shared Initial prompt operation.
@@ -66,15 +64,7 @@ impl Resolved {
             initial_transport,
             context_sources,
             consent,
-            deadline: Instant::now() + Duration::from_secs(3600),
         }
-    }
-
-    // A fixture whose request ends at `deadline`.
-    #[cfg(test)]
-    pub(super) fn with_deadline(mut self, deadline: Instant) -> Self {
-        self.deadline = deadline;
-        self
     }
 
     // Only the Windows launch-recovery fixtures adjust a resolved spec.
@@ -83,26 +73,12 @@ impl Resolved {
         &mut self.spec
     }
 
-    // The clock is read before `create` runs, so that a request whose deadline passed during
-    // the resolution creates nothing more (the state root's mode and durability receipt
-    // included). `create` receives the deadline: a reopen's reservation reads it again before
-    // it writes its marker, and `create_session` before it prepares the state root and again
-    // right before it allocates the Session directory.
     pub(super) fn create_with<T>(
         self,
-        create: impl FnOnce(
-            SessionSpec,
-            Option<&consent::Assessment>,
-            Instant,
-        ) -> Result<(CreatedSession, T)>,
+        create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<(CreatedSession, T)>,
     ) -> Result<(Prepared, T)> {
-        if Instant::now() >= self.deadline {
-            bail!(TimedOut::new(
-                "the request's deadline passed before creation began; no Session was created"
-            ));
-        }
         let provider = self.spec.provider;
-        let (created, source) = create(self.spec, self.consent.as_ref(), self.deadline)?;
+        let (created, source) = create(self.spec, self.consent.as_ref())?;
         Ok((
             Prepared {
                 created,
@@ -219,68 +195,42 @@ pub(super) struct Resolution<'a> {
     pub(super) effort: Option<String>,
     pub(super) yolo: bool,
     pub(super) prompt: String,
-    // Chosen by `choose_launch_surface` at the command's own place in its order: `ask` after
-    // its context resolution, `reopen` before it inspects the source. The resolution decides
-    // an automatic Herdr choice with the provider (`admit_choice`) and checks its caller.
+    // Chosen by `choose_launch_surface` at the command's own place in its order, where 0.4.49
+    // chose and checked it: `ask` after its context resolution, `reopen` before it reads the
+    // source. The resolution decides an automatic Herdr choice with the provider
+    // (`admit_choice`) and, when it is Herdr, with `caller`.
     pub(super) surface: terminal::Selection,
+    // What the caller check found when the surface was chosen.
+    pub(super) caller: CallerCheck,
     pub(super) context_sources: Vec<requests::ContextSource>,
     // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
     pub(super) workspace_noun: &'static str,
     // How an admission refusal is reported: unchanged for `ask`, typed as reopen's
     // workspace-refused gate for a reopen.
     pub(super) admission_refusal: fn(anyhow::Error) -> anyhow::Error,
-    // A write the command owes before its own, run once every other refusal of the resolution
-    // has passed, right before the workspace-consent store is written: a reopen's settlement
-    // of an interrupted launch failure, then the source marker's judgment it waited for.
-    pub(super) before_writes: Option<Box<dyn FnOnce() -> Result<()> + 'a>>,
 }
 
-// The launchable spec of a start, after the command selected its terminal, in this order:
-// the Surface decision before the version (`choose_before_probe`), the canonical workspace
-// directory, state root and launch admission, provider executable and version, version-aware
-// surface admission (which decides an automatic Herdr choice that depends on the version),
-// title, and workspace consent; the caller check of an automatic choice that is Herdr comes as
-// soon as that choice is known (`resolve_with`). Nothing is created, so a failure changes
-// nothing.
+// The launchable spec of a start, after the command selected its terminal and checked its
+// caller (`choose_launch_surface`), in 0.4.49's order: the Surface decision before the version
+// (`choose_before_probe`), the canonical workspace directory, state root and launch admission,
+// provider executable and version, version-aware surface admission (which decides an
+// automatic Herdr choice that depends on the version, with the caller check's outcome), title,
+// and workspace consent. Nothing is created, so a failure changes nothing.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
-    resolve_with(
-        resolution,
-        deadline,
-        |provider| {
-            let provider_path = resolve_provider(provider)?;
-            let provider_version =
-                check_provider_version_until(provider, &provider_path, Some(deadline))?;
-            Ok((provider_path, provider_version))
-        },
-        terminal::admit_selection,
-    )
+    resolve_with(resolution, |provider| {
+        let provider_path = resolve_provider(provider)?;
+        let provider_version =
+            check_provider_version_until(provider, &provider_path, Some(deadline))?;
+        Ok((provider_path, provider_version))
+    })
 }
 
 // `probe` is the resolution's one look at the installed CLI: its executable path and its
 // supported version (`provider_installation::read_installed_version`, which doctor's report of
-// the Surface reads too). `verify_caller` is the caller check of an automatic Herdr choice
-// (`terminal::admit_selection`), given the request's `deadline`. Tests resolve without an
-// installed provider or a Herdr Core through them.
-//
-// The caller check runs once, by one rule: as soon as the automatic choice is known to be
-// Herdr. Where the adapter's answer does not depend on the version, that is before the
-// workspace and the probe, as early as in 0.4.49 for `ask` and right after the source and its
-// provider's reopen support for `reopen`, whose resolution starts here. Where it depends on
-// the version, it is after the probe, and only for a choice that then ends on Herdr. A
-// fallback and an explicit choice are never checked against the caller. The request's
-// deadline limits the check's wait for the core's replies, a check that fails after it is
-// reported as timed out, and the clock is read when the check returns successfully, the
-// boundary where 0.4.49's version probe stopped a late request before any write. The check's
-// other steps and what the resolution reads besides are not bounded by it, as in 0.4.49, nor
-// is the wait for the workspace-consent lock. `before_writes` runs after every other refusal
-// and before that store is written. Creation reads the deadline again
-// (`Resolved::create_with`, `Reservation::claim_until`, `state_root::create_directory`);
-// docs/agents/herdr.md states the whole guarantee.
+// the Surface reads too). Tests resolve without an installed provider through it.
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
-    deadline: Instant,
     probe: impl FnOnce(FirstPartyCli) -> Result<(PathBuf, String)>,
-    verify_caller: impl FnOnce(terminal::Selection, Instant) -> Result<()>,
 ) -> Result<Resolved> {
     let Resolution {
         provider,
@@ -293,44 +243,14 @@ pub(super) fn resolve_with(
         yolo,
         prompt,
         surface,
+        caller,
         context_sources,
         workspace_noun,
         admission_refusal,
-        before_writes,
     } = resolution;
-    let mut verify_caller = Some(verify_caller);
-    let mut check_caller = |kind: terminal::TerminalKind| -> Result<()> {
-        if kind == terminal::TerminalKind::Herdr
-            && matches!(surface, terminal::Selection::Herdr { .. })
-            && let Some(verify) = verify_caller.take()
-        {
-            verify(surface, deadline).map_err(|error| {
-                if Instant::now() >= deadline {
-                    error.context(TimedOut::new(
-                        "the request's deadline passed during the Herdr caller check",
-                    ))
-                } else {
-                    error
-                }
-            })?;
-            // 0.4.49 ran the deadline-aware version probe after the caller check, so a check
-            // that returns after the deadline stopped the request before the workspace-consent
-            // store was written; the clock is read here for the same boundary.
-            if Instant::now() >= deadline {
-                bail!(TimedOut::new(
-                    "the request's deadline passed during the Herdr caller check; no Session was created"
-                ));
-            }
-        }
-        Ok(())
-    };
-    // Before anything is resolved or probed: a surface the provider's adapter cannot run on at
-    // all on this platform is refused, an automatic Herdr choice it cannot run on takes its
-    // fallback, and a choice no version can change is final, and checked against its caller
-    // when it is an automatic Herdr choice.
-    if let EarlyChoice::Known(admitted) = choose_before_probe(provider, surface)? {
-        check_caller(admitted.kind)?;
-    }
+    // A surface the provider's adapter cannot run on at all on this platform is refused
+    // before anything is resolved or probed.
+    let _ = choose_before_probe(provider, surface)?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -356,8 +276,18 @@ pub(super) fn resolve_with(
         initial_transport,
         ..
     } = admit_choice(provider, surface, Some(&provider_version))?;
-    // An automatic choice that the version decided for Herdr is checked against its caller now.
-    check_caller(terminal_kind)?;
+    // An automatic choice that ends on Herdr launches there only if its caller check passed.
+    if terminal_kind == terminal::TerminalKind::Herdr
+        && matches!(surface, terminal::Selection::Herdr { .. })
+    {
+        match caller {
+            CallerCheck::Passed => {}
+            CallerCheck::Failed(error) => return Err(error),
+            CallerCheck::NotNeeded => {
+                bail!("the automatic choice of Herdr was not checked against its caller")
+            }
+        }
+    }
     let requested_title = title.unwrap_or_else(|| {
         let workspace_name = workspace
             .file_name()
@@ -366,9 +296,6 @@ pub(super) fn resolve_with(
         default_title.render(provider, workspace_name)
     });
     let title = sanitize_title(&requested_title)?;
-    if let Some(before_writes) = before_writes {
-        before_writes()?;
-    }
     let consent = consent::assess(
         &root,
         match consent_path {
@@ -392,7 +319,6 @@ pub(super) fn resolve_with(
         initial_transport,
         context_sources,
         consent: Some(consent),
-        deadline,
     })
 }
 
@@ -400,29 +326,86 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
     let attached = context::resolve(&request.context_results)?;
-    let surface = choose_launch_surface(request.terminal)?;
-    resolve(fresh_resolution(request, attached, surface), deadline)
+    let (surface, caller) = choose_launch_surface(request.terminal, Some(request.provider))?;
+    resolve(
+        fresh_resolution(request, attached, surface, caller),
+        deadline,
+    )
+}
+
+// What the caller check of an automatic Herdr choice found where `choose_launch_surface` ran
+// it: the place where 0.4.49 ran it, before the workspace, the probe and, for a reopen, the
+// source. The resolution uses it once the choice is decided (`resolve_with`).
+pub(super) enum CallerCheck {
+    // Nothing to prove: an explicit choice, a choice outside hc, or an automatic choice the
+    // provider takes on its fallback at every version.
+    NotNeeded,
+    Passed,
+    // A check that failed where the provider's version decides the choice (Codex off
+    // Windows): an automatic choice that ends on Herdr is refused with it, and one that the
+    // version gives its fallback launches there.
+    Failed(anyhow::Error),
 }
 
 // The terminal a launch asked for or its caller's environment selects, the one entry of `ask`
-// and `reopen`, each at its own place in its order (`Resolution::surface`). It reads the
-// environment only, creates nothing and is the same on every platform: an explicit
-// `--terminal` (`requested`) wins, and the platform's selection decides whether to accept it
-// here or to leave a kind it does not run to its adapter; otherwise inside an hc terminal it
-// is Herdr, with the Surface this platform chooses outside Herdr as its fallback, and
-// elsewhere that Surface.
+// and `reopen`, each at its own place in its order (`Resolution::surface`), and the caller
+// check of an automatic Herdr choice, run there as in 0.4.49. Selection reads the environment
+// only and is the same on every platform: an explicit `--terminal` (`requested`) wins, and the
+// platform's selection decides whether to accept it here or to leave a kind it does not run
+// to its adapter; otherwise inside an hc terminal it is Herdr, with the Surface this platform
+// chooses outside Herdr as its fallback, and elsewhere that Surface.
 //
-// `resolve` then decides with the provider, before the workspace (`choose_before_probe`) and
-// again with the probed version (`admit_choice`): an automatic Herdr choice is Herdr where the
-// adapter admits it, and its fallback otherwise; an explicit choice the adapter does not admit
-// is refused. An automatic choice that is Herdr proves that this process runs in the caller's
-// Herdr terminal on the running core (`terminal::admit_selection`, the only step that opens a
-// connection) as soon as it is known, by the rule stated at `resolve_with`, or the launch is
-// refused without opening another terminal.
+// An automatic Herdr choice proves that this process runs in the caller's Herdr terminal on
+// the running core (`terminal::admit_selection`, the only step that opens a connection). A
+// failed check refuses the launch here, without opening another terminal, where the choice is
+// already known to be Herdr: for `ask`, a provider whose adapter's answer does not depend on
+// the version (Claude, Agy, Pi); for `reopen`, which does not know its provider before it
+// reads its source, always, as in 0.4.49 (every provider that supports reopen runs on Herdr,
+// so no reopen that would take the fallback is refused). Where the version decides (Codex off
+// Windows), the outcome is kept for `resolve_with`. A provider that takes its fallback at
+// every version is not checked. `resolve` then decides with the provider, before the
+// workspace (`choose_before_probe`) and again with the probed version (`admit_choice`).
 pub(super) fn choose_launch_surface(
     requested: Option<terminal::TerminalKind>,
-) -> Result<terminal::Selection> {
-    terminal::select_for(requested)
+    provider: Option<FirstPartyCli>,
+) -> Result<(terminal::Selection, CallerCheck)> {
+    let selection = terminal::select_for(requested)?;
+    let caller = check_caller(selection, provider, terminal::admit_selection)?;
+    Ok((selection, caller))
+}
+
+// The caller check of `selection` for `provider` (`None`: not known yet), by the rule above.
+// `verify` is the check itself (`terminal::admit_selection`); tests check without a Herdr Core
+// through it.
+pub(super) fn check_caller(
+    selection: terminal::Selection,
+    provider: Option<FirstPartyCli>,
+    verify: impl FnOnce(terminal::Selection) -> Result<()>,
+) -> Result<CallerCheck> {
+    if !matches!(selection, terminal::Selection::Herdr { .. }) {
+        return Ok(CallerCheck::NotNeeded);
+    }
+    Ok(
+        match provider.map(|provider| choose_before_probe(provider, selection)) {
+            None => {
+                verify(selection)?;
+                CallerCheck::Passed
+            }
+            Some(early) => match early? {
+                EarlyChoice::Known(admitted) if admitted.kind != terminal::TerminalKind::Herdr => {
+                    CallerCheck::NotNeeded
+                }
+                EarlyChoice::Known(_) => {
+                    verify(selection)?;
+                    CallerCheck::Passed
+                }
+                EarlyChoice::ByVersion { .. } => match verify(selection) {
+                    Ok(()) => CallerCheck::Passed,
+                    Err(error) => CallerCheck::Failed(error),
+                },
+            },
+        },
+    )
 }
 
 // The Surface a selection gives a provider, and the initial Transport its adapter selected
@@ -518,6 +501,7 @@ pub(super) fn fresh_resolution(
     request: &AskRequest,
     attached: context::ResolvedContext,
     surface: terminal::Selection,
+    caller: CallerCheck,
 ) -> Resolution<'_> {
     Resolution {
         provider: request.provider,
@@ -530,10 +514,10 @@ pub(super) fn fresh_resolution(
         yolo: request.yolo,
         prompt: attached.prompt_with_attachments(&request.prompt),
         surface,
+        caller,
         context_sources: attached.sources,
         workspace_noun: "workspace",
         admission_refusal: std::convert::identity,
-        before_writes: None,
     }
 }
 
@@ -541,10 +525,9 @@ pub(super) fn fresh_resolution(
 pub(super) fn create_with_consent(
     mut spec: SessionSpec,
     assessment: Option<&consent::Assessment>,
-    deadline: Instant,
 ) -> Result<CreatedSession> {
     spec.prompt = delegation_prompt(&spec.prompt);
-    let created = create_session(spec, deadline)?;
+    let created = create_session(spec)?;
     record_consent(&created, assessment)?;
     Ok(created)
 }
@@ -854,8 +837,8 @@ fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
     };
     let start = Start::new(options)?;
     let resolved = resolve_fresh(&request, start.deadline())?;
-    let (prepared, ()) = resolved.create_with(|spec, consent, deadline| {
-        create_with_consent(spec, consent, deadline).map(|created| (created, ()))
+    let (prepared, ()) = resolved.create_with(|spec, consent| {
+        create_with_consent(spec, consent).map(|created| (created, ()))
     })?;
     start.run(&prepared, &FreshSource, report)
 }

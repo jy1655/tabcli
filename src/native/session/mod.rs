@@ -59,7 +59,7 @@ pub(in crate::native) mod test_support {
     pub(in crate::native) use super::primitives::close_io_test;
     pub(in crate::native) use super::primitives::{
         SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
-        with_publication_read_log, with_sync_failure, with_sync_log, write_event,
+        with_publication_read_log, with_sync_delay, with_sync_failure, with_sync_log, write_event,
     };
 
     /// A minimal manifest for a session fixture, named after its directory. Every
@@ -508,9 +508,8 @@ impl Store {
     pub(in crate::native) fn create_directory(
         root: &Path,
         durable: &[PathBuf],
-        deadline: Option<std::time::Instant>,
     ) -> Result<(PathBuf, String, Option<String>)> {
-        create_directory(root, durable, deadline)
+        create_directory(root, durable)
     }
     pub(in crate::native) fn create_state_root(
         root: &Path,
