@@ -726,10 +726,13 @@ lock before it settles a session. On every OS, Repair leaves a registered core-r
 terminal (Herdr) for explicit Close. `owner_exit::core_kept` gathers the decision's evidence
 for every owner record into `CreationEvidence`, which only that module can construct. The Herdr
 adapter's `authority::grant` is the only function that permits `terminal.kill` or
-`terminal.rm`. It admits only an explicit `CloseCause` and requires the creation record in the
-handle. It removes a finished terminal whatever the owner record says. It ends a running one only
-when this session's owner is positively gone and the program is observed with its recorded
-birth. On macOS and
+`terminal.rm`, and its grant names the observed terminal and core; the verified connection
+(`terminal/herdr/linked.rs`) sends either call only by consuming that grant. On the creation
+record it admits only an explicit `CloseCause` and requires the creation record in the
+handle; a close with a live attested owner, the cleanup after a refused reopen included, keeps
+its own proof. It removes a finished terminal whatever the owner record says. It ends a running
+one only when this session's owner is positively gone and the program is observed with its
+recorded birth. On macOS and
 Linux, Repair also preserves an intent or another Surface that can outlive its owner. Their
 ordinary dead-owner branch keeps requiring an exited, bound owner with complete control,
 apart from two earlier routes. A Linux tmux server is closed by its creation-time incarnation
