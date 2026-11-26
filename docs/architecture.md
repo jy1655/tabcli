@@ -727,8 +727,10 @@ for every owner record into `CreationEvidence`, which only that module can const
 adapter's `authority::grant` is the only function that permits `terminal.kill` or
 `terminal.rm`. It mints only from an observation the verified connection produced
 (`terminal/herdr/linked.rs`), which names that connection's core and the terminal, and refuses
-one from another core; the connection sends either call only by consuming that grant, and the
-transport's stream is private to it. On the creation
+one from another core or of another address; the connection sends either call only by consuming
+that grant, and the
+transport's stream is private to it in production builds (a source scan checks the method
+names; `docs/agents/herdr.md` states what this covers and what it does not). On the creation
 record it admits only an explicit `CloseCause` and requires the creation record in the
 handle; a close with a live attested owner, the cleanup after a refused reopen included, keeps
 its own proof. It removes a finished terminal whatever the owner record says and never ends a
