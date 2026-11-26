@@ -249,6 +249,27 @@ fn every_command_that_would_act_on_a_session_of_another_os_gives_one_refusal() {
                 let reply = fixture.run(args);
                 assert_eq!(reply["ok"], true, "{case}, {args:?}: {reply}");
             }
+            // Doctor's probe observes no surface of another OS: its presence is unverified,
+            // with the one refusal as the reason.
+            let probed = fixture.run(&["doctor", ID, "--probe", "--json"]);
+            let check = probed["checks"]
+                .as_array()
+                .and_then(|checks| {
+                    checks
+                        .iter()
+                        .find(|check| check["id"] == "terminal_surface")
+                })
+                .unwrap_or_else(|| panic!("{case}: {probed}"));
+            assert_eq!(
+                check["reason_code"], "terminal_surface_unverified",
+                "{case}: {check}"
+            );
+            assert_eq!(
+                check["detail"],
+                format!("Surface presence could not be verified: {refusal}"),
+                "{case}: {check}"
+            );
+            unchanged("doctor --probe");
             let inspected = fixture.run(&["inspect", ID, "--json"]);
             assert!(inspected.to_string().contains(state), "{case}: {inspected}");
         }

@@ -149,6 +149,10 @@ impl SessionEvidence {
                         .and_then(|s| s.to_str())
                         .context("invalid session path")?,
                 )?;
+                // No surface of a session of another OS is observed from this machine.
+                if let Some(refusal) = terminal::foreign::of_records(reader, Some(&session)) {
+                    return Err(refusal);
+                }
                 let budget = deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(2));

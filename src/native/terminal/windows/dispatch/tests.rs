@@ -286,34 +286,24 @@ fn an_expired_open_of_another_kind_gets_the_lookup_refusal() {
 // Doctor's probe of a stored handle of another OS's terminal reads the lookup's refusal on
 // Windows, as on macOS and Linux: the presence is unverified, never a missing surface. Before
 // the lookup refused it, the managed console parsed a WezTerm pane id `0` as a process id and
-// reported the surface missing.
+// reported the surface missing. (On every OS the probe's own judgment of a session of another
+// OS answers before any lookup; this test reads the Windows lookup directly, on every host.)
 #[test]
 fn doctor_probe_of_another_kinds_handle_is_unverified() {
     use crate::native::doctor;
-    use crate::native::query::observation::{SessionEvidence, judgment::SurfacePresence};
-    use crate::native::session::{Reader, Store};
-    let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("session-foreign");
-    std::fs::create_dir(&directory).unwrap();
+    use crate::native::query::observation::judgment::SurfacePresence;
     let handle = TerminalSession::new(TerminalKind::WezTerm, "0".into())
         .with_binding(Some("session-foreign".into()));
-    Store::open_unchecked(&directory)
-        .write_terminal(&handle)
-        .unwrap();
-    let reader = Reader::open_unchecked(&directory);
-    let evidence = SessionEvidence::read(&reader, Ok(false));
     let dispatch = recording_dispatch();
-    let probe = |directory: &Path, session: &TerminalSession, timeout: Duration| {
-        surface_present(&dispatch, directory, session, timeout)
-    };
-    let presence = evidence.judge_surface_presence_with(
-        &reader,
-        Instant::now() + Duration::from_secs(2),
-        &probe,
-    );
+    let presence = SurfacePresence::of(surface_present(
+        &dispatch,
+        Path::new("unused"),
+        &handle,
+        Duration::from_secs(2),
+    ));
     let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
-    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
-    let check = doctor::surface_presence_check(presence);
+    assert_eq!(presence, SurfacePresence::Unverified(refusal.into()));
+    let check = doctor::surface_presence_check(&presence);
     assert_eq!(check.reason_code, "terminal_surface_unverified");
     assert!(dispatch.console.calls().is_empty());
 }
