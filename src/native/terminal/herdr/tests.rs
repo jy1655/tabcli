@@ -1580,21 +1580,32 @@ fn a_reply_sent_before_the_core_closed_its_end_is_read() {
     assert!(started.elapsed() >= Duration::from_millis(100));
 }
 
-// A socket can be readable with nothing to read in order: Linux keeps an urgent (out-of-band)
-// byte on a Unix stream socket in its receive queue, reports the socket readable, and an
-// ordinary blocking read then waits for ordinary data. The read still ends at its deadline.
-// macOS refuses out-of-band data on Unix sockets, so there the queue stays empty.
+// Sends one urgent (out-of-band) byte from the core's end. `false` where the system keeps no
+// out-of-band data on Unix stream sockets and refuses the send: macOS, and Linux before 5.15
+// or without CONFIG_AF_UNIX_OOB. Any other error fails the test.
+#[cfg(unix)]
+fn send_urgent_byte(core: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let sent = unsafe { libc::send(core.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+    if sent == 1 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+    false
+}
+
+// A socket can be readable with nothing to read in order: Linux keeps an urgent byte on a
+// Unix stream socket in its receive queue and reports the socket readable, and an ordinary
+// blocking read then waits for ordinary data. The read still ends at its deadline. Where the
+// system refuses the urgent byte, the same read covers a silent peer.
 #[cfg(unix)]
 #[test]
 fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
     use std::io::ErrorKind;
-    use std::os::unix::{io::AsRawFd, net::UnixStream};
+    use std::os::unix::net::UnixStream;
     let (mut tab, core) = UnixStream::pair().unwrap();
-    let urgent = unsafe { libc::send(core.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
-    #[cfg(target_os = "linux")]
-    assert_eq!(urgent, 1, "{}", std::io::Error::last_os_error());
-    #[cfg(not(target_os = "linux"))]
-    let _ = urgent;
+    let urgent = send_urgent_byte(&core);
     let (sender, outcome) = std::sync::mpsc::channel();
     let reader = thread::spawn(move || {
         let mut buffer = [0_u8; 16];
@@ -1607,9 +1618,66 @@ fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
     let (result, elapsed) = outcome
         .recv_timeout(Duration::from_secs(10))
         .expect("the read was still blocked ten seconds after its 100 ms deadline");
-    assert_eq!(result, Err(ErrorKind::TimedOut));
-    assert!(elapsed >= Duration::from_millis(100));
+    assert_eq!(
+        result,
+        Err(ErrorKind::TimedOut),
+        "urgent byte sent: {urgent}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+        "a 100 ms read returned after {elapsed:?} (urgent byte sent: {urgent})"
+    );
     reader.join().unwrap();
+    drop(core);
+}
+
+// After a receive that found nothing, the read goes back to waiting against its deadline, so
+// a reply the core sends in the last milliseconds is read. The urgent byte makes the socket
+// readable with nothing to receive; the read starts with 10 ms left, so a read that paused
+// before it waited again (up to 10 ms, cab25db to 8f316da) slept past its deadline and missed
+// the reply sent 3 ms in. Without out-of-band data there is no empty receive, and the same
+// reply is read as any other.
+#[cfg(unix)]
+#[test]
+fn a_reply_that_follows_an_empty_receive_before_the_deadline_is_read() {
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::net::UnixStream;
+    let reply = [
+        br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
+        b"\n",
+    ]
+    .concat();
+    let (mut tab, mut core) = UnixStream::pair().unwrap();
+    let urgent = send_urgent_byte(&core);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(10);
+    let sent = reply.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(3));
+        core.write_all(&sent).unwrap();
+        (core, Instant::now())
+    });
+    let mut buffer = [0_u8; 256];
+    let result = super::Stream::read_before(&mut tab, &mut buffer, deadline)
+        .map(|read| buffer[..read].to_vec());
+    let (core, written) = writer.join().unwrap();
+    if written + Duration::from_millis(1) < deadline {
+        assert_eq!(
+            result.as_deref().ok(),
+            Some(reply.as_slice()),
+            "{result:?} (urgent byte sent: {urgent})"
+        );
+    } else {
+        // The writer itself ran late, past the point this test can judge: the read may only
+        // return the reply or time out at its deadline.
+        assert!(
+            result.as_deref().ok() == Some(reply.as_slice())
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == ErrorKind::TimedOut),
+            "{result:?}"
+        );
+    }
     drop(core);
 }
 

@@ -255,7 +255,7 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
 /// refuses SO_RCVTIMEO with EINVAL once the core has closed its end, and a reply the core
 /// sent before it closed is still in the socket to be read. Readiness does not promise
 /// ordinary bytes (Linux reports a queue that holds only an urgent byte as readable), so the
-/// receive itself never blocks: with nothing to read it waits again, until the deadline.
+/// receive itself never blocks: with nothing to read it waits again, against the deadline.
 fn receive_before(
     stream: &UnixStream,
     buffer: &mut [u8],
@@ -276,12 +276,13 @@ fn receive_before(
         }
         let error = std::io::Error::last_os_error();
         match error.kind() {
-            std::io::ErrorKind::Interrupted => {}
-            // Readable with nothing to receive: wait a moment, so that a queue that stays
-            // readable does not turn this into a busy loop.
-            std::io::ErrorKind::WouldBlock => std::thread::sleep(
-                super::remaining(deadline)?.min(std::time::Duration::from_millis(10)),
-            ),
+            // Readable with nothing to receive: wait again at once, so that a reply the core
+            // sends before the deadline is read. This cannot spin. On Linux the ordinary
+            // receive drops a lone urgent byte from the queue (`manage_oob` in af_unix.c),
+            // so the next poll waits; where Unix sockets keep no out-of-band data (macOS,
+            // Linux before 5.15 or without CONFIG_AF_UNIX_OOB), readable means bytes or the
+            // end of the stream, which the receive returns.
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => {}
             _ => return Err(error),
         }
     }
