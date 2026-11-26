@@ -15,9 +15,10 @@
   to the macOS capture host. A session directory the caller refused before any Surface adds
   no row: no host ran, and a macOS capture kind keeps only its initial `awaiting_host` stage.
   The returned error holds the host's reason with the directory; the status and the launch log
-  hold a fixed reason only when the settlement wrote them (a lifecycle lock held until the
-  launch deadline, or facts not this launch's, leave the status launching, and the log line is
-  best effort).
+  hold a fixed reason only when the settlement wrote them, and the log line is best effort. A
+  launch that is not this launch's own or cannot be read keeps its existing status, which may
+  already be `Failed` or `Closed`; a lifecycle lock held until the launch deadline leaves it
+  launching.
 - `screen` observes the bound surface only. It reads the surface record under the Snapshot's
   shared lock and releases the lock; a kind's declared screen-read refusal then answers before
   any adapter, `tell`'s surface ownership check runs, one read goes through the shared

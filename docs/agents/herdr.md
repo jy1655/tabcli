@@ -77,10 +77,11 @@
   caller's error names the directory and the host's reason. The Session records a fixed reason
   that names no path (`terminal launch failed: the Herdr launch host would refuse the session
   directory; no surface handle was recorded and no prompt was sent`), and the launch log gets
-  the same line on a best-effort basis. A lock held until the deadline leaves the Session
-  launching and its Claim retained, as for every failure to open a Surface, and facts that are
-  not this launch's leave nothing written; then only the returned error holds the refusal. No
-  terminal exists either way. What the caller cannot know stays the host's, unchanged from
+  the same line on a best-effort basis. When the facts are not established (another holder
+  keeps the lock until the deadline, a launch that is not this launch's own or cannot be read),
+  the refusal writes nothing: the Session keeps its status, the launch log has no line from
+  TAB, and the returned error holds the refusal; `reopen` can still copy that error into the
+  status (below). No terminal exists either way. What the caller cannot know stays the host's, unchanged from
   0.4.49: the directory changed after the check, a program started under another token than
   the core's own, a read only the host can make. The host logs its refusal as before when it
   still can (a directory that is gone takes no line), and the launch ends as below when its
@@ -117,24 +118,42 @@
   the decision, about this launch's own records: the Claim at the path is this launch's token,
   the launch receipt carries the same token and is pending, the status is `Launching`
   (`pending::judge`), and the ordinary poll's reading says pending. Nothing is written,
-  created or re-permissioned before that is established: the lock is taken from the existing
-  lock file, without creating it or changing its permissions (`Store::try_lock_existing`).
+  created or re-permissioned before that is established.
   (b) When any of those facts cannot be read, or is not as required, the early decision does
   nothing: the wait goes on to its next ordinary poll, and the existing paths decide (a refusal
   is returned without writing). An observation that is inconclusive is never evidence.
   (c) Once taken on those facts, the decision stands, even if the world changes afterwards.
   That is what "fails at once" means, and it is the owner's decision.
-  (d) An early decision never acts after the launch deadline (`Expiry::BudgetOrReceipt`, also
-  checked after the core's reply and before a retried lock is accepted); from then on only the
-  existing deadline path acts.
-  The fixed reasons are what `status.json`, the closed record and `launch.log` hold, which is
-  what `residual_surface()` and the status readers interpret. The returned error keeps the
-  directory, the terminal and the launch log's path, and reopen's refusal record keeps that
-  full error as its detail, as for every failed launch since 0.4.49. A later reopen of the same
-  source that settles a refused launch still launching with its Claim
-  (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`) writes that detail into
-  the status error; an early refusal leaves a launch so only when it wrote nothing (a lock held
-  until the deadline, facts not this launch's).
+  (d) An early decision never acts after the launch deadline; from then on only the existing
+  deadline path acts.
+  One function establishes these facts for both decisions, in this order, writing nothing
+  (`launch::establish_early_facts`): the existing lifecycle lock file, opened for reading and
+  writing without creating or truncating it or changing its permissions, without blocking on
+  a special file (macOS, Linux), and accepted only when the opened handle is a regular file
+  (`Store::try_lock_existing`); one lock attempt; under it, this launch's Claim token at the
+  path; the receipt of that token, still `Pending`, and the status `Launching` without a
+  tombstone (`pending::judge`); the launch-host Record, read without the ordinary poll's
+  publication of a recorded failure (`host_record_pending`; the refusal needs it too, because
+  a macOS capture host's Record exists before the directory is checked); the ordinary poll's
+  reading of the status and the receipt (`read_confirmation`); and last, the monotonic launch
+  budget and the receipt's deadline. A read that fails or is inconclusive, a fact not as
+  required, a busy or unavailable lock, or a clock that has run out establishes nothing. Each
+  decision writes only on established facts, at once, under that same lock. Otherwise the
+  finished-terminal probe defers to the ordinary poll, and the refusal returns the original
+  refusal; it adds that the Claim is retained only when the budget ran out while another holder
+  kept the lock and this launch's Claim is still seen at the path.
+  The fixed reasons are in the failed `status.json` and, on a best-effort basis, in
+  `launch.log`; `residual_surface()` and the status readers interpret the status. A later
+  successful close without a terminal handle writes its closed record and status without that
+  error. The returned error keeps the directory, the terminal and the launch log's path, and
+  reopen's refusal record keeps that full error as its detail, as for every failed launch since
+  0.4.49. Reopen can copy that detail into the status error of a refused launch still
+  launching with its Claim in two places: the original `reopen` command itself, which settles
+  its failed launch through `fence_failed_start` with the detail once it gets the lifecycle
+  lock (`fail_reopen_launch`, after `record_failed_launch`), for example when a reader held the
+  lock through the refusal's deadline and then released it; and a later reopen of the same
+  source (`retry_interrupted_launch_fence`, through `retry_failed_start_fence`). An early
+  refusal leaves a launch so only when it wrote nothing.
 - On Linux and Windows, `bound_host` logs a startup-input flush or launch-shell start
   failure before attempting to record it. Publication requires the host's live birth to
   match the birth in its proven binding and rechecks the pending Claim and exact Surface

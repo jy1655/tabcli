@@ -203,8 +203,8 @@ that no provider was started (the session records `terminal surface finished bef
 launch was confirmed`; the error adds the terminal, its exit code when the core gives one, and
 the launch log's path), as a tmux start does when its surface disappears. Otherwise TAB keeps
 waiting as for any surface: a later confirmation still succeeds, a provider or launch-host
-failure ends the start with its own reason, and without either the start ends at the launch
-deadline.
+failure ends the start with its own reason, a surface that disappears ends it at the next
+check, and without any of these the start ends at the launch deadline.
 
 `--model` and `--effort` default to no TAB override and must be nonempty when provided. Provider
 defaults apply. Effort is forwarded to Codex's reasoning configuration, Claude and Agy's effort
