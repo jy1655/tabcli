@@ -6,12 +6,12 @@
 //! terminal by its own creation record once the owner is verified gone; the owner record
 //! neither grants nor blocks it. A finished terminal is removed and an absent one settled
 //! whatever the record says (exited or PID reused; bound, unbound or another session's;
-//! complete or not). A running terminal is ended only when this session's owner is positively
-//! gone: a record bound to this session that names an incarnation the OS observed exited or
-//! reused. A foreign, unbound or PID-only record cannot show that, so its running terminal is
-//! retained until the user ends it on its core. The adapter then ends it only after observing
-//! its program with the recorded birth. Only an explicit close acts on a gone owner's
-//! terminal; a close that cleans up after another command does not.
+//! complete or not). `core_kept` gathers that evidence for every owner record and returns it,
+//! never an action; the Herdr adapter's one granting function decides from it and from its own
+//! observation of the terminal. A running terminal is ended only when this session's owner is
+//! positively gone (`core_kept` says when) and its program is observed with its recorded
+//! birth. Only an explicit close acts on such a terminal; a close that cleans up after another
+//! command does not.
 //!
 //! Other kinds keep their platform's rule: macOS and Linux Repair retain a handle that can
 //! outlive the owner, and a close intent; Windows Repair closes the managed console of an
@@ -45,88 +45,91 @@ pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> 
     terminal::facts(kind).owner_survival == OwnerSurvival::CoreRetainsFinished
 }
 
-/// Whether the owner of this session is positively gone: the record is bound to this session
-/// and names an incarnation, and the OS observed that incarnation exited or its PID reused. A
-/// record of another session, an unbound one or a PID-only one can be observed gone without
-/// showing that this session has ended.
+/// What the decision found for a kind whose core keeps its terminals.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-pub(super) fn this_sessions_owner_gone(
-    owner: &terminal::ownership::NativeSessionOwner,
-    expected_session_id: &str,
-    process: &ProcessObservation,
-) -> bool {
-    owner.binding(expected_session_id) == terminal::ownership::OwnerBinding::Bound
-        && crate::native::session::owner::records_incarnation(owner)
-        && matches!(process, ProcessObservation::Gone(_))
+pub(super) enum CoreKept {
+    /// No live owner of this session holds the surface: the close acts on the terminal's
+    /// creation record, with this evidence.
+    Created(super::CreationEvidence),
+    /// A record bound to this session names a live, attested incarnation: the live-owner
+    /// rules apply, with this record and attestation.
+    LiveOwner(
+        Box<(
+            terminal::ownership::NativeSessionOwner,
+            crate::native::session::owner::OwnerAttestation,
+        )>,
+    ),
 }
 
-/// A startup surface with no live owner: a failed start whose owner is gone, or one that never
-/// recorded an owner (`owner_gone` is then true). A kind whose core keeps its terminals closes
-/// on the creation record, launch label and program birth included; the other kinds keep the
-/// surface-only close.
+/// The one place the close decision establishes its evidence for a kind whose core keeps its
+/// terminals (Herdr), on every OS and for every owner record: absent, damaged, another
+/// session's, unbound, PID-only, live, gone. It returns evidence, never an action. Only a
+/// record bound to this session that names an attested live incarnation leads to the
+/// live-owner rules; an owner that cannot be inspected refuses. Everything else is a close on
+/// the creation record, whose owner finding is positive only when:
+/// - the record is bound to this session and names an incarnation the platform can produce,
+///   which the OS observed exited, or whose PID a later process holds (a reuse that the live
+///   process contradicts proves nothing); or
+/// - the session's own wrapper recorded its end (state `exited`).
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-pub(super) fn startup_surface(
-    session: &TerminalSession,
-    owner_gone: bool,
-) -> super::TerminalCloseAuthority {
-    if !core_retains_finished(session.kind) {
-        return super::TerminalCloseAuthority::SurfaceOnly;
-    }
-    super::TerminalCloseAuthority::CreatedSurface(if owner_gone {
-        super::Running::End
-    } else {
-        super::Running::Keep
-    })
-}
-
-/// The authority over a surface whose recorded owner is observed gone, the same on every OS: a
-/// kind whose core keeps its terminals is closed on the terminal's creation record, and only
-/// by an explicit close. `None` leaves the decision to the platform's rule for the other kinds.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn gone_owner(
+pub(super) fn core_kept(
     observation: &dyn super::CloseObservation,
-    session: &TerminalSession,
     expected_session_id: &str,
-    owner: &terminal::ownership::NativeSessionOwner,
-    process: &ProcessObservation,
-) -> Result<Option<super::TerminalCloseAuthority>> {
-    if !core_retains_finished(session.kind) {
-        return Ok(None);
-    }
+    session: &TerminalSession,
+) -> Result<CoreKept> {
+    use super::{CreationEvidence, OwnerFinding};
+    use crate::native::process_identity::{Attested, Gone};
+    use crate::native::session::owner::{record_conflicts, records_incarnation};
+    use terminal::ownership::OwnerBinding;
+
     session.verify_managed_session(expected_session_id)?;
-    if observation.cause() != super::CloseCause::Explicit {
-        bail!(
-            "the session's native owner is gone; only close-session --explicit ends or removes its {} terminal, so nothing was sent and the handle is retained",
-            session.kind.display_name()
-        );
-    }
-    Ok(Some(super::TerminalCloseAuthority::CreatedSurface(
-        if this_sessions_owner_gone(owner, expected_session_id, process) {
-            super::Running::End
+    let cause = observation.cause();
+    let created = |owner: OwnerFinding| Ok(CoreKept::Created(CreationEvidence { cause, owner }));
+    // Only the session's wrapper writes `exited`, after its provider has exited.
+    let end_recorded = || -> Result<OwnerFinding> {
+        Ok(if observation.status()?.state == SessionState::Exited {
+            OwnerFinding::EndRecorded
         } else {
-            super::Running::Keep
-        },
-    )))
-}
-
-/// Windows explicit close: a kind whose core keeps its terminals is observed for a gone owner
-/// before the ownership proof, which a gone owner never passes. A live or uninspectable
-/// owner keeps the ownership proof.
-#[cfg(windows)]
-pub(super) fn windows_explicit_close(
-    observation: &dyn super::CloseObservation,
-    expected_session_id: &str,
-    session: &TerminalSession,
-) -> Result<Option<super::TerminalCloseAuthority>> {
-    if !core_retains_finished(session.kind) {
-        return Ok(None);
+            OwnerFinding::NotEstablished
+        })
+    };
+    // A wrapper that has not recorded itself yet may be registering.
+    if !observation.owner_present()? {
+        return created(end_recorded()?);
     }
-    let owner = observation.owner()?;
-    let process = observation.observe_owner_record(&owner).process;
-    if !matches!(process, ProcessObservation::Gone(_)) {
-        return Ok(None);
+    // A record that cannot be decoded names no owner.
+    let Ok(owner) = observation.owner() else {
+        return created(end_recorded()?);
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let attestation = observation.posix_owner_live(&owner);
+    #[cfg(windows)]
+    let attestation = observation.observe_owner_record(&owner);
+    let bound = owner.binding(expected_session_id) == OwnerBinding::Bound;
+    match &attestation.process {
+        // A record whose own fields conflict names nothing to inspect.
+        ProcessObservation::Unknown(_) if record_conflicts(&owner) => created(end_recorded()?),
+        ProcessObservation::Unknown(reason) => bail!("{reason}"),
+        ProcessObservation::Live(Attested::Incarnation) if bound => {
+            Ok(CoreKept::LiveOwner(Box::new((owner, attestation))))
+        }
+        // Another session's or an unbound record of a live process, or a PID-only record:
+        // nothing shows that this session's owner is live or gone.
+        ProcessObservation::Live(_) => created(end_recorded()?),
+        ProcessObservation::Gone(gone) => {
+            let incarnation_gone = bound
+                && records_incarnation(&owner)
+                && match gone {
+                    Gone::Exited => true,
+                    Gone::Reused(_) => observation.reuse_corroborated(&owner),
+                };
+            if incarnation_gone {
+                created(OwnerFinding::IncarnationGone)
+            } else {
+                created(end_recorded()?)
+            }
+        }
     }
-    gone_owner(observation, session, expected_session_id, &owner, &process)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -145,13 +148,6 @@ pub(super) fn explicit_close(
     use terminal::ownership::OwnerBinding;
 
     session.verify_managed_session(expected_session_id)?;
-    // An interrupted owner teardown keeps its own completion rule below.
-    if teardown_intent.is_none()
-        && let Some(authority) =
-            gone_owner(observation, session, expected_session_id, owner, &process)?
-    {
-        return Ok(authority);
-    }
     if matches!(process, ProcessObservation::Gone(Gone::Reused(_)))
         || observation.pid_alive(owner.pid)
         || owner.binding(expected_session_id) != OwnerBinding::Bound
@@ -280,10 +276,13 @@ impl<'a> RepairSurfaces<'a> {
         deadline: Instant,
     ) -> Result<RepairSurface<'a>> {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
             Self::WithoutSurface => retain_or(reader, Retention::WithoutSurface, || {
                 Ok(RepairSurface::Settle(Retention::WithoutSurface))
             }),
+            // No surface can be retained here; the settlement checks the fixture again.
+            #[cfg(all(test, not(any(target_os = "macos", target_os = "linux", windows))))]
+            Self::WithoutSurface => Ok(RepairSurface::Settle(Retention::WithoutSurface)),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             Self::Posix => retain_or(reader, Retention::Posix, || {
                 Ok(RepairSurface::Settle(Retention::Posix))

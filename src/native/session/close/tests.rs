@@ -342,6 +342,7 @@ fn consumed_handle_tombstone_reads_back_through_its_reader() {
             Ok(terminal::CloseResult {
                 outcome: terminal::CloseOutcome::Missing,
                 reason: Some("the tab was already gone".to_owned()),
+                keeps_diagnosis: false,
             })
         },
     )
@@ -579,7 +580,7 @@ fn close_deadline_preclose_repair_does_not_get_another_budget() {
             std::thread::sleep(
                 deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
             );
-            Ok(DeadOwnerRepair::Untouched)
+            Ok(false)
         },
         |_| panic!("repair spent the close deadline"),
         deadline,
@@ -3853,3 +3854,34 @@ fn entries(directory: &Path) -> Vec<Entry> {
 }
 
 type Entry = (PathBuf, Option<Vec<u8>>);
+
+// Review round 2, finding 7: only a Herdr close on its creation record keeps the stored
+// diagnosis. The explicit close of another retained surface whose owner is gone records what
+// it recorded before os-parity: here the window is absent and the closed record adds nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_retained_surface_of_another_kind_closes_with_its_earlier_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-retained");
+    fs::create_dir(&directory).unwrap();
+    write_owned_terminal_state(&directory, "working", reaped_child_pid());
+    let store = Store::open_unchecked(&directory);
+    let mut status = store.status().unwrap();
+    status.error = Some("provider reported a failure".into());
+    store.write_status(&status).unwrap();
+    close_with_attestation(
+        &store,
+        None,
+        budget::close_deadline(),
+        |_| crate::native::session::owner::OwnerAttestation {
+            process: crate::native::process_identity::ProcessObservation::Gone(
+                crate::native::process_identity::Gone::Exited,
+            ),
+            control: crate::native::session::owner::ControlAttestation::NotRecorded,
+            pid_alive: Some(false),
+        },
+        |_| Ok(terminal::CloseOutcome::Missing.into()),
+    )
+    .unwrap();
+    assert_eq!(store.closed_if_present().unwrap().unwrap().error, None);
+}

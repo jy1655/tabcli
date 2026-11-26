@@ -188,15 +188,92 @@ pub(in crate::native) struct OwnerObservers<'a> {
 }
 
 /// Whether this platform's attestation of `owner` compares a recorded incarnation (a birth on
-/// macOS and Linux, the process identity on Windows) rather than the PID alone. Only then is
-/// its Gone the OS's positive answer about that incarnation: a PID-only Gone rests on the
-/// liveness probe, which on Windows also answers `false` for an inspection failure.
+/// macOS and Linux, the process identity on Windows) that the platform can produce, rather
+/// than the PID alone. Only then is its Gone the OS's positive answer about that incarnation:
+/// a PID-only Gone rests on the liveness probe, which on Windows also answers `false` for an
+/// inspection failure, and an impossible birth compares unequal to every live process.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn records_incarnation(owner: &NativeSessionOwner) -> bool {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    return matches!(recorded_birth(owner), Ok(Some(_)));
+    return matches!(recorded_birth(owner), Ok(Some(birth)) if birth_is_possible(&birth));
     #[cfg(windows)]
-    return owner.linux_birth.is_none() && owner.windows_process_identity.is_some();
+    return owner.linux_birth.is_none()
+        && owner
+            .windows_process_identity
+            .clone()
+            .is_some_and(|identity| {
+                crate::native::terminal::WindowsIncarnation(identity).is_possible()
+            });
+}
+
+/// Whether the record's own incarnation fields conflict (another platform's or a mixed birth), so
+/// that attestation can only answer Unknown about it.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(in crate::native) fn record_conflicts(owner: &NativeSessionOwner) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return recorded_birth(owner).is_err();
+    #[cfg(windows)]
+    return owner.linux_birth.is_some();
+}
+
+/// A birth the platform can report: macOS microseconds below a second and a positive second;
+/// a Linux boot identity that is not all zero and a positive start tick count.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn birth_is_possible(birth: &ProcessBirth) -> bool {
+    match birth {
+        ProcessBirth::Macos(seconds, microseconds) => *seconds > 0 && *microseconds < 1_000_000,
+        ProcessBirth::Linux(birth) => !birth.boot_id.is_nil() && birth.starttime_ticks > 0,
+    }
+}
+
+/// Corroborates a reused-PID answer about `owner`: its recorded incarnation is one the platform
+/// can produce, and the process now at its PID was created after it (on Linux, also any process
+/// of another boot). Otherwise the record conflicts with the live process (a damaged birth, or
+/// on Windows the same creation time under another image path) and proves no death. An
+/// observation that fails corroborates nothing.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(in crate::native) fn reuse_corroborated(owner: &NativeSessionOwner) -> bool {
+    reuse_corroborated_with(owner, &installed_observers())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub(in crate::native) fn reuse_corroborated_with(
+    owner: &NativeSessionOwner,
+    observers: &OwnerObservers<'_>,
+) -> bool {
+    if !records_incarnation(owner) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(Some(ProcessBirth::Macos(seconds, microseconds))) = recorded_birth(owner) else {
+            return false;
+        };
+        matches!((observers.birth)(owner.pid), Ok(Some(live)) if live > (seconds, microseconds))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(Some(ProcessBirth::Linux(recorded))) = recorded_birth(owner) else {
+            return false;
+        };
+        match (observers.birth)(owner.pid) {
+            Ok(Some(ProcessBirth::Linux(live))) => {
+                live.boot_id != recorded.boot_id || live.starttime_ticks > recorded.starttime_ticks
+            }
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use crate::native::terminal::WindowsIncarnation;
+        let Some(recorded) = owner.windows_process_identity.clone() else {
+            return false;
+        };
+        match (observers.identity)(owner.pid) {
+            Ok(Some(live)) => WindowsIncarnation(recorded).succeeded_by(&WindowsIncarnation(live)),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -237,22 +314,23 @@ fn process_control(pid: u32) -> Result<Option<NativeProcessIdentity>> {
     return crate::native::terminal::linux::process::live_native_process_identity_if_present(pid);
 }
 
+fn installed_observers() -> OwnerObservers<'static> {
+    OwnerObservers {
+        pid_alive: &process_is_alive,
+        #[cfg(target_os = "linux")]
+        birth: &process_birth,
+        #[cfg(target_os = "macos")]
+        birth: &crate::native::terminal::macos::process::macos_process_start,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        control: &process_control,
+        #[cfg(windows)]
+        identity: &crate::native::terminal::observe_windows_process_identity,
+    }
+}
+
 /// Reads only the supplied owner and OS evidence. Never acquires a session lock or reads records.
 pub(in crate::native) fn attest_owner(owner: &NativeSessionOwner) -> OwnerAttestation {
-    attest_owner_with(
-        owner,
-        OwnerObservers {
-            pid_alive: &process_is_alive,
-            #[cfg(target_os = "linux")]
-            birth: &process_birth,
-            #[cfg(target_os = "macos")]
-            birth: &crate::native::terminal::macos::process::macos_process_start,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            control: &process_control,
-            #[cfg(windows)]
-            identity: &crate::native::terminal::observe_windows_process_identity,
-        },
-    )
+    attest_owner_with(owner, installed_observers())
 }
 
 pub(in crate::native) fn attest_owner_with(

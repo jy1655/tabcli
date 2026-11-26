@@ -280,6 +280,9 @@ pub(super) enum CloseOutcome {
 pub(in crate::native) struct CloseResult {
     pub outcome: CloseOutcome,
     pub reason: Option<String>,
+    /// The closed record keeps the session's stored diagnosis, read under the lifecycle lock:
+    /// a close on a terminal's creation record, which no live owner reported on.
+    pub keeps_diagnosis: bool,
 }
 
 impl From<CloseOutcome> for CloseResult {
@@ -287,6 +290,21 @@ impl From<CloseOutcome> for CloseResult {
         Self {
             outcome,
             reason: None,
+            keeps_diagnosis: false,
+        }
+    }
+}
+
+impl CloseResult {
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
+    pub(in crate::native) fn keeping_diagnosis(outcome: CloseOutcome) -> Self {
+        Self {
+            outcome,
+            reason: None,
+            keeps_diagnosis: true,
         }
     }
 }

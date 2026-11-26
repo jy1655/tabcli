@@ -68,7 +68,12 @@ fn scripted_dead_owner_close_refuses_the_installed_ownership_probe() {
         .with_binding(Some("session-foreign".into()));
     let adapters = Adapter::with_core(fixture.core.clone());
     let observation = Production::new(&fixture.directory, SESSION, &surface, later())
-        .with_posix_dead_owner_observations(&adapters, &|_| gone(Gone::Exited), &|_| false);
+        .with_posix_dead_owner_observations(
+            &adapters,
+            &|_| gone(Gone::Exited),
+            &|_| false,
+            &|_| panic!("an exited owner needs no reuse corroboration"),
+        );
     let _ = observation.ownership_proof();
 }
 
@@ -115,7 +120,7 @@ impl Fixture {
         let adapters = Adapter::with_core(self.core.clone());
         session::close::close_with_attestation(&self.store(), None, deadline, observe, |surface| {
             Production::new(&self.directory, SESSION, surface, deadline)
-                .with_posix_dead_owner_observations(&adapters, &observe, &pid_is_alive)
+                .with_posix_dead_owner_observations(&adapters, &observe, &pid_is_alive, &|_| true)
                 .close_posix_surface()
         })
     }
@@ -265,4 +270,26 @@ fn ended_close_checks_the_launch_label_with_current_and_legacy_records() {
             fixture.assert_closed("legacy launch");
         }
     }
+}
+
+// A Herdr terminal is closed with its live owner or on its creation record, never on the
+// surface alone: that authority is refused before anything is sent.
+#[test]
+fn a_herdr_terminal_is_never_closed_on_the_surface_alone() {
+    let fixture = Fixture::new();
+    let surface = fixture.store().terminal().unwrap();
+    let error = posix::close_owned_session(
+        &Adapter::with_core(fixture.core.clone()),
+        &fixture.directory,
+        SESSION,
+        &surface,
+        posix::OwnedSurfaceClose::SurfaceOnly,
+        session::close::budget::close_deadline(),
+    )
+    .unwrap_err();
+    assert!(
+        error_text(&error).contains("closed with its live owner or on its creation record"),
+        "{error:#}"
+    );
+    assert_eq!(fixture.mutations(), (0, 0));
 }

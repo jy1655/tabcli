@@ -748,3 +748,224 @@ fn prune_attests_an_owner_record_whatever_session_it_names() {
         );
     }
 }
+
+// os-parity, review round 2, finding 5, through the real classifier: a reused-PID answer counts
+// as the recorded owner's death only for a recorded incarnation that the platform can produce,
+// and only when the process now at its PID was created after it. An impossible recorded birth
+// and a live process that began no later than the record (or, on Windows, at the same creation
+// time under another path) still classify as reuse, but corroborate nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reuse_counts_only_for_a_possible_birth_that_a_later_process_replaced() {
+    let owner = |seconds, microseconds| NativeSessionOwner {
+        pid: 4242,
+        process_start_seconds: Some(seconds),
+        process_start_microseconds: Some(microseconds),
+        ..Default::default()
+    };
+    type Birth = Box<dyn Fn(u32) -> anyhow::Result<Option<(u64, u64)>>>;
+    let observers = |live: (u64, u64)| -> Birth { Box::new(move |_| Ok(Some(live))) };
+    for (label, recorded, live, possible, corroborated) in [
+        ("a later process", (10, 20), (10, 21), true, true),
+        (
+            "a process born earlier than the record",
+            (10, 20),
+            (9, 999_999),
+            true,
+            false,
+        ),
+        (
+            "an impossible microsecond",
+            (10, 1_000_000),
+            (11, 0),
+            false,
+            false,
+        ),
+        ("a zero second", (0, 20), (11, 0), false, false),
+    ] {
+        let owner = owner(recorded.0, recorded.1);
+        assert_eq!(records_incarnation(&owner), possible, "{label}");
+        let birth = observers(live);
+        let observers = OwnerObservers {
+            pid_alive: &|_| true,
+            birth: &*birth,
+            control: &|_| panic!("a reused incarnation compares no control"),
+        };
+        assert!(
+            matches!(
+                attest_owner_with(&owner, observers).process,
+                ProcessObservation::Gone(Gone::Reused(_))
+            ),
+            "{label}"
+        );
+        let observers = OwnerObservers {
+            pid_alive: &|_| true,
+            birth: &*birth,
+            control: &|_| panic!("corroboration compares no control"),
+        };
+        assert_eq!(
+            reuse_corroborated_with(&owner, &observers),
+            corroborated,
+            "{label}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reuse_counts_only_for_a_possible_birth_that_a_later_process_replaced() {
+    use crate::native::terminal::LinuxBirth;
+    let boot = |id: &str| id.parse().unwrap();
+    let this_boot = "00112233-4455-6677-8899-aabbccddeeff";
+    let owner = |boot_id, ticks| NativeSessionOwner {
+        pid: 4242,
+        linux_birth: Some(LinuxBirth {
+            boot_id,
+            starttime_ticks: ticks,
+        }),
+        ..Default::default()
+    };
+    for (label, recorded, live, possible, corroborated) in [
+        (
+            "a later process",
+            (this_boot, 20),
+            (this_boot, 21),
+            true,
+            true,
+        ),
+        (
+            "a process of another boot",
+            ("ffeeddcc-bbaa-9988-7766-554433221100", 20),
+            (this_boot, 5),
+            true,
+            true,
+        ),
+        (
+            "a process born earlier than the record",
+            (this_boot, 20),
+            (this_boot, 19),
+            true,
+            false,
+        ),
+        (
+            "zero start ticks",
+            (this_boot, 0),
+            (this_boot, 5),
+            false,
+            false,
+        ),
+        (
+            "a nil boot identity",
+            ("00000000-0000-0000-0000-000000000000", 20),
+            (this_boot, 21),
+            false,
+            false,
+        ),
+    ] {
+        let owner = owner(boot(recorded.0), recorded.1);
+        assert_eq!(records_incarnation(&owner), possible, "{label}");
+        let live = LinuxBirth {
+            boot_id: boot(live.0),
+            starttime_ticks: live.1,
+        };
+        let birth = move |_| Ok(Some(ProcessBirth::Linux(live)));
+        let observers = OwnerObservers {
+            pid_alive: &|_| true,
+            birth: &birth,
+            control: &|_| panic!("corroboration compares no control"),
+        };
+        assert!(
+            matches!(
+                attest_owner_with(&owner, observers).process,
+                ProcessObservation::Gone(Gone::Reused(_))
+            ),
+            "{label}"
+        );
+        let observers = OwnerObservers {
+            pid_alive: &|_| true,
+            birth: &birth,
+            control: &|_| panic!("corroboration compares no control"),
+        };
+        assert_eq!(
+            reuse_corroborated_with(&owner, &observers),
+            corroborated,
+            "{label}"
+        );
+    }
+}
+
+// Runs on the Windows runner only.
+#[cfg(windows)]
+#[test]
+fn a_reuse_counts_only_for_a_possible_birth_that_a_later_process_replaced() {
+    use crate::native::terminal::WindowsProcessIdentity;
+    let identity = |creation_time, path: &str| WindowsProcessIdentity {
+        creation_time,
+        executable_path: path.into(),
+    };
+    for (label, recorded, live, possible, corroborated) in [
+        (
+            "a later process",
+            identity(10, r"C:\tabcli\tabcli.exe"),
+            identity(11, r"C:\other.exe"),
+            true,
+            true,
+        ),
+        (
+            "the same creation time under another path",
+            identity(10, r"C:\tabcli\tabcli-damaged.exe"),
+            identity(10, r"C:\tabcli\tabcli.exe"),
+            true,
+            false,
+        ),
+        (
+            "a process created earlier than the record",
+            identity(10, r"C:\tabcli\tabcli.exe"),
+            identity(9, r"C:\other.exe"),
+            true,
+            false,
+        ),
+        (
+            "no creation time",
+            identity(0, r"C:\tabcli\tabcli.exe"),
+            identity(11, r"C:\other.exe"),
+            false,
+            false,
+        ),
+        (
+            "no image path",
+            identity(10, ""),
+            identity(11, r"C:\other.exe"),
+            false,
+            false,
+        ),
+    ] {
+        let owner = NativeSessionOwner {
+            pid: 4242,
+            windows_process_identity: Some(recorded),
+            ..Default::default()
+        };
+        assert_eq!(records_incarnation(&owner), possible, "{label}");
+        let observe = move |_| Ok(Some(live.clone()));
+        let observers = OwnerObservers {
+            pid_alive: &|_| true,
+            identity: &observe,
+        };
+        assert!(
+            matches!(
+                attest_owner_with(&owner, observers).process,
+                ProcessObservation::Gone(Gone::Reused(_))
+            ),
+            "{label}"
+        );
+        let observers = OwnerObservers {
+            pid_alive: &|_| true,
+            identity: &observe,
+        };
+        assert_eq!(
+            reuse_corroborated_with(&owner, &observers),
+            corroborated,
+            "{label}"
+        );
+    }
+}

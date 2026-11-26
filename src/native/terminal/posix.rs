@@ -21,14 +21,13 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 /// Which authority the owned close runs under: the attested owner is live, or only the
 /// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
 /// work for a live owner only. `CreatedSurface` reaches only a kind whose core keeps its
-/// terminals, with no live owner left: the adapter removes the terminal only once the
-/// creation record in the handle proves it is this session's, and ends a running one only as
-/// `Running` allows.
+/// terminals, with no live owner of this session left: it carries the decision's evidence, and
+/// the adapter's one granting function decides from it and its own observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum OwnedSurfaceClose {
     LiveOwner,
     SurfaceOnly,
-    CreatedSurface(super::close_authority::Running),
+    CreatedSurface(super::close_authority::CreationEvidence),
 }
 
 pub(in crate::native::terminal) trait PosixTerminalAdapter {
@@ -508,7 +507,12 @@ mod tests {
                 Path::new("/unused"),
                 "session-fake",
                 &surface,
-                OwnedSurfaceClose::CreatedSurface(super::super::close_authority::Running::End),
+                OwnedSurfaceClose::CreatedSurface(
+                    super::super::close_authority::CreationEvidence::scripted(
+                        super::super::close_authority::CloseCause::Explicit,
+                        true,
+                    ),
+                ),
                 deadline,
             )
             .unwrap_err();

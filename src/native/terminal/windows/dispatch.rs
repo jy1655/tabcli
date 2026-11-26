@@ -59,18 +59,18 @@ pub(in crate::native) trait WindowsTerminalAdapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome>;
-    /// Removes the surface with no live owner left, proving it by the creation record in the
-    /// handle, and ends a running one only as `running` allows. Only a kind whose core keeps
-    /// its terminals has such a record, and the dispatch refuses every other kind before its
-    /// adapter, so the default is an invariant failure and never an ordinary answer.
+    /// Closes the surface with no live owner of this session left, on the creation record in
+    /// the handle and the decision's `evidence`. Only a kind whose core keeps its terminals has
+    /// such a record, and the dispatch refuses every other kind before its adapter, so the
+    /// default is an invariant failure and never an ordinary answer.
     fn close_created_surface(
         &self,
         directory: &Path,
         session: &TerminalSession,
-        running: super::close_authority::Running,
+        evidence: super::close_authority::CreationEvidence,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        let _ = (directory, running, deadline);
+        let _ = (directory, evidence, deadline);
         bail!(
             "{} keeps no creation record; the shared dispatch must refuse before its adapter",
             session.kind.display_name()
@@ -212,7 +212,7 @@ pub(in crate::native) fn close_created_surface(
     adapters: &dyn Adapters,
     directory: &Path,
     session: &TerminalSession,
-    running: super::close_authority::Running,
+    evidence: super::close_authority::CreationEvidence,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     crate::native::session::close::budget::close_remaining(deadline)?;
@@ -224,7 +224,7 @@ pub(in crate::native) fn close_created_surface(
     }
     adapters
         .adapter(session.kind)
-        .close_created_surface(directory, session, running, deadline)
+        .close_created_surface(directory, session, evidence, deadline)
 }
 
 pub(in crate::native::terminal) fn surface_present(

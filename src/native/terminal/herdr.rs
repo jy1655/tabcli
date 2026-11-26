@@ -21,12 +21,13 @@
 //! (herdr-core 0.1.21 `paths.rs`).
 use super::record::HerdrHostBirth;
 use crate::native::session::close::budget::close_remaining;
-use crate::native::terminal::close_authority::Running;
+use crate::native::terminal::close_authority::CreationEvidence;
 use crate::native::terminal::{
     CloseOutcome, RetainedLaunchSurface, TerminalKind, TerminalSendFailure, TerminalSendResult,
     TerminalSession,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use authority::{Basis, Grant};
 use identity::{CLOSE_STOPPED, Launch, Recorded, Requirement, binding_names_host, target};
 use serde_json::{Value, json};
 use std::{
@@ -37,6 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod authority;
 mod identity;
 #[cfg(windows)]
 mod pipe;
@@ -742,11 +744,13 @@ fn remove_created(
         let Some(first) = get(&mut linked, address, deadline)? else {
             return Ok(());
         };
-        let same = |observed: &Observed| launch.check_cleanup(&first, observed);
-        same(&first)?;
+        launch.check_cleanup(&first, &first)?;
         handle = launch.recover_handle(core, &linked, &first);
-        // The launcher removes the terminal it has just created and never bound.
-        end_and_remove(core, &mut linked, address, deadline, &same, &|_| Ok(())).map(|_| ())
+        let basis = Basis::Launch {
+            launch,
+            first: &first,
+        };
+        end_and_remove(core, &mut linked, address, deadline, &basis).map(|_| ())
     })();
     match (removed, handle) {
         (Ok(()), _) => cause.context(format!(
@@ -771,33 +775,18 @@ fn retain_unremoved(surface: TerminalSession, reason: String) -> anyhow::Error {
     .into()
 }
 
-/// Whether a close may end a terminal that still runs.
-#[derive(Clone, Copy)]
-enum End {
-    /// A live, attested owner closes with its own proof, or the launcher removes the terminal
-    /// it has just created.
-    WithOwner,
-    /// No live owner is left: the program must first be observed with its recorded birth.
-    Observed,
-    /// The owner record cannot show that this session has ended: a running terminal is left
-    /// alone.
-    Never,
-}
-
 /// Ends the program of `address` and removes the finished terminal, on a linked connection.
-/// Every step reads the terminal again and checks that observation before it acts, so a
+/// Every step reads the terminal again and asks `authority::grant` before it acts, so a
 /// repeated call finishes what an earlier one left (a removed terminal is not killed, a
-/// finished one is only removed), and a terminal that changed in between is left alone.
-/// `may_end` is asked before the one `terminal.kill`. The core offers no conditional kill or
-/// remove: another client of the same user can still change the terminal between the last
-/// read and the action.
+/// finished one is only removed), and a terminal that changed in between is left alone. The
+/// core offers no conditional kill or remove: another client of the same user can still change
+/// the terminal between the last read and the action.
 fn end_and_remove(
     core: &dyn Core,
     linked: &mut Linked<'_>,
     address: &str,
     deadline: Instant,
-    same: &dyn Fn(&Observed) -> Result<()>,
-    may_end: &dyn Fn(&Observed) -> Result<()>,
+    basis: &Basis<'_>,
 ) -> Result<CloseOutcome> {
     let mut outcome = CloseOutcome::Missing;
     let mut killed = false;
@@ -810,37 +799,45 @@ fn end_and_remove(
         let Some(observed) = get(linked, address, deadline)? else {
             return Ok(outcome);
         };
-        same(&observed).context(CLOSE_STOPPED)?;
-        match observed.state {
-            State::Live if !killed => {
-                may_end(&observed)?;
-                match linked.connection.call(
-                    "terminal.kill",
-                    json!({"terminal": address}),
-                    deadline,
-                ) {
-                    Ok(_) => {}
-                    Err(CallError::Refused { kind, .. })
-                        if kind == "not_found" || kind == "finished" => {}
-                    Err(error) => return Err(error.into_error("terminal.kill")),
-                }
+        match authority::grant(core, basis, &observed, killed).context(CLOSE_STOPPED)? {
+            Grant::Kill(kill) => {
+                end_program(linked, address, kill, deadline)?;
                 killed = true;
                 outcome = CloseOutcome::Closed;
-                continue;
             }
-            State::Live => core.pause(deadline),
-            State::Finished => return remove_once(linked, address, deadline, outcome),
+            Grant::Wait => core.pause(deadline),
+            Grant::Remove(remove) => {
+                return remove_once(linked, address, remove, deadline, outcome);
+            }
         }
     }
 }
 
-/// One `terminal.rm` and one read to confirm it. `not_found` from the recorded core answers
-/// the removal itself: another client removed the terminal after the last read. A removal
-/// the core acknowledged while it still lists the terminal is not sent again; the handle is
-/// kept for the next close.
+/// One `terminal.kill`, which only `authority::grant` can permit.
+fn end_program(
+    linked: &mut Linked<'_>,
+    address: &str,
+    _: authority::Kill,
+    deadline: Instant,
+) -> Result<()> {
+    match linked
+        .connection
+        .call("terminal.kill", json!({"terminal": address}), deadline)
+    {
+        Ok(_) => Ok(()),
+        Err(CallError::Refused { kind, .. }) if kind == "not_found" || kind == "finished" => Ok(()),
+        Err(error) => Err(error.into_error("terminal.kill")),
+    }
+}
+
+/// One `terminal.rm`, which only `authority::grant` can permit, and one read to confirm it.
+/// `not_found` from the recorded core answers the removal itself: another client removed the
+/// terminal after the last read. A removal the core acknowledged while it still lists the
+/// terminal is not sent again; the handle is kept for the next close.
 fn remove_once(
     linked: &mut Linked<'_>,
     address: &str,
+    _: authority::Remove,
     deadline: Instant,
     outcome: CloseOutcome,
 ) -> Result<CloseOutcome> {
@@ -860,13 +857,12 @@ fn remove_once(
     Ok(CloseOutcome::Closed)
 }
 
-/// Closes exactly the recorded terminal, proven by its creation record at every read: absent
-/// only when its own core no longer holds it. `end` decides whether a running one may be ended.
-fn close_until(
+/// The close of a live, attested owner of this session, or of the launcher that bound the
+/// terminal: exactly the recorded terminal, absent only when its own core no longer holds it.
+fn close_owned(
     core: &dyn Core,
     session: &TerminalSession,
     directory: &Path,
-    end: End,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     close_remaining(deadline)?;
@@ -875,38 +871,46 @@ fn close_until(
     else {
         return Ok(CloseOutcome::Missing);
     };
-    let same = |observed: &Observed| recorded.check(core, observed);
-    let may_end = |observed: &Observed| match end {
-        End::WithOwner => Ok(()),
-        End::Observed => recorded.program_observed(core, observed),
-        End::Never => bail!(
-            "Herdr terminal {} is still running and its owner record does not show that this session's owner is gone, so TAB does not end it; nothing was sent and the handle is retained; end it on its recorded core, then close again",
-            observed.address
-        ),
-    };
     close_remaining(deadline)?;
-    end_and_remove(core, &mut linked, &session.id, deadline, &same, &may_end)
+    end_and_remove(
+        core,
+        &mut linked,
+        &session.id,
+        deadline,
+        &Basis::Owned(&recorded),
+    )
 }
 
-/// With no live owner left to close with, on every OS: removes the recorded terminal once its
-/// creation record proves it is the terminal this session created (its core, address,
-/// creation time, program, session directory and launch label). A running terminal is ended
-/// (at most one `terminal.kill`) only when `running` allows it and its program is observed
-/// with the recorded birth. The owner record plays no part. A terminal set to keep, or one
-/// that is not this session's, is left alone with its handle retained; only `not_found` from
-/// its own core proves it gone.
+/// With no live owner of this session to close with, on every OS: the terminal's creation
+/// record and the decision's evidence decide, through `authority::grant`. A cleanup gets
+/// nothing. The handle's creation record is validated before its core is asked, so only a
+/// whole record can be settled as absent by `not_found`. A terminal set to keep, or one that is
+/// not this session's, is left alone with its handle retained.
 fn close_created(
     core: &dyn Core,
     session: &TerminalSession,
     directory: &Path,
-    running: Running,
+    evidence: CreationEvidence,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    let end = match running {
-        Running::End => End::Observed,
-        Running::Keep => End::Never,
+    let evidence = authority::admit(evidence)?;
+    close_remaining(deadline)?;
+    let Some((recorded, mut linked)) =
+        Recorded::open(core, session, Requirement::Created(directory), deadline)?
+    else {
+        return Ok(CloseOutcome::Missing);
     };
-    close_until(core, session, directory, end, deadline)
+    close_remaining(deadline)?;
+    end_and_remove(
+        core,
+        &mut linked,
+        &session.id,
+        deadline,
+        &Basis::Created {
+            recorded: &recorded,
+            evidence,
+        },
+    )
 }
 
 fn surface_present(
@@ -1122,7 +1126,7 @@ impl<C: Core> Adapter<C> {
             |startup_deadline| create(&self.core, command, directory, startup_deadline, deadline),
             |_, _| Ok(()),
             |session, deadline| {
-                close_until(&self.core, session, directory, End::WithOwner, deadline)
+                close_owned(&self.core, session, directory, deadline)
                     .map(|_| ())
                     .map_err(|error| {
                         retain_unremoved(
@@ -1180,17 +1184,17 @@ impl<C: Core> Adapter<C> {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_until(&self.core, session, directory, End::WithOwner, deadline)
+        close_owned(&self.core, session, directory, deadline)
     }
 
     pub(in crate::native::terminal) fn close_created(
         &self,
         directory: &Path,
         session: &TerminalSession,
-        running: Running,
+        evidence: CreationEvidence,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_created(&self.core, session, directory, running, deadline)
+        close_created(&self.core, session, directory, evidence, deadline)
     }
 }
 
@@ -1272,13 +1276,20 @@ mod posix_adapter {
             close: OwnedSurfaceClose,
             deadline: Instant,
         ) -> Result<CloseOutcome> {
-            if let OwnedSurfaceClose::CreatedSurface(running) = close {
-                return self.close_created(directory, session, running, deadline);
+            match close {
+                OwnedSurfaceClose::CreatedSurface(evidence) => {
+                    self.close_created(directory, session, evidence, deadline)
+                }
+                OwnedSurfaceClose::LiveOwner => {
+                    record_live_owner_intent(directory, id, session, deadline)?;
+                    self.close(directory, session, deadline)
+                }
+                // The decision never leaves a Herdr terminal to the surface alone: it is closed
+                // with its live owner or on its creation record.
+                OwnedSurfaceClose::SurfaceOnly => anyhow::bail!(
+                    "a Herdr terminal is closed with its live owner or on its creation record; no close was sent and the handle is retained"
+                ),
             }
-            if close == OwnedSurfaceClose::LiveOwner {
-                record_live_owner_intent(directory, id, session, deadline)?;
-            }
-            self.close(directory, session, deadline)
         }
     }
 
@@ -1374,10 +1385,10 @@ mod windows_adapter {
             &self,
             directory: &Path,
             session: &TerminalSession,
-            running: crate::native::terminal::close_authority::Running,
+            evidence: crate::native::terminal::close_authority::CreationEvidence,
             deadline: Instant,
         ) -> Result<CloseOutcome> {
-            self.close_created(directory, session, running, deadline)
+            self.close_created(directory, session, evidence, deadline)
         }
         fn surface_present(
             &self,

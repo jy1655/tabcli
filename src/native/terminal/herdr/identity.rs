@@ -39,13 +39,15 @@ fn usable_endpoint(endpoint: &str) -> bool {
 /// | Operations | Directory | State | Additional evidence |
 /// | --- | --- | --- | --- |
 /// | Send, screen, verify | Managed Session id | Live | Program still exists |
-/// | Presence, every close, cleanup after binding fails | Exact path | Either | Launch label |
+/// | Presence, close with a live owner, cleanup after binding fails | Exact path | Either | |
+/// | Close with no live owner (`Created`) | Exact path | Either | A whole creation record, launch label |
 ///
-/// A close with no live owner left also observes a running terminal's program with its
-/// recorded birth before it ends it (`program_observed`).
+/// A `Created` close also observes a running terminal's program with its recorded birth before
+/// `authority::grant` lets it end the terminal (`program_observed`).
 pub(super) enum Requirement<'a> {
     Live,
     Bound(&'a Path),
+    Created(&'a Path),
 }
 
 pub(super) struct Recorded<'a> {
@@ -69,6 +71,11 @@ impl<'a> Recorded<'a> {
             surface,
             requirement,
         };
+        // Absence from the core settles a close on the creation record only for a handle whose
+        // creation record is whole, so it is checked before the core is asked.
+        if let Requirement::Created(_) = recorded.requirement {
+            recorded.check_creation_record_whole()?;
+        }
         let mut linked = link(
             core,
             Path::new(&surface.socket),
@@ -86,7 +93,8 @@ impl<'a> Recorded<'a> {
     pub(super) fn check(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
         let identity = self.check_identity(core, observed);
         match self.requirement {
-            Requirement::Bound(_) => {
+            Requirement::Bound(_) => identity,
+            Requirement::Created(_) => {
                 identity?;
                 self.check_launch(observed)
             }
@@ -101,6 +109,33 @@ impl<'a> Recorded<'a> {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The proof `authority::grant` asks of a close on the creation record: the handle was
+    /// opened for one, and the observation matches its identity and launch label.
+    pub(super) fn check_creation_record(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
+        if !matches!(self.requirement, Requirement::Created(_)) {
+            bail!("a close on the creation record needs a handle opened for one");
+        }
+        self.check(core, observed)
+    }
+
+    /// The handle's own creation record is whole: its launch label is one TAB generates, and
+    /// on Windows, where every writer (0.4.47 on) saved it, it is present. The macOS and Linux
+    /// handles of 0.4.45 and 0.4.46 omitted it; their label is compared with the name.
+    fn check_creation_record_whole(&self) -> Result<()> {
+        let address = &self.session.id;
+        match self.session.herdr_launch_nonce() {
+            Some(nonce) => launch_name(nonce)
+                .map(|_| ())
+                .with_context(|| format!("Herdr handle for terminal {address} records a damaged launch label; the handle is retained")),
+            #[cfg(unix)]
+            None => Ok(()),
+            #[cfg(windows)]
+            None => bail!(
+                "Herdr handle for terminal {address} records no launch label, which every Windows Herdr handle TAB wrote has; the handle is retained"
+            ),
         }
     }
 
@@ -125,7 +160,7 @@ impl<'a> Recorded<'a> {
         let address = &observed.address;
         let directory = match self.requirement {
             Requirement::Live => None,
-            Requirement::Bound(directory) => Some(directory),
+            Requirement::Bound(directory) | Requirement::Created(directory) => Some(directory),
         };
         let argv_directory = observed.argv.get(2);
         let session_directory = match directory {
@@ -159,8 +194,14 @@ impl<'a> Recorded<'a> {
                     "finished Herdr terminal {address} is set to keep; verify it with `{get}`, run `{remove}`, then retry close-session"
                 );
             }
+            let keep_off = hc_command(
+                &recorded.socket,
+                "keep",
+                &format!("{address} --off"),
+                cfg!(windows),
+            );
             bail!(
-                "Herdr terminal {address} is set to keep, so a replacement program can run in it; run `hc keep {address} --off` first"
+                "Herdr terminal {address} is set to keep, so a replacement program can run in it; run `{keep_off}` first, after checking that the core at that endpoint is the one TAB recorded"
             );
         }
         if observed.state == State::Live
@@ -185,7 +226,8 @@ impl<'a> Recorded<'a> {
         let matches_launch = match self.session.herdr_launch_nonce() {
             Some(expected) => nonce == expected,
             // Records from 0.4.45 and 0.4.46, on macOS and Linux only, omitted the nonce. Every
-            // Windows writer (0.4.47 on) saved it, so a Windows handle without one is not TAB's.
+            // Windows writer (0.4.47 on) saved it, so a Windows handle without one is not TAB's
+            // (`check_creation_record_whole` refuses it first).
             #[cfg(unix)]
             None => observed.name.as_deref() == Some(launch_name(nonce)?.as_str()),
             #[cfg(windows)]
