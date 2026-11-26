@@ -297,7 +297,7 @@ thread_local! {
 
 /// Lets a test resolve a Claude reopen past its platform gate where reopen is not implemented
 /// (macOS, Linux), as on native Windows; nothing after the resolution is reached this way.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) fn allow_reopen_for_test(allow: bool) {
     REOPEN_AVAILABLE_FOR_TEST.with(|cell| cell.set(allow));
 }

@@ -4214,6 +4214,9 @@ fn consent_failure_after_a_reopened_launch_keeps_the_source_reservation() {
 // only then is the workspace-consent store written. Each case runs in a child process with
 // its own state root, a Claude stand-in on PATH, and an hc terminal whose core is absent;
 // Claude reopen is let past its platform gate (`allow_reopen_for_test`), as on native Windows.
+// They run on macOS, Linux and Windows, as the launch-surface tests do: on any other OS the
+// selection refuses before the caller check or the recovery.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn in_review_case(test: &str, case: impl FnOnce(&Path)) {
     const CHILD_PROCESS: &str = "TABCLI_REOPEN_REVIEW_CASE_CHILD";
     if std::env::var_os(CHILD_PROCESS).is_none() {
@@ -4222,11 +4225,12 @@ fn in_review_case(test: &str, case: impl FnOnce(&Path)) {
         fs::create_dir_all(&root).unwrap();
         let bin = base.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        // A Claude whose `--version` succeeds, slowly once `claude.slow` exists beside it.
+        // A Claude whose `--version` succeeds; once `claude.slow` exists beside it, it first
+        // leaves `claude.started` there and then takes 2 s.
         #[cfg(windows)]
         fs::write(
             bin.join("claude.cmd"),
-            "@echo off\r\nif exist \"%~dpn0.slow\" ping -n 3 127.0.0.1 >nul\r\necho 2.1.302\r\n",
+            "@echo off\r\nif exist \"%~dpn0.slow\" (type nul > \"%~dpn0.started\" & ping -n 3 127.0.0.1 >nul)\r\necho 2.1.302\r\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -4235,7 +4239,7 @@ fn in_review_case(test: &str, case: impl FnOnce(&Path)) {
             let claude = bin.join("claude");
             fs::write(
                 &claude,
-                "#!/bin/sh\nif [ -f \"$0.slow\" ]; then sleep 2; fi\necho 2.1.302\n",
+                "#!/bin/sh\nif [ -f \"$0.slow\" ]; then : > \"$0.started\"; sleep 2; fi\necho 2.1.302\n",
             )
             .unwrap();
             fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
@@ -4289,6 +4293,7 @@ fn in_review_case(test: &str, case: impl FnOnce(&Path)) {
 
 // A closed source whose last reopen's launch failed before that failure was settled: its child
 // still launches under the refused launch's Claim.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn interrupted_reopen(root: &Path, source_id: &str, child_id: &str) -> (PathBuf, PathBuf) {
     let source = write_closed_reopen_source(
         root,
@@ -4317,6 +4322,7 @@ fn interrupted_reopen(root: &Path, source_id: &str, child_id: &str) -> (PathBuf,
     (source, child)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn review_request(id: &str, terminal: Option<terminal::TerminalKind>) -> ReopenRequest {
     ReopenRequest {
         id: id.into(),
@@ -4333,6 +4339,7 @@ fn review_request(id: &str, terminal: Option<terminal::TerminalKind>) -> ReopenR
 }
 
 // The terminal this platform chooses outside Herdr, named explicitly: no caller check.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn review_explicit_terminal() -> terminal::TerminalKind {
     if cfg!(target_os = "macos") {
         terminal::TerminalKind::Ghostty
@@ -4345,6 +4352,7 @@ fn review_explicit_terminal() -> terminal::TerminalKind {
 
 // 1. A recovery that is slow (each sync of the child waits 1 s) with 650 ms left: the child is
 //    settled, the probe does not start, and no consent is written (0.4.49: the same).
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_slow_recovery_leaves_the_probe_no_time_and_writes_no_consent() {
     in_review_case(
@@ -4386,10 +4394,12 @@ fn a_slow_recovery_leaves_the_probe_no_time_and_writes_no_consent() {
     );
 }
 
-// 2. The child's lifecycle lock held for 850 ms while the probe would take 1.3 s or more: the
-//    settlement does not wait for the lock, the marker still names a launching child, and the
-//    reopen is refused as already reopened before the probe; the child stays launching and
-//    nothing is written (0.4.49: the same).
+// 2. The child's lifecycle lock held until the provider's probe has started (so for the whole
+//    reopen where nothing probes with the lock held): the settlement does not wait for the
+//    lock, the marker still names a launching child, and the reopen is refused as already
+//    reopened before the probe; the child stays launching and nothing is written (0.4.49: the
+//    same). A build that probed first would find the lock free afterwards.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
     in_review_case(
@@ -4405,13 +4415,19 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
                 .unwrap()
                 .join("claude.slow");
             fs::write(&slow, b"").unwrap();
+            let started = slow.with_extension("started");
             let (held, wait) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
             let holder = {
                 let child = child.clone();
+                let started = started.clone();
                 thread::spawn(move || {
                     let lock = Store::open_unchecked(&child).lock().unwrap();
                     held.send(()).unwrap();
-                    thread::sleep(Duration::from_millis(850));
+                    while !started.exists()
+                        && released.recv_timeout(Duration::from_millis(10)).is_err()
+                    {
+                    }
                     drop(lock);
                 })
             };
@@ -4423,7 +4439,9 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
                 ),
                 Instant::now() + Duration::from_secs(30),
             );
+            release.send(()).unwrap();
             holder.join().unwrap();
+            assert!(!started.exists(), "the provider was probed");
             fs::remove_file(&slow).unwrap();
             let error = outcome.err().expect("the busy child refuses the reopen");
             assert_eq!(
@@ -4446,6 +4464,7 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
 
 // 3. An already failed child without its lock file, an expired deadline and no core: the
 //    caller check refuses first, and the lock file is not created (0.4.49: the same).
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_refused_caller_creates_no_lock_file_on_a_failed_child() {
     in_review_case(

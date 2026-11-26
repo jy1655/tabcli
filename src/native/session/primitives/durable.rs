@@ -134,7 +134,7 @@ pub(in crate::native) fn with_sync_failure<T>(directory: &Path, run: impl FnOnce
 
 /// Runs `run` while every sync of `directory` on this thread waits `delay` first: a slow
 /// disk under one Session.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) fn with_sync_delay<T>(
     directory: &Path,
     delay: std::time::Duration,
