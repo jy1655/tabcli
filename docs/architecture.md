@@ -726,8 +726,10 @@ lock before it settles a session. On every OS, Repair leaves a registered core-r
 terminal (Herdr) for explicit Close. `owner_exit::core_kept` gathers the decision's evidence
 for every owner record into `CreationEvidence`, which only that module can construct. The Herdr
 adapter's `authority::grant` is the only function that permits `terminal.kill` or
-`terminal.rm`, and its grant names the observed terminal and core; the verified connection
-(`terminal/herdr/linked.rs`) sends either call only by consuming that grant. On the creation
+`terminal.rm`. It mints only from an observation the verified connection produced
+(`terminal/herdr/linked.rs`), which names that connection's core and the terminal, and refuses
+one from another core; the connection sends either call only by consuming that grant, and the
+transport's stream is private to it. On the creation
 record it admits only an explicit `CloseCause` and requires the creation record in the
 handle; a close with a live attested owner, the cleanup after a refused reopen included, keeps
 its own proof. It removes a finished terminal whatever the owner record says. It ends a running

@@ -91,14 +91,24 @@
   running a replacement in between is left alone and its handle retained. A close whose kill
   reply was lost fails instead of repeating it, and the next close finishes from what it
   reads (a finished terminal is only removed). A close sends at most one `terminal.rm` with one
-  confirming read; `not_found` from the recorded core answers it. Only `authority::grant`
-  (`terminal/herdr/authority.rs`) can permit a `terminal.kill` or a `terminal.rm`: it mints
-  the only values those calls take, from the basis of the close and the observation it acts
-  on, each naming the terminal it observed and the core that answered. The verified connection
-  (`terminal/herdr/linked.rs`) sends either call only by consuming such a grant for its own core,
-  and every request on a raw connection takes a permit that only that module constructs. The
-  evidence a close on the creation record carries (`CreationEvidence`) has private fields in
-  `owner_exit`, its only constructor. Herdr's registration declares that its core retains a
+  confirming read; `not_found` from the recorded core answers it. The seal around those two
+  calls, exactly and no wider:
+  - Only `authority::grant` (`terminal/herdr/authority.rs`) mints a `Kill` or `Remove` grant,
+    and only from an observation that the verified connection itself produced (`Seen`, made
+    only by `Linked::observe` in `terminal/herdr/linked.rs`). That observation carries the
+    connection's core id and the terminal's address inseparably. `grant` takes no core id from
+    its caller and refuses an observation from a core other than the one its basis records.
+  - Outside the transport (`framed.rs`, `unix.rs`, `pipe.rs`), no code can send a request except
+    through `Linked`: the stream is private to `framed.rs`, `Connection::call` takes a `Permit`
+    that only `linked.rs` constructs, and the transport tests exchange only `hello`,
+    `terminal.get` and `terminal.send` (`Framed::exchange_for_test`).
+  - In production code only `linked.rs` names `terminal.kill` or `terminal.rm`
+    (`only_the_verified_connection_names_the_mutation_calls` scans the sources). `Linked::call`
+    refuses both, and `Linked` sends one only by consuming a grant, on the connection to the
+    core the grant names.
+
+  The evidence a close on the creation record carries (`CreationEvidence`) has private fields
+  in `owner_exit`, its only constructor. Herdr's registration declares that its core retains a
   finished terminal, and one rule applies to it on every OS (the owner's decisions of
   2026-11-26, os-parity):
   - Repair's dead-owner decision never ends, removes or reads a gone owner's terminal: it keeps
@@ -120,13 +130,18 @@
     this session, that cleanup still closes through the close with a live owner, as before.
   - The creation record proves the terminal and nothing else does: the recorded core, address,
     creation time, program PID, the exact session directory in the argv and the launch label,
-    from a handle whose own record is whole before even `not_found` settles it: a host PID,
-    this platform's host birth with values it can report, and a launch label in the form both
-    writers produce (16 random bytes as 32 lowercase hexadecimal digits), present on Windows.
-    The macOS and Linux handles of 0.4.45 and 0.4.46 omit the label. A finished terminal is
-    then removed and an absent one settled whatever the owner record says, including one that
-    names a live process of another session or a recycled PID. The state of the owner record
-    never strands a session.
+    from a handle whose own record is whole before even `not_found` settles it. A record is
+    whole exactly when a released writer on this platform (0.4.45 to 0.4.49) could have written
+    it, derived from those writers: a host PID that the platform's process reader reports (1 to
+    `i32::MAX` on macOS and Linux, any nonzero PID on Windows); a host birth of the platform's
+    own kind with values its writers record (macOS microseconds below a second; a Linux boot id
+    that is not all zero and any start tick, zero included; any Windows creation time); and a
+    launch label of exactly 32 lowercase hexadecimal digits, which every generator wrote. Every
+    Windows writer saved the label. The macOS and Linux writers of 0.4.45 and 0.4.46 omitted the
+    field and never wrote `null`, so an explicit `null` is refused. A finished terminal is then
+    removed and an absent one settled whatever the owner record says, including one that names
+    a live process of another session or a recycled PID. The state of the owner record never
+    strands a session.
   - A running terminal is ended (one `terminal.kill`) only when this session's owner is
     positively gone and its program is observed with its recorded birth. Positively gone means
     a record bound to this session names an incarnation the platform can produce (a valid
@@ -144,18 +159,26 @@
     acts on the creation record. Without one, an owner positively gone by its incarnation records
     `native session process <pid> is no longer running`, as 0.4.49's Repair wrote it. Every OS
     writes that reason into the handle's consumption marker, so a close interrupted after the
-    marker and before the closed record keeps it. Other closes keep their earlier outcome.
+    marker and before the closed record keeps it. A committed marker is never rewritten, and a
+    reason the closed record already carries, whole or as a `; `-joined part, is not added
+    again. A downgrade to 0.4.49 in that window can lose the reason: its Windows replay reads
+    none and rewrites the marker. Other closes keep their earlier outcome.
   - The close with a live owner, the cleanup after a failed binding and the read-only presence
     probe keep the identity without the launch label, as before.
 
-  Handles created by 0.4.45 and 0.4.46 on macOS and Linux omit the nonce. For those, the launch
-  label must agree with the terminal's generated name. A failed read, kill or removal keeps the
-  handle for retry. A refusal that names an hc command names the recorded endpoint; the user
-  checks with `tabcli doctor <session> --probe` (doctor asks no core without `--probe`) that
-  the core there is the one TAB recorded before changing anything: `terminal_surface_present`
-  or `terminal_surface_missing` shows that the recorded core answered. A handle the close
-  refuses before the core lookup (no usable address or core, or a creation record that is not
-  whole) is not recovered by ending or removing the terminal. Cleanup after binding fails uses
+  Handles created by 0.4.45 and 0.4.46 on macOS and Linux omit the nonce. For those, the
+  terminal's launch label must be 32 lowercase hexadecimal digits and agree with the terminal's
+  generated name. A failed read, kill or removal keeps the handle for retry. A refusal that
+  names an hc command names the recorded endpoint; the user checks with
+  `tabcli doctor <session> --probe` (doctor asks no core without `--probe`) that the core there
+  is the one TAB recorded before changing anything. `terminal_surface_present` or
+  `terminal_surface_missing` shows that the recorded core answered, and so does the
+  `terminal_surface_unverified` detail of a terminal set to keep, which names the recorded core
+  as having answered at its endpoint. The presence probe compares the argv, the creation time,
+  the reported PID and, for a running program whose birth is observable, that birth; it does
+  not validate the handle's creation record or the launch label. A handle the close refuses
+  before the core lookup (no usable address or core, or a creation record that is not whole)
+  is not recovered by ending or removing the terminal. Cleanup after binding fails uses
   the ordinary close proof. Cleanup before confirmation checks the full launch argv, label and
   name, plus the creation
   time and PID from its first read at that address. It refuses a terminal set to keep. A birth

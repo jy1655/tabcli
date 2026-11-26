@@ -187,12 +187,20 @@ session record, whatever the session's owner record says.
 
 To act on the terminal yourself, first run `tabcli doctor <session> --probe`; without
 `--probe` doctor asks no core. Its `terminal_surface` check connects to the recorded socket and
-requires the permanent core ID that TAB recorded. Only `terminal_surface_present` (the recorded
-core holds this session's terminal) or `terminal_surface_missing` (the recorded core answered
-and no longer holds it) shows that the recorded core answered there. `terminal_surface_unverified`
-shows nothing about the terminal; its detail says why. A detail naming a different Herdr Core
-means that socket now belongs to another core: do not run hc there, restore the original core
-and close again. Then run hc against the recorded core only. The session's
+requires the permanent core ID that TAB recorded before it reads any terminal. Then it compares,
+on that core, the terminal at the recorded address with the handle: TAB's launch host and this
+session's directory in the program arguments, the creation time and the PID the core reports,
+and, for a running program whose start time the system reports, that start time. It refuses a
+terminal set to keep. It does not check the handle's own creation record or the launch label,
+which the close checks (see below). `terminal_surface_present` (the recorded core holds this
+session's terminal) and `terminal_surface_missing` (the recorded core answered and no longer
+holds it) show that the recorded core answered there. A terminal set to keep reports
+`terminal_surface_unverified` with a detail saying that it is set to keep on the recorded Herdr
+Core, naming its ID, which answered at its endpoint; that detail also shows that the recorded
+core answered. Any other `terminal_surface_unverified` shows nothing about the terminal; its
+detail says why. A detail naming a different Herdr Core means that socket now belongs to another
+core: do not run hc there, restore the original core and close again. Then run hc against the
+recorded core only. The session's
 `attach_command` names its socket: on macOS and Linux use the same form, `HC_SOCKET='<socket>'
 hc get <address>`, and on Windows the PowerShell block of `attach_command` with `get` in place
 of `attach`. A plain `hc get <address>` uses whichever core your environment selects, where the
@@ -201,13 +209,14 @@ session's directory, whose last part is the session ID. When TAB refused the mat
 that this is the session's terminal is yours. Once you are sure, end it with `hc kill
 <address>` and remove it with `hc rm <address>`, both in the same form. Refusals that name an hc
 command, such as turning keep off, already use that form. The next close then finds the
-terminal gone and closes the session record, provided the handle itself is whole. A close
-refuses a damaged handle before it asks any core: one with no usable terminal address or core,
-no host PID, a host birth this platform cannot report, or a launch label in a form TAB never
-writes (on Windows, also none). The error names the field and retains the handle, and ending
-or removing the terminal does not change that refusal. The doctor probe does not check the
-host PID, host birth or launch label. TAB has no command that repairs a handle: keep the
-session directory as it is for diagnosis.
+terminal gone and closes the session record, provided the handle itself is whole: a handle is
+whole exactly when a released TAB could have written it on this platform. A close refuses any
+other handle before it asks any core: one with no usable terminal address or core, a host PID
+this platform's process reader never reports, a host birth no TAB writer on this platform
+records, or a launch label that is not 32 lowercase hexadecimal digits (an explicit `null`
+included; on Windows, also none). The error names the field and retains the handle, and ending
+or removing the terminal does not change that refusal. TAB has no command that repairs a
+handle: keep the session directory as it is for diagnosis.
 
 Codex requires stable 0.169.0 or newer here. Its adapter adds `--no-daemon` so tool commands run
 inside the hc terminal. Claude uses its official messaging path; Codex uses its queue for
