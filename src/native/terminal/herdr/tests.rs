@@ -1580,6 +1580,39 @@ fn a_reply_sent_before_the_core_closed_its_end_is_read() {
     assert!(started.elapsed() >= Duration::from_millis(100));
 }
 
+// A socket can be readable with nothing to read in order: Linux keeps an urgent (out-of-band)
+// byte on a Unix stream socket in its receive queue, reports the socket readable, and an
+// ordinary blocking read then waits for ordinary data. The read still ends at its deadline.
+// macOS refuses out-of-band data on Unix sockets, so there the queue stays empty.
+#[cfg(unix)]
+#[test]
+fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
+    use std::io::ErrorKind;
+    use std::os::unix::{io::AsRawFd, net::UnixStream};
+    let (mut tab, core) = UnixStream::pair().unwrap();
+    let urgent = unsafe { libc::send(core.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+    #[cfg(target_os = "linux")]
+    assert_eq!(urgent, 1, "{}", std::io::Error::last_os_error());
+    #[cfg(not(target_os = "linux"))]
+    let _ = urgent;
+    let (sender, outcome) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buffer = [0_u8; 16];
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let result = super::Stream::read_before(&mut tab, &mut buffer, deadline);
+        let _ = sender.send((result.map_err(|error| error.kind()), started.elapsed()));
+    });
+    // The core's end stays open, so a read that outlives its deadline would block for good.
+    let (result, elapsed) = outcome
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the read was still blocked ten seconds after its 100 ms deadline");
+    assert_eq!(result, Err(ErrorKind::TimedOut));
+    assert!(elapsed >= Duration::from_millis(100));
+    reader.join().unwrap();
+    drop(core);
+}
+
 // --- Review regressions (2026-11-18): each was written and run before its fix. ---
 
 // herdr-core `terminal_run` creates the terminal, then `flush_saved` can answer

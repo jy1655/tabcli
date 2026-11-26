@@ -251,23 +251,44 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
     Ok(Framed::new(stream))
 }
 
-impl Stream for UnixStream {
-    fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize> {
-        self.set_write_timeout(Some(super::remaining(deadline)?))?;
-        Write::write(self, bytes)
-    }
-
-    // The read waits with poll(2), not a receive timeout: macOS refuses SO_RCVTIMEO with
-    // EINVAL once the core has closed its end, and a reply the core sent before it closed is
-    // still in the socket to be read.
-    fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize> {
-        wait_readable(self, deadline)?;
-        Read::read(self, buffer)
+/// The read of `Stream::read_before`. It waits with poll(2), not a receive timeout: macOS
+/// refuses SO_RCVTIMEO with EINVAL once the core has closed its end, and a reply the core
+/// sent before it closed is still in the socket to be read. Readiness does not promise
+/// ordinary bytes (Linux reports a queue that holds only an urgent byte as readable), so the
+/// receive itself never blocks: with nothing to read it waits again, until the deadline.
+fn receive_before(
+    stream: &UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    loop {
+        wait_readable(stream, deadline)?;
+        let received = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if let Ok(count) = usize::try_from(received) {
+            return Ok(count);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            // Readable with nothing to receive: wait a moment, so that a queue that stays
+            // readable does not turn this into a busy loop.
+            std::io::ErrorKind::WouldBlock => std::thread::sleep(
+                super::remaining(deadline)?.min(std::time::Duration::from_millis(10)),
+            ),
+            _ => return Err(error),
+        }
     }
 }
 
-/// Returns once a read of `stream` does not block (bytes, the end of the stream or an error
-/// is waiting), or `TimedOut` at the deadline.
+/// Returns once `stream` is readable (bytes, the end of the stream or an error is waiting, or,
+/// on Linux, an urgent byte), or `TimedOut` at the deadline.
 fn wait_readable(stream: &UnixStream, deadline: Instant) -> std::io::Result<()> {
     loop {
         // Rounded up to whole milliseconds, so that no wait ends before the deadline.
@@ -287,5 +308,16 @@ fn wait_readable(stream: &UnixStream, deadline: Instant) -> std::io::Result<()> 
                 }
             }
         }
+    }
+}
+
+impl Stream for UnixStream {
+    fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize> {
+        self.set_write_timeout(Some(super::remaining(deadline)?))?;
+        Write::write(self, bytes)
+    }
+
+    fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize> {
+        receive_before(self, buffer, deadline)
     }
 }
