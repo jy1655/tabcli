@@ -42,7 +42,7 @@
   the PID and start time live on. Every procfs reader refuses it. The tmux server
   observation holds a pidfd on the server before it reads: on that entry an exit the pidfd
   reports proves the server gone, and otherwise the birth is read once more. The repeated
-  close of a real-tmux test failed once on the Ubuntu runner (2026-11-26) with only an
+  close of a real-tmux test failed once on the Ubuntu runner (2026-11-25) with only an
   integer parse error in its log; such an entry is the explanation reproduced from the
   kernel's code, not an observed line.
 - Measure Linux provider commands before spawn: each argument or environment string including

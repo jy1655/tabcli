@@ -223,7 +223,7 @@ mod tests {
         cut.extend_from_slice(fields.join(" ").as_bytes());
         assert_eq!(parse_stat(&cut, 42).unwrap().ticks, 123);
     }
-    // The repeated close of the real-tmux test once failed on the Ubuntu runner (2026-11-26)
+    // The repeated close of the real-tmux test once failed on the Ubuntu runner (2026-11-25)
     // with "invalid digit found in string" from this reader. The job log holds only that error;
     // an entry printed for a task whose signal state was released (fs/proc/array.c) is the
     // explanation reproduced from the kernel's code. Such an entry proves no exit, so the
