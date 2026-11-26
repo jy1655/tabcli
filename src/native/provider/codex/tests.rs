@@ -893,21 +893,19 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         assert_eq!(released::v0_4_49(text), *by_0_4_49, "0.4.49 on {text:?}");
         assert_eq!(launches(text), *by_this_build, "this build on {text:?}");
     }
-    // This build launches no row whose Codex is below the floor. It launches one row whose text
-    // does not show Codex's own version: a sole version-like word is read whatever program it
-    // names, the cost of reading unlabelled text at all.
-    for (text, codex, [.., by_this_build]) in &table {
-        assert!(
-            !(*by_this_build && *codex == Some(false)),
-            "this build launches a Codex below the floor on {text:?}"
-        );
-    }
-    let launched_unknown = table
+    // This build launches a row only when its one version-like word, read alone, meets the
+    // floor; it does not read the words around it. The rows it launches whose Codex is not shown
+    // to meet the floor are exactly these: a sole version of another program, and a comparison
+    // written apart from its version.
+    let launched_unsettled = table
         .iter()
-        .filter(|(_, codex, [.., by_this_build])| *by_this_build && codex.is_none())
+        .filter(|(_, codex, [.., by_this_build])| *by_this_build && *codex != Some(true))
         .map(|(text, ..)| text.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(launched_unknown, ["unknown (runtime 22.0.0)"]);
+    assert_eq!(
+        launched_unsettled,
+        ["unknown (runtime 22.0.0)", "Codex < 0.169.0"]
+    );
     for named in [
         "OpenAI Codex (v0.170.0)",
         "(0.170.0)",
@@ -932,6 +930,7 @@ fn pending_herdr_launches_across_the_wrapper_handoff() {
         "OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)",
         "OpenAI Codex (v0.170.0) (proxy http://127.0.0.1:8080/)",
         "OpenAI Codex (0.168.0.1--) (runtime 22.0.0)",
+        "Codex < 0.169.0",
     ] {
         assert!(
             table.iter().any(|(text, ..)| text == named),

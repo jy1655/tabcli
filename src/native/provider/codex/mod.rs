@@ -161,10 +161,11 @@ fn field_version(field: &str) -> std::result::Result<Version, semver::Error> {
 // `0.170.0--` and `0.168.0-rc-.` keep their prerelease. `0.170.0+`, `0.170.0-`, `<0.169.0`,
 // `codex/0.168.0`, `v0.168.0.1-rc.1` and `0.168.0.1--` do not read. A banner that also shows an
 // address, a URL with a numeric host, a four-part build number or another program's version,
-// or the same version twice, has two such words and is not read: the rule errs toward
-// refusal, since a misread version could let a Codex that lacks `--no-daemon` start on Herdr,
-// where a detached `ask` can already have reported the request accepted. A sole such word is
-// read whatever program it names. docs/agents/codex.md holds the table of texts that
+// or the same version twice, has two such words and is not read: the rule refuses whenever
+// more than one word could be the version, since a misread version could let a Codex that
+// lacks `--no-daemon` start on Herdr, where a detached `ask` can already have reported the
+// request accepted. It reads that one word alone: a sole such word is read whatever program it
+// names, and a comparison written apart from it (`Codex < 0.169.0`) is not seen. docs/agents/codex.md holds the table of texts that
 // `pending_herdr_launches_across_the_wrapper_handoff` checks against this reading.
 fn unlabelled_codex_version(output: &str) -> Result<Version> {
     let words = output

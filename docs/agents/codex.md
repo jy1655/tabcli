@@ -34,15 +34,20 @@
   and `Codex 0.170.0.` are 0.170.0, `0.170.0--` and `0.168.0-rc-.` are prereleases, and
   `0.170.0+`, `0.170.0-`, `<0.169.0`, `codex/0.168.0`, `v0.168.0.1-rc.1` and `0.168.0.1--` do
   not read. With no such word, with two or more (the same version printed twice included), or
-  with one that does not read, the text is not read: an automatic choice takes its fallback
-  and an explicit `--terminal herdr` is refused. The rule errs toward refusal, since a misread
-  version could let a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can
-  already have reported the request accepted when Codex refuses the option. Its accepted cost:
-  a banner that also shows an address, a URL with a numeric host, a four-part build number or
-  another program's version is not read, including banners 0.4.48 admitted such as
-  `OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)`. A sole version-like word is read whatever
-  program it names (`unknown (runtime 22.0.0)` is 22.0.0): the rule cannot tell whose version
-  a lone word is. A second label and a label without a field on its line are refused.
+  with one that does not read, the text is not read for Herdr. Where the general provider
+  probe has read a version from the same text, an automatic choice then takes its fallback
+  and an explicit `--terminal herdr` is refused; text the general probe cannot parse
+  (`unknown`, `codex/0.168.0` alone) is refused there, before any surface is chosen. The rule
+  refuses whenever more than one word could be the version, since a misread version could let
+  a Codex that lacks `--no-daemon` start on Herdr, where a detached `ask` can already have
+  reported the request accepted when Codex refuses the option. Its accepted cost: a banner that
+  also shows an address, a URL with a numeric host, a four-part build number or another
+  program's version is not read, including banners 0.4.48 admitted such as
+  `OpenAI Codex (v0.170.0) (proxy=127.0.0.1:8080)`. What it establishes is limited to the one
+  word it reads: it does not read the words around that word, so a sole version-like word is
+  read whatever program it names (`unknown (runtime 22.0.0)` is 22.0.0), and a comparison
+  written apart from its version is not seen (`Codex < 0.169.0` is 0.169.0). A second label
+  and a label without a field on its line are refused.
   The wrapper reads the recorded version by the same rule, so a pending launch that another
   release's binary starts (the executable at its path replaced in between) can be refused
   there, after its Session and terminal exist. Do not replace the binary while a Herdr launch
@@ -80,6 +85,7 @@
   | `OpenAI Codex (v0.170.0) (proxy http://127.0.0.1:8080/)` | yes | launches | refuses | refuses |
   | `codex 0.170.0 build 1.2.3.4` | yes | launches | refuses | refuses |
   | `Codex <0.169.0` | no | launches | refuses | refuses |
+  | `Codex < 0.169.0` | no | launches | refuses | launches |
   | `OpenAI Codex (v0.168.0.1-rc.1) (runtime 22.0.0)` | no | launches | refuses | refuses |
   | `OpenAI Codex (0.168.0.1--) (runtime 22.0.0)` | no | launches | refuses | refuses |
   | `codex/0.168.0 (node 22.0.0)` | no | launches | refuses | refuses |
@@ -87,10 +93,12 @@
 
   Notes on the table. The Codex column says whether the Codex the text describes meets the
   floor (stable 0.169.0 or newer): `yes`, `no`, or `unknown` where the text does not show
-  Codex's own version. The test checks that this build launches no row marked `no`, and that
-  the one row it launches marked `unknown` is `unknown (runtime 22.0.0)`, the sole-word cost
-  above. A `<` is no enclosing punctuation, so `Codex <0.169.0`, which 0.4.48 read as 0.169.0
-  and launched, does not read here.
+  Codex's own version. This build launches a row only when its one version-like word, read
+  alone, is a stable version at or above the floor; the test checks that the rows it launches
+  whose Codex is not shown to meet the floor are exactly `unknown (runtime 22.0.0)` and
+  `Codex < 0.169.0`, the limits stated above. A `<` written onto the version is part of the
+  word and no enclosing punctuation, so `Codex <0.169.0`, which 0.4.48 read as 0.169.0 and
+  launched, does not read here.
 
   The queue floor, hook eligibility and doctor keep the general probe's reading (the first
   token that parses once surrounding punctuation is removed), under which earlier releases
