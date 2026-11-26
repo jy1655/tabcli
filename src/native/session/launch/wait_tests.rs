@@ -342,6 +342,119 @@ fn a_held_lock_retains_the_claim_for_either_reason() {
     }
 }
 
+// The wait with its deadline `deadline_ms` after its start, probing `surface` through the
+// installed terminal adapters, as the launcher does.
+fn run_on_surface(store: &Store, deadline_ms: u64, surface: &terminal::TerminalSession) -> Run {
+    let start = Instant::now();
+    let mut clock = Simulated {
+        now: Rc::new(Cell::new(start)),
+        sleeps: Vec::new(),
+    };
+    let mut presence = TerminalSurface {
+        directory: store.directory(),
+        surface,
+    };
+    let result = wait_with(
+        store,
+        start + Duration::from_millis(deadline_ms),
+        &mut clock,
+        &mut presence,
+    );
+    Run {
+        result,
+        sleeps: clock.sleeps,
+        probes: Vec::new(),
+    }
+}
+
+// The owner's decision of 2026-11-26 (option A): a Herdr terminal that its verified core
+// reports finished before startup was confirmed ends the wait at the next probe, as a tmux
+// surface that disappears does, instead of at the launch deadline. The failure names the
+// terminal and its exit code and points to the launch host's own line in the launch log. The
+// launch ends as the deadline would have ended it: failed, its Claim released, its receipt
+// pending and its surface handle kept for close.
+#[test]
+fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe() {
+    use crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore;
+    for (exit_code, refusal) in [(Some(1), true), (None, false)] {
+        let core = ScriptedHerdrCore::start();
+        let (_dir, store, token) = fixture();
+        let surface = core.hold_launch(
+            store.directory(),
+            "finished",
+            exit_code.map_or(
+                serde_json::json!({}),
+                |code| serde_json::json!({"exit_code": code}),
+            ),
+        );
+        store.write_terminal(&surface).unwrap();
+        if refusal {
+            log(
+                &store,
+                "herdr_host_refused: Herdr launch directory is not private to the current user",
+            );
+        }
+        let run = run_on_surface(&store, START_TIMEOUT.as_millis() as u64, &surface);
+        let error = run.result.unwrap_err();
+        let mut expected = format!(
+            "terminal surface finished before provider launch was confirmed (Herdr terminal t7 {})",
+            exit_code.map_or("finished".to_owned(), |code| format!(
+                "exited with code {code}"
+            ))
+        );
+        if refusal {
+            expected.push_str(&format!(
+                "; its launch host logged a refusal in {}",
+                store.directory().join(LOG).display()
+            ));
+        }
+        assert_eq!(format!("{error:#}"), expected);
+        assert!(error.downcast_ref::<TimedOut>().is_none());
+        assert_eq!(run.sleeps, [100; 10], "{exit_code:?}");
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        assert_eq!(status.error.as_deref(), Some(expected.as_str()));
+        assert!(!claim_is(&store, &token));
+        assert_eq!(read(&store).unwrap().unwrap().phase, Phase::Pending);
+        assert_eq!(store.terminal().unwrap(), surface);
+        assert!(core.holds_launch());
+    }
+}
+
+// What already decides the launch keeps deciding it when the terminal has finished: a
+// confirmed startup ends the wait as confirmed, and a launch-host Record (#409) names the
+// failure it records.
+#[test]
+fn a_confirmed_launch_or_a_host_record_wins_over_a_finished_herdr_terminal() {
+    use crate::native::terminal::scripted_herdr_core::ScriptedHerdrCore;
+    let core = ScriptedHerdrCore::start();
+    let (_dir, store, _) = fixture();
+    let surface = core.hold_launch(store.directory(), "finished", serde_json::json!({}));
+    store.write_terminal(&surface).unwrap();
+    spawned(&store);
+    run_on_surface(&store, 20_000, &surface).result.unwrap();
+
+    let core = ScriptedHerdrCore::start();
+    let (_dir, store, token) = fixture();
+    let surface = core.hold_launch(store.directory(), "finished", serde_json::json!({}));
+    store.write_terminal(&surface).unwrap();
+    host::fail_bound_herdr(
+        &store,
+        &token,
+        &surface,
+        host::FailureReason::InputFlushFailed,
+        0,
+    )
+    .unwrap();
+    let error = run_on_surface(&store, 20_000, &surface).result.unwrap_err();
+    let status = store.status().unwrap();
+    assert_eq!(Some(format!("{error:#}")), status.error);
+    assert!(
+        format!("{error:#}").contains("(input_flush_failed)"),
+        "{error:#}"
+    );
+}
+
 // The production surface observation reaches the terminal's presence check: a surface that
 // no adapter of this platform inspects is an inspection error, never absence.
 #[cfg(not(windows))]

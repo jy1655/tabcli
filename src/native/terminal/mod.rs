@@ -492,6 +492,8 @@ where
 
 #[cfg(all(test, windows))]
 pub(in crate::native) mod launch_failure_test_support;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+pub(in crate::native) mod scripted_herdr_core;
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn bind_surface_before_start<T, Bind, Start, Cleanup, Unbind>(
