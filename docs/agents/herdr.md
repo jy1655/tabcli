@@ -121,15 +121,30 @@
     lifecycle lock before it settles a session, so a handle that a concurrent close restored
     is never consumed. The steps Repair takes before that decision still run: publishing a
     completed result, and settling a launch that was never confirmed.
-  - The rule applies when no teardown intent is saved. On macOS and Linux, a close with a live
-    owner that proved its terminal absent saves a teardown intent before it ends the owner. A
-    close that finds one saved replays it under 0.4.49's rules, unchanged
+  - The rule applies when no teardown intent is saved. On macOS and Linux TAB establishes that
+    from the close-intent file (`terminal.close-intent.json`): it finds the file absent, or reads
+    it and establishes that it holds no teardown payload. An ordinary close with a live owner
+    writes that file without one. A file TAB cannot read, or that is not JSON, refuses the close
+    before TAB can tell which kind of intent it holds, a finished terminal included. A close
+    with a live owner that proved its terminal absent saves a teardown intent before it ends the
+    owner. A close that finds one saved replays it under 0.4.49's rules, unchanged
     (`terminal_teardown_intent`, the intent branch of `decide` and of `explicit_close`), before
     and instead of the choice below. That replay refuses, among other cases, whenever the
     intent does not validate against the current owner record and handle (the record gone,
     unreadable, replaced or changed) or the owner's PID was reused, so it can refuse a finished
-    or absent terminal until the intent validates or is cleared. TAB clears the intent only when
-    a close completes. Bringing this replay under the rule is a follow-up.
+    or absent terminal until the intent validates or is cleared. One action differs: when the
+    replayed decision leaves the close to the surface alone (`SurfaceOnly`: the owner record
+    disappears after the intent validated, in a launching or failed session), the Herdr adapter
+    closes on the creation record (`CreationEvidence::surface_only`, admitted whatever the
+    close's cause) with that decision's result. It settles an absent terminal on `not_found`
+    and removes a finished one, as 0.4.49 did, and refuses a running one, which 0.4.49 ended.
+    No other decision gives a Herdr terminal `SurfaceOnly` on any OS. The intent is validated
+    while the handle still needs a decision about its terminal. Once a close has written the
+    consumption marker (`terminal.closed.json`), a retry finishes the record cleanup from it
+    and reads neither the intent nor the owner. A close removes the intent with the handle when
+    it consumes the handle, before it publishes the session's closed state, so a close that
+    fails after that point reports the failure with the intent already gone. Bringing this
+    replay under the rule is a follow-up.
   - `owner_exit::core_kept` chooses between the close with a live owner and the close on the
     creation record, for every owner record, and returns evidence, never an action. The owner
     record answers one question, from one typed read: is there an attested live incarnation of
@@ -152,9 +167,11 @@
     removal and its confirming read); the refusal of a running terminal states it in its own
     text.
   - Only `close-session --explicit`, and the sessions it lists with `--with-started-from`, act on
-    the creation record. On that path the cleanup after a refused reopen (`CloseCause::Cleanup`)
-    is refused before the core is asked, a failed start included. With a verified live owner of
-    this session, that cleanup still closes through the close with a live owner, as before.
+    the creation record that `core_kept` chooses. On that path the cleanup after a refused
+    reopen (`CloseCause::Cleanup`) is refused before the core is asked, a failed start included.
+    With a verified live owner of this session, that cleanup still closes through the close with
+    a live owner, as before. A replayed decision that leaves the close to the surface alone
+    (above) is admitted whatever the cause, as 0.4.49 acted on the surface for it.
   - The creation record proves the terminal and nothing else does: the recorded core, address,
     creation time, program PID, the exact session directory in the argv and the launch label,
     from a handle whose own record is whole before even `not_found` settles it. A record is
@@ -216,10 +233,15 @@
   | Every other case: unreadable, none, damaged, contradictory, unbound, another session's, uninspectable process, exited between the two reads, PID-only live, gone | refused, nothing sent, handle kept | removed | settled |
 
   On the creation record, the cleanup after a refused reopen refuses every column before the
-  core is asked; a whole creation record and the terminal's verified identity are required for
-  every removal and settlement. The table holds when no teardown intent is saved. On macOS and
-  Linux a close interrupted during a live owner's teardown resumes under 0.4.49's rules, which
-  can refuse a finished or absent terminal until the intent validates or is cleared (above).
+  core is asked. Every removal and settlement needs a whole creation record; a removal also
+  needs the terminal on the verified core to match it, and a settlement needs `not_found` from
+  that core for the recorded address. The table holds when no teardown intent is saved: on
+  macOS and Linux TAB finds the close-intent file absent, or reads it and establishes that it
+  holds no teardown payload (a file it cannot read or decode refuses the close). A close
+  interrupted during a live owner's teardown resumes under 0.4.49's rules while the handle
+  still needs a decision about its terminal, which can refuse a finished or absent terminal
+  until the intent validates or is cleared; a replayed decision that leaves the close to the
+  surface alone closes on the creation record (above).
 
   Handles created by 0.4.45 and 0.4.46 on macOS and Linux omit the nonce. For those, the
   terminal's launch label must be 32 lowercase hexadecimal digits and agree with the terminal's

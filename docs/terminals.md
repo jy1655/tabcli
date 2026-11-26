@@ -187,13 +187,23 @@ the session record. Closing a session whose owner is verified live is unchanged.
 sessions, `tell` and waiting for a result never close a Herdr terminal on their own; an
 attached `ask` or `tell` stops waiting once the owner is gone.
 
-These rules apply when no teardown intent is saved. On macOS and Linux, a close with a verified
-live owner whose terminal is proven absent saves a teardown intent and then ends the owner (see
-the owner teardown under [Ownership and close](#ownership-and-close) below). If that close is
-interrupted, the next close resumes it under 0.4.49's rules, unchanged: it can refuse a finished
-or absent terminal until the intent validates against the current owner record and handle, or
-is cleared, and TAB clears it only when a close completes. Read the refusal and keep the session
-directory as it is.
+These rules apply when no teardown intent is saved. On macOS and Linux TAB establishes that
+from the session's close-intent file (`terminal.close-intent.json`): the file is absent, or TAB
+reads it and finds that it holds no teardown payload. A close with a verified live owner writes
+that file before it acts. If the file cannot be read or does not hold JSON, the close refuses
+before it can tell what the file holds, a finished terminal included. A close with a verified
+live owner whose terminal is proven absent saves a teardown intent in it and then ends the
+owner (see the owner teardown under [Ownership and close](#ownership-and-close) below). If that
+close is interrupted before it consumes the handle, the next close resumes it under 0.4.49's
+rules: it can refuse a finished or absent terminal until the intent validates against the
+current owner record and handle. When the resumed close finds the owner record gone in a
+launching or failed session and leaves the terminal to be closed on its own, as 0.4.49 did,
+TAB closes it on its creation record instead: it settles an absent terminal and removes a
+finished one, as 0.4.49 did, and keeps a running one, which 0.4.49 ended. Once a close has
+consumed the handle and written `terminal.closed.json`, a retry only finishes the session
+record, without reading the intent or the owner. TAB removes the intent when it consumes the
+handle, before it records the session as closed, so a close can still fail after that point
+with the intent already gone. Read the refusal and keep the session directory as it is.
 
 What changed from 0.4.49: there, on macOS and Linux, the ordinary close of a session whose
 owner had exited already refused a running Herdr terminal and removed only a finished one, and
@@ -253,8 +263,8 @@ terminal depends on what TAB verifies about the session's owner at that moment:
   closes once its process group is gone. The checks of the creation record and launch label above do not
   apply to this close; a handle with no usable terminal address or core is still refused
   before any core is asked.
-- On macOS and Linux, if a teardown intent is saved, the close resumes it under 0.4.49's rules
-  (see above).
+- On macOS and Linux, if a teardown intent is saved, the close resumes it under 0.4.49's rules,
+  and a close-intent file TAB cannot read or decode refuses the close (see above).
 
 TAB has no command that repairs a handle: keep the session directory as it is for diagnosis.
 
