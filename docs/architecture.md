@@ -88,7 +88,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the adapter's minimum (supported, too old, unrecognized). Each caller runs the probe with its own executor and keeps its own
   vocabulary: the `ask`/`reopen` preflight (bounded by the start deadline) and the wrapper's
   re-check refuse through `check_provider_version_until`, a version below the minimum as
-  `Unsupported`; `doctor` runs `process_env::probe` and reports rows. The wrapper's re-check
+  `Unsupported`; `doctor` runs `process_env::probe` and reports rows, except the version that
+  decides a version-dependent Surface choice inside hc, which it reads with the launch's own
+  command and reading (`read_installed_version`) under its diagnostic limits
+  (`process_env::probe_output`). The wrapper's re-check
   is bounded by the launch record's deadline plus a short grace, so that the launcher's
   deadline settles the launch first, through the preflight's executor, which ends only the
   probe's direct child at that bound (a runtime under a shim script can outlive it); a
@@ -148,11 +151,20 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   after the provider version probe (refusing surface-specific version requirements before title,
   consent, session, or terminal creation) and carries the admitted initial `Transport` into
   `Start::run` and `turn_run::run_initial`. The surface it admits comes from one entry,
-  `choose_launch_surface`, which creates nothing: the requested terminal, else the caller's
-  environment with the provider's pre-probe answer for the one provider-dependent automatic
-  choice (Herdr on Windows; a reopen passes no provider, as it selects before reading its
-  source), then the caller check of an automatic Herdr choice (`terminal::admit_selection`).
-  `doctor` reports the same selection without admission (`select_surface`). The common option
+  `choose_launch_surface`, which creates nothing and is the same on every OS: the requested
+  terminal, else the caller's environment (`terminal::select_for`: inside hc Herdr, with the
+  platform's own choice as its fallback). An automatic Herdr choice gets the caller check
+  (`terminal::admit_selection`) there, where 0.4.49 ran it, and its outcome
+  (`CallerCheck`) goes with the selection. `resolve` decides that choice with the provider and
+  its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
+  explicit choice is refused; a Herdr choice whose check failed is refused. Every step after the
+  check therefore keeps 0.4.49's order and its clock reads, and its refusals except where the
+  owner's decision on the automatic choice moved one: a Codex whose check failed is refused
+  with that check's error only once its version is known, so a missing workspace is reported
+  first (Current Herdr Surface Boundary).
+  `doctor` reports the same decision without the caller check (`automatic_surface` and
+  `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
+  (`read_installed_version`). The common option
   validation they share lives in `args.rs`, and `tell` parses through the same option helper
   with the follow-up option set.
 - `src/native/reopen.rs` owns Reopen resolution, provenance, and the initial operation's

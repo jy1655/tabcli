@@ -48,14 +48,19 @@ impl Core for Installed {
         std::process::id()
     }
 
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    // A process that is not running has no parent to show; orphans are adopted by init, so a
+    // live process always names one.
+    fn parent_pid(&self, pid: u32) -> Result<super::Parent> {
         #[cfg(target_os = "macos")]
-        return Ok(
-            crate::native::terminal::macos::process::macos_process_info(pid)?
-                .map(|info| info.parent_pid),
-        );
+        let parent = crate::native::terminal::macos::process::macos_process_info(pid)?
+            .map(|info| info.parent_pid);
         #[cfg(target_os = "linux")]
-        return crate::native::terminal::linux::process::parent_pid(pid);
+        let parent = crate::native::terminal::linux::process::parent_pid(pid)?;
+        Ok(match parent {
+            Some(0) => super::Parent::Root,
+            Some(parent) => super::Parent::Process(parent),
+            None => super::Parent::Unknown(format!("process {pid} is absent or invisible to TAB")),
+        })
     }
 
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {

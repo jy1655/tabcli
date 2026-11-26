@@ -224,18 +224,57 @@
   client of the same user can still change the terminal between TAB's last read and its action.
   hc does not sweep detached processes. TAB touches no other terminal and calls no core operation.
 - An explicit `--terminal` wins. Otherwise `HC_TERMINAL_ID` with `TERM_PROGRAM=ghostty` (the
-  identity hc gives every program) selects Herdr, on Windows only for a provider whose adapter
-  runs there;
-  the marker under another `TERM_PROGRAM` was inherited and is ignored. Selection reads only
-  the environment and, on Windows, the requested provider. Launch admission
-  (`terminal::admit_selection`) then requires the caller's terminal to be live on the
-  addressed core with this process among its program's descendants, and refuses otherwise
-  without opening another terminal. `ask` and `reopen` choose through one entry,
-  `session_start::choose_launch_surface`: selection with the provider's pre-probe answer, then
-  this admission; a reopen passes no provider, as it selects before reading its source. The
-  provider's own admission follows in `resolve`. `doctor` reports `select_surface`, the
-  selection without any admission, so it can name an automatic Herdr that `ask` then refuses
-  (no verified caller, or a provider version below the Herdr floor).
+  identity hc gives every program) selects Herdr, with the terminal the platform chooses
+  outside Herdr as its fallback (`terminal::Selection::Herdr`; Ghostty on macOS, from that
+  same `TERM_PROGRAM`, tmux on Linux, the managed console on Windows); the marker under another
+  `TERM_PROGRAM` was inherited and is ignored. This rule is the same on every OS (owner's
+  decision 2A, 2026-11-26) and reads only the environment. `ask` and `reopen` select through
+  one entry, `session_start::choose_launch_surface`, at the place where 0.4.49 selected and
+  checked: `ask` after its attached results, `reopen` before it reads its source. There an
+  automatic Herdr choice is checked against its caller (`terminal::admit_selection`), as in
+  0.4.49, for every provider that can end on Herdr. A failed check refuses the launch there
+  where the choice is already known to be Herdr: for `ask`, Claude, Agy and Pi; for `reopen`,
+  which does not know its provider yet, always (every provider that supports reopen runs on
+  Herdr, so no reopen that would take the fallback is refused). Where the version decides
+  (Codex off Windows), the outcome is kept (`session_start::CallerCheck`). `resolve` then
+  decides with the provider (`session_start::admit_choice`), before the workspace and again
+  with the probed version: an automatic choice is Herdr where the adapter admits it and its
+  fallback otherwise (Codex below stable 0.169.0 off Windows, any Codex on Windows), and an
+  explicit `--terminal herdr` it does not admit is refused with the adapter's text. An
+  automatic choice that ends on Herdr launches there only if its check passed, and is
+  otherwise refused with the check's error; one that takes the fallback ignores the check.
+  So every later step runs in 0.4.49's order, after the same refusals and clock reads: the
+  caller check's reads and writes on the core share its own ten-second deadline, not the
+  request's, while its endpoint discovery and its walk of parents are not bounded and can take
+  longer, as in 0.4.49; the version probe reads the deadline before it starts; and nothing
+  after it reads the deadline before the Session exists, as in 0.4.49 (bounding every step by
+  the deadline is a separate, later change). The check's deadline ends its waits, not its
+  calls: a reply whose last byte arrives just before it is still decoded afterwards, and on
+  Windows a pipe operation cancelled there is waited for before its buffer is released, so a
+  call can return after the ten seconds. Two differences remain, both from the owner's
+  decision on the automatic choice: a Codex off Windows whose check failed goes on to the
+  workspace, the admission and its probe, and its version then refuses it with the check's
+  error or gives it the fallback, where 0.4.49 refused at the check; and an automatic reopen
+  inside hc on Windows is checked, where 0.4.49 chose the managed console without a check.
+  That added check can also change which of two truthful contention verdicts a concurrent
+  reopen gets, because the probes after it happen later.
+  For `reopen`, the settlement of an interrupted launch failure of the source's last child
+  (`retry_interrupted_launch_fence`) runs after the selection, the caller check and the
+  lookup of the source directory, as in 0.4.49. The judgment of the source's marker, the
+  other source gates, the provider's reopen support and the rest of the resolution, the
+  consent assessment included, can still refuse afterwards and leave that child `Failed`, as
+  in 0.4.49. The caller's terminal must be live on the addressed
+  core with this process among its program's descendants, or the launch is refused without
+  opening another terminal. Up to 64 parent links are compared; only a chain that ends at a
+  root (no parent, or init) proves the command is outside, while reaching that bound or a
+  parent that cannot be established (on Windows: it ended, its PID was reused, or it may not
+  be inspected) is reported as unverified, and both refuse. So a caller that cannot be
+  verified never refuses an `ask` on the fallback, on any OS. `doctor` reports the same
+  decision (`session_start::automatic_surface`) without the caller check: see Observation and
+  Self-Test Boundary.
+  The fallback is not checked for presence before a session exists, as with any other
+  terminal: a Mac without Ghostty, Linux without tmux 3.2 or Windows without PowerShell 7
+  fails at that terminal's open with its own refusal.
   An explicit `--terminal herdr` can launch outside Herdr.
   On macOS and Linux both selection modes check the caller on the connection that creates the child before
   naming a parent.
@@ -287,7 +326,7 @@
 - Each provider adapter answers whether it runs on a surface and returns its selected
   initial `Transport` (`surface_support`, required, no default), before anything is
   created (`provider::admit_surface`): first without a version
-  before resolution and probing (and for terminal selection via `provider::surface_support`),
+  before resolution and probing,
   and again with the probed version right after the CLI version probe, handing the
   admitted `Transport` straight into initial delivery. On Windows Herdr, Codex
   refuses immediately: its initial prompt is the injected console paste (#124), text without Return and one
@@ -298,8 +337,10 @@
   refusing older or prerelease versions before any session or terminal exists. Claude (official
   messaging; its dialog is left to the user, as on macOS and Linux), Agy (paste through the
   surface behind its log readiness and receipt) and Pi run there. Inside an hc terminal the
-  automatic choice is Herdr when the provider's adapter runs there and the managed console
-  otherwise; a reopen, whose provider is unknown at selection, keeps the console.
+  automatic choice follows the rule above: Herdr for them and the managed console for Codex.
+  A `reopen` reaches that choice only for an eligible closed Claude source (Agy, Pi and Codex
+  cannot reopen), which now gets Herdr after the caller check; 0.4.49 and earlier gave it the
+  console.
 - A Herdr handle on Windows never reaches the console control helper: the seven surface
   operations resolve its adapter through the one Windows lookup (`windows/dispatch.rs`), and
   guarded dialog input answers with Herdr's declared refusal first, as on the other platforms.

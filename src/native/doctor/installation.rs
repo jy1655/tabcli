@@ -64,6 +64,37 @@ pub(super) enum VersionProbe {
     Completed(VersionReport),
 }
 
+/// What a version probe established, as a row whose answer depends on the version needs it.
+#[derive(Debug, PartialEq)]
+pub(super) enum VersionOutcome {
+    /// `--probe` was not given.
+    NotRequested,
+    /// No usable executable to probe.
+    NoExecutable,
+    /// The probe produced no version: it could not run or exited unsuccessfully.
+    Failed,
+    /// The launch's general version check refuses this text before any terminal is chosen:
+    /// too old (`too_old`), or no version in it.
+    Refused { too_old: bool },
+    /// The text the launch's general version check admits.
+    Supported(String),
+}
+
+pub(super) fn version_outcome(probe: &VersionProbe) -> VersionOutcome {
+    match probe {
+        VersionProbe::NotRequested => VersionOutcome::NotRequested,
+        VersionProbe::NoExecutable => VersionOutcome::NoExecutable,
+        VersionProbe::Failed(_) | VersionProbe::Completed(VersionReport::Exited(_)) => {
+            VersionOutcome::Failed
+        }
+        VersionProbe::Completed(VersionReport::Read { text, support }) => match support {
+            VersionSupport::Supported => VersionOutcome::Supported(text.clone()),
+            VersionSupport::TooOld => VersionOutcome::Refused { too_old: true },
+            VersionSupport::Unrecognized(_) => VersionOutcome::Refused { too_old: false },
+        },
+    }
+}
+
 /// The version row, and the version text it reports as current.
 pub(super) fn version_check(
     provider: FirstPartyCli,
@@ -144,7 +175,7 @@ pub(super) fn workspace_check(workspace: &Path, is_directory: std::io::Result<bo
         CheckId::WORKSPACE,
         availability,
         reason,
-        "Working directory observation; CLI version checks do not depend on this directory.",
+        "Working directory observation; CLI version checks do not depend on this directory, except the one that decides an automatic Herdr choice, which runs where doctor runs, as ask's does.",
         "Restore or inspect the recorded directory before workspace-relative operations.",
     )
     .evidence(json!({"path": workspace}))

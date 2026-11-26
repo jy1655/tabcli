@@ -78,7 +78,7 @@ impl Core for Installed {
         std::process::id()
     }
 
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    fn parent_pid(&self, pid: u32) -> Result<super::Parent> {
         parent_of(pid)
     }
 
@@ -127,23 +127,36 @@ pub(super) fn creation_time(pid: u32) -> Result<Option<u64>> {
 
 /// The parent of a live process. Windows keeps a child's parent PID after the parent ends,
 /// and that PID can then name a later process: only a live process created no later than
-/// the child is its parent. A parent this process may not inspect ends the walk; the walk
-/// can then only refuse, never accept.
-pub(super) fn parent_of(pid: u32) -> Result<Option<u32>> {
-    let Some(parent) = snapshot_parent(pid)? else {
-        return Ok(None);
+/// the child is its parent. A parent that ended, a reused PID and a parent this process may
+/// not inspect are unknown, never a root: the walk can then only refuse, never accept, and
+/// it does not claim that the command runs outside the terminal.
+pub(super) fn parent_of(pid: u32) -> Result<super::Parent> {
+    use super::Parent;
+    let parent = match snapshot_parent(pid)? {
+        None => return Ok(Parent::Unknown(format!("process {pid} is not running"))),
+        Some(None) => return Ok(Parent::Root),
+        Some(Some(parent)) => parent,
     };
     let Some(child_created) = creation_time(pid)? else {
-        return Ok(None);
+        return Ok(Parent::Unknown(format!(
+            "process {pid} is no longer running"
+        )));
     };
-    match creation_time(parent) {
-        Ok(Some(parent_created)) if parent_created <= child_created => Ok(Some(parent)),
-        Ok(_) | Err(_) => Ok(None),
-    }
+    Ok(match creation_time(parent) {
+        Ok(Some(parent_created)) if parent_created <= child_created => Parent::Process(parent),
+        Ok(Some(_)) => Parent::Unknown(format!(
+            "the parent {parent} of process {pid} ended and its PID names a later process"
+        )),
+        Ok(None) => Parent::Unknown(format!("the parent {parent} of process {pid} ended")),
+        Err(error) => Parent::Unknown(format!(
+            "the parent {parent} of process {pid} cannot be inspected: {error:#}"
+        )),
+    })
 }
 
-/// The parent PID that a process snapshot records for `pid`, if the snapshot lists it.
-fn snapshot_parent(pid: u32) -> Result<Option<u32>> {
+/// The parent PID that a process snapshot records for `pid`: `None` when the snapshot does
+/// not list `pid`, `Some(None)` when it records no parent.
+fn snapshot_parent(pid: u32) -> Result<Option<Option<u32>>> {
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if raw == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error()).context("cannot list Windows processes");
@@ -156,10 +169,10 @@ fn snapshot_parent(pid: u32) -> Result<Option<u32>> {
     let mut more = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
     while more != 0 {
         if entry.th32ProcessID == pid {
-            return Ok(
+            return Ok(Some(
                 (entry.th32ParentProcessID != 0 && entry.th32ParentProcessID != pid)
                     .then_some(entry.th32ParentProcessID),
-            );
+            ));
         }
         more = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
     }
