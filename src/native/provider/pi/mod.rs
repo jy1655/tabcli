@@ -459,6 +459,7 @@ fn prepare_launch_for_platform(
             context.directory,
             FirstPartyCli::Pi,
             APPLIED_MARKER,
+            context.workspace,
         )?);
     }
     if !windows {

@@ -83,10 +83,13 @@ provider option is planned and again for that command immediately before the pro
 immediately before a trust-dialog key, and immediately before every Agy paste is handed to the
 terminal; `doctor` reports the same check. That is the last point TAB's own code controls, and a
 change after it takes effect for the next act, not the one in flight: a revocation that lands
-while the terminal already carries out a paste does not stop that paste. A launch whose command
-carries no trust option reads no consent at its start, as before. Each check reads the records,
-provider stores and Git files as they are now and writes nothing, and evidence it cannot read is
-reported as unreadable, not as missing trust. A session's check needs the source recorded at its
+while the terminal already carries out a paste does not stop that paste. The final check before
+a provider starts reads no consent for a command that carries no trust option, as before; every
+`ask` and supported `reopen` still assesses consent while the session is resolved. Each check
+reads the records, provider stores and Git files as they are now and writes nothing. Evidence it
+cannot read gives no trust option and no dialog key, as missing consent did before; `doctor` and
+the Agy paste gate report it as unreadable, and a command that already carries a trust option
+does not start. A session's check needs the source recorded at its
 start: after `tabcli consent reset` of the workspace or of its main working tree, only a new
 `ask` or a supported `reopen` acquires consent again. What a launch recorded is history. A revoked consent, a source that no longer trusts the directory or a worktree
 that is no longer registered stops a TAB paste into a running Agy session that relies on its

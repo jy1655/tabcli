@@ -280,6 +280,7 @@ fn the_spawn_fence_asks_about_the_commands_own_launch_option() {
         &session.directory,
         FirstPartyCli::Agy,
         "agy-settings-override",
+        &git.worktree,
     )
     .unwrap();
     let admit = |grant: &LaunchGrant| {
@@ -380,7 +381,13 @@ fn the_spawn_fence_starts_nothing_for_a_launch_option_without_consent() {
             .unwrap();
     manifest["provider"] = serde_json::json!("pi");
     write_json_atomic(&session.directory.join("manifest.json"), &manifest).unwrap();
-    let grant = apply_option(&session.directory, FirstPartyCli::Pi, "pi-approve-once").unwrap();
+    let grant = apply_option(
+        &session.directory,
+        FirstPartyCli::Pi,
+        "pi-approve-once",
+        &workspace,
+    )
+    .unwrap();
     fs::remove_file(&fixture.pi).unwrap();
     let mut command = if cfg!(windows) {
         let mut command = std::process::Command::new("cmd");
@@ -437,4 +444,36 @@ fn a_command_without_a_launch_option_starts_whatever_the_consent_record_holds() 
             .unwrap_or_else(|error| panic!("{record:?}: {error:#}"));
         let _ = child.wait();
     }
+}
+
+// Review r4, finding 3: the bounded question takes one absolute deadline before it starts. No
+// time left refuses without asking, and an answer that comes after the deadline refuses.
+#[test]
+fn the_bounded_question_refuses_without_time_and_after_its_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    const LATE: &str = "could not be confirmed within the launch's remaining time";
+    let asked = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = asked.clone();
+    let error = within(Duration::ZERO, move || {
+        flag.store(true, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains(LATE), "{error:#}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!asked.load(Ordering::SeqCst));
+    let error = within(Duration::from_millis(20), || {
+        std::thread::sleep(Duration::from_millis(200));
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains(LATE), "{error:#}");
+    within(Duration::from_secs(5), || Ok(())).unwrap();
+    assert_eq!(
+        within(Duration::from_secs(5), || anyhow::bail!("refused"))
+            .unwrap_err()
+            .to_string(),
+        "refused"
+    );
 }

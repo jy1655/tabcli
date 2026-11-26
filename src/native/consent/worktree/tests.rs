@@ -224,7 +224,7 @@ fn a_worktree_that_git_added_names_its_main_working_tree() {
     fs::copy(worktree.join(".git"), second.join(".git")).unwrap();
     assert_eq!(
         error(&second.canonicalize().unwrap()),
-        "the worktree registration names another .git file"
+        "the worktree registration names a .git file in another folder"
     );
 }
 
@@ -251,7 +251,7 @@ fn a_relative_path_registration_names_its_main_working_tree() {
     .unwrap();
     assert_eq!(
         error(&fixture.worktree),
-        "the worktree registration names another .git file"
+        "the worktree registration names a .git file in another folder"
     );
 
     // The same as Git itself writes it, where Git does.
@@ -449,8 +449,8 @@ fn the_registration_must_name_this_worktree_and_its_common_directory_by_identity
     fs::create_dir(&other).unwrap();
     fs::copy(fixture.worktree.join(".git"), other.join(".git")).unwrap();
     assert_eq!(
-        error(&other),
-        "the worktree registration names another .git file"
+        error(&other.canonicalize().unwrap()),
+        "the worktree registration names a .git file in another folder"
     );
     // The common directory named by the registration must be the main working tree's `.git`.
     let commondir = fixture.registration.join("commondir");
@@ -600,7 +600,8 @@ fn no_link_on_the_way_counts() {
         format!("{} is a link", alias.display())
     );
     point(&fixture, &git_path(&fixture.registration));
-    // The registration naming this worktree back through a linked directory.
+    // The registration naming this worktree back through a linked directory: not a spelling of
+    // this worktree's `.git`, so refused before the link is reached (review r4, finding 4).
     let worktree_alias = root.join("worktree-alias");
     symlink(&fixture.worktree, &worktree_alias).unwrap();
     fs::write(
@@ -610,7 +611,7 @@ fn no_link_on_the_way_counts() {
     .unwrap();
     assert_eq!(
         error(&fixture.worktree),
-        format!("{} is a link", worktree_alias.display())
+        "the worktree registration names a .git file in another folder"
     );
     fs::write(
         fixture.registration.join("gitdir"),
@@ -690,4 +691,38 @@ fn a_share_without_consent_evidence_is_never_touched() {
         r"\\tab-test.invalid\share\repository"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+// Review r4, finding 4: the back-pointer is resolved lexically first and must designate `.git`
+// in the assessed workspace before anything on its path is walked. A stale registration that
+// names a former worktree in a third tree is refused before any I/O there (that tree does not
+// even exist here: a walk would report it unreadable), absolute or relative.
+#[test]
+fn a_back_pointer_into_a_third_tree_is_refused_before_any_io_there() {
+    let (_temp, root) = canonical_root();
+    let fixture = registered(&root);
+    let gitdir = fixture.registration.join("gitdir");
+    for back in [
+        format!("{}\n", git_path(&root.join("third/former/.git"))),
+        "../../../../third/former/.git\n".to_owned(),
+    ] {
+        fs::write(&gitdir, &back).unwrap();
+        assert_eq!(
+            error(&fixture.worktree),
+            "the worktree registration names a .git file in another folder",
+            "{back}"
+        );
+    }
+    // Git's own spellings of this worktree's `.git` still verify.
+    for back in [
+        format!("{}\n", git_path(&fixture.worktree.join(".git"))),
+        "../../../../worktree/.git\n".to_owned(),
+    ] {
+        fs::write(&gitdir, &back).unwrap();
+        assert_eq!(
+            verified(&fixture.worktree).unwrap(),
+            Some(fixture.repository.clone()),
+            "{back}"
+        );
+    }
 }

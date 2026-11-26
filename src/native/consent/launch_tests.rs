@@ -368,9 +368,16 @@ fn launch_dialog_typed_prewrite_refusal_is_distinct_from_dispatch_error() {
         assert!(error.contains("dialog dispatch failed"), "{error}");
         assert_eq!(error.contains("no response sent"), refused, "{error}");
         assert_eq!(error.contains("possible response"), !refused, "{error}");
+        // A stale claim proves the key unsent: the record returns to what the step assessed
+        // (review r3, finding 4). An uncertain dispatch keeps the pending value.
         assert_eq!(
             observe(&h.directory).value()["applied"],
-            "workspace-dialog-response-pending"
+            if refused {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("workspace-dialog-response-pending")
+            },
+            "refused: {refused}"
         );
     }
 }

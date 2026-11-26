@@ -108,7 +108,25 @@ fn authority_for(
     }
     user_home(env)?;
     let root = directory.parent().context("session has no state root")?;
-    let now = assess_current(root, &workspace, env)?;
+    // Evidence that the recheck cannot read is a refusal marked unreadable (review r4, finding
+    // 1): a consumer that does not need the cause plans no option, sends no key and still tries
+    // its independent routes, as a missing consent did in 0.4.49; Agy reports the cause, and a
+    // granted command refuses to start.
+    let now = match assess_current(root, &workspace, env) {
+        Ok(now) => now,
+        Err(error) => {
+            return Ok((
+                Authority {
+                    applied,
+                    verdict: Err(Refusal {
+                        reason: format!("the workspace's consent cannot be read now: {error:#}"),
+                        unreadable: true,
+                    }),
+                },
+                None,
+            ));
+        }
+    };
     if now.state != "verified"
         || now.identity != assessment.identity
         || now.source != assessment.source
@@ -212,17 +230,31 @@ pub(super) fn admit_launch_within(
     let Some(budget) = budget else {
         return admit_launch_with(directory, grant, &env);
     };
-    // The assessment writes nothing, so an answer that comes too late is simply dropped.
-    let (sent, received) = std::sync::mpsc::channel();
     let (owned, owned_grant) = (directory.to_owned(), grant.clone());
-    std::thread::spawn(move || {
-        let _ = sent.send(admit_launch_with(&owned, &owned_grant, &env));
-    });
-    received.recv_timeout(budget).unwrap_or_else(|_| {
-        bail!(
-            "workspace consent for the launch option could not be confirmed within the launch's remaining time, so the provider was not started"
-        )
+    within(budget, move || {
+        admit_launch_with(&owned, &owned_grant, &env)
     })
+}
+
+// `check` answered within `budget` (review r4, finding 3). No time left refuses without asking.
+// Otherwise one absolute monotonic deadline is taken before the check starts, and an answer
+// that has not arrived by it, or arrives after it, refuses. The check writes nothing, so a late
+// answer is simply dropped.
+fn within(budget: Duration, check: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
+    const LATE: &str = "workspace consent for the launch option could not be confirmed within the launch's remaining time, so the provider was not started";
+    if budget.is_zero() {
+        bail!(LATE);
+    }
+    let deadline = std::time::Instant::now() + budget;
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sent.send(check());
+    });
+    let answer = received
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| anyhow::anyhow!(LATE))?;
+    ensure!(std::time::Instant::now() <= deadline, LATE);
+    answer
 }
 
 pub(super) fn admit_launch_with(

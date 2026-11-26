@@ -615,8 +615,12 @@ fn session_trust_settings(
     let file = crate::native::session::Store::open_unchecked(context.directory)
         .private(SESSION_SETTINGS_FILE);
     file.write_json(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
-    let grant =
-        super::super::consent::apply_option(context.directory, FirstPartyCli::Agy, APPLIED_MARKER)?;
+    let grant = super::super::consent::apply_option(
+        context.directory,
+        FirstPartyCli::Agy,
+        APPLIED_MARKER,
+        context.workspace,
+    )?;
     Ok(Some((file.path().to_owned(), grant)))
 }
 

@@ -1404,3 +1404,141 @@ fn a_held_session_record_lock_ends_the_step_unsent_by_its_deadline() {
     assert_eq!(fs::read(c.directory.join(SESSION_FILE)).unwrap(), before);
     drop(holder);
 }
+
+// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// a refusal for the dialog step, as a missing consent was in 0.4.49: no key and no error.
+#[test]
+fn an_unreadable_source_store_takes_no_key_and_is_no_error() {
+    let c = consented(FirstPartyCli::Claude, false);
+    fs::remove_file(&c.stores.pi).unwrap();
+    write_private(&c.stores.pi, b"{").unwrap();
+    c.complete(
+        FirstPartyCli::Claude,
+        provider::launch_dialog(FirstPartyCli::Claude),
+        &mut FakeClock::new(Instant::now()),
+        &mut Untouched,
+    )
+    .unwrap();
+    assert_eq!(observe(&c.directory).applied_marker(), None);
+}
+
+// The session record's lock, taken and held by the caller.
+fn hold_session_lock(directory: &Path) -> fs::File {
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("workspace-consent.lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    holder
+}
+
+// Runs a Claude dialog step for `c` in a thread, with a one-second deadline and the scripted
+// `dispatch`, and returns its outcome, or `None` when it does not end within ten seconds.
+fn step_in_thread(
+    c: &Consented,
+    dispatch: impl FnMut(&Path) -> Result<bool> + Send + 'static,
+) -> Option<std::result::Result<(), String>> {
+    let (sent, received) = std::sync::mpsc::channel();
+    let directory = c.directory.clone();
+    let env = c.stores.env.clone();
+    let mut dispatch = dispatch;
+    std::thread::spawn(move || {
+        let mut clock = FakeClock::new(Instant::now());
+        let deadline = clock.now() + Duration::from_secs(1);
+        let policy = FakePolicy::default();
+        let result = LaunchDialog {
+            directory: &directory,
+            target: FirstPartyCli::Claude,
+            expected_claim: "1-2-3",
+            deadline,
+        }
+        .complete(
+            LaunchDialogSupport::Answered(&policy),
+            &env,
+            &mut clock,
+            &mut scripted(
+                GuardedKey::Taken,
+                || Ok(DIALOG.to_owned()),
+                || dispatch(&directory),
+            ),
+        );
+        let _ = sent.send(result.map_err(|error| format!("{error:#}")));
+    });
+    received.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+// Review r4, finding 5: recording the provider's confirmation takes the session record's lock
+// within the step's deadline. A writer that holds it past then ends the step with the trust
+// confirmed and its recording failed, and no input is retried.
+#[test]
+fn a_held_lock_after_the_answer_reports_confirmed_trust_and_a_failed_record() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let claude = c.stores.claude.clone();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = dispatched.clone();
+    let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let held = holder.clone();
+    let outcome = step_in_thread(&c, move |directory| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *held.lock().unwrap() = Some(hold_session_lock(directory));
+        write_json_atomic(
+            &claude,
+            &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+        )
+        .unwrap();
+        Ok(true)
+    })
+    .expect("the step ends by its deadline while the record is held");
+    let error = outcome.unwrap_err();
+    assert!(
+        error.starts_with("provider trust is confirmed; recording the TAB applied marker failed; no input was retried"),
+        "{error}"
+    );
+    assert_eq!(dispatched.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(holder);
+}
+
+// Review r4, finding 6: a key proven unsent whose pending marker cannot be restored (the record's
+// lock held until the deadline) stops the step and reports both facts: nothing was sent, and the
+// marker could not be restored. Nothing is dispatched again.
+#[test]
+fn a_failed_restore_stops_the_step_and_reports_both_facts() {
+    for path in ["screen changed", "stale claim"] {
+        let c = consented(FirstPartyCli::Claude, false);
+        let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = dispatched.clone();
+        let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let held = holder.clone();
+        let outcome = step_in_thread(&c, move |directory| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *held.lock().unwrap() = Some(hold_session_lock(directory));
+            if path == "screen changed" {
+                Ok(false)
+            } else {
+                Err(anyhow::Error::new(terminal::StaleDialogClaim))
+            }
+        })
+        .expect("the step ends by its deadline while the record is held");
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains("the pending response marker could not be restored")
+                && error.ends_with("no response sent"),
+            "{path}: {error}"
+        );
+        assert_eq!(
+            dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{path}"
+        );
+        drop(holder);
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some(RESPONSE_PENDING),
+            "{path}"
+        );
+    }
+}

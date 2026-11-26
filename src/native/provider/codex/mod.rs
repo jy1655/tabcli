@@ -668,6 +668,7 @@ fn prepare_launch_for_platform(
             context.directory,
             FirstPartyCli::Codex,
             APPLIED_MARKER,
+            context.workspace,
         )?);
     }
     arguments.extend(own);

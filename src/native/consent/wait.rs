@@ -535,4 +535,34 @@ mod tests {
         assert_eq!(error.to_string(), "timed out: fourth");
         assert_eq!(clock.slept, Duration::from_millis(250));
     }
+
+    // Review r4, finding 1: a source store that becomes unreadable after the session's
+    // assessment is a refusal for the Codex wait, as a missing consent was in 0.4.49: the
+    // marker route closes and the independent evidence is still checked.
+    #[test]
+    fn an_unreadable_source_store_leaves_the_independent_evidence_to_the_wait() {
+        use super::super::record::{applied, assess_with, record};
+        let (_temp, workspace, fixture) = setup();
+        let (root, directory) = session(&workspace, "awaiting-initial-input");
+        trust_pi(&fixture, &workspace);
+        let assessment = assess_with(root.path(), &workspace, &fixture.env).unwrap();
+        assert_eq!(assessment.state, "verified");
+        record(&directory, &assessment).unwrap();
+        applied(&directory, "codex-config-override").unwrap();
+        fs::remove_file(&fixture.pi).unwrap();
+        crate::native::session::primitives::write_private(&fixture.pi, b"{").unwrap();
+        let mut asked = 0;
+        wait_for_native_trust_with(
+            &directory,
+            FirstPartyCli::Codex,
+            Instant::now() + Duration::from_secs(5),
+            &fixture.env,
+            &mut || {
+                asked += 1;
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(asked, 1);
+    }
 }

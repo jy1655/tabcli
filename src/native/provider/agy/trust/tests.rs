@@ -449,7 +449,10 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     // evidence, never as an absent entry (review round 3, finding 12).
     fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
     let store = root.join(".gemini/antigravity-cli/settings.json");
-    fs::write(&store, b"{\"trustedWorkspaces\":true}").unwrap();
+    // Created as Agy's own store is, private to the user, so that the reader refuses its
+    // contents rather than its access list (Windows CI, 2026-11-26; review r4, finding 8).
+    crate::native::session::primitives::write_private(&store, b"{\"trustedWorkspaces\":true}")
+        .unwrap();
     let (outcome, check) = gate();
     let outcome = outcome.unwrap_err();
     assert!(

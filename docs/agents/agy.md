@@ -56,6 +56,10 @@
   (router's limit, 2026-11-26). The backends are not changed, so a revocation that lands after
   that point does not stop the paste already handed to the backend. The request trace's paste
   timestamps surround the send itself and stay empty when that check refuses. An
+  Agy store that TAB's reader refuses (malformed, or its access list lets another account
+  change it) withholds even a paste that relies on the setting alone: the authority asks every
+  target whether its store declines the workspace, and a store it cannot read is a refusal
+  marked unreadable, not a missing entry (consent's authority, Trust Store Boundary). An
   unreadable store, session record or log is reported as unreadable evidence, never as an
   absent entry. The store is shared by every Agy process, so a dialog approved in one
   session leaves another session's dialog open; the log line is per process and appears at

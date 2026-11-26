@@ -1129,3 +1129,124 @@ fn the_store_only_answer_reads_the_store_alone() {
         );
     }
 }
+
+// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// a refusal for the plan through the production gate, as a missing consent was in 0.4.49: the
+// command carries no trust option and no grant, and the launch goes on. The recheck refuses on
+// the pinned fixture store before any store of the caller's own environment is read.
+#[test]
+fn a_source_store_unreadable_after_the_assessment_plans_a_plain_command() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: "codex".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: workspace.clone(),
+            title: "plain".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &workspace, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    std::fs::remove_file(&pi).unwrap();
+    crate::native::session::primitives::write_private(&pi, b"{").unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &workspace,
+            title: "plain",
+            prompt: "plain prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .unwrap();
+    assert!(plan.trust_grant.is_none());
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("projects=")),
+        "{:?}",
+        plan.arguments
+    );
+}
+
+// Review r4, finding 2: the grant names the workspace the command was built for. A session whose
+// consent record was assessed for another directory than the wrapper's snapshot (which gives
+// the command its working directory and its trust override) gets no grant: the plan refuses.
+#[test]
+fn a_grant_for_another_workspace_than_the_command_refuses_the_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (directory, workspace) = launch_fixture(&root);
+    let other = root.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&other).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment = crate::native::consent::prepare_at_home(&directory, &other, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    let error = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &workspace,
+            title: "mismatch",
+            prompt: "mismatch prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        |_, _| Ok(true),
+    )
+    .map(|plan| plan.trust_grant)
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another workspace than the command's"),
+        "{error:#}"
+    );
+}

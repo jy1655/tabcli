@@ -20,10 +20,11 @@
 //!    and every one is a directory.
 //! 4. `<main>/.git` is therefore a real directory of `<main>`, and it has no `commondir` of its
 //!    own.
-//! 5. The registration's `gitdir` names `.git` in `W` itself, and its `commondir` names
-//!    `<main>/.git`; each is walked the same way from the registration and compared by file
-//!    identity, never by name: the file and, for the back-pointer, its directory too, so a hard
-//!    link to `W/.git` in another folder is not `W`. On Windows the identity is the volume and
+//! 5. The registration's `gitdir` names `.git` in `W` itself, first lexically (before anything
+//!    on its path is touched) and then physically, and its `commondir` names `<main>/.git`; each
+//!    is walked the same way from the registration and compared by file identity: the file and,
+//!    for the back-pointer, its directory too, so a hard link to `W/.git` in another folder is
+//!    not `W`. On Windows the identity is the volume and
 //!    the full 128-bit file id; where it cannot be read, nothing is inherited.
 //!
 //! The limit (router's ruling, 2026-11-26): the check defends the property against whatever
@@ -84,11 +85,18 @@ pub(super) fn main_worktree(
         Err(error) => return Err(error.into()),
         Ok(_) => bail!("the main working tree's .git names a common directory of its own"),
     }
-    let back = walk(
-        &registration,
-        Path::new(one_line(&read_git_file(&registration.join("gitdir"))?)?),
-        Kind::File,
-    )?;
+    // Review r4, finding 4: the back-pointer must designate `.git` in this workspace lexically,
+    // in a spelling Git writes (absolute from its volume's root, or relative to the
+    // registration), before anything on its path is walked: a stale registration that names a
+    // former worktree in a third tree is refused without touching that tree. The physical
+    // comparisons below still follow.
+    let back_text = read_git_file(&registration.join("gitdir"))?;
+    let back_target = Path::new(one_line(&back_text)?);
+    ensure!(
+        lexical(&registration, back_target)? == pointer,
+        "the worktree registration names a .git file in another folder"
+    );
+    let back = walk(&registration, back_target, Kind::File)?;
     ensure!(
         object_id(&back)? == object_id(&pointer)?,
         "the worktree registration names another .git file"
@@ -125,10 +133,8 @@ pub(super) fn is_link(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-// The main working tree that `target`, resolved from `base` as Git resolves it with `.` and
-// `..` applied lexically, claims as `<main>/.git/worktrees/<id>`; `<main>` may be a volume
-// root. For the screen only: no I/O.
-fn claimed_main(base: &Path, target: &Path) -> Result<Option<PathBuf>> {
+// `target`, resolved from `base` as Git resolves it with `.` and `..` applied lexically. No I/O.
+fn lexical(base: &Path, target: &Path) -> Result<PathBuf> {
     let (mut path, components) = start(base, target)?;
     for component in components {
         match component {
@@ -142,6 +148,13 @@ fn claimed_main(base: &Path, target: &Path) -> Result<Option<PathBuf>> {
             }
         }
     }
+    Ok(path)
+}
+
+// The main working tree that `target`, resolved lexically from `base`, claims as
+// `<main>/.git/worktrees/<id>`; `<main>` may be a volume root. For the screen only: no I/O.
+fn claimed_main(base: &Path, target: &Path) -> Result<Option<PathBuf>> {
+    let mut path = lexical(base, target)?;
     let names: Vec<_> = path
         .components()
         .rev()

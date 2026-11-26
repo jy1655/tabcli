@@ -1,12 +1,12 @@
 use super::authority::{Authority, Consented, authority};
-use super::record::{LAUNCH_OPTION_UNAVAILABLE, applied, transition};
+use super::record::{LAUNCH_OPTION_UNAVAILABLE, transition};
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
 use crate::native::session::{Reader, schema::SessionManifest};
 use crate::native::{provider, terminal};
 use agent_bridge::FirstPartyCli;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -312,8 +312,22 @@ impl LaunchDialog<'_> {
             require_launch_dialog_live(directory, responded)?;
             if trusted {
                 if responded {
-                    applied(directory, RESPONSE_CONFIRMED)
-                        .context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")?;
+                    // Within the step's deadline (review r4, finding 5): a record held past it
+                    // reports the confirmed trust and the failed record, and nothing is sent again.
+                    transition(
+                        directory,
+                        Some(RESPONSE_PENDING),
+                        Some(RESPONSE_CONFIRMED),
+                        deadline,
+                    )
+                    .and_then(|recorded| {
+                        ensure!(
+                            recorded,
+                            "the session's consent record no longer holds this step's pending response"
+                        );
+                        Ok(())
+                    })
+                    .context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")?;
                 }
                 return Ok(());
             }
@@ -368,17 +382,29 @@ impl LaunchDialog<'_> {
                     }
                     let mut attempted = false;
                     // Every path that proves the key unsent returns the record from this step's
-                    // own pending value to what the step assessed (review r3, finding 4). A
-                    // restore that cannot take the lock leaves the pending value, which refuses
-                    // any later attempt; only a dispatch that may have sent the key keeps it.
-                    let unsent = |error: anyhow::Error| {
-                        let _ = transition(
+                    // own pending value to what the step assessed (review r3, finding 4); only a
+                    // dispatch that may have sent the key keeps it. A record that another writer
+                    // already changed is left as it is. A restore that fails (the lock held until
+                    // the deadline, the record not writable) ends the step and says so with the
+                    // unsent key (review r4, finding 6); the pending value then refuses any later
+                    // attempt.
+                    let restore = || {
+                        transition(
                             directory,
                             Some(RESPONSE_PENDING),
                             assessed.as_deref(),
                             deadline,
-                        );
-                        error
+                        )
+                        .err()
+                        .map(|error| {
+                            format!(
+                                "the key was not sent, and the pending response marker could not be restored ({error:#})"
+                            )
+                        })
+                    };
+                    let unsent = |error: anyhow::Error| match restore() {
+                        Some(failed) => error.context(failed),
+                        None => error,
                     };
                     responded = respond_to_workspace_dialog(
                         directory,
@@ -412,10 +438,15 @@ impl LaunchDialog<'_> {
                             attempted = true;
                             match surface.answer(input, deadline) {
                                 // The surface saw a changed screen and sent nothing.
-                                Ok(false) => {
-                                    let _ = unsent(anyhow::anyhow!("not sent"));
-                                    Ok(false)
-                                }
+                                Ok(false) => match restore() {
+                                    Some(failed) => {
+                                        attempted = false;
+                                        Err(anyhow::anyhow!(
+                                            "the screen changed before the key; {failed}"
+                                        ))
+                                    }
+                                    None => Ok(false),
+                                },
                                 Err(error) if error.is::<terminal::StaleDialogClaim>() => {
                                     Err(unsent(error))
                                 }

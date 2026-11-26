@@ -668,3 +668,36 @@ fn the_store_only_answer_reads_the_store_alone() {
         );
     }
 }
+
+// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// a refusal for the plan, as a missing consent was in 0.4.49: no session-only setting, no grant,
+// and the launch goes on.
+#[test]
+fn a_source_store_unreadable_after_the_assessment_plans_no_setting() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let pi = root.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let directory = consented_launch_session(&root, &workspace);
+    std::fs::remove_file(&pi).unwrap();
+    crate::native::session::primitives::write_private(&pi, b"{").unwrap();
+    let env = crate::native::consent::Environment::at_home(&root);
+    let plan = prepare_launch_for_platform(
+        launch_context(&directory, &workspace, false, "1.5.17"),
+        false,
+        &mut |directory| crate::native::consent::authority(directory, FirstPartyCli::Agy, &env),
+    )
+    .unwrap();
+    assert!(plan.trust_grant.is_none());
+    assert!(!plan.arguments.contains(&OsString::from("--settings")));
+    assert!(!directory.join(SESSION_SETTINGS_FILE).exists());
+}

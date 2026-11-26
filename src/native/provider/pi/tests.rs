@@ -1345,3 +1345,80 @@ fn the_store_only_answer_reads_the_store_alone() {
         );
     }
 }
+
+// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// a refusal for the plan through the production gate, as a missing consent was in 0.4.49: the
+// command carries no trust option and no grant, and the launch goes on. The recheck refuses on
+// the pinned fixture store before any store of the caller's own environment is read.
+#[test]
+fn a_source_store_unreadable_after_the_assessment_plans_a_plain_command() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    session_turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    super::test_support::launching_status(&directory);
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "pi".to_owned(),
+            provider_path: "pi".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: workspace.clone(),
+            title: "plain".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &workspace, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    std::fs::remove_file(&pi).unwrap();
+    crate::native::session::primitives::write_private(&pi, b"{").unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &workspace,
+            title: "plain",
+            prompt: "plain prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .unwrap();
+    assert!(plan.trust_grant.is_none());
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument == "--approve"),
+        "{:?}",
+        plan.arguments
+    );
+}

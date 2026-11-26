@@ -531,13 +531,22 @@ fn with_session_record<T>(
 
 /// Records that a launch plan put `provider`'s trust-bearing option `marker` in its command, and
 /// returns the grant the plan carries to the spawn fence: the option and the identity of the
-/// workspace the session's assessment consented to.
+/// workspace the session's assessment consented to. `workspace` is the one the command was built
+/// for (the wrapper's snapshot that gives it its working directory and its option): a consent
+/// record for another directory, or one whose identity is not that directory's now, grants
+/// nothing (review r4, finding 2).
 pub(in crate::native) fn apply_option(
     directory: &Path,
     provider: FirstPartyCli,
     marker: &'static str,
+    workspace: &Path,
 ) -> Result<super::authority::LaunchGrant> {
     with_session_record(directory, None, |path, mut assessment| {
+        if assessment.identity.path != workspace || identity(workspace)? != assessment.identity {
+            bail!(
+                "the session's consent names another workspace than the command's, so its launch option is not granted"
+            );
+        }
         assessment.applied = Some(marker.to_owned());
         RecordStore::at(path).write_json(&assessment)?;
         Ok(super::authority::LaunchGrant {
@@ -592,8 +601,9 @@ pub(in crate::native) fn option_unavailable(directory: &Path) -> Result<()> {
 }
 
 /// The applied value in the session's consent record, read as its typed record: none without a
-/// record, and an error for a record that cannot be read or is not a whole assessment. A gate
-/// that decides on the value reads it here, never through `observe`, whose view is for display.
+/// record, and an error for a record that cannot be read or is not a whole assessment. Agy's
+/// setting gate reads it here; the Codex wait keeps its existing `observe` reading, which only
+/// selects whether to ask the typed authority, so its independent routes stay as they were.
 pub(in crate::native) fn session_applied(directory: &Path) -> Result<Option<String>> {
     let Some(text) = Reader::open_unchecked(directory)
         .private(SESSION_FILE)

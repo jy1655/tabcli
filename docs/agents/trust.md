@@ -48,9 +48,12 @@
   before any I/O (only the leading parent steps of a relative path are taken); then the same
   path is walked component by component (each inspected before the next, none a link or, on
   Windows, a reparse point, every one a directory); `<main>/.git` has no `commondir` of its
-  own; and the registration's `gitdir` and `commondir`, walked the same way, name `.git` in `W`
-  itself and `<main>/.git` by file identity, never by name: the back-pointer's file and its
-  directory, so a hard link to `W/.git` in another folder is not `W`. On Windows an identity is
+  own; and the registration's `gitdir` names `.git` in `W` itself, first lexically (in a spelling
+  Git writes, absolute or relative to the registration, before anything on its path is walked,
+  so a stale registration naming a former worktree in a third tree is refused without touching
+  that tree) and then, walked the same way, by file identity, the file and its directory, so a
+  hard link to `W/.git` in another folder is not `W`; its `commondir`, walked the same way,
+  names `<main>/.git` by identity. On Windows an identity is
   the volume and the full 128-bit file id (`FileIdInfo`; the 64-bit index can repeat on ReFS),
   and where it cannot be read nothing is inherited. Pointer files are opened so that a FIFO
   cannot block the open (`O_NONBLOCK`), and the opened handle is checked. Relative-path
@@ -92,27 +95,35 @@
   assessment still runs every reader on the launch folder as 0.4.49 does, and Claude's reader
   there runs `git rev-parse` in the launch folder when a repository encloses it, which follows
   the folder's own `.git` pointer (follow-up, below).
-- Follow-ups outside this change (review r3): (1) Claude's scope probe on the launch folder
-  (finding 5, present in 0.4.49): screen a worktree pointer before a scope probe may follow
-  it, use the store-only result to skip Claude's positive-source scope probe when Claude's
-  store has no entry, and keep the full scope check for a prospective Claude grant. (2) Codex's
-  case-folded key (finding 10): for inheritance, keep the store's actual matched spelling and
-  require an unambiguous match to the physical main working tree before the first pin, without
-  changing Codex's ordinary launch.
+- Follow-ups beyond the two limits or outside this change (reviews r3 and r4): (1) recheck
+  consent inside the terminal backends after their internal waits; (2) traverse the worktree
+  paths by directory handles, and bind the child's working directory to a directory handle;
+  (3) Claude's scope probe on the launch folder (present in 0.4.49): screen a worktree pointer
+  before a scope probe may follow it, use the store-only result to skip Claude's
+  positive-source scope probe when Claude's store has no entry, and keep the full scope check
+  for a prospective Claude grant; and Codex's case-folded Windows key: for inheritance, keep
+  the store's actual matched spelling and require an unambiguous match to the physical main
+  working tree before the first pin, without changing Codex's ordinary launch.
 - `consent/authority.rs` is the one answer to "may this target provider treat this
   session's workspace as consented now". It reads the session's assessment as a typed record,
   binds it to the manifest's workspace by path and identity, assesses that workspace again
   without writing and without acquiring anything (a session's recheck needs the pins recorded
   at its start, so a `consent reset` of the worktree or of its main working tree refuses until
   a new `ask` or supported `reopen` acquires consent again), and asks the target provider
-  whether it declines, or cannot read, the workspace or its main working tree. A record or
-  manifest that cannot be read is an error, and so at a recheck is the pinned source's store
-  and every required read of the registration and the main working tree (a missing file is a
-  fact: the worktree is no longer registered); a start records a reset for an unreadable
-  source, as every earlier release did. A target store that cannot be read is a refusal marked
-  unreadable; anything else that does not hold is a refusal with its reason. A gate that
-  decides on the session's applied value decodes the record as its typed assessment
-  (`session_applied`): valid JSON of another shape is unreadable, never an absent marker.
+  whether it declines, or cannot read, the workspace or its main working tree. A session
+  record or manifest that cannot be read is an error. Evidence that the recheck cannot read
+  (the pinned source's store, a required read of the registration or of the main working tree;
+  a missing file is a fact: the worktree is no longer registered) and a target store that
+  cannot be read are refusals marked unreadable (review r4, finding 1): a consumer that does
+  not need the cause treats them as a missing consent was treated in 0.4.49 (Codex and Pi plan
+  no option, Claude's dialog step sends no key, the Codex wait still tries its independent
+  evidence), Agy reports the cause, and a command that carries a grant refuses to start. A
+  start records a reset for an unreadable source, as every earlier release did. Anything else
+  that does not hold is a refusal with its reason. Agy's marker read decodes the session record
+  as its typed assessment (`session_applied`): valid JSON of another shape is unreadable there,
+  never an absent marker. The Codex wait keeps its existing reading: `observe` only selects
+  whether to ask the typed authority, and a record that supplies no marker leaves it to its
+  independent readiness evidence.
 - When the authority is asked (router's limit, 2026-11-26). Consent is asked again at the last
   point the provider-neutral code controls, and a change after that point takes effect for the
   next act, not the one in flight:
@@ -130,16 +141,28 @@
     from the pending value: a pending value that a step reads before its own write is not its
     own and refuses (another attempt owns it, or its key may have been sent), and every path
     that proves the key unsent (expiry, a failed liveness or authority read, a refusal, a
-    changed screen, a stale claim) returns the record to the assessed value.
+    changed screen, a stale claim) returns the record to the assessed value. If that
+    restoration itself fails (the lock held until the deadline, the record not writable), the
+    step stops and reports both facts, that the key was not sent and that its marker could not
+    be restored; a later attempt then refuses as for an unowned pending value. After the key,
+    the provider's confirmation is recorded within the same deadline; a record that cannot take
+    it reports that the provider's trust is confirmed and the recording failed, and no input is
+    retried.
   - A provider's start: the authority is asked only for a command that carries a
     trust-bearing option. The plan carries that option, its provider and the workspace identity
     it was granted for (`LaunchGrant`) to the spawn fence, which asks about that command
     (`consent::admit_launch`) under the lifecycle lock immediately before its existing
     deadline check, so the order (deadline, `Spawning`, spawn) is unchanged; the question is
-    bounded by the launch's remaining budget and a late answer refuses, so it cannot push a
-    start past the receipt's expiry. A command without such an option follows 0.4.49's
-    admission exactly and reads no consent: a damaged record does not stop a plain Claude
-    launch, a supported reopen, or a plain Codex or Pi command. A change of consent during the
+    bounded by the launch's remaining budget: no time left refuses a granted command without
+    asking, one absolute deadline is taken before the question starts, and an answer that
+    arrives after it refuses, so it cannot push a start past the receipt's expiry. The grant is
+    made only for the workspace the command was built for (the wrapper's snapshot that gives it
+    its working directory and its option), and the fence requires the authority to find that
+    same identity consented. At the spawn fence a command without such an option follows
+    0.4.49's admission exactly and reads no consent there: a damaged record does not stop a
+    plain Claude launch, a supported reopen, or a plain Codex or Pi command (every `ask` and
+    supported `reopen` still assesses consent while the session is resolved). A change of
+    consent during the
     durable `Spawning` write that follows, and the child's working directory between the check
     and the exec, are beyond the limit.
   An applied marker records what a launch did and is never authority: every gate takes the
