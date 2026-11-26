@@ -4398,10 +4398,16 @@ fn a_slow_recovery_leaves_the_probe_no_time_and_writes_no_consent() {
 //    reopen where nothing probes with the lock held): the settlement does not wait for the
 //    lock, the marker still names a launching child, and the reopen is refused as already
 //    reopened before the probe; the child stays launching and nothing is written (0.4.49: the
-//    same). A build that probed first would find the lock free afterwards.
+//    same). A build that probes before the recovery is caught by the `claude.started` file its
+//    probe leaves, whether or not the holder has let the lock go by the time that probe
+//    returns. A build whose recovery waits for the lock before any probe would wait for ever,
+//    since neither release signal can come: after `WATCHDOG` the holder lets go and the case
+//    fails as blocked before probing. A healthy reopen returns within milliseconds and is
+//    released through `release`, far inside that bound, so the bound decides nothing there.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
+    const WATCHDOG: Duration = Duration::from_secs(120);
     in_review_case(
         "a_busy_child_lock_refuses_the_reopen_as_already_reopened",
         |root| {
@@ -4424,11 +4430,18 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
                 thread::spawn(move || {
                     let lock = Store::open_unchecked(&child).lock().unwrap();
                     held.send(()).unwrap();
+                    let watchdog = Instant::now() + WATCHDOG;
+                    let mut expired = false;
                     while !started.exists()
                         && released.recv_timeout(Duration::from_millis(10)).is_err()
                     {
+                        if Instant::now() >= watchdog {
+                            expired = true;
+                            break;
+                        }
                     }
                     drop(lock);
+                    expired
                 })
             };
             wait.recv().unwrap();
@@ -4439,9 +4452,17 @@ fn a_busy_child_lock_refuses_the_reopen_as_already_reopened() {
                 ),
                 Instant::now() + Duration::from_secs(30),
             );
-            // The holder has already let go if the provider was probed.
+            // The holder has already let go if the provider was probed or the watchdog expired.
             let _ = release.send(());
-            holder.join().unwrap();
+            let expired = holder.join().unwrap();
+            assert!(
+                !expired,
+                "the recovery blocked before probing: the reopen still waited for the child's lock after {WATCHDOG:?}, when the test's watchdog released it; it then returned {}",
+                match &outcome {
+                    Ok(_) => "a resolution".to_owned(),
+                    Err(error) => format!("{error:#}"),
+                }
+            );
             assert!(!started.exists(), "the provider was probed");
             fs::remove_file(&slow).unwrap();
             let error = outcome.err().expect("the busy child refuses the reopen");
