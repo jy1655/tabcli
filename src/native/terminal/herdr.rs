@@ -224,9 +224,11 @@ fn read_config_socket(path: &Path, deadline: Instant) -> Result<Option<String>> 
     remaining(deadline)?;
     // Even a regular file can reside on a stalled filesystem. The worker only reads
     // the selected config and checks the deadline between reads.
-    std::thread::Builder::new().spawn(move || {
-        let _ = done.send(read_config(&path, deadline));
-    })?;
+    std::thread::Builder::new()
+        .spawn(move || {
+            let _ = done.send(read_config(&path, deadline));
+        })
+        .context("failed to spawn the Herdr configuration reader")?;
     result
         .recv_timeout(remaining(deadline)?)
         .map_err(|error| match error {
@@ -253,26 +255,25 @@ fn read_config(path: &Path, deadline: Instant) -> Result<Option<String>> {
             Err(error) => return Err(error),
         };
         #[cfg(unix)]
-        let fifo = std::os::unix::fs::FileTypeExt::is_fifo(&file.metadata()?.file_type());
+        let mut poll_readable =
+            std::os::unix::fs::FileTypeExt::is_fifo(&file.metadata()?.file_type());
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
         loop {
             let _left = remaining(deadline)?;
             #[cfg(unix)]
-            if fifo && !unix::wait_fd(std::os::fd::AsRawFd::as_raw_fd(&file), libc::POLLIN, _left)?
+            if poll_readable
+                && !unix::wait_fd(std::os::fd::AsRawFd::as_raw_fd(&file), libc::POLLIN, _left)?
             {
                 continue;
             }
             match file.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => bytes.extend_from_slice(&buffer[..count]),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    continue;
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                #[cfg(unix)]
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    poll_readable = true;
                 }
                 Err(error) => return Err(error),
             }

@@ -239,7 +239,8 @@
   where the choice is already known to be Herdr: for `ask`, Claude, Agy and Pi; for `reopen`,
   which does not know its provider yet, always (every provider that supports reopen runs on
   Herdr, so no reopen that would take the fallback is refused). Where the version decides
-  (Codex off Windows), the outcome is kept (`session_start::CallerCheck`). `resolve` then
+  (Codex off Windows), the outcome is kept (`session_start::CallerCheck`) only while the
+  request has time left. `resolve` then
   decides with the provider (`session_start::admit_choice`), before the workspace and again
   with the probed version: an automatic choice is Herdr where the adapter admits it and its
   fallback otherwise (Codex below stable 0.169.0 off Windows, any Codex on Windows), and an
@@ -248,13 +249,12 @@
   otherwise refused with the check's error; one that takes the fallback ignores the check.
   The automatic caller check shares the earlier of the request deadline and ten seconds across
   configuration discovery, connection, core requests and the walk of parent processes.
+  The deadline bounds waits, although decoding a reply received just before expiry, a
+  configuration read or a parent lookup already in progress can finish later.
   On Windows, a cancelled pipe operation may return later because the system must finish
   using its buffer before TAB releases it.
-  Two differences remain, both from the owner's
-  decision on the automatic choice: a Codex off Windows whose check failed goes on to the
-  workspace, the admission and its probe, and its version then refuses it with the check's
-  error or gives it the fallback, where 0.4.49 refused at the check; and an automatic reopen
-  inside hc on Windows is checked, where 0.4.49 chose the managed console without a check.
+  On Windows, an automatic reopen inside hc checks its caller,
+  where 0.4.49 chose the managed console without a check.
   That added check can also change which of two truthful contention verdicts a concurrent
   reopen gets, because the probes after it happen later.
   For `reopen`, the settlement of an interrupted launch failure of the source's last child

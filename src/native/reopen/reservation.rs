@@ -710,7 +710,6 @@ impl Reservation {
                     format!("could not claim session {id} for reopen: {error:#}"),
                 )
             })?;
-        deadline::wrote("the source was reserved for reopen");
         Ok(Reservation {
             path,
             claim,

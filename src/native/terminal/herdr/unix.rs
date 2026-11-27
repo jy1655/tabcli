@@ -298,12 +298,18 @@ fn connect_before(socket: &Path, deadline: Instant) -> std::io::Result<UnixStrea
     {
         address.sun_len = length as u8;
     }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    // Darwin has no SOCK_CLOEXEC and sets the descriptor flag with fcntl.
+    #[cfg(target_os = "macos")]
+    let kind = libc::SOCK_STREAM;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // The stream owns the descriptor from here, and closes it on every return.
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
     if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -317,12 +323,12 @@ fn connect_before(socket: &Path, deadline: Instant) -> std::io::Result<UnixStrea
         }
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EINTR) => {}
+            Some(libc::EISCONN) => break,
             // A full listen queue: wait for room until the deadline.
             Some(libc::EAGAIN) => {
                 std::thread::sleep(super::remaining(deadline)?.min(CONNECT_RETRY));
             }
-            Some(libc::EINPROGRESS) => {
+            Some(libc::EINPROGRESS | libc::EINTR | libc::EALREADY) => {
                 while !wait_fd(fd, libc::POLLOUT, super::remaining(deadline)?)? {}
                 let mut failure: libc::c_int = 0;
                 let mut size = size_of::<libc::c_int>() as libc::socklen_t;
@@ -426,14 +432,12 @@ fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize>
     usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
 }
 
-/// Polls for bytes, end of stream, an error or (on Linux) an urgent byte. The poll timeout
-/// rounds whole microseconds up to milliseconds, so it can exceed `timeout` by up to one
-/// millisecond. Under one microsecond the poll is immediate. Returns `false` on timeout
-/// or interruption.
 fn wait_readable(stream: &UnixStream, timeout: Duration) -> std::io::Result<bool> {
     wait_fd(stream.as_raw_fd(), libc::POLLIN, timeout)
 }
 
+/// Positive timeouts round up to whole milliseconds; only zero polls immediately.
+/// Returns false on timeout or interruption so the caller can recheck its deadline.
 pub(super) fn wait_fd(
     fd: std::os::fd::RawFd,
     events: libc::c_short,

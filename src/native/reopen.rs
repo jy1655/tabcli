@@ -320,8 +320,8 @@ impl ResolvedReopen {
             .map_err(|error| {
                 reopen_refusal(ReopenGate::ProviderUnsupported, format!("{error:#}"))
             })?;
-        // The shared resolution fails before anything is created, so a failed consent
-        // assessment leaves the source reopenable.
+        // Shared consent may already have changed when resolution fails. The source
+        // stays reopenable because its reservation belongs to creation.
         let start = session_start::resolve(
             resolution(
                 &request,

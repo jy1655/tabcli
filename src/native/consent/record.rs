@@ -194,22 +194,32 @@ pub(super) fn with_record<T>(
     }
     use crate::native::session_start::deadline;
     deadline::before("preparing the workspace consent directory")?;
-    fs::create_dir_all(parent)?;
-    RecordStore::at(parent).set_directory_private()?;
-    deadline::wrote("the workspace consent directory was prepared");
+    fs::create_dir_all(root)?;
+    match fs::create_dir(parent) {
+        Ok(()) => deadline::wrote("the workspace consent directory was created"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir() => {}
+        Err(error) => return Err(error.into()),
+    }
+    deadline::set_permissions(
+        parent,
+        "workspace consent directory permissions were set",
+        || RecordStore::at(parent).set_directory_private(),
+    )?;
     let lock_path = path.with_extension("lock");
     if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
         bail!("invalid workspace consent lock");
     }
     deadline::before("opening the workspace consent lock")?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    RecordStore::set_file_private(&lock)?;
-    deadline::wrote("the workspace consent lock file was prepared");
+    let lock = deadline::open_lock(
+        &lock_path,
+        OpenOptions::new().read(true).write(true),
+        "the workspace consent lock file was created",
+    )?;
+    deadline::set_permissions(
+        &lock_path,
+        "workspace consent lock permissions were set",
+        || RecordStore::set_file_private(&lock),
+    )?;
     match deadline::current() {
         Some(end) => deadline::lock(&lock, end, "locking workspace consent")?,
         None => lock.lock()?,
@@ -530,9 +540,8 @@ pub(in crate::native) fn after_main_identified(hook: impl FnOnce(&Path) + 'stati
     AFTER_MAIN_IDENTIFIED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-// Assess before anything is created: the assessment reads the shared record and the provider
-// stores, and a failure there must consume nothing (a reopen's source marker is claimed by
-// create). The assessment is recorded with the session once that exists.
+// The assessment may update shared consent before Session creation. Reopen claims the
+// source only after assessment succeeds and records the assessment with the new Session.
 pub(in crate::native) fn assess(root: &Path, requested: &Path) -> Result<Assessment> {
     let env = Environment::current();
     user_home(&env)?;
@@ -1296,4 +1305,13 @@ fn request_deadline_consent_record_is_absent() {
         "consent record was written"
     );
     assert!(result.is_err());
+    let error =
+        crate::native::session_start::deadline::expire_at("writing workspace consent", || {
+            assess_with(root.path(), &canonical, &env)
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "the request's deadline passed before writing workspace consent; no Session was created"
+    );
 }

@@ -1927,11 +1927,10 @@ For `ask`, `tell`, and `reopen`, the timeout is one command deadline shared by p
 or delivery, and result waiting. Before a Session exists, the deadline bounds the automatic
 Herdr caller check (also limited to ten seconds), the wait for a reopen reservation, and the
 start of each write to workspace consent, the state root, the Session directory and the reopen
-marker. A write already in progress completes. Once TAB has written a reopen marker, finalizing
+marker, except that state-root preparation makes the root private even if the deadline has passed.
+A write already in progress completes. Once TAB has written a reopen marker, finalizing
 or releasing it can wait past the deadline to bind the child to its source or make the source
-reopenable when creation fails.
-
-A timeout while waiting for a result does not cancel delivered
+reopenable when creation fails. A timeout while waiting for a result does not cancel delivered
 work. A startup timeout can prevent a provider that has not started from launching. Startup has a
 separate ceiling of 30 seconds or the remaining command budget, whichever is shorter; increasing
 `--timeout-secs` does not extend that ceiling. Inspect the recorded request before retrying. TAB

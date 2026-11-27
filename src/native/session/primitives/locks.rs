@@ -75,13 +75,27 @@ impl TurnClaimLock {
         const STEP: &str = "claiming the reopen source lock";
         deadline::before(STEP)?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options.read(true).write(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let file = options.open(directory.join(TURN_CLAIM_LOCK_FILE))?;
-        deadline::lock(&file, end, STEP)?;
+        let path = directory.join(TURN_CLAIM_LOCK_FILE);
+        let file = deadline::open_lock(
+            &path,
+            &mut options,
+            "the reopen source lock file was created",
+        )
+        .with_context(|| format!("failed to open {}", path.display()))?;
+        deadline::lock(&file, end, STEP).map_err(|error| {
+            if error.is::<crate::native::failure_kind::TimedOut>() {
+                error
+            } else {
+                error.context("failed to lock native turn claim lifecycle")
+            }
+        })?;
         deadline::before(STEP)?;
-        set_private_file_permissions(&file)?;
+        deadline::set_permissions(&path, "reopen source lock permissions were set", || {
+            set_private_file_permissions(&file)
+        })?;
         Ok(Self { _file: file })
     }
 }

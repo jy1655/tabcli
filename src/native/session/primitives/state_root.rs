@@ -36,8 +36,8 @@ pub(in crate::native) struct StateRootDurabilityReceipt {
 /// are idempotent. The receipt is written through [`write_json_atomic`], which also syncs
 /// the root, only after the walk succeeded.
 ///
-/// Returns the walk's failure, if any, for the session's launch status: a missing receipt
-/// never blocks creation, and the receipt stays absent so the next creation walks again.
+/// Expiry during the walk ends creation. Other walk failures are returned for the launch
+/// status and leave the receipt absent so the next creation walks again.
 pub(in crate::native) fn create_state_root(
     root: &Path,
     durable_directories: &[PathBuf],
@@ -65,18 +65,19 @@ pub(in crate::native) fn create_state_root(
         // A concurrent creator may win the race; the ancestry walk below covers its
         // entries and this creator's alike.
         deadline::before("creating state directories")?;
-        if let Err(error) = fs::create_dir(directory)
-            && !directory.is_dir()
-        {
-            return Err(error).with_context(|| {
-                format!("failed to create state directory {}", directory.display())
-            });
+        match fs::create_dir(directory) {
+            Ok(()) => deadline::wrote("state directories were created"),
+            Err(_) if directory.is_dir() => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create state directory {}", directory.display())
+                });
+            }
         }
-        deadline::wrote("state directories were prepared");
     }
-    deadline::before("setting state root permissions")?;
-    set_private_directory_permissions(root)?;
-    deadline::wrote("state root permissions were set");
+    deadline::set_permissions(root, "state root permissions were set", || {
+        set_private_directory_permissions(root)
+    })?;
     if state_root_durability_receipt_present(root) {
         return Ok(None);
     }
@@ -265,18 +266,43 @@ mod request_deadline_tests {
 
     #[cfg(unix)]
     #[test]
-    fn request_deadline_state_root_mode_is_preserved() {
+    fn request_deadline_existing_state_root_is_made_private() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
-        let result = deadline::expire_at("setting state root permissions", || {
+        let result = deadline::during(std::time::Instant::now(), || {
             create_state_root(root.path(), &[])
         });
         assert_eq!(
             fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
-            0o750
+            0o700
         );
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("syncing state root ancestry"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("state root permissions were set"),
+            "{error:#}"
+        );
+        assert!(!state_root_durability_receipt_present(root.path()));
+    }
+
+    #[test]
+    fn request_deadline_existing_private_root_reports_no_change() {
+        let root = tempfile::tempdir().unwrap();
+        create_state_root(root.path(), &[]).unwrap();
+        let error = deadline::expire_at("creating the Session directory", || {
+            create_directory(root.path(), &[])
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the request's deadline passed before creating the Session directory; no Session was created"
+        );
     }
 
     #[test]

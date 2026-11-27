@@ -109,7 +109,7 @@ fn pre_creation_refusal_releases_the_marker_after_the_competing_holder() {
     drop(lock);
     let error = worker.join().unwrap();
     assert!(
-        error
+        !error
             .to_string()
             .contains("the source was reserved for reopen"),
         "{error:#}"
@@ -165,6 +165,8 @@ fn request_deadline_marker_is_absent() {
         Some(REOPEN_TEST_CONVERSATION),
         true,
     );
+    fs::remove_file(directory.join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE))
+        .unwrap();
     let result = session_start::deadline::expire_at("writing the reopen marker", || {
         Reservation::claim(&directory, id, REOPEN_TEST_CONVERSATION)
     });
@@ -172,7 +174,11 @@ fn request_deadline_marker_is_absent() {
         !directory.join(REOPEN_MARKER_FILE).exists(),
         "marker was written"
     );
-    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("source lock file was created"),
+        "{error:#}"
+    );
 }
 
 #[test]

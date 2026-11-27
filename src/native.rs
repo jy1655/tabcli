@@ -513,8 +513,8 @@ fn create_session_within(
     Store::open_unchecked(&directory)
         .record(CoreRecord::InitialPrompt)
         .write_private(spec.prompt.as_bytes())?;
-    // An ancestry sync failure never blocks the session: the root lacks its receipt, so
-    // the next creation repeats the walk, and the launch status records what failed.
+    // Deadline expiry during ancestry sync already ended creation. Other sync failures
+    // reach the launch status and leave the receipt absent for the next creation.
     update_status(&directory, SessionState::Launching, None, ancestry_error)?;
     Ok(CreatedSession {
         id,

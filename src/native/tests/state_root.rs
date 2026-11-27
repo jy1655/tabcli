@@ -399,7 +399,7 @@ fn the_ancestry_walk_is_bounded() {
 }
 
 #[test]
-fn an_ancestry_sync_failure_never_blocks_session_creation_and_leaves_no_receipt() {
+fn an_ancestry_sync_io_failure_allows_session_creation_and_leaves_no_receipt() {
     let nested = NestedStateRoot::new();
     let (outcome, log) =
         with_sync_failure(nested.base.path(), || with_sync_log(|| nested.create()));

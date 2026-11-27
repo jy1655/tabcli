@@ -1779,9 +1779,9 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
     assert_no_sessions();
 }
 
-// A caller check that consumes the preparation budget leaves the shared consent store untouched.
+// Expiry at workspace resolution leaves the shared consent store untouched.
 #[test]
-fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
+fn an_expired_request_refuses_at_the_workspace_and_writes_no_consent() {
     use crate::native::failure_kind::{FailureKind, classify};
     use crate::native::session::primitives::STATE_DIR_ENV;
     use std::process::Command;
@@ -1817,7 +1817,7 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
         #[cfg(unix)]
         path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
         let test_name = format!(
-            "{}::a_caller_check_that_ends_after_the_deadline_writes_nothing",
+            "{}::an_expired_request_refuses_at_the_workspace_and_writes_no_consent",
             module_path!()
                 .split_once("::")
                 .map_or(module_path!(), |(_, rest)| rest)
@@ -2120,5 +2120,38 @@ fn create_logs_the_herdr_refusal_only_for_an_automatic_fallback() {
             .filter(|message| message.starts_with("Herdr was not used for this launch"))
             .collect();
         assert_eq!(notes, note.as_slice(), "{log}");
+    }
+}
+
+#[test]
+fn request_deadline_consumed_by_caller_verification_is_a_timeout() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    for provider in [
+        None,
+        Some(FirstPartyCli::Claude),
+        Some(FirstPartyCli::Codex),
+    ] {
+        if cfg!(windows) && provider == Some(FirstPartyCli::Codex) {
+            continue;
+        }
+        let error = deadline::during(Instant::now() + Duration::from_secs(60), || {
+            check_caller(
+                terminal::Selection::Herdr {
+                    fallback: platform_fallback(),
+                },
+                provider,
+                |_| {
+                    deadline::spend();
+                    bail!("Run inside Herdr")
+                },
+            )
+        })
+        .err()
+        .expect("caller exhausted request budget");
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+        assert_eq!(
+            error.to_string(),
+            "the request's deadline passed before checking the Herdr caller; no Session was created"
+        );
     }
 }

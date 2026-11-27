@@ -42,7 +42,7 @@ pub(super) struct Resolved {
     initial_transport: Box<dyn delivery::Transport>,
     context_sources: Vec<requests::ContextSource>,
     // Assessed by resolve, from the path its Resolution names (ask: the requested path,
-    // aliases included; reopen: the canonical one), before anything is created; recorded
+    // aliases included; reopen: the canonical one), before Session creation; recorded
     // with the session once it exists. None records nothing.
     consent: Option<consent::Assessment>,
 }
@@ -338,8 +338,8 @@ pub(super) fn resolve_with(
 }
 
 fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
-    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
-    // or delivery exists, so a failed resolution changes nothing.
+    // Resolve attachments before Session creation. Subsequent workspace consent assessment may
+    // update shared records even if the start is refused.
     let attached = context::resolve(&request.context_results)?;
     let (surface, caller) = choose_launch_surface(request.terminal, Some(request.provider))?;
     resolve(
@@ -377,7 +377,8 @@ pub(super) enum CallerCheck {
 // the version (Claude, Agy, Pi); for `reopen`, which does not know its provider before it
 // reads its source, always, as in 0.4.49 (every provider that supports reopen runs on Herdr,
 // so no reopen that would take the fallback is refused). Where the version decides (Codex off
-// Windows), the outcome is kept for `resolve_with`. A provider that takes its fallback at
+// Windows), the outcome is kept for `resolve_with` only while the request has time left.
+// A provider that takes its fallback at
 // every version is not checked. `resolve` then decides with the provider, before the
 // workspace (`choose_before_probe`) and again with the probed version (`admit_choice`).
 pub(super) fn choose_launch_surface(
@@ -400,27 +401,23 @@ pub(super) fn check_caller(
     if !matches!(selection, terminal::Selection::Herdr { .. }) {
         return Ok(CallerCheck::NotNeeded);
     }
-    Ok(
-        match provider.map(|provider| choose_before_probe(provider, selection)) {
-            None => {
-                verify(selection)?;
-                CallerCheck::Passed
-            }
-            Some(early) => match early? {
-                EarlyChoice::Known(admitted) if admitted.kind != terminal::TerminalKind::Herdr => {
-                    CallerCheck::NotNeeded
-                }
-                EarlyChoice::Known(_) => {
-                    verify(selection)?;
-                    CallerCheck::Passed
-                }
-                EarlyChoice::ByVersion { .. } => match verify(selection) {
-                    Ok(()) => CallerCheck::Passed,
-                    Err(error) => CallerCheck::Failed(error),
-                },
-            },
-        },
-    )
+    let version_decides = match provider
+        .map(|p| choose_before_probe(p, selection))
+        .transpose()?
+    {
+        Some(EarlyChoice::Known(admitted)) if admitted.kind != terminal::TerminalKind::Herdr => {
+            return Ok(CallerCheck::NotNeeded);
+        }
+        Some(EarlyChoice::ByVersion { .. }) => true,
+        _ => false,
+    };
+    let outcome = verify(selection);
+    deadline::before("checking the Herdr caller")?;
+    match outcome {
+        Ok(()) => Ok(CallerCheck::Passed),
+        Err(error) if version_decides => Ok(CallerCheck::Failed(error)),
+        Err(error) => Err(error),
+    }
 }
 
 // The Surface a selection gives a provider, and the initial Transport its adapter selected
