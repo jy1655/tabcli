@@ -1741,3 +1741,73 @@ fn a_native_origin_keeps_its_owner_verdict_while_close_claims_or_marks_its_surfa
         ]
     );
 }
+
+#[test]
+fn a_busy_first_surface_read_leaves_the_origin_verdict_to_the_other_records() {
+    use crate::native::terminal::TerminalKind::{Herdr, Tmux, WindowsConsole};
+
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-origin";
+    let origin = Session::new(root.path(), id, "ready");
+    origin.owner(Some(id), 7);
+    let child = Session::started_from(root.path(), "session-child", "ready", id);
+    let mut environment = Environment::new();
+    let reference = read(&mut environment, &child);
+    for slot in [CoreRecord::Terminal, CoreRecord::TerminalClosed] {
+        for (other_kind, exited) in [
+            (Herdr, false),
+            (Herdr, true),
+            (Tmux, false),
+            (WindowsConsole, false),
+        ] {
+            let (active, marker) = match slot {
+                CoreRecord::Terminal => (Herdr, other_kind),
+                _ => (other_kind, Herdr),
+            };
+            write(
+                &origin.record(CoreRecord::Terminal),
+                &json!({"terminal":active,"session_id":"surface","managed_session_id":id}),
+            );
+            write(
+                &origin.record(CoreRecord::TerminalClosed),
+                &json!({"consumed":true,"terminal":marker}),
+            );
+            // Without a managed terminal platform the origin reader classifies no copies.
+            let copy =
+                Herdr.supported_on_this_platform() && !other_kind.supported_on_this_platform();
+            environment.attest(move |_| {
+                assert!(!copy, "local attestation of a copied origin");
+                attestation(
+                    if exited {
+                        ProcessObservation::Gone(Gone::Exited)
+                    } else {
+                        ProcessObservation::Live(Attested::PidOnly)
+                    },
+                    ControlAttestation::NotRecorded,
+                )
+            });
+            let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+            budget.busy_once = Some(origin.record(slot));
+            let answer = observe(
+                root.path(),
+                reference.clone(),
+                &mut budget,
+                &mut environment.origin(),
+            );
+            assert_eq!(budget.busy_once, None);
+            let expected = if copy {
+                ("owner_unverified", None)
+            } else if exited {
+                ("owner_exited", Some(true))
+            } else {
+                ("owner_live", Some(false))
+            };
+            assert_eq!(
+                (answer.reason.as_str(), answer.ended),
+                expected,
+                "busy {}, other {other_kind:?}, exited {exited}",
+                slot.name()
+            );
+        }
+    }
+}

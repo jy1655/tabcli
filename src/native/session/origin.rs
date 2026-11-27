@@ -108,6 +108,8 @@ pub(in crate::native) struct ReadBudget {
     deadline: Instant,
     remaining: u64,
     exhausted: Option<Exhaustion>,
+    #[cfg(test)]
+    busy_once: Option<std::path::PathBuf>,
 }
 
 impl ReadBudget {
@@ -116,6 +118,8 @@ impl ReadBudget {
             deadline,
             remaining: bytes,
             exhausted: None,
+            #[cfg(test)]
+            busy_once: None,
         }
     }
 
@@ -158,7 +162,18 @@ impl ReadBudget {
             return Err(self.exhaust(Exhaustion::Bytes));
         }
         let limit = record_limit.min(self.remaining);
-        let outcome = match record.timeline(limit) {
+        let read = record.timeline(limit);
+        #[cfg(test)]
+        let read = if self
+            .busy_once
+            .take_if(|path| path == record.path())
+            .is_some()
+        {
+            Err(SnapshotBusy.into())
+        } else {
+            read
+        };
+        let outcome = match read {
             Ok(None) => Ok(None),
             Ok(Some(bytes)) => {
                 self.remaining -= bytes.len() as u64;
