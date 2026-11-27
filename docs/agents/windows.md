@@ -5,10 +5,9 @@
 - The seven surface operations on Windows (open, send, screen, guarded key, verify, close and
   presence) resolve their adapter through one lookup (`windows/dispatch.rs`), as `posix.rs`
   does on macOS and Linux: the Herdr adapter for a Herdr terminal, and `ManagedConsole`
-  (`windows/mod.rs`) for every other kind. Screen and guarded key first answer with the kind's
-  declared refusal, if it has one. A handle of a kind Windows does not run stays with the
-  managed console, whose open refuses the kind and whose helper refuses the handle; refusing
-  it in the lookup would change what such a handle reports and is not decided. Give a new
+  (`windows/mod.rs`) for a managed console. Screen and guarded key first answer with the kind's
+  declared refusal, if it has one. See [Stored terminal handles](../terminals.md#stored-terminal-handles)
+  for other kinds. Give a new
   Windows surface its own adapter in that lookup; do not branch one of these operations on the
   kind. `attach_command` and `admit_selection` still check kinds outside those operations.
   Dead-owner Repair decides whether it needs a close transaction in

@@ -603,8 +603,10 @@ fn context_mode_arguments_are_validated_before_any_session_is_read() {
     assert_eq!(fixture.files(), before);
 }
 
-// Exercise real ask preparation and receipt publication without a terminal or model:
-// the unsupported Windows surface refuses launch on macOS after preparation.
+// Exercise real ask preparation and receipt publication without a terminal or model: an
+// explicit Herdr whose core socket (`HC_SOCKET`) is a relative path refuses the launch after
+// preparation, when the adapter resolves the endpoint and before it connects to any core.
+// Herdr requires Codex 0.169.0 or newer.
 #[cfg(target_os = "macos")]
 fn prepare_attachment(fixture: &Fixture, mode: Option<&str>) -> (String, Value, String) {
     use std::os::unix::fs::PermissionsExt;
@@ -613,7 +615,7 @@ fn prepare_attachment(fixture: &Fixture, mode: Option<&str>) -> (String, Value, 
     let provider = bin.join("codex");
     fs::write(
         &provider,
-        "#!/bin/sh\n[ \"$1\" = --version ] || exit 99\nprintf 'codex-cli 0.163.0\\n'\n",
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 99\nprintf 'codex-cli 0.169.0\\n'\n",
     )
     .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -627,7 +629,7 @@ fn prepare_attachment(fixture: &Fixture, mode: Option<&str>) -> (String, Value, 
         "--context-result",
         "session-source/request-done",
         "--terminal",
-        "windows-console",
+        "herdr",
         "--json",
     ];
     if let Some(mode) = mode {
@@ -637,13 +639,17 @@ fn prepare_attachment(fixture: &Fixture, mode: Option<&str>) -> (String, Value, 
         .args(args)
         .env("PATH", &bin)
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
+        .env("HC_SOCKET", "relative-herdr-core.sock")
+        .env_remove("HC_SESSION")
+        .env_remove("HC_TERMINAL_ID")
         .env_remove("AGENT_BRIDGE_NATIVE_SESSION_ID")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("Windows Console is only available on Windows"),
+        stderr(&output)
+            .contains("the Herdr Core socket relative-herdr-core.sock is not an absolute path"),
         "{}",
         stderr(&output)
     );

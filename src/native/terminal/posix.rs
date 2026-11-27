@@ -111,7 +111,8 @@ pub(in crate::native::terminal) trait PosixTerminalAdapter {
 }
 
 /// The adapter of a kind. Every shared operation resolves its adapter here and nowhere
-/// else; production passes `&INSTALLED`, a test a `Dispatch` over its own adapters.
+/// else; production passes `&INSTALLED`, a test a `Dispatch` over its own adapters. The
+/// installed lookup answers a kind its OS does not run with `OsTerminals::unavailable`.
 pub(in crate::native::terminal) trait Adapters {
     fn adapter(&self, kind: TerminalKind) -> Result<&dyn PosixTerminalAdapter>;
 }
@@ -129,6 +130,9 @@ where
     F: FnOnce(&mut TerminalSession) -> Result<()>,
     U: FnOnce() -> Result<()>,
 {
+    // The lookup answers first, so that a kind this OS does not run is refused before the
+    // creation setting is read, as on the other OSes.
+    let adapter = adapters.adapter(kind)?;
     // Read once for creation. Close uses only the persisted target/ownership record,
     // never a setting that the user may have changed since this launch.
     #[cfg(target_os = "macos")]
@@ -137,7 +141,7 @@ where
             .parent()
             .context("session directory has no state root")?,
     )?;
-    adapters.adapter(kind)?.open_bound_tab(
+    adapter.open_bound_tab(
         #[cfg(target_os = "macos")]
         mode,
         command,

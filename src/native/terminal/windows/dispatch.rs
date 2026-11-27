@@ -1,11 +1,15 @@
 //! The seven Windows surface operations (open, send, screen, guarded key, verify, close and
 //! presence). Screen and guarded key first read the kind's declared refusal; then every
-//! operation resolves its adapter through one lookup (`Adapters::adapter`): Herdr, or the
-//! managed console for every other kind. macOS and Linux do the same through `posix.rs`.
+//! operation resolves its adapter through one lookup (`Adapters::adapter`): the managed
+//! console or Herdr, and for every other kind the refusal that each OS gives a kind it does
+//! not run (`OsTerminals::unavailable`). macOS and Linux do the same through `posix.rs`.
 //! Compiled into every test build, so that the lookup and the refusals are tested on every
 //! CI target; the installed adapters stay in `windows/mod.rs` (the managed console) and
 //! `herdr.rs`.
-use super::{CloseOutcome, GuardedDialogInput, TerminalKind, TerminalSendResult, TerminalSession};
+use super::{
+    CloseOutcome, GuardedDialogInput, OsTerminals, TerminalKind, TerminalSendFailure,
+    TerminalSendResult, TerminalSession,
+};
 use anyhow::{Result, bail};
 use std::{
     path::Path,
@@ -17,7 +21,8 @@ pub(in crate::native::terminal) type BindSurface<'a> =
 pub(in crate::native::terminal) type UnbindSurface<'a> = Box<dyn FnOnce() -> Result<()> + 'a>;
 
 pub(in crate::native) trait WindowsTerminalAdapter {
-    /// `kind` is the requested launch kind. Each adapter refuses kinds it does not create.
+    /// `kind` is the requested launch kind, which the lookup gave this adapter. Each adapter
+    /// still refuses kinds it does not create.
     fn open_bound_tab(
         &self,
         kind: TerminalKind,
@@ -78,9 +83,10 @@ pub(in crate::native) trait WindowsTerminalAdapter {
 }
 
 /// The adapter of a kind. Every operation resolves its adapter here and nowhere else;
-/// production passes the installed `Dispatch`, a test one over its own adapters.
+/// production passes the installed `Dispatch`, a test one over its own adapters. A kind that
+/// Windows does not run has no adapter.
 pub(in crate::native) trait Adapters {
-    fn adapter(&self, kind: TerminalKind) -> &dyn WindowsTerminalAdapter;
+    fn adapter(&self, kind: TerminalKind) -> Result<&dyn WindowsTerminalAdapter>;
 }
 
 /// The two Windows surfaces: the managed console and a terminal of a Herdr Core.
@@ -96,20 +102,19 @@ impl<C, H> Dispatch<C, H> {
 }
 
 impl<C: WindowsTerminalAdapter, H: WindowsTerminalAdapter> Adapters for Dispatch<C, H> {
-    fn adapter(&self, kind: TerminalKind) -> &dyn WindowsTerminalAdapter {
+    fn adapter(&self, kind: TerminalKind) -> Result<&dyn WindowsTerminalAdapter> {
         match kind {
-            TerminalKind::Herdr => &self.herdr,
-            // A handle of a kind that Windows does not run (a record can name another
-            // platform) stays with the managed console, whose open refuses the kind and
-            // whose helper refuses the handle. Refusing it here instead would change what
-            // those handles report; that is a separate decision.
-            TerminalKind::WindowsConsole
-            | TerminalKind::Iterm2
+            TerminalKind::WindowsConsole => Ok(&self.console),
+            TerminalKind::Herdr => Ok(&self.herdr),
+            // A handle of a kind that Windows does not run (a record can name another OS's
+            // terminal) gets the refusal every OS gives such a kind, as macOS and Linux do;
+            // it never reaches the console helper.
+            TerminalKind::Iterm2
             | TerminalKind::AppleTerminal
             | TerminalKind::Ghostty
             | TerminalKind::Warp
             | TerminalKind::WezTerm
-            | TerminalKind::Tmux => &self.console,
+            | TerminalKind::Tmux => Err(OsTerminals::WINDOWS.unavailable(kind)),
         }
     }
 }
@@ -127,7 +132,7 @@ where
     F: FnOnce(&mut TerminalSession) -> Result<()>,
     U: FnOnce() -> Result<()>,
 {
-    adapters.adapter(kind).open_bound_tab(
+    adapters.adapter(kind)?.open_bound_tab(
         kind,
         command,
         directory,
@@ -143,8 +148,10 @@ pub(in crate::native::terminal) fn send_file(
     prompt_path: &Path,
     deadline: Instant,
 ) -> TerminalSendResult {
+    // Nothing is sent to a kind without an adapter.
     adapters
         .adapter(session.kind)
+        .map_err(TerminalSendFailure::not_sent)?
         .send_file(session, prompt_path, deadline)
 }
 
@@ -158,7 +165,7 @@ pub(in crate::native::terminal) fn read_screen(
         return Err(anyhow::anyhow!(refusal));
     }
     adapters
-        .adapter(session.kind)
+        .adapter(session.kind)?
         .read_screen(session, deadline)
 }
 
@@ -173,7 +180,7 @@ pub(in crate::native::terminal) fn guarded_dialog_input(
         return Err(anyhow::anyhow!(refusal));
     }
     adapters
-        .adapter(session.kind)
+        .adapter(session.kind)?
         .guarded_dialog_input(directory, session, input, deadline)
 }
 
@@ -183,7 +190,7 @@ pub(in crate::native::terminal) fn verify_surface(
     timeout: Option<Duration>,
 ) -> Result<()> {
     adapters
-        .adapter(session.kind)
+        .adapter(session.kind)?
         .verify_surface(session, timeout)
 }
 
@@ -195,7 +202,7 @@ pub(in crate::native) fn close_session_until(
 ) -> Result<CloseOutcome> {
     crate::native::session::close::budget::close_remaining(deadline)?;
     adapters
-        .adapter(session.kind)
+        .adapter(session.kind)?
         .close_session_until(directory, session, deadline)
 }
 
@@ -206,7 +213,7 @@ pub(in crate::native::terminal) fn surface_present(
     timeout: Duration,
 ) -> Result<bool> {
     adapters
-        .adapter(session.kind)
+        .adapter(session.kind)?
         .surface_present(directory, session, timeout)
 }
 
@@ -217,7 +224,7 @@ pub(in crate::native::terminal) fn launch_surface(
     timeout: Duration,
 ) -> Result<super::LaunchSurface> {
     adapters
-        .adapter(session.kind)
+        .adapter(session.kind)?
         .launch_surface(directory, session, timeout)
 }
 
