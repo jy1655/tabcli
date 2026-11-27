@@ -302,11 +302,11 @@ fn surface_probes_are_due_every_second_within_two_seconds_and_the_deadline() {
     assert_eq!(run.sleeps, [100; 35]);
 }
 
-// The case observed on 2026-11-26 (Windows, hc 0.1.21): a launch host that refuses its session
-// directory leaves only its line in the launch log, no Record, and its finished Herdr terminal
-// still reads as present, so the wait ends only at the launch deadline, with the generic
-// timeout. A refusal the launcher can know beforehand no longer reaches the wait; one that
-// only the host can know still ends this way.
+// On 2026-11-26 (Windows, hc 0.1.21), the 0.4.49 host refused its session directory and
+// left only a line in the launch log. Its finished Herdr terminal still appeared present,
+// so the wait reached the launch deadline and returned the generic timeout.
+// The wait never reads the log, so a refusal line from a 0.4.50 or earlier host has no
+// effect. A host that refuses its directory now writes no line.
 #[test]
 fn a_directory_refusal_in_the_log_alone_ends_the_wait_at_the_deadline() {
     let (_dir, store, token) = fixture();
