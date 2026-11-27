@@ -590,6 +590,8 @@ before deciding that the operation never happened.
 | `reopen.marker.json` | Source reservation naming its one reopen |
 | `reopen.refusal.json` | New session's recorded launch-phase reopen refusal |
 
+When close consumes a legacy handle that omits its terminal kind, the consumption marker records `"terminal": null`.
+
 For launch failure details, read `status.json` and `launch.log` alongside `launch.json` and the
 claim. The receipt records spawn phase, not a failed or cancelled state.
 

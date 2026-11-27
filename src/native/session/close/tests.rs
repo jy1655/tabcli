@@ -401,6 +401,134 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     assert_eq!(status.state.as_str(), "closed");
 }
 
+// The adapter still receives the effective legacy kind. The consumption marker describes
+// only the kind supplied by the handle, for maps and positional records alike.
+#[test]
+fn close_records_only_the_kind_stated_in_the_handle() {
+    for (wire, effective, stated) in [
+        (
+            r#"{"terminal":"iterm2","session_id":"s"}"#,
+            "iterm2",
+            Some("iterm2"),
+        ),
+        (
+            r#"["windows-console","s"]"#,
+            "windows-console",
+            Some("windows-console"),
+        ),
+        (
+            r#"["herdr","s",null,null,"managed",null,null,null,null,{"socket":"endpoint","core_id":"core","created_ms":1,"host_pid":2,"host_creation_time":3}]"#,
+            "herdr",
+            Some("herdr"),
+        ),
+        (r#"{"iterm_session_id":"s"}"#, "iterm2", None),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_unchecked(directory.path());
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
+        store
+            .record(CoreRecord::Terminal)
+            .write_private(wire.as_bytes())
+            .unwrap();
+        close(&store, None, budget::close_deadline(), |handle| {
+            assert_eq!(handle.kind.as_str(), effective);
+            Ok(terminal::CloseOutcome::Missing.into())
+        })
+        .unwrap();
+        let marker = store
+            .record(CoreRecord::TerminalClosed)
+            .json_with(super::super::record::terminal_tombstone_value)
+            .unwrap();
+        assert_eq!(marker.get("terminal"), Some(&json!(stated)), "{wire}");
+    }
+}
+
+#[test]
+fn native_marker_commitment_and_reason_keep_their_json_rules() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let mut cases: Vec<(Vec<u8>, bool, Option<&str>)> = [
+        (
+            r#"{"consumed":true,"terminal":"unknown","reason":"accepted"}"#,
+            true,
+            Some("accepted"),
+        ),
+        (
+            r#"{"consumed":false,"reason":"native"}"#,
+            false,
+            Some("native"),
+        ),
+        (r#"{"consumed":true}"#, true, None),
+        (
+            r#"{"consumed":true,"consumed":false,"reason":"first","reason":42}"#,
+            false,
+            None,
+        ),
+        (
+            r#"{"consumed":false,"consumed":true,"reason":42,"reason":"last"}"#,
+            true,
+            Some("last"),
+        ),
+        (
+            r#"{"consumed":true,"terminal":null,"terminal":"tmux"}"#,
+            true,
+            None,
+        ),
+        (
+            r#"{"consumed":true,"terminal":"tmux","terminal":null}"#,
+            true,
+            None,
+        ),
+        (
+            r#"{"consumed":true,"terminal":6,"reason":false}"#,
+            true,
+            None,
+        ),
+        (
+            r#"{"consumed":true,"terminal":"tmux"} trailing"#,
+            false,
+            None,
+        ),
+        (r#"{"reason":"bad""#, false, None),
+        (r#"[{"consumed":true,"reason":"nested"}]"#, false, None),
+        ("42", false, None),
+        ("null", false, None),
+    ]
+    .into_iter()
+    .map(|(text, committed, reason)| (text.as_bytes().to_vec(), committed, reason))
+    .collect();
+    for depth in [126, 127] {
+        let text = format!(
+            r#"{{"consumed":true,"reason":"deep","unknown":{}0{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        cases.push((
+            text.into_bytes(),
+            depth == 126,
+            (depth == 126).then_some("deep"),
+        ));
+    }
+    cases.push((
+        b"{\"consumed\":true,\"unknown\":\"\xff\"}".to_vec(),
+        false,
+        None,
+    ));
+    for (bytes, committed, reason) in cases {
+        fs::write(store.record(CoreRecord::TerminalClosed).path(), &bytes).unwrap();
+        assert_eq!(
+            committed_consumption_marker(&store).unwrap(),
+            committed,
+            "{bytes:?}"
+        );
+        assert_eq!(
+            terminal_consumption_reason(&store).unwrap().as_deref(),
+            reason,
+            "{bytes:?}"
+        );
+    }
+}
+
 #[test]
 fn consumed_handle_tombstone_reads_back_through_its_reader() {
     // A close that consumes a handle records its kind, and on macOS the adapter's reason.

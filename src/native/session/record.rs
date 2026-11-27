@@ -264,20 +264,93 @@ pub(in crate::native) fn terminal_tombstone(text: &str) -> serde_json::Result<Te
     serde_json::from_str(text)
 }
 
-/// Observation and timeline retain the full value, including unknown terminal kinds
-/// and fields. A typed self-test projection must not narrow these readers.
-pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Result<Value> {
-    serde_json::from_str(text)
+/// The native replay accepts the last consumed field. A strict completion additionally
+/// requires unambiguous identity fields; an absent or unrecognized kind supplies no kind.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum Consumption {
+    Incomplete,
+    NativeOnly,
+    Completed(Option<crate::native::terminal::TerminalKind>),
 }
 
-/// Close only asks for a reason. Malformed JSON or a non-string reason means none;
-/// neither a typed terminal kind nor a consumed fact is required by this projection.
-pub(in crate::native) fn terminal_consumption_reason(text: &str) -> Option<String> {
-    terminal_tombstone_value(text)
-        .ok()?
-        .get("reason")?
-        .as_str()
-        .map(str::to_owned)
+pub(super) struct ConsumptionMarker {
+    value: Value,
+    pub(super) consumption: Consumption,
+}
+
+impl ConsumptionMarker {
+    pub(super) fn reason(&self) -> Option<&str> {
+        self.value.get("reason")?.as_str()
+    }
+
+    pub(super) fn committed(&self) -> bool {
+        self.consumption != Consumption::Incomplete
+    }
+}
+
+struct MarkerVisitor;
+
+impl<'de> serde::de::Visitor<'de> for MarkerVisitor {
+    type Value = ConsumptionMarker;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a consumption marker object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::Deserialize;
+        let mut fields = serde_json::Map::new();
+        let mut repeated = false;
+        while let Some((key, value)) = map.next_entry::<String, Value>()? {
+            let identity = matches!(key.as_str(), "consumed" | "terminal");
+            if fields.insert(key, value).is_some() && identity {
+                repeated = true;
+            }
+        }
+        let consumption = if fields.get("consumed") != Some(&Value::Bool(true)) {
+            Consumption::Incomplete
+        } else if repeated {
+            Consumption::NativeOnly
+        } else {
+            match fields.get("terminal") {
+                None | Some(Value::Null) => Consumption::Completed(None),
+                Some(kind @ Value::String(_)) => Consumption::Completed(
+                    crate::native::terminal::TerminalKind::deserialize(kind).ok(),
+                ),
+                Some(_) => Consumption::NativeOnly,
+            }
+        };
+        Ok(ConsumptionMarker {
+            value: Value::Object(fields),
+            consumption,
+        })
+    }
+}
+
+/// Observe top-level duplicates before insertion collapses them. Every member, including
+/// unknown ones, goes through Value's ordinary JSON/depth checks. Other JSON values are
+/// still available to the historical full-value readers and have no commitment or reason.
+pub(super) fn consumption_marker(text: &str) -> serde_json::Result<ConsumptionMarker> {
+    use serde::Deserializer;
+    if text
+        .trim_start_matches([' ', '\t', '\r', '\n'])
+        .starts_with('{')
+    {
+        let mut decoder = serde_json::Deserializer::from_str(text);
+        let marker = decoder.deserialize_map(MarkerVisitor)?;
+        decoder.end()?;
+        Ok(marker)
+    } else {
+        Ok(ConsumptionMarker {
+            value: serde_json::from_str(text)?,
+            consumption: Consumption::Incomplete,
+        })
+    }
+}
+
+/// Observation and timeline retain the full value, including unknown fields and kinds.
+pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Result<Value> {
+    consumption_marker(text).map(|marker| marker.value)
 }
 
 /// Timeline's retained-byte policy, including its historical error contexts: invalid

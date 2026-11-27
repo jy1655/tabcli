@@ -6,14 +6,36 @@ use super::{LinuxBirth, TerminalKind, WezTermMux, WindowsProcessIdentity};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-const fn legacy_iterm2_kind() -> TerminalKind {
-    TerminalKind::Iterm2
+// Most readers need the effective kind; marker publication needs the stated kind.
+trait KindSlot: From<TerminalKind> {
+    fn omitted() -> Self;
+}
+
+impl KindSlot for TerminalKind {
+    fn omitted() -> Self {
+        Self::Iterm2
+    }
+}
+
+impl KindSlot for Option<TerminalKind> {
+    fn omitted() -> Self {
+        None
+    }
+}
+
+fn present_kind<'de, D: Deserializer<'de>, K: KindSlot>(decoder: D) -> Result<K, D::Error> {
+    TerminalKind::deserialize(decoder).map(K::from)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(in crate::native) struct TerminalSession {
-    #[serde(default = "legacy_iterm2_kind", rename = "terminal")]
-    pub(in crate::native) kind: TerminalKind,
+pub(in crate::native) struct TerminalSession<K = TerminalKind> {
+    #[serde(
+        rename = "terminal",
+        default = "K::omitted",
+        deserialize_with = "present_kind",
+        bound(deserialize = "K: KindSlot")
+    )]
+    pub(in crate::native) kind: K,
     #[serde(alias = "iterm_session_id", rename = "session_id")]
     pub(in crate::native) id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +143,29 @@ pub(in crate::native) struct LinuxHostIdentity {
 }
 
 impl TerminalSession {
+    /// The same flat schema for maps and positional records. Provenance travels beside
+    /// the effective handle and cannot change its equality or serialization.
+    pub(in crate::native) fn decode_with_stated_kind(
+        text: &str,
+    ) -> serde_json::Result<(Self, Option<TerminalKind>)> {
+        let wire: TerminalSession<Option<TerminalKind>> = serde_json::from_str(text)?;
+        let kind = wire.kind;
+        let handle = Self {
+            kind: kind.unwrap_or_else(TerminalKind::omitted),
+            id: wire.id,
+            tab_id: wire.tab_id,
+            window_id: wire.window_id,
+            managed_session_id: wire.managed_session_id,
+            windows_process_identity: wire.windows_process_identity,
+            wezterm_mux: wire.wezterm_mux,
+            linux_host: wire.linux_host,
+            tmux_socket: wire.tmux_socket,
+            herdr_core: wire.herdr_core,
+            herdr_launch_nonce: wire.herdr_launch_nonce,
+        };
+        Ok((handle, kind))
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
     pub(in crate::native) fn new(kind: TerminalKind, id: String) -> Self {
         Self {
@@ -403,6 +448,39 @@ mod tests {
         assert!(serde_json::from_value::<TerminalSession>(mixed).is_err());
         let wrong = surface(json!({"host_creation_time": "1"}));
         assert!(serde_json::from_value::<TerminalSession>(wrong).is_err());
+    }
+
+    #[test]
+    fn positional_and_named_handles_share_the_first_kind_and_trailing_defaults() {
+        let read = |wire| serde_json::from_str::<TerminalSession>(wire);
+        let named = read(r#"{"terminal":"iterm2","session_id":"pane"}"#).unwrap();
+        assert_eq!(read(r#"{"iterm_session_id":"pane"}"#).unwrap(), named);
+        assert_eq!(read(r#"["iterm2","pane"]"#).unwrap(), named);
+        for wire in [
+            r#"["windows-console","pane",null,null,"managed"]"#,
+            r#"["herdr","t7",null,null,"managed",null,null,null,null,{"socket":"endpoint","core_id":"core","created_ms":1,"host_pid":2,"host_creation_time":3}]"#,
+        ] {
+            let positional = read(wire).unwrap();
+            let named = serde_json::to_value(&positional).unwrap();
+            assert_eq!(
+                named["terminal"],
+                serde_json::from_str::<Value>(wire).unwrap()[0]
+            );
+            assert_eq!(
+                serde_json::from_value::<TerminalSession>(named).unwrap(),
+                positional
+            );
+        }
+        for wire in [
+            r#"{"terminal":"iterm2","session_id":"s","terminal":"tmux"}"#,
+            r#"{"session_id":"s","iterm_session_id":"s"}"#,
+            r#"{"terminal":null,"session_id":"pane"}"#,
+            r#"[null,"pane"]"#,
+            r#"["unknown-kind","pane"]"#,
+            r#"["herdr"]"#,
+        ] {
+            assert!(read(wire).is_err(), "{wire}");
+        }
     }
 
     #[test]
