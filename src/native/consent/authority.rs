@@ -148,7 +148,7 @@ fn authority_for(
     }
     let main = assessment.repository_root.as_ref().map(|root| &root.path);
     for path in std::iter::once(&workspace).chain(main) {
-        match provider::workspace_trust(target, path, env, None) {
+        match target_trust(target, path, env) {
             Ok(Trust::Declined) => {
                 return Ok((
                     Authority::refused(
@@ -188,6 +188,19 @@ fn authority_for(
         },
         Some(assessment.identity),
     ))
+}
+
+// A target with no entry can receive consent from another provider.
+fn target_trust(target: FirstPartyCli, path: &Path, env: &Environment) -> Result<Trust> {
+    let trust = provider::workspace_trust(target, path, env, None)?;
+    if trust == Trust::Absent {
+        match target {
+            FirstPartyCli::Claude => provider::claude::require_exact_claude_trust_scope(path)?,
+            // These targets need no Git scope check to apply TAB's workspace consent.
+            FirstPartyCli::Codex | FirstPartyCli::Agy | FirstPartyCli::Pi => {}
+        }
+    }
+    Ok(trust)
 }
 
 /// The authority as a yes or no, for an adapter that applies consent through its own launch

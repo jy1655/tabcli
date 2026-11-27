@@ -33,8 +33,20 @@ pub(super) fn workspace_trust(
     env: &consent::Environment,
     store: Option<&Path>,
 ) -> Result<Trust> {
-    require_exact_claude_trust_scope(workspace)?;
-    store_trust(workspace, env, store)
+    workspace_trust_with(workspace, env, store, &mut ProcessGitScope)
+}
+
+fn workspace_trust_with(
+    workspace: &Path,
+    env: &consent::Environment,
+    store: Option<&Path>,
+    git: &mut impl GitScope,
+) -> Result<Trust> {
+    let trust = store_trust(workspace, env, store)?;
+    if matches!(trust, Trust::Trusted(_)) {
+        require_exact_scope_with(workspace, git)?;
+    }
+    Ok(trust)
 }
 
 // What Claude's own store says of exactly `workspace`, from the store alone: unlike
@@ -251,7 +263,7 @@ pub(super) fn git_workspace_command(workspace: &Path) -> Result<std::process::Co
     Ok(command)
 }
 
-pub(super) fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
+pub(in crate::native) fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
     require_exact_scope_with(workspace, &mut ProcessGitScope)
 }
 
@@ -273,7 +285,15 @@ impl GitScope for ProcessGitScope {
 
 fn require_exact_scope_with(workspace: &Path, git: &mut impl GitScope) -> Result<()> {
     // Claude saves Git-subdirectory approval at the root; exact child consent cannot authorize it.
-    // Let Git resolve worktrees/nested roots; failed lookup leaves Claude's dialog untouched.
+    // A local .git file or directory marks this folder as its own top level.
+    match std::fs::symlink_metadata(workspace.join(".git")) {
+        Ok(entry) if entry.is_file() || entry.is_dir() => return Ok(()),
+        Ok(_) => {
+            bail!("cannot verify Claude's Git workspace trust scope; use its own trust dialog")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut has_git_ancestor = false;
     for parent in workspace.ancestors().skip(1) {
         if parent.join(".git").try_exists()? {

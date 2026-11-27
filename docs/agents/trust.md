@@ -40,6 +40,10 @@
   Codex's configuration, from Git, or from a screen that merely lacks the dialog's
   words: an empty screen is not evidence, and a wrong inference pastes an Enter onto
   "Trust and continue".
+- Claude's trust store supplies an exact source only for an accepted workspace entry whose
+  scope TAB then verifies. Granting another provider's consent to Claude also requires exact
+  scope. A launch folder with its own `.git` file or directory is its own top level for both
+  checks, without a Git process.
 - When acquiring a source, TAB considers inheritance only if no provider trusts the workspace exactly
   (`exact_trust_comes_first_and_consent_extends_to_no_child_or_parent`).
 - A linked worktree can inherit the consent of its main working tree when Git's registration

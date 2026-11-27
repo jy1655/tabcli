@@ -264,7 +264,25 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
     };
     let child_screen = screen.replace(&key, &child_key);
     assert_eq!(trust::dialog_key(&child_screen, &child, false), None);
-    assert!(ADAPTER.workspace_trust(&child, &env, None).is_err());
+    assert_eq!(
+        ADAPTER.workspace_trust(&child, &env, None).unwrap(),
+        Trust::Absent
+    );
+    crate::native::session::primitives::write_json_atomic(
+        &store,
+        &serde_json::json!({"projects": {
+            &key: {"hasTrustDialogAccepted": true},
+            &child_key: {"hasTrustDialogAccepted": true}
+        }}),
+    )
+    .unwrap();
+    assert_eq!(
+        ADAPTER
+            .workspace_trust(&child, &env, None)
+            .unwrap_err()
+            .to_string(),
+        "Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog"
+    );
     assert!(matches!(
         ADAPTER.workspace_trust(&workspace, &env, None).unwrap(),
         Trust::Trusted(_)
@@ -1771,9 +1789,8 @@ fn resume_plan_is_the_complete_command_for_every_policy() {
     }
 }
 
-// Consent's worktree screen asks only Claude's store. Claude's full lookup first probes `.git` in
-// the path's ancestors and runs Git there, which fails for this path; the store-only answer
-// touches neither the path nor its ancestors and is the store's exact, positive decision.
+// The worktree screen reads Claude's exact entry even when the listed folder's scope
+// cannot be verified.
 #[test]
 fn the_store_only_answer_reads_the_store_alone() {
     use super::super::super::consent;
@@ -1808,10 +1825,11 @@ fn the_store_only_answer_reads_the_store_alone() {
             expected,
             "{accepted}"
         );
-        assert!(
-            ADAPTER
-                .workspace_trust(&fixture.path, &fixture.env, None)
-                .is_err()
-        );
+        let trust = ADAPTER.workspace_trust(&fixture.path, &fixture.env, None);
+        if expected {
+            assert!(trust.is_err());
+        } else {
+            assert_eq!(trust.unwrap(), consent::Trust::Absent);
+        }
     }
 }

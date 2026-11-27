@@ -2,7 +2,7 @@
 // consent of its repository's main working tree, derived again at every assessment.
 use super::super::store::native_key;
 use super::super::tests::{Fixture, session, setup, trust_pi};
-use super::super::worktree::tests::{Registered, git_path, registered};
+use super::super::worktree::tests::{Git, Registered, git_path, registered};
 use super::tests::{PROVIDERS, replace_store, store_of, trust};
 use super::*;
 use crate::native::session::primitives::write_json_atomic;
@@ -625,13 +625,38 @@ fn a_main_working_tree_that_only_claude_trusts_still_gives_inheritance() {
     );
 }
 
-// The screen is a necessary condition only, never consent. Claude's store lists the main working
-// tree, but Claude's own reader refuses it as an exact folder: a repository above it makes the
-// reader ask Git, which cannot read this repository's format. The worktree inherits nothing and
-// nothing is recorded for the main working tree; once the reader accepts it, the same store
-// gives inheritance.
+// The registration passes the store screen. If the main tree loses its .git directory
+// before the full reader checks it, Claude's scope becomes the enclosing repository.
 #[test]
 fn a_main_working_tree_that_a_store_lists_but_its_reader_refuses_gives_nothing() {
+    let (temp, fixture, git) = worktree_setup();
+    let root = temp.path().canonicalize().unwrap();
+    Git::new().run(&["init", "--quiet", &git_path(&root)]);
+    trust(&fixture, FirstPartyCli::Claude, &git.repository);
+    after_main_identified(|main| fs::rename(main.join(".git"), main.join("saved-git")).unwrap());
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(assessment.state, "unverified");
+    assert_eq!(assessment.repository_root, None);
+    assert!(!record_path(temp.path(), &git.repository).exists());
+    assert_eq!(
+        provider::workspace_trust(FirstPartyCli::Claude, &git.repository, &fixture.env, None)
+            .unwrap_err()
+            .to_string(),
+        "Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog"
+    );
+    fs::rename(
+        git.repository.join("saved-git"),
+        git.repository.join(".git"),
+    )
+    .unwrap();
+    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert_eq!(assessment.detail, INHERITED_DETAIL);
+    assert!(record_path(temp.path(), &git.repository).exists());
+}
+
+#[test]
+fn a_listed_nested_main_working_tree_supplies_consent_at_its_own_git_directory() {
     let (temp, fixture, git) = worktree_setup();
     let root = temp.path().canonicalize().unwrap();
     trust(&fixture, FirstPartyCli::Claude, &git.repository);
@@ -640,19 +665,17 @@ fn a_main_working_tree_that_a_store_lists_but_its_reader_refuses_gives_nothing()
     text.push_str("[core]\n\trepositoryformatversion = 99\n");
     fs::write(&config, text).unwrap();
     fs::create_dir(root.join(".git")).unwrap();
-    assert!(
-        provider::workspace_trust(FirstPartyCli::Claude, &git.repository, &fixture.env, None)
-            .is_err()
-    );
-    let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
-    assert_eq!(assessment.state, "unverified");
-    assert_eq!(assessment.repository_root, None);
-    assert!(!record_path(temp.path(), &git.repository).exists());
-    fs::remove_dir(root.join(".git")).unwrap();
     let assessment = assess_with(temp.path(), &git.worktree, &fixture.env).unwrap();
     assert_eq!(assessment.state, "verified");
     assert_eq!(assessment.detail, INHERITED_DETAIL);
-    assert!(record_path(temp.path(), &git.repository).exists());
+    assert_eq!(
+        assessment.source,
+        Some(exact(&fixture, FirstPartyCli::Claude, &git.repository))
+    );
+    assert_eq!(
+        assessment.repository_root,
+        Some(identity(&git.repository).unwrap())
+    );
 }
 
 // A pinned recheck screens the main working tree against the store its pin

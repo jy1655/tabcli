@@ -1,5 +1,9 @@
 # Current Claude Boundary
 
+- TAB reads Claude's workspace entry first and checks its Git scope only for an accepted entry.
+  A prospective Claude grant from another provider and a Claude dialog key also require exact scope.
+  A `.git` file or directory in the launch folder makes that folder its own top level for this
+  check, without running Git or interpreting `core.worktree`.
 - Native Windows workspace approval is a bounded best-effort console fallback, derived
   from Claude Code 2.1.302's 150 ms input guard. The exact full dialog must be observed
   unchanged for one second before one combined Down/Enter response (or Enter when Yes
