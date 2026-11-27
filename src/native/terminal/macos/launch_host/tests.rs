@@ -2,6 +2,7 @@ use super::*;
 use crate::native::clock::FakeClock;
 use crate::native::session::CoreRecord;
 use crate::native::session::primitives::unix_ms;
+use crate::native::session::tests::FIXED_UNIX_MS;
 use crate::native::terminal::macos::{iterm2, wezterm};
 use std::{
     cell::{Cell, RefCell},
@@ -709,10 +710,36 @@ const IDENTITY: host::HostIdentity = host::HostIdentity {
     start_microseconds: 5,
 };
 
+const WALL: u128 = 1_000_000;
+
+struct FixedWall(Option<u128>);
+
+impl Drop for FixedWall {
+    fn drop(&mut self) {
+        FIXED_UNIX_MS.set(self.0);
+    }
+}
+
+// The ordering tests decide which fact fails. Only the test advances the receipt clock.
+fn fixed_pending_launch() -> (FixedWall, tempfile::TempDir, Store, String) {
+    let wall = FixedWall(FIXED_UNIX_MS.replace(Some(WALL)));
+    let (directory, store, token) = launch::test_support::pending_launch(
+        "session-",
+        &std::env::temp_dir(),
+        Duration::from_secs(10),
+    );
+    let mut receipt = launch::read(&store).unwrap().unwrap();
+    receipt.deadline_unix_ms = WALL + 10_000;
+    store
+        .record(CoreRecord::Launch)
+        .write_json(&receipt)
+        .unwrap();
+    (wall, directory, store, token)
+}
+
 // An iTerm2 host admitted for a pending launch, preparing its environment.
-fn admitted(timeout: Duration) -> (tempfile::TempDir, Store, String) {
-    let (directory, store, token) =
-        launch::test_support::pending_launch("session-", &std::env::temp_dir(), timeout);
+fn admitted() -> (FixedWall, tempfile::TempDir, Store, String) {
+    let (wall, directory, store, token) = fixed_pending_launch();
     host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
     host::admit(&store, &token, IDENTITY).unwrap();
     host::advance(
@@ -726,7 +753,7 @@ fn admitted(timeout: Duration) -> (tempfile::TempDir, Store, String) {
         },
     )
     .unwrap();
-    (directory, store, token)
+    (wall, directory, store, token)
 }
 
 fn session_id(store: &Store) -> &str {
@@ -796,7 +823,7 @@ fn launch_log(store: &Store) -> String {
 
 #[test]
 fn capture_failure_is_recorded_while_binding_is_absent() {
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted();
     let (error, trace) = refuse(
         &store,
         &token,
@@ -837,7 +864,7 @@ fn capture_failure_is_recorded_while_binding_is_absent() {
 // A capture that timed out: its failure record's budget is the one `status.error` names.
 #[test]
 fn a_capture_timeout_records_the_budget_that_status_error_names() {
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted();
     let (error, trace) = refuse(
         &store,
         &token,
@@ -865,7 +892,7 @@ fn a_capture_timeout_records_the_budget_that_status_error_names() {
 
 #[test]
 fn binding_failure_is_recorded_while_capture_is_still_running() {
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted();
     bind(&store, TerminalKind::WezTerm);
     // The capture never answers: the refusal comes at the first observation.
     let (error, trace) = refuse(&store, &token, vec![]);
@@ -894,15 +921,7 @@ fn binding_failure_is_recorded_while_capture_is_still_running() {
 
 #[test]
 fn binding_timeout_is_retained_after_receipt_expiry() {
-    struct Wall(Option<u128>);
-    impl Drop for Wall {
-        fn drop(&mut self) {
-            crate::native::session::tests::FIXED_UNIX_MS.set(self.0);
-        }
-    }
-    const WALL: u128 = 1_000_000;
-    let _wall = Wall(crate::native::session::tests::FIXED_UNIX_MS.replace(Some(WALL)));
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted();
     // A receipt that expires 50 ms after the host starts, on the fixed wall clock.
     let mut receipt = launch::read(&store).unwrap().unwrap();
     receipt.deadline_unix_ms = WALL + 50;
@@ -978,7 +997,7 @@ fn the_locked_binding_observation_needs_an_eligible_host_and_a_readable_handle()
         ("failed host", IDENTITY, Binding::Unavailable),
         ("another incarnation", other, Binding::Unavailable),
     ] {
-        let (_directory, store, token) = admitted(Duration::from_secs(10));
+        let (_wall, _directory, store, token) = admitted();
         match case {
             "another terminal" => bind(&store, TerminalKind::WezTerm),
             "damaged handle" => fs::write(store.record(CoreRecord::Terminal).path(), b"{").unwrap(),
@@ -1100,12 +1119,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
     ];
     let mut failures = Vec::new();
     for (case, changes, caller, expect) in cases {
-        let root = tempfile::tempdir().unwrap();
-        let directory =
-            launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10))
-                .0;
-        let store = Store::open_unchecked(directory.path());
-        let token = launch::read(&store).unwrap().unwrap().claim_token;
+        let (_wall, _directory, store, token) = fixed_pending_launch();
         host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         host::admit(&store, &token, identity).unwrap();
         apply(&store, &changes);
@@ -1119,12 +1133,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
     }
     // A host record that does not name this admitted, unfailed incarnation.
     for case in ["unadmitted", "failed", "damaged"] {
-        let root = tempfile::tempdir().unwrap();
-        let directory =
-            launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10))
-                .0;
-        let store = Store::open_unchecked(directory.path());
-        let token = launch::read(&store).unwrap().unwrap().claim_token;
+        let (_wall, _directory, store, token) = fixed_pending_launch();
         host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         match case {
             "unadmitted" => {}
