@@ -150,7 +150,7 @@ pub(in crate::native::terminal) fn send_file(
 ) -> TerminalSendResult {
     // Nothing is sent to a kind without an adapter.
     adapters
-        .adapter(session.kind)?
+        .adapter(session.kind)
         .map_err(TerminalSendFailure::not_sent)?
         .send_file(session, prompt_path, deadline)
 }
