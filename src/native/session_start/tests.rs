@@ -648,14 +648,7 @@ mod resolution {
                 .env_remove("PI_CODING_AGENT_DIR")
                 .output()
                 .unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                out.status.success()
-                    && stdout.contains("running 1 test")
-                    && stdout.contains("1 passed"),
-                "stdout:\n{stdout}\nstderr:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            crate::native::tests::assert_child_ran_this_test(&out);
             return;
         }
         let root = Reader::state_root().unwrap();
@@ -1483,12 +1476,7 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
 
@@ -2008,12 +1996,7 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
             .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
 
