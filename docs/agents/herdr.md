@@ -74,7 +74,7 @@
   a read showed (an absent directory included): a read that fails otherwise, such as TAB's own
   token denied `READ_CONTROL` or a transient I/O error, refuses nothing, and the host decides
   as in 0.4.49. A refusal is an early decision (below) and settles as a failure to open the
-  Surface (`launch::refused_before_surface`, with `terminal_failed`'s wording). It is detected
+  Surface (`launch::terminal_failure`). It is detected
   at once; returning it can wait for the lifecycle lock up to the launch budget. It is judged
   once, from what was observed: a directory corrected while TAB waits for the lock is not
   examined again, and the remedy is to correct the directory and run the command again. The
@@ -126,8 +126,8 @@
   `close-session` removes the finished terminal (`terminal.rm`). Creation removes a created
   terminal that its last live read finds finished; one that finishes after that read is bound
   and left to this probe.
-- Early launch decisions: the directory refusal before any Surface (every bound host) and the
-  finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
+- Early launch decisions: a failure to open a Surface without a retained handle (including a directory
+  refusal) and the finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
   owner's decision, a different outcome from waiting for the deadline whenever the world
   changes in between; the bar for both (2026-11-26):
   (a) An early decision is taken only from facts read under the lifecycle lock at the moment of
@@ -158,7 +158,7 @@
   finished-terminal probe defers to the ordinary poll, and the refusal returns the original
   refusal; it adds that the Claim is retained only when the budget ran out while another holder
   kept the lock and this launch's Claim is still seen at the path.
-  The fixed reasons are in the failed `status.json` and, on a best-effort basis, in
+  The reasons are in the failed `status.json` and, on a best-effort basis, in
   `launch.log`; `residual_surface()` and the status readers interpret the status. A later
   successful close without a terminal handle writes its closed record and status without that
   error. The returned refusal keeps the directory, the error of a completed finished-terminal

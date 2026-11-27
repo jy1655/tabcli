@@ -790,7 +790,7 @@ fn a_refusal_keeps_the_claim_once_its_launch_budget_is_spent_on_a_held_lock() {
         now: Rc::new(Cell::new(start)),
         sleeps: Vec::new(),
     };
-    let error = refused_before_surface_with(
+    let error = reported_open_failure(
         &store,
         &token,
         anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x"),
@@ -802,7 +802,7 @@ fn a_refusal_keeps_the_claim_once_its_launch_budget_is_spent_on_a_held_lock() {
     assert_eq!(clock.sleeps, [100, 100, 50]);
     assert_eq!(
         format!("{error:#}"),
-        "terminal launch failure handoff: terminal launch failed: the Herdr launch host would refuse the session directory; provider startup is in progress; the claim is retained: the Herdr launch host would refuse the session directory /state/x"
+        "terminal launch failure handoff: the lifecycle lock was held until the launch deadline; the claim is retained: the Herdr launch host would refuse the session directory /state/x"
     );
     let after = store.status().unwrap();
     assert_eq!((after.state, after.error), (before.state, before.error));
@@ -979,7 +979,7 @@ fn a_refusal_never_settles_after_its_launch_budget() {
             }
         },
     };
-    let error = refused_before_surface_with(
+    let error = reported_open_failure(
         &store,
         &token,
         anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x"),
@@ -1080,7 +1080,7 @@ fn the_early_decisions_take_only_an_existing_lock_file() {
             now: Rc::new(Cell::new(start)),
             sleeps: Vec::new(),
         };
-        let error = refused_before_surface_with(
+        let error = reported_open_failure(
             &store,
             &token,
             anyhow::anyhow!("the Herdr launch host would refuse the session directory /state/x"),
@@ -1095,6 +1095,20 @@ fn the_early_decisions_take_only_an_existing_lock_file() {
         );
         unchanged(&store, lock);
     }
+}
+
+fn reported_open_failure(
+    store: &Store,
+    token: &str,
+    refusal: anyhow::Error,
+    recorded: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> anyhow::Error {
+    report_handoff(
+        refusal,
+        settle_open_failure(store, token, recorded, deadline, clock),
+    )
 }
 
 fn refusal() -> anyhow::Error {
@@ -1113,7 +1127,7 @@ fn refuse(store: &Store, token: &str, now: &Rc<Cell<Instant>>, deadline_ms: u64)
     };
     format!(
         "{:#}",
-        refused_before_surface_with(
+        reported_open_failure(
             store,
             token,
             refusal(),
@@ -1382,4 +1396,66 @@ fn the_terminal_surface_presence_reports_an_uninspectable_surface_as_an_error() 
         surface: &surface,
     };
     assert!(presence.present(Duration::from_secs(2)).is_err());
+}
+
+#[test]
+fn open_failure_waits_for_the_shared_reader() {
+    use std::sync::mpsc;
+    let (_dir, store, token) = fixture();
+    let (held, acquired) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let (released, unlocked) = mpsc::channel();
+    let directory = store.directory().to_owned();
+    let reader = std::thread::spawn(move || {
+        let lock = Store::open_unchecked(directory)
+            .lock_shared()
+            .unwrap()
+            .unwrap();
+        held.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(lock);
+        released.send(()).unwrap();
+    });
+    acquired.recv().unwrap();
+    let start = Instant::now();
+    let mut clock = Stepping {
+        start,
+        now: Rc::new(Cell::new(start)),
+        sleeps: vec![],
+        step: |_| {
+            release.send(()).unwrap();
+            unlocked.recv_timeout(Duration::from_secs(10)).unwrap();
+        },
+    };
+    terminal_handoff(
+        &store,
+        &token,
+        &anyhow::anyhow!("fixture open error"),
+        start + START_TIMEOUT,
+        &mut clock,
+    )
+    .unwrap();
+    reader.join().unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Failed);
+    assert!(
+        store
+            .status()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("fixture open error")
+    );
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
+fn open_failure_preserves_a_different_pending_claim() {
+    let (_dir, store, token) = fixture();
+    let _ = terminal_failure(
+        &store,
+        "other-launch",
+        anyhow::anyhow!("fixture open error"),
+        Instant::now() + START_TIMEOUT,
+    );
+    untouched(&store, &token);
 }

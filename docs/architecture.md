@@ -300,7 +300,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   core is reached, without an account), and the Herdr adapter for the core's account on the
   connection that sends `terminal.run` (`refuse_before_core_launch`). It refuses only what it
   read; a read that fails other than by absence leaves the directory to the host. A refusal
-  (`DirectoryRefusal`) is a failure to open the Surface (`launch::refused_before_surface`).
+  (`DirectoryRefusal`) shares the settlement for failures to open a Surface without a retained
+  handle (`launch::terminal_failure`).
   The launcher's wait probes its surface through the adapter's `launch_surface` (by default
   its presence): a Herdr terminal its core reports finished before startup fails the launch
   through the settlement the deadline uses (`finished_before_startup`). Both are early

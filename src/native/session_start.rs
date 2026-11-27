@@ -115,6 +115,7 @@ pub(super) enum Failure<'a> {
     Preparing(anyhow::Error),
     Launch {
         claim: &'a mut turn::Claim,
+        deadline: Instant,
         error: anyhow::Error,
     },
     Delivery {
@@ -150,7 +151,7 @@ impl InitialSource for FreshSource {
                 mark_start_failed(created, &error);
                 error
             }
-            Failure::Launch { claim, error } if !claim.launch_fenced() => {
+            Failure::Launch { claim, error, .. } if !claim.launch_fenced() => {
                 launch::settle_unfenced_start(
                     &Store::open_unchecked(&created.directory),
                     claim,
@@ -629,6 +630,7 @@ impl Start {
                     created,
                     Failure::Launch {
                         claim: &mut initial_claim,
+                        deadline,
                         error,
                     },
                 ));

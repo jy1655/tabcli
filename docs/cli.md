@@ -1933,10 +1933,10 @@ or delivery, and result waiting. Before a Session exists, the deadline bounds th
 Herdr caller check (also limited to ten seconds), the wait for a reopen reservation, and the
 start of each write to workspace consent, the state root, the Session directory and the reopen
 marker, except that state-root preparation makes the root private even if the deadline has passed.
-A write already in progress completes. Once TAB has written a reopen marker, finalizing
-or releasing it can wait past the deadline to bind the child to its source or make the source
-reopenable when creation fails. A timeout while waiting for a result does not cancel delivered
-work. A startup timeout can prevent a provider that has not started from launching. Startup has a
+A write already in progress completes. Once TAB has written a reopen marker, finalizing or releasing
+it, including publishing a child's launch refusal, can wait past the deadline to bind the child
+to its source or make the source reopenable after a failure. A timeout while waiting for a result
+does not cancel delivered work. A startup timeout can prevent a provider that has not started from launching. Startup has a
 separate ceiling of 30 seconds or the remaining command budget, whichever is shorter; increasing
 `--timeout-secs` does not extend that ceiling. Inspect the recorded request before retrying. TAB
 allows one request at a time through a claim, the exclusive right to deliver that turn. If delivery

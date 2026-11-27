@@ -500,7 +500,14 @@ fn launch_failed_waits_for_in_progress_spawn_and_preserves_committed_live_state(
                     attempt.send(()).unwrap();
                 }
             },
-            || fail_reopen_launch(&created, &mut claim, anyhow::anyhow!(FAILURE)),
+            || {
+                fail_reopen_launch(
+                    &created,
+                    &mut claim,
+                    anyhow::anyhow!(FAILURE),
+                    Instant::now() + Duration::from_secs(30),
+                )
+            },
         );
         releaser.join().unwrap();
         let process = worker.join().unwrap();
