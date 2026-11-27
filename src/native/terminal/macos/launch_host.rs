@@ -338,6 +338,8 @@ enum Binding {
     Host,
     /// The bound surface names another surface.
     Other,
+    /// The pending launch reached its receipt's wall-clock deadline.
+    Expired,
     /// This incarnation may no longer act for the launch, or the binding cannot be read.
     Unavailable,
 }
@@ -371,6 +373,7 @@ impl BindingObservation for LockedBinding<'_> {
             Ok(None) => Binding::Absent,
             Ok(Some(true)) => Binding::Host,
             Ok(Some(false)) => Binding::Other,
+            Err(error) if error.is::<host::ReceiptExpired>() => Binding::Expired,
             Err(_) => Binding::Unavailable,
         }
     }
@@ -393,6 +396,9 @@ fn decide(now: Instant, deadline: Instant, ready: bool, binding: impl FnOnce() -
         return Step::Refuse(Refusal::host(host::FailureReason::BindingTimeout));
     }
     match binding() {
+        // Only macOS runs this capture host. Its uptime deadline can still be ahead
+        // when the locked check finds the wall-clock receipt expired after sleep.
+        Binding::Expired => Step::Refuse(Refusal::host(host::FailureReason::BindingTimeout)),
         Binding::Other | Binding::Unavailable => {
             Step::Refuse(Refusal::host(host::FailureReason::BindingMismatch))
         }
