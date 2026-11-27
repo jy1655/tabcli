@@ -145,12 +145,15 @@ pub(in crate::native::terminal) trait Connection {
 /// What the adapter reads from this process and the system.
 pub(in crate::native::terminal) trait Core {
     /// The socket that `hc` would use from this environment.
-    fn endpoint(&self) -> Result<PathBuf>;
+    fn endpoint(&self, deadline: Instant) -> Result<PathBuf>;
     /// A connection to a running core at exactly `socket`; never starts a core.
     fn connect(&self, socket: &Path, deadline: Instant) -> Result<Box<dyn Connection + '_>>;
     fn executable(&self) -> Result<PathBuf>;
     /// The local Herdr caller marker when the terminal environment selects Herdr.
     fn caller_terminal(&self) -> Option<String>;
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
     fn current_pid(&self) -> u32;
     /// What this machine shows of a process's parent.
     fn parent_pid(&self, pid: u32) -> Result<Parent>;
@@ -215,18 +218,78 @@ fn deadline_after(timeout: Duration) -> Result<Instant> {
 
 /// The `socket` setting of an `hc` configuration file: absent when the file does not exist
 /// or does not set it; an error when the file cannot be read or parsed.
-fn read_config_socket(path: &Path) -> Result<Option<String>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "cannot read the Herdr configuration {}; TAB does not guess the core's socket",
-                    path.display()
-                )
-            });
+fn read_config_socket(path: &Path, deadline: Instant) -> Result<Option<String>> {
+    let path = path.to_owned();
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    remaining(deadline)?;
+    // Even a regular file can reside on a stalled filesystem. The worker only reads
+    // the selected config and checks the deadline between reads.
+    std::thread::Builder::new()
+        .spawn(move || {
+            let _ = done.send(read_config(&path, deadline));
+        })
+        .context("failed to spawn the Herdr configuration reader")?;
+    result
+        .recv_timeout(remaining(deadline)?)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                anyhow!("Herdr configuration read timed out")
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                anyhow!("Herdr configuration reader stopped")
+            }
+        })?
+}
+
+fn read_config(path: &Path, deadline: Instant) -> Result<Option<String>> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let read = || -> std::io::Result<Option<String>> {
+        remaining(deadline)?;
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        let mut poll_readable =
+            std::os::unix::fs::FileTypeExt::is_fifo(&file.metadata()?.file_type());
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let _left = remaining(deadline)?;
+            #[cfg(unix)]
+            if poll_readable
+                && !unix::wait_fd(std::os::fd::AsRawFd::as_raw_fd(&file), libc::POLLIN, _left)?
+            {
+                continue;
+            }
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                #[cfg(unix)]
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    poll_readable = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    let Some(text) = read().with_context(|| {
+        format!(
+            "cannot read the Herdr configuration {}; TAB does not guess the core's socket",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(None);
     };
     config_socket(&text).with_context(|| {
         format!(
@@ -475,7 +538,7 @@ fn create(
     startup_deadline: Instant,
     cleanup_deadline: Instant,
 ) -> Result<TerminalSession> {
-    let socket = core.endpoint()?;
+    let socket = core.endpoint(startup_deadline)?;
     let mut linked = link(core, &socket, None, startup_deadline)
         .context("the Herdr terminal was not created")?;
     let argv = host_program(&core.executable()?, directory, command);
@@ -919,6 +982,11 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
     let mut pid = core.current_pid();
     let mut links = 0;
     loop {
+        if core.now() >= deadline {
+            return Ok(unverified(
+                "the deadline passed while TAB read its parent processes".into(),
+            ));
+        }
         if pid == program {
             return Ok(Caller::Verified(address));
         }
@@ -944,7 +1012,10 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
 /// Automatic selection requires a verified caller before creating any Session records.
 fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
     let verify = || {
-        let mut linked = link(core, &core.endpoint()?, None, deadline)?;
+        remaining(deadline)?;
+        let endpoint = core.endpoint(deadline)?;
+        remaining(deadline)?;
+        let mut linked = link(core, &endpoint, None, deadline)?;
         match caller_on(core, &mut linked, deadline)? {
             Caller::Verified(_) => Ok(()),
             Caller::Outside(reason) | Caller::Unverified(reason) => bail!(reason),
@@ -956,7 +1027,10 @@ fn verify_caller(core: &dyn Core, deadline: Instant) -> Result<()> {
 }
 
 pub(in crate::native::terminal) fn verify_caller_terminal() -> Result<()> {
-    verify_caller(&Installed, deadline_after(CALLER_TIMEOUT)?)
+    let limit = deadline_after(CALLER_TIMEOUT)?;
+    let deadline = crate::native::session_start::deadline::current()
+        .map_or(limit, |request| request.min(limit));
+    verify_caller(&Installed, deadline)
 }
 
 /// The launch host's check, registered for Herdr: the bound surface names the terminal that

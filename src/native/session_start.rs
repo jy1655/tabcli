@@ -18,6 +18,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 pub(super) mod admission;
+pub(super) mod deadline;
 mod provider_drift;
 
 pub(super) type ResultExtra = serde_json::Map<String, serde_json::Value>;
@@ -41,7 +42,7 @@ pub(super) struct Resolved {
     initial_transport: Box<dyn delivery::Transport>,
     context_sources: Vec<requests::ContextSource>,
     // Assessed by resolve, from the path its Resolution names (ask: the requested path,
-    // aliases included; reopen: the canonical one), before anything is created; recorded
+    // aliases included; reopen: the canonical one), before Session creation; recorded
     // with the session once it exists. None records nothing.
     consent: Option<consent::Assessment>,
 }
@@ -225,7 +226,7 @@ pub(super) struct Resolution<'a> {
 // (`choose_before_probe`), the canonical workspace directory, state root and launch admission,
 // provider executable and version, version-aware surface admission (which decides an
 // automatic Herdr choice that depends on the version, with the caller check's outcome), title,
-// and workspace consent. Nothing is created, so a failure changes nothing.
+// and workspace consent. The consent assessment may update shared records before a Session exists.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
     resolve_with(resolution, |provider| {
         let provider_path = resolve_provider(provider)?;
@@ -261,6 +262,7 @@ pub(super) fn resolve_with(
     // A surface the provider's adapter cannot run on at all on this platform is refused
     // before anything is resolved or probed.
     let _ = choose_before_probe(provider, surface)?;
+    deadline::before("resolving the workspace")?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -273,6 +275,7 @@ pub(super) fn resolve_with(
             workspace.display()
         );
     }
+    deadline::before("checking launch admission")?;
     let root = Reader::state_root()
         .and_then(|root| admission::check(&root, &workspace).map(|()| root))
         .map_err(admission_refusal)?;
@@ -306,6 +309,7 @@ pub(super) fn resolve_with(
         default_title.render(provider, workspace_name)
     });
     let title = sanitize_title(&requested_title)?;
+    deadline::before("assessing workspace consent")?;
     let consent = consent::assess(
         &root,
         match consent_path {
@@ -334,8 +338,8 @@ pub(super) fn resolve_with(
 }
 
 fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
-    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
-    // or delivery exists, so a failed resolution changes nothing.
+    // Resolve attachments before Session creation. Subsequent workspace consent assessment may
+    // update shared records even if the start is refused.
     let attached = context::resolve(&request.context_results)?;
     let (surface, caller) = choose_launch_surface(request.terminal, Some(request.provider))?;
     resolve(
@@ -373,7 +377,8 @@ pub(super) enum CallerCheck {
 // the version (Claude, Agy, Pi); for `reopen`, which does not know its provider before it
 // reads its source, always, as in 0.4.49 (every provider that supports reopen runs on Herdr,
 // so no reopen that would take the fallback is refused). Where the version decides (Codex off
-// Windows), the outcome is kept for `resolve_with`. A provider that takes its fallback at
+// Windows), the outcome is kept for `resolve_with` only while the request has time left.
+// A provider that takes its fallback at
 // every version is not checked. `resolve` then decides with the provider, before the
 // workspace (`choose_before_probe`) and again with the probed version (`admit_choice`).
 pub(super) fn choose_launch_surface(
@@ -396,27 +401,23 @@ pub(super) fn check_caller(
     if !matches!(selection, terminal::Selection::Herdr { .. }) {
         return Ok(CallerCheck::NotNeeded);
     }
-    Ok(
-        match provider.map(|provider| choose_before_probe(provider, selection)) {
-            None => {
-                verify(selection)?;
-                CallerCheck::Passed
-            }
-            Some(early) => match early? {
-                EarlyChoice::Known(admitted) if admitted.kind != terminal::TerminalKind::Herdr => {
-                    CallerCheck::NotNeeded
-                }
-                EarlyChoice::Known(_) => {
-                    verify(selection)?;
-                    CallerCheck::Passed
-                }
-                EarlyChoice::ByVersion { .. } => match verify(selection) {
-                    Ok(()) => CallerCheck::Passed,
-                    Err(error) => CallerCheck::Failed(error),
-                },
-            },
-        },
-    )
+    let version_decides = match provider
+        .map(|p| choose_before_probe(p, selection))
+        .transpose()?
+    {
+        Some(EarlyChoice::Known(admitted)) if admitted.kind != terminal::TerminalKind::Herdr => {
+            return Ok(CallerCheck::NotNeeded);
+        }
+        Some(EarlyChoice::ByVersion { .. }) => true,
+        _ => false,
+    };
+    let outcome = verify(selection);
+    deadline::before("using the Herdr caller check")?;
+    match outcome {
+        Ok(()) => Ok(CallerCheck::Passed),
+        Err(error) if version_decides => Ok(CallerCheck::Failed(error)),
+        Err(error) => Err(error),
+    }
 }
 
 // The Surface a selection gives a provider, and the initial Transport its adapter selected
@@ -847,9 +848,11 @@ fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
         json: request.json,
     };
     let start = Start::new(options)?;
-    let resolved = resolve_fresh(&request, start.deadline())?;
-    let (prepared, ()) = resolved.create_with(|spec, consent| {
-        create_with_consent(spec, consent).map(|created| (created, ()))
+    let (prepared, ()) = deadline::during(start.deadline(), || {
+        let resolved = resolve_fresh(&request, start.deadline())?;
+        resolved.create_with(|spec, consent| {
+            create_with_consent(spec, consent).map(|created| (created, ()))
+        })
     })?;
     start.run(&prepared, &FreshSource, report)
 }

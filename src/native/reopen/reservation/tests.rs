@@ -61,6 +61,127 @@ fn test_launch_refusal(gate: ReopenGate) -> RecordedReopenRefusal {
 const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
 
 #[test]
+fn pre_creation_refusal_releases_the_marker_after_the_competing_holder() {
+    use std::sync::mpsc;
+
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-precreation";
+    let directory = write_closed_reopen_source(
+        root.path(),
+        id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let source = inspect_reopen_source(&directory, id).unwrap();
+    let worker_directory = directory.clone();
+    let before = snapshot_directory(&directory);
+    let (reserved, wait_reserved) = mpsc::channel();
+    let (held, wait_held) = mpsc::channel();
+    let (rolling_back, wait_rollback) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        use crate::native::session::primitives::close_io_test::{Point, during};
+        during(
+            move |point| {
+                if point == Point::BlockingLock {
+                    rolling_back.send(()).unwrap();
+                }
+            },
+            || {
+                session_start::deadline::expire_at("creating the Session directory", || {
+                    create_reopened_session(&worker_directory, id, &source, || {
+                        reserved.send(()).unwrap();
+                        wait_held.recv().unwrap();
+                        session_start::deadline::before("creating the Session directory")?;
+                        panic!("expired directory allocation")
+                    })
+                })
+            },
+        )
+        .err()
+        .unwrap()
+    });
+
+    wait_reserved.recv().unwrap();
+    let lock = Store::open_unchecked(&directory).lock().unwrap();
+    held.send(()).unwrap();
+    wait_rollback.recv().unwrap();
+    drop(lock);
+    let error = worker.join().unwrap();
+    assert!(
+        !error
+            .to_string()
+            .contains("the source was reserved for reopen"),
+        "{error:#}"
+    );
+    assert_eq!(snapshot_directory(&directory), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    Reservation::claim(&directory, id, REOPEN_TEST_CONVERSATION).unwrap();
+}
+
+#[test]
+fn request_deadline_contended_claim_returns_with_the_lock_still_held() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-contended-source";
+    let directory = write_closed_reopen_source(
+        root.path(),
+        id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let before = snapshot_directory(&directory);
+    let source = inspect_reopen_source(&directory, id).unwrap();
+    let lock = Store::open_unchecked(&directory).lock().unwrap();
+    let worker_directory = directory.clone();
+    let (done, outcome) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let result = session_start::deadline::during(deadline, || {
+            create_reopened_session(&worker_directory, id, &source, || bail!("entered creation"))
+        });
+        done.send(result.err().unwrap()).unwrap();
+    });
+    let refused = outcome.recv_timeout(Duration::from_secs(3));
+    drop(lock);
+    worker.join().unwrap();
+    assert_eq!(snapshot_directory(&directory), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    let error = refused.expect("claim waited past its deadline");
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::TimedOut)
+    );
+}
+
+#[test]
+fn request_deadline_marker_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-expired-marker";
+    let directory = write_closed_reopen_source(
+        root.path(),
+        id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    fs::remove_file(directory.join(crate::native::session::test_support::TURN_CLAIM_LOCK_FILE))
+        .unwrap();
+    let result = session_start::deadline::expire_at("writing the reopen marker", || {
+        Reservation::claim(&directory, id, REOPEN_TEST_CONVERSATION)
+    });
+    assert!(
+        !directory.join(REOPEN_MARKER_FILE).exists(),
+        "marker was written"
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("source lock file was created"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn creation_binds_both_sessions_or_releases_the_source_reservation() {
     for failure in [None, Some("create"), Some("consent"), Some("provenance")] {
         let root = tempfile::tempdir().unwrap();

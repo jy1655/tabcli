@@ -84,9 +84,8 @@
   stores, `reopen` exactly as `ask`: the source session's assessment is diagnostic history
   of another session and is never reused as consent (#202). A start that skipped the
   assessment would leave `authorized` false for good, so the session could not take the
-  guarded dialog answer that a fresh `ask` can. The assessment is part of the resolution,
-  before anything is created, and create records it with the session before anything else
-  binds to that session: a failed assessment consumes nothing, and a record that cannot be
-  written fails the creation, which for a reopen releases the source reservation (found in
-  review, 2026-10-17).
+  guarded dialog answer that a fresh `ask` can. Resolution may update shared consent before
+  Session creation. A failed assessment leaves the reopen source available. Creation records
+  the assessment before binding the Session to its source, and a failure to record it
+  releases the reopen reservation.
 

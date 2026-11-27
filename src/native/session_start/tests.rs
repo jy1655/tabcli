@@ -1779,12 +1779,9 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
     assert_no_sessions();
 }
 
-// A caller check that returns only after the request's deadline is followed, as in 0.4.49, by
-// the version probe, which reads the clock before it starts: the request ends there as timed
-// out and nothing is written, the shared workspace-consent store included. Claude's failed
-// check would refuse at once; Codex's outcome waits for its version (off Windows).
+// Expiry at workspace resolution leaves the shared consent store untouched.
 #[test]
-fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
+fn an_expired_request_refuses_at_the_workspace_and_writes_no_consent() {
     use crate::native::failure_kind::{FailureKind, classify};
     use crate::native::session::primitives::STATE_DIR_ENV;
     use std::process::Command;
@@ -1820,7 +1817,7 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
         #[cfg(unix)]
         path.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
         let test_name = format!(
-            "{}::a_caller_check_that_ends_after_the_deadline_writes_nothing",
+            "{}::an_expired_request_refuses_at_the_workspace_and_writes_no_consent",
             module_path!()
                 .split_once("::")
                 .map_or(module_path!(), |(_, rest)| rest)
@@ -1868,19 +1865,21 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
         providers.push(FirstPartyCli::Codex);
     }
     for provider in providers {
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let caller = check_caller(selection, Some(provider), |_| {
-            std::thread::sleep(Duration::from_millis(200));
-            Ok(())
-        })
-        .unwrap();
+        let caller = check_caller(selection, Some(provider), |_| Ok(())).unwrap();
         let request = ask(provider);
-        let error = resolve(
-            fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
-            deadline,
-        )
+        let deadline = Instant::now();
+        let error = deadline::during(deadline, || {
+            resolve(
+                fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
+                deadline,
+            )
+        })
         .err()
         .expect("the deadline ends the resolution");
+        assert!(
+            error.to_string().contains("resolving the workspace"),
+            "{error:#}"
+        );
         assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
         assert!(
             !root.join("workspace-consent").exists(),
@@ -2121,5 +2120,38 @@ fn create_logs_the_herdr_refusal_only_for_an_automatic_fallback() {
             .filter(|message| message.starts_with("Herdr was not used for this launch"))
             .collect();
         assert_eq!(notes, note.as_slice(), "{log}");
+    }
+}
+
+#[test]
+fn request_deadline_consumed_by_caller_verification_is_a_timeout() {
+    use crate::native::failure_kind::{FailureKind, classify};
+    for provider in [
+        None,
+        Some(FirstPartyCli::Claude),
+        Some(FirstPartyCli::Codex),
+    ] {
+        if cfg!(windows) && provider == Some(FirstPartyCli::Codex) {
+            continue;
+        }
+        let error = deadline::during(Instant::now() + Duration::from_secs(60), || {
+            check_caller(
+                terminal::Selection::Herdr {
+                    fallback: platform_fallback(),
+                },
+                provider,
+                |_| {
+                    deadline::spend();
+                    bail!("Run inside Herdr")
+                },
+            )
+        })
+        .err()
+        .expect("caller exhausted request budget");
+        assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
+        assert_eq!(
+            error.to_string(),
+            "the request's deadline passed before using the Herdr caller check; no Session was created"
+        );
     }
 }

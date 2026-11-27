@@ -29,8 +29,10 @@ const MAX_SOCKET_PATH: usize = 107;
 pub(in crate::native::terminal) struct Installed;
 
 impl Core for Installed {
-    fn endpoint(&self) -> Result<PathBuf> {
-        resolve_socket(&EndpointInputs::from_env(), &super::read_config_socket)
+    fn endpoint(&self, deadline: Instant) -> Result<PathBuf> {
+        resolve_socket(&EndpointInputs::from_env(), &|path| {
+            super::read_config_socket(path, deadline)
+        })
     }
 
     fn connect(&self, socket: &Path, deadline: Instant) -> Result<Box<dyn super::Connection + '_>> {
@@ -248,7 +250,7 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
             socket.display()
         );
     }
-    let stream = match UnixStream::connect(socket) {
+    let stream = match connect_before(socket, deadline) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -257,6 +259,9 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
             ) =>
         {
             return Err(not_running(socket));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            bail!("Herdr connection timed out")
         }
         Err(error) => {
             return Err(error).with_context(|| format!("cannot connect to {}", socket.display()));
@@ -270,6 +275,89 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
     }
     Ok(Framed::new(stream))
 }
+
+/// A connection to `socket` that ends by `deadline`. `UnixStream::connect` can wait without a
+/// bound (Linux makes a blocking connect wait for room in a full listen queue), so the socket
+/// connects without blocking and waits for room, or for completion, only until the deadline.
+fn connect_before(socket: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    use std::os::unix::{ffi::OsStrExt, io::FromRawFd};
+    let bytes = socket.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the Herdr socket path cannot be connected to",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length as u8;
+    }
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    // Darwin has no SOCK_CLOEXEC and sets the descriptor flag with fcntl.
+    #[cfg(target_os = "macos")]
+    let kind = libc::SOCK_STREAM;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The stream owns the descriptor from here, and closes it on every return.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stream.set_nonblocking(true)?;
+    loop {
+        super::remaining(deadline)?;
+        let connected =
+            unsafe { libc::connect(fd, (&raw const address).cast(), length as libc::socklen_t) };
+        if connected == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EISCONN) => break,
+            // A full listen queue: wait for room until the deadline.
+            Some(libc::EAGAIN) => {
+                std::thread::sleep(super::remaining(deadline)?.min(CONNECT_RETRY));
+            }
+            Some(libc::EINPROGRESS | libc::EINTR | libc::EALREADY) => {
+                while !wait_fd(fd, libc::POLLOUT, super::remaining(deadline)?)? {}
+                let mut failure: libc::c_int = 0;
+                let mut size = size_of::<libc::c_int>() as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&raw mut failure).cast(),
+                        &mut size,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if failure != 0 {
+                    return Err(std::io::Error::from_raw_os_error(failure));
+                }
+                break;
+            }
+            _ => return Err(error),
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// How long a connection waits before it tries a full listen queue again.
+const CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The read of `Stream::read_before`. It waits with poll(2), not a receive timeout: macOS
 /// refuses SO_RCVTIMEO with EINVAL once the core has closed its end, and a reply the core
@@ -344,15 +432,21 @@ fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize>
     usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
 }
 
-/// Polls for bytes, end of stream, an error or (on Linux) an urgent byte. The poll timeout
-/// rounds whole microseconds up to milliseconds, so it can exceed `timeout` by up to one
-/// millisecond. Under one microsecond the poll is immediate. Returns `false` on timeout
-/// or interruption.
 fn wait_readable(stream: &UnixStream, timeout: Duration) -> std::io::Result<bool> {
-    let timeout = timeout.as_micros().div_ceil(1000);
+    wait_fd(stream.as_raw_fd(), libc::POLLIN, timeout)
+}
+
+/// Positive timeouts round up to whole milliseconds; only zero polls immediately.
+/// Returns false on timeout or interruption so the caller can recheck its deadline.
+pub(super) fn wait_fd(
+    fd: std::os::fd::RawFd,
+    events: libc::c_short,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let timeout = timeout.as_nanos().div_ceil(1_000_000);
     let mut poll = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
+        fd,
+        events,
         revents: 0,
     };
     match unsafe { libc::poll(&mut poll, 1, i32::try_from(timeout).unwrap_or(i32::MAX)) } {

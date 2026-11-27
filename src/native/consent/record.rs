@@ -192,20 +192,51 @@ pub(super) fn with_record<T>(
     if fs::symlink_metadata(parent).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
         bail!("invalid workspace consent directory");
     }
-    fs::create_dir_all(parent)?;
-    RecordStore::at(parent).set_directory_private()?;
+    use crate::native::session_start::deadline;
+    deadline::before("preparing the workspace consent directory")?;
+    let create_directory = |directory: &Path, fact| -> std::io::Result<()> {
+        match fs::create_dir(directory) {
+            Ok(()) => deadline::wrote(fact),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    };
+    if deadline::current().is_some()
+        && !root.is_dir()
+        && let Some(ancestor) = root.parent()
+    {
+        fs::create_dir_all(ancestor)?;
+        create_directory(root, "the state root was created")?;
+    } else {
+        fs::create_dir_all(root)?;
+    }
+    create_directory(parent, "the workspace consent directory was created")?;
+    deadline::set_permissions(
+        parent,
+        "workspace consent directory permissions were set",
+        || RecordStore::at(parent).set_directory_private(),
+    )?;
     let lock_path = path.with_extension("lock");
     if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
         bail!("invalid workspace consent lock");
     }
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    RecordStore::set_file_private(&lock)?;
-    lock.lock()?;
+    deadline::before("opening the workspace consent lock")?;
+    let lock = deadline::open_lock(
+        &lock_path,
+        OpenOptions::new().read(true).write(true),
+        "the workspace consent lock file was created",
+    )?;
+    deadline::set_permissions(
+        &lock_path,
+        "workspace consent lock permissions were set",
+        || RecordStore::set_file_private(&lock),
+    )?;
+    match deadline::current() {
+        Some(end) => deadline::lock(&lock, end, "locking workspace consent")?,
+        None => lock.lock()?,
+    }
     let record = read_store(&path)?
         .map(|s| serde_json::from_str(&s))
         .transpose()?;
@@ -275,7 +306,9 @@ fn assess_identified(
         Mode::Record | Mode::Inherit => with_record(root, &identity.path, |path, existing| {
             let (assessment, write) = decide(root, existing, assessment, env, mode)?;
             if let Some(record) = write {
+                crate::native::session_start::deadline::before("writing workspace consent")?;
                 RecordStore::at(path).write_json(&record)?;
+                crate::native::session_start::deadline::wrote("workspace consent was recorded");
             }
             Ok(assessment)
         }),
@@ -422,7 +455,13 @@ fn inherited(
     let strict = mode == Mode::Recheck;
     // At a recheck, provider and Git evidence that cannot be read is typed as such, and the main
     // working tree's own assessment passes its errors on as they are.
-    let unread = |error: anyhow::Error| if strict { Err(error) } else { Ok(None) };
+    let unread = |error: anyhow::Error| {
+        if strict || error.is::<crate::native::failure_kind::TimedOut>() {
+            Err(error)
+        } else {
+            Ok(None)
+        }
+    };
     let evidence = |error: anyhow::Error, what: &'static str| {
         if strict {
             Err(error.context(EvidenceUnreadable(what)))
@@ -514,9 +553,8 @@ pub(in crate::native) fn after_main_identified(hook: impl FnOnce(&Path) + 'stati
     AFTER_MAIN_IDENTIFIED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-// Assess before anything is created: the assessment reads the shared record and the provider
-// stores, and a failure there must consume nothing (a reopen's source marker is claimed by
-// create). The assessment is recorded with the session once that exists.
+// The assessment may update shared consent before Session creation. Reopen claims the
+// source only after assessment succeeds and records the assessment with the new Session.
 pub(in crate::native) fn assess(root: &Path, requested: &Path) -> Result<Assessment> {
     let env = Environment::current();
     user_home(&env)?;
@@ -1260,6 +1298,55 @@ mod tests {
                 .unwrap()
                 .state,
             "verified"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn request_deadline_consent_record_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let canonical = workspace.path().canonicalize().unwrap();
+    let env = Environment::at_home(root.path());
+    let result =
+        crate::native::session_start::deadline::expire_at("writing workspace consent", || {
+            assess_with(root.path(), &canonical, &env)
+        });
+    assert!(
+        !record_path(root.path(), &canonical).exists(),
+        "consent record was written"
+    );
+    assert!(result.is_err());
+    let error =
+        crate::native::session_start::deadline::expire_at("writing workspace consent", || {
+            assess_with(root.path(), &canonical, &env)
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "the request's deadline passed before writing workspace consent; no Session was created"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn request_deadline_reports_a_state_root_created_during_consent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing").join("state");
+    let workspace = temp.path().canonicalize().unwrap();
+    for created in [true, false] {
+        assert_eq!(root.exists(), !created);
+        let error = crate::native::session_start::deadline::expire_at(
+            "opening the workspace consent lock",
+            || with_record(&root, &workspace, |_, _| Ok(())),
+        )
+        .unwrap_err();
+        assert!(root.is_dir());
+        assert_eq!(
+            error.to_string().contains("the state root was created"),
+            created,
+            "{error:#}"
         );
     }
 }

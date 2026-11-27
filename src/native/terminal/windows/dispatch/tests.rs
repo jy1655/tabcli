@@ -414,7 +414,7 @@ mod herdr_core {
     const UNANSWERED: &str = "the scripted Herdr Core does not answer";
 
     impl Core for UnansweredCore {
-        fn endpoint(&self) -> Result<PathBuf> {
+        fn endpoint(&self, _: Instant) -> Result<PathBuf> {
             Ok(self.endpoint.clone())
         }
         fn connect(&self, socket: &Path, _: Instant) -> Result<Box<dyn Connection + '_>> {
