@@ -284,6 +284,17 @@ pub(in crate::native) fn judge(
     }
 }
 
+#[derive(Debug)]
+pub(in crate::native) struct ReceiptExpired;
+
+impl std::fmt::Display for ReceiptExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("launch host is no longer eligible")
+    }
+}
+
+impl std::error::Error for ReceiptExpired {}
+
 // The Pending launch of `token`; `require_time` adds the receipt's deadline.
 fn eligible(store: &Store, token: &str, require_time: bool) -> Result<Record> {
     let receipt = super::read(store)?.context("missing launch receipt")?;
@@ -292,10 +303,11 @@ fn eligible(store: &Store, token: &str, require_time: bool) -> Result<Record> {
     } else {
         Expiry::Unchecked
     };
-    if pending::judge(store, &receipt, token, expiry)?.is_err() {
-        bail!("launch host is no longer eligible");
+    match pending::judge(store, &receipt, token, expiry)? {
+        Ok(()) => Ok(receipt),
+        Err(pending::NotPending::Expired) => Err(ReceiptExpired.into()),
+        Err(_) => bail!("launch host is no longer eligible"),
     }
-    Ok(receipt)
 }
 
 fn write(store: &Store, host: &HostRecord) -> Result<()> {
