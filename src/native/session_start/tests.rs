@@ -438,6 +438,7 @@ fn a_start_failure_without_a_receipt_records_only_the_failed_status() {
     let error = FreshSource.failed(
         &prepared.created,
         Failure::Launch {
+            deadline: Instant::now(),
             claim: &mut claim,
             error: anyhow::anyhow!("injected receipt failure"),
         },
@@ -1424,6 +1425,7 @@ fn a_fenced_launch_failure_is_left_to_the_launchers_settlement() {
     let error = FreshSource.failed(
         &prepared.created,
         Failure::Launch {
+            deadline: Instant::now(),
             claim: &mut claim,
             error: anyhow::anyhow!("startup is still holding the lifecycle lock"),
         },

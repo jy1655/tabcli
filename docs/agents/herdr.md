@@ -74,7 +74,7 @@
   a read showed (an absent directory included): a read that fails otherwise, such as TAB's own
   token denied `READ_CONTROL` or a transient I/O error, refuses nothing, and the host decides
   as in 0.4.49. A refusal is an early decision (below) and settles as a failure to open the
-  Surface (`launch::refused_before_surface`, with `terminal_failed`'s wording). It is detected
+  Surface (`launch::terminal_failure`). It is detected
   at once; returning it can wait for the lifecycle lock up to the launch budget. It is judged
   once, from what was observed: a directory corrected while TAB waits for the lock is not
   examined again, and the remedy is to correct the directory and run the command again. The
@@ -156,9 +156,9 @@
   required, a busy or unavailable lock, or a clock that has run out establishes nothing. Each
   decision writes only on established facts, at once, under that same lock. Otherwise the
   finished-terminal probe defers to the ordinary poll, and the refusal returns the original
-  refusal; it adds that the Claim is retained only when the budget ran out while another holder
-  kept the lock and this launch's Claim is still seen at the path.
-  The fixed reasons are in the failed `status.json` and, on a best-effort basis, in
+  refusal. At the deadline, a busy lock adds a lock-timeout diagnostic, including Claim
+  retention only if this launch's Claim is still seen at the path.
+  The reasons are in the failed `status.json` and, on a best-effort basis, in
   `launch.log`; `residual_surface()` and the status readers interpret the status. A later
   successful close without a terminal handle writes its closed record and status without that
   error. The returned refusal keeps the directory, the error of a completed finished-terminal

@@ -4627,3 +4627,138 @@ fn a_refused_caller_creates_no_lock_file_on_a_failed_child() {
         },
     );
 }
+
+fn open_failure_fixture(root: &Path) -> (PathBuf, CreatedSession, turn::Claim) {
+    let source = write_closed_reopen_source(
+        root,
+        "session-source",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let child = write_reopen_launch_session(root, "session-child", Path::new("claude"));
+    Reservation::claim(&source, "session-source", REOPEN_TEST_CONVERSATION)
+        .unwrap()
+        .finalize("session-child")
+        .unwrap();
+    let store = Store::open_unchecked(&child);
+    let claim = turn::claim(&store, &[]).unwrap();
+    let token = claim.token().to_owned();
+
+    launch::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+    (
+        source,
+        CreatedSession {
+            id: "session-child".into(),
+            manifest: store.manifest().unwrap(),
+            directory: child,
+        },
+        claim,
+    )
+}
+
+#[test]
+fn open_failure_fence_leaves_the_published_refusal_for_the_next_reopen() {
+    use crate::native::session::primitives::close_io_test::{Point, during};
+    use std::sync::mpsc;
+    let root = tempfile::tempdir().unwrap();
+    let (source, created, mut claim) = open_failure_fixture(root.path());
+    let reason = "surface could not open";
+    let child = created.directory.clone();
+    let token = claim.token().to_owned();
+    let store = Store::open_unchecked(&child);
+    let (finished, result) = mpsc::channel();
+    let (enter, published) = mpsc::channel();
+    let (resume, held) = mpsc::channel();
+    let worker_source = source.clone();
+    let worker = thread::spawn(move || {
+        let error = during(
+            move |point| {
+                if point == Point::BeforeLock("failed launch fence") {
+                    enter.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            },
+            || {
+                fail_reopen_launch(
+                    &created,
+                    &mut claim,
+                    anyhow::anyhow!(reason),
+                    Instant::now(),
+                )
+            },
+        );
+        let outcome = settle_reopen_outcome(&worker_source, &created.directory, Err(error));
+        finished.send(outcome).unwrap();
+    });
+    published.recv_timeout(Duration::from_secs(10)).unwrap();
+    let lock = store.lock().unwrap();
+    resume.send(()).unwrap();
+    let outcome = result.recv_timeout(Duration::from_secs(3));
+    drop(lock);
+    worker.join().unwrap();
+    let (result, gate) = outcome.expect("fence waited for the held lock past the deadline");
+    assert_eq!(gate, Some(ReopenGate::LaunchFailed));
+    let error = result.unwrap_err();
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("the failed launch could not be fenced: the request deadline passed waiting for the child's lifecycle lock"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("provider startup holds the lifecycle lock"),
+        "{diagnostic}"
+    );
+    let refusal = read_reopen_launch_refusal(&child).unwrap();
+    assert_eq!(refusal.claim_token.as_deref(), Some(token.as_str()));
+    assert_eq!(refusal.detail, reason);
+    assert_eq!(store.status().unwrap().state, SessionState::Launching);
+    retry_interrupted_launch_fence(&source).unwrap();
+    assert_eq!(store.status().unwrap().error.as_deref(), Some(reason));
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+    assert!(
+        verify_reopen_source_is_closed(&source, "session-source")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn open_failure_refusal_publication_waits_even_after_the_deadline() {
+    use crate::native::session::primitives::close_io_test::{Point, during};
+    use std::sync::mpsc;
+    let root = tempfile::tempdir().unwrap();
+    let (source, created, mut claim) = open_failure_fixture(root.path());
+    let child = created.directory.clone();
+    let lock = Store::open_unchecked(&child).lock().unwrap();
+    let (enter, waiting) = mpsc::channel();
+
+    let worker = thread::spawn(move || {
+        during(
+            move |point| {
+                if point == Point::BlockingLock {
+                    let _ = enter.send(());
+                }
+            },
+            || {
+                fail_reopen_launch(
+                    &created,
+                    &mut claim,
+                    anyhow::anyhow!("open failed"),
+                    Instant::now(),
+                )
+            },
+        )
+    });
+    waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(read_reopen_launch_refusal(&child).is_none());
+    drop(lock);
+    let error = worker.join().unwrap();
+    assert_eq!(reopen_refusal_gate(&error), Some(ReopenGate::LaunchFailed));
+    assert_eq!(
+        read_reopen_launch_refusal(&child).unwrap().detail,
+        "open failed"
+    );
+    assert!(
+        verify_reopen_source_is_closed(&source, "session-source")
+            .unwrap()
+            .is_some()
+    );
+}

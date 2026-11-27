@@ -409,9 +409,11 @@ impl session_start::InitialSource for ReopenAttempt {
                 session_start::mark_start_failed(created, &refusal);
                 refusal
             }
-            session_start::Failure::Launch { claim, error } => {
-                fail_reopen_launch(created, claim, error)
-            }
+            session_start::Failure::Launch {
+                claim,
+                error,
+                deadline,
+            } => fail_reopen_launch(created, claim, error, deadline),
             session_start::Failure::Delivery { error, deadline } => {
                 close_surface_after_reopen_verification_failure(
                     &created.directory,
@@ -428,22 +430,28 @@ fn fail_reopen_launch(
     created: &CreatedSession,
     initial_claim: &mut session::turn::Claim,
     error: anyhow::Error,
+    deadline: Instant,
 ) -> anyhow::Error {
     initial_claim.fence_launch();
     let mut detail = format!("{error:#}");
-    let gate = match record_failed_launch(&created.directory, initial_claim.token(), &error) {
-        Ok(gate) => gate,
-        Err(record_error) => {
-            detail.push_str(&format!(
-                "; the refusal record could not be written: {record_error:#}"
-            ));
-            reopen_refusal_gate(&error).unwrap_or(ReopenGate::LaunchFailed)
-        }
-    };
+    let (gate, fence_deadline) =
+        match record_failed_launch(&created.directory, initial_claim.token(), &error) {
+            Ok(gate) => (gate, Some(deadline)),
+            Err(record_error) => {
+                detail.push_str(&format!(
+                    "; the refusal record could not be written: {record_error:#}"
+                ));
+                (
+                    reopen_refusal_gate(&error).unwrap_or(ReopenGate::LaunchFailed),
+                    None,
+                )
+            }
+        };
     if let Err(fence_error) = session::launch::fence_failed_start(
         &Store::open_unchecked(&created.directory),
         initial_claim.token(),
         &detail,
+        fence_deadline,
     ) {
         detail.push_str(&format!(
             "; the failed launch could not be fenced: {fence_error:#}"

@@ -212,7 +212,7 @@ impl Store {
         let store = self;
         // The tombstone is the close's commit point: every later write, whatever state it
         // asks for, restores the tombstone unchanged and does not advance the generation.
-        // launch::terminal_failed can separately append a residual-surface diagnostic to
+        // launch::terminal_failure can separately append a residual-surface diagnostic to
         // both records under this lock without changing their lifecycle fields.
         if let Some(closed) = store.closed_if_present()? {
             return store.persist_status(&closed);

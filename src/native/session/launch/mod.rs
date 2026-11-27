@@ -271,8 +271,26 @@ pub(in crate::native) fn fence_failed_start(
     store: &Store,
     expected_token: &str,
     reason: &str,
+    deadline: Option<Instant>,
 ) -> Result<()> {
-    let _lock = store.lock()?;
+    #[cfg(test)]
+    super::primitives::close_io_test::at(super::primitives::close_io_test::Point::BeforeLock(
+        "failed launch fence",
+    ));
+    let _lock = loop {
+        let Some(deadline) = deadline else {
+            // Without a published refusal the next reopen cannot retry this fence.
+            break store.lock()?;
+        };
+        if let Some(lock) = store.try_lock()? {
+            break lock;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(WAIT_POLL));
+        if Instant::now() >= deadline {
+            bail!("the request deadline passed waiting for the child's lifecycle lock");
+        }
+    };
     fence_failed_start_locked(store, expected_token, reason)
 }
 
@@ -405,7 +423,19 @@ fn fail_locked_with_residual(
     {
         return Ok(());
     }
-    let status: SessionStatus = store.status()?;
+    fail_current_launch_locked(store, record, reason, residual_surface, store.status()?).map(|_| ())
+}
+
+// The caller holds the lifecycle lock and verified the current Claim. Return whether
+// the failure was published or an interrupted Pending failure released its Claim.
+fn fail_current_launch_locked(
+    store: &Store,
+    record: &Record,
+    reason: &str,
+    residual_surface: Option<ResidualSurface>,
+    status: SessionStatus,
+) -> Result<bool> {
+    let directory = store.directory();
     if status.state != SessionState::Launching {
         if status.state == SessionState::Failed && record.phase == Phase::Pending {
             remove_turn_claim_locked(
@@ -413,8 +443,9 @@ fn fail_locked_with_residual(
                     .record(CoreRecord::TurnClaim)
                     .path(),
             )?;
+            return Ok(true);
         }
-        return Ok(());
+        return Ok(false);
     }
     let reason = if record.phase == Phase::Spawning {
         format!("{reason}; provider spawn is uncertain; the claim is retained, do not resend")
@@ -436,60 +467,41 @@ fn fail_locked_with_residual(
         )?;
     }
     log(store, &reason);
-    Ok(())
+    Ok(true)
 }
 
 // The plain form, which the tests of this module and of close use.
 #[cfg(test)]
 pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
-    fail_deciding(store, reason, |_, reason| Ok(reason.to_owned()))
-}
-
-// `fail`, with the recorded wording decided under the lock from the launch record
-// and the other records as they are at that moment.
-fn fail_deciding(
-    store: &Store,
-    reason: &str,
-    wording: impl FnOnce(&Record, &str) -> Result<String>,
-) -> Result<()> {
     let Some(_lock) = store.try_lock()? else {
-        return Err(startup_in_progress(reason));
+        bail!("{reason}; provider startup is in progress; the claim is retained");
     };
-    fail_deciding_locked(store, reason, wording)
-}
-
-// What `fail_deciding` returns when another holder keeps the lifecycle lock.
-fn startup_in_progress(reason: &str) -> anyhow::Error {
-    anyhow::anyhow!("{reason}; provider startup is in progress; the claim is retained")
-}
-
-fn fail_deciding_locked(
-    store: &Store,
-    reason: &str,
-    wording: impl FnOnce(&Record, &str) -> Result<String>,
-) -> Result<()> {
     if let Some(record) = read(store)?
         && record.phase != Phase::Spawned
     {
-        let reason = wording(&record, reason)?;
-        fail_locked(store, &record, &reason)?;
+        fail_locked(store, &record, reason)?;
     }
     Ok(())
 }
 
 // The error returned by ask, including its JSON error rendering.
-pub(in crate::native) fn terminal_failure(store: &Store, error: anyhow::Error) -> anyhow::Error {
-    let retained = error.downcast_ref::<terminal::RetainedLaunchSurface>();
-    let unverified = retained.is_some_and(|surface| surface.unverified_cleanup);
-    let has_surface = retained.is_some();
-    let handoff = terminal_failed(store, &error);
-    let residual = unverified || (has_surface && handoff.is_err());
-    let error = match handoff {
-        Ok(()) => error,
-        Err(record_error) => {
-            error.context(format!("terminal launch failure handoff: {record_error:#}"))
-        }
-    };
+pub(in crate::native) fn terminal_failure(
+    store: &Store,
+    token: &str,
+    error: anyhow::Error,
+    deadline: Instant,
+) -> anyhow::Error {
+    let handoff = terminal_handoff(
+        store,
+        token,
+        &error,
+        deadline,
+        &mut crate::native::clock::SystemClock,
+    );
+    let residual = error
+        .downcast_ref::<terminal::RetainedLaunchSurface>()
+        .is_some_and(|surface| surface.unverified_cleanup || handoff.is_err());
+    let error = report_handoff(error, handoff);
     if residual && !format!("{error:#}").contains(RESIDUAL_SURFACE_MARKER) {
         error.context(RESIDUAL_SURFACE_MARKER)
     } else {
@@ -497,18 +509,42 @@ pub(in crate::native) fn terminal_failure(store: &Store, error: anyhow::Error) -
     }
 }
 
-// The launcher's terminal-creation failure handoff.
+fn report_handoff(error: anyhow::Error, handoff: Result<()>) -> anyhow::Error {
+    match handoff {
+        Ok(()) => error,
+        Err(record_error) => {
+            error.context(format!("terminal launch failure handoff: {record_error:#}"))
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -> Result<()> {
-    let reason = format!("terminal launch failed: {error:#}");
+    let token = read(store)?.context("missing fixture launch")?.claim_token;
+    terminal_handoff(
+        store,
+        &token,
+        error,
+        Instant::now() + START_TIMEOUT,
+        &mut crate::native::clock::SystemClock,
+    )
+}
+
+fn terminal_handoff(
+    store: &Store,
+    token: &str,
+    error: &anyhow::Error,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Result<()> {
     let Some(retained) = error.downcast_ref::<terminal::RetainedLaunchSurface>() else {
-        // Only a failure before a surface was bound (a close in progress moves the handle
-        // to the closing record and may give it back) and before the provider spawn began
-        // proves that nothing was sent. A bound surface keeps its handle, and a spawn in
-        // progress has its own wording. Decided under the lock, on the records as they are.
-        return fail_deciding(store, &reason, |record, reason| {
-            unbound_wording(store, record, reason)
-        });
+        return if let Some(refusal) = error.downcast_ref::<terminal::DirectoryRefusal>() {
+            refused_before_surface(store, token, &refusal.recorded(), deadline, clock)
+        } else {
+            settle_open_failure(store, token, error, deadline, clock)
+        };
     };
+    let reason = format!("terminal launch failed: {error:#}");
     let _lock = store.lock()?;
     let evidence = (|| -> Result<_> {
         Ok((
@@ -533,6 +569,16 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
             bail!("{message}");
         }
     };
+    if claim.as_deref().is_some_and(|current| current != token)
+        || record
+            .as_ref()
+            .is_some_and(|record| record.claim_token != token)
+    {
+        bail!(
+            "the session is no longer owned by this launch; exact retained surface={:?}; {RESIDUAL_SURFACE_MARKER}; {reason}",
+            retained.surface
+        );
+    }
     let owns_claim = record
         .as_ref()
         .is_some_and(|record| claim.as_deref() == Some(record.claim_token.as_str()));
@@ -596,74 +642,91 @@ fn unbound_wording(store: &Store, record: &Record, reason: &str) -> Result<Strin
     })
 }
 
-/// Settles a launch whose session directory the launch host would refuse, which the launcher
-/// established before any Surface existed (`terminal::DirectoryRefusal`), as the failure to
-/// open a Surface that it is (`terminal_failed`). An early decision (docs/agents/herdr.md,
-/// "Early launch decisions"): it writes only when `establish_early_facts` finds the facts hold,
-/// at once, under the lock that established them, and waits out another holder of the lock
-/// until `deadline`, the launch's own. Otherwise it writes nothing and returns the refusal; only
-/// when the budget ran out while another holder kept the lock and this launch's Claim is still
-/// seen at the path does it add that the Claim is retained, as every failure to open a Surface
-/// does. The refusal is judged once, as observed: a directory corrected while the lock is
-/// awaited is not examined again. The Session records `recorded`, a fixed reason that names no
-/// path (`DirectoryRefusal::recorded`); the refusal, which names the directory, is returned to
-/// the caller.
-pub(in crate::native) fn refused_before_surface(
+fn settle_open_failure(
     store: &Store,
     token: &str,
-    refusal: anyhow::Error,
-    recorded: &str,
+    error: &anyhow::Error,
     deadline: Instant,
-) -> anyhow::Error {
-    refused_before_surface_with(
+    clock: &mut dyn Clock,
+) -> Result<()> {
+    let lock = loop {
+        match store.try_lock_existing() {
+            Ok(ExistingLock::Held(lock)) => break Ok(Some(lock)),
+            Ok(ExistingLock::Unavailable) => break Ok(None),
+            Err(error) => break Err(error),
+            Ok(ExistingLock::Busy) => wait_for_open_lock(store, token, deadline, clock)?,
+        }
+    };
+    if turn::current_claim_token(store)?.as_deref() != Some(token) {
+        return Ok(());
+    }
+    let retained = "nothing was recorded; the claim is retained";
+    let record = read(store).context(retained)?;
+    let warning = if record
+        .as_ref()
+        .is_some_and(|record| record.phase != Phase::Pending)
+    {
+        "nothing was recorded; the claim is retained; provider startup may be in progress, do not resend"
+    } else {
+        retained
+    };
+    let Some(_lock) = lock.context(warning)? else {
+        bail!("{warning}")
+    };
+    let Some(record) =
+        record.filter(|record| record.claim_token == token && record.phase != Phase::Spawned)
+    else {
+        bail!("{warning}");
+    };
+    let reason = unbound_wording(
         store,
-        token,
-        refusal,
-        recorded,
-        deadline,
-        &mut crate::native::clock::SystemClock,
+        &record,
+        &format!("terminal launch failed: {error:#}"),
     )
+    .context(warning)?;
+    let status = store.status().context(warning)?;
+    if !fail_current_launch_locked(store, &record, &reason, None, status)? {
+        bail!("{warning}");
+    }
+    Ok(())
 }
 
-fn refused_before_surface_with(
+fn wait_for_open_lock(
     store: &Store,
     token: &str,
-    refusal: anyhow::Error,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(clock.now());
+    if remaining.is_zero() {
+        let retained = if turn::current_claim_token(store).ok().flatten().as_deref() == Some(token)
+        {
+            "; the claim is retained"
+        } else {
+            ""
+        };
+        bail!("the lifecycle lock was held until the launch deadline{retained}");
+    }
+    clock.sleep(remaining.min(WAIT_POLL));
+    Ok(())
+}
+
+fn refused_before_surface(
+    store: &Store,
+    token: &str,
     recorded: &str,
     deadline: Instant,
     clock: &mut dyn Clock,
-) -> anyhow::Error {
+) -> Result<()> {
     let reason = format!("terminal launch failed: {recorded}");
     loop {
         match establish_early_facts(store, token, deadline, clock) {
-            EarlyFacts::Hold(_lock) => {
-                return match fail_deciding_locked(store, &reason, |record, reason| {
-                    unbound_wording(store, record, reason)
-                }) {
-                    Ok(()) => refusal,
-                    Err(handoff) => {
-                        refusal.context(format!("terminal launch failure handoff: {handoff:#}"))
-                    }
-                };
+            EarlyFacts::Hold(_lock, record) => {
+                let reason = unbound_wording(store, &record, &reason)?;
+                return fail_locked(store, &record, &reason);
             }
-            EarlyFacts::Busy => {
-                let remaining = deadline.saturating_duration_since(clock.now());
-                if !remaining.is_zero() {
-                    clock.sleep(remaining.min(WAIT_POLL));
-                    continue;
-                }
-                let held = turn::current_claim_token(store)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|claim| claim == token);
-                return if held {
-                    let contended = startup_in_progress(&reason);
-                    refusal.context(format!("terminal launch failure handoff: {contended:#}"))
-                } else {
-                    refusal
-                };
-            }
-            EarlyFacts::NotEstablished => return refusal,
+            EarlyFacts::Busy => wait_for_open_lock(store, token, deadline, clock)?,
+            EarlyFacts::NotEstablished => return Ok(()),
         }
     }
 }
@@ -671,7 +734,7 @@ fn refused_before_surface_with(
 /// What `establish_early_facts` found.
 enum EarlyFacts {
     /// The facts hold: the lifecycle lock under which they were read, for the decision's write.
-    Hold(std::fs::File),
+    Hold(std::fs::File, Record),
     /// Another holder has the lifecycle lock.
     Busy,
     /// Anything else: nothing is decided.
@@ -721,7 +784,7 @@ fn establish_early_facts(
     if clock.now() >= deadline || unix_ms() >= receipt.deadline_unix_ms {
         return EarlyFacts::NotEstablished;
     }
-    EarlyFacts::Hold(lock)
+    EarlyFacts::Hold(lock, receipt)
 }
 
 /// The ordinary poll's reading of the launch-host Record (`host_decision_locked`), without the
@@ -1093,7 +1156,7 @@ fn finished_before_startup(
     deadline: Instant,
     clock: &mut dyn Clock,
 ) -> Option<Result<()>> {
-    let EarlyFacts::Hold(_lock) = establish_early_facts(store, token, deadline, clock) else {
+    let EarlyFacts::Hold(_lock, _) = establish_early_facts(store, token, deadline, clock) else {
         return None;
     };
     Some(
@@ -1986,9 +2049,14 @@ mod tests {
 
     #[test]
     fn unproven_terminal_failure_records_no_handle_and_no_prompt() {
-        let (directory, _) = fixture();
+        let (directory, token) = fixture();
         let store = Store::open_unchecked(directory.path());
-        terminal_failed(&store, &anyhow::anyhow!("iTerm2 automation timed out")).unwrap();
+        let _ = terminal_failure(
+            &store,
+            &token,
+            anyhow::anyhow!("iTerm2 automation timed out"),
+            Instant::now() + START_TIMEOUT,
+        );
         let status = store.status().unwrap();
         assert_eq!(status.state, SessionState::Failed);
         assert_eq!(
@@ -2002,16 +2070,21 @@ mod tests {
     }
 
     #[test]
-    fn bound_surface_or_spawn_in_progress_keeps_its_own_failure_wording() {
+    fn open_error_preserves_bound_handles_and_uncertain_spawn_wording() {
         // A surface bound before the failure keeps its handle, so the sentence is absent.
-        let (directory, _) = fixture();
+        let (directory, token) = fixture();
         let store = Store::open_unchecked(directory.path());
         let surface: terminal::TerminalSession = serde_json::from_value(serde_json::json!({
             "terminal":"ghostty", "session_id":"u2", "tab_id":"t2", "window_id":"w1"
         }))
         .unwrap();
         store.write_terminal(&surface).unwrap();
-        terminal_failed(&store, &anyhow::anyhow!("Ghostty start failed")).unwrap();
+        let _ = terminal_failure(
+            &store,
+            &token,
+            anyhow::anyhow!("Ghostty start failed"),
+            Instant::now() + START_TIMEOUT,
+        );
         let status = store.status().unwrap();
         assert_eq!(status.state, SessionState::Failed);
         assert_eq!(
@@ -2021,13 +2094,18 @@ mod tests {
         assert!(store.terminal().is_ok());
 
         // A handle that a close moved to the closing record is still a handle.
-        let (directory, _) = fixture();
+        let (directory, token) = fixture();
         let store = Store::open_unchecked(directory.path());
         store
             .record(CoreRecord::TerminalClosing)
             .write_json(&surface)
             .unwrap();
-        terminal_failed(&store, &anyhow::anyhow!("Ghostty start failed")).unwrap();
+        let _ = terminal_failure(
+            &store,
+            &token,
+            anyhow::anyhow!("Ghostty start failed"),
+            Instant::now() + START_TIMEOUT,
+        );
         assert_eq!(
             store.status().unwrap().error.as_deref(),
             Some("terminal launch failed: Ghostty start failed")
@@ -2040,7 +2118,7 @@ mod tests {
                 .is_some()
         );
 
-        // A spawn in progress may have carried the prompt: the spawn wording stays alone.
+        // The spawn may have delivered the prompt.
         let (directory, token) = fixture();
         let store = Store::open_unchecked(directory.path());
         let mut record = read(&store).unwrap().unwrap();
@@ -2050,17 +2128,32 @@ mod tests {
             .record(CoreRecord::Launch)
             .write_json(&record)
             .unwrap();
-        terminal_failed(&store, &anyhow::anyhow!("Ghostty start failed")).unwrap();
-        let error = store.status().unwrap().error.unwrap();
-        assert!(error.contains("provider spawn is uncertain"), "{error}");
-        assert!(!error.contains("no prompt was sent"), "{error}");
+        let _ = terminal_failure(
+            &store,
+            &token,
+            anyhow::anyhow!("Ghostty start failed"),
+            Instant::now() + START_TIMEOUT,
+        );
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        let reason = "terminal launch failed: Ghostty start failed; provider spawn is uncertain; the claim is retained, do not resend";
+        assert_eq!(status.error.as_deref(), Some(reason));
+        assert!(
+            fs::read_to_string(store.directory().join(LOG))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with(reason)
+        );
+        assert_eq!(turn::current_claim_token(&store).unwrap(), Some(token));
     }
 
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn retained_handoff_marks_stored_and_returned_diagnostics_once() {
         for case in ["normal", "lost", "closed", "write", "read"] {
-            let (directory, _) = fixture();
+            let (directory, token) = fixture();
             let store = Store::open_unchecked(directory.path());
             if matches!(case, "lost" | "closed") {
                 fail(&store, "launch cancelled").unwrap();
@@ -2088,7 +2181,7 @@ mod tests {
                     .with_unverified_cleanup()
                     .into();
             let before = store.status().unwrap();
-            let returned = terminal_failure(&store, error);
+            let returned = terminal_failure(&store, &token, error, Instant::now() + START_TIMEOUT);
             let text = format!("{returned:#}");
             assert_eq!(
                 text.matches(RESIDUAL_SURFACE_MARKER).count(),

@@ -50,7 +50,7 @@ pub(in crate::native) fn start(
     initial_claim.fence_launch();
     // The launch host's verdict on the session directory, reproduced before any Surface
     // exists: a refusal is a failure to open the Surface and settles as one, for this launch
-    // only (`launch::refused_before_surface`).
+    // only (`launch::terminal_failure`).
     let opened = terminal::refuse_before_launch(terminal_kind, &created.directory).and_then(|()| {
         terminal::open_bound_tab(
             terminal_kind,
@@ -74,19 +74,8 @@ pub(in crate::native) fn start(
             #[cfg(test)]
             open_failure_hook::run(&created.directory);
             let store = Store::open_unchecked(&created.directory);
-            let refused = error
-                .downcast_ref::<terminal::DirectoryRefusal>()
-                .map(terminal::DirectoryRefusal::recorded);
-            let error = match refused {
-                Some(recorded) => launch::refused_before_surface(
-                    &store,
-                    expected_claim_token,
-                    error,
-                    &recorded,
-                    launch_deadline,
-                ),
-                None => launch::terminal_failure(&store, error),
-            };
+            let error =
+                launch::terminal_failure(&store, expected_claim_token, error, launch_deadline);
             return Err(error).with_context(|| {
                 format!(
                     "failed to open {} surface for session {}",
