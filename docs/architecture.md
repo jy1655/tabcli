@@ -735,38 +735,19 @@ The recovery close in #87 is not implemented. Its authority decision waits for W
 evidence from a `warp_control_cli` build or an upstream change.
 
 `terminal::close_authority` decides explicit Close over its observation seam. Close can act
-with a live attested owner, act on a proven Surface alone, remove a Surface that its creation
-record proves when no live owner is left (never ending it while it runs), end a live attested
-owner whose Surface is proven absent, or settle a proven absence or
+with a live attested owner, act on a proven Surface alone, remove a verified finished Surface,
+end a live attested owner whose Surface is proven absent, or settle a proven absence or
 completed teardown. An ambiguous identity retains the handle. The platform adapters perform
 surface close, and `terminal::ownership` performs owner teardown. `session::close` claims the
 handle, records the transition and tombstones, and converges interrupted Close.
 
-`terminal::close_authority::owner_exit` owns the dead-owner Close decision and the dead-owner
-Surface decision in Repair. The owner's rule is one behavior on every OS, with a difference
-only where it is unavoidable (2026-11-26, os-parity). Repair scans active then claimed handles
-through the same reader and retains damaged evidence, and scans again under the lifecycle
-lock before it settles a session. On every OS, Repair leaves a registered core-retained
-terminal (Herdr) for explicit Close. `owner_exit::core_kept` gathers the decision's evidence
-for every owner record into `CreationEvidence`, which only that module can construct. The Herdr
-adapter's `authority::grant` is the only function that permits `terminal.kill` or
-`terminal.rm`. It mints only from an observation the verified connection produced
-(`terminal/herdr/linked.rs`), which names that connection's core and the terminal, and refuses
-one from another core or of another address; the connection sends either call only by consuming
-that grant, and the
-transport's stream is private to it in production builds (a source scan checks the method
-names; `docs/agents/herdr.md` states what this covers and what it does not). On the creation
-record it admits only an explicit `CloseCause` and requires the creation record in the
-handle; a close with a live attested owner, the cleanup after a refused reopen included, keeps
-its own proof. On the creation record it removes a finished terminal whatever the owner record
-says and never ends a running one (the owner's decision of 2026-11-26). On macOS and
-Linux, Repair also preserves an intent or another Surface that can outlive its owner. Their
-ordinary dead-owner branch keeps requiring an exited, bound owner with complete control,
-apart from two earlier routes. A Linux tmux server is closed by its creation-time incarnation
-before the owner is read. An exact close intent resumes under its own rule once its owner's
-incarnation is gone. The managed Windows console, a Windows-only Surface, is closed by Repair
-through its root identity in an active session and settles from its Records once the session
-has ended. Repair uses the same handle claim as explicit Close when it must call an adapter.
+`terminal::close_authority::owner_exit` owns the ordinary dead-owner Close decision on macOS
+and Linux and the dead-owner Surface decision in Repair. Repair scans active then claimed
+handles through the same reader and retains damaged evidence. On macOS and Linux, Repair
+preserves an intent or a Surface that can outlive its owner for explicit Close. For a
+core-retained terminal see [Herdr close](agents/herdr.md#close-by-creation-record).
+An exited or failed console session settles from its
+Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
 
 ## Where to add things
 

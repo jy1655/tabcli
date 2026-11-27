@@ -175,7 +175,6 @@ leave the program running. TAB then rechecks its identity. Park before closing i
 want the session to continue. If you already closed the pane with keep enabled, check that
 `hc get <address>` on the recorded core reports `finished` for this session. Remove that
 finished terminal with `hc rm <address>`, then run `tabcli close-session <session> --explicit`.
-That close settles the session under the conditions given below for a removed terminal.
 The returned `attach_command` names the socket to use for these hc commands.
 On Linux the terminal starts bash with job control and without shell startup files. The core's environment must provide the tools the CLI needs. Remote hc machines are unsupported. See below for native Windows.
 
@@ -184,104 +183,6 @@ binding even when the caller's `HC_SESSION` or `HC_SOCKET` changes. A replaced o
 core is not evidence that a terminal is gone. Queries connect without starting a service.
 A parented session counts in the caller's `hc wait --children`. The core does not type child
 notifications into the caller, and the session continues when the caller ends.
-If the original program ends outside TAB with keep off, run
-`tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
-finished terminal and closes the session record. TAB first proves from its own record of the
-terminal's creation (core, address, creation time, program, session directory and launch
-label) that it is this session's terminal. When TAB cannot verify a live owner for the session,
-a finished or removed terminal is then cleaned up whatever the session's owner record says,
-including an owner whose process ID now belongs to another process. With a verified live owner
-the close needs its full ownership proof instead, which a finished terminal fails, as does an
-absent one on Windows (on macOS and Linux the owner's own teardown can follow). When TAB cannot
-verify a live owner for the session, it never ends a terminal
-that still runs: the close keeps the session, sends nothing and says so, naming the recorded
-core and the `hc` commands for its endpoint, and, when the owner record or its process could
-not be read, why. Wait for the terminal to finish, or end it there with `hc kill <address>`
-after the checks below, then run the close again: it removes the finished terminal and closes
-the session record. Closing a session whose owner is verified live is unchanged. Listing
-sessions, `tell` and waiting for a result never close a Herdr terminal on their own; an
-attached `ask` or `tell` stops waiting once the owner is gone.
-
-These rules apply when no teardown intent is saved. On macOS and Linux TAB establishes that
-from the session's close-intent file (`terminal.close-intent.json`): the file is absent, or TAB
-reads it and finds that it holds no teardown payload. A close with a verified live owner writes
-that file before it acts. If the file cannot be read or does not hold JSON, the close refuses
-before it can tell what the file holds, a finished terminal included. A close with a verified
-live owner whose terminal is proven absent saves a teardown intent in it and then ends the
-owner (see the owner teardown under [Ownership and close](#ownership-and-close) below). If that
-close is interrupted before it consumes the handle, the next close resumes it under 0.4.49's
-rules: it can refuse a finished or absent terminal until the intent validates against the
-current owner record and handle. When the resumed close finds the owner record gone in a
-launching or failed session and leaves the terminal to be closed on its own, as 0.4.49 did,
-TAB closes it on its creation record instead: it settles an absent terminal and removes a
-finished one, as 0.4.49 did, and keeps a running one, which 0.4.49 ended. Once a close has
-consumed the handle and written `terminal.closed.json`, a retry only finishes the session
-record, without reading the intent or the owner. TAB removes the intent when it consumes the
-handle, before it records the session as closed, so a close can still fail after that point
-with the intent already gone. Read the refusal and keep the session directory as it is.
-
-What changed from 0.4.49: there, on macOS and Linux, the ordinary close of a session whose
-owner had exited already refused a running Herdr terminal and removed only a finished one, and
-it refused even a finished one when the owner's process ID had been reused or the owner record
-was unbound, another session's or incomplete. A running terminal was ended only by three
-shortcuts: the close of a failed start (status `failed`, its launch never confirmed, its owner
-gone), the close of a `launching` or `failed` session without an owner record (both on Windows
-as well), and, on macOS and Linux, a close resumed after an interrupted close whose owner had
-since died. On Windows, listing sessions, `tell` or an attached `ask` or `tell` also removed a
-gone owner's terminal, ending it if it still ran. In all of those cases TAB now keeps a running
-terminal: end it as described below, or wait for it to finish, then run
-`tabcli close-session <session> --explicit` again. When no live owner is verified, a finished
-or absent terminal is now removed or settled whatever the owner record says.
-
-To act on the terminal yourself, first run `tabcli doctor <session> --probe`; without
-`--probe` doctor asks no core. Its `terminal_surface` check connects to the recorded socket and
-requires the permanent core ID that TAB recorded before it reads any terminal. Then it compares,
-on that core, the terminal at the recorded address with the handle: TAB's launch host and this
-session's directory in the program arguments, the creation time and the PID the core reports,
-and, for a running program whose start time the system reports, that start time. It refuses a
-terminal set to keep. It does not check the handle's own creation record or the launch label,
-which the close checks (see below). `terminal_surface_present` (the recorded core holds this
-session's terminal) and `terminal_surface_missing` (the recorded core answered and no longer
-holds it) show that the recorded core answered there. A terminal set to keep reports
-`terminal_surface_unverified` with a detail saying that it is set to keep on the recorded Herdr
-Core, naming its ID, which answered at its endpoint; that detail also shows that the recorded
-core answered. Any other `terminal_surface_unverified` shows nothing about the terminal; its
-detail says why. A detail naming a different Herdr Core means that socket now belongs to another
-core: do not run hc there, restore the original core and close again. Then run hc against the
-recorded core only. The session's
-`attach_command` names its socket: on macOS and Linux use the same form, `HC_SOCKET='<socket>'
-hc get <address>`, and on Windows the PowerShell block of `attach_command` with `get` in place
-of `attach`. A plain `hc get <address>` uses whichever core your environment selects, where the
-same address can be another terminal. Check that the program arguments `hc get` shows name this
-session's directory, whose last part is the session ID. When TAB refused the match, deciding
-that this is the session's terminal is yours. Once you are sure, end it with `hc kill
-<address>` and remove it with `hc rm <address>`, both in the same form. Refusals that name an hc
-command, such as turning keep off, already use that form. Then run
-`tabcli close-session <session> --explicit` again. What that close does with the removed
-terminal depends on what TAB verifies about the session's owner at that moment:
-
-- When TAB cannot verify a live owner (and no teardown intent is saved), the close settles the
-  session only when the handle itself is whole and the recorded core, recognised by its
-  permanent ID, answers that the address is not found. A handle is whole when its host PID, host
-  birth and launch label pass checks derived from what released TAB versions wrote on this
-  platform (its wire spelling is not examined, since that close ends nothing and removes only a
-  terminal the recorded core identifies). Before it asks any core, this close refuses any other
-  handle: one with no usable terminal address or core, a host PID this platform's process
-  reader never reports, a host birth no TAB writer on this platform records, or a launch label
-  that is not 32 lowercase hexadecimal digits (an explicit `null` included; on Windows, also
-  none). The error names the field and retains the handle, and ending or removing the terminal
-  does not change that refusal.
-- When TAB verifies a live owner, the close needs its full ownership proof, which a removed
-  terminal fails. On Windows the close then refuses and keeps the handle while that owner
-  stays live. On macOS and Linux the proven absence leads TAB to end the owner, under the
-  checks of the owner teardown in [Ownership and close](#ownership-and-close), and the session
-  closes once its process group is gone. The checks of the creation record and launch label above do not
-  apply to this close; a handle with no usable terminal address or core is still refused
-  before any core is asked.
-- On macOS and Linux, if a teardown intent is saved, the close resumes it under 0.4.49's rules,
-  and a close-intent file TAB cannot read, or that is not JSON, refuses the close (see above).
-
-TAB has no command that repairs a handle: keep the session directory as it is for diagnosis.
 
 Codex requires stable 0.169.0 or newer here: `--terminal herdr` refuses an older Codex, and
 inside an hc terminal the automatic choice gives it Ghostty (macOS) or tmux (Linux) instead.
@@ -298,6 +199,19 @@ TAB removes the caller identity rather than forcing persistence on a nested sess
 core's environment for other terminals. TAB reads only the visible screen (`lines=0`) and
 never scrolls history. It cannot atomically compare a dialog and press a key through hc, so
 workspace trust dialogs must be handled by the user through Herdr or `hc attach`.
+
+### Closing a Herdr session
+
+If TAB cannot verify a live owner and refuses to close a running terminal, wait for it to
+finish or end it on the recorded core, then run `tabcli close-session <session> --explicit`.
+Before ending it yourself, run `tabcli doctor <session> --probe` and check with `hc get
+<address>` on that core that the program arguments name this session's directory.
+See [Close by creation record](agents/herdr.md#close-by-creation-record) for the close rule
+and its limits.
+
+In 0.4.49 an explicit close could end a running Herdr terminal after a failed start or when
+resuming an ordinary close whose owner was gone. Windows dead-owner repair could also end it.
+These cases now leave the running terminal for you.
 
 ### Herdr Core on native Windows
 
@@ -331,15 +245,8 @@ receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. 
 its Windows initial prompt is pasted and then submitted against the exact console screen, which
 Herdr cannot do, so use `--terminal windows-console` for it; inside an hc terminal the automatic
 choice already gives it the managed console. The returned `attach_command` is a
-PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close with a
-live owner ends the whole terminal. Closing follows the rules for macOS and Linux above: when a
-provider ends on its own, run `tabcli close-session <session> --explicit` to remove its finished
-terminal, and a terminal that still runs after its session's owner is gone is never ended by
-TAB: end it with the `hc kill` command the refusal names, then close again. Up to 0.4.49 on
-Windows, listing sessions, `tell` or an attached `ask` or `tell` removed it themselves, and
-ended a still running terminal of a session whose owner was gone. If the
-core cannot be reached, the session keeps its handle and a later close finishes it. Only Pi
-has been run live on Windows Herdr.
+PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. For close, see
+[Closing a Herdr session](#closing-a-herdr-session). Only Pi has been run live on Windows Herdr.
 
 ## Linux / tmux
 
@@ -608,10 +515,7 @@ prune them.
 A dead owner does not prove that its surface closed (#69). Inspect the session and use `tabcli
 close-session SESSION --explicit` to close a retained surface. Repair first checks whether a
 completed result needs publication. On macOS, Terminal.app, Ghostty, WezTerm, and Warp keep handles
-for surfaces that can outlive their owner, as tmux does on Linux and Herdr does on macOS, Linux
-and Windows. A Herdr terminal is then closed by its own recorded creation and a tmux server by
-its recorded birth (see their sections above); the macOS surfaces follow the rules below.
-Terminal.app, WezTerm, and Warp record a close intent
+for surfaces that can outlive their owner. Terminal.app, WezTerm, and Warp record a close intent
 before their live-owner close operation. An interrupted close can resume only when the intent
 matches the same session, surface, and owner record, and that owner's recorded incarnation is
 proven gone. Those records do not grant permission to signal another process.
@@ -621,7 +525,6 @@ retry after the owner ends. Without separate failed-start close authority or pro
 is absent, TAB refuses the close and retains the handle. Check the named surface in Ghostty.
 
 Windows repair can close the managed console whose owner exited, using the same close checks.
-It leaves a Herdr terminal for `close-session --explicit`, as on macOS and Linux.
 Missing or unreadable evidence can stop repair. Run
 `sessions` to attempt repair. Use `inspect`, timeline, `result`, `search`, or `doctor` when you want
 to read the records without changing them.

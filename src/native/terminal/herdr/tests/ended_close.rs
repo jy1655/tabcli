@@ -267,7 +267,7 @@ fn ended_close_checks_the_launch_label_with_current_and_legacy_records() {
     }
 }
 
-// A Herdr terminal is never closed on the surface alone (review round 8, finding 1): when the
+// A Herdr terminal is never closed on the surface alone: when the
 // decision leaves the close to the surface alone, the adapter closes on the creation record. It
 // refuses a running terminal with nothing sent, removes a finished one and settles an absent
 // one on `not_found` from the recorded core.

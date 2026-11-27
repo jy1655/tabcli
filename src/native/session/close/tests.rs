@@ -3854,7 +3854,7 @@ fn entries(directory: &Path) -> Vec<Entry> {
 
 type Entry = (PathBuf, Option<Vec<u8>>);
 
-// Review round 2, finding 7: only a Herdr close on its creation record keeps the stored
+// Only a Herdr close on its creation record keeps the stored
 // diagnosis. The explicit close of another retained surface whose owner is gone records what
 // it recorded before os-parity: here the window is absent and the closed record adds nothing.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

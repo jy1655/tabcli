@@ -1074,7 +1074,7 @@ fn close_kills_then_removes_and_repeats_idempotently() {
 
 // The launch label is part of the creation record that a close without a live owner relies
 // on. The close with a live, attested owner and the read-only presence probe keep the
-// identity they had before (review round 2, finding 8): a relabelled terminal whose program,
+// identity they had before: a relabelled terminal whose program,
 // directory and birth still verify is closed by its owner and reported present.
 #[test]
 fn ordinary_close_removes_a_finished_terminal_with_a_changed_launch_label() {
@@ -2428,7 +2428,7 @@ mod ended_close;
 // os-parity: Repair and explicit close of a terminal whose owner is verified gone, on every OS.
 mod owner_gone;
 
-// Review round 4 (the seal around the mutation calls): in production code only `linked.rs`, the
+// In production code only `linked.rs`, the
 // verified connection, names `terminal.kill` or `terminal.rm`, and it sends them only for a
 // grant. This fails if either name appears in any other production source, where a request with
 // it could be built. Test sources are not production code: the scripted core receives these

@@ -296,7 +296,7 @@ mod tests {
     }
 
     // An explicit `null` launch label is kept as read: it is neither the legacy omission nor a
-    // label (review round 4, finding 3). The accessors exist where Herdr does.
+    // label. The accessors exist where Herdr does.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn a_null_launch_label_is_kept_apart_from_an_omitted_one() {

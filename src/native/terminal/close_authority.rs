@@ -1178,7 +1178,7 @@ mod projected_authority_tests {
                 CloseCause::Explicit,
                 created(true),
             ),
-            // Review round 5, finding 2: this session's owner that cannot be inspected decides
+            // This session's owner that cannot be inspected decides
             // nothing; the creation record removes a finished terminal and settles an absent one.
             (
                 "uninspectable owner",
@@ -1189,7 +1189,7 @@ mod projected_authority_tests {
                 CloseCause::Explicit,
                 created(false),
             ),
-            // Review round 5, finding 3: a record that carries another platform's incarnation
+            // A record that carries another platform's incarnation
             // fields contradicts itself, even with a matching live local incarnation.
             (
                 "contradictory record, another platform's birth, live",
@@ -1209,7 +1209,7 @@ mod projected_authority_tests {
                 CloseCause::Explicit,
                 created(false),
             ),
-            // Review round 6, finding 1: the whole decoded record, nested identities included.
+            // The whole decoded record, nested identities included.
             (
                 "contradictory record, another platform's nested identity, live",
                 Record::ConflictingNested,
@@ -1219,7 +1219,7 @@ mod projected_authority_tests {
                 CloseCause::Explicit,
                 created(false),
             ),
-            // Review round 3, finding 4: only this session's process refuses when it cannot be
+            // Only this session's process refuses when it cannot be
             // inspected; another session's or an unbound record's process is not inspected.
             (
                 "another session's owner, uninspectable",
@@ -1409,11 +1409,11 @@ mod projected_authority_tests {
         assert_eq!(observation.calls(), reads);
     }
 
-    // Review round 4, finding 6: a kind whose core keeps its terminals reads the owner record
+    // A kind whose core keeps its terminals reads the owner record
     // once, as one typed result. The scripted presence stands for an earlier read that found the
     // record, and the directory now in its place for the record replaced before a later read:
     // with one read, that read meets the replacement. Its failure verifies no live owner, so the
-    // close takes the creation record (review round 5, finding 2), with the failure kept for the
+    // close takes the creation record, with the failure kept for the
     // refusal of a running terminal.
     #[test]
     fn a_core_kept_terminal_reads_its_owner_record_once() {

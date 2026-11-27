@@ -887,7 +887,7 @@ fn a_failed_or_unanswered_removal_is_finished_by_the_next_close() {
     assert_eq!(fixture.mutations(), (0, 0));
     fixture.assert_closed("close after an unanswered removal");
 
-    // Review round 7, finding 5: with an owner record that cannot be read, a refusal after the
+    // With an owner record that cannot be read, a refusal after the
     // first read keeps its own error and, once, why TAB could not verify a live owner: a refused
     // second read, a refused removal, and a confirming read that still finds the terminal. The
     // next close removes the finished terminal.
@@ -960,7 +960,7 @@ fn a_failed_or_unanswered_removal_is_finished_by_the_next_close() {
 }
 
 // Every Windows Herdr handle TAB has written (0.4.47 on) records its launch label, so one
-// without it cannot be proven TAB's and is never ended or removed (review finding 4). The
+// without it cannot be proven TAB's and is never ended or removed. The
 // name fallback stays for the macOS and Linux handles of 0.4.45 and 0.4.46. Runs on the
 // Windows runner only.
 #[cfg(windows)]
@@ -987,7 +987,7 @@ fn a_windows_handle_without_its_launch_label_is_refused() {
     fixture.assert_retained("Windows handle without a launch label", SessionState::Ready);
 }
 
-// One removal and one confirmation (review finding 7). `not_found` from the recorded core
+// One removal and one confirmation. `not_found` from the recorded core
 // answers the removal itself: the terminal is absent and the close asks nothing more. A
 // removal the core acknowledged while the next read still lists the terminal is not sent
 // again: the handle is kept for the next close.
@@ -1026,8 +1026,7 @@ fn a_removal_is_sent_once_and_confirmed_once() {
     fixture.assert_retained("acknowledged removal still listed", SessionState::Ready);
 }
 
-// A Herdr close keeps the diagnosis the session already holds (review findings 8 and, in round
-// 2, 7): the closed record carries the stored failure read under the lifecycle lock.
+// A Herdr close keeps the diagnosis the session already holds: the closed record carries the stored failure read under the lifecycle lock.
 #[test]
 fn an_explicit_close_keeps_the_sessions_diagnosis() {
     let fixture = Fixture::new("exited", &complete_owner());
@@ -1041,7 +1040,7 @@ fn an_explicit_close_keeps_the_sessions_diagnosis() {
     );
 
     // Without a stored diagnosis, an owner observed gone records its generated reason, as
-    // 0.4.49's Repair did (review round 3, finding 8).
+    // 0.4.49's Repair did.
     let fixture = Fixture::new("working", &complete_owner());
     fixture.finish();
     fixture.close(exited, false).unwrap();
@@ -1066,7 +1065,7 @@ fn an_explicit_close_keeps_the_sessions_diagnosis() {
 // close holds that lock from its claim to its restore. A close that refuses and restores its
 // handle between the scan's two reads leaves both reads empty; Repair must then find the
 // handle again under the lock before it settles the session, or the restored handle is
-// consumed and the terminal is stranded (review finding 1; 0.4.49 had the same interleaving on
+// consumed and the terminal is stranded (0.4.49 had the same interleaving on
 // macOS and Linux, and on Windows in exited and failed sessions). Repair takes the lifecycle
 // lock first to recover a pending completion, then scans; the hook restores the handle at the
 // next lifecycle lock, the first one after the scan.
@@ -1128,7 +1127,7 @@ fn repair_finds_a_restored_handle_again_under_the_lifecycle_lock() {
 }
 
 // An attached `ask` or `tell` returns as soon as the owner is gone, on every OS, without
-// changing a Record (review finding 6): Repair now leaves the terminal on Windows too, so the
+// changing a Record: Repair now leaves the terminal on Windows too, so the
 // wait no longer learns of the owner's death from a closed session. The owner is a reaped
 // process that the OS observes for real.
 #[test]
@@ -1270,8 +1269,7 @@ fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
         CloseOutcome::Missing
     );
     assert!(fixture.core.methods().is_empty());
-    // A terminal its core keeps is never closed on the surface alone (review round 8, finding
-    // 1): that decision closes on the creation record with the decision's own result, which
+    // A terminal its core keeps is never closed on the surface alone: that decision closes on the creation record with the decision's own result, which
     // keeps no diagnosis. A running terminal is refused with nothing sent; a finished one is
     // removed.
     let surface_only = || {
@@ -1294,7 +1292,7 @@ fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
     assert!(fixture.console.methods().is_empty());
 }
 
-// Review round 2, finding 1: a record that names a live process which is not this session's
+// A record that names a live process which is not this session's
 // owner (another session's owner, or a recycled PID in a PID-only record) never strands the
 // session. The running terminal is retained; once it has been ended on its recorded core,
 // the same command removes it while that other process stays alive, and an absent terminal
@@ -1346,7 +1344,7 @@ fn a_live_process_that_is_not_this_sessions_owner_never_strands_the_session() {
     }
 }
 
-// Review round 2, finding 2, under the owner's decision of 2026-11-26: a session whose own
+// Under the owner's decision of 2026-11-26: a session whose own
 // wrapper recorded its end (`exited`) still keeps its running terminal, whatever the owner
 // record says; once the terminal has finished, the same command removes it.
 #[test]
@@ -1386,7 +1384,7 @@ fn a_session_that_recorded_its_own_end_still_keeps_its_running_terminal() {
     }
 }
 
-// Review round 2, finding 3: a cleanup after another command (a refused reopen) never ends or
+// A cleanup after another command (a refused reopen) never ends or
 // removes a terminal that no live owner holds, the failed start included, and settles no
 // absent one: it sends nothing and keeps the handle and the state.
 #[test]
@@ -1420,7 +1418,7 @@ fn a_cleanup_never_acts_on_a_terminal_without_a_live_owner() {
     }
 }
 
-// Review round 2, finding 4: a session without an owner record may have a wrapper that is
+// A session without an owner record may have a wrapper that is
 // registering, so its running terminal is kept; a finished one is removed and an absent one
 // settled.
 #[test]
@@ -1456,7 +1454,7 @@ fn a_session_without_an_owner_record_keeps_its_running_terminal() {
 /// A handle damage for the absence test.
 type Damage = fn(&mut serde_json::Map<String, Value>);
 
-// Review rounds 2 to 4 (finding 6, then 3 and 4): a close settles an absent terminal from its
+// A close settles an absent terminal from its
 // creation record when the decoded host PID, host birth and launch label pass the checks derived
 // from the released writers. Each accepted row is one released writer's output, as its tag's
 // source writes it:
@@ -1464,7 +1462,7 @@ type Damage = fn(&mut serde_json::Map<String, Value>);
 // Linux, Windows) save the 32 lowercase hexadecimal digits their generator wrote; the host PID is
 // one the core reported and the platform's reader returned a birth for; the host birth is the
 // platform's own kind (0.4.45's flat macOS fields are the same wire). Each refused row damages
-// one field in a way a review named, and the refusal names that field before the core's
+// one field, and the refusal names that field before the core's
 // `not_found` can settle the handle.
 #[test]
 fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_it() {
@@ -1700,7 +1698,7 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
     }
 }
 
-// Review round 4, finding 3: a legacy macOS or Linux handle has no saved label, so its terminal's
+// A legacy macOS or Linux handle has no saved label, so its terminal's
 // label is checked as the generators wrote it (32 lowercase hexadecimal digits) before it is
 // compared with the terminal's name. A label of the name's 24 digits, or in upper case, is not
 // TAB's, and the finished terminal is left alone.
@@ -1730,7 +1728,7 @@ fn a_legacy_handle_accepts_only_a_launch_label_as_written() {
     }
 }
 
-// Review round 2, finding 7: the closed record of a Herdr close keeps the stored diagnosis read
+// The closed record of a Herdr close keeps the stored diagnosis read
 // under the lifecycle lock, the failed start included.
 #[test]
 fn a_failed_start_close_keeps_its_launch_diagnosis() {
@@ -1742,7 +1740,7 @@ fn a_failed_start_close_keeps_its_launch_diagnosis() {
     assert_eq!(closed.error.as_deref(), Some("provider launch timed out"));
 }
 
-// Review round 2, finding 9: a refusal's recovery command names the recorded core's endpoint.
+// A refusal's recovery command names the recorded core's endpoint.
 #[test]
 fn the_keep_refusal_names_the_recorded_core() {
     let fixture = Fixture::new("ready", &complete_owner());
@@ -1750,7 +1748,7 @@ fn the_keep_refusal_names_the_recorded_core() {
     let text = error_text(&fixture.close(exited, false).unwrap_err());
     assert!(text.contains("HC_SOCKET"), "{text}");
     assert!(text.contains("keep t7 --off"), "{text}");
-    // Review round 4, finding 9: the refusal says that the recorded core answered, which
+    // The refusal says that the recorded core answered, which
     // `doctor --probe` shows as its unverified detail.
     assert!(
         text.contains("on the recorded Herdr Core core-a, which answered at its endpoint"),
@@ -1901,7 +1899,7 @@ fn the_one_granting_function_grants_only_what_its_evidence_establishes() {
     }
 }
 
-// Review round 3, finding 4, and round 5, finding 2: whatever record names an owner whose
+// Whatever record names an owner whose
 // process cannot be inspected, and while it stays uninspectable, the close never strands the
 // session. Another session's or an unbound record's process is not even inspected; this
 // session's own owner that cannot be inspected verifies no live owner. The running terminal is
@@ -1951,7 +1949,7 @@ fn an_uninspectable_owner_process_never_strands_the_session() {
     }
 }
 
-// Review round 3, finding 8: the stored diagnosis survives a close interrupted after its handle
+// The stored diagnosis survives a close interrupted after its handle
 // consumption marker and before its closed record. The retry finishes from the marker without
 // the adapter, and the marker carries the reason on every OS.
 #[test]
@@ -1978,7 +1976,7 @@ fn an_interrupted_close_keeps_the_diagnosis_across_its_consumption_marker() {
     assert_eq!(closed.error.as_deref(), Some("provider launch timed out"));
 }
 
-// Review rounds 3 and 4 (finding 1): a grant is minted only from an observation the verified
+// A grant is minted only from an observation the verified
 // connection produced, which names that connection's core. `grant` takes no core id from its
 // caller and refuses an observation from another core; a grant for one core is not sent on a
 // connection to another; a plain call naming either mutation is not sent. Two cores both hold
@@ -2040,7 +2038,7 @@ fn a_grant_names_the_core_that_reported_its_terminal() {
     );
 }
 
-// Review round 4, finding 7: a replay keeps the committed consumption marker. A close whose
+// A replay keeps the committed consumption marker. A close whose
 // pre-close Repair failed (another session's record, its process uninspectable) and whose
 // session stored a diagnosis commits both in the marker. The retry after an interruption there
 // records that combined reason once, and a later explicit close of the closed session keeps the
@@ -2081,7 +2079,7 @@ fn a_replayed_consumption_marker_keeps_its_combined_reason_once() {
     assert_eq!(closed.error.as_deref(), Some(committed.as_str()));
 }
 
-// Review round 4, finding 6, and round 5, finding 2: the close reads the owner record once. A
+// The close reads the owner record once. A
 // record that cannot be read (here a directory in its place) verifies no live owner, on every
 // OS: a running terminal is kept, with the read failure in the refusal, and once it has
 // finished the same command removes it.
@@ -2094,7 +2092,7 @@ fn an_owner_record_that_cannot_be_read_never_strands_the_session() {
     fixture.core.clear_calls();
     let text = error_text(&fixture.close(exited, false).unwrap_err());
     assert!(text.contains(STILL_RUNNING), "{text}");
-    // The running refusal states why in its own text, and only there (review round 7, 5).
+    // The running refusal states why in its own text, and only there.
     assert_eq!(
         text.matches("its owner record could not be read").count(),
         1,
@@ -2135,7 +2133,7 @@ fn the_running_refusal_names_what_works() {
         assert!(text.contains(&command), "{verb}: {text}");
     }
     assert!(text.contains("run close-session again"), "{text}");
-    // Review round 5, finding 10: what TAB established, the recorded core, and the checks the
+    // What TAB established, the recorded core, and the checks the
     // guide asks for before a manual kill.
     assert!(
         text.contains("TAB could not verify a live owner for this session"),
@@ -2151,7 +2149,7 @@ fn the_running_refusal_names_what_works() {
     assert_eq!(fixture.mutations(), (0, 0));
 }
 
-// Review round 5, finding 4: the mint compares the terminal address as well as the core with
+// The mint compares the terminal address as well as the core with
 // its basis. A terminal at another address on the same core, identical in everything else, gets
 // no grant.
 #[test]
@@ -2185,7 +2183,7 @@ fn a_grant_names_the_address_its_basis_records() {
     assert_eq!(fixture.mutations(), (0, 0));
 }
 
-// Review round 5, finding 8: a replay keeps a committed consumption marker's bytes and writes a
+// A replay keeps a committed consumption marker's bytes and writes a
 // damaged one again (not JSON, or `consumed: false`), as before os-parity, sending nothing to the
 // core either way.
 #[test]
@@ -2250,7 +2248,7 @@ fn a_replay_keeps_a_committed_marker_and_repairs_a_damaged_one() {
     );
 }
 
-// Review round 5, finding 12: the close with a live owner is unchanged by the owner's decision.
+// The close with a live owner is unchanged by the owner's decision.
 // Its ownership proof needs the terminal present and running on its recorded core. The surface
 // part of that proof is the production one here (`verify_surface` through the Herdr adapter on
 // the scripted core): a finished terminal fails it on every OS; an absent one fails it on
@@ -2333,7 +2331,7 @@ fn a_live_owner_close_needs_its_terminal_running() {
     }
 }
 
-// Review round 6, finding 3: the attestation reads the owner's birth, then its control identity.
+// The attestation reads the owner's birth, then its control identity.
 // When the birth matched but the control read finds no process at the PID, the owner exited
 // during attestation: the decision takes the creation record (with the diagnosis), instead of
 // choosing the close with a live owner and refusing there. macOS and Linux only.
@@ -2396,7 +2394,7 @@ fn an_owner_that_exits_between_its_two_reads_takes_the_creation_record() {
     assert_eq!(fixture.mutations(), (0, 0));
 }
 
-// Review round 7, findings 1 to 4 (the coordinator's ruling): a close with a live owner that
+// A close with a live owner that
 // proved its terminal absent records a teardown intent before it ends the owner. A close that
 // finds such an intent saved follows 0.4.49's replay rules exactly; the creation-record rule of
 // os-parity applies only when no teardown intent is saved. Here the interrupted teardown's
@@ -2463,7 +2461,7 @@ fn an_interrupted_teardown_keeps_the_replay_of_0_4_49() {
     }
 }
 
-// Review round 8, finding 1: the reviewer's interleaving. A failed session's saved teardown
+// A failed session's saved teardown
 // intent validates against its owner record, and the record then disappears before the decision
 // reads whether one is present. The decision, 0.4.49's code, leaves the close to the surface
 // alone (`SurfaceOnly`). The Herdr adapter then does the creation-record operation: it asks the
@@ -2592,7 +2590,7 @@ fn a_replayed_intent_whose_owner_goes_after_validation_closes_on_the_creation_re
     assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
-// Review round 6, finding 4: the close with a live owner needs its full ownership proof. A bound
+// The close with a live owner needs its full ownership proof. A bound
 // record whose birth matches but which lacks the TTY and process-group fields is refused by the
 // production proof (the Herdr adapter's surface check, then the owner check, here with the
 // process reads scripted), and nothing is sent. macOS and Linux only.
@@ -2668,7 +2666,7 @@ fn a_live_owner_without_its_control_record_is_refused_by_the_full_proof() {
     assert_eq!(fixture.mutations(), (0, 0));
 }
 
-// Review round 6, finding 5: a refusal on the creation record keeps why no live owner was
+// A refusal on the creation record keeps why no live owner was
 // verified, beside its own recovery instructions (here a running terminal set to keep, with an
 // owner record that cannot be read); the cleanup after a refused reopen says that TAB could not
 // verify a live owner.
