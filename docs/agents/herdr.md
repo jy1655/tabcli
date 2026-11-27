@@ -344,7 +344,7 @@
   A `reopen` reaches that choice only for an eligible closed Claude source (Agy, Pi and Codex
   cannot reopen), which now gets Herdr after the caller check; 0.4.49 and earlier gave it the
   console.
-- A Herdr handle on Windows never reaches the console control helper: the seven surface
+- A Herdr handle on Windows never reaches the console control helper: the eight surface
   operations resolve its adapter through the one Windows lookup (`windows/dispatch.rs`), and
   guarded dialog input answers with Herdr's declared refusal first, as on the other platforms.
   Pi and Agy keep their Windows framing, readiness and receipts; only the transport is
