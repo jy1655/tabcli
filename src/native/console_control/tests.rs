@@ -529,13 +529,7 @@ fn isolated_root(test: &str, child: &str) -> Option<PathBuf> {
         )
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    crate::native::tests::assert_child_ran_this_test(&output);
     None
 }
 
@@ -1161,13 +1155,7 @@ fn console_helpers_explicitly_forward_only_the_selected_state_root() {
                 "helper environment test",
             )
             .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            crate::native::tests::assert_child_ran_this_test(&output);
         }
         return;
     }

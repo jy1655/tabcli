@@ -34,6 +34,8 @@ pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
     spec: SessionSpec,
     terminal_kind: terminal::TerminalKind,
+    // The automatic fallback reason to log once the Session exists.
+    herdr_refusal: Option<anyhow::Error>,
     // The initial-prompt Transport selected by post-probe surface admission, carried
     // straight into initial delivery so delivery cannot re-decide it independently.
     initial_transport: Box<dyn delivery::Transport>,
@@ -61,6 +63,7 @@ impl Resolved {
         Self {
             spec,
             terminal_kind,
+            herdr_refusal: None,
             initial_transport,
             context_sources,
             consent,
@@ -79,6 +82,13 @@ impl Resolved {
     ) -> Result<(Prepared, T)> {
         let provider = self.spec.provider;
         let (created, source) = create(self.spec, self.consent.as_ref())?;
+        if let Some(reason) = self.herdr_refusal {
+            let reason = agent_bridge::terminal_safe_text(&format!("{reason:#}"), false);
+            launch::log(
+                &Store::open_unchecked(&created.directory),
+                &format!("Herdr was not used for this launch: {reason}"),
+            );
+        }
         Ok((
             Prepared {
                 created,
@@ -274,7 +284,7 @@ pub(super) fn resolve_with(
     let Admitted {
         kind: terminal_kind,
         initial_transport,
-        ..
+        herdr_refusal,
     } = admit_choice(provider, surface, Some(&provider_version))?;
     // An automatic choice that ends on Herdr launches there only if its caller check passed.
     if terminal_kind == terminal::TerminalKind::Herdr
@@ -318,6 +328,7 @@ pub(super) fn resolve_with(
         terminal_kind,
         initial_transport,
         context_sources,
+        herdr_refusal,
         consent: Some(consent),
     })
 }
@@ -350,10 +361,10 @@ pub(super) enum CallerCheck {
 // The terminal a launch asked for or its caller's environment selects, the one entry of `ask`
 // and `reopen`, each at its own place in its order (`Resolution::surface`), and the caller
 // check of an automatic Herdr choice, run there as in 0.4.49. Selection reads the environment
-// only and is the same on every platform: an explicit `--terminal` (`requested`) wins, and the
-// platform's selection decides whether to accept it here or to leave a kind it does not run
-// to its adapter; otherwise inside an hc terminal it is Herdr, with the Surface this platform
-// chooses outside Herdr as its fallback, and elsewhere that Surface.
+// only. Every platform selects an explicit `--terminal` (`requested`) or refuses it here
+// before creating a session if it does not run that kind. Without an explicit request, an hc
+// terminal selects Herdr with the platform's usual Surface as its fallback; elsewhere the
+// platform selects its usual Surface.
 //
 // An automatic Herdr choice proves that this process runs in the caller's Herdr terminal on
 // the running core (`terminal::admit_selection`, the only step that opens a connection). A

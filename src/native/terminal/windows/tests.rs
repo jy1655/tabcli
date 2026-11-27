@@ -1245,8 +1245,8 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
         "iTerm2 is not available on Windows; use windows-console or herdr"
     );
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
-    // The managed console's open, which the installed lookup gives every kind but Herdr,
-    // refuses another kind before any process, binding or unbinding.
+    // The installed lookup refuses another kind's open with the same text, before any
+    // process, binding or unbinding.
     let refused = terminal::open_bound_tab(
         terminal::TerminalKind::Iterm2,
         "command",
@@ -1256,19 +1256,26 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
         || unreachable!("a refused kind is never unbound"),
     )
     .unwrap_err();
-    assert_eq!(format!("{refused:#}"), "iTerm2 is not available on Windows");
+    assert_eq!(
+        format!("{refused:#}"),
+        "iTerm2 is not available on Windows; use windows-console or herdr"
+    );
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
 }
 
-// A handle of a kind that Windows does not run keeps the managed console's answers behind the
-// Windows lookup, as before it: a stored WezTerm record whose pane id 0 names no process is a
-// missing surface to doctor's probe, the ownership proof goes on to the owner record, and an
-// open checks its startup deadline before it refuses the kind.
+// A stored handle of a kind that Windows does not run is refused by the installed lookup, as on
+// macOS and Linux, and never reaches the console helper: doctor's probe of a WezTerm record
+// whose pane id 0 names no process is unverified, not a missing surface; the ownership proof
+// refuses it before the owner record; a send is known unsent; screen, close and presence get
+// the same refusal; an open gets it even with an expired deadline; guarded input answers with
+// WezTerm's declared refusal first, as on every OS.
 #[test]
-fn another_kinds_handle_keeps_the_managed_console_answers() {
+fn another_kinds_handle_is_refused_by_the_installed_lookup() {
     use crate::native::doctor;
+    use crate::native::failure_kind::{FailureKind, classify};
     use crate::native::query::observation::{SessionEvidence, judgment::SurfacePresence};
     use crate::native::session::{Reader, Store};
+    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-foreign");
     fs::create_dir(&directory).unwrap();
@@ -1281,36 +1288,57 @@ fn another_kinds_handle_keeps_the_managed_console_answers() {
     let evidence = SessionEvidence::read(&reader, Ok(false));
     let presence =
         evidence.judge_surface_presence(&reader, Instant::now() + Duration::from_secs(2));
-    assert_eq!(*presence, SurfacePresence::Missing);
+    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
     assert_eq!(
         doctor::surface_presence_check(presence).reason_code,
-        "terminal_surface_missing"
+        "terminal_surface_unverified"
     );
 
-    let error = terminal::ownership::verified_terminal_surface_owner(
-        &directory,
-        "session-foreign",
-        &handle,
-        Some(Duration::from_secs(5)),
-    )
-    .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("requires a live native-session owner"),
-        "{error:#}"
-    );
-
-    let error = terminal::open_bound_tab(
-        terminal::TerminalKind::WezTerm,
-        "command",
-        Path::new("unused"),
-        Instant::now(),
-        |_| unreachable!("a refused open is never bound"),
-        || unreachable!("a refused open is never unbound"),
-    )
-    .unwrap_err();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let prompt = directory.join("prompt.txt");
+    fs::write(&prompt, "hello").unwrap();
+    let failure = terminal::send_file(&handle, &prompt, deadline).unwrap_err();
+    assert!(!failure.delivery_may_have_occurred());
+    let errors = [
+        terminal::ownership::verified_terminal_surface_owner(
+            &directory,
+            "session-foreign",
+            &handle,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap_err(),
+        failure.into_error(),
+        terminal::read_screen(&handle, deadline).unwrap_err(),
+        terminal::close_session_until(&directory, &handle, deadline).unwrap_err(),
+        terminal::surface_present(&directory, &handle, Duration::from_secs(5)).unwrap_err(),
+        terminal::open_bound_tab(
+            terminal::TerminalKind::WezTerm,
+            "command",
+            Path::new("unused"),
+            Instant::now(),
+            |_| unreachable!("a refused open is never bound"),
+            || unreachable!("a refused open is never unbound"),
+        )
+        .unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(format!("{error:#}"), refusal);
+        assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+    }
+    let input = terminal::GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
+        screen: String::new(),
+        key: terminal::DialogKey::Enter,
+    };
     assert_eq!(
-        format!("{error:#}"),
-        "Windows console startup timeout leaves no room for exact process cleanup"
+        terminal::guarded_dialog_input(&directory, &handle, &input, deadline)
+            .unwrap_err()
+            .to_string(),
+        terminal::TerminalKind::WezTerm
+            .registration()
+            .guarded_input_refusal
+            .unwrap()
     );
 }
 

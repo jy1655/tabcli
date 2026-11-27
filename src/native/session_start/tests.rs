@@ -648,14 +648,7 @@ mod resolution {
                 .env_remove("PI_CODING_AGENT_DIR")
                 .output()
                 .unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                out.status.success()
-                    && stdout.contains("running 1 test")
-                    && stdout.contains("1 passed"),
-                "stdout:\n{stdout}\nstderr:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            crate::native::tests::assert_child_ran_this_test(&out);
             return;
         }
         let root = Reader::state_root().unwrap();
@@ -1483,12 +1476,7 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
             .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::native::tests::assert_child_ran_this_test(&out);
         return;
     }
 
@@ -1976,29 +1964,21 @@ fn admit_choice_gives_an_automatic_herdr_its_fallback_and_keeps_explicit_refusal
     }
 }
 
-// Post-probe surface admission hands its selected initial Transport straight into Resolved
-// and Prepared so initial delivery cannot re-select a transport independently.
-#[test]
-fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
-    use crate::native::delivery::Readiness;
+fn isolated_resolution_root() -> Option<PathBuf> {
     use crate::native::session::primitives::STATE_DIR_ENV;
     use std::process::Command;
 
-    const CHILD: &str = "TABCLI_START_ADMITTED_TRANSPORT_CHILD";
+    const CHILD: &str = "TABCLI_START_RESOLUTION_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let base = tempfile::tempdir().unwrap();
         let codex_home = base.path().join("codex");
         fs::create_dir_all(&codex_home).unwrap();
         let root = base.path().join("state");
         fs::create_dir(&root).unwrap();
-        let test_name = format!(
-            "{}::resolve_with_carries_the_admitted_initial_transport_into_prepared",
-            module_path!()
-                .split_once("::")
-                .map_or(module_path!(), |(_, rest)| rest)
-        );
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env(STATE_DIR_ENV, &root)
             .env("HOME", base.path())
@@ -2008,51 +1988,66 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
             .env_remove("PI_CODING_AGENT_DIR")
             .output()
             .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
+        crate::native::tests::assert_child_ran_this_test(&out);
+        return None;
     }
 
-    let root = Reader::state_root().unwrap();
+    Some(Reader::state_root().unwrap())
+}
+
+fn resolve_surface_fixture(
+    root: &Path,
+    provider: FirstPartyCli,
+    surface: terminal::Selection,
+    version: &str,
+) -> Resolved {
     let project = root.parent().unwrap().join("project");
     fs::create_dir_all(&project).unwrap();
-    let resolve_case = |provider, surface, version: &str| {
-        let ask = AskRequest {
-            provider,
-            workspace: project.clone(),
-            prompt: "fixture prompt".into(),
-            title: None,
-            model: None,
-            effort: None,
-            terminal: None,
-            yolo: false,
-            timeout: Duration::from_secs(30),
-            detach: false,
-            json: false,
-            context_results: Vec::new(),
-        };
-        resolve_with(
-            fresh_resolution(
-                &ask,
-                context::resolve(&[]).unwrap(),
-                terminal::Selection::Kind(surface),
-                CallerCheck::NotNeeded,
-            ),
-            |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
-        )
-        .unwrap()
+    let ask = AskRequest {
+        provider,
+        workspace: project,
+        prompt: "fixture prompt".into(),
+        title: None,
+        model: None,
+        effort: None,
+        terminal: None,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+        context_results: Vec::new(),
     };
+    resolve_with(
+        fresh_resolution(
+            &ask,
+            context::resolve(&[]).unwrap(),
+            surface,
+            CallerCheck::NotNeeded,
+        ),
+        |_| Ok((PathBuf::from("provider-fixture"), version.to_owned())),
+    )
+    .unwrap()
+}
 
+// Post-probe surface admission hands its selected initial Transport straight into Resolved
+// and Prepared so initial delivery cannot re-select a transport independently.
+#[test]
+fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
+    use crate::native::delivery::Readiness;
+    let Some(root) = isolated_resolution_root() else {
+        return;
+    };
     let surface = if cfg!(windows) {
         terminal::TerminalKind::WindowsConsole
     } else {
         terminal::TerminalKind::Herdr
     };
-    let resolved = resolve_case(FirstPartyCli::Codex, surface, "codex-cli 0.169.0");
+    let resolved = resolve_surface_fixture(
+        &root,
+        FirstPartyCli::Codex,
+        terminal::Selection::Kind(surface),
+        "codex-cli 0.169.0",
+    );
     let expected_name = if cfg!(windows) {
         "terminal-paste-fallback"
     } else {
@@ -2075,13 +2070,56 @@ fn resolve_with_carries_the_admitted_initial_transport_into_prepared() {
         assert!(facts.surface.is_none());
     }
 
-    let claude = resolve_case(
+    let claude = resolve_surface_fixture(
+        &root,
         FirstPartyCli::Claude,
-        terminal::TerminalKind::Herdr,
+        terminal::Selection::Kind(terminal::TerminalKind::Herdr),
         "2.1.302",
     );
     assert_eq!(
         claude.initial_transport.facts().name,
         "provider-cross-session-message"
     );
+}
+
+#[test]
+fn create_logs_the_herdr_refusal_only_for_an_automatic_fallback() {
+    use terminal::{Selection, TerminalKind::Herdr};
+
+    let Some(root) = isolated_resolution_root() else {
+        return;
+    };
+    let provider = FirstPartyCli::Codex;
+    let version = "codex-cli 0.168.0";
+    let refusal = crate::native::provider::admit_surface(provider, Herdr, Some(version))
+        .err()
+        .expect("Codex 0.168.0 cannot launch on Herdr");
+    let fallback = platform_fallback();
+    let expected = format!("Herdr was not used for this launch: {refusal:#}");
+    for (selection, note) in [
+        (Selection::Herdr { fallback }, Some(expected.as_str())),
+        (Selection::Kind(fallback), None),
+    ] {
+        let resolved = resolve_surface_fixture(&root, provider, selection, version);
+        let (prepared, ()) = resolved
+            .create_with(|spec, _| {
+                Ok((
+                    create_session_within(&root, std::slice::from_ref(&root), spec)?,
+                    (),
+                ))
+            })
+            .unwrap();
+        let log = match fs::read_to_string(prepared.created.directory.join(launch::LOG)) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("could not read launch log: {error}"),
+        };
+        let notes: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(_, message)| message)
+            .filter(|message| message.starts_with("Herdr was not used for this launch"))
+            .collect();
+        assert_eq!(notes, note.as_slice(), "{log}");
+    }
 }

@@ -139,7 +139,7 @@ session-example/
 ├── initial-prompt.txt     Initial prompt as retained for delivery
 ├── status.json            Recorded state and error reason
 ├── launch.json            Launch claim, deadline, and spawn phase
-├── launch.log             Launch stages, errors, and exit codes
+├── launch.log             Launch stages, terminal fallback reason, errors, and exit codes
 ├── native-session.json    Owner identity used to check the surface
 ├── terminal.json          The bound surface
 ├── workspace-consent.json Workspace trust source and application

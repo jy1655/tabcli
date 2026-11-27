@@ -199,20 +199,105 @@ fn linux_registers_tmux_and_herdr() {
     assert_eq!(select(None).unwrap(), TerminalKind::Tmux);
     assert!(INSTALLED.adapter(TerminalKind::Tmux).is_ok());
     for kind in TerminalKind::ALL {
+        // The installed lookup serves exactly the kinds the Linux list names.
+        assert_eq!(
+            INSTALLED.adapter(kind).is_ok(),
+            OsTerminals::LINUX.runs(kind),
+            "{kind:?}"
+        );
         if matches!(kind, TerminalKind::Tmux | TerminalKind::Herdr) {
             continue;
         }
+        let refusal = format!(
+            "{} is not available on Linux; use tmux or herdr",
+            kind.display_name()
+        );
         let error = select(Some(kind)).unwrap_err();
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "{} is not available on Linux; use tmux or Herdr",
-                kind.display_name()
-            )
-        );
+        assert_eq!(error.to_string(), refusal);
         let error = INSTALLED.adapter(kind).err().unwrap();
         assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+        assert_eq!(error.to_string(), refusal);
+    }
+}
+// Every surface operation on a stored handle of a kind Linux does not run gets the installed
+// lookup's refusal before any adapter, as on macOS and Windows; only a kind's declared screen
+// or guarded-input refusal answers first.
+#[test]
+fn the_installed_lookup_refuses_every_operation_on_a_kind_linux_does_not_run() {
+    use super::super::{DialogKey, GuardedDialogInput, TerminalKind, posix};
+    use crate::native::failure_kind::{FailureKind, classify};
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-foreign");
+    std::fs::create_dir(&directory).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let input = GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
+        screen: "screen".into(),
+        key: DialogKey::Enter,
+    };
+    for kind in TerminalKind::ALL {
+        if matches!(kind, TerminalKind::Tmux | TerminalKind::Herdr) {
+            continue;
+        }
+        let refusal = format!(
+            "{} is not available on Linux; use tmux or herdr",
+            kind.display_name()
+        );
+        let session = TerminalSession::new(kind, "surface".into())
+            .with_binding(Some("session-foreign".into()));
+        let failure = posix::send_file(&INSTALLED, &session, &directory, deadline).unwrap_err();
+        assert!(!failure.delivery_may_have_occurred(), "{kind:?}");
+        let errors = [
+            posix::open_bound_tab(
+                &INSTALLED,
+                kind,
+                "command",
+                &directory,
+                deadline,
+                |_| panic!("a refused kind is never bound"),
+                || panic!("a refused kind is never unbound"),
+            )
+            .unwrap_err(),
+            failure.into_error(),
+            posix::verify_surface(&INSTALLED, &directory, &session, None).unwrap_err(),
+            posix::close_owned_session(
+                &INSTALLED,
+                &directory,
+                "session-foreign",
+                &session,
+                posix::OwnedSurfaceClose::SurfaceOnly,
+                deadline,
+            )
+            .unwrap_err(),
+            posix::surface_present(&INSTALLED, &directory, &session, Duration::from_secs(1))
+                .unwrap_err(),
+            posix::launch_surface(&INSTALLED, &directory, &session, Duration::from_secs(1))
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(format!("{error:#}"), refusal, "{kind:?}");
+            assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+        }
+        let registration = kind.registration();
+        let screen = posix::read_screen(&INSTALLED, &session, deadline).unwrap_err();
+        assert_eq!(
+            screen.to_string(),
+            registration
+                .screen_read_refusal
+                .map_or_else(|| refusal.clone(), str::to_owned),
+            "{kind:?}"
+        );
+        let guarded =
+            posix::guarded_dialog_input(&INSTALLED, &session, &input, deadline).unwrap_err();
+        assert_eq!(
+            guarded.to_string(),
+            registration
+                .guarded_input_refusal
+                .map_or_else(|| refusal.clone(), str::to_owned),
+            "{kind:?}"
+        );
     }
 }
 #[test]

@@ -489,12 +489,10 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
 fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated() {
     let fixture = ready("pi");
     let directory = &fixture.directory;
-    let platform_supports_terminals = cfg!(any(windows, target_os = "macos"));
-    let unbound = if platform_supports_terminals {
-        "surface_unbound"
-    } else {
-        "surface_unsupported"
-    };
+    // A handle that is not this session's is unbound on every OS, whether or not this OS
+    // runs its kind (on Linux `supported_kind` is Terminal.app); only a bound handle of a
+    // kind this OS does not run is unsupported.
+    let unbound = "surface_unbound";
     let other_platform = if cfg!(windows) {
         terminal::TerminalKind::AppleTerminal
     } else {
