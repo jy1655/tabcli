@@ -1,7 +1,8 @@
 use super::{TerminalSession, WindowsProcessIdentity};
 use anyhow::{Context, Result, ensure};
 
-/// A comparison used by process attestation; record and surface equality stay exact.
+/// A comparison used by process attestation and the console root presence probe;
+/// record and surface handle equality stay exact.
 #[derive(Debug)]
 pub(in crate::native) struct WindowsIncarnation(pub WindowsProcessIdentity);
 

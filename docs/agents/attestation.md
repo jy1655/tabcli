@@ -36,7 +36,9 @@
   terminal adapters, reopen, the Claude registry) map the four answers in their own vocabulary
   and keep their messages and authority.
 - Windows: the attestation compares executable paths case-insensitively; record and surface
-  handle equality stay exact. The observer opens with `PROCESS_QUERY_LIMITED_INFORMATION |
+  handle equality stay exact. The Windows console root presence probe uses the same observer,
+  maps exit and a different creation time to absence, and treats a same-birth image conflict as unverified.
+  The observer opens with `PROCESS_QUERY_LIMITED_INFORMATION |
   SYNCHRONIZE`, so a process that grants only query access is Unknown, never absent. The
   image-path query of an exited process fails (os error 31, GitHub runner, 2026-10-15), so an
   exited process whose object is still retained is Gone through the signalled handle (#191).

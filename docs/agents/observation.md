@@ -32,7 +32,7 @@
   be verified by a doctor probe or either screen binding check. Its launch configuration remains
   historical evidence and doctor omits local installation, provider-adapter and shell diagnostics.
 - The Windows managed-console presence probe observes the recorded root process. A matching
-  creation time and case-insensitive executable path prove presence. A confirmed exit or a
+  creation time and ASCII-case-insensitive executable path prove presence. A confirmed exit or a
   different creation time proves the recorded root is gone. An invalid record, an inspection
   error or a conflicting image at the same creation time leaves presence unverified.
 - Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,
