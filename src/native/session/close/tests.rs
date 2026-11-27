@@ -4406,19 +4406,22 @@ fn native_close_runs_launch_repair_inside_one_lifecycle_lock() {
 
 #[test]
 fn native_close_replay_keeps_last_marker_fields_and_active_handle_precedence() {
-    for (wire, committed, reason) in [
-        (Some("{"), false, None),
+    // The repair error includes a file path, which cannot contain the NUL in either reason.
+    for (wire, committed, retains_reason) in [
+        (Some("{"), false, false),
         (
-            Some(r#"{"consumed":false,"consumed":true,"reason":"old","reason":42}"#),
+            Some(
+                r#"{"consumed":false,"consumed":true,"reason":"superseded-marker-reason\u0000","reason":42}"#,
+            ),
             true,
-            None,
+            false,
         ),
         (
-            Some(r#"{"consumed":true,"consumed":false,"reason":"retained"}"#),
+            Some(r#"{"consumed":true,"consumed":false,"reason":"retained-marker-reason\u0000"}"#),
             false,
-            Some("retained"),
+            true,
         ),
-        (None, false, None),
+        (None, false, false),
     ] {
         let (_directory, store) = deadline_fixture();
         store
@@ -4459,8 +4462,12 @@ fn native_close_replay_keeps_last_marker_fields_and_active_handle_precedence() {
         }
         let error = store.status().unwrap().error.unwrap();
         assert!(error.contains("pre-close session repair failed"), "{error}");
-        assert_eq!(error.contains("retained"), reason.is_some());
-        assert!(!error.contains("old"));
+        assert_eq!(
+            error.contains("retained-marker-reason\0"),
+            retains_reason,
+            "{error}"
+        );
+        assert!(!error.contains("superseded-marker-reason\0"), "{error}");
     }
 }
 
