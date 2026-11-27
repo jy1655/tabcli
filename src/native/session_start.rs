@@ -34,6 +34,7 @@ pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
     spec: SessionSpec,
     terminal_kind: terminal::TerminalKind,
+    // The automatic fallback reason to log once the Session exists.
     herdr_refusal: Option<anyhow::Error>,
     // The initial-prompt Transport selected by post-probe surface admission, carried
     // straight into initial delivery so delivery cannot re-decide it independently.
