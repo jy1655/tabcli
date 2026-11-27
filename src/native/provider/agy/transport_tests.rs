@@ -39,6 +39,8 @@ struct FakeIo {
     send_finishes_at: Option<Instant>,
     expected_surface: serde_json::Value,
     expected_deadline: Instant,
+    // Runs at every read of the log before the paste, to change the world at that point.
+    on_offset: Option<Box<dyn FnMut()>>,
 }
 impl Io for FakeIo {
     fn session_directory(&mut self, _: &terminal::TerminalSession) -> Result<PathBuf> {
@@ -53,6 +55,11 @@ impl Io for FakeIo {
         assert_eq!(path, self.directory.join(AGY_LOG_FILE));
         self.order
             .push(if self.sent { "receipt" } else { "offset" });
+        if !self.sent
+            && let Some(hook) = &mut self.on_offset
+        {
+            hook();
+        }
         Ok(if self.sent { &self.after } else { &self.before }.clone())
     }
     fn send(
@@ -164,6 +171,7 @@ impl Fixture {
             send_finishes_at: None,
             expected_surface: serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
             expected_deadline: self.start + Duration::from_secs(20),
+            on_offset: None,
         };
         FakeRuntime { clock, io }
     }
@@ -242,12 +250,13 @@ fn native_transport_success_preserves_read_environment_and_send_order() {
     }
 }
 
+// Runs on the Windows CI runner only.
 #[cfg(windows)]
 #[test]
-fn windows_follow_up_skips_trust_and_readiness_and_reads_offset_once() {
+fn windows_follow_up_waits_for_trust_but_not_readiness_and_reads_offset_once() {
     let fixture = Fixture::new();
     let mut runtime = fixture.runtime();
-    runtime.io.before = Some(b"ordinary log\n".to_vec());
+    runtime.io.before = Some(TRUSTED_STARTUP.as_bytes().to_vec());
     runtime.io.after = Some(
         [
             runtime.io.before.clone().unwrap(),
@@ -262,14 +271,16 @@ fn windows_follow_up_skips_trust_and_readiness_and_reads_offset_once() {
         ]
         .concat(),
     );
-    std::fs::remove_file(fixture.directory.join("manifest.json")).unwrap();
     let (outcome, runtime) = fixture.send(runtime, false);
     assert!(matches!(outcome, Outcome::Sent));
-    assert_eq!(runtime.io.order, ["session", "offset", "send", "receipt"]);
+    assert_eq!(
+        runtime.io.order,
+        ["session", "environment", "offset", "send", "receipt"]
+    );
     assert_eq!(runtime.clock.slept, Duration::ZERO);
     assert_eq!(
         trace(&fixture.directory, &fixture.pending)["pre_paste_offset"],
-        13
+        TRUSTED_STARTUP.len()
     );
 }
 
@@ -331,7 +342,7 @@ fn missing_log_is_not_sent() {
     assert!(matches!(outcome, Outcome::NotSent(_)));
     assert!(!runtime.io.sent);
     if cfg!(windows) {
-        assert_eq!(runtime.io.order, ["session", "offset"]);
+        assert_eq!(runtime.io.order, ["session", "environment", "offset"]);
     }
 }
 
@@ -415,4 +426,132 @@ fn receipt_window_starts_after_send_advances_time() {
         trace(&fixture.directory, &fixture.pending)["outcome"],
         "delivery-uncertain"
     );
+}
+
+// A paste without a startup readiness wait, which is how a Windows follow-up
+// is delivered after its session's initial paste, still waits for this process's own trust
+// evidence, as every paste does. The shared path runs on every platform.
+#[test]
+fn a_paste_without_readiness_still_waits_for_the_trust_evidence() {
+    let fixture = Fixture::new();
+    let surface: terminal::TerminalSession = serde_json::from_value(
+        serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+    )
+    .unwrap();
+    let prompt = fixture.directory.join("prompt.txt");
+    let deadline = fixture.start + Duration::from_secs(20);
+    // A log that has lost, or never had, the customization load line.
+    std::fs::remove_file(fixture.directory.join(AGY_LOG_FILE)).unwrap();
+    write_private(&fixture.directory.join(AGY_LOG_FILE), b"ordinary log\n").unwrap();
+    let mut runtime = fixture.runtime();
+    let error =
+        super::delivery::deliver_terminal_turn(&surface, &prompt, deadline, None, &mut runtime)
+            .unwrap_err();
+    assert!(!error.delivery_may_have_occurred());
+    assert!(
+        error
+            .error()
+            .to_string()
+            .contains("this session's agy.log does not show"),
+        "{}",
+        error.error()
+    );
+    assert!(!runtime.io.sent);
+    assert_eq!(runtime.io.order, ["session", "environment"]);
+
+    // With the line, the same paste goes ahead at once: no readiness wait.
+    std::fs::remove_file(fixture.directory.join(AGY_LOG_FILE)).unwrap();
+    write_private(
+        &fixture.directory.join(AGY_LOG_FILE),
+        TRUSTED_STARTUP.as_bytes(),
+    )
+    .unwrap();
+    let mut runtime = fixture.runtime();
+    super::delivery::deliver_terminal_turn(&surface, &prompt, deadline, None, &mut runtime)
+        .unwrap();
+    assert_eq!(
+        runtime.io.order,
+        ["session", "environment", "offset", "send", "receipt"]
+    );
+    assert_eq!(runtime.clock.slept, Duration::ZERO);
+}
+
+// The trust is consumed after every readiness wait, immediately
+// before the paste. Agy's store entry withdrawn while the paste waited for a quiet log sends
+// nothing, through the gated path and through the one without readiness.
+#[test]
+fn trust_is_consumed_immediately_before_the_paste() {
+    for gated in [true, false] {
+        let fixture = Fixture::new();
+        let store = fixture
+            .root
+            .path()
+            .join(".gemini/antigravity-cli/settings.json");
+        let mut runtime = fixture.runtime();
+        runtime.io.on_offset = Some(Box::new(move || {
+            let _ = std::fs::remove_file(&store);
+        }));
+        let result = if gated {
+            let (outcome, runtime) = fixture.send(runtime, cfg!(windows));
+            assert!(!runtime.io.sent, "gated");
+            match outcome {
+                Outcome::NotSent(error) => Err(error.to_string()),
+                other => panic!("{other:?}"),
+            }
+        } else {
+            let surface: terminal::TerminalSession = serde_json::from_value(
+                serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+            )
+            .unwrap();
+            let result = super::delivery::deliver_terminal_turn(
+                &surface,
+                &fixture.directory.join("prompt.txt"),
+                fixture.start + Duration::from_secs(20),
+                None,
+                &mut runtime,
+            )
+            .map_err(|error| error.error().to_string());
+            assert!(!runtime.io.sent, "without readiness");
+            result
+        };
+        let error = result.unwrap_err();
+        assert!(
+            error.starts_with("Agy workspace trust did not hold immediately before the paste"),
+            "{error}"
+        );
+        assert!(
+            trace(&fixture.directory, &fixture.pending)["outcome"] == "not-sent",
+            "{gated}"
+        );
+    }
+}
+
+// The load line must be in the very log contents that supply the
+// receipt offset. A log replaced after the trust wait, which passes readiness without the
+// line, supplies no offset and nothing is pasted.
+#[test]
+fn a_qualifying_log_without_the_load_line_supplies_no_offset() {
+    let fixture = Fixture::new();
+    let mut runtime = fixture.runtime();
+    let startup =
+        "I0924 16:42:24.080467       1 analytics.go:187] CLI startup completed (took 230.2044ms)\n";
+    runtime.io.before = Some(
+        if cfg!(windows) {
+            format!("{startup}{REDRAW}")
+        } else {
+            startup.to_owned()
+        }
+        .into_bytes(),
+    );
+    let (outcome, runtime) = fixture.send(runtime, cfg!(windows));
+    let Outcome::NotSent(error) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("do not show this session's workspace customization load"),
+        "{error}"
+    );
+    assert!(!runtime.io.sent);
 }

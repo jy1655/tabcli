@@ -337,8 +337,11 @@ that combination unless you control the account's other Claude sessions. Read
 settings still apply. See [permission modes](docs/security-and-data.md#permission-modes).
 
 Workspace trust stays with the provider. TAB can reuse verified existing consent for an exact
-workspace; it does not grant new trust. If a trust dialog holds up work, review it in the managed
-surface. See [workspace trust and consent](docs/security-and-data.md#workspace-trust-and-consent).
+workspace, and for a git worktree of a repository whose main working tree has such consent,
+without answering a dialog on inherited consent. It does not grant new trust and never writes
+a provider's trust store. If a trust dialog
+holds up work, review it in the managed surface. See
+[workspace trust and consent](docs/security-and-data.md#workspace-trust-and-consent).
 
 To see whose decision TAB recorded for a directory, run `tabcli consent inspect PATH`.
 `consent revoke PATH` stops that reuse and leaves the provider's own trust alone; `consent reset PATH`

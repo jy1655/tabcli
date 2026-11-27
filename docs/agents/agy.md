@@ -4,9 +4,9 @@
   accepted signal, so every paste into its TUI is a fallback that must be proven by Agy's
   own `--log-file`: a readiness gate before the paste and a `HandleUserInput` receipt
   after it. This holds for the native Windows initial prompt and for every follow-up on
-  native Windows and macOS; the macOS initial prompt is a launch argument and never waits.
-- Agy keeps its workspace-trust dialog over the composer until the exact workspace is in
-  its own trust store (`trustedWorkspaces`), and it still runs an argument-delivered
+  every platform; the macOS and Linux initial prompt is a launch argument and never waits.
+- Without a session-only trust setting, Agy keeps its workspace-trust dialog over the composer until the
+  exact workspace is in its own trust store (`trustedWorkspaces`), and it still runs an argument-delivered
   initial prompt behind the dialog. A paste onto the dialog is discarded and its Enter
   confirms the preselected "Yes, I trust this folder"; Agy then logs the trust reload
   (`Reloading system slash commands and skills` and three companion lines, 356 bytes) and
@@ -14,14 +14,21 @@
   lost paste because the paste caused it, and it never comes in a workspace trusted before
   launch (reproduced on demand 2026-10-01, Agy 1.2.14, macOS; more than 100 logs, no
   counterexample).
-- Never paste without both trust facts: Agy's store lists the exact workspace, and this
-  session's own `agy.log` shows the workspace customization load, a `hooks_manager.go`
-  line from a goroutine other than the main one. The store is shared by every Agy
-  process, so a dialog approved in one session leaves another session's dialog open; the
-  log line is per process and appears at startup in a workspace trusted before launch or
-  when the dialog is approved in that session. The macOS follow-up and the native Windows
-  initial paste wait for both and fail `not_sent` at the deadline. Do not put a time
-  window in their place, and do not answer the dialog without verified consent.
+- For a consented launch identified as Agy 1.5.17 or newer, TAB passes the exact workspace
+  through Agy's session-only `--settings` option without writing Agy's trust store
+  (`consented_launch_hands_agy_the_exact_workspace_in_session_only_settings`).
+- Only a launch identified as older and recorded as lacking the option is eligible for Agy's
+  guarded dialog answer (`an_inconclusive_agy_launch_never_falls_back_to_the_key`).
+- Every paste requires this session's workspace customization load (a `hooks_manager.go` line from a
+  goroutine other than the main one) in `agy.log` and either Agy's exact trust entry or the session
+  setting's marker with current consent
+  (`the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line`).
+  A paste missing either fact is not sent: it ends `not_sent`, at the latest when the deadline expires.
+  A refusal immediately before the paste is also `not_sent`.
+  The store is shared by every Agy process, so a dialog approved in one session leaves another
+  session's dialog open; the log line is per process and appears at startup in a workspace
+  trusted before launch or when the dialog is approved in that session.
+  Do not put a time window in their place, and do not answer the dialog without verified consent.
 - A log without that line withholds the paste but does not prove an open dialog: the log
   can be missing, or cut before the line, in a session that has none. Report what was
   read (the session's trust is unverified) and keep the recovery conditional on what the

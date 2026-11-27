@@ -505,6 +505,7 @@ fn launch_arguments_and_record_cover_version_settings_and_launcher_gates() {
                 yolo: false,
                 model: None,
                 effort: None,
+                provider_version: "fixture",
             },
             cfg!(windows),
             |_, _| Ok(false),
@@ -1051,6 +1052,7 @@ fn the_launch_plan_propagates_a_failed_notice_record_instead_of_returning_argume
                     yolo: false,
                     model: None,
                     effort: None,
+                    provider_version: "fixture",
                 },
             )
         });

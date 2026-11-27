@@ -372,9 +372,8 @@ workspace trust, look at the managed surface and decide whether to trust that di
 not treat an empty screen as proof of trust, blindly press Enter, or resend input whose receipt is
 uncertain.
 
-Agy's terminal fallback needs provider-owned readiness and a receipt (#43, #48). The native Windows
-initial paste and macOS follow-ups require both exact workspace trust in Agy's store and this
-session's log evidence of workspace customization loading. Readiness requires startup and a quiet
+Agy's terminal fallback needs provider-owned readiness and a receipt (#43, #48). See the
+[Agy paste requirements](agents/agy.md). Readiness requires startup and a quiet
 period, plus redraw on Windows; there is no additional reload window. If input is withheld because
 TAB cannot verify this session’s trust, check the surface. If it shows the composer instead of a
 trust dialog, or input remains withheld after approval, close the session and start a new one. Do

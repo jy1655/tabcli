@@ -1539,7 +1539,7 @@ fn hold_check_reports_each_part_without_changing_other_checks() {
 fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     const OBSERVATION: &str =
         "Observation only: doctor never answers the dialog or edits Agy's settings.";
-    const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
+    const WITHHELD: &str = "Every paste (the Windows initial prompt and every follow-up) is withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
     const RECOVERY: &str = "If the managed terminal shows the trust dialog, approve it there and send the prompt again; if it shows the composer or the prompt is still withheld afterwards, close this session and start a new one";
     let fixture = Fixture::new("agy");
     let home = tempfile::tempdir().unwrap();
@@ -1561,7 +1561,7 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
         check(&report, "agy_workspace_trust").clone()
     };
     let recovering_next_action = format!(
-        "{OBSERVATION} {RECOVERY}. A workspace another provider already trusts is answered from shared consent on a later ask."
+        "{OBSERVATION} {RECOVERY}. A later ask applies shared consent itself: exact trust from another provider, or the trust of the main working tree of a verified linked git worktree."
     );
     let evidence = json!({"workspace": workspace, "store": store, "log": log});
     let with_home = [("HOME", Some(home_str)), ("USERPROFILE", None)];
@@ -1633,7 +1633,12 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
         row["detail"],
         "Agy's trust store or this session's agy.log could not be read, so the dialog state is unobserved: Agy trustedWorkspaces is not an array"
     );
-    assert_eq!(row["next_action"], recovering_next_action);
+    assert_eq!(
+        row["next_action"],
+        format!(
+            "{OBSERVATION} Repair or restore the file named in the detail (Agy's settings, this session's workspace consent record or its log); TAB pastes nothing into this session while it cannot be read."
+        )
+    );
     assert_eq!(row["evidence"], evidence);
 }
 

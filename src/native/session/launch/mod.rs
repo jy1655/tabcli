@@ -1162,9 +1162,24 @@ fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
     }
 }
 
+// `spawn_granted` for a command without a trust-bearing option, as the tests start one.
+#[cfg(test)]
 pub(in crate::native) fn spawn<F>(
     store: &Store,
     command: &mut Command,
+    record_process: F,
+) -> Result<Child>
+where
+    F: FnOnce(&mut Child) -> Result<()>,
+{
+    spawn_granted(store, command, None, record_process)
+}
+
+/// `spawn` for a command that may carry a trust-bearing launch option (`grant`, from its plan).
+pub(in crate::native) fn spawn_granted<F>(
+    store: &Store,
+    command: &mut Command,
+    grant: Option<&crate::native::consent::LaunchGrant>,
     record_process: F,
 ) -> Result<Child>
 where
@@ -1177,6 +1192,29 @@ where
         .context("provider launch was refused before spawn")?;
     let _lock = Store::open_unchecked(directory).lock()?;
     let mut record = read(store)?;
+    // A command that carries a trust-bearing launch option is asked about here, under the lock
+    // and immediately before the deadline check, so that the order (deadline, `Spawning`,
+    // spawn) is unchanged: its consent, bound to the provider and workspace its plan was
+    // granted for, must hold now. The question is bounded by the launch's remaining time, so it
+    // cannot push the start past the receipt's expiry; no time left refuses a granted command
+    // without asking, whatever a later clock reading says. A refusal leaves the launch pending: no
+    // provider was started. A change of
+    // consent during the durable write that follows takes effect for the next act, not this
+    // one. A command without such an option reads no consent, as 0.4.49 admitted it.
+    if let Some(grant) = grant {
+        match record
+            .as_ref()
+            .map(|record| record.remaining(Duration::ZERO))
+        {
+            Some(Some(remaining)) if remaining.is_zero() => {
+                bail!("provider launch deadline expired before spawn")
+            }
+            Some(Some(remaining)) => {
+                crate::native::consent::admit_launch(directory, grant, Some(remaining))?
+            }
+            _ => crate::native::consent::admit_launch(directory, grant, None)?,
+        }
+    }
     check_spawn_locked(store, record.as_ref())?;
     if let Some(record) = &mut record {
         record.phase = Phase::Spawning;
