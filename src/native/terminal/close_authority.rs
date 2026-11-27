@@ -642,9 +642,7 @@ pub(in crate::native) fn close_windows_owned_surface_with(
             )
             .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated))
         }
-        // A terminal its core keeps is never closed on the surface alone: as on macOS and Linux,
-        // the close the decision left to the surface alone acts on its creation record, with
-        // that decision's result (no Windows decision reaches it for Herdr today).
+        // Retained adapter mapping. No current decision selects SurfaceOnly for Herdr.
         TerminalCloseAuthority::SurfaceOnly if owner_exit::core_retains_finished(session.kind) => {
             windows_dispatch::close_created_surface(
                 adapters,

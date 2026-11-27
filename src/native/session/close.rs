@@ -15,6 +15,8 @@ use crate::native::session::turn::{
 };
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::native::terminal::close_authority::owner_exit::core_retains_finished;
 pub(in crate::native) use crate::native::terminal::close_authority::owner_exit::repair_owner_is_live;
 use crate::native::terminal::close_authority::owner_exit::{RepairSurface, RepairSurfaces};
 use crate::native::terminal::ownership::NativeSessionOwner;
@@ -246,7 +248,7 @@ pub(in crate::native) fn terminal_teardown_intent(
         return Ok(None);
     }
     let intent: TerminalCloseIntent = serde_json::from_value(value)?;
-    let current_owner = if surface.kind == terminal::TerminalKind::Herdr {
+    let current_owner = if core_retains_finished(surface.kind) {
         None
     } else {
         Some(reader.owner()?)

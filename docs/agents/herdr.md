@@ -378,9 +378,10 @@
   removes only the finished terminal the verified core identifies, settles the session on
   that core's `not_found` for the recorded address, and refuses a running terminal.
 - On macOS and Linux, a saved teardown intent must match the session and exact handle and
-  name a process group led by its recorded owner and a nonempty reason. Replay with a live attested owner requires
-  that same owner in the intent. Without a verified live owner, explicit close uses the
-  creation record.
+  give a nonempty reason. Its saved owner must be bound to the session, have a complete
+  control record and a nonempty TTY, and lead the saved foreground process group
+  (1 through `i32::MAX`). Replay with a live attested owner requires that same owner in
+  the intent. Without a verified live owner, explicit close uses the creation record.
 - An unreadable close-intent file refuses a close that needs an intent decision.
 - Cleanup after a refused reopen refuses the creation record selected for lack of a live owner
   (`a_cleanup_never_acts_on_a_terminal_without_a_live_owner`).

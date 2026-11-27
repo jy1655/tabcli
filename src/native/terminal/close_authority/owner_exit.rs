@@ -11,9 +11,10 @@
 //! function decides from its own observation of the terminal. A close on the creation record
 //! never ends a running terminal (the owner's decision of 2026-11-26): the person ends it or
 //! waits for it to finish, and closes again. Only an explicit close acts on such a terminal; a
-//! close that cleans up after another command does not. A saved teardown intent (macOS and
-//! Linux) keeps 0.4.49's decision; when that decision leaves the close to the surface alone, the
-//! terminal is closed on its creation record as well (`CreationEvidence::surface_only`).
+//! close that cleans up after another command does not. On macOS and Linux a saved teardown
+//! intent must validate on its own fields. A live-owner replay requires the saved owner to
+//! match the owner attested by `core_kept`. Without a verified live owner, the same
+//! creation-record rule applies.
 //!
 //! Other kinds keep their platform's rule: macOS and Linux Repair retain a handle that can
 //! outlive the owner, and a close intent; Windows Repair closes the managed console of an
@@ -43,13 +44,13 @@ pub(in crate::native::terminal) fn outlives_owner(kind: TerminalKind) -> bool {
 /// A kind whose core keeps its terminals until they are removed. Its handle records the
 /// terminal's creation (core, address, creation time, program and launch label), which proves
 /// the terminal without the owner.
-pub(in crate::native::terminal) fn core_retains_finished(kind: TerminalKind) -> bool {
+pub(in crate::native) fn core_retains_finished(kind: TerminalKind) -> bool {
     terminal::facts(kind).owner_survival == OwnerSurvival::CoreRetainsFinished
 }
 
 /// The decision's evidence for a close on a terminal's creation record. Its fields are private
-/// to this module, so only `core_kept` and, for a close the decision left to the surface alone,
-/// `surface_only` establish it (and, in tests, `scripted`). A close on the creation record
+/// to this module. `core_kept` constructs the decision's evidence. The adapter also has a
+/// retained `surface_only` mapping, and tests can supply `scripted` evidence. A close on the creation record
 /// removes a finished terminal and settles an absent one, and never ends a running one (the
 /// owner's decision of 2026-11-26): nothing here permits that, and nothing about the owner
 /// permits or refuses anything on this path. The evidence says why the close runs, and, for
@@ -76,7 +77,7 @@ pub(in crate::native) struct CreationEvidence {
 enum Source {
     /// `core_kept`, for a close run for this cause.
     Decided(super::CloseCause),
-    /// The decision, 0.4.49's code, left the close to the surface alone (`SurfaceOnly`).
+    /// The adapter was given a `SurfaceOnly` authority.
     SurfaceOnly,
 }
 
@@ -85,7 +86,7 @@ enum Source {
     allow(dead_code)
 )]
 impl CreationEvidence {
-    /// Evidence for the adapter's mapping of an explicit `SurfaceOnly` authority.
+    /// The retained adapter mapping admits `SurfaceOnly` for either close cause.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native::terminal) fn surface_only() -> Self {
         Self {
@@ -100,9 +101,7 @@ impl CreationEvidence {
         self.source == Source::Decided(super::CloseCause::Explicit)
     }
 
-    /// Whether this close may act on the creation record: one that `close-session --explicit`
-    /// asked for, or one that the decision left to the surface alone, whatever its cause (0.4.49
-    /// acted on the surface for it).
+    /// Admission for an explicit close or the retained `SurfaceOnly` mapping.
     pub(in crate::native::terminal) fn admitted(&self) -> bool {
         self.explicit() || self.source == Source::SurfaceOnly
     }

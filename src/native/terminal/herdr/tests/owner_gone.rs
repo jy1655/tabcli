@@ -1270,9 +1270,7 @@ fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
         CloseOutcome::Missing
     );
     assert!(fixture.core.methods().is_empty());
-    // A terminal its core keeps is never closed on the surface alone: that decision closes
-    // on the creation record with the decision's own result, which keeps no diagnosis. A running
-    // terminal is refused with nothing sent; a finished one is removed.
+    // Supply SurfaceOnly directly to exercise the Windows adapter's retained mapping.
     let surface_only = || {
         close_windows_owned_surface_with(
             || Ok(TerminalCloseAuthority::SurfaceOnly),
@@ -2411,25 +2409,79 @@ fn save_teardown(fixture: &Fixture, surface: &TerminalSession, owner: &NativeSes
 #[cfg(unix)]
 #[test]
 fn saved_teardown_with_a_contradictory_owner_sends_no_group_signal() {
+    let mut owner = complete_owner();
+    #[cfg(target_os = "linux")]
+    {
+        owner.terminal_app = Some(crate::native::terminal::ownership::MacTerminalAppIdentity {
+            pid: 314,
+            start_seconds: 42,
+            start_microseconds: 0,
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        owner.windows_process_identity = Some(crate::native::terminal::WindowsProcessIdentity {
+            creation_time: 42,
+            executable_path: "tabcli.exe".into(),
+        });
+    }
+    assert_eq!(absent_live_owner_replay_signals(&owner), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_with_the_same_live_owner_reaches_owner_teardown() {
+    assert_eq!(absent_live_owner_replay_signals(&complete_owner()), 1);
+}
+
+#[cfg(unix)]
+fn absent_live_owner_replay_signals(owner: &NativeSessionOwner) -> usize {
+    use crate::native::session::owner::{OwnerObservers, attest_owner_with};
     use crate::native::terminal::close_authority::{
         close_owned_surface_with, decide, test_support::TestObservation,
     };
+    use crate::native::terminal::ownership::{NativeProcessIdentity, ProcessBirth};
     use crate::native::terminal::posix;
     use std::cell::Cell;
-    let mut owner = complete_owner();
-    owner.windows_process_identity = Some(crate::native::terminal::WindowsProcessIdentity {
-        creation_time: 42,
-        executable_path: "tabcli.exe".into(),
-    });
-    let fixture = Fixture::new("ready", &owner);
+
+    #[cfg(target_os = "linux")]
+    let birth = ProcessBirth::Linux(owner.linux_birth.unwrap());
+    #[cfg(target_os = "macos")]
+    let birth = ProcessBirth::Macos(
+        owner.process_start_seconds.unwrap(),
+        owner.process_start_microseconds.unwrap(),
+    );
+    let observe = |record: &NativeSessionOwner| {
+        attest_owner_with(
+            record,
+            OwnerObservers {
+                pid_alive: &|_| true,
+                #[cfg(target_os = "linux")]
+                birth: &|_| Ok(Some(birth)),
+                #[cfg(target_os = "macos")]
+                birth: &|_| Ok(birth.macos()),
+                control: &|pid| {
+                    Ok(Some(NativeProcessIdentity {
+                        pid,
+                        parent_pid: 1,
+                        birth,
+                        terminal_tty_device: 42,
+                        process_group: owner.pid,
+                        terminal_process_group: owner.pid,
+                    }))
+                },
+            },
+        )
+    };
+    let fixture = Fixture::new("ready", owner);
     let surface = fixture.store().terminal().unwrap();
-    save_teardown(&fixture, &surface, &owner);
+    save_teardown(&fixture, &surface, owner);
     fixture.remove();
     let deadline = later();
     let adapters = Adapter::with_core(fixture.core.clone());
     let signals = Cell::new(0);
     let observation = TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
-        .with_posix_owner_live(|_| live_other())
+        .with_posix_owner_live(observe)
         .with_proof(|| Err(anyhow!("surface absent")))
         .with_presence(|| {
             posix::surface_present(
@@ -2459,7 +2511,6 @@ fn saved_teardown_with_a_contradictory_owner_sends_no_group_signal() {
         deadline,
     )
     .unwrap();
-    assert_eq!(signals.get(), 0);
     assert_eq!(result.outcome, CloseOutcome::Missing);
     assert!(
         fixture
@@ -2468,6 +2519,7 @@ fn saved_teardown_with_a_contradictory_owner_sends_no_group_signal() {
             .iter()
             .any(|method| method == "terminal.get")
     );
+    signals.get()
 }
 
 #[cfg(unix)]
@@ -2477,12 +2529,16 @@ fn saved_teardown_with_a_replacement_owner_settles_an_absent_terminal() {
         let mut owner = complete_owner();
         let fixture = Fixture::new("ready", &owner);
         save_teardown(&fixture, &fixture.store().terminal().unwrap(), &owner);
+        let store = fixture.store();
+        let intent = store.record(CoreRecord::TerminalCloseIntent);
+        assert!(intent.bytes().unwrap().is_some());
         fixture.claim();
         owner.managed_session_id = replacement;
         fixture.store().write_owner(&owner).unwrap();
         fixture.remove();
         assert_eq!(fixture.close(exited, false).unwrap(), CloseOutcome::Missing);
         fixture.assert_closed("replacement owner");
+        assert!(intent.bytes().unwrap().is_none());
     }
 }
 
@@ -2494,10 +2550,14 @@ fn saved_teardown_with_the_wrong_handle_and_no_owner_keeps_the_handle() {
     let mut wrong = fixture.store().terminal().unwrap();
     wrong.id = "t8".into();
     save_teardown(&fixture, &wrong, &owner);
+    let store = fixture.store();
+    let intent = store.record(CoreRecord::TerminalCloseIntent);
+    let saved = intent.bytes().unwrap().unwrap();
     fs::remove_file(fixture.store().record(CoreRecord::Owner).path()).unwrap();
     fixture.remove();
     assert!(fixture.close(exited, false).is_err());
     fixture.assert_retained("wrong handle", SessionState::Ready);
+    assert_eq!(intent.bytes().unwrap(), Some(saved));
     assert!(fixture.core.methods().is_empty());
 }
 
@@ -2584,29 +2644,66 @@ fn saved_teardown_without_a_readable_owner_uses_the_creation_record() {
             if unreadable {
                 fs::create_dir(path).unwrap();
             }
-            match state {
-                "absent" => fixture.remove(),
-                "finished" => fixture.finish(),
-                _ => {}
-            }
-            let result = fixture.close(exited, false);
-            if state == "running" {
-                assert!(error_text(&result.unwrap_err()).contains(STILL_RUNNING));
-                fixture.assert_retained(state, SessionState::Ready);
-            } else {
-                assert_eq!(
-                    result.unwrap(),
-                    if state == "finished" {
-                        CloseOutcome::Closed
-                    } else {
-                        CloseOutcome::Missing
-                    }
-                );
-                fixture.assert_closed(state);
-            }
-            assert_eq!(fixture.mutations(), (0, usize::from(state == "finished")));
+            check_saved_teardown_terminal(&fixture, state, None);
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_after_the_bound_owner_exits_uses_the_creation_record() {
+    for state in ["absent", "finished", "running"] {
+        let owner = complete_owner();
+        let fixture = Fixture::new("ready", &owner);
+        save_teardown(&fixture, &fixture.store().terminal().unwrap(), &owner);
+        check_saved_teardown_terminal(
+            &fixture,
+            state,
+            Some("native session process 4242 is no longer running"),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn check_saved_teardown_terminal(fixture: &Fixture, state: &str, expected_reason: Option<&str>) {
+    let store = fixture.store();
+    let intent = store.record(CoreRecord::TerminalCloseIntent);
+    let saved = intent.bytes().unwrap().unwrap();
+    match state {
+        "absent" => fixture.remove(),
+        "finished" => fixture.finish(),
+        "running" => {}
+        _ => unreachable!(),
+    }
+    // The scripted dead-owner adapter panics on a group probe or owner teardown.
+    let result = fixture.close(exited, false);
+    if state == "running" {
+        assert!(error_text(&result.unwrap_err()).contains(STILL_RUNNING));
+        fixture.assert_retained(state, SessionState::Ready);
+        assert_eq!(intent.bytes().unwrap(), Some(saved));
+    } else {
+        assert_eq!(
+            result.unwrap(),
+            if state == "finished" {
+                CloseOutcome::Closed
+            } else {
+                CloseOutcome::Missing
+            }
+        );
+        fixture.assert_closed(state);
+        assert!(intent.bytes().unwrap().is_none());
+        if let Some(reason) = expected_reason {
+            assert_eq!(
+                store.closed_if_present().unwrap().unwrap().error.as_deref(),
+                Some(reason)
+            );
+            assert_eq!(
+                store.terminal_closed().unwrap().reason.as_deref(),
+                Some(reason)
+            );
+        }
+    }
+    assert_eq!(fixture.mutations(), (0, usize::from(state == "finished")));
 }
 
 // The close with a live owner needs its full ownership proof. A bound
