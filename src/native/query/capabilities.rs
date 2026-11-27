@@ -21,6 +21,7 @@ pub(super) struct FollowUpEvidence<'a> {
     pub(super) recovery_required: bool,
     pub(super) repair_owner: Option<&'a OwnerJudgment>,
     pub(super) owner: &'a OwnerJudgment,
+    pub(super) copy: Option<terminal::foreign::CopyEvidence>,
     pub(super) surface: &'a Surface,
     pub(super) reopened: bool,
 }
@@ -176,6 +177,12 @@ fn tell_gates(
     }
     let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
     surface_gate(evidence.surface)?;
+    if let Some(copy) = evidence.copy {
+        return Err(Stop::refused(
+            "surface_unsupported",
+            copy.observation_refusal().to_string(),
+        ));
+    }
     owner_control_gate(evidence.owner, |attestation| {
         SurfaceProbe::HOST.owner_requirement(attestation)
     })?;

@@ -422,8 +422,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   only evidence of a copy, the remaining records are indistinguishable from a local session's.
   The close authority and surface-ownership probe require a bound owner for owner control.
   Origin uses the same owner decoder within its 128 KiB read bound.
-  The public wait and the owner judgments predicting Repair use local process liveness only
-  for sessions whose records supply no evidence of a copy.
+  Every consumer relies on the copy's records alone for process and surface liveness.
   Owner attestation separates incarnation birth from recorded TTY/process-group control,
   preserves inspection errors, and projects the
   public OwnerObservation. It takes only an owner value and OS observations, never a Store
@@ -434,12 +433,15 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   from the receipt of the claim its launch record names (from a read Snapshot or by a bounded
   direct read), and judges whether that one Origin, in the same state root, ended: a valid close
   tombstone first, then a recorded `closed`, `failed` or `exited` status, then
-  `attest_owner(owner).process` for a bound owner, never the projected liveness bools. The owner
+  `attest_owner(owner).process` for a bound owner of a native Origin, never the projected
+  liveness bools. A copied Origin at this point has unknown owner liveness. The owner
   record is read within the Owner record's own 128 KiB bound inside the observation budget. A missing
   Origin directory is undecided, not ended. It reads through `CoreRecordReader`'s bounded strict
-  regular-file reads within a `ReadBudget`, rechecks the tombstone and status after the verdict,
-  and opens no Store, takes no lock, repairs, recovers or writes nothing. It renders the public
-  `origin` and `origin_observation` fields once for `status`, `sessions`, `inspect` and `doctor`,
+  regular-file reads within a `ReadBudget`, without opening a Store, taking a lock, repairing,
+  recovering or writing. With no close tombstone, stability requires its continued absence,
+  unchanged status, and unchanged owner bytes or absence when used. Only a copy verdict also
+  rechecks the readable active-handle and consumption-marker slots, including their absence.
+  It renders the public `origin` and `origin_observation` fields once for `status`, `sessions`, `inspect` and `doctor`,
   and owns the bounded started-from scan that `close-session` reports after a successful close,
   with the re-verification of each listed session that `--with-started-from` runs before its
   close.

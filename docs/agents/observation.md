@@ -28,6 +28,9 @@
   `AGENT_BRIDGE_NATIVE_SESSION_DIR` removed besides the adapter's removals). A
   provider whose choice does not depend on the version gets no version wording. The report
   keeps its row order.
+- A copied session has unknown local owner liveness in inspect and doctor. Its surface cannot
+  be verified by a doctor probe or either screen binding check. Its launch configuration remains
+  historical evidence and doctor omits local installation, provider-adapter and shell diagnostics.
 - Doctor uses the retained launch host diagnosis. For a bound Linux or Windows Herdr host,
   its `launch_stage` row keeps `launch_host_failed` and directs the caller to the launch
   log for an input-flush or shell-start error. The shell-environment probe guidance applies
@@ -61,6 +64,8 @@
   model time or billing time, and do not collect provider usage from a signal that the
   provider does not document as usage. Usage a query shows is what the event records
   (`usage`, or `usage_reason` with the bounded `usage_error`); never estimate or total it.
+- A copy cannot authorize follow-up input. Hold and record-only completion recovery keep their
+  ordinary precedence over the surface check.
 - A delivery refusal (`Delivery::NotSent`) is settled by `settle_delivery_refusal_locked`
   as the receipt's failed event: TAB-owned evidence of what was not sent, with
   `provenance: "delivery_not_sent"`, the refusal text as `error`, the session's provider

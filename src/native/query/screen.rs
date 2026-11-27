@@ -240,7 +240,9 @@ fn bound_surface(
     if state == SessionState::Closed || reader.closed_if_present()?.is_some() {
         bail!("session {id} is closed; its terminal surface is not read");
     }
-    let record = SurfaceRecord::read(reader);
+    let surfaces = terminal::foreign::SurfaceRecords::read(reader);
+    let copy = surfaces.evidence(reader, &crate::native::session::owner::observe(reader));
+    let record = SurfaceRecord::from_records(reader, surfaces);
     drop(snapshot);
     match (judgment::surface(&record, id), record) {
         (
@@ -252,7 +254,10 @@ fn bound_surface(
             },
             SurfaceRecord::Active(Ok(Some(handle))),
         ) => match ActiveHandle::of(supported, bound, empty_id) {
-            ActiveHandle::Bound => Ok(handle),
+            ActiveHandle::Bound => match copy {
+                Some(copy) => Err(copy.observation_refusal()),
+                None => Ok(handle),
+            },
             ActiveHandle::Unsupported => Err(anyhow::Error::new(Unsupported::new(format!(
                 "the recorded terminal, {}, is not supported on this platform",
                 kind.display_name()

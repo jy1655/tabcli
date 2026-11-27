@@ -4777,3 +4777,37 @@ fn open_failure_refusal_publication_waits_even_after_the_deadline() {
             .is_some()
     );
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_refused_launch_uses_no_spawn_proof_but_never_checks_a_recorded_pid() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-copy-refused";
+    let dir = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
+    update_status(&dir, SessionState::Failed, None, None).unwrap();
+    let store = Store::open_unchecked(&dir);
+    store
+        .write_owner(&session::test_support::copied_owner(id))
+        .unwrap();
+    let refusal = test_launch_refusal(ReopenGate::ProviderUnsupported);
+    for has_pid in [false, true] {
+        if has_pid {
+            store
+                .record(CoreRecord::ProviderProcess)
+                .write_json(&ProviderProcessRecord {
+                    schema: 1,
+                    managed_session_id: id.into(),
+                    pid: 7,
+                    spawned_unix_ms: 1,
+                    windows_process_identity: None,
+                })
+                .unwrap();
+        }
+        let before = snapshot_directory(&dir);
+        let cleanup =
+            refused_launch_cleanup_with(&dir, &refusal, |_| panic!("copy probed provider"))
+                .unwrap();
+        assert_eq!(cleanup.releases_marker(), !has_pid);
+        assert_eq!(snapshot_directory(&dir), before);
+    }
+}

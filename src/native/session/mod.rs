@@ -64,6 +64,27 @@ pub(in crate::native) mod test_support {
         with_publication_read_log, with_sync_failure, with_sync_log, write_event,
     };
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub(in crate::native) fn copied_owner(
+        id: &str,
+    ) -> crate::native::terminal::ownership::NativeSessionOwner {
+        let mut owner = crate::native::terminal::ownership::NativeSessionOwner {
+            pid: std::process::id(),
+            managed_session_id: Some(id.into()),
+            ..Default::default()
+        };
+        if cfg!(windows) {
+            owner.process_start_seconds = Some(1);
+        } else {
+            owner.windows_process_identity =
+                Some(crate::native::terminal::WindowsProcessIdentity {
+                    creation_time: 1,
+                    executable_path: "foreign.exe".into(),
+                });
+        }
+        owner
+    }
+
     /// A minimal manifest for a session fixture, named after its directory. Every
     /// session has one; a delivery refusal records an event that names the provider
     /// from it, so a fixture that settles a refusal needs it.

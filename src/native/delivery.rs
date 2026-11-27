@@ -433,6 +433,26 @@ fn initial_prompt_delay_within_budget(
     Ok(delay)
 }
 
+pub(in crate::native) fn follow_up_surface(
+    reader: &Reader,
+    id: &str,
+    deadline: Instant,
+    requested: Duration,
+    prove: impl FnOnce(&Path, &str, &terminal::TerminalSession, Option<Duration>) -> Result<()>,
+) -> Result<terminal::TerminalSession> {
+    let selected = reader
+        .record(crate::native::session::CoreRecord::Terminal)
+        .json_with(terminal::TerminalSession::decode_with_stated_kind)?;
+    let timeout = remaining_turn_timeout(deadline, requested)?;
+    selected.0.verify_managed_session(id)?;
+    if let Some(copy) = terminal::foreign::evidence_for_active(reader, &selected) {
+        return Err(copy.observation_refusal());
+    }
+    let (handle, _) = selected;
+    prove(reader.directory(), id, &handle, Some(timeout))?;
+    Ok(handle)
+}
+
 pub(in crate::native) fn verify_terminal_surface_ownership_until(
     directory: &Path,
     expected_session_id: &str,
@@ -441,6 +461,13 @@ pub(in crate::native) fn verify_terminal_surface_ownership_until(
     requested: Duration,
 ) -> Result<()> {
     let timeout = remaining_turn_timeout(deadline, requested)?;
+    session.verify_managed_session(expected_session_id)?;
+    let reader = Reader::open_unchecked(directory);
+    let records = terminal::foreign::SurfaceRecords::read(&reader);
+    if let Some(copy) = records.evidence(&reader, &crate::native::session::owner::observe(&reader))
+    {
+        return Err(copy.observation_refusal());
+    }
     terminal::ownership::verify_terminal_surface_ownership_with_timeout(
         directory,
         expected_session_id,

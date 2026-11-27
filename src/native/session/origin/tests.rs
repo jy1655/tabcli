@@ -1287,7 +1287,7 @@ fn failed_reads_are_charged_against_the_cumulative_allowance() {
     let _hooks = Hooks::new();
     let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
-    // The observation allowance holds eight full records; each failed read reserves one.
+    // Each failed read reserves one full record from the observation allowance.
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
     malformed_manifest(&origin);
@@ -1541,5 +1541,273 @@ fn an_owner_record_is_read_within_the_owner_bound() {
             (ended, reason, detail),
             "{size}"
         );
+    }
+}
+
+fn max_native_origin(root: &Path) -> Session {
+    let id = "session-origin";
+    let origin = Session::new(root, id, "ready");
+    origin.owner(Some(id), 7);
+    write(
+        &origin.record(CoreRecord::Terminal),
+        &json!({"terminal":"herdr","session_id":"surface","managed_session_id":id}),
+    );
+    write(
+        &origin.record(CoreRecord::TerminalClosed),
+        &json!({"consumed":true,"terminal":"herdr"}),
+    );
+    for (record, size) in [
+        (CoreRecord::Manifest, RECORD_LIMIT),
+        (CoreRecord::Status, RECORD_LIMIT),
+        (CoreRecord::Owner, owner::LIMIT),
+        (CoreRecord::Terminal, RECORD_LIMIT),
+        (CoreRecord::TerminalClosed, RECORD_LIMIT),
+    ] {
+        let path = origin.record(record);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(size as usize, b' ');
+        fs::write(path, bytes).unwrap();
+    }
+    origin
+}
+
+#[test]
+fn slice_three_maximum_native_origin_retains_its_owner_verdict() {
+    let root = tempfile::tempdir().unwrap();
+    let mut environment = Environment::new();
+    let origin = max_native_origin(root.path());
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let reference = read(&mut environment, &child);
+    for alive in [true, false] {
+        environment.attest(move |_| {
+            attestation(
+                if alive {
+                    ProcessObservation::Live(Attested::PidOnly)
+                } else {
+                    ProcessObservation::Gone(Gone::Exited)
+                },
+                ControlAttestation::NotRecorded,
+            )
+        });
+        let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+        let answer = observe(
+            root.path(),
+            reference.clone(),
+            &mut budget,
+            &mut environment.origin(),
+        );
+        assert_eq!(answer.ended, Some(!alive));
+        assert_eq!(
+            answer.reason,
+            if alive { "owner_live" } else { "owner_exited" }
+        );
+    }
+    assert_eq!(origin.reader().status().unwrap().state, SessionState::Ready);
+}
+
+#[test]
+fn slice_three_origin_exceeding_the_total_returns_no_end_verdict() {
+    let root = tempfile::tempdir().unwrap();
+    let mut environment = Environment::new();
+    let origin = max_native_origin(root.path());
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let reference = read(&mut environment, &child);
+    let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+    // The caller has already spent 256 KiB. The native target needs another 576 KiB.
+    for _ in 0..4 {
+        budget
+            .read(
+                &origin.reader().record(CoreRecord::Manifest),
+                &mut environment.clock,
+            )
+            .unwrap();
+    }
+    let answer = observe(
+        root.path(),
+        reference,
+        &mut budget,
+        &mut environment.origin(),
+    );
+    assert_eq!(
+        (answer.ended, answer.reason.as_str()),
+        (None, "origin_budget_exhausted")
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_origin_checks_surface_bytes_again_before_reporting_unknown() {
+    let hooks = Hooks::new();
+    let mut environment = Environment::new();
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-origin";
+    let child = Session::started_from(root.path(), "session-child", "ready", id);
+    let origin = Session::new(root.path(), id, "ready");
+    origin.owner(Some(id), 7);
+    let kind = if cfg!(windows) {
+        "tmux"
+    } else {
+        "windows-console"
+    };
+    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosed] {
+        let path = origin.record(record);
+        let wire = match record {
+            CoreRecord::Terminal => {
+                json!({"terminal":kind,"session_id":"surface","managed_session_id":id})
+            }
+            _ => json!({"consumed":true,"terminal":kind}),
+        };
+        write(&path, &wire);
+        environment.attest(move |_| panic!("origin consulted local owner"));
+        let answer = observed(&mut environment, root.path(), &child);
+        assert_eq!(
+            (answer.ended, answer.reason.as_str()),
+            (None, "owner_unverified")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            wire
+        );
+        let changed = path.clone();
+        hooks.checkpoint(move |point, _| {
+            if point == Checkpoint::OriginRead {
+                fs::remove_file(&changed).unwrap()
+            }
+        });
+        let answer = observed(&mut environment, root.path(), &child);
+        assert_eq!(
+            (answer.ended, answer.reason.as_str()),
+            (None, "origin_busy")
+        );
+        hooks.checkpoint(|_, _| {});
+    }
+}
+
+#[test]
+fn a_native_origin_keeps_its_owner_verdict_while_close_claims_or_marks_its_surface() {
+    let hooks = Hooks::new();
+    let mut rows = Vec::new();
+    for alive in [true, false] {
+        for change in ["none", "claim", "marker"] {
+            let root = tempfile::tempdir().unwrap();
+            let id = "session-origin";
+            let child = Session::started_from(root.path(), "session-child", "ready", id);
+            let origin = Session::new(root.path(), id, "ready");
+            origin.owner(Some(id), 7);
+            let active = origin.record(CoreRecord::Terminal);
+            write(
+                &active,
+                &json!({"terminal":"herdr","session_id":"surface","managed_session_id":id}),
+            );
+            let closing = origin.record(CoreRecord::TerminalClosing);
+            let marker = origin.record(CoreRecord::TerminalClosed);
+            hooks.checkpoint(move |point, _| {
+                if point == Checkpoint::OriginRead {
+                    match change {
+                        "claim" => fs::rename(&active, &closing).unwrap(),
+                        "marker" => write(&marker, &json!({"consumed":true,"terminal":"herdr"})),
+                        _ => (),
+                    }
+                }
+            });
+            let mut environment = Environment::new();
+            environment.attest(move |_| {
+                attestation(
+                    if alive {
+                        ProcessObservation::Live(Attested::PidOnly)
+                    } else {
+                        ProcessObservation::Gone(Gone::Exited)
+                    },
+                    ControlAttestation::NotRecorded,
+                )
+            });
+            let answer = observed(&mut environment, root.path(), &child);
+            rows.push((change, answer.ended, answer.reason));
+        }
+    }
+    let actual: Vec<_> = rows
+        .iter()
+        .map(|(change, ended, reason)| (*change, *ended, reason.as_str()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("none", Some(false), "owner_live"),
+            ("claim", Some(false), "owner_live"),
+            ("marker", Some(false), "owner_live"),
+            ("none", Some(true), "owner_exited"),
+            ("claim", Some(true), "owner_exited"),
+            ("marker", Some(true), "owner_exited")
+        ]
+    );
+}
+
+#[test]
+fn a_busy_first_surface_read_leaves_the_origin_verdict_to_the_other_records() {
+    use crate::native::terminal::TerminalKind::{Herdr, Tmux, WindowsConsole};
+
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-origin";
+    let origin = Session::new(root.path(), id, "ready");
+    origin.owner(Some(id), 7);
+    let child = Session::started_from(root.path(), "session-child", "ready", id);
+    let mut environment = Environment::new();
+    let reference = read(&mut environment, &child);
+    for slot in [CoreRecord::Terminal, CoreRecord::TerminalClosed] {
+        for (other_kind, exited) in [
+            (Herdr, false),
+            (Herdr, true),
+            (Tmux, false),
+            (WindowsConsole, false),
+        ] {
+            let (active, marker) = match slot {
+                CoreRecord::Terminal => (Herdr, other_kind),
+                _ => (other_kind, Herdr),
+            };
+            write(
+                &origin.record(CoreRecord::Terminal),
+                &json!({"terminal":active,"session_id":"surface","managed_session_id":id}),
+            );
+            write(
+                &origin.record(CoreRecord::TerminalClosed),
+                &json!({"consumed":true,"terminal":marker}),
+            );
+            // Without a managed terminal platform the origin reader classifies no copies.
+            let copy =
+                Herdr.supported_on_this_platform() && !other_kind.supported_on_this_platform();
+            environment.attest(move |_| {
+                assert!(!copy, "local attestation of a copied origin");
+                attestation(
+                    if exited {
+                        ProcessObservation::Gone(Gone::Exited)
+                    } else {
+                        ProcessObservation::Live(Attested::PidOnly)
+                    },
+                    ControlAttestation::NotRecorded,
+                )
+            });
+            let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+            budget.busy_once = Some(origin.record(slot));
+            let answer = observe(
+                root.path(),
+                reference.clone(),
+                &mut budget,
+                &mut environment.origin(),
+            );
+            assert_eq!(budget.busy_once, None);
+            let expected = if copy {
+                ("owner_unverified", None)
+            } else if exited {
+                ("owner_exited", Some(true))
+            } else {
+                ("owner_live", Some(false))
+            };
+            assert_eq!(
+                (answer.reason.as_str(), answer.ended),
+                expected,
+                "busy {}, other {other_kind:?}, exited {exited}",
+                slot.name()
+            );
+        }
     }
 }

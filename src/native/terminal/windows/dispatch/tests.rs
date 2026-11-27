@@ -296,10 +296,8 @@ fn an_expired_open_of_another_kind_gets_the_lookup_refusal() {
     assert!(dispatch.console.calls().is_empty());
 }
 
-// Doctor's probe of a stored handle of another OS's terminal reads the lookup's refusal on
-// Windows, as on macOS and Linux: the presence is unverified, never a missing surface. Before
-// the lookup refused it, the managed console parsed a WezTerm pane id `0` as a process id and
-// reported the surface missing.
+// Windows recognizes the bound foreign handle as a copy before probing. Its refusal has
+// the Windows lookup's text. On macOS and Linux this fixture reaches the injected lookup.
 #[test]
 fn doctor_probe_of_another_kinds_handle_is_unverified() {
     use crate::native::doctor;
@@ -308,15 +306,22 @@ fn doctor_probe_of_another_kinds_handle_is_unverified() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-foreign");
     std::fs::create_dir(&directory).unwrap();
-    let handle = TerminalSession::new(TerminalKind::WezTerm, "0".into())
-        .with_binding(Some("session-foreign".into()));
+    let kind = if cfg!(target_os = "linux") {
+        TerminalKind::Tmux
+    } else {
+        TerminalKind::WezTerm
+    };
+    let handle =
+        TerminalSession::new(kind, "0".into()).with_binding(Some("session-foreign".into()));
     Store::open_unchecked(&directory)
         .write_terminal(&handle)
         .unwrap();
     let reader = Reader::open_unchecked(&directory);
     let evidence = SessionEvidence::read(&reader, Ok(false));
     let dispatch = recording_dispatch();
+    let probed = Cell::new(false);
     let probe = |directory: &Path, session: &TerminalSession, timeout: Duration| {
+        probed.set(true);
         surface_present(&dispatch, directory, session, timeout)
     };
     let presence = evidence.judge_surface_presence_with(
@@ -324,10 +329,26 @@ fn doctor_probe_of_another_kinds_handle_is_unverified() {
         Instant::now() + Duration::from_secs(2),
         &probe,
     );
-    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
-    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
+    assert_eq!(probed.get(), !cfg!(windows));
+    let refusal = OsTerminals::WINDOWS.unavailable(kind).to_string();
+    assert_eq!(*presence, SurfacePresence::Unverified(refusal));
     let check = doctor::surface_presence_check(presence);
     assert_eq!(check.reason_code, "terminal_surface_unverified");
+    // An unbound legacy iTerm2 handle passes the binding check and supplies no copy evidence.
+    // Its doctor probe therefore exercises the Windows presence lookup on every test host.
+    Store::open_unchecked(&directory)
+        .write_terminal(&TerminalSession::new(TerminalKind::Iterm2, "0".into()))
+        .unwrap();
+    let legacy = SessionEvidence::read(&reader, Ok(false));
+    probed.set(false);
+    let presence = legacy.judge_surface_presence_with(&reader, deadline(), &probe);
+    assert!(probed.get());
+    assert_eq!(
+        *presence,
+        SurfacePresence::Unverified(
+            "iTerm2 is not available on Windows; use windows-console or herdr".into()
+        )
+    );
     assert!(dispatch.console.calls().is_empty());
 }
 

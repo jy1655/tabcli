@@ -2706,3 +2706,86 @@ fn capabilities_add_nothing_to_human_inspect_or_the_timeline() {
     assert!(timeline.get("capabilities").is_none());
     assert!(!timeline.to_string().contains("record_gates_passed"));
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_tell_recovers_a_journal_before_refusing_and_honors_hold_first() {
+    let fixture = Fixture::new();
+    let dir = &fixture.directory;
+    let id = "session-observe";
+    let kind = if cfg!(windows) {
+        "tmux"
+    } else {
+        "windows-console"
+    };
+    write(
+        &dir.join("terminal.json"),
+        &json!({"terminal":kind,"session_id":"saved","managed_session_id":id}),
+    );
+    fs::write(dir.join("turn.claim.lock"), "").unwrap();
+    write(&dir.join("status.json"), &status("working", 2, None));
+    fs::write(dir.join("turn.claim"), "123-456-0\n").unwrap();
+    request(&fixture, "123-456-0", "request-turn", "event-1.json");
+    let event = support::event(
+        "claude",
+        "native-session",
+        "event-1.json",
+        "already completed",
+        None,
+        3,
+    );
+    write(
+        &dir.join("turn.completion.json"),
+        &json!({
+            "schema":1,"claim_token":"123-456-0","event_file":"event-1.json",
+            "event":event,"status_state":"ready","status_error":null
+        }),
+    );
+    let args = ["tell", id, "--prompt", "follow up", "--json"];
+    write(
+        &dir.join("hold.json"),
+        &json!({"held":true,"created_unix_ms":1}),
+    );
+    let held = support::entries(dir);
+    let answer = fixture.run(&args);
+    let held_answer: Value = serde_json::from_slice(&answer.stdout).unwrap();
+    assert_eq!(
+        held_answer["error"],
+        "session session-observe is held; release the hold before sending a follow-up"
+    );
+    assert!(!answer.status.success());
+    assert_eq!(support::entries(dir), held);
+    fs::remove_file(dir.join("hold.json")).unwrap();
+    let answer = fixture.run(&args);
+    let refused: Value = serde_json::from_slice(&answer.stdout).unwrap();
+    assert_eq!(refused["failure_kind"], "unsupported");
+    let expected = match std::env::consts::OS {
+        "windows" => "tmux is not available on Windows; use windows-console or herdr",
+        "macos" => {
+            "Windows Console is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"
+        }
+        _ => "Windows Console is not available on Linux; use tmux or herdr",
+    };
+    assert_eq!(refused["error"], expected);
+    assert!(!answer.status.success());
+    let state: Value = serde_json::from_slice(&fs::read(dir.join("status.json")).unwrap()).unwrap();
+    assert_eq!(
+        (
+            state["state"].as_str(),
+            dir.join("events/event-1.json").exists(),
+            dir.join("turn.claim").exists(),
+            dir.join("turn.completion.json").exists()
+        ),
+        (Some("ready"), true, false, false)
+    );
+    let published: Value =
+        serde_json::from_slice(&fs::read(dir.join("events/event-1.json")).unwrap()).unwrap();
+    assert_eq!(published["message"], "already completed");
+    let ready = support::entries(dir);
+    let retry = fixture.run(&args);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&retry.stdout).unwrap(),
+        refused
+    );
+    assert_eq!(support::entries(dir), ready);
+}

@@ -684,7 +684,7 @@ fn terminal_close_markers_are_reported_without_consuming_or_resuming_them() {
     write(
         &fixture.directory.join("terminal.closing.json"),
         &json!({
-            "terminal":"iterm2", "session_id":"owned-surface", "managed_session_id":"session-doctor"
+            "terminal":"herdr", "session_id":"owned-surface", "managed_session_id":"session-doctor"
         }),
     );
     let before = entries(fixture.root.path());
@@ -695,7 +695,7 @@ fn terminal_close_markers_are_reported_without_consuming_or_resuming_them() {
     assert_eq!(entries(fixture.root.path()), before);
     write(
         &fixture.directory.join("terminal.closed.json"),
-        &json!({"consumed":true,"terminal":"iterm2"}),
+        &json!({"consumed":true,"terminal":"herdr"}),
     );
     let before = entries(fixture.root.path());
     assert_eq!(
@@ -2195,13 +2195,18 @@ fn a_rejected_launch_host_record_makes_the_timeline_incomplete() {
     }
 }
 
-// When the tombstone names Ghostty, doctor can rule out both the launch host and the shell probe.
+// The tombstone names a terminal this system runs without a launch host or shell capture.
 #[test]
 fn a_closed_session_s_tombstone_names_its_terminal_for_doctor() {
     let fixture = Fixture::new("codex");
+    let kind = match std::env::consts::OS {
+        "linux" => "tmux",
+        "windows" => "windows-console",
+        _ => "ghostty",
+    };
     write(
         &fixture.directory.join("terminal.closed.json"),
-        &json!({"consumed": true, "terminal": "ghostty"}),
+        &json!({"consumed": true, "terminal": kind}),
     );
     let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
     assert_eq!(
@@ -2212,4 +2217,57 @@ fn a_closed_session_s_tombstone_names_its_terminal_for_doctor() {
         check(&value, "shell_environment")["reason_code"],
         "shell_environment_probe_not_applicable"
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_session_doctor_reports_the_launch_without_running_local_diagnostics() {
+    let fixture = Fixture::new("claude");
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["provider_path"] = json!(env!("CARGO_BIN_EXE_tabcli"));
+    manifest["resumed_from"] =
+        json!({"session":"source","provider_session_id":"saved","event_id":"first"});
+    write(&path, &manifest);
+    let kind = if cfg!(windows) {
+        "tmux"
+    } else {
+        "windows-console"
+    };
+    write(
+        &fixture.directory.join("terminal.json"),
+        &json!({"terminal":kind,"session_id":"surface","managed_session_id":"session-doctor"}),
+    );
+    let before = entries(&fixture.directory);
+    for probe in [false, true] {
+        let mut args = vec!["doctor", "session-doctor", "--json"];
+        if probe {
+            args.push("--probe");
+        }
+        let value = report(fixture.run(&args));
+        assert_eq!(
+            value["configured"]["provider_path"],
+            env!("CARGO_BIN_EXE_tabcli")
+        );
+        for field in ["executable", "executable_source"] {
+            assert_eq!(
+                value["scope"].get(field),
+                Some(&Value::Null),
+                "{field}, probe={probe}"
+            );
+        }
+        assert_eq!(value["scope"]["current_version"], Value::Null);
+        let rows = value["checks"].as_array().unwrap();
+        for local in [
+            "claude_resumed_conversation_holders",
+            "provider_version",
+            "shell_environment",
+        ] {
+            assert!(
+                rows.iter().all(|row| row["id"] != local),
+                "{local}, probe={probe}"
+            );
+        }
+        assert_eq!(entries(&fixture.directory), before);
+    }
 }

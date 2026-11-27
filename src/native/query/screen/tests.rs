@@ -98,9 +98,15 @@ impl SurfaceAccess for Fake {
             .unwrap()
             .map(|recorded| recorded.owner);
         if let Some(owner) = &owner {
-            self.verified_owners
-                .borrow_mut()
-                .push((owner.pid, owner.process_start_seconds));
+            self.verified_owners.borrow_mut().push((
+                owner.pid,
+                owner.process_start_seconds.or_else(|| {
+                    owner
+                        .windows_process_identity
+                        .as_ref()
+                        .map(|w| w.creation_time)
+                }),
+            ));
         }
         Ok(owner)
     }
@@ -169,8 +175,12 @@ fn owner(pid: u32, start_seconds: u64) -> NativeSessionOwner {
     NativeSessionOwner {
         pid,
         managed_session_id: Some(ID.into()),
-        process_start_seconds: Some(start_seconds),
-        process_start_microseconds: Some(0),
+        process_start_seconds: cfg!(target_os = "macos").then_some(start_seconds),
+        process_start_microseconds: cfg!(target_os = "macos").then_some(0),
+        windows_process_identity: cfg!(windows).then(|| terminal::WindowsProcessIdentity {
+            creation_time: start_seconds,
+            executable_path: "native.exe".into(),
+        }),
         ..NativeSessionOwner::default()
     }
 }
@@ -775,4 +785,37 @@ fn parse_defaults_to_a_ten_second_text_read() {
         (request.id.as_str(), request.timeout, request.json),
         (ID, Duration::from_secs(3), true)
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_screen_rechecks_evidence_before_each_ownership_proof() {
+    fn make_copy(directory: &Path) {
+        Store::open_unchecked(directory)
+            .write_owner(&crate::native::session::test_support::copied_owner(ID))
+            .unwrap();
+    }
+    let surface = handle(terminal::TerminalKind::Herdr, Some(ID));
+    let fixture = Fixture::new(SessionState::Ready, Some(&surface));
+    Store::open_unchecked(&fixture.directory)
+        .record(CoreRecord::Owner)
+        .remove()
+        .unwrap();
+    let mut access = Fake::new(&fixture);
+    access.during_read = Some(make_copy);
+    let error = refusal(fixture.observe_while_records_change(&access).0);
+    assert_eq!(
+        classify(&error),
+        Some(FailureKind::Unsupported),
+        "{error:#}"
+    );
+    assert!(matches!(
+        &access.calls.borrow()[..],
+        [Call::Verify { .. }, Call::Read { .. }]
+    ));
+    let mut access = Fake::new(&fixture);
+    access.verified = vec![Err("unexpected ownership proof")];
+    let error = refusal(fixture.observe(&access).0);
+    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+    assert!(access.calls.borrow().is_empty());
 }

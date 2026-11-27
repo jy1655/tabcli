@@ -88,6 +88,7 @@ pub(super) fn value(
                 .evidence
                 .repair_owner_with(&super::observation::judgment::Observers::SYSTEM),
             owner: owner_judgment,
+            copy: observation.evidence.copy,
             surface: &judgments.surface,
             reopened: resumed_from.is_some(),
         },

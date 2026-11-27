@@ -198,8 +198,9 @@ _Avoid_: parent, launcher, owner
 
 **Origin ended**:
 The observation that a managed Origin's recorded lifecycle has ended, or that the Gone of its
-recorded Owner incarnation was confirmed. It does not mean that a surface ended, that a
-session was abandoned, or that anyone may close it.
+recorded native Owner incarnation was confirmed. It does not mean that a surface ended, that a
+session was abandoned, or that anyone may close it. Only the recorded lifecycle can establish
+that a copied Origin ended.
 _Avoid_: orphan, abandoned, stranded
 
 **Hold**:
@@ -236,8 +237,8 @@ _Avoid_: parent, launcher process
 The record of a session's owner, read under one policy by every reader (no link, a regular
 file, a bound size, UTF-8; anything else is unreadable) and judged by its binding: bound to the
 session, unbound (a legacy record) or foreign (naming another session). For a native session Repair attests the
-recorded process whatever the binding. A copy has no local owner liveness for Repair. Only a
-bound record grants control authority.
+recorded process whatever the binding. A Copy has no local owner liveness. Only a bound record
+grants control authority.
 _Avoid_: owner file, native-session record
 
 **Residual surface**:
@@ -297,6 +298,7 @@ _Avoid_: resume lock, continuation token
 **Reopen reservation**:
 One attempt's exclusive hold on a closed source Session. Creating the new Session consumes
 that hold; a refused launch releases it only when its provider is verified gone or never spawned.
+A recorded provider process in a copied target stays unverified.
 _Avoid_: provider conversation lock, resume lease
 
 **Reopen gate**:
