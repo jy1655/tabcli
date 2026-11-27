@@ -190,37 +190,145 @@ fn expired_close_reaches_no_windows_adapter() {
     assert!(dispatch.herdr.calls().is_empty());
 }
 
-// A handle of a kind that Windows does not run (a record can name another platform) stays
-// with the managed console, as before the lookup: the console's open gets the asked kind and
-// refuses it (a Windows test pins that refusal), and its helper refuses the handle (no test
-// runs the helper on such a handle). Only the kind's declared screen and guarded-input
-// refusals answer before it.
+// A handle of a kind that Windows does not run (a record can name another OS's terminal) is
+// refused by the lookup, as on macOS and Linux: every operation answers the same unsupported
+// refusal, which names Windows and the kinds it runs, and no adapter is reached. Only the
+// kind's declared screen and guarded-input refusals answer before the lookup, as there too.
+// The expected text is written out here, independent of `OsTerminals`.
 #[test]
-fn every_other_kind_stays_with_the_managed_console() {
+fn every_other_kind_is_refused_by_the_lookup_before_any_adapter() {
+    use crate::native::failure_kind::{FailureKind, classify};
     for kind in TerminalKind::ALL {
         if matches!(kind, TerminalKind::WindowsConsole | TerminalKind::Herdr) {
             continue;
         }
         let dispatch = recording_dispatch();
+        let refusal = format!(
+            "{} is not available on Windows; use windows-console or herdr",
+            kind.display_name()
+        );
         let registration = kind.registration();
-        let mut reached = vec!["open", "send"];
-        let screen = registration.screen_read_refusal.unwrap_or_else(|| {
-            reached.push("screen");
-            "ok"
-        });
-        let dialog = registration.guarded_input_refusal.unwrap_or_else(|| {
-            reached.push("dialog");
-            "ok"
-        });
-        reached.extend(["verify", "close", "present", "launch"]);
+        let screen = registration
+            .screen_read_refusal
+            .map_or_else(|| refusal.clone(), str::to_owned);
+        let dialog = registration
+            .guarded_input_refusal
+            .map_or_else(|| refusal.clone(), str::to_owned);
         assert_eq!(
             every_operation(&dispatch, kind),
-            ["ok", "ok", screen, dialog, "ok", "ok", "ok", "ok"],
+            [
+                refusal.clone(),
+                refusal.clone(),
+                screen,
+                dialog,
+                refusal.clone(),
+                refusal.clone(),
+                refusal.clone(),
+                refusal.clone(),
+            ],
             "{kind:?}"
         );
-        assert_eq!(dispatch.console.calls(), reached, "{kind:?}");
+        assert!(dispatch.console.calls().is_empty(), "{kind:?}");
+        assert!(dispatch.herdr.calls().is_empty(), "{kind:?}");
+
+        // The refusal is a platform gate (unsupported), and a refused send is known unsent.
+        let directory = Path::new("unused");
+        let session = TerminalSession::new(kind, "handle".into());
+        let failure = send_file(&dispatch, &session, directory, deadline()).unwrap_err();
+        assert!(!failure.delivery_may_have_occurred(), "{kind:?}");
+        let opened = open_bound_tab(
+            &dispatch,
+            kind,
+            "command",
+            directory,
+            deadline(),
+            |_| panic!("a refused kind is never bound"),
+            || panic!("a refused kind is never unbound"),
+        );
+        for error in [
+            opened.unwrap_err(),
+            failure.into_error(),
+            verify_surface(&dispatch, &session, None).unwrap_err(),
+            close_session_until(&dispatch, directory, &session, deadline()).unwrap_err(),
+            surface_present(&dispatch, directory, &session, Duration::from_secs(1)).unwrap_err(),
+        ] {
+            assert_eq!(format!("{error:#}"), refusal, "{kind:?}");
+            assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
+        }
+        assert!(dispatch.console.calls().is_empty(), "{kind:?}");
         assert!(dispatch.herdr.calls().is_empty(), "{kind:?}");
     }
+}
+
+// The lookup has an adapter for exactly the kinds that the Windows list names, which is what
+// the refusal offers and what `supported_on_this_platform` reads on Windows.
+#[test]
+fn the_lookup_serves_exactly_the_kinds_windows_runs() {
+    let dispatch = recording_dispatch();
+    for kind in TerminalKind::ALL {
+        assert_eq!(
+            dispatch.adapter(kind).is_ok(),
+            crate::native::terminal::OsTerminals::WINDOWS.runs(kind),
+            "{kind:?}"
+        );
+    }
+}
+
+// An open of such a kind is refused by the lookup before any startup deadline is read, as on
+// macOS and Linux: an expired deadline still gets the kind's refusal.
+#[test]
+fn an_expired_open_of_another_kind_gets_the_lookup_refusal() {
+    let dispatch = recording_dispatch();
+    let error = open_bound_tab(
+        &dispatch,
+        TerminalKind::WezTerm,
+        "command",
+        Path::new("unused"),
+        Instant::now(),
+        |_| panic!("a refused kind is never bound"),
+        || panic!("a refused kind is never unbound"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "WezTerm is not available on Windows; use windows-console or herdr"
+    );
+    assert!(dispatch.console.calls().is_empty());
+}
+
+// Doctor's probe of a stored handle of another OS's terminal reads the lookup's refusal on
+// Windows, as on macOS and Linux: the presence is unverified, never a missing surface. Before
+// the lookup refused it, the managed console parsed a WezTerm pane id `0` as a process id and
+// reported the surface missing.
+#[test]
+fn doctor_probe_of_another_kinds_handle_is_unverified() {
+    use crate::native::doctor;
+    use crate::native::query::observation::{SessionEvidence, judgment::SurfacePresence};
+    use crate::native::session::{Reader, Store};
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-foreign");
+    std::fs::create_dir(&directory).unwrap();
+    let handle = TerminalSession::new(TerminalKind::WezTerm, "0".into())
+        .with_binding(Some("session-foreign".into()));
+    Store::open_unchecked(&directory)
+        .write_terminal(&handle)
+        .unwrap();
+    let reader = Reader::open_unchecked(&directory);
+    let evidence = SessionEvidence::read(&reader, Ok(false));
+    let dispatch = recording_dispatch();
+    let probe = |directory: &Path, session: &TerminalSession, timeout: Duration| {
+        surface_present(&dispatch, directory, session, timeout)
+    };
+    let presence = evidence.judge_surface_presence_with(
+        &reader,
+        Instant::now() + Duration::from_secs(2),
+        &probe,
+    );
+    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
+    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
+    let check = doctor::surface_presence_check(presence);
+    assert_eq!(check.reason_code, "terminal_surface_unverified");
+    assert!(dispatch.console.calls().is_empty());
 }
 
 /// Hands its one adapter out for every kind and counts the lookups, so that only the
@@ -232,9 +340,9 @@ struct EveryKind {
 }
 
 impl Adapters for EveryKind {
-    fn adapter(&self, _: TerminalKind) -> &dyn WindowsTerminalAdapter {
+    fn adapter(&self, _: TerminalKind) -> Result<&dyn WindowsTerminalAdapter> {
         self.lookups.set(self.lookups.get() + 1);
-        &self.adapter
+        Ok(&self.adapter)
     }
 }
 

@@ -587,6 +587,31 @@ fn a_handle_not_bound_to_this_session_is_refused_before_any_terminal_call() {
     }
 }
 
+// A handle that is not this session's is refused as unbound on every OS, whether or not this
+// OS runs its kind: the binding is the same fact everywhere, this OS's support is not. Before,
+// support was judged first, so the same records read as unbound on the kind's own OS and as
+// unsupported elsewhere.
+#[test]
+fn an_unbound_handle_is_refused_as_unbound_whatever_os_its_kind_runs_on() {
+    for kind in terminal::TerminalKind::ALL {
+        for binding in [Some("session-other"), None] {
+            if kind == terminal::TerminalKind::Iterm2 && binding.is_none() {
+                continue; // A legacy iTerm2 handle without a binding counts as bound.
+            }
+            let surface = handle(kind, binding);
+            let fixture = Fixture::new(SessionState::Working, Some(&surface));
+            let access = Fake::new(&fixture);
+            let error = refusal(fixture.observe(&access).0);
+            assert_eq!(
+                error.to_string(),
+                "the recorded terminal handle is not bound to session session-screen",
+                "{kind:?} {binding:?}"
+            );
+            assert!(access.calls.borrow().is_empty(), "{kind:?} {binding:?}");
+        }
+    }
+}
+
 #[test]
 fn unsupported_and_declared_refusals_answer_before_any_terminal_call() {
     let mut refused = Vec::new();

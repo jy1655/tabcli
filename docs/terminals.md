@@ -4,11 +4,17 @@ Choose the terminal where TAB opens your sessions, and check what it will close 
 On macOS, TAB detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
 Windows Terminal tab, then a separate console window, or Herdr inside an hc terminal. Linux
 detects Herdr and otherwise uses tmux.
-Use `--terminal` to override the selection.
+Use `--terminal` to override the selection. If this operating system does not run the named terminal, TAB refuses the selection before creating a session and lists the terminal kinds the system runs.
 
 TAB creates a new surface for each session: a tab, window, pane, or console. It does not adopt
 one of your existing tabs or attach to an independently running provider CLI. A Linux TAB
 process inside WSL would use tmux, but has not been verified. See [CLI commands](cli.md) for a worked session.
+
+## Stored terminal handles
+
+TAB refuses operations that need a terminal adapter for a kind this system does not run.
+The adapter lookup reports `<Name> is not available on <system>; use <the kinds that system runs>`.
+If closing the surface is refused, TAB keeps the handle. Close the session on the system that created it.
 
 ## Selection and settings
 

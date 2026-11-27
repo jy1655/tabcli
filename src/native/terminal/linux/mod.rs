@@ -5,24 +5,26 @@ pub(in crate::native) mod pidfd;
 pub(in crate::native) mod process;
 pub(in crate::native) mod tmux;
 use super::{
-    TerminalKind,
+    OsTerminals, TerminalKind,
     posix::{Adapters, PosixTerminalAdapter},
 };
-use crate::native::failure_kind::Unsupported;
-use anyhow::{Result, bail};
+use anyhow::Result;
 pub(super) struct Installed;
 pub(super) static INSTALLED: Installed = Installed;
 static HERDR: super::herdr::InstalledAdapter = super::herdr::Adapter::installed();
 static TMUX: tmux::Adapter<tmux::Installed> = tmux::Adapter::installed();
 impl Adapters for Installed {
+    // A kind Linux does not run gets the refusal every OS gives such a kind.
     fn adapter(&self, kind: TerminalKind) -> Result<&dyn PosixTerminalAdapter> {
         match kind {
             TerminalKind::Tmux => Ok(&TMUX),
             TerminalKind::Herdr => Ok(&HERDR),
-            kind => bail!(Unsupported::new(format!(
-                "{} is not available on Linux; use tmux or Herdr",
-                kind.display_name()
-            ))),
+            TerminalKind::Iterm2
+            | TerminalKind::AppleTerminal
+            | TerminalKind::Ghostty
+            | TerminalKind::Warp
+            | TerminalKind::WezTerm
+            | TerminalKind::WindowsConsole => Err(OsTerminals::LINUX.unavailable(kind)),
         }
     }
 }
