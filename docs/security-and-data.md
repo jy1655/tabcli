@@ -202,8 +202,9 @@ not examine Unix access control list entries that could grant another account wr
 On Windows it reads ownership and the access list from the same handle as the content. The
 owner must be the token user or default owner. TAB rejects an allow rule on the store that grants
 write, append, change-owner, or change-access-list rights to anyone except the token user, default
-owner, SYSTEM, Administrators, or OWNER RIGHTS. TAB ignores deny and inherit-only rules and
-refuses a missing access list or an unrecognized rule that applies to the store.
+owner, SYSTEM, Administrators, or OWNER RIGHTS. TAB ignores every inherit-only rule and every plain deny rule, and
+refuses a missing access list or any rule that applies to the store and is neither a plain
+allow nor a plain deny.
 These checks cannot establish who wrote the content earlier. The check does
 not exclude a process that already has the store open for writing. If a store fails this check,
 TAB does not use it to approve workspace input.
