@@ -93,8 +93,7 @@
   repair can settle the launch first (below). No terminal exists either way. What the caller
   cannot know stays the host's, unchanged from 0.4.49: the directory changed after the check,
   a program started under another token than the core's own, a read only the host can make.
-  The host logs its refusal as before when it still can (a directory that is gone takes no
-  line), and the launch ends as below when its terminal finishes.
+  A host that refuses the session directory leaves its contents untouched.
 - The launcher's wait reads the launch's terminal through the Herdr adapter's own probe
   (`launch_surface`): the exact terminal with the presence proof, and the launch label when
   the handle records one. A terminal its verified core reports finished before startup was

@@ -88,24 +88,39 @@ fn a_reused_herdr_host_pid_cannot_record_a_failure() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn direct_handoff_logs_a_directory_admission_refusal() {
+#[cfg(any(target_os = "linux", windows))]
+fn check_refused_directory(initial_log: Option<&[u8]>) {
     let root = tempfile::tempdir().unwrap();
-    for kind in [TerminalKind::Herdr, TerminalKind::Tmux] {
+    #[cfg(target_os = "linux")]
+    let kinds = [TerminalKind::Herdr, TerminalKind::Tmux];
+    #[cfg(windows)]
+    let kinds = [TerminalKind::Herdr];
+    for kind in kinds {
         let directory = root.path().join(format!("session-{}", kind.as_str()));
         fs::create_dir(&directory).unwrap();
+        let log = directory.join(launch::LOG);
+        if let Some(bytes) = initial_log {
+            crate::native::session::primitives::write_private(&log, bytes).unwrap();
+        }
+        #[cfg(target_os = "linux")]
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
-        let error = run_handoff_with(
-            &directory,
-            kind,
-            &mut SystemClock,
-            |_| panic!("admission refused"),
-            || panic!("admission refused"),
-            || -> Result<()> { panic!("admission refused") },
-            || panic!("admission refused"),
+        #[cfg(windows)]
+        {
+            crate::native::session::primitives::set_private_directory_permissions(&directory)
+                .unwrap();
+            super::windows_tests::icacls(&directory, "*S-1-1-0:(W)");
+        }
+        use super::super::host;
+        let command = host::parse(
+            kind.registration().host_command,
+            &[
+                directory.to_str().unwrap().to_owned(),
+                host::LAUNCH_COMMAND_FLAG.to_owned(),
+                "must not run".to_owned(),
+            ],
         )
-        .unwrap_err();
+        .unwrap();
+        let error = host::run(command).unwrap_err();
         assert_eq!(
             error.to_string(),
             format!(
@@ -113,15 +128,26 @@ fn direct_handoff_logs_a_directory_admission_refusal() {
                 kind.display_name()
             )
         );
-        let log = fs::read_to_string(directory.join(launch::LOG)).unwrap();
-        assert!(log.ends_with(&format!(" {}_host_refused: {error:#}\n", kind.as_str())));
-        assert!(
-            !Store::open_unchecked(&directory)
-                .record(CoreRecord::LaunchHost)
-                .path()
-                .exists()
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            usize::from(initial_log.is_some())
         );
+        if let Some(bytes) = initial_log {
+            assert_eq!(fs::read(&log).unwrap(), bytes);
+        }
     }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn refused_directory_keeps_its_existing_log() {
+    check_refused_directory(Some(b"existing log\n"));
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn refused_directory_stays_empty() {
+    check_refused_directory(None);
 }
 
 #[test]

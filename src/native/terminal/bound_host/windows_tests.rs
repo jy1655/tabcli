@@ -17,7 +17,7 @@ fn private_session(root: &Path, name: &str) -> PathBuf {
     directory
 }
 
-fn icacls(path: &Path, grant: &str) {
+pub(super) fn icacls(path: &Path, grant: &str) {
     let system = std::env::var_os("SystemRoot").expect("SystemRoot");
     let status = Command::new(PathBuf::from(system).join(r"System32\icacls.exe"))
         .arg(path)
