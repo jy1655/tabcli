@@ -753,6 +753,7 @@ fn launch_plan_owns_session_watcher_even_before_hook_availability_is_known() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         cfg!(windows),
         |_, _| Ok(false),

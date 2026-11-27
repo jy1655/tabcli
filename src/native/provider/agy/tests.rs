@@ -268,7 +268,9 @@ fn probes_drop_caller_identities_and_keep_configuration() {
 }
 
 // The complete launch command for every policy combination and both platform branches:
-// policy, the private log file, and off Windows the correlated interactive prompt.
+// policy, the private log file, and off Windows the correlated interactive prompt. Without
+// consent the command is the one every earlier release built, and no settings file or applied
+// marker is written, even for an Agy that takes the setting.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
     for windows in [false, true] {
@@ -292,12 +294,24 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                             yolo,
                             model,
                             effort,
+                            provider_version: "1.5.17",
                         },
                         windows,
+                        &mut |_| Ok(refused()),
                     )
                     .unwrap();
                     let label =
                         format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
+                    assert!(
+                        session_settings_files(&directory).unwrap().is_empty(),
+                        "{label}"
+                    );
+                    assert!(
+                        crate::native::consent::observe(&directory)
+                            .value()
+                            .is_null(),
+                        "{label}"
+                    );
                     let pending = read_pending_turn(&directory).unwrap().unwrap();
                     assert_eq!(
                         pending.claim_token,
@@ -372,8 +386,10 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         false,
+        &mut |_| panic!("no consent work for an Agy whose version identifies nothing"),
     )
     .unwrap();
     assert_eq!(
@@ -397,4 +413,604 @@ fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
         )),
         "{error:#}"
     );
+}
+
+fn refused() -> crate::native::consent::Authority {
+    crate::native::consent::Authority {
+        applied: None,
+        verdict: Err(crate::native::consent::Refusal {
+            reason: "no consent".into(),
+            unreadable: false,
+        }),
+    }
+}
+
+fn consented(kind: crate::native::consent::Consented) -> crate::native::consent::Authority {
+    crate::native::consent::Authority {
+        applied: None,
+        verdict: Ok(kind),
+    }
+}
+
+// A session directory with its manifest, claim and consent record, in a state root of its
+// own, for a launch in `workspace`.
+fn consented_launch_session(root: &Path, workspace: &Path) -> std::path::PathBuf {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "agy".to_owned(),
+            provider_path: "agy".into(),
+            provider_version: "recorded at resolution".to_owned(),
+            workspace: workspace.to_owned(),
+            title: "Agy test".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    session_turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::consent::prepare_at_home(&directory, workspace, root).unwrap();
+    directory
+}
+
+fn launch_context<'a>(
+    directory: &'a Path,
+    workspace: &'a Path,
+    yolo: bool,
+    version: &'a str,
+) -> LaunchContext<'a> {
+    LaunchContext {
+        bridge_executable: Path::new("/opt/agent-bridge"),
+        directory,
+        workspace,
+        title: "Agy test",
+        prompt: "agy prompt",
+        yolo,
+        model: None,
+        effort: None,
+        provider_version: version,
+    }
+}
+
+// With consent, exact or inherited (owner's decisions, 2026-11-26), an Agy that takes the
+// session-only settings gets the exact workspace in a private settings file of the session,
+// named by `--settings` before the log file, on both platforms and whatever the bypass; the
+// applied marker follows the file. The version is the wrapper's own probe of this launch (the
+// manifest's is never read), judged before any consent work: an older one records only that
+// the option is unavailable, and one that identifies nothing writes nothing; neither asks
+// consent anything.
+#[test]
+fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
+    use crate::native::consent::Consented;
+    for (version, support) in [
+        ("1.5.17", "supported"),
+        ("1.6.0", "supported"),
+        ("v1.5.17", "supported"),
+        (" 1.5.18\n", "supported"),
+        ("1.5.16", "older"),
+        ("1.5.17-rc.1", "older"),
+        ("1.1.12", "older"),
+        ("agy 2.0.1 (go 1.25.0)", "unknown"),
+        ("unknown", "unknown"),
+        ("", "unknown"),
+    ] {
+        for kind in [Consented::Exact, Consented::Inherited] {
+            for windows in [false, true] {
+                for yolo in [false, true] {
+                    let label =
+                        format!("version={version:?} {kind:?} windows={windows} yolo={yolo}");
+                    let home = tempfile::tempdir().unwrap();
+                    let root = home.path().canonicalize().unwrap();
+                    // Characters that a command shim would interpret: none reaches an argument.
+                    let workspace = root.join("work 'q' ü & %PATH% $HOME ^");
+                    std::fs::create_dir(&workspace).unwrap();
+                    let directory = consented_launch_session(&root, &workspace);
+                    let mut asked = 0;
+                    let plan = prepare_launch_for_platform(
+                        launch_context(&directory, &workspace, yolo, version),
+                        windows,
+                        &mut |asked_for| {
+                            assert_eq!(asked_for, directory);
+                            asked += 1;
+                            Ok(consented(kind))
+                        },
+                    )
+                    .unwrap();
+                    let applies = support == "supported";
+                    assert_eq!(asked, usize::from(applies), "{label}");
+                    // One settings file of its own for a plan that applies the setting.
+                    let files = session_settings_files(&directory).unwrap();
+                    assert_eq!(files.len(), usize::from(applies), "{label}");
+                    let settings = files.first().cloned().unwrap_or_default();
+                    let mut expected = agy_policy(yolo, None, None);
+                    if applies {
+                        expected.extend([
+                            OsString::from("--settings"),
+                            settings.clone().into_os_string(),
+                        ]);
+                    }
+                    expected.extend([
+                        OsString::from("--log-file"),
+                        directory.join(AGY_LOG_FILE).into_os_string(),
+                    ]);
+                    assert_eq!(plan.arguments[..expected.len()], expected[..], "{label}");
+                    let observed = crate::native::consent::observe(&directory);
+                    if applies {
+                        let written: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+                        assert_eq!(
+                            written,
+                            serde_json::json!({
+                                "trustedWorkspaces": [crate::native::consent::native_key(&workspace).unwrap()]
+                            }),
+                            "{label}"
+                        );
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            assert_eq!(
+                                std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+                                0o600,
+                                "{label}"
+                            );
+                        }
+                        assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
+                        let grant = plan.trust_grant.as_ref().unwrap();
+                        assert_eq!(grant.provider, FirstPartyCli::Agy, "{label}");
+                        assert_eq!(grant.marker, APPLIED_MARKER, "{label}");
+                        assert_eq!(
+                            grant.workspace,
+                            crate::native::consent::identity(&workspace).unwrap(),
+                            "{label}"
+                        );
+                        let named = grant.option_file.as_ref().unwrap();
+                        assert_eq!(named.path, settings, "{label}");
+                        assert!(
+                            settings
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with("agy-session-trust-"),
+                            "{label}"
+                        );
+                    } else {
+                        assert!(plan.trust_grant.is_none(), "{label}");
+                        assert_eq!(
+                            observed.applied_marker(),
+                            (support == "older").then_some("launch-option-unavailable"),
+                            "{label}"
+                        );
+                    }
+                    // No provider store was created or written under this home.
+                    assert!(!root.join(".gemini").exists(), "{label}");
+                }
+            }
+        }
+    }
+}
+
+// A refused or failing authority writes nothing; a refusal records nothing either, so the
+// dialog step sends no key for such a launch.
+#[test]
+fn the_authority_decides_the_setting_and_an_inconclusive_one_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let directory = consented_launch_session(&root, &root);
+    let plan = prepare_launch_for_platform(
+        launch_context(&directory, &root, false, "1.5.17"),
+        false,
+        &mut |_| Ok(refused()),
+    )
+    .unwrap();
+    assert!(!plan.arguments.contains(&OsString::from("--settings")));
+    let error = prepare_launch_for_platform(
+        launch_context(&directory, &root, false, "1.5.17"),
+        false,
+        &mut |_| Err(anyhow::anyhow!("consent unreadable")),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.to_string(), "consent unreadable");
+    assert!(session_settings_files(&directory).unwrap().is_empty());
+    assert_eq!(
+        crate::native::consent::observe(&directory).applied_marker(),
+        None
+    );
+}
+
+#[test]
+fn the_session_settings_floor_is_the_measured_version() {
+    assert_eq!(SESSION_SETTINGS_FLOOR, semver::Version::new(1, 5, 17));
+    assert_eq!(ADAPTER.applied_marker(), Some("agy-settings-override"));
+    for (version, support) in [
+        ("1.5.17", SettingSupport::Supported),
+        ("v1.5.17", SettingSupport::Supported),
+        ("1.5.18\n", SettingSupport::Supported),
+        ("1.5.16", SettingSupport::Older),
+        ("1.1.12", SettingSupport::Older),
+        ("antigravity 1.5.18\n", SettingSupport::Unknown),
+        ("", SettingSupport::Unknown),
+    ] {
+        assert_eq!(setting_support(version), support, "{version:?}");
+    }
+}
+
+// Consent's worktree screen asks only Agy's store: the answer about a path that nothing may touch
+// comes from the store alone and is the store's exact decision. Agy's full lookup reads only the
+// store too, so it answers the same for that path, unchanged.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent::{self, Trust};
+    let fixture = super::super::UntouchedPath::new();
+    std::fs::create_dir_all(fixture.home.join(".gemini/antigravity-cli")).unwrap();
+    let store = fixture.home.join(".gemini/antigravity-cli/settings.json");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env, None)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, expected) in [(&fixture.path, true), (&parent, false)] {
+        crate::native::session::primitives::write_json_atomic(
+            &store,
+            &serde_json::json!({"trustedWorkspaces":[consent::native_key(listed).unwrap()]}),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env, None)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            matches!(
+                ADAPTER
+                    .workspace_trust(&fixture.path, &fixture.env, None)
+                    .unwrap(),
+                Trust::Trusted(_)
+            ),
+            expected
+        );
+    }
+}
+
+// A source store that becomes unreadable after the session's assessment is
+// a refusal for the plan, as a missing consent was in 0.4.49: no session-only setting, no grant,
+// and the launch goes on.
+#[test]
+fn a_source_store_unreadable_after_the_assessment_plans_no_setting() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let pi = root.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let directory = consented_launch_session(&root, &workspace);
+    std::fs::remove_file(&pi).unwrap();
+    crate::native::session::primitives::write_private(&pi, b"{").unwrap();
+    let env = crate::native::consent::Environment::at_home(&root);
+    let plan = prepare_launch_for_platform(
+        launch_context(&directory, &workspace, false, "1.5.17"),
+        false,
+        &mut |directory| crate::native::consent::authority(directory, FirstPartyCli::Agy, &env),
+    )
+    .unwrap();
+    assert!(plan.trust_grant.is_none());
+    assert!(!plan.arguments.contains(&OsString::from("--settings")));
+    assert!(session_settings_files(&directory).unwrap().is_empty());
+}
+
+// The command's workspace is checked against the consent record before any
+// settings file is published, and each granted plan has its own file. A later plan built for
+// another directory (a stale snapshot) is refused and leaves the earlier plan's settings bytes,
+// and the directory's other files, as they were.
+#[test]
+fn a_refused_plan_leaves_an_earlier_plans_settings_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let stale = root.join("stale");
+    std::fs::create_dir(&stale).unwrap();
+    let directory = consented_launch_session(&root, &workspace);
+    let settings_of = |plan: &LaunchPlan| {
+        let at = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "--settings")
+            .expect("the plan applies the setting");
+        std::path::PathBuf::from(&plan.arguments[at + 1])
+    };
+    let first = prepare_launch_for_platform(
+        launch_context(&directory, &workspace, false, "1.5.17"),
+        false,
+        &mut |_| Ok(consented(crate::native::consent::Consented::Exact)),
+    )
+    .unwrap();
+    let settings = settings_of(&first);
+    let bytes = std::fs::read(&settings).unwrap();
+    let names = |directory: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names(&directory);
+    let error = prepare_launch_for_platform(
+        launch_context(&directory, &stale, false, "1.5.17"),
+        false,
+        &mut |_| Ok(consented(crate::native::consent::Consented::Exact)),
+    )
+    .map(|plan| plan.arguments)
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another workspace than the command's"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), bytes);
+    let mut after = names(&directory);
+    // The refused plan installed its own pending turn as every plan does; no settings file.
+    after.retain(|name| !before.contains(name));
+    assert!(
+        after
+            .iter()
+            .all(|name| !name.to_string_lossy().starts_with("agy-session-trust")),
+        "{after:?}"
+    );
+}
+
+// The names of the session's Agy settings files, sorted, read without the adapter's own listing.
+fn settings_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("agy-session-trust"))
+        .collect();
+    names.sort();
+    names
+}
+
+// The plan owns its settings file from the file's exclusive creation until
+// its grant is made. A write that fails after the file was created removes it, here the sync of
+// the session directory after the whole file was written, and so does a grant that is not made.
+// A removal that fails is reported with the file's path; the file is then left as it is.
+#[test]
+fn a_settings_file_that_no_plan_was_granted_is_removed_or_named() {
+    use crate::native::session::primitives::{
+        injected_fault, injected_sync_failure, with_fault_budget, with_sync_failure,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let directory = consented_launch_session(&root, &workspace);
+    let context = launch_context(&directory, &workspace, false, "1.5.17");
+    let plan = || {
+        session_trust_settings(&context, &mut |_| {
+            Ok(consented(crate::native::consent::Consented::Exact))
+        })
+        .map(|planned| planned.map(|(file, _)| file))
+    };
+    let applied = || {
+        crate::native::consent::observe(&directory)
+            .applied_marker()
+            .map(str::to_owned)
+    };
+
+    // The session directory's sync fails after the whole file was written: no file is left.
+    let error = with_sync_failure(&directory, plan).unwrap_err();
+    assert!(injected_sync_failure(&error), "{error:#}");
+    assert_eq!(settings_names(&directory), Vec::<String>::new());
+    assert_eq!(applied(), None);
+
+    // The removal fails too (a fault at every later boundary): the error names the file.
+    let error = with_fault_budget(2, plan).unwrap_err();
+    let text = format!("{error:#}");
+    let left = settings_names(&directory);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(injected_fault(&error), "{text}");
+    assert!(
+        text.contains(&*directory.join(&left[0]).to_string_lossy())
+            && text.contains("could not be removed"),
+        "{text}"
+    );
+    std::fs::remove_file(directory.join(&left[0])).unwrap();
+
+    // The grant is not made (the session record's lock is not a file): the file is removed, and
+    // a removal that fails is reported with its path.
+    let lock = directory.join("workspace-consent.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let error = plan().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid workspace consent lock"),
+        "{error:#}"
+    );
+    assert_eq!(settings_names(&directory), Vec::<String>::new());
+    let error = with_fault_budget(3, plan).unwrap_err();
+    let text = format!("{error:#}");
+    let left = settings_names(&directory);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        text.contains("invalid workspace consent lock")
+            && text.contains(&*directory.join(&left[0]).to_string_lossy())
+            && text.contains("could not be removed"),
+        "{text}"
+    );
+    std::fs::remove_file(directory.join(&left[0])).unwrap();
+    std::fs::remove_dir(&lock).unwrap();
+    assert_eq!(applied(), None);
+
+    // A granted plan keeps its file.
+    let file = plan().unwrap().unwrap();
+    assert_eq!(
+        settings_names(&directory),
+        [file.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+    assert_eq!(applied().as_deref(), Some(APPLIED_MARKER));
+}
+
+// A session directory for one Agy launch in its own state root, the launch context's workspace,
+// and the plan of `session_trust_settings` with consent granted, returning the file it applied.
+struct SettingsPlan {
+    _home: tempfile::TempDir,
+    directory: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+}
+
+impl SettingsPlan {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let directory = consented_launch_session(&root, &workspace);
+        Self {
+            _home: home,
+            directory,
+            workspace,
+        }
+    }
+
+    fn plan(&self) -> Result<Option<std::path::PathBuf>> {
+        session_trust_settings(
+            &launch_context(&self.directory, &self.workspace, false, "1.5.17"),
+            &mut |_| Ok(consented(crate::native::consent::Consented::Exact)),
+        )
+        .map(|planned| planned.map(|(file, _)| file))
+    }
+
+    fn applied(&self) -> Option<String> {
+        crate::native::consent::observe(&self.directory)
+            .applied_marker()
+            .map(str::to_owned)
+    }
+}
+
+// A grant that fails after the session record was replaced (the existing
+// fault point after the rename, before the syncs that make it durable) returns the record's
+// applied marker to what it held before, under the record's lock, so no marker names a command
+// that was never built; an earlier plan's marker stays, with its file. A return that fails too
+// (a process that stopped there) is reported with the marker it may leave.
+#[test]
+fn a_failed_grant_returns_the_applied_marker_to_its_earlier_value() {
+    use crate::native::session::primitives::{injected_fault, with_fault_at, with_fault_budget};
+    const AFTER_RENAME: &str = "syncing a renamed record";
+    let s = SettingsPlan::new();
+    let error = with_fault_at(AFTER_RENAME, || s.plan()).unwrap_err();
+    assert!(injected_fault(&error), "{error:#}");
+    assert_eq!(s.applied(), None);
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+
+    // The return fails as well: the error says which marker the record may still show.
+    let error = with_fault_budget(6, || s.plan()).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(&format!("injected fault before {AFTER_RENAME}"))
+            && text.contains(&format!(
+                "this attempt received no grant for the launch option {APPLIED_MARKER}, and the session's consent record may still name it"
+            )),
+        "{text}"
+    );
+    for name in settings_names(&s.directory) {
+        std::fs::remove_file(s.directory.join(name)).unwrap();
+    }
+
+    // An earlier plan's marker and file stay when a later plan's grant fails.
+    let s = SettingsPlan::new();
+    let first = s.plan().unwrap().unwrap();
+    let error = with_fault_at(AFTER_RENAME, || s.plan()).unwrap_err();
+    assert!(injected_fault(&error), "{error:#}");
+    assert_eq!(s.applied().as_deref(), Some(APPLIED_MARKER));
+    assert_eq!(
+        settings_names(&s.directory),
+        [first.file_name().unwrap().to_string_lossy().into_owned()]
+    );
+}
+
+// The removal of a settings file that no plan was granted is made durable:
+// the session directory is synced after the unlink, as after the file's creation. A removal
+// whose sync fails names the file in the plan's error.
+#[test]
+fn the_removal_of_an_ungranted_settings_file_is_durable_or_named() {
+    use crate::native::session::primitives::{SyncRecord, with_sync_failure, with_sync_log};
+    let s = SettingsPlan::new();
+    // The grant is not made (the session record's lock is not a file).
+    let lock = s.directory.join("workspace-consent.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let (outcome, log) = with_sync_log(|| s.plan());
+    assert!(
+        format!("{:#}", outcome.unwrap_err()).contains("invalid workspace consent lock"),
+        "{log:?}"
+    );
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+    let directory_syncs = log
+        .iter()
+        .filter(|record| **record == SyncRecord::Directory(s.directory.clone()))
+        .count();
+    // The file's creation, then its removal.
+    assert_eq!(directory_syncs, 2, "{log:?}");
+    std::fs::remove_dir(&lock).unwrap();
+
+    // Every sync of the session directory fails: the file is written and removed, and the error
+    // says that its removal could not be made durable, naming the file.
+    let error = with_sync_failure(&s.directory, || s.plan()).unwrap_err();
+    let text = format!("{error:#}");
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+    assert!(
+        text.contains(&*s.directory.join("agy-session-trust-").to_string_lossy())
+            && text.contains("could not be made durable"),
+        "{text}"
+    );
+}
+
+// The removal says which of its steps failed. The unlink of an ungranted
+// settings file succeeds; then the session directory loses its permissions (a volume that fails
+// from that moment), so its sync fails and so would any later look at the path. The plan reports a
+// file that was removed but whose removal could not be made durable, never a file that could not
+// be removed.
+#[cfg(unix)]
+#[test]
+fn an_unlinked_settings_file_whose_sync_fails_is_not_reported_as_kept() {
+    use crate::native::session::primitives::with_step_at;
+    use std::os::unix::fs::PermissionsExt;
+    let s = SettingsPlan::new();
+    // The grant is not made (the session record's lock is not a file), so the file is removed.
+    std::fs::create_dir(s.directory.join("workspace-consent.lock")).unwrap();
+    let locked = s.directory.clone();
+    let error = with_step_at(
+        "syncing a removed record's directory",
+        move || std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap(),
+        || s.plan(),
+    )
+    .unwrap_err();
+    std::fs::set_permissions(&s.directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(settings_names(&s.directory), Vec::<String>::new());
+    // A user that may read anything (root) syncs the directory anyway.
+    if unsafe { libc::geteuid() } != 0 {
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("was removed, but its removal could not be made durable")
+                && !text.contains("could not be removed"),
+            "{text}"
+        );
+    }
 }

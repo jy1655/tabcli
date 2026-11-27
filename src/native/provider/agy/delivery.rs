@@ -1,13 +1,13 @@
-use super::readiness::{ReadinessTiming, wait_for_startup_readiness_with};
+use super::readiness::{ReadinessTiming, wait_for_startup_readiness_observed};
 use super::receipt::confirm_input_receipt_with;
-use super::trust::wait_for_workspace_trust;
+use super::trust::{trust_at_dispatch, wait_for_workspace_trust, workspace_customizations_loaded};
 use super::turn::{PendingAgyTurn, read_pending_turn};
 use super::{AGY_LOG_FILE, INPUT_RECEIPT_WINDOW, STARTUP_POLL_INTERVAL};
 
 use crate::native::consent::Environment;
 use crate::native::session::{Reader, RecordReader, Store};
 use crate::native::terminal;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -119,10 +119,16 @@ impl<'a> PreparedTerminalTurn<'a> {
         })
     }
 
+    // `at_dispatch` runs immediately before `send`, after every wait: the trust is consumed
+    // there, and its refusal sends nothing. That is the last point the provider-neutral code
+    // controls; the terminal backend's own steps after it are not asked again (router's limit,
+    // 2026-11-26), so a revocation after it does not stop the paste already handed to the
+    // backend.
     fn deliver<R>(
         self,
         terminal: &str,
         runtime: &mut R,
+        at_dispatch: impl FnOnce() -> Result<()>,
         send: impl FnOnce(&mut R) -> terminal::TerminalSendResult,
         confirm: impl FnOnce(&mut R, &PendingAgyTurn, usize) -> terminal::TerminalSendResult,
     ) -> terminal::TerminalSendResult {
@@ -132,14 +138,17 @@ impl<'a> PreparedTerminalTurn<'a> {
             self.pre_paste_len,
             terminal,
             runtime,
+            at_dispatch,
             send,
             |runtime| confirm(runtime, &self.pending, self.pre_paste_len),
         )
     }
 }
 
-// A Windows follow-up has already passed startup trust/readiness in its initial
-// paste; all other pastes wait for both gates here before preparing the turn.
+// Every paste waits for the trust evidence first: Agy's own store or this session's applied
+// setting with current consent, and this process's own log line. A Windows follow-up has
+// already passed startup readiness in its initial paste and skips only that wait; all other
+// pastes also wait for readiness before preparing the turn.
 pub(super) fn deliver_terminal_turn<R: Runtime>(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
@@ -157,39 +166,49 @@ pub(super) fn deliver_terminal_turn<R: Runtime>(
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
+    let env = runtime.split().1.environment();
     let prepared = PreparedTerminalTurn::prepare_with(
         &directory,
         runtime,
-        |runtime| {
-            if readiness.is_some() {
-                let (clock, io) = runtime.split();
-                wait_for_workspace_trust(&directory, deadline, &io.environment(), clock)?;
-            }
-            Ok(())
-        },
+        |runtime| wait_for_workspace_trust(&directory, deadline, &env, runtime.split().0),
         |runtime| {
             let (clock, io) = runtime.split();
-            if let Some(timing) = readiness {
+            // The receipt offset and the very contents it was measured on, from one read: the
+            // readiness wait returns its qualifying observation instead of having every poll
+            // copied.
+            let (offset, qualifying) = if let Some(timing) = readiness {
                 // No later log read may replace the gate's receipt offset.
-                wait_for_startup_readiness_with(
+                wait_for_startup_readiness_observed(
                     &mut || io.read_log(&log_path),
                     deadline,
                     timing,
                     STARTUP_POLL_INTERVAL,
                     clock,
-                )
+                )?
             } else {
                 let log = io
                     .read_log(&log_path)
                     .context("Agy log could not be read before the console paste")?;
-                follow_up_pre_paste_offset(log.as_deref())
-            }
+                (follow_up_pre_paste_offset(log.as_deref())?, log)
+            };
+            // This process's own load line, in the very contents whose length is the receipt
+            // offset: a replaced or rotated log that lost it supplies no offset.
+            ensure!(
+                qualifying
+                    .as_deref()
+                    .and_then(|log| log.get(..offset))
+                    .is_some_and(workspace_customizations_loaded),
+                "the {AGY_LOG_FILE} contents that supply the receipt offset do not show this session's workspace customization load, so the prompt was not pasted"
+            );
+            Ok(offset)
         },
     )
     .map_err(TerminalSendFailure::not_sent)?;
     prepared.deliver(
         session.kind.as_str(),
         runtime,
+        // The trust is consumed here, after every wait and immediately before the paste.
+        || trust_at_dispatch(&directory, &env),
         |runtime| runtime.split().1.send(session, prompt_path, deadline),
         |runtime, pending, pre_paste_len| {
             let (clock, io) = runtime.split();
@@ -211,16 +230,21 @@ pub(super) fn deliver_terminal_turn<R: Runtime>(
 // the failure between terminal injection, a late reload, and Agy's input loop.
 // Record actual dispatch times and the offset used by the receipt check without
 // copying prompt text. Diagnostic write failures never cancel or retry delivery.
-fn trace_terminal_delivery<R, S, C>(
+// The paste timestamps surround the send itself: `at_dispatch` runs
+// before them, and its refusal leaves them empty and records the input as not sent.
+#[allow(clippy::too_many_arguments)]
+fn trace_terminal_delivery<R, A, S, C>(
     directory: &Path,
     pending: &PendingAgyTurn,
     pre_paste_len: usize,
     terminal: &str,
     runtime: &mut R,
+    at_dispatch: A,
     send: S,
     confirm: C,
 ) -> terminal::TerminalSendResult
 where
+    A: FnOnce() -> Result<()>,
     S: FnOnce(&mut R) -> terminal::TerminalSendResult,
     C: FnOnce(&mut R) -> terminal::TerminalSendResult,
 {
@@ -233,14 +257,20 @@ where
         "paste_returned_unix_ms":null, "receipt_finished_unix_ms":null, "error":null,
     });
     let _ = record.write_json(&trace);
-    trace["paste_started_unix_ms"] =
-        serde_json::json!(crate::native::session::primitives::unix_ms());
-    let result = send(runtime);
-    trace["paste_returned_unix_ms"] =
-        serde_json::json!(crate::native::session::primitives::unix_ms());
-    let result = result.and_then(|()| confirm(runtime));
-    trace["receipt_finished_unix_ms"] =
-        serde_json::json!(crate::native::session::primitives::unix_ms());
+    let result = match at_dispatch() {
+        Err(error) => Err(terminal::TerminalSendFailure::not_sent(error)),
+        Ok(()) => {
+            trace["paste_started_unix_ms"] =
+                serde_json::json!(crate::native::session::primitives::unix_ms());
+            let result = send(runtime);
+            trace["paste_returned_unix_ms"] =
+                serde_json::json!(crate::native::session::primitives::unix_ms());
+            let result = result.and_then(|()| confirm(runtime));
+            trace["receipt_finished_unix_ms"] =
+                serde_json::json!(crate::native::session::primitives::unix_ms());
+            result
+        }
+    };
     trace["outcome"] = serde_json::json!(match &result {
         Ok(()) => "confirmed",
         Err(error) if error.delivery_may_have_occurred() => "delivery-uncertain",

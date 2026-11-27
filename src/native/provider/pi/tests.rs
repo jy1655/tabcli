@@ -775,6 +775,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                                 yolo,
                                 model,
                                 effort,
+                                provider_version: "fixture",
                             },
                             windows,
                             authorized,
@@ -851,6 +852,14 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         } else {
                             assert!(observed.value().is_null(), "{label}: {observed:?}");
                         }
+                        // The plan carries the option it put in the command to the spawn
+                        // fence; a plain command carries none and reads no consent there.
+                        let grant = plan.trust_grant.as_ref();
+                        assert_eq!(grant.is_some(), consent, "{label}");
+                        if let Some(grant) = grant {
+                            assert_eq!(grant.provider, FirstPartyCli::Pi, "{label}");
+                            assert_eq!(grant.marker, APPLIED_MARKER, "{label}");
+                        }
                     }
                 }
             }
@@ -887,6 +896,7 @@ fn launch_plan_watcher_starts_the_hook_failure_monitor_only_when_started() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         false,
         crate::native::consent::authorized,
@@ -1287,4 +1297,128 @@ fn pending_install_requires_a_live_session_and_cancel_is_unconditional() {
     fs::write(&closed_path, b"unreadable").unwrap();
     cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
     assert!(read_pending_turn(directory.path()).unwrap().is_none());
+}
+
+// Consent's worktree screen asks only Pi's store: the answer about a path that nothing may touch
+// comes from the store alone and is the store's exact, positive decision; a parent's decision,
+// positive or not, lists nothing. Pi's full lookup reads only the store too (its parent walk is
+// lexical), so it answers the same for that path, unchanged.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent::{self, Trust};
+    let fixture = super::super::UntouchedPath::new();
+    std::fs::create_dir_all(fixture.home.join(".pi/agent")).unwrap();
+    let store = fixture.home.join(".pi/agent").join("trust.json");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env, None)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, decision, expected) in [
+        (&fixture.path, true, true),
+        (&fixture.path, false, false),
+        (&parent, true, false),
+        (&parent, false, false),
+    ] {
+        write_json_atomic(
+            &store,
+            &serde_json::json!({consent::native_key(listed).unwrap():decision}),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env, None)
+                .unwrap(),
+            expected,
+            "{decision}"
+        );
+        assert_eq!(
+            matches!(
+                ADAPTER
+                    .workspace_trust(&fixture.path, &fixture.env, None)
+                    .unwrap(),
+                Trust::Trusted(_)
+            ),
+            expected,
+            "{decision}"
+        );
+    }
+}
+
+// A source store that becomes unreadable after the session's assessment is
+// a refusal for the plan through the production gate, as a missing consent was in 0.4.49: the
+// command carries no trust option and no grant, and the launch goes on. The recheck refuses on
+// the pinned fixture store before any store of the caller's own environment is read.
+#[test]
+fn a_source_store_unreadable_after_the_assessment_plans_a_plain_command() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    session_turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    super::test_support::launching_status(&directory);
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "pi".to_owned(),
+            provider_path: "pi".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: workspace.clone(),
+            title: "plain".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &workspace, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    std::fs::remove_file(&pi).unwrap();
+    crate::native::session::primitives::write_private(&pi, b"{").unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &workspace,
+            title: "plain",
+            prompt: "plain prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .unwrap();
+    assert!(plan.trust_grant.is_none());
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument == "--approve"),
+        "{:?}",
+        plan.arguments
+    );
 }

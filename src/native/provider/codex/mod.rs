@@ -435,6 +435,20 @@ impl NativeProviderAdapter for CodexAdapter {
         }
     }
 
+    // `workspace_trust` is already store-only: it resolves the store from `env`, reads that
+    // file, and compares `workspace` as a string key.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.workspace_trust(workspace, env, store)?,
+            super::super::consent::Trust::Trusted(_)
+        ))
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         launch_environment_removals()
     }
@@ -727,6 +741,7 @@ fn prepare_launch_for_platform(
         // Immediately after the unchanged notify override, before a positional prompt.
         own.splice(2..2, [OsString::from("-c"), OsString::from(value)]);
     }
+    let mut trust_grant = None;
     if authorized(context.directory, FirstPartyCli::Codex)? {
         // Official process-local TOML override; never edits config.toml or any
         // approval/sandbox setting. Insert before the positional prompt.
@@ -737,10 +752,17 @@ fn prepare_launch_for_platform(
                 OsString::from(workspace_trust_override(context.workspace)?),
             ],
         );
-        super::super::consent::applied(context.directory, APPLIED_MARKER)?;
+        trust_grant = Some(super::super::consent::apply_option(
+            context.directory,
+            FirstPartyCli::Codex,
+            APPLIED_MARKER,
+            context.workspace,
+            None,
+        )?);
     }
     arguments.extend(own);
     Ok(LaunchPlan {
+        trust_grant,
         arguments,
         initial_prompt: InitialPromptDisposition::of(route.initial_transport().as_ref()),
         watcher: Box::new(transcript::Watcher),

@@ -328,6 +328,20 @@ impl NativeProviderAdapter for PiAdapter {
         }
     }
 
+    // `workspace_trust` is already store-only: it resolves the store from `env`, reads that
+    // file, and compares `workspace` and its lexical ancestors as string keys.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.workspace_trust(workspace, env, store)?,
+            super::super::consent::Trust::Trusted(_)
+        ))
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // Pi's descendants and a bundled agent-detection dependency can read caller context:
         // an independent launch drops Codex identity/shutdown context and Claude identity/inbox.
@@ -441,16 +455,24 @@ fn prepare_launch_for_platform(
         OsString::from("--name"),
         OsString::from(context.title),
     ]);
+    let mut trust_grant = None;
     if authorized(context.directory, FirstPartyCli::Pi)? {
         // Pi documents --approve as a one-run project-trust override. It is
         // not a tool permission flag and does not persist to trust.json.
         arguments.push(OsString::from("--approve"));
-        super::super::consent::applied(context.directory, APPLIED_MARKER)?;
+        trust_grant = Some(super::super::consent::apply_option(
+            context.directory,
+            FirstPartyCli::Pi,
+            APPLIED_MARKER,
+            context.workspace,
+            None,
+        )?);
     }
     if !windows {
         arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
     }
     Ok(LaunchPlan {
+        trust_grant,
         arguments,
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),

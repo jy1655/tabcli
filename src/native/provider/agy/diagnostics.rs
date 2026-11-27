@@ -3,10 +3,13 @@ use super::evidence::{only_user_input_carries, transcript_logs};
 use super::monitor::{ResultReader, brain_root, parse_conversation_id, pending_turn_log};
 use super::readiness::observe_startup;
 use super::receipt::{input_receipts, receipt_matches};
-use super::trust::workspace_trust_missing;
+use super::trust::{
+    TRUST_SETTING_UNVERIFIED, TRUST_SETTING_WITHOUT_CONSENT, TrustRoute, workspace_trust_evidence,
+};
 use super::turn::read_pending_turn;
 use super::{
-    AGY_LOG_FILE, FULL_TRANSCRIPT_FILE, TRANSCRIPT_FILE, TRUST_RECOVERY, TRUST_STORE_MISSING,
+    AGY_LOG_FILE, APPLIED_MARKER, FULL_TRANSCRIPT_FILE, TRANSCRIPT_FILE, TRUST_RECOVERY,
+    TRUST_STORE_MISSING,
 };
 use crate::native::diagnostics::vocabulary::{CheckId, Reason};
 use crate::native::session::{Reader, SessionState};
@@ -38,26 +41,51 @@ pub(super) fn workspace_trust_check(
     };
     const OBSERVATION: &str =
         "Observation only: doctor never answers the dialog or edits Agy's settings.";
-    const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
+    const WITHHELD: &str = "Every paste (the Windows initial prompt and every follow-up) is withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
     let log_path = Reader::open_unchecked(directory)
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
-    let (availability, reason, detail) = match workspace_trust_missing(workspace, env, &log_path) {
-        Ok(None) => (
+    let evidence = workspace_trust_evidence(workspace, env, directory);
+    // Whether the session's record says its launch configured the session-only setting: for
+    // the row's wording and evidence only, never the evidence that Agy took it.
+    let configured =
+        super::super::super::consent::observe(directory).applied_marker() == Some(APPLIED_MARKER);
+    let (availability, reason, detail) = match evidence {
+        Ok(Ok(TrustRoute::Setting)) => (
+            Available,
+            Reason::AGY_WORKSPACE_TRUSTED,
+            format!("This session's launch configured Agy's session-only setting that trusts this exact workspace (never saved to Agy's trust store), the workspace's consent still holds, and this session's {AGY_LOG_FILE} shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer."),
+        ),
+        Ok(Ok(TrustRoute::Store)) => (
             Available,
             Reason::AGY_WORKSPACE_TRUSTED,
             "Agy's own trust store lists this exact workspace and this session's agy.log shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer.".to_owned(),
         ),
-        Ok(Some(TRUST_STORE_MISSING)) => (
+        Ok(Err(TRUST_STORE_MISSING)) => (
             Unavailable,
             Reason::AGY_WORKSPACE_UNTRUSTED,
             format!("Agy's own trust store does not list this exact workspace, and Agy keeps its workspace-trust dialog over the composer until such a workspace is approved. {WITHHELD}"),
         ),
-        Ok(Some(_)) => (
+        Ok(Err(TRUST_SETTING_WITHOUT_CONSENT)) => (
+            Unavailable,
+            Reason::AGY_WORKSPACE_UNTRUSTED,
+            format!("This session's launch configured Agy's session-only setting that trusts this exact workspace, but the workspace's consent no longer holds and Agy's own trust store does not list it, so TAB pastes nothing into this session. {WITHHELD}"),
+        ),
+        Ok(Err(TRUST_SETTING_UNVERIFIED)) => (
+            Unknown,
+            Reason::AGY_SESSION_TRUST_UNVERIFIED,
+            format!("This session's launch configured Agy's session-only setting that trusts this exact workspace, but its {AGY_LOG_FILE} does not show that this session loaded the workspace customizations. Agy may not have started, or may not have taken the setting and show its workspace-trust dialog, or the log is missing or no longer holds that line. {WITHHELD}"),
+        ),
+        Ok(Err(_)) => (
             Unknown,
             Reason::AGY_SESSION_TRUST_UNVERIFIED,
             format!("Agy's own trust store lists this exact workspace, but this session's agy.log does not show that this session loaded the workspace customizations. Either this session still shows its own workspace-trust dialog, as it does after the workspace was approved in another session, or the log is missing or no longer holds that line. {WITHHELD}"),
+        ),
+        Err(error) if configured => (
+            Unknown,
+            Reason::AGY_TRUST_EVIDENCE_UNREADABLE,
+            format!("This session's workspace consent or {AGY_LOG_FILE} could not be read, so the dialog state is unobserved: {error:#}"),
         ),
         Err(error) => (
             Unknown,
@@ -67,11 +95,26 @@ pub(super) fn workspace_trust_check(
     };
     let next_action = if availability == Available {
         OBSERVATION.to_owned()
+    } else if reason == Reason::AGY_TRUST_EVIDENCE_UNREADABLE {
+        format!(
+            "{OBSERVATION} Repair or restore the file named in the detail (Agy's settings, this session's workspace consent record or its log); TAB pastes nothing into this session while it cannot be read."
+        )
     } else {
         format!(
-            "{OBSERVATION} {TRUST_RECOVERY}. A workspace another provider already trusts is answered from shared consent on a later ask."
+            "{OBSERVATION} {TRUST_RECOVERY}. A later ask applies shared consent itself: exact trust from another provider, or the trust of the main working tree of a verified linked git worktree."
         )
     };
+    // The session-only settings files are listed only for a session whose launch configured the
+    // setting, so the row of any other session keeps the evidence it always had. A listing that
+    // could not be completed says so, never an empty list.
+    let mut evidence =
+        serde_json::json!({ "workspace": workspace, "store": home.settings, "log": log_path });
+    if configured {
+        evidence["session_settings"] = match super::session_settings_files(directory) {
+            Ok(files) => serde_json::json!({ "complete": true, "files": files }),
+            Err(error) => serde_json::json!({ "complete": false, "error": error.to_string() }),
+        };
+    }
     Check::new(
         CheckId::AGY_WORKSPACE_TRUST,
         availability,
@@ -79,9 +122,7 @@ pub(super) fn workspace_trust_check(
         detail,
         next_action,
     )
-    .evidence(
-        serde_json::json!({ "workspace": workspace, "store": home.settings, "log": log_path }),
-    )
+    .evidence(evidence)
 }
 
 pub(super) fn input_receipt_check(
@@ -96,7 +137,7 @@ fn input_receipt_check_for_platform(
 ) -> super::super::super::diagnostics::Check {
     use super::super::super::diagnostics::{Availability::Unknown, Check};
     const CHECK_ID: CheckId = CheckId::AGY_INPUT_RECEIPT;
-    const NEXT_ACTION: &str = "Observation only. A gated paste (the Windows initial prompt, every macOS follow-up) first waits until Agy's own trust store lists the exact workspace and this session's agy.log shows the workspace customization load (agy_workspace_trust), then for CLI startup completed and a 3.5 s quiet period without reload, redraw, or hooks lines. The Windows console also requires a Full redraw completed after startup. Neither platform waits for the trust reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line): Agy logs it only when a trust dialog is approved, so it never comes once the trust evidence holds. The log evidence is re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), and the paste follows the read that passed the gate with that read's length as the receipt offset; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    const NEXT_ACTION: &str = "Observation only. Every paste first waits until Agy's own trust store lists the exact workspace, or the session's launch configured Agy's session-only setting that trusts it while its consent still holds, and this session's agy.log shows the workspace customization load (agy_workspace_trust). The Windows initial prompt and every macOS and Linux follow-up then also wait for CLI startup completed and a 3.5 s quiet period without reload, redraw, or hooks lines. The Windows console also requires a Full redraw completed after startup. Neither platform waits for the trust reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line): Agy logs it only when a trust dialog is approved, so it never comes once the trust evidence holds. The log evidence is re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), and the paste follows the read that passed the gate with that read's length as the receipt offset (that read must itself show the workspace customization load; a Windows follow-up takes its offset from one read that must show it, without the startup wait), and the trust evidence is checked once more immediately before the paste; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let redraw_required = windows;
     let startup_markers = if windows {
         "CLI startup completed followed by a Full redraw completed"

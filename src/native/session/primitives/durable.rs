@@ -18,15 +18,43 @@ use crate::native::session::close;
 use crate::native::terminal;
 
 pub(in crate::native) fn remove_file_if_present(path: &Path) -> Result<()> {
-    close::budget::check()?;
-    fault_point("removing a record file")?;
-    match fs::remove_file(path) {
-        Ok(()) => {
-            fault_point("syncing a removed record's directory")?;
-            sync_parent_directory(path)
+    remove_file_durably(path).map_err(RemovalFailure::into_error)
+}
+
+/// Which step of `remove_file_durably` failed, with its error as `remove_file_if_present`
+/// returns it.
+#[derive(Debug)]
+pub(in crate::native) enum RemovalFailure {
+    /// Before or at the unlink: the file may still be there.
+    NotRemoved(anyhow::Error),
+    /// After a successful unlink: the file is gone, but the directory entry's removal could not
+    /// be made durable.
+    NotDurable(anyhow::Error),
+}
+
+impl RemovalFailure {
+    pub(in crate::native) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NotRemoved(error) | Self::NotDurable(error) => error,
         }
+    }
+}
+
+/// `remove_file_if_present`, saying which step failed: the unlink, or the sync of the parent
+/// directory after it.
+pub(in crate::native) fn remove_file_durably(
+    path: &Path,
+) -> std::result::Result<(), RemovalFailure> {
+    close::budget::check().map_err(RemovalFailure::NotRemoved)?;
+    fault_point("removing a record file").map_err(RemovalFailure::NotRemoved)?;
+    match fs::remove_file(path) {
+        Ok(()) => fault_point("syncing a removed record's directory")
+            .and_then(|()| sync_parent_directory(path))
+            .map_err(RemovalFailure::NotDurable),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+        Err(error) => Err::<(), _>(error)
+            .with_context(|| format!("failed to remove {}", path.display()))
+            .map_err(RemovalFailure::NotRemoved),
     }
 }
 
@@ -54,8 +82,16 @@ pub(in crate::native) fn rename_session_file(from: &Path, to: &Path) -> Result<(
 // sync the operating system rejects. All are inert outside tests.
 
 #[cfg(test)]
+type TestStep = Box<dyn FnOnce()>;
+
+#[cfg(test)]
 thread_local! {
     static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The one boundary that fails, once, while `with_fault_at` runs.
+    static FAULT_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The one boundary at which a test's step runs, once, while `with_step_at` runs.
+    static STEP_AT: std::cell::RefCell<Option<(String, TestStep)>> =
+        const { std::cell::RefCell::new(None) };
     static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
         const { std::cell::RefCell::new(None) };
     /// Directories whose sync fails with an injected error while `with_sync_failure` runs.
@@ -85,6 +121,23 @@ pub(in crate::native) enum SyncRecord {
 pub(in crate::native) fn fault_point(label: &str) -> Result<()> {
     #[cfg(test)]
     {
+        let step = STEP_AT.with(|at| {
+            let mut at = at.borrow_mut();
+            match at.take() {
+                Some((named, step)) if named == label => Some(step),
+                other => {
+                    *at = other;
+                    None
+                }
+            }
+        });
+        if let Some(step) = step {
+            step();
+        }
+        if FAULT_AT.with(|at| at.borrow().as_deref() == Some(label)) {
+            FAULT_AT.with(|at| at.borrow_mut().take());
+            bail!("injected fault before {label}");
+        }
         FAULT_BUDGET.with(|budget| match budget.get() {
             None => Ok(()),
             Some(0) => bail!("injected fault before {label}"),
@@ -111,6 +164,31 @@ pub(in crate::native) fn with_fault_budget<T>(budget: usize, run: impl FnOnce() 
     FAULT_BUDGET.with(|cell| cell.set(Some(budget)));
     let outcome = run();
     FAULT_BUDGET.with(|cell| cell.set(None));
+    outcome
+}
+
+/// Runs `run` while the first boundary named `label` fails, once, with an injected error; every
+/// other boundary passes. Unlike a fault budget, which models a process that stopped, this models
+/// one step that failed while the process goes on.
+#[cfg(test)]
+pub(in crate::native) fn with_fault_at<T>(label: &str, run: impl FnOnce() -> T) -> T {
+    FAULT_AT.with(|at| *at.borrow_mut() = Some(label.to_owned()));
+    let outcome = run();
+    FAULT_AT.with(|at| at.borrow_mut().take());
+    outcome
+}
+
+/// Runs `run` while `step` runs, once, at the first boundary named `label`, which then passes:
+/// what happens at that moment outside this process, such as a directory losing its permissions.
+#[cfg(all(test, unix))]
+pub(in crate::native) fn with_step_at<T>(
+    label: &str,
+    step: impl FnOnce() + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    STEP_AT.with(|at| *at.borrow_mut() = Some((label.to_owned(), Box::new(step))));
+    let outcome = run();
+    STEP_AT.with(|at| at.borrow_mut().take());
     outcome
 }
 
@@ -297,12 +375,24 @@ pub(in crate::native) fn fault_point_keeping_temporary(
 }
 
 pub(in crate::native) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    fill_private(create_private(path)?, path, bytes)
+}
+
+/// The first step of `write_private`: creates `path` only if nothing is there. Once it returns,
+/// the file exists at its final path, empty and not yet private; a caller that must not leave it
+/// behind owns its removal from here on.
+pub(in crate::native) fn create_private(path: &Path) -> Result<File> {
     fault_point("creating a private record file")?;
-    let mut file = OpenOptions::new()
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// The rest of `write_private` for the file `create_private` made at `path`: its private
+/// permissions, `bytes`, and the syncs that make both durable. The file is closed on return.
+pub(in crate::native) fn fill_private(mut file: File, path: &Path, bytes: &[u8]) -> Result<()> {
     // The file now exists at its final path; a fault here leaves it empty, as a stop would.
     fault_point("writing a private record's permissions and content")?;
     set_private_file_permissions(&file)?;

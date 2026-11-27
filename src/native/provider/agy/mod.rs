@@ -78,8 +78,10 @@ const FULL_TRANSCRIPT_FILE: &str = "transcript_full.jsonl";
 // leaves it to the user. See docs/verification/2026-10-01-bug-triage.md.
 const AGY_MODEL_LABEL_PREFIXES: [&str; 3] = ["Gemini ", "Claude ", "GPT-"];
 
-// Without a process-local trust API, answer only the exact managed dialog and verify the saved decision.
-// Remove this fallback when Agy provides an official trust input API.
+// The dialog answer is the fallback for an Agy older than `SESSION_SETTINGS_FLOOR` launched with
+// exact consent: answer only the exact managed dialog and verify the saved decision. A launch
+// that applied the session-only settings, or whose consent is inherited, takes no key. Remove
+// this fallback once the supported Agy versions all take the settings.
 fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
     let lines: Vec<_> = screen
         .lines()
@@ -183,7 +185,8 @@ fn send_terminal_follow_up<R: Runtime>(
 ) -> terminal::TerminalSendResult {
     if cfg!(windows) {
         // The Windows initial paste already waited for startup readiness, so a
-        // follow-up only takes its receipt offset and pastes.
+        // follow-up waits only for the trust evidence, as every paste does, then takes its
+        // receipt offset and pastes.
         deliver_terminal_turn(session, prompt_path, deadline, None, runtime)
     } else {
         // Argument prompts run behind the trust dialog; each macOS follow-up needs trust, readiness
@@ -323,7 +326,7 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn applied_marker(&self) -> Option<&'static str> {
-        None
+        Some(APPLIED_MARKER)
     }
 
     fn follow_up_transport(&self) -> Box<dyn Transport> {
@@ -390,6 +393,20 @@ impl NativeProviderAdapter for AgyAdapter {
         })
     }
 
+    // `workspace_trust` is already store-only: it resolves the store from `env`, reads that
+    // file, and compares `workspace` as a string key.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.workspace_trust(workspace, env, store)?,
+            super::super::consent::Trust::Trusted(_)
+        ))
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // An independent Agy launch and its descendants must not carry the caller's
         // Codex identity/shutdown context or Claude identity/inbox.
@@ -406,7 +423,7 @@ impl NativeProviderAdapter for AgyAdapter {
                 CheckId::AGY_FOLLOW_UP,
                 Unknown,
                 Reason::AGY_TERMINAL_FALLBACK,
-                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; the Windows initial prompt and every macOS follow-up also wait until Agy's own trust store lists the exact workspace and the session's own log shows that it loaded the workspace customizations. The macOS initial prompt is a launch argument and never waits.",
+                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. The Windows initial prompt and every macOS and Linux follow-up wait for Agy's own log to show startup readiness; a Windows follow-up skips that wait. Every paste requires a HandleUserInput receipt and waits until Agy's own trust store lists the exact workspace, or the session's launch configured Agy's session-only setting that trusts it while its consent still holds, and the session's own log shows that it loaded the workspace customizations; the trust is checked again immediately before the paste. The macOS and Linux initial prompt is a launch argument and never waits.",
                 "Inspect the managed owner and terminal; retain this fallback until Agy offers a verified native path.",
             ),
             input_receipt_check(context.directory),
@@ -425,7 +442,13 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        prepare_launch_for_platform(context, cfg!(windows))
+        prepare_launch_for_platform(context, cfg!(windows), &mut |directory| {
+            super::super::consent::authority(
+                directory,
+                FirstPartyCli::Agy,
+                &super::super::consent::Environment::current(),
+            )
+        })
     }
 
     fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
@@ -468,9 +491,16 @@ fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
 }
 
 // The complete launch command: the requested policy in Agy's flags (the bypass only when
-// requested, then effort, then model), the private log file, and off Windows the
-// correlated prompt as the interactive prompt argument.
-fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
+// requested, then effort, then model), Agy's session-only settings file that trusts the exact
+// workspace when the Agy the wrapper just probed takes it and consent holds, the private log
+// file, and off Windows the correlated prompt as the interactive prompt argument. `authority`
+// is consent's one answer; production passes `consent::authority`. The applied marker is
+// recorded right after the settings file, before the plan exists.
+fn prepare_launch_for_platform(
+    context: LaunchContext<'_>,
+    windows: bool,
+    authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
+) -> Result<LaunchPlan> {
     let claim_token =
         session_turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Agy launch has no native turn claim")?;
@@ -497,6 +527,11 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
                 .map(OsString::from),
         );
     }
+    let mut trust_grant = None;
+    if let Some((settings, grant)) = session_trust_settings(&context, authority)? {
+        arguments.extend([OsString::from("--settings"), settings.into_os_string()]);
+        trust_grant = Some(grant);
+    }
     arguments.extend([
         OsString::from("--log-file"),
         log_path.as_os_str().to_owned(),
@@ -508,6 +543,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         ]);
     }
     Ok(LaunchPlan {
+        trust_grant,
         arguments,
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
@@ -515,6 +551,163 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         watcher: Box::new(AgyTranscriptWatcher { log_path }),
         environment_removals: launch_environment_removals(),
     })
+}
+
+// The consent applied marker of an Agy launch that hands Agy the exact workspace through its
+// session-only settings.
+const APPLIED_MARKER: &str = "agy-settings-override";
+
+// Agy's `--settings` takes "a JSON object of" its settings keys, "inline or as a file path",
+// for that process only and never saved. TAB passes a private file in the session directory, one
+// per granted plan (`agy-session-trust-<random>.json`):
+// the workspace path then needs no quoting through a Windows command shim, and the argument is
+// a path like the log file's. Measured only with Agy 1.5.17 on macOS (2026-11-26): standalone,
+// with the exact canonical folder in `trustedWorkspaces`, inline or as a file, it showed no
+// trust dialog, logged the workspace customization load off the main goroutine and left its
+// own trust store unchanged, also across a settings change (`/thinking`) that rewrote that
+// store; through TAB on Herdr the same for a new worktree. The 1.5.8 changelog already names
+// `--settings`, but earlier releases were not measured with `trustedWorkspaces`, and an Agy
+// without the option fails on it, so an earlier version launches as before. Lower this floor
+// only with a measurement, and delete the file when Agy offers a trust option of its own.
+const SESSION_SETTINGS_PREFIX: &str = "agy-session-trust-";
+const SESSION_SETTINGS_FLOOR: semver::Version = semver::Version::new(1, 5, 17);
+
+// What the version text of this launch's wrapper probe says about the session-only setting.
+// Agy prints its version alone; any other text, such as a banner naming more than one version,
+// identifies nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingSupport {
+    Supported,
+    // Positively identified as older than the setting: the only launch that keeps the guarded
+    // dialog answer for exact consent.
+    Older,
+    Unknown,
+}
+
+fn setting_support(version: &str) -> SettingSupport {
+    let version = version.trim();
+    match semver::Version::parse(version.strip_prefix('v').unwrap_or(version)) {
+        Ok(version) if version >= SESSION_SETTINGS_FLOOR => SettingSupport::Supported,
+        Ok(_) => SettingSupport::Older,
+        Err(_) => SettingSupport::Unknown,
+    }
+}
+
+// When the Agy the wrapper probed takes the setting and consent holds for the workspace now
+// (exact trust from another provider's store, or inherited by a verified worktree; owner's
+// decisions, 2026-11-26), the session-only settings file that trusts the workspace, written
+// before the applied marker. The version is judged first, so an older Agy does no consent work
+// here; it records only that the option is unavailable, which alone keeps the guarded dialog
+// answer for it. A version that identifies nothing, a refusal or any other inconclusive
+// check writes nothing, so no key is sent either.
+fn session_trust_settings(
+    context: &LaunchContext<'_>,
+    authority: &mut dyn FnMut(&Path) -> Result<super::super::consent::Authority>,
+) -> Result<Option<(PathBuf, super::super::consent::LaunchGrant)>> {
+    match setting_support(context.provider_version) {
+        SettingSupport::Supported => {}
+        SettingSupport::Older => {
+            // An older launch keeps running as before even if this record cannot be written;
+            // without it the dialog step only withholds its key.
+            let _ = super::super::consent::option_unavailable(context.directory);
+            return Ok(None);
+        }
+        SettingSupport::Unknown => return Ok(None),
+    }
+    if authority(context.directory)?.verdict.is_err() {
+        return Ok(None);
+    }
+    // The command's workspace is checked against the consent record before
+    // anything is published, and this plan's settings file is its own: created new under a random
+    // name, private, never replaced by another plan, and named in the grant with its bytes, which
+    // the spawn fence checks again. The plan owns the file from its
+    // exclusive creation until the grant is made. A write that fails after the file exists, or a
+    // grant that is not made, removes it, and a removal that fails is reported with its path.
+    super::super::consent::check_command_workspace(context.directory, context.workspace)?;
+    let key = super::super::consent::native_key(context.workspace)?;
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "trustedWorkspaces": [key] }))?;
+    let (created, file) = new_session_settings(context.directory)?;
+    let granted = crate::native::session::primitives::fill_private(created, &file, &bytes)
+        .and_then(|()| {
+            super::super::consent::apply_option(
+                context.directory,
+                FirstPartyCli::Agy,
+                APPLIED_MARKER,
+                context.workspace,
+                Some((&file, &bytes)),
+            )
+        });
+    match granted {
+        Ok(grant) => Ok(Some((file, grant))),
+        Err(error) => Err(discard_ungranted(&file, error)),
+    }
+}
+
+// A new file in the session directory, `agy-session-trust-<random>.json`, created only if no
+// file has that name, and still empty: the caller owns it from here on.
+fn new_session_settings(directory: &Path) -> Result<(std::fs::File, PathBuf)> {
+    let created = tempfile::Builder::new()
+        .prefix(SESSION_SETTINGS_PREFIX)
+        .suffix(".json")
+        .rand_bytes(12)
+        // The plan removes the file itself, and reports a removal that fails.
+        .disable_cleanup(true)
+        .make_in(directory, |path| {
+            crate::native::session::primitives::create_private(path).map_err(|error| {
+                match error.downcast::<std::io::Error>() {
+                    Ok(error) => error,
+                    Err(error) => std::io::Error::other(format!("{error:#}")),
+                }
+            })
+        })?;
+    let (file, path) = created.into_parts();
+    Ok((file, path.to_path_buf()))
+}
+
+// Removes a settings file that no plan was granted, durably (the session directory is synced
+// after the unlink), and returns the plan's `error`, naming the file when
+// it could not be removed or its removal could not be made durable, as the removal itself says: no
+// Agy was started with it, and a file left stays with the session's
+// records until `prune-sessions` removes the session directory.
+fn discard_ungranted(file: &Path, error: anyhow::Error) -> anyhow::Error {
+    use crate::native::session::primitives::{RemovalFailure, remove_file_durably};
+    let (outcome, removal) = match remove_file_durably(file) {
+        Ok(()) => return error,
+        Err(RemovalFailure::NotRemoved(removal)) => ("could not be removed", removal),
+        Err(RemovalFailure::NotDurable(removal)) => (
+            "was removed, but its removal could not be made durable",
+            removal,
+        ),
+    };
+    error.context(format!(
+        "the settings file {} that no plan was granted {outcome} ({removal:#}); no Agy was started with it",
+        file.display()
+    ))
+}
+
+// The single settings file of a session that this change's earlier build (a52af49) launched,
+// before each granted plan had a file of its own; listed by doctor only.
+const FORMER_SESSION_SETTINGS_FILE: &str = "agy-session-trust.json";
+
+// The settings files that launches of this session wrote, sorted: one per granted plan, and
+// the former single file. Only regular files count, never a link or a directory with such a
+// name. An entry that cannot be read makes the listing an error, never a shorter list.
+pub(super) fn session_settings_files(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let settings = name == FORMER_SESSION_SETTINGS_FILE
+            || (name.starts_with(SESSION_SETTINGS_PREFIX) && name.ends_with(".json"));
+        if settings && entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 // The unstarted transcript watcher a launch plan carries: Agy's own log file of the
