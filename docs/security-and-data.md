@@ -189,16 +189,22 @@ symbolic link (on Windows, also a junction) or a non-directory at `events` with 
 behind it: `result`, `inspect` and `wait` fail, `status` reports the session as incomplete with
 that reason, and `sessions` shows `"results": 0` for it. A missing `events/` lists no results.
 
-TAB makes private directories mode `0700` and private records mode `0600` on Unix. On Windows,
-it installs a protected access list giving the current user full control, with inheritance for
-private directories. Administrators and the operating system can still access the data.
+On Unix, TAB sets private directories to mode `0700` and private records to mode `0600`.
+On Windows, it installs a protected access list giving the current user full control, with
+inheritance for private directories. TAB applies these directory permissions to the state root
+at every session creation, without verifying who can change it. On macOS, an existing access
+control list entry can still grant access after the mode change. On Windows, TAB neither checks
+nor changes the state root's owner. Administrators and the operating system can still access the data.
 
-Before accepting a trust store as evidence, TAB checks who can change it. On Unix the current
-user must own it and other accounts must not have write access. On Windows it reads ownership
-and the access list from the same handle as the content. The owner must be the token user or
-default owner. No other account may write, append, or change ownership or the access list, except
-SYSTEM, Administrators, and OWNER RIGHTS. A missing or unrecognized access list is refused.
-This checks current access; it cannot establish who wrote the content earlier. The check does
+Before accepting a trust store as evidence, TAB checks its ownership and permissions. On Unix,
+the current user must own the store and the group and other write bits must be clear. TAB does
+not examine Unix access control list entries that could grant another account write access.
+On Windows it reads ownership and the access list from the same handle as the content. The
+owner must be the token user or default owner. TAB rejects an allow rule on the store that grants
+write, append, change-owner, or change-access-list rights to anyone except the token user, default
+owner, SYSTEM, Administrators, or OWNER RIGHTS. TAB ignores deny and inherit-only rules and
+refuses a missing access list or an unrecognized rule that applies to the store.
+These checks cannot establish who wrote the content earlier. The check does
 not exclude a process that already has the store open for writing. If a store fails this check,
 TAB does not use it to approve workspace input.
 
