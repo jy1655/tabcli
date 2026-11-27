@@ -2425,3 +2425,4 @@ reasons contain `session` and `reason`. Excerpts are limited to 200 displayed ch
 Inspection has `workspace`, `current_identity`, and `record` (null if absent). A changed record has
 `schema`, `identity`, `source`, and `revoked`. Identity contains `path`, `volume`, `file`,
 `created`, and `owner`; non-null source evidence has `provider`, `store`, and `key`.
+See [workspace trust and consent](security-and-data.md#workspace-trust-and-consent) for inherited records.

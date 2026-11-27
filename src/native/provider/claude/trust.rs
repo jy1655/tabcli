@@ -34,6 +34,17 @@ pub(super) fn workspace_trust(
     store: Option<&Path>,
 ) -> Result<Trust> {
     require_exact_claude_trust_scope(workspace)?;
+    store_trust(workspace, env, store)
+}
+
+// What Claude's own store says of exactly `workspace`, from the store alone: unlike
+// `workspace_trust`, no probe of `.git` in the path's ancestors and no `git`, so nothing touches
+// the path. Consent's worktree screen asks only this.
+pub(super) fn store_trust(
+    workspace: &Path,
+    env: &consent::Environment,
+    store: Option<&Path>,
+) -> Result<Trust> {
     let store = match store {
         Some(store) => store.to_path_buf(),
         None => trust_store(env)?,

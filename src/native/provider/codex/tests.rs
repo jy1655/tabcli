@@ -401,6 +401,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                                 yolo,
                                 model,
                                 effort,
+                                provider_version: "fixture",
                             },
                             windows,
                             authorized,
@@ -467,6 +468,14 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         } else {
                             assert!(observed.value().is_null(), "{label}: {observed:?}");
                         }
+                        // The plan carries the option it put in the command to the spawn
+                        // fence; a plain command carries none and reads no consent there.
+                        let grant = plan.trust_grant.as_ref();
+                        assert_eq!(grant.is_some(), consent, "{label}");
+                        if let Some(grant) = grant {
+                            assert_eq!(grant.provider, FirstPartyCli::Codex, "{label}");
+                            assert_eq!(grant.marker, APPLIED_MARKER, "{label}");
+                        }
                     }
                 }
             }
@@ -495,6 +504,7 @@ fn herdr_codex_launch_keeps_tools_in_the_terminal_process() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         false,
         |_, _| Ok(false),
@@ -537,6 +547,7 @@ fn prepare_launch_refuses_windows_herdr_before_installing_pending_turn() {
             yolo: false,
             model: None,
             effort: None,
+            provider_version: "fixture",
         },
         true,
         |_, _| Ok(false),
@@ -1163,6 +1174,7 @@ fn herdr_runtime_selection_uses_the_surface_and_requires_a_supported_codex() {
                 yolo: false,
                 model: None,
                 effort: None,
+                provider_version: "fixture",
             },
             windows,
             |_, _| Ok(false),
@@ -1388,5 +1400,336 @@ fn lifecycle_binding_and_stop_keep_the_claim_pending() {
             .unwrap()
             .as_deref(),
         Some(claim.token())
+    );
+}
+
+// Consent's worktree screen asks only Codex's store: the answer about a path that nothing may
+// touch comes from the store alone and is the store's exact, positive decision. Codex's full
+// lookup reads only the store too, so it answers the same for that path, unchanged.
+#[test]
+fn the_store_only_answer_reads_the_store_alone() {
+    use super::super::super::consent::{self, Trust};
+    let fixture = super::super::UntouchedPath::new();
+    std::fs::create_dir(fixture.home.join(".codex")).unwrap();
+    let store = fixture.home.join(".codex").join("config.toml");
+    assert!(
+        !ADAPTER
+            .store_lists_trusted(&fixture.path, &fixture.env, None)
+            .unwrap()
+    );
+    let parent = fixture.path.parent().unwrap().to_owned();
+    for (listed, level, expected) in [
+        (&fixture.path, "trusted", true),
+        (&fixture.path, "untrusted", false),
+        (&parent, "trusted", false),
+    ] {
+        let mut key = consent::native_key(listed).unwrap();
+        if cfg!(windows) {
+            key = key.to_lowercase();
+        }
+        let _ = std::fs::remove_file(&store);
+        crate::native::session::primitives::write_private(
+            &store,
+            format!(
+                "[projects.{}]\ntrust_level = \"{level}\"\n",
+                serde_json::to_string(&key).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER
+                .store_lists_trusted(&fixture.path, &fixture.env, None)
+                .unwrap(),
+            expected,
+            "{level}"
+        );
+        assert_eq!(
+            matches!(
+                ADAPTER
+                    .workspace_trust(&fixture.path, &fixture.env, None)
+                    .unwrap(),
+                Trust::Trusted(_)
+            ),
+            expected,
+            "{level}"
+        );
+    }
+}
+
+// A source store that becomes unreadable after the session's assessment is
+// a refusal for the plan through the production gate, as a missing consent was in 0.4.49: the
+// command carries no trust option and no grant, and the launch goes on. The recheck refuses on
+// the pinned fixture store before any store of the caller's own environment is read.
+#[test]
+fn a_source_store_unreadable_after_the_assessment_plans_a_plain_command() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: "codex".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: workspace.clone(),
+            title: "plain".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &workspace, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    std::fs::remove_file(&pi).unwrap();
+    crate::native::session::primitives::write_private(&pi, b"{").unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &workspace,
+            title: "plain",
+            prompt: "plain prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .unwrap();
+    assert!(plan.trust_grant.is_none());
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("projects=")),
+        "{:?}",
+        plan.arguments
+    );
+}
+
+// The grant names the workspace the command was built for. A session whose
+// consent record was assessed for another directory than the wrapper's snapshot (which gives
+// the command its working directory and its trust override) gets no grant: the plan refuses.
+#[test]
+fn a_grant_for_another_workspace_than_the_command_refuses_the_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (directory, workspace) = launch_fixture(&root);
+    let other = root.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&other).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment = crate::native::consent::prepare_at_home(&directory, &other, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    let error = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &workspace,
+            title: "mismatch",
+            prompt: "mismatch prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        |_, _| Ok(true),
+    )
+    .map(|plan| plan.trust_grant)
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another workspace than the command's"),
+        "{error:#}"
+    );
+}
+
+// TAB's own shared consent record that cannot be read or decoded after the
+// session's resolution is an error for the plan, as in 0.4.49; only provider stores and Git's
+// registration evidence become a refusal marked unreadable.
+#[test]
+fn a_damaged_shared_consent_record_after_resolution_is_an_error_for_the_plan() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: "codex".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: workspace.clone(),
+            title: "damaged".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&workspace).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &workspace, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    let shared = std::fs::read_dir(root.join("workspace-consent"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    std::fs::remove_file(&shared).unwrap();
+    crate::native::session::primitives::write_private(&shared, b"{").unwrap();
+    assert!(
+        prepare_launch_for_platform(
+            LaunchContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                workspace: &workspace,
+                title: "damaged",
+                prompt: "damaged prompt",
+                yolo: false,
+                model: None,
+                effort: None,
+                provider_version: "fixture",
+            },
+            false,
+            crate::native::consent::authorized,
+        )
+        .is_err()
+    );
+}
+
+// The main working tree of an inherited source lost between its
+// identification and the rest of its assessment while the plan rechecks consent withdraws the
+// inheritance. The plan goes on with a plain command through the production gate, as with a
+// registration that is gone; it does not stop. The recheck reads only the pinned fixture store.
+#[test]
+fn a_main_working_tree_lost_during_the_recheck_plans_a_plain_command() {
+    use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let nest = root.join("nest");
+    std::fs::create_dir(&nest).unwrap();
+    let git = crate::native::consent::registered(&nest);
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: "session-safe123".to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: "codex".into(),
+            provider_version: "fixture".to_owned(),
+            workspace: git.worktree.clone(),
+            title: "worktree".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let home = root.join("home");
+    let pi = home.join(".pi/agent/trust.json");
+    std::fs::create_dir_all(pi.parent().unwrap()).unwrap();
+    crate::native::session::primitives::write_private(
+        &pi,
+        serde_json::json!({crate::native::consent::native_key(&git.repository).unwrap(): true})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let assessment =
+        crate::native::consent::prepare_at_home(&directory, &git.worktree, &home).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert!(assessment.repository_root.is_some());
+    let (from, to) = (git.repository.clone(), nest.join("moved"));
+    crate::native::consent::after_main_identified(move |_| std::fs::rename(&from, &to).unwrap());
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: &git.worktree,
+            title: "worktree",
+            prompt: "worktree prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+            provider_version: "fixture",
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .map_err(|error| format!("{error:#}"))
+    .unwrap();
+    assert!(!git.repository.exists());
+    assert!(plan.trust_grant.is_none());
+    assert!(
+        !plan
+            .arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("projects=")),
+        "{:?}",
+        plan.arguments
     );
 }
