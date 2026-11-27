@@ -305,27 +305,11 @@ A provider's own recorded consent to work in an exact workspace, read from a sto
 user can change.
 _Avoid_: approval, permission (TAB's own permission mode is a different axis)
 
-**Inherited consent**:
-Consent for a linked git worktree that no provider trusts exactly, taken from the consent of its
-repository's main working tree (that folder's own record, source and revocation) once Git's own
-files prove the registration in both directions. It is derived again at every use, like any
-consent, and never answered with a dialog key.
-_Avoid_: parent trust, repository trust (a parent directory never supplies consent)
-
-**Consent authority**:
-The one answer to whether a target provider may treat a session's workspace as consented now,
-derived again from current records, stores and Git files at every use and never written. Its yes
-is asked again at the last point TAB's own code controls: a launch option in its plan and, for
-that command, in the spawn fence; a dialog key inside its dispatch; an Agy paste that relies on
-the session-only setting immediately before the terminal backend's send. A change after that
-point takes effect for the next act. A session's recheck needs the pins recorded at its start. A
-launch's applied marker records what it configured and is never authority.
-_Avoid_: authorized flag, consent cache
+For inherited consent and consent authority, see the [Trust Store Boundary](docs/agents/trust.md).
 
 **Launch dialog**:
 The dialog a provider shows at startup, asking whether to trust the workspace. TAB answers
-it at most once with a guarded key, and only for a launch whose consent is verified exact
-Workspace trust that the launch did not already apply through the provider's own
-process-local option; which screens count and what the provider's bypass option changes is
-each provider adapter's own policy.
+it at most once with a guarded key, and only for a launch whose Workspace trust consent is
+verified; which screens count and what the provider's bypass option changes is each provider
+adapter's own policy.
 _Avoid_: trust prompt, popup, permission dialog (a tool-permission dialog is never answered)

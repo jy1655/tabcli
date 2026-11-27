@@ -5,8 +5,8 @@
   own `--log-file`: a readiness gate before the paste and a `HandleUserInput` receipt
   after it. This holds for the native Windows initial prompt and for every follow-up on
   every platform; the macOS and Linux initial prompt is a launch argument and never waits.
-- Agy keeps its workspace-trust dialog over the composer until the exact workspace is in
-  its own trust store (`trustedWorkspaces`), and it still runs an argument-delivered
+- Without a session-only trust setting, Agy keeps its workspace-trust dialog over the composer until the
+  exact workspace is in its own trust store (`trustedWorkspaces`), and it still runs an argument-delivered
   initial prompt behind the dialog. A paste onto the dialog is discarded and its Enter
   confirms the preselected "Yes, I trust this folder"; Agy then logs the trust reload
   (`Reloading system slash commands and skills` and three companion lines, 356 bytes) and
@@ -14,101 +14,18 @@
   lost paste because the paste caused it, and it never comes in a workspace trusted before
   launch (reproduced on demand 2026-10-01, Agy 1.2.14, macOS; more than 100 logs, no
   counterexample).
-- With consent's authority finding the workspace consented (exact trust from another
-  provider's store, or inherited by a verified worktree; owner's decisions, 2026-11-26) and
-  the version that the wrapper's own probe returned for this launch (`LaunchContext::
-  provider_version`) at 1.5.17 or newer (the text must be the version alone), the launch hands
-  Agy the exact workspace through its own `--settings` ("Settings for this session only,
-  never saved"): a private file in the session directory holding
-  `{"trustedWorkspaces":[<native key>]}`, then the applied marker `agy-settings-override`.
-  The command's workspace is checked against the consent record before the file is written,
-  and each granted plan has a file of its own, `agy-session-trust-<random>.json`, created new
-  so that no other planning attempt for the session replaces it (review r5, finding 1). The
-  plan carries the option, the workspace it was granted for and that file's path and digest to
-  the spawn fence, which asks the authority about this command again under the session's
-  lifecycle lock, just before the fence's deadline check and its durable `Spawning` record, and
-  refuses the command unless the provider store reader (`consent::read_store`) accepts the file
-  at that path and its bytes have that digest. The reader refuses a final path component that is
-  a symbolic link or not a regular file (the directories above it are not inspected), more than
-  8 MiB or text that is not UTF-8, on Unix a file that the effective user does not own or whose
-  mode has a group or other write bit (owner and mode bits only, no access control list), and on
-  Windows a file that fails the owner and access-list rule (Trust Store Boundary). A replacement
-  with the same bytes that the reader accepts passes; a refusal by the reader names the file and
-  the reader's reason (review r7, finding 5; review r8, finding 4). Removal: the plan owns the
-  file from its exclusive creation until the grant is made (review r6, finding 2), so a write
-  that fails once the file exists (a failed directory sync can follow a complete file) or a grant
-  that is not made has the plan remove it and sync the session directory
-  (`remove_file_durably`). The plan's error names the file when the unlink failed ("could not be
-  removed") or when the unlink succeeded and the sync failed ("was removed, but its removal
-  could not be made durable"), as the removal itself reports (review r7, finding 2; review r8,
-  finding 1). When the grant's write of the applied marker fails, the plan, still under the
-  record's lock, rewrites the earlier record unless the record already shows the earlier marker
-  (so an earlier plan's marker stays); if that rewrite fails too, the record can keep the
-  attempted marker, and the error says that this attempt received no grant and that the record
-  may still name the option (review r7, finding 1; review r8, finding 2). A plan refused before
-  the file (an unsupported or unidentified version, a refusing authority, the workspace check)
-  writes none. The files stay with the session's other records after it ends, as do those of a
-  plan refused at the spawn fence, of a removal that failed and of a wrapper that stopped before
-  the grant (inert: no Agy was started with them), until `tabcli prune-sessions` removes the
-  session directory. Doctor's `agy_workspace_trust` row of a
-  session whose record names the setting lists them as `session_settings`: regular files only,
-  including the single `agy-session-trust.json` of a session that this change's earlier build
-  launched, and a listing that could not be completed is marked so, never shown as an empty list
-  (review r6, finding 3). 0.4.49 ignores them, as every file it does not name, and its prune
-  removes the directory whole. The version is
-  judged before any consent work. An Agy positively identified as older records only
-  `launch-option-unavailable` and is the one Agy launch whose exact consent may still take the
-  guarded dialog answer; a version that identifies nothing, or a refused or failing check on a
-  supported version, records nothing, and the dialog step then sends no key.
-  A file, not inline JSON, so that no quote reaches a Windows command shim; the argument is a
-  path like `--log-file`. No key is sent and Agy's store is not written. For an ordinary folder
-  that only another provider trusts this replaces the guarded answer (iTerm2, Terminal.app,
-  Windows console), after which Agy saved the folder, and the launch refusal on a surface
-  without a guarded key (Herdr, tmux, WezTerm) or whose screen cannot be read (Ghostty, Warp).
-- Measured, all with Agy 1.5.17 on macOS (2026-11-26): standalone in an empty folder no store
-  lists, inline or as a file, no dialog, the prompt answered, a `hooks_manager.go` line off
-  the main goroutine and `settings.json` byte-identical afterwards; a settings change
-  (`/thinking on`, then off) rewrote that store with its own key while the saved
-  `trustedWorkspaces` stayed as it was, and returned it to its original bytes; through TAB on
-  Herdr, a new worktree of this repository launched without a dialog, answered a follow-up and
-  left the store unchanged. The coordinator's authenticated runs through TAB on macOS Herdr at
-  commit `6eebb37` (2026-11-26) added an ordinary folder with exact consent that only Codex
-  lists (no dialog, Agy's store unchanged), absolute and relative worktree registrations, and a
-  revoke that refused the next follow-up. Not measured: Windows, Linux, the other surfaces, and
-  other settings writes. The 1.5.8 changelog already names
-  `--settings`, but older versions were not measured with `trustedWorkspaces`, and an Agy
-  without the option fails on it. Delete the file when Agy offers a trust option of its own.
-- Never paste without both trust facts: Agy was told to trust the exact workspace (its
-  store lists it, or this session's record says its launch configured the setting and
-  consent's authority finds the workspace consented now), and this session's own `agy.log`
-  shows the workspace customization load, a `hooks_manager.go` line from a goroutine other
-  than the main one, in the very log contents that supply the receipt offset. The first fact
-  is checked once more in the delivery step, after every readiness wait, immediately before
-  the terminal backend's send is called: the last point the provider-neutral code controls
-  (router's limit, 2026-11-26). The backends are not changed, so a revocation that lands after
-  that point does not stop the paste already handed to the backend. The request trace's paste
-  timestamps surround the send itself and stay empty when that check refuses. An
-  Agy store that TAB's reader refuses (malformed, or failing the reader's owner and permission
-  check) withholds even a paste that relies on the setting alone: the authority asks every
-  target whether its store declines the workspace, and a store it cannot read is a refusal
-  marked unreadable, not a missing entry (consent's authority, Trust Store Boundary). An
-  unreadable store, session record or log is reported as unreadable evidence, never as an
-  absent entry. The store is shared by every Agy process, so a dialog approved in one
-  session leaves another session's dialog open; the log line is per process and appears at
-  startup in a workspace trusted before launch or when the dialog is approved in that
-  session. The setting is TAB's configuration, not evidence, and the marker is history, not
-  authority: an Agy that ignores the setting logs no such line, and a revoked or withdrawn
-  consent refuses the next paste that relies on the setting. It does not change what the
-  running Agy trusts, and a session whose workspace Agy's own store lists keeps its pastes. Every paste waits for both, the Windows follow-up included
-  (it skips only the startup readiness wait), and fails `not_sent` at the deadline. Do not put
-  a time window in their place, and do not answer the dialog without verified exact consent
-  that no launch option applied.
-- After a downgrade to 0.4.49 a session launched with the setting keeps working where that
-  binary does not need the setting: a gated paste (every macOS and Linux follow-up) passes
-  only when Agy's own store lists the workspace and the log has the load line, and a
-  Windows follow-up is not gated by 0.4.49 at all. A gated paste that relied on the setting
-  alone is refused as not sent; close that session and start a new one, which shows Agy's
-  dialog under 0.4.49.
+- For a consented launch identified as Agy 1.5.17 or newer, TAB passes the exact workspace
+  through Agy's session-only `--settings` option without writing Agy's trust store
+  (`consented_launch_hands_agy_the_exact_workspace_in_session_only_settings`).
+- Only a launch identified as older and recorded as lacking the option is eligible for Agy's
+  guarded dialog answer (`an_inconclusive_agy_launch_never_falls_back_to_the_key`).
+- Every paste requires this session's workspace customization load in `agy.log` and either
+  Agy's exact trust entry or the session setting's marker with current consent
+  (`the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line`).
+  The store is shared by every Agy process, so a dialog approved in one session leaves another
+  session's dialog open; the log line is per process and appears at startup in a workspace
+  trusted before launch or when the dialog is approved in that session.
+  Do not put a time window in their place, and do not answer the dialog without verified consent.
 - A log without that line withholds the paste but does not prove an open dialog: the log
   can be missing, or cut before the line, in a session that has none. Report what was
   read (the session's trust is unverified) and keep the recovery conditional on what the

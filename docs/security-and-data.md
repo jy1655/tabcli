@@ -44,110 +44,19 @@ owner, and provider that supplied the decision. Consent does not extend to paren
 directories, and a symlink alias cannot supply fresh consent. If the original provider removes
 its decision, TAB does not silently choose another provider as the source.
 
-Git worktrees are the one exception, for every provider. When no provider trusts a directory
-exactly, and Git's own files prove that it is a linked worktree registered by a repository whose
-main working tree has verified consent in TAB, the worktree inherits that consent; Codex does
-the same by itself. The rule is about who can register a worktree in a trusted repository: anyone
-who can write that repository's `.git` directory can, and the worktree's files are then trusted
-like any commit checked out in the main working tree. A cloned or fetched repository cannot
-register a worktree by itself. The main working tree's own consent decides, with its source,
-identity and revocation: `tabcli consent revoke` on the main working tree also withdraws the
-consent TAB derives for its worktrees. A provider that declines the worktree itself, either the
-source of that consent or the provider being launched, withdraws it too. A provider's own trust
-of a worktree, such as an entry in Agy's own store or Codex's own repository rule, is unchanged.
+For linked worktrees, see the [consent rule, its limits and registration repair](agents/trust.md).
+For Agy's session-only setting and dialog eligibility, see the [Agy boundary](agents/agy.md).
 
-TAB reads the worktree's `.git` file and the registration it names without running `git`. Before
-the worktree check touches the main working tree that the file names, TAB asks each provider
-whether its own store lists exactly that path as trusted, answered from the store alone, with no
-I/O on the path or its ancestors and no `git`; the worktree check never touches a path that no
-store lists. That describes the worktree check only: assessing the launch folder itself as an
-exact folder still runs each provider's reader there as 0.4.49 does, and Claude's reader runs
-`git rev-parse` in the launch folder when a repository encloses it, which follows the folder's
-own `.git` pointer (a known follow-up). A path that steps back with `..` over a name it named is
-refused before any I/O. TAB then checks the registration in both directions by file identity
-(the back-pointer must name `.git` in the launch folder itself, so a hard link elsewhere does not
-count; it and the registration's common directory are first compared as Git spells them, so a
-stale registration that points into a third folder is refused before TAB looks there), absolute
-and relative registrations (`git worktree add --relative-paths`) alike, and
-refuses a path through a symbolic link or junction, a submodule, a bare repository, and a main
-working tree whose `.git` points to a common directory of its own. The check defends this rule
-against whatever the launch folder holds and against any local user who cannot write the main
-working tree's `.git` or an ancestor directory of either tree; it does not defend against
-someone who can replace those ancestors while it runs, just as an exactly trusted folder is
-trusted by its path. A registration that still spells the worktree's old path, including a
-rename that changed only letter case on a case-insensitive volume, does not inherit, and the
-provider's own trust dialog applies: `git worktree repair <worktree>` rewrites the registration
-of a moved worktree, and `git -c core.ignorecase=false worktree repair <worktree>` also one that
-differs only by case, which Git otherwise keeps on such a volume. The screen is a necessary
-condition only, never consent: after these checks
-the main working tree's own consent is assessed as for any exact folder, and a path that a store
-lists but its provider's reader refuses gives no inheritance. TAB does not evaluate Git
-configuration, `HEAD`, objects or refs: a repository whose configuration moves its working tree
-(`core.worktree`) or uses unusual extensions is judged by its registration alone. The record
-then also names the main working tree (`repository_root`).
-
-TAB checks consent again at every use, not only at launch, and consumes it at the act: when a
-provider option is planned; again for that command in the spawn fence, under the session's
-lifecycle lock, just before the fence's deadline check and the durable record of the spawn that
-precede the start; immediately before a trust-dialog key; and immediately before an Agy paste
-that relies on the session-only setting is handed to the terminal (a session whose workspace
-Agy's own store lists exactly is checked against that store there instead). For such an Agy
-session `doctor` reports the same check. That is the last point TAB's own code controls, and a
-change after it takes effect for the next act, not the one in flight: a revocation that lands
-while the terminal already carries out a paste does not stop that paste. The final check before
-a provider starts reads no consent for a command that carries no trust option, as before; every
-`ask` and supported `reopen` still assesses consent while the session is resolved. Each check
-reads the records, provider stores and Git files as they are now and writes nothing. Provider or
-Git evidence it cannot read gives no trust option and no dialog key, as missing consent did
-before; for an Agy session that relies on the session-only setting, `doctor` and the paste gate
-report it as unreadable; and a command that already carries a trust option does not start.
-TAB's own consent record that cannot be read or decoded is an error, as before. A session's
-check needs the source recorded at its start: after `tabcli consent reset` of the workspace or of
-its main working tree, only a new `ask` or a supported `reopen` acquires consent again. What a
-launch recorded is history. A revoked consent, a source that no longer trusts the directory, or a
-worktree that is no longer registered or whose main working tree is gone stops a TAB paste into a
-running Agy session that relies on its session-only setting. It does not change what the running
-Agy trusts, and a session whose workspace Agy's own trust store lists exactly keeps its pastes.
-
-TAB never writes a provider trust store. With verified consent, Codex receives a process-local
-configuration override, Pi receives its one-run approval option, and Agy 1.5.17 or newer receives
-a settings file for that session only (`--settings`, which Agy documents as never saved), so no
-key is sent and Agy's own store is not written. TAB creates that file in the session directory as
-`agy-session-trust-<random>.json`, a new one for each launch plan granted the setting, so one
-session can hold several. In the spawn fence, just before Agy starts, TAB reads the file at the
-path the plan named with the reader it uses for provider trust stores and compares the digest of
-its bytes with the bytes the plan wrote. That reader refuses a path whose last component is a
-symbolic link or not a regular file (it does not inspect the directories above that component),
-a file larger than 8 MiB or not valid UTF-8, and, on macOS and Linux, a file that your effective
-user does not own or whose mode lets its group or others write (it reads the owner and the mode
-bits, not an access control list). On Windows it applies the owner and access-list rule for trust
-stores in [Local records](#local-records). A changed, missing or refused file stops the launch,
-and a refusal by the reader names the file and the reader's reason; a replacement at the same
-path with the same bytes that passes the reader is accepted. If a plan fails after creating its
-file and before the setting is granted, TAB removes the file and syncs the session directory; its
-error names the file if the removal failed, or if the file was removed but its removal could not
-be made durable. If the plan's write of its applied marker failed, TAB tries to return the
-session's consent record to the marker it held before; if that also fails, the error says that
-this attempt received no grant and that the record may still name the attempted option. Every
-other such file stays with the session's records after the session ends, until `prune-sessions`
-removes the session directory. Only Agy 1.5.17 on macOS has been measured
-(standalone, and through TAB on Herdr in a new worktree): no trust dialog, and its store
-unchanged. For an ordinary folder that only another provider trusts, this changes what 0.4.49
-did with Agy: in iTerm2, Terminal.app and the native Windows console TAB used to answer Agy's
-dialog, after which Agy saved the folder in its own store; in Herdr, tmux and WezTerm the launch
-failed because no guarded key can be sent there; in Ghostty and Warp it failed at the screen
-read. Now all of them launch with the setting, and Agy no longer saves such a folder because of
-TAB. Without such an option, and only with exact consent, TAB can answer Claude's startup trust
-dialog, or that of an Agy whose version the launch identified as older than 1.5.17, once in
-iTerm2, Terminal.app, and the native Windows console; the provider saves the decision after the
-guarded response. An Agy launch whose version or consent check was inconclusive gets no key. See
+With verified exact consent, TAB can answer eligible Claude or Agy startup trust dialogs once in
+iTerm2, Terminal.app, and the native Windows console; see
 [terminal requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts)
 for the terminal-specific limits.
 
 Before responding, TAB checks that it owns the surface and checks the captured screen again.
-It then checks that the provider saved its decision. TAB never answers a dialog for consent that
-a worktree inherits, because the provider would then save the worktree as trusted. Without
-verified consent, the dialog stays for you to answer.
+It then checks that the provider saved its decision. Without verified consent, the dialog stays
+for you to answer. TAB never writes a provider trust store directly; the provider saves the
+decision after the guarded response. Codex instead receives a process-local configuration
+override, and Pi receives its one-run approval option.
 
 To see the recorded source for a workspace, run:
 
@@ -162,6 +71,17 @@ but does not approve the workspace. Shared records live in `workspace-consent/` 
 root. Each session keeps its own assessment in `workspace-consent.json`; a reopened session
 assesses its workspace for itself, like a fresh `ask`, and inherits nothing from the source
 session's assessment.
+
+For inherited consent, both records store the main working tree's identity in `repository_root`
+and identify its provider trust entry in `source`. In the shared record, `consent revoke` keeps
+both and `consent reset` clears both.
+The session directory can also contain `workspace-consent.lock` and private
+`agy-session-trust-<random>.json` files for individual launch plans.
+A complete settings file contains the workspace path in `trustedWorkspaces`.
+Files can remain after close or an unsuccessful launch and are removed with the session
+directory by `tabcli prune-sessions`.
+The `applied` field in `workspace-consent.json` can retain `agy-settings-override` even
+after a failed grant, so the marker alone proves neither consent nor launch.
 
 If consent is missing or unreadable, check the store TAB reads. In these paths, home means
 `HOME` when set, otherwise `USERPROFILE`:
@@ -178,12 +98,8 @@ Some initial prompts wait rather than risk typing a submission key onto a trust 
 
 - Codex on native Windows waits for exact trust, verified shared consent, or its empty composer.
   An empty screen or missing dialog text is not enough.
-- Agy on native Windows waits for its exact trust entry, or the session-only setting TAB passed
-  at launch while consent still holds, and this session's customization-load log entry, then
-  startup readiness. On macOS and Linux its initial prompt is an argument and can run behind the
-  dialog. Every follow-up, on Windows too, waits for the same trust and log evidence before
-  input. The setting alone is not enough: if Agy ignored it, the log entry is missing and
-  nothing is pasted.
+- Agy on native Windows requires the [Agy paste evidence](agents/agy.md) and startup readiness.
+  On macOS its initial prompt is an argument and can run behind the dialog; follow-ups wait for the trust and log evidence before input.
 - Pi on native Windows waits for the current turn's startup event after the trust procedure.
   That event can follow a decline; it is not shared consent.
 - Claude on native Windows delivers the initial prompt through official cross-session messaging
@@ -212,25 +128,22 @@ The code uses `HOME` first, then `USERPROFILE`, on both platforms. The override 
 entire root. `settings.json` in that root holds TAB's surface-creation preferences.
 
 Inside a session directory, these are the records most useful when checking a request. Some
-exist only during a turn or after close; `agy.log` and the `agy-session-trust-<random>.json` files
-are specific to Agy. A session holds one such file for each launch plan that was granted the
-session-only setting, so it can hold several, and keeps one that a failed plan could not remove.
+exist only during a turn or after close; `agy.log` is specific to Agy.
 
 ```text
 session-example/
-├── manifest.json                   Provider, workspace, and launch choices
-├── initial-prompt.txt              Initial prompt as retained for delivery
-├── status.json                     Recorded state and error reason
-├── launch.json                     Launch claim, deadline, and spawn phase
-├── launch.log                      Launch stages, errors, and exit codes
-├── native-session.json             Owner identity used to check the surface
-├── terminal.json                   The bound surface
-├── workspace-consent.json          Workspace trust source and application
-├── requests/                       Receipts connecting requests to results
-├── events/                         Recorded turn results
-├── agy.log                         Agy readiness, input receipts, and errors
-├── agy-session-trust-<random>.json Agy's session-only workspace trust, one per granted plan
-└── closed.json                     Recorded closed status
+├── manifest.json          Provider, workspace, and launch choices
+├── initial-prompt.txt     Initial prompt as retained for delivery
+├── status.json            Recorded state and error reason
+├── launch.json            Launch claim, deadline, and spawn phase
+├── launch.log             Launch stages, errors, and exit codes
+├── native-session.json    Owner identity used to check the surface
+├── terminal.json          The bound surface
+├── workspace-consent.json Workspace trust source and application
+├── requests/              Receipts connecting requests to results
+├── events/                Recorded turn results
+├── agy.log                Agy readiness, input receipts, and errors
+└── closed.json            Recorded closed status
 ```
 
 For launch failure details, read `status.json` and `launch.log` alongside `launch.json` and the

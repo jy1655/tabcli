@@ -2424,7 +2424,5 @@ reasons contain `session` and `reason`. Excerpts are limited to 200 displayed ch
 
 Inspection has `workspace`, `current_identity`, and `record` (null if absent). A changed record has
 `schema`, `identity`, `source`, and `revoked`. Identity contains `path`, `volume`, `file`,
-`created`, and `owner`; non-null source evidence has `provider`, `store`, and `key`. A git
-worktree whose consent comes from its repository's main working tree also has `repository_root`,
-that main working tree's identity, and its source names the main working tree's `key`; `revoke`
-keeps both and `reset` clears both. A session's `workspace_consent` carries the same field.
+`created`, and `owner`; non-null source evidence has `provider`, `store`, and `key`.
+See [workspace trust and consent](security-and-data.md#workspace-trust-and-consent) for inherited records.
