@@ -1219,8 +1219,7 @@ mod projected_authority_tests {
                 CloseCause::Explicit,
                 created(false),
             ),
-            // Only this session's process refuses when it cannot be
-            // inspected; another session's or an unbound record's process is not inspected.
+            // Another session's or an unbound record's process is not inspected.
             (
                 "another session's owner, uninspectable",
                 Record::Foreign,

@@ -1026,7 +1026,8 @@ fn a_removal_is_sent_once_and_confirmed_once() {
     fixture.assert_retained("acknowledged removal still listed", SessionState::Ready);
 }
 
-// A Herdr close keeps the diagnosis the session already holds: the closed record carries the stored failure read under the lifecycle lock.
+// A Herdr close keeps the diagnosis the session already holds: the closed record carries the
+// stored failure read under the lifecycle lock.
 #[test]
 fn an_explicit_close_keeps_the_sessions_diagnosis() {
     let fixture = Fixture::new("exited", &complete_owner());
@@ -1269,9 +1270,9 @@ fn the_windows_lookup_closes_a_gone_owners_terminal_by_its_creation_record() {
         CloseOutcome::Missing
     );
     assert!(fixture.core.methods().is_empty());
-    // A terminal its core keeps is never closed on the surface alone: that decision closes on the creation record with the decision's own result, which
-    // keeps no diagnosis. A running terminal is refused with nothing sent; a finished one is
-    // removed.
+    // A terminal its core keeps is never closed on the surface alone: that decision closes
+    // on the creation record with the decision's own result, which keeps no diagnosis. A running
+    // terminal is refused with nothing sent; a finished one is removed.
     let surface_only = || {
         close_windows_owned_surface_with(
             || Ok(TerminalCloseAuthority::SurfaceOnly),

@@ -750,6 +750,8 @@ preserves an intent or a Surface that can outlive its owner for explicit Close. 
 core-retained terminal see [Herdr close](agents/herdr.md#close-by-creation-record).
 An exited or failed console session settles from its
 Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
+For terminal kinds other than Herdr, the platform differences remain and are tracked in
+[issue #421](https://github.com/jy1655/tabcli/issues/421).
 
 ## Where to add things
 

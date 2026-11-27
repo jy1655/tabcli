@@ -202,6 +202,11 @@ workspace trust dialogs must be handled by the user through Herdr or `hc attach`
 
 ### Closing a Herdr session
 
+If the original program ends outside TAB with keep off, run
+`tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
+finished terminal and closes the session record. If the core cannot be reached, the session
+keeps its handle and a later close finishes it.
+
 If TAB cannot verify a live owner and refuses to close a running terminal, wait for it to
 finish or end it on the recorded core, then run `tabcli close-session <session> --explicit`.
 Before ending it yourself, run `tabcli doctor <session> --probe` and check with `hc get
@@ -209,9 +214,12 @@ Before ending it yourself, run `tabcli doctor <session> --probe` and check with 
 See [Close by creation record](agents/herdr.md#close-by-creation-record) for the close rule
 and its limits.
 
-In 0.4.49 an explicit close could end a running Herdr terminal after a failed start or when
-resuming an ordinary close whose owner was gone. Windows dead-owner repair could also end it.
-These cases now leave the running terminal for you.
+In 0.4.49 an explicit close could end a running Herdr terminal after a failed start, when
+resuming an ordinary close whose owner was gone, or during a launch whose wrapper had not
+yet recorded its owner. Windows dead-owner repair could also end it.
+These cases now leave the running terminal for you. When TAB closes on the creation record,
+the owner record no longer prevents closing a session whose verified terminal is finished
+or absent. This lets you close sessions stranded under 0.4.49.
 
 ### Herdr Core on native Windows
 

@@ -215,9 +215,11 @@
   reply was lost fails instead of repeating it, and the next close finishes from what it
   reads (a finished terminal is only removed). Herdr's registration declares that its core
   retains a finished terminal (see [Close by creation record](#close-by-creation-record)).
-  Handles created by 0.4.45 and 0.4.46 omit the nonce; for those, the original identity
-  checks also require the
-  launch label to agree with the terminal's generated name. A failed read or removal keeps
+  To remove a finished terminal on the creation record, TAB checks the launch label, sends
+  one `terminal.rm`, and confirms absence on that core. It never sends `terminal.kill` on
+  this path. Handles created by 0.4.45 and 0.4.46 omit the nonce; for those, the original
+  identity checks also require the launch label to agree with the terminal's generated name.
+  A failed read or removal keeps
   the handle for retry. Cleanup after binding fails uses the ordinary close proof. Cleanup
   before confirmation checks the full launch argv, label and name, plus the creation
   time and PID from its first read at that address. It refuses a terminal set to keep. A birth
@@ -379,10 +381,12 @@
   as a follow-up (`an_interrupted_teardown_keeps_the_replay_of_0_4_49`).
 - An unreadable close-intent file refuses a close that needs an intent decision.
 - When the decision leaves the close to the surface alone, either cause runs the same
-  creation-record close (`a_replayed_intent_whose_owner_goes_after_validation_closes_on_the_creation_record`).
+  creation-record close with that decision's result and no stored diagnosis
+  (`a_replayed_intent_whose_owner_goes_after_validation_closes_on_the_creation_record`).
 - Cleanup after a refused reopen refuses the creation record selected for lack of a live owner
   (`a_cleanup_never_acts_on_a_terminal_without_a_live_owner`).
 - Each kill or removal requires a grant for the terminal observed on the verified core
   (`a_grant_names_the_core_that_reported_its_terminal`, `a_grant_names_the_address_its_basis_records`).
-- A close on the creation record preserves the stored diagnosis across interruption
+- A creation-record close chosen for lack of a live owner preserves the stored diagnosis
+  across interruption
   (`an_interrupted_close_keeps_the_diagnosis_across_its_consumption_marker`).
