@@ -2195,8 +2195,7 @@ fn a_rejected_launch_host_record_makes_the_timeline_incomplete() {
     }
 }
 
-// A closed session keeps its terminal kind in the close tombstone; doctor uses it to decide
-// that the host record and the probe do not apply to that terminal.
+// When the tombstone names Ghostty, doctor can rule out both the launch host and the shell probe.
 #[test]
 fn a_closed_session_s_tombstone_names_its_terminal_for_doctor() {
     let fixture = Fixture::new("codex");

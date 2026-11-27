@@ -114,9 +114,10 @@ pub(in crate::native) struct RecordedReopenRefusal {
     pub(in crate::native) cleanup_detail: Option<String>,
 }
 
-/// The tombstone a close leaves once it has consumed the terminal handle. `terminal` is the
-/// consumed handle's kind, null when the close found no handle; `reason` is the close's reason,
-/// written on every OS since os-parity (earlier Windows binaries wrote none).
+/// When close writes this tombstone, `terminal` is the kind the consumed handle stated.
+/// It is null if the handle omitted its kind or the writer decoded no handle.
+/// `reason` is the close's reason, written on every OS since os-parity (earlier Windows
+/// binaries wrote none).
 #[derive(Debug, Deserialize, PartialEq)]
 pub(in crate::native) struct TerminalTombstone {
     pub(in crate::native) consumed: bool,

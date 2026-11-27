@@ -611,11 +611,10 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     })
 }
 
-/// The terminal a session launched in, as its records name it: the launch host record of
-/// its receipt, then an active surface handle. `launch_host` is the host record that the
-/// session's Observation judged; a host record's terminal never changes once written. When
-/// no Observation could be read, the host record is read here, after the snapshot attempt,
-/// without its lock.
+/// The launch host record bound to the receipt takes precedence over the surface records.
+/// `launch_host` is the host record that the session's Observation judged. Its terminal
+/// never changes once written. When no Observation could be read, the host record is read
+/// here, after the snapshot attempt, without its lock.
 fn recorded_terminal(
     reader: &Reader,
     launch_host: Option<launch::host::HostObservation>,
@@ -631,8 +630,8 @@ fn recorded_terminal(
     surface_kind(evidence)
 }
 
-/// The terminal kind a session's surface records name: the active or closing handle, or
-/// the close tombstone, which keeps the kind after the handle is consumed.
+/// Active and closing handles supply their effective kind. A close tombstone supplies
+/// a kind only when its `terminal` field names one.
 fn surface_kind(evidence: &SessionEvidence) -> Option<terminal::TerminalKind> {
     match &evidence.surface {
         query::observation::SurfaceRecord::Active(Ok(Some(surface)))

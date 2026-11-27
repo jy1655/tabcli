@@ -264,18 +264,9 @@ pub(in crate::native) fn terminal_tombstone(text: &str) -> serde_json::Result<Te
     serde_json::from_str(text)
 }
 
-/// The native replay accepts the last consumed field. A strict completion additionally
-/// requires unambiguous identity fields; an absent or unrecognized kind supplies no kind.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) enum Consumption {
-    Incomplete,
-    NativeOnly,
-    Completed(Option<crate::native::terminal::TerminalKind>),
-}
-
+/// Native replay reads commitment and reason from the marker's last JSON field values.
 pub(super) struct ConsumptionMarker {
     value: Value,
-    pub(super) consumption: Consumption,
 }
 
 impl ConsumptionMarker {
@@ -284,73 +275,17 @@ impl ConsumptionMarker {
     }
 
     pub(super) fn committed(&self) -> bool {
-        self.consumption != Consumption::Incomplete
+        self.value.get("consumed") == Some(&Value::Bool(true))
     }
 }
 
-struct MarkerVisitor;
-
-impl<'de> serde::de::Visitor<'de> for MarkerVisitor {
-    type Value = ConsumptionMarker;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a consumption marker object")
-    }
-
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        use serde::Deserialize;
-        let mut fields = serde_json::Map::new();
-        let mut repeated = false;
-        while let Some((key, value)) = map.next_entry::<String, Value>()? {
-            let identity = matches!(key.as_str(), "consumed" | "terminal");
-            if fields.insert(key, value).is_some() && identity {
-                repeated = true;
-            }
-        }
-        let consumption = if fields.get("consumed") != Some(&Value::Bool(true)) {
-            Consumption::Incomplete
-        } else if repeated {
-            Consumption::NativeOnly
-        } else {
-            match fields.get("terminal") {
-                None | Some(Value::Null) => Consumption::Completed(None),
-                Some(kind @ Value::String(_)) => Consumption::Completed(
-                    crate::native::terminal::TerminalKind::deserialize(kind).ok(),
-                ),
-                Some(_) => Consumption::NativeOnly,
-            }
-        };
-        Ok(ConsumptionMarker {
-            value: Value::Object(fields),
-            consumption,
-        })
-    }
-}
-
-/// Observe top-level duplicates before insertion collapses them. Every member, including
-/// unknown ones, goes through Value's ordinary JSON/depth checks. Other JSON values are
-/// still available to the historical full-value readers and have no commitment or reason.
 pub(super) fn consumption_marker(text: &str) -> serde_json::Result<ConsumptionMarker> {
-    use serde::Deserializer;
-    if text
-        .trim_start_matches([' ', '\t', '\r', '\n'])
-        .starts_with('{')
-    {
-        let mut decoder = serde_json::Deserializer::from_str(text);
-        let marker = decoder.deserialize_map(MarkerVisitor)?;
-        decoder.end()?;
-        Ok(marker)
-    } else {
-        Ok(ConsumptionMarker {
-            value: serde_json::from_str(text)?,
-            consumption: Consumption::Incomplete,
-        })
-    }
+    terminal_tombstone_value(text).map(|value| ConsumptionMarker { value })
 }
 
 /// Observation and timeline retain the full value, including unknown fields and kinds.
 pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Result<Value> {
-    consumption_marker(text).map(|marker| marker.value)
+    serde_json::from_str(text)
 }
 
 /// Timeline's retained-byte policy, including its historical error contexts: invalid

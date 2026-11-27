@@ -1,51 +1,6 @@
 use super::*;
 
 #[test]
-fn only_unambiguous_marker_fields_supply_a_completed_kind() {
-    use crate::native::terminal::TerminalKind::Tmux;
-    use Consumption::{Completed, Incomplete, NativeOnly};
-    for (wire, expected) in [
-        (
-            r#"{"consumed":true,"terminal":"tmux"}"#,
-            Completed(Some(Tmux)),
-        ),
-        (r#"{"consumed":true}"#, Completed(None)),
-        (r#"{"consumed":true,"terminal":null}"#, Completed(None)),
-        (r#"{"consumed":true,"terminal":"future"}"#, Completed(None)),
-        (r#"{"consumed":true,"terminal":17}"#, NativeOnly),
-        (r#"{"consumed":true,"consumed":true}"#, NativeOnly),
-        (r#"{"consumed":false,"consumed":true}"#, NativeOnly),
-        (
-            r#"{"consumed":true,"consumed":false,"reason":"native"}"#,
-            Incomplete,
-        ),
-        (
-            r#"{"consumed":true,"terminal":null,"terminal":"tmux"}"#,
-            NativeOnly,
-        ),
-        (
-            r#"{"consumed":true,"terminal":"tmux","terminal":null}"#,
-            NativeOnly,
-        ),
-        (
-            r#"{"consumed":true,"reason":null,"reason":"ok","extra":{"terminal":1,"terminal":2}}"#,
-            Completed(None),
-        ),
-        (r#"{"consumed":false,"reason":"native"}"#, Incomplete),
-        ("null", Incomplete),
-        ("[true]", Incomplete),
-    ] {
-        let marker = consumption_marker(wire).unwrap();
-        assert_eq!(marker.consumption, expected, "{wire}");
-        assert_eq!(
-            marker.value,
-            serde_json::from_str::<Value>(wire).unwrap(),
-            "{wire}"
-        );
-    }
-}
-
-#[test]
 fn reopen_auxiliary_decoders_keep_legacy_shape_policy() {
     // These historical auxiliary shapes allow u128 timestamps and unknown schema/gate
     // values. Reopen judges authority after decoding; moving them must not add the

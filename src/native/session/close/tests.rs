@@ -530,8 +530,48 @@ fn native_marker_commitment_and_reason_keep_their_json_rules() {
 }
 
 #[test]
+fn doctor_probe_has_no_terminal_context_after_close_of_an_unstated_kind() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-doctor";
+    let directory = root.path().join(id);
+    fs::create_dir_all(directory.join("events")).unwrap();
+    crate::native::session::test_support::write_test_manifest(&directory, "codex");
+    let store = Store::open_unchecked(&directory);
+    update_status(&directory, SessionState::Working, None, None).unwrap();
+    store
+        .record(CoreRecord::Terminal)
+        .write_private(br#"{"iterm_session_id":"s"}"#)
+        .unwrap();
+    close(&store, None, budget::close_deadline(), |handle| {
+        assert_eq!(handle.kind, terminal::TerminalKind::Iterm2);
+        Ok(terminal::CloseOutcome::Missing.into())
+    })
+    .unwrap();
+
+    let output = std::process::Command::new(crate::native::tests::package_binary())
+        .args(["doctor", id, "--probe", "--json"])
+        .env(
+            crate::native::session::primitives::STATE_DIR_ENV,
+            root.path(),
+        )
+        .env("ZDOTDIR", root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        reason(&report["checks"], "terminal_record"),
+        "terminal_consumed"
+    );
+    assert_eq!(
+        reason(&report["checks"], "shell_environment"),
+        "shell_environment_probe_context_unavailable"
+    );
+}
+
+#[test]
 fn consumed_handle_tombstone_reads_back_through_its_reader() {
-    // A close that consumes a handle records its kind, and on macOS the adapter's reason.
+    // Close records the kind this handle states and the adapter's reason on every OS.
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_json_atomic(
