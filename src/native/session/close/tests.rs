@@ -31,6 +31,88 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::{sync::atomic::Ordering, thread};
 
+fn repair_without_handle(marker: Option<&[u8]>) -> (tempfile::TempDir, Store) {
+    use crate::native::process_identity::Gone;
+    use crate::native::session::owner::ControlAttestation;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    update_status(directory.path(), SessionState::Exited, None, None).unwrap();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 42,
+            ..Default::default()
+        })
+        .unwrap();
+    if let Some(bytes) = marker {
+        store
+            .record(CoreRecord::TerminalClosed)
+            .write_private(bytes)
+            .unwrap();
+    }
+    assert!(
+        repair_dead_owner_attested_until(
+            &store,
+            |_| OwnerAttestation {
+                process: ProcessObservation::Gone(Gone::Exited),
+                control: ControlAttestation::NotRecorded,
+                pid_alive: Some(false),
+            },
+            budget::close_deadline()
+        )
+        .unwrap()
+    );
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+    (directory, store)
+}
+
+fn assert_repaired_marker(bytes: &[u8]) {
+    use crate::native::query::observation::SurfaceRecord;
+
+    let (_directory, store) = repair_without_handle(Some(bytes));
+    let SurfaceRecord::Closed(marker) = SurfaceRecord::read(&store) else {
+        panic!("expected a closed surface");
+    };
+    assert_eq!(
+        marker.expect("Repair must leave a decodable consumption marker"),
+        json!({
+            "consumed": true,
+            "terminal": null,
+            "reason": "native session process 42 is no longer running"
+        })
+    );
+}
+
+#[test]
+fn repair_without_handle_replaces_non_utf8_marker() {
+    assert_repaired_marker(&[0xff]);
+}
+
+#[test]
+fn repair_without_handle_replaces_invalid_json_marker() {
+    assert_repaired_marker(b"{");
+}
+
+#[test]
+fn repair_without_handle_keeps_committed_marker_bytes() {
+    let marker = br#"{ "terminal": "herdr", "reason": "previous close", "consumed": true }"#;
+    let (_directory, store) = repair_without_handle(Some(marker));
+    assert_eq!(
+        store
+            .record(CoreRecord::TerminalClosed)
+            .bytes()
+            .unwrap()
+            .unwrap(),
+        marker
+    );
+}
+
+#[test]
+fn repair_without_handle_leaves_absent_marker_absent() {
+    let (_directory, store) = repair_without_handle(None);
+    assert!(!store.record(CoreRecord::TerminalClosed).present().unwrap());
+}
+
 fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());
