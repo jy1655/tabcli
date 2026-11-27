@@ -291,7 +291,8 @@ fn receive_before(
 }
 
 /// Waits for readability using the time left before `deadline`, then receives without
-/// blocking. After a timeout or interruption, the loop rechecks the original deadline.
+/// blocking. After a timeout or interruption, the loop rechecks the original deadline
+/// and returns `TimedOut` once no time is left. Tests can script the clock, wait and receive.
 pub(super) fn wait_and_receive(
     clock: &mut dyn Clock,
     buffer: &mut [u8],
@@ -343,8 +344,10 @@ fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize>
     usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
 }
 
-/// Polls for readability with `timeout` converted to whole milliseconds. Returns `false`
-/// on timeout or interruption.
+/// Polls for bytes, end of stream, an error or (on Linux) an urgent byte. The poll timeout
+/// rounds whole microseconds up to milliseconds, so it can exceed `timeout` by up to one
+/// millisecond. Under one microsecond the poll is immediate. Returns `false` on timeout
+/// or interruption.
 fn wait_readable(stream: &UnixStream, timeout: Duration) -> std::io::Result<bool> {
     let timeout = timeout.as_micros().div_ceil(1000);
     let mut poll = libc::pollfd {
