@@ -290,10 +290,8 @@ fn receive_before(
     )
 }
 
-/// The loop of `receive_before`, with its clock and its two steps as parameters so that a
-/// test can script them. Before each wait it reads the time left before `deadline` from the
-/// clock and ends with `TimedOut` when none is left. `wait` waits at most that long and tells
-/// whether the socket became readable; `receive` takes what is there without blocking.
+/// Waits for readability using the time left before `deadline`, then receives without
+/// blocking. After a timeout or interruption, the loop rechecks the original deadline.
 pub(super) fn wait_and_receive(
     clock: &mut dyn Clock,
     buffer: &mut [u8],
@@ -345,11 +343,9 @@ fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize>
     usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
 }
 
-/// Waits at most `timeout` for `stream` to become readable (bytes, the end of the stream or an
-/// error is waiting, or, on Linux, an urgent byte): `true` once it is, `false` when the time
-/// passed or a signal interrupted the wait.
+/// Polls for readability with `timeout` converted to whole milliseconds. Returns `false`
+/// on timeout or interruption.
 fn wait_readable(stream: &UnixStream, timeout: Duration) -> std::io::Result<bool> {
-    // Rounded up to whole milliseconds, so that no wait ends before the deadline.
     let timeout = timeout.as_micros().div_ceil(1000);
     let mut poll = libc::pollfd {
         fd: stream.as_raw_fd(),
