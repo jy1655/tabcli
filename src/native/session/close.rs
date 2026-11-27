@@ -522,13 +522,14 @@ where
         }
     }
 
-    let terminal = match closing.json_with(super::record::terminal) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            restore_terminal_handle(&closing_path, &terminal_path)?;
-            return Err(error);
-        }
-    };
+    let (terminal, stated_kind) =
+        match closing.json_with(terminal::TerminalSession::decode_with_stated_kind) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                restore_terminal_handle(&closing_path, &terminal_path)?;
+                return Err(error);
+            }
+        };
     let result = match crate::native::session::close::budget::close_remaining(deadline)
         .and_then(|_| close_terminal(&terminal))
         .and_then(|result| {
@@ -550,8 +551,11 @@ where
         close_error = merge_close_reason(merge_close_reason(close_error, diagnosis), result.reason);
     }
 
-    let consume_result =
-        consume_terminal_handle(store, Some(terminal.kind.as_str()), close_error.as_deref());
+    let consume_result = consume_terminal_handle(
+        store,
+        stated_kind.map(terminal::TerminalKind::as_str),
+        close_error.as_deref(),
+    );
     // Only this path has the adapter's positive close/absence result. No-handle
     // close, repair, and replay of a consumed handle cannot clear the observation.
     let cleared = status.residual_surface().map(|_| ResidualSurface::Cleared);
@@ -575,13 +579,17 @@ fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<
 // Every OS records the close's reason in the consumption marker, so that a close interrupted
 // after it and before the closed record keeps that reason (os-parity).
 fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
-    // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read is
-    // strict, and an undecodable tombstone never keeps a close from finishing.
+    Ok(read_consumption_marker(store)?.and_then(|marker| marker.reason().map(str::to_owned)))
+}
+
+fn read_consumption_marker(store: &Store) -> Result<Option<super::record::ConsumptionMarker>> {
+    // Malformed JSON and invalid UTF-8 grant no marker facts. Preserve I/O failures.
     Ok(store
         .record(CoreRecord::TerminalClosed)
         .bytes()?
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| super::record::terminal_consumption_reason(&text)))
+        .and_then(|bytes| {
+            super::record::consumption_marker(std::str::from_utf8(&bytes).ok()?).ok()
+        }))
 }
 
 /// Joins two close reasons with `; `. A reason that the other already carries, whole or as a
@@ -606,12 +614,7 @@ fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<S
 /// else it holds (a terminal kind this build does not know included). Bytes that are not such a
 /// marker are a damaged marker, which the next consumption writes again.
 fn committed_consumption_marker(store: &Store) -> Result<bool> {
-    Ok(store
-        .record(CoreRecord::TerminalClosed)
-        .bytes()?
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| super::record::terminal_tombstone_value(&text).ok())
-        .is_some_and(|marker| marker.get("consumed") == Some(&serde_json::Value::Bool(true))))
+    Ok(read_consumption_marker(store)?.is_some_and(|marker| marker.committed()))
 }
 
 fn consume_terminal_handle(

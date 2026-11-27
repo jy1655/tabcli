@@ -264,20 +264,28 @@ pub(in crate::native) fn terminal_tombstone(text: &str) -> serde_json::Result<Te
     serde_json::from_str(text)
 }
 
-/// Observation and timeline retain the full value, including unknown terminal kinds
-/// and fields. A typed self-test projection must not narrow these readers.
-pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Result<Value> {
-    serde_json::from_str(text)
+/// Native replay reads commitment and reason from the marker's last JSON field values.
+pub(super) struct ConsumptionMarker {
+    value: Value,
 }
 
-/// Close only asks for a reason. Malformed JSON or a non-string reason means none;
-/// neither a typed terminal kind nor a consumed fact is required by this projection.
-pub(in crate::native) fn terminal_consumption_reason(text: &str) -> Option<String> {
-    terminal_tombstone_value(text)
-        .ok()?
-        .get("reason")?
-        .as_str()
-        .map(str::to_owned)
+impl ConsumptionMarker {
+    pub(super) fn reason(&self) -> Option<&str> {
+        self.value.get("reason")?.as_str()
+    }
+
+    pub(super) fn committed(&self) -> bool {
+        self.value.get("consumed") == Some(&Value::Bool(true))
+    }
+}
+
+pub(super) fn consumption_marker(text: &str) -> serde_json::Result<ConsumptionMarker> {
+    terminal_tombstone_value(text).map(|value| ConsumptionMarker { value })
+}
+
+/// Observation and timeline retain the full value, including unknown fields and kinds.
+pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(text)
 }
 
 /// Timeline's retained-byte policy, including its historical error contexts: invalid
