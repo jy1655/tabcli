@@ -491,9 +491,11 @@ It sends SIGTERM only to the group the owner leads and waits up to three seconds
 It sends no SIGKILL and no shell signal. Once the group is gone, close consumes the handle and
 records `closed`, outcome `Missing`, and the reason. A failure to confirm disappearance
 keeps the intent and handle. A later close obtains authority again if the owner is live.
-If the owner is dead, it sends nothing and completes only after that group is proven gone;
-EPERM and a zombie-only group do not establish absence. Check the reported error and the
-session's processes before retrying. Observation and signal are not one atomic operation.
+For Herdr, a valid intent with no verified live owner permits explicit close on the creation
+record. For Terminal.app, Ghostty, Warp, WezTerm and iTerm2, replay still requires the
+matching owner record. If that owner has exited, close sends nothing and completes only
+after the group is proven gone. EPERM and a zombie-only group do not establish absence.
+Check the reported error and the session's processes before retrying. Observation and signal are not one atomic operation.
 The group's disappearance does not prove that processes which left the group have ended.
 
 If Ghostty initialization fails after TAB proves the created terminal, tab, and window ids,

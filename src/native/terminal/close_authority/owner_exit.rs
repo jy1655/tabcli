@@ -85,13 +85,7 @@ enum Source {
     allow(dead_code)
 )]
 impl CreationEvidence {
-    /// The evidence for a close that the decision, 0.4.49's code, left to the surface alone
-    /// (`SurfaceOnly`) on a kind whose core keeps its terminals. For Herdr this is reached only on
-    /// macOS and Linux, by a replayed teardown intent whose owner record is then found absent in
-    /// a launching or failed session. 0.4.49 closed the terminal on the surface alone, ending a
-    /// running one; the close on the creation record keeps its settlement of an absent terminal
-    /// and its removal of a finished one, and never ends a running one (the owner's decision of
-    /// 2026-11-26). Only the mapping of that decision constructs it.
+    /// Evidence for the adapter's mapping of an explicit `SurfaceOnly` authority.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     pub(in crate::native::terminal) fn surface_only() -> Self {
         Self {

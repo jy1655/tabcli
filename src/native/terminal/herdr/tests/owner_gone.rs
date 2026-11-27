@@ -2395,200 +2395,218 @@ fn an_owner_that_exits_between_its_two_reads_takes_the_creation_record() {
     assert_eq!(fixture.mutations(), (0, 0));
 }
 
-// A close with a live owner that
-// proved its terminal absent records a teardown intent before it ends the owner. A close that
-// finds such an intent saved follows 0.4.49's replay rules exactly; the creation-record rule of
-// os-parity applies only when no teardown intent is saved. Here the interrupted teardown's
-// owner record has since gone, or can no longer be read: the intent cannot be validated, so the
-// retry refuses before it asks the core anything, whether the terminal finished or is absent,
-// and keeps the intent and the handle, as 0.4.49 does. Replacing this replay is a follow-up.
-// macOS and Linux only (Windows records no teardown intent).
 #[cfg(unix)]
-#[test]
-fn an_interrupted_teardown_keeps_the_replay_of_0_4_49() {
-    type Lose = fn(&std::path::Path);
-    type Terminal = fn(&Fixture);
-    let owners: [(&str, Lose); 2] = [
-        ("owner record gone", |path| fs::remove_file(path).unwrap()),
-        ("owner record unreadable", |path| {
-            fs::remove_file(path).unwrap();
-            fs::create_dir(path).unwrap();
-        }),
-    ];
-    let terminals: [(&str, Terminal); 2] = [
-        ("terminal absent", Fixture::remove),
-        ("terminal finished", Fixture::finish),
-    ];
-    for ((owner_label, lose), (terminal_label, terminal)) in owners
-        .into_iter()
-        .flat_map(|owner| terminals.map(|terminal| (owner, terminal)))
-    {
-        let label = format!("{owner_label}, {terminal_label}");
-        let fixture = Fixture::new("ready", &complete_owner());
-        terminal(&fixture);
-        let store = fixture.store();
-        let surface = store.terminal().unwrap();
-        // The state the interrupted teardown left: its intent, naming the owner it attested.
-        session::close::record_terminal_teardown_intent(
-            &store,
-            SESSION,
-            &surface,
-            &complete_owner(),
-            4242,
-            "the surface was proven absent while its owner was live; the owner was ended",
-        )
-        .unwrap();
-        lose(store.record(CoreRecord::Owner).path());
-        let intent = store
-            .record(CoreRecord::TerminalCloseIntent)
-            .bytes()
-            .unwrap();
-        fixture.core.clear_calls();
-        assert!(fixture.close(exited, false).is_err(), "{label}");
-        assert!(
-            fixture.core.methods().is_empty(),
-            "{label}: the intent is validated before any core is asked: {:?}",
-            fixture.core.methods()
-        );
-        assert_eq!(
-            store
-                .record(CoreRecord::TerminalCloseIntent)
-                .bytes()
-                .unwrap(),
-            intent,
-            "{label}: the intent is kept"
-        );
-        fixture.assert_retained(&label, SessionState::Ready);
-    }
+fn save_teardown(fixture: &Fixture, surface: &TerminalSession, owner: &NativeSessionOwner) {
+    session::close::record_terminal_teardown_intent(
+        &fixture.store(),
+        SESSION,
+        surface,
+        owner,
+        owner.pid,
+        "owner teardown",
+    )
+    .unwrap();
 }
 
-// A failed session's saved teardown
-// intent validates against its owner record, and the record then disappears before the decision
-// reads whether one is present. The decision, 0.4.49's code, leaves the close to the surface
-// alone (`SurfaceOnly`). The Herdr adapter then does the creation-record operation: it asks the
-// recorded core, settles an absent terminal on `not_found` and removes a finished one, as
-// 0.4.49 did, and refuses a running one with the keep text (0.4.49 ended it; the owner's
-// decision of 2026-11-26). The earlier interruption test removes the owner record before the
-// intent is validated. macOS and Linux only (Windows records no teardown intent).
 #[cfg(unix)]
 #[test]
-fn a_replayed_intent_whose_owner_goes_after_validation_closes_on_the_creation_record() {
-    use crate::native::session::Reader;
+fn saved_teardown_with_a_contradictory_owner_sends_no_group_signal() {
     use crate::native::terminal::close_authority::{
         close_owned_surface_with, decide, test_support::TestObservation,
     };
-    use crate::native::terminal::posix::{self, OwnedSurfaceClose};
-    use std::cell::RefCell;
-    type Terminal = fn(&Fixture);
-    let rows: [(&str, Terminal, Expected, Mutations); 3] = [
-        ("absent", Fixture::remove, Ok(CloseOutcome::Missing), (0, 0)),
-        (
-            "finished",
-            Fixture::finish,
-            Ok(CloseOutcome::Closed),
-            (0, 1),
-        ),
-        ("running", |_| {}, Err(STILL_RUNNING), (0, 0)),
-    ];
-    // Every row is checked before the test fails, so that a failure shows all three.
-    let mut mismatches = Vec::new();
-    for (label, terminal, expected, mutations) in rows {
-        let fixture = Fixture::new("failed", &complete_owner());
-        terminal(&fixture);
-        let store = fixture.store();
-        let surface = store.terminal().unwrap();
-        session::close::record_terminal_teardown_intent(
-            &store,
-            SESSION,
-            &surface,
-            &complete_owner(),
-            4242,
-            "the surface was proven absent while its owner was live; the owner was ended",
-        )
-        .unwrap();
-        let owner = store.record(CoreRecord::Owner).path().to_owned();
-        let adapters = Adapter::with_core(fixture.core.clone());
-        let closes = RefCell::new(Vec::new());
-        let validated = RefCell::new(None);
-        fixture.core.clear_calls();
-        let deadline = session::close::budget::close_deadline();
-        let result = session::close::close_with_attestation(
-            &store,
-            None,
-            deadline,
-            |_| exited(),
-            |surface| {
-                let observation =
-                    TestObservation::on_records(&fixture.directory, SESSION, surface, deadline)
-                        .with_evidence(crate::native::terminal::close_evidence(TerminalKind::Herdr))
-                        .with_teardown_intent(|| {
-                            let intent = session::close::terminal_teardown_intent(
-                                &Reader::open_unchecked(&fixture.directory),
-                                surface,
-                            );
-                            *validated.borrow_mut() = Some(matches!(intent, Ok(Some(_))));
-                            // The intent has validated; the owner record goes now.
-                            let _ = fs::remove_file(&owner);
-                            intent
-                        });
-                close_owned_surface_with(
-                    || decide(&observation, SESSION, surface, deadline),
-                    || panic!("a gone owner is not torn down"),
-                    |close| {
-                        closes.borrow_mut().push(close.clone());
-                        posix::close_owned_session(
-                            &adapters,
-                            &fixture.directory,
-                            SESSION,
-                            surface,
-                            close,
-                            deadline,
-                        )
-                    },
-                    deadline,
-                )
-            },
-        )
-        .map_err(|error| error_text(&error));
-        assert_eq!(
-            *validated.borrow(),
-            Some(true),
-            "{label}: the intent validated"
-        );
-        assert_eq!(
-            *closes.borrow(),
-            [OwnedSurfaceClose::SurfaceOnly],
-            "{label}: the decision left the close to the surface alone"
-        );
-        let answered = match (&expected, &result) {
-            (Ok(outcome), Ok(got)) => outcome == got,
-            (Err(text), Err(error)) => error.contains(text),
-            _ => false,
-        };
-        if !answered {
-            mismatches.push(format!("{label}: expected {expected:?}, got {result:?}"));
-            continue;
-        }
-        if !fixture
+    use crate::native::terminal::posix;
+    use std::cell::Cell;
+    let mut owner = complete_owner();
+    owner.windows_process_identity = Some(crate::native::terminal::WindowsProcessIdentity {
+        creation_time: 42,
+        executable_path: "tabcli.exe".into(),
+    });
+    let fixture = Fixture::new("ready", &owner);
+    let surface = fixture.store().terminal().unwrap();
+    save_teardown(&fixture, &surface, &owner);
+    fixture.remove();
+    let deadline = later();
+    let adapters = Adapter::with_core(fixture.core.clone());
+    let signals = Cell::new(0);
+    let observation = TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+        .with_posix_owner_live(|_| live_other())
+        .with_proof(|| Err(anyhow!("surface absent")))
+        .with_presence(|| {
+            posix::surface_present(
+                &adapters,
+                &fixture.directory,
+                &surface,
+                Duration::from_secs(1),
+            )
+        })
+        .with_attest(|| Ok(()));
+    let result = close_owned_surface_with(
+        || decide(&observation, SESSION, &surface, deadline),
+        || {
+            signals.set(signals.get() + 1);
+            Ok(CloseOutcome::Missing.into())
+        },
+        |close| {
+            posix::close_owned_session(
+                &adapters,
+                &fixture.directory,
+                SESSION,
+                &surface,
+                close,
+                deadline,
+            )
+        },
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(signals.get(), 0);
+    assert_eq!(result.outcome, CloseOutcome::Missing);
+    assert!(
+        fixture
             .core
             .methods()
             .iter()
             .any(|method| method == "terminal.get")
-        {
-            mismatches.push(format!("{label}: the recorded core was not asked"));
-        }
-        if fixture.mutations() != mutations {
-            mismatches.push(format!("{label}: mutations {:?}", fixture.mutations()));
-        }
-        match expected {
-            Ok(_) => fixture.assert_closed(label),
-            Err(_) => {
-                assert!(fixture.core.terminal("t7").is_some(), "{label}");
-                fixture.assert_retained(label, SessionState::Failed);
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_with_a_replacement_owner_settles_an_absent_terminal() {
+    for replacement in [None, Some("session-foreign".into())] {
+        let mut owner = complete_owner();
+        let fixture = Fixture::new("ready", &owner);
+        save_teardown(&fixture, &fixture.store().terminal().unwrap(), &owner);
+        fixture.claim();
+        owner.managed_session_id = replacement;
+        fixture.store().write_owner(&owner).unwrap();
+        fixture.remove();
+        assert_eq!(fixture.close(exited, false).unwrap(), CloseOutcome::Missing);
+        fixture.assert_closed("replacement owner");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_with_the_wrong_handle_and_no_owner_keeps_the_handle() {
+    let owner = complete_owner();
+    let fixture = Fixture::new("ready", &owner);
+    let mut wrong = fixture.store().terminal().unwrap();
+    wrong.id = "t8".into();
+    save_teardown(&fixture, &wrong, &owner);
+    fs::remove_file(fixture.store().record(CoreRecord::Owner).path()).unwrap();
+    fixture.remove();
+    assert!(fixture.close(exited, false).is_err());
+    fixture.assert_retained("wrong handle", SessionState::Ready);
+    assert!(fixture.core.methods().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_reads_the_owner_once_when_the_first_read_fails() {
+    use crate::native::terminal::close_authority::{
+        OwnerRead, TerminalCloseAuthority, decide, test_support::TestObservation,
+    };
+    use std::cell::Cell;
+    let owner = complete_owner();
+    let fixture = Fixture::new("ready", &owner);
+    let surface = fixture.store().terminal().unwrap();
+    save_teardown(&fixture, &surface, &owner);
+    fs::remove_file(fixture.store().record(CoreRecord::Owner).path()).unwrap();
+    let reads = Cell::new(0);
+    let deadline = later();
+    let observation = TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+        .with_read_owner(|| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                anyhow::bail!("first owner read failed");
             }
+            Ok(OwnerRead::Recorded(Box::new(owner.clone())))
+        })
+        .with_posix_owner_live(|_| live_other());
+    let result = decide(&observation, SESSION, &surface, deadline);
+    assert_eq!(reads.get(), 1);
+    assert!(
+        matches!(result, Ok(TerminalCloseAuthority::CreatedSurface(evidence))
+        if evidence.unverified().unwrap_or_default().contains("first owner read failed"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_refuses_a_different_attested_live_owner() {
+    use crate::native::terminal::close_authority::{decide, test_support::TestObservation};
+    let mut owner = complete_owner();
+    let fixture = Fixture::new("ready", &owner);
+    let surface = fixture.store().terminal().unwrap();
+    save_teardown(&fixture, &surface, &owner);
+    owner.terminal_tty_device = Some(43);
+    fixture.store().write_owner(&owner).unwrap();
+    let deadline = later();
+    let observation = TestObservation::on_records(&fixture.directory, SESSION, &surface, deadline)
+        .with_posix_owner_live(|_| live_other())
+        .with_proof(|| panic!("a different live owner cannot replay the intent"));
+    let error = decide(&observation, SESSION, &surface, deadline).unwrap_err();
+    assert!(error_text(&error).contains("does not match the attested owner"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ghostty_saved_teardown_still_requires_the_recorded_owner() {
+    let owner = complete_owner();
+    let fixture = Fixture::new("failed", &owner);
+    let surface = TerminalSession::new(TerminalKind::Ghostty, "fixture".into())
+        .with_binding(Some(SESSION.into()));
+    save_teardown(&fixture, &surface, &owner);
+    fs::remove_file(fixture.store().record(CoreRecord::Owner).path()).unwrap();
+    let deadline = later();
+    let observation =
+        crate::native::terminal::close_authority::test_support::TestObservation::on_records(
+            &fixture.directory,
+            SESSION,
+            &surface,
+            deadline,
+        );
+    assert!(observation.decide(SESSION, &surface, deadline).is_err());
+    assert_eq!(observation.calls(), ["teardown-intent"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_teardown_without_a_readable_owner_uses_the_creation_record() {
+    for unreadable in [false, true] {
+        for state in ["absent", "finished", "running"] {
+            let owner = complete_owner();
+            let fixture = Fixture::new("ready", &owner);
+            save_teardown(&fixture, &fixture.store().terminal().unwrap(), &owner);
+            let path = fixture.store().record(CoreRecord::Owner).path().to_owned();
+            fs::remove_file(&path).unwrap();
+            if unreadable {
+                fs::create_dir(path).unwrap();
+            }
+            match state {
+                "absent" => fixture.remove(),
+                "finished" => fixture.finish(),
+                _ => {}
+            }
+            let result = fixture.close(exited, false);
+            if state == "running" {
+                assert!(error_text(&result.unwrap_err()).contains(STILL_RUNNING));
+                fixture.assert_retained(state, SessionState::Ready);
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    if state == "finished" {
+                        CloseOutcome::Closed
+                    } else {
+                        CloseOutcome::Missing
+                    }
+                );
+                fixture.assert_closed(state);
+            }
+            assert_eq!(fixture.mutations(), (0, usize::from(state == "finished")));
         }
     }
-    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
 // The close with a live owner needs its full ownership proof. A bound
