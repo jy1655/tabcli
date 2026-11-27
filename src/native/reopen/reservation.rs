@@ -608,6 +608,8 @@ pub(super) fn verify_reopen_source_is_closed(
     marker::observe(directory)?.into_stale(id)
 }
 
+// Only claiming the source lock has a request deadline. Once the marker is written,
+// finalization must bind its child and rollback must release the source even when creation failed.
 // The winner's hold on a closed source. Dropping it before `finalize` removes the marker
 // again, so a reopen that never created its session leaves the source reopenable.
 #[derive(Debug)]
@@ -667,17 +669,24 @@ impl Reservation {
             .record(CoreRecord::ReopenMarker)
             .path()
             .to_owned();
-        let _lock = Store::open_unchecked(directory).lock()?;
+        use crate::native::session_start::deadline;
+        let store = Store::open_unchecked(directory);
+        let _lock = match deadline::current() {
+            Some(end) => session::TurnClaimLock::for_reopen(directory, end)?,
+            None => store.lock()?,
+        };
         if let Some(stale) = verify_reopen_source_is_closed(directory, id)? {
             // The gate re-ran under the lock, so the stale marker still names a refused launch
             // whose cleanup is verified now; releasing it here is the reconciliation the
             // crashed or timed-out parent never performed.
+            deadline::before("releasing the stale reopen marker")?;
             RecordStore::at(&path).remove().with_context(|| {
             format!(
                 "could not release the stale reopen marker of session {id} (reopened as {}, refused at {}, {})",
                 stale.refused_session, stale.gate, stale.cleanup
             )
         })?;
+            deadline::wrote("the stale reopen marker was removed");
         }
         let claim = format!(
             "{}-{}-{}",
@@ -692,6 +701,7 @@ impl Reservation {
             reopened_by: None,
             created_unix_ms: unix_ms(),
         };
+        deadline::before("writing the reopen marker")?;
         session::RecordStore::at(&path)
             .write_private(&serde_json::to_vec_pretty(&marker)?)
             .map_err(|error| {
@@ -700,6 +710,7 @@ impl Reservation {
                     format!("could not claim session {id} for reopen: {error:#}"),
                 )
             })?;
+        deadline::wrote("the source was reserved for reopen");
         Ok(Reservation {
             path,
             claim,

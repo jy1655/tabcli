@@ -36,6 +36,9 @@ struct FakeState {
     inject: BTreeMap<&'static str, VecDeque<Injected>>,
     births: BTreeMap<u32, HerdrHostBirth>,
     parents: BTreeMap<u32, u32>,
+    parent_time: Option<Instant>,
+    now: Option<Instant>,
+    config: Option<PathBuf>,
     unreadable_parent: Option<u32>,
     unknown_parent: Option<u32>,
     caller: Option<String>,
@@ -248,7 +251,10 @@ impl Connection for FakeConnection {
 }
 
 impl Core for FakeCore {
-    fn endpoint(&self) -> Result<PathBuf> {
+    fn endpoint(&self, deadline: Instant) -> Result<PathBuf> {
+        if let Some(config) = &self.0.borrow().config {
+            read_config_socket(config, deadline)?;
+        }
         Ok(PathBuf::from(SOCKET))
     }
     fn connect(&self, socket: &Path, _: Instant) -> Result<Box<dyn Connection + '_>> {
@@ -267,11 +273,21 @@ impl Core for FakeCore {
     fn caller_terminal(&self) -> Option<String> {
         self.0.borrow().caller.clone()
     }
+    fn now(&self) -> Instant {
+        self.0.borrow().now.unwrap_or_else(Instant::now)
+    }
     fn current_pid(&self) -> u32 {
         self.0.borrow().current_pid
     }
     fn parent_pid(&self, pid: u32) -> Result<Parent> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
+        if let Some(now) = state.parent_time {
+            assert!(
+                state.now.is_none(),
+                "ancestry walk continued beyond deadline"
+            );
+            state.now = Some(now);
+        }
         if state.unreadable_parent == Some(pid) {
             bail!("process {pid} is unreadable");
         }
@@ -450,13 +466,13 @@ fn config_socket_reads_only_a_string_setting() {
     assert!(config_socket("socket = ").is_err());
     let directory = tempfile::tempdir().unwrap();
     assert_eq!(
-        read_config_socket(&directory.path().join("missing.toml")).unwrap(),
+        read_config_socket(&directory.path().join("missing.toml"), later()).unwrap(),
         None
     );
     let unreadable = directory.path().join("config.toml");
     fs::create_dir(&unreadable).unwrap();
     assert!(
-        error_text(&read_config_socket(&unreadable).unwrap_err())
+        error_text(&read_config_socket(&unreadable, later()).unwrap_err())
             .contains("does not guess the core's socket")
     );
 }
@@ -469,7 +485,7 @@ fn a_configuration_linked_to_the_null_device_is_empty() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("config.toml");
     std::os::unix::fs::symlink("/dev/null", &config).unwrap();
-    assert_eq!(read_config_socket(&config).unwrap(), None);
+    assert_eq!(read_config_socket(&config, later()).unwrap(), None);
 }
 
 #[test]
@@ -948,8 +964,8 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
     let state = core.0.clone();
     struct Forgetful(FakeCore);
     impl Core for Forgetful {
-        fn endpoint(&self) -> Result<PathBuf> {
-            self.0.endpoint()
+        fn endpoint(&self, deadline: Instant) -> Result<PathBuf> {
+            self.0.endpoint(deadline)
         }
         fn connect(&self, socket: &Path, deadline: Instant) -> Result<Box<dyn Connection + '_>> {
             self.0.connect(socket, deadline)
@@ -1336,6 +1352,82 @@ fn the_launch_host_binds_only_to_its_own_terminal_and_program() {
     assert!(!binding_names_host(&other, Some("t7"), pid));
     let bare = TerminalSession::new(TerminalKind::Herdr, "t7".into());
     assert!(!binding_names_host(&bare, Some("t7"), pid));
+}
+
+#[test]
+fn request_deadline_expiring_during_the_ancestry_walk_stops_it() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": 300, "argv": ["claude"],
+               "created_ms": 1, "labels": {}}),
+    );
+    core.0.borrow_mut().caller = Some("t3".into());
+    // 900 (this process) -> 800 (a tool shell) -> 300 (the terminal's program).
+    core.0.borrow_mut().parents = BTreeMap::from([(900, 800), (800, 300), (300, 200)]);
+    let deadline = later();
+    core.0.borrow_mut().parent_time = Some(deadline);
+    let error = verify_caller(&core, deadline).unwrap_err();
+    assert!(error.to_string().contains("deadline"), "{error:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn request_deadline_fifo_config_without_a_writer_returns() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    let name = std::ffi::CString::new(config.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let path = config.clone();
+    let (done, outcome) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let core = FakeCore::new();
+        core.0.borrow_mut().config = Some(path);
+        let error = verify_caller(&core, Instant::now() + Duration::from_millis(200)).unwrap_err();
+        done.send(error).unwrap();
+    });
+    let refused = outcome.recv_timeout(Duration::from_secs(3));
+    if refused.is_err() {
+        drop(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&config)
+                .unwrap(),
+        );
+    }
+    worker.join().unwrap();
+    let error = refused.expect("FIFO config read waited for a writer");
+    assert!(error.to_string().contains("timed out"), "{error:#}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn request_deadline_connect_to_a_full_listen_queue_returns() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    };
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.path().join("c");
+    let listener = UnixListener::bind(&socket).unwrap();
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let _queued = UnixStream::connect(&socket).unwrap();
+    let (done, outcome) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let error = unix::open(&socket, Instant::now() + Duration::from_millis(200)).err();
+        done.send(error).unwrap();
+    });
+    let refused = outcome.recv_timeout(Duration::from_secs(3));
+    drop(listener);
+    worker.join().unwrap();
+    let error = refused
+        .expect("connect waited past deadline")
+        .expect("queue was full");
+    assert!(error.to_string().contains("timed out"), "{error:#}");
 }
 
 #[test]

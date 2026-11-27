@@ -219,7 +219,9 @@ fn run_reopen_inner(
             detach: request.detach,
             json: request.json,
         })?;
-        let attempt = ResolvedReopen::resolve(request, start.deadline())?.create()?;
+        let attempt = session_start::deadline::during(start.deadline(), || {
+            ResolvedReopen::resolve(request, start.deadline())?.create()
+        })?;
         Ok::<_, anyhow::Error>((start, attempt))
     })();
     match prepared {
@@ -307,6 +309,7 @@ impl ResolvedReopen {
         // checked against its caller here, as in 0.4.49, and refused here when that fails.
         let (surface, caller) = session_start::choose_launch_surface(request.terminal, None)?;
         let source_directory = Reader::session_directory(&request.id)?;
+        session_start::deadline::before("inspecting the reopen source")?;
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not

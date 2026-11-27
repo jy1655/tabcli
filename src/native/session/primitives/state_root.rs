@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::native::session_start::deadline;
+
 use super::durable::{
     fault_point, set_private_directory_permissions, sync_directory, write_json_atomic,
 };
@@ -62,6 +64,7 @@ pub(in crate::native) fn create_state_root(
     for directory in created.iter().rev() {
         // A concurrent creator may win the race; the ancestry walk below covers its
         // entries and this creator's alike.
+        deadline::before("creating state directories")?;
         if let Err(error) = fs::create_dir(directory)
             && !directory.is_dir()
         {
@@ -69,13 +72,19 @@ pub(in crate::native) fn create_state_root(
                 format!("failed to create state directory {}", directory.display())
             });
         }
+        deadline::wrote("state directories were prepared");
     }
+    deadline::before("setting state root permissions")?;
     set_private_directory_permissions(root)?;
+    deadline::wrote("state root permissions were set");
     if state_root_durability_receipt_present(root) {
         return Ok(None);
     }
     fault_point("syncing the state root's ancestry")?;
     if let Err(error) = sync_state_root_ancestry(root, durable_directories) {
+        if error.is::<crate::native::failure_kind::TimedOut>() {
+            return Err(error);
+        }
         return Ok(Some(format!(
             "state root ancestry was not made durable: {error:#}"
         )));
@@ -84,7 +93,9 @@ pub(in crate::native) fn create_state_root(
         schema: 1,
         synced_unix_ms: unix_ms(),
     };
+    deadline::before("writing the state root durability receipt")?;
     write_json_atomic(&root.join(STATE_ROOT_DURABLE_FILE), &receipt)?;
+    deadline::wrote("the state root durability receipt was written");
     Ok(None)
 }
 
@@ -115,6 +126,7 @@ pub(in crate::native) fn sync_state_root_ancestry(
         } else {
             parent
         };
+        deadline::before("syncing state root ancestry")?;
         sync_directory(holder)
             .with_context(|| format!("failed to sync state directory {}", holder.display()))?;
         let holder_is_filesystem_root = parent.as_os_str().is_empty() || parent.parent().is_none();
@@ -211,6 +223,7 @@ pub(in crate::native) fn create_directory(
     durable_directories: &[PathBuf],
 ) -> Result<(PathBuf, String, Option<String>)> {
     let ancestry_error = create_state_root(root, durable_directories)?;
+    deadline::before("creating the Session directory")?;
     let temp = tempfile::Builder::new()
         .prefix("session-")
         .tempdir_in(root)?;
@@ -232,4 +245,65 @@ pub(in crate::native) fn create_directory(
     sync_directory(&directory)
         .with_context(|| format!("failed to sync session directory {}", directory.display()))?;
     Ok((directory, id, ancestry_error))
+}
+
+#[cfg(test)]
+mod request_deadline_tests {
+    use super::*;
+    use crate::native::session_start::deadline;
+
+    #[test]
+    fn request_deadline_state_root_directory_is_absent() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("new");
+        let result = deadline::expire_at("creating state directories", || {
+            create_state_root(&root, &[])
+        });
+        assert!(!root.exists(), "state root was created");
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_deadline_state_root_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let result = deadline::expire_at("setting state root permissions", || {
+            create_state_root(root.path(), &[])
+        });
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn request_deadline_state_root_receipt_is_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let result = deadline::expire_at("writing the state root durability receipt", || {
+            create_state_root(root.path(), &[])
+        });
+        assert!(
+            !state_root_durability_receipt_present(root.path()),
+            "receipt was written"
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn request_deadline_session_directory_is_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let result = deadline::expire_at("creating the Session directory", || {
+            create_directory(root.path(), &[])
+        });
+        assert!(state_root_durability_receipt_present(root.path()));
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "Session directory was created"
+        );
+        assert!(result.is_err());
+    }
 }

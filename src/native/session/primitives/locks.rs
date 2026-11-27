@@ -69,6 +69,23 @@ pub(in crate::native) struct TurnClaimLock {
     _file: File,
 }
 
+impl TurnClaimLock {
+    pub(in crate::native) fn for_reopen(directory: &Path, end: std::time::Instant) -> Result<Self> {
+        use crate::native::session_start::deadline;
+        const STEP: &str = "claiming the reopen source lock";
+        deadline::before(STEP)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(directory.join(TURN_CLAIM_LOCK_FILE))?;
+        deadline::lock(&file, end, STEP)?;
+        deadline::before(STEP)?;
+        set_private_file_permissions(&file)?;
+        Ok(Self { _file: file })
+    }
+}
+
 pub(in crate::native) fn lock_turn_claim(path: &Path) -> Result<TurnClaimLock> {
     let lock_path = path.with_file_name(TURN_CLAIM_LOCK_FILE);
     let file = OpenOptions::new()

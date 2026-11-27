@@ -18,6 +18,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 pub(super) mod admission;
+pub(super) mod deadline;
 mod provider_drift;
 
 pub(super) type ResultExtra = serde_json::Map<String, serde_json::Value>;
@@ -225,7 +226,7 @@ pub(super) struct Resolution<'a> {
 // (`choose_before_probe`), the canonical workspace directory, state root and launch admission,
 // provider executable and version, version-aware surface admission (which decides an
 // automatic Herdr choice that depends on the version, with the caller check's outcome), title,
-// and workspace consent. Nothing is created, so a failure changes nothing.
+// and workspace consent. The consent assessment may update shared records before a Session exists.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
     resolve_with(resolution, |provider| {
         let provider_path = resolve_provider(provider)?;
@@ -261,6 +262,7 @@ pub(super) fn resolve_with(
     // A surface the provider's adapter cannot run on at all on this platform is refused
     // before anything is resolved or probed.
     let _ = choose_before_probe(provider, surface)?;
+    deadline::before("resolving the workspace")?;
     let workspace = requested.canonicalize().with_context(|| {
         format!(
             "{workspace_noun} does not exist or cannot be resolved: {}",
@@ -273,6 +275,7 @@ pub(super) fn resolve_with(
             workspace.display()
         );
     }
+    deadline::before("checking launch admission")?;
     let root = Reader::state_root()
         .and_then(|root| admission::check(&root, &workspace).map(|()| root))
         .map_err(admission_refusal)?;
@@ -306,6 +309,7 @@ pub(super) fn resolve_with(
         default_title.render(provider, workspace_name)
     });
     let title = sanitize_title(&requested_title)?;
+    deadline::before("assessing workspace consent")?;
     let consent = consent::assess(
         &root,
         match consent_path {
@@ -847,9 +851,11 @@ fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
         json: request.json,
     };
     let start = Start::new(options)?;
-    let resolved = resolve_fresh(&request, start.deadline())?;
-    let (prepared, ()) = resolved.create_with(|spec, consent| {
-        create_with_consent(spec, consent).map(|created| (created, ()))
+    let (prepared, ()) = deadline::during(start.deadline(), || {
+        let resolved = resolve_fresh(&request, start.deadline())?;
+        resolved.create_with(|spec, consent| {
+            create_with_consent(spec, consent).map(|created| (created, ()))
+        })
     })?;
     start.run(&prepared, &FreshSource, report)
 }

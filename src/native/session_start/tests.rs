@@ -1779,10 +1779,7 @@ fn resolve_with_refuses_unsupported_herdr_codex_versions_before_session_creation
     assert_no_sessions();
 }
 
-// A caller check that returns only after the request's deadline is followed, as in 0.4.49, by
-// the version probe, which reads the clock before it starts: the request ends there as timed
-// out and nothing is written, the shared workspace-consent store included. Claude's failed
-// check would refuse at once; Codex's outcome waits for its version (off Windows).
+// A caller check that consumes the preparation budget leaves the shared consent store untouched.
 #[test]
 fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
     use crate::native::failure_kind::{FailureKind, classify};
@@ -1868,19 +1865,21 @@ fn a_caller_check_that_ends_after_the_deadline_writes_nothing() {
         providers.push(FirstPartyCli::Codex);
     }
     for provider in providers {
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let caller = check_caller(selection, Some(provider), |_| {
-            std::thread::sleep(Duration::from_millis(200));
-            Ok(())
-        })
-        .unwrap();
+        let caller = check_caller(selection, Some(provider), |_| Ok(())).unwrap();
         let request = ask(provider);
-        let error = resolve(
-            fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
-            deadline,
-        )
+        let deadline = Instant::now();
+        let error = deadline::during(deadline, || {
+            resolve(
+                fresh_resolution(&request, context::resolve(&[]).unwrap(), selection, caller),
+                deadline,
+            )
+        })
         .err()
         .expect("the deadline ends the resolution");
+        assert!(
+            error.to_string().contains("resolving the workspace"),
+            "{error:#}"
+        );
         assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
         assert!(
             !root.join("workspace-consent").exists(),

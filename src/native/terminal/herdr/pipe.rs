@@ -55,11 +55,10 @@ const BUSY_WAIT: Duration = Duration::from_millis(100);
 pub(in crate::native::terminal) struct Installed;
 
 impl Core for Installed {
-    fn endpoint(&self) -> Result<PathBuf> {
-        resolve_pipe(
-            &WindowsEndpointInputs::from_env(),
-            &super::read_config_socket,
-        )
+    fn endpoint(&self, deadline: Instant) -> Result<PathBuf> {
+        resolve_pipe(&WindowsEndpointInputs::from_env(), &|path| {
+            super::read_config_socket(path, deadline)
+        })
     }
 
     fn connect(&self, socket: &Path, deadline: Instant) -> Result<Box<dyn Connection + '_>> {
@@ -192,6 +191,7 @@ pub(super) fn open(pipe: &Path, deadline: Instant) -> Result<Framed<Pipe>> {
     local_pipe_name(pipe)?;
     let name = wide(pipe);
     let handle = loop {
+        super::remaining(deadline).map_err(|_| anyhow::anyhow!("Herdr connection timed out"))?;
         // Identification only: whoever serves this name cannot act as this user.
         let raw = unsafe {
             CreateFileW(

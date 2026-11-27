@@ -192,12 +192,16 @@ pub(super) fn with_record<T>(
     if fs::symlink_metadata(parent).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
         bail!("invalid workspace consent directory");
     }
+    use crate::native::session_start::deadline;
+    deadline::before("preparing the workspace consent directory")?;
     fs::create_dir_all(parent)?;
     RecordStore::at(parent).set_directory_private()?;
+    deadline::wrote("the workspace consent directory was prepared");
     let lock_path = path.with_extension("lock");
     if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
         bail!("invalid workspace consent lock");
     }
+    deadline::before("opening the workspace consent lock")?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -205,7 +209,11 @@ pub(super) fn with_record<T>(
         .write(true)
         .open(lock_path)?;
     RecordStore::set_file_private(&lock)?;
-    lock.lock()?;
+    deadline::wrote("the workspace consent lock file was prepared");
+    match deadline::current() {
+        Some(end) => deadline::lock(&lock, end, "locking workspace consent")?,
+        None => lock.lock()?,
+    }
     let record = read_store(&path)?
         .map(|s| serde_json::from_str(&s))
         .transpose()?;
@@ -275,7 +283,9 @@ fn assess_identified(
         Mode::Record | Mode::Inherit => with_record(root, &identity.path, |path, existing| {
             let (assessment, write) = decide(root, existing, assessment, env, mode)?;
             if let Some(record) = write {
+                crate::native::session_start::deadline::before("writing workspace consent")?;
                 RecordStore::at(path).write_json(&record)?;
+                crate::native::session_start::deadline::wrote("workspace consent was recorded");
             }
             Ok(assessment)
         }),
@@ -422,7 +432,13 @@ fn inherited(
     let strict = mode == Mode::Recheck;
     // At a recheck, provider and Git evidence that cannot be read is typed as such, and the main
     // working tree's own assessment passes its errors on as they are.
-    let unread = |error: anyhow::Error| if strict { Err(error) } else { Ok(None) };
+    let unread = |error: anyhow::Error| {
+        if strict || error.is::<crate::native::failure_kind::TimedOut>() {
+            Err(error)
+        } else {
+            Ok(None)
+        }
+    };
     let evidence = |error: anyhow::Error, what: &'static str| {
         if strict {
             Err(error.context(EvidenceUnreadable(what)))
@@ -1262,4 +1278,22 @@ mod tests {
             "verified"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn request_deadline_consent_record_is_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let canonical = workspace.path().canonicalize().unwrap();
+    let env = Environment::at_home(root.path());
+    let result =
+        crate::native::session_start::deadline::expire_at("writing workspace consent", || {
+            assess_with(root.path(), &canonical, &env)
+        });
+    assert!(
+        !record_path(root.path(), &canonical).exists(),
+        "consent record was written"
+    );
+    assert!(result.is_err());
 }
