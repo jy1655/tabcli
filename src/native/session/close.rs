@@ -15,6 +15,8 @@ use crate::native::session::turn::{
 };
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::native::terminal::close_authority::owner_exit::core_retains_finished;
 pub(in crate::native) use crate::native::terminal::close_authority::owner_exit::repair_owner_is_live;
 use crate::native::terminal::close_authority::owner_exit::{RepairSurface, RepairSurfaces};
 use crate::native::terminal::ownership::NativeSessionOwner;
@@ -150,7 +152,7 @@ struct TerminalCloseIntent {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_teardown_intent"
     )]
-    teardown: Option<TerminalTeardownIntent>,
+    teardown: Option<TeardownGroup>,
 }
 
 // Absence is the legacy format. A present field must deserialize as a complete
@@ -158,16 +160,23 @@ struct TerminalCloseIntent {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn deserialize_teardown_intent<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<TerminalTeardownIntent>, D::Error>
+) -> std::result::Result<Option<TeardownGroup>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    TerminalTeardownIntent::deserialize(deserializer).map(Some)
+    TeardownGroup::deserialize(deserializer).map(Some)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
+struct TeardownGroup {
+    process_group: u32,
+    reason: String,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) struct TerminalTeardownIntent {
+    owner: NativeSessionOwner,
     pub process_group: u32,
     pub reason: String,
 }
@@ -204,16 +213,25 @@ pub(in crate::native) fn record_terminal_teardown_intent(
             managed_session_id: id.to_owned(),
             terminal: surface.clone(),
             owner: owner.clone(),
-            teardown: Some(TerminalTeardownIntent {
+            teardown: Some(TeardownGroup {
                 process_group,
                 reason: reason.to_owned(),
             }),
         })
 }
 
-// Teardown is independent of surface retention policy, including iTerm2. A record
-// claiming this intent kind must validate; it may never fall through to dead-owner
-// absence based on the surface alone.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl TerminalTeardownIntent {
+    pub(in crate::native) fn verify_owner(&self, observed: &NativeSessionOwner) -> Result<()> {
+        if serde_json::to_value(observed)? != serde_json::to_value(&self.owner)? {
+            bail!("terminal teardown intent does not match the attested owner and exact handle");
+        }
+        Ok(())
+    }
+}
+
+// Validate the saved handle and teardown against the owner named in the intent.
+// Herdr compares that owner with the one observation that selects live-owner close.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_teardown_intent(
     reader: &Reader,
@@ -230,14 +248,18 @@ pub(in crate::native) fn terminal_teardown_intent(
         return Ok(None);
     }
     let intent: TerminalCloseIntent = serde_json::from_value(value)?;
-    let owner: NativeSessionOwner = reader.owner()?;
+    let current_owner = if core_retains_finished(surface.kind) {
+        None
+    } else {
+        Some(reader.owner()?)
+    };
+    let owner = intent.owner;
     let teardown = intent.teardown.context("missing teardown intent")?;
     // A complete control record also needs both process groups, which the clauses comparing
     // them with the intent's group already require.
     if intent.terminal != *surface
         || surface.managed_session_id.as_deref() != Some(&intent.managed_session_id)
         || owner.binding(&intent.managed_session_id) != OwnerBinding::Bound
-        || serde_json::to_value(&owner)? != serde_json::to_value(&intent.owner)?
         || owner.process_group != Some(teardown.process_group)
         || owner.pid != teardown.process_group
         || teardown.process_group == 0
@@ -249,7 +271,15 @@ pub(in crate::native) fn terminal_teardown_intent(
     {
         bail!("terminal teardown intent does not match the attested owner and exact handle");
     }
-    Ok(Some(teardown))
+    let replay = TerminalTeardownIntent {
+        owner,
+        process_group: teardown.process_group,
+        reason: teardown.reason,
+    };
+    if let Some(current_owner) = current_owner {
+        replay.verify_owner(&current_owner)?;
+    }
+    Ok(Some(replay))
 }
 
 // An explicit close can end the owner before the window is gone, so a

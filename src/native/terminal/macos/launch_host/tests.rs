@@ -2,6 +2,7 @@ use super::*;
 use crate::native::clock::FakeClock;
 use crate::native::session::CoreRecord;
 use crate::native::session::primitives::unix_ms;
+use crate::native::session::tests::FIXED_UNIX_MS;
 use crate::native::terminal::macos::{iterm2, wezterm};
 use std::{
     cell::{Cell, RefCell},
@@ -709,11 +710,37 @@ const IDENTITY: host::HostIdentity = host::HostIdentity {
     start_microseconds: 5,
 };
 
-// An iTerm2 host admitted for a pending launch, preparing its environment.
-fn admitted(timeout: Duration) -> (tempfile::TempDir, Store, String) {
-    let (directory, store, token) =
-        launch::test_support::pending_launch("session-", &std::env::temp_dir(), timeout);
-    host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
+const WALL: u128 = 1_000_000;
+
+struct FixedWall(Option<u128>);
+
+impl Drop for FixedWall {
+    fn drop(&mut self) {
+        FIXED_UNIX_MS.set(self.0);
+    }
+}
+
+// The ordering tests decide which fact fails. Only the test advances the receipt clock.
+fn fixed_pending_launch() -> (FixedWall, tempfile::TempDir, Store, String) {
+    let wall = FixedWall(FIXED_UNIX_MS.replace(Some(WALL)));
+    let (directory, store, token) = launch::test_support::pending_launch(
+        "session-",
+        &std::env::temp_dir(),
+        Duration::from_secs(10),
+    );
+    let mut receipt = launch::read(&store).unwrap().unwrap();
+    receipt.deadline_unix_ms = WALL + 10_000;
+    store
+        .record(CoreRecord::Launch)
+        .write_json(&receipt)
+        .unwrap();
+    (wall, directory, store, token)
+}
+
+// A host admitted for a pending launch, preparing its environment.
+fn admitted(kind: TerminalKind) -> (FixedWall, tempfile::TempDir, Store, String) {
+    let (wall, directory, store, token) = fixed_pending_launch();
+    host::initialize(&store, &token, kind).unwrap();
     host::admit(&store, &token, IDENTITY).unwrap();
     host::advance(
         &store,
@@ -726,7 +753,7 @@ fn admitted(timeout: Duration) -> (tempfile::TempDir, Store, String) {
         },
     )
     .unwrap();
-    (directory, store, token)
+    (wall, directory, store, token)
 }
 
 fn session_id(store: &Store) -> &str {
@@ -796,7 +823,7 @@ fn launch_log(store: &Store) -> String {
 
 #[test]
 fn capture_failure_is_recorded_while_binding_is_absent() {
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted(TerminalKind::Iterm2);
     let (error, trace) = refuse(
         &store,
         &token,
@@ -837,7 +864,7 @@ fn capture_failure_is_recorded_while_binding_is_absent() {
 // A capture that timed out: its failure record's budget is the one `status.error` names.
 #[test]
 fn a_capture_timeout_records_the_budget_that_status_error_names() {
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted(TerminalKind::Iterm2);
     let (error, trace) = refuse(
         &store,
         &token,
@@ -865,7 +892,7 @@ fn a_capture_timeout_records_the_budget_that_status_error_names() {
 
 #[test]
 fn binding_failure_is_recorded_while_capture_is_still_running() {
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted(TerminalKind::Iterm2);
     bind(&store, TerminalKind::WezTerm);
     // The capture never answers: the refusal comes at the first observation.
     let (error, trace) = refuse(&store, &token, vec![]);
@@ -894,15 +921,7 @@ fn binding_failure_is_recorded_while_capture_is_still_running() {
 
 #[test]
 fn binding_timeout_is_retained_after_receipt_expiry() {
-    struct Wall(Option<u128>);
-    impl Drop for Wall {
-        fn drop(&mut self) {
-            crate::native::session::tests::FIXED_UNIX_MS.set(self.0);
-        }
-    }
-    const WALL: u128 = 1_000_000;
-    let _wall = Wall(crate::native::session::tests::FIXED_UNIX_MS.replace(Some(WALL)));
-    let (_directory, store, token) = admitted(Duration::from_secs(10));
+    let (_wall, _directory, store, token) = admitted(TerminalKind::Iterm2);
     // A receipt that expires 50 ms after the host starts, on the fixed wall clock.
     let mut receipt = launch::read(&store).unwrap().unwrap();
     receipt.deadline_unix_ms = WALL + 50;
@@ -959,6 +978,46 @@ fn binding_timeout_is_retained_after_receipt_expiry() {
     );
 }
 
+#[test]
+fn receipt_expiry_during_capture_reports_a_deadline_with_uptime_left() {
+    let (_wall, _directory, store, token) = admitted(TerminalKind::Herdr);
+    let mut clock = FakeClock::new(Instant::now());
+    let start = clock.now();
+    let receipt = launch::read(&store).unwrap().unwrap();
+    let deadline = launch::saturating_deadline(start, receipt.remaining(Duration::ZERO));
+    assert!(start < deadline);
+    let mut binding = LockedBinding {
+        store: &store,
+        token: &token,
+        identity: IDENTITY,
+        session_id: session_id(&store),
+        kind: TerminalKind::Herdr,
+    };
+    assert_eq!(binding.observe(), Binding::Absent);
+
+    // Resume the same host and Session while capture still has no answer.
+    FIXED_UNIX_MS.set(Some(WALL + 598_000));
+    let Step::Refuse(refusal) = decide(clock.now(), deadline, false, || binding.observe()) else {
+        panic!("the expired receipt must refuse handoff");
+    };
+    let recorder = Recorder {
+        store: &store,
+        token: &token,
+        kind: TerminalKind::Herdr,
+        identity: Some(IDENTITY),
+        start,
+    };
+    let _error = recorder.refuse(refusal, clock.now());
+    assert_eq!(host_record(&store).elapsed_ms, 0);
+    assert!(launch::repair(&store).unwrap());
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(
+            "terminal launch host failed (binding_timeout); last recorded launch stage: environment_preparing"
+        )
+    );
+}
+
 // The surface observation port's production adapter, on a real Session directory. A binding
 // that names this host's surface depends on the terminal's environment; the PTY regression
 // tests and the surface identity tests cover it.
@@ -974,11 +1033,11 @@ fn the_locked_binding_observation_needs_an_eligible_host_and_a_readable_handle()
         ("absent", IDENTITY, Binding::Absent),
         ("another terminal", IDENTITY, Binding::Other),
         ("damaged handle", IDENTITY, Binding::Unavailable),
-        ("expired receipt", IDENTITY, Binding::Unavailable),
+        ("expired receipt", IDENTITY, Binding::Expired),
         ("failed host", IDENTITY, Binding::Unavailable),
         ("another incarnation", other, Binding::Unavailable),
     ] {
-        let (_directory, store, token) = admitted(Duration::from_secs(10));
+        let (_wall, _directory, store, token) = admitted(TerminalKind::Iterm2);
         match case {
             "another terminal" => bind(&store, TerminalKind::WezTerm),
             "damaged handle" => fs::write(store.record(CoreRecord::Terminal).path(), b"{").unwrap(),
@@ -1100,12 +1159,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
     ];
     let mut failures = Vec::new();
     for (case, changes, caller, expect) in cases {
-        let root = tempfile::tempdir().unwrap();
-        let directory =
-            launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10))
-                .0;
-        let store = Store::open_unchecked(directory.path());
-        let token = launch::read(&store).unwrap().unwrap().claim_token;
+        let (_wall, _directory, store, token) = fixed_pending_launch();
         host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         host::admit(&store, &token, identity).unwrap();
         apply(&store, &changes);
@@ -1119,12 +1173,7 @@ fn eligibility_reports_the_first_failing_fact_then_the_host_record() {
     }
     // A host record that does not name this admitted, unfailed incarnation.
     for case in ["unadmitted", "failed", "damaged"] {
-        let root = tempfile::tempdir().unwrap();
-        let directory =
-            launch::test_support::pending_launch("session-", root.path(), Duration::from_secs(10))
-                .0;
-        let store = Store::open_unchecked(directory.path());
-        let token = launch::read(&store).unwrap().unwrap().claim_token;
+        let (_wall, _directory, store, token) = fixed_pending_launch();
         host::initialize(&store, &token, TerminalKind::Iterm2).unwrap();
         match case {
             "unadmitted" => {}

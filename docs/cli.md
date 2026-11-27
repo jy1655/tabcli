@@ -1793,10 +1793,15 @@ with outcome `Missing`, consumes the handle, and retains the reason in `inspect`
 
 If disappearance cannot be confirmed, close fails and keeps the intent and handle. Check the
 error and the session's processes before repeating `close-session SESSION --explicit`. A
-retry with a live attested owner obtains authority again. With a dead owner, it sends no signal
-and completes only when the recorded group is proven gone. EPERM, including for a group
-containing only zombies, is not proof of disappearance. Observation and signal are not one
-atomic operation. The group's disappearance does not prove that processes which left it ended.
+retry with a matching, attested live owner requires fresh close authority. For Herdr, a
+valid intent without a verified live owner permits explicit close on the creation record.
+If the bound owner has exited, TAB settles an absent terminal, removes a finished one, or
+refuses a running one without probing or signalling the saved group. For Terminal.app,
+Ghostty, Warp, WezTerm and iTerm2, replay requires the matching owner record. If that
+owner has exited, TAB sends no signal and completes only when the recorded group is proven
+gone. EPERM, including for a group containing only zombies, is not proof of disappearance.
+Observation and signal are not one atomic operation. The group's disappearance does not
+prove that processes which left it ended.
 
 While a session is `launching` with no surface handle and a pending launch deadline still in the
 future, close refuses without changing the session or its claim:

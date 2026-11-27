@@ -411,22 +411,22 @@ pub(in crate::native) fn decide(
         let has_teardown_intent = teardown_intent.is_some();
         #[cfg(windows)]
         let has_teardown_intent = false;
-        // A kind whose core keeps its terminals (Herdr) gathers its evidence in one place, for
-        // every owner record, the failed start and the record that is not there included. It
-        // leaves only a live, attested owner of this session to the rules below. A saved
-        // teardown intent of an interrupted owner teardown (macOS and Linux) is read, validated
-        // and replayed exactly as 0.4.49 does it, before and instead of this choice.
-        let core_kept_owner =
-            if owner_exit::core_retains_finished(session.kind) && !has_teardown_intent {
-                match owner_exit::core_kept(observation, expected_session_id, session)? {
-                    owner_exit::CoreKept::Created(evidence) => {
-                        return Ok(TerminalCloseAuthority::CreatedSurface(evidence));
-                    }
-                    owner_exit::CoreKept::LiveOwner(observed) => Some(*observed),
+        let core_kept_owner = if owner_exit::core_retains_finished(session.kind) {
+            match owner_exit::core_kept(observation, expected_session_id, session)? {
+                owner_exit::CoreKept::Created(evidence) => {
+                    return Ok(TerminalCloseAuthority::CreatedSurface(evidence));
                 }
-            } else {
-                None
-            };
+                owner_exit::CoreKept::LiveOwner(observed) => {
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    if let Some(intent) = &teardown_intent {
+                        intent.verify_owner(&observed.0)?;
+                    }
+                    Some(*observed)
+                }
+            }
+        } else {
+            None
+        };
         if core_kept_owner.is_some() || observation.owner_present()? {
             // An explicit close may reclaim the exact startup surface after its wrapper
             // died, including an uncertain spawn. This is not automatic failure cleanup:
@@ -642,9 +642,7 @@ pub(in crate::native) fn close_windows_owned_surface_with(
             )
             .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated))
         }
-        // A terminal its core keeps is never closed on the surface alone: as on macOS and Linux,
-        // the close the decision left to the surface alone acts on its creation record, with
-        // that decision's result (no Windows decision reaches it for Herdr today).
+        // Retained adapter mapping. No current decision selects SurfaceOnly for Herdr.
         TerminalCloseAuthority::SurfaceOnly if owner_exit::core_retains_finished(session.kind) => {
             windows_dispatch::close_created_surface(
                 adapters,

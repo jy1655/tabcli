@@ -210,7 +210,15 @@ fn serve(mut stream: impl Read + Write, runs: &AtomicUsize, terminals: &Mutex<Ve
 #[cfg(unix)]
 impl ScriptedHerdrCore {
     pub(in crate::native) fn start() -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let private = std::fs::Permissions::from_mode(0o700);
+        let directory = tempfile::Builder::new()
+            .permissions(private.clone())
+            .tempdir()
+            .unwrap();
+        // Restore owner access if the umask suppressed it at creation.
+        std::fs::set_permissions(directory.path(), private).unwrap();
         let endpoint = directory.path().join("core.sock");
         let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -342,6 +350,22 @@ impl Drop for ScriptedHerdrCore {
             let _ = server.join();
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_scripted_socket_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let core = ScriptedHerdrCore::start();
+    let permissions = core
+        .endpoint
+        .parent()
+        .unwrap()
+        .metadata()
+        .unwrap()
+        .permissions();
+    assert_eq!(permissions.mode() & 0o777, 0o700);
 }
 
 // A call that panics leaves the variables as they were for the tests that follow.
