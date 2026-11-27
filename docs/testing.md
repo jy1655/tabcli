@@ -254,7 +254,7 @@ minutes for the minimum Rust job, 30 for Linux and macOS, and 60 for Windows and
 test steps, one of which also runs Windows tests for historical tags.
 The macOS stable job installs Ghostty and iTerm2 for the AppleScript compile test.
 The release-candidate job packages the executable and license and includes third-party notices
-for `tabcli`. It checks the archive checksum, extracts the archive and checks the binary's version.
+for `tabcli`. It checks the archive checksum, extracts the archive and checks the extracted binary's version.
 This is not an authenticated live test.
 Linux CI runs portable and Linux surface tests, including a real-tmux test that is skipped
 when tmux is absent. These checks do not authenticate provider CLIs. The separate

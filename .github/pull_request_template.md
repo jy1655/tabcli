@@ -16,7 +16,7 @@ For each item, state what ran and the result, or why it was not run. See
 - [ ] `git diff --check`
 - [ ] Linux cross-target Clippy below
 - [ ] Windows cross-target Clippy below
-- [ ] FreeBSD cross-target check below (Rust 1.97.1)
+- [ ] FreeBSD cross-target check below (CI runs it on Rust 1.97.1)
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
