@@ -4218,23 +4218,17 @@ fn native_close_claim_sync_failure_leaves_a_resumable_claim() {
 fn native_close_dispatches_a_replacement_only_on_retry() {
     use crate::native::session::primitives::with_step_at;
     let (_directory, store) = deadline_fixture();
-    let replacement = terminal::TerminalSession::new(
-        if cfg!(windows) {
-            terminal::TerminalKind::Tmux
-        } else {
-            terminal::TerminalKind::WindowsConsole
-        },
-        "replacement".into(),
-    )
-    .with_binding(Some(
-        store
-            .directory()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .into(),
-    ));
+    let replacement =
+        terminal::TerminalSession::new(terminal::TerminalKind::Herdr, "replacement".into())
+            .with_binding(Some(
+                store
+                    .directory()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            ));
     let path = store.record(CoreRecord::Terminal).path().to_owned();
     let mut dispatched = Vec::new();
     let mut run = || {

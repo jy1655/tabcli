@@ -250,11 +250,12 @@ fn a_snapshot_without_the_lifecycle_lock_is_unknown() {
     assert!(!fixture.directory.join(TURN_CLAIM_LOCK_FILE).exists());
 }
 
-/// The terminal kind this platform supports. Linux supports none, so a handle of this kind
-/// is judged unsupported there.
+/// A native terminal kind for the supported platform's fixtures.
 fn supported_kind() -> terminal::TerminalKind {
     if cfg!(windows) {
         terminal::TerminalKind::WindowsConsole
+    } else if cfg!(target_os = "linux") {
+        terminal::TerminalKind::Tmux
     } else {
         terminal::TerminalKind::AppleTerminal
     }
@@ -334,8 +335,7 @@ fn render(directory: &Path, adjust: impl FnOnce(&mut observation::Observation)) 
     value["capabilities"].clone()
 }
 
-/// For rows past the surface gate. The terminals a platform supports differ (Linux supports
-/// none), so these rows replace that one judgment with a bound, supported handle, as
+/// For rows past the surface gate. The terminals a platform supports differ, so these rows replace that one judgment with a bound, supported handle, as
 /// inspect's own tests replace judgments; every other gate, the owner included, is judged
 /// from the records by the production observers.
 fn observe_past_surface(directory: &Path) -> Value {
@@ -489,9 +489,7 @@ fn tell_record_gates_follow_the_actions_order_and_report_its_own_text() {
 fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated() {
     let fixture = ready("pi");
     let directory = &fixture.directory;
-    // A handle that is not this session's is unbound on every OS, whether or not this OS
-    // runs its kind (on Linux `supported_kind` is Terminal.app); only a bound handle of a
-    // kind this OS does not run is unsupported.
+    // Binding is checked before platform support.
     let unbound = "surface_unbound";
     let other_platform = if cfg!(windows) {
         terminal::TerminalKind::AppleTerminal
@@ -500,6 +498,8 @@ fn the_surface_gate_judges_the_recorded_handle_and_leaves_the_probe_unevaluated(
     };
     for (kind, session, reason) in [
         (other_platform, Some(SESSION), "surface_unsupported"),
+        (other_platform, Some("session-other"), unbound),
+        (other_platform, None, unbound),
         (supported_kind(), Some("session-other"), unbound),
         (supported_kind(), None, unbound),
     ] {

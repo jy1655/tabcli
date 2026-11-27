@@ -221,8 +221,9 @@ tabcli sessions
 tabcli close-session session-example --explicit
 ```
 
-Replace `session-example` with an id from the list. Close checks ownership and ends that session's
-surface; it retains the records. If close refuses because ownership cannot be established,
+Replace `session-example` with an id from the list. Close verifies authority before acting
+on a native surface. It settles an eligible copy from its records and retains the session history
+in both cases. If close refuses because ownership cannot be established,
 inspect the session and surface before removing any records. The public `sessions` command also
 repairs unfinished lifecycle changes and dead owners; it is not a read-only query.
 

@@ -799,6 +799,21 @@ fn host_record_pending(reader: &Reader, receipt: &Record) -> bool {
     }
 }
 
+/// Whether a launching copy's records support a running refusal before a retry can repair it.
+pub(super) fn records_leave_launch_pending(
+    reader: &Reader,
+    status: &SessionStatus,
+) -> Result<bool> {
+    let Some(receipt) = read(reader)? else {
+        return Ok(true);
+    };
+    Ok(confirmed(reader, &receipt, status)
+        || turn::current_claim_token(reader)?.as_deref() != Some(receipt.claim_token.as_str())
+        || (unix_ms() < receipt.deadline_unix_ms
+            && !matches!(host::observe(reader, Some(&receipt)),
+                host::HostObservation::Recorded(record) if record.failure.is_some())))
+}
+
 fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
     record.phase == Phase::Spawned
         || (record.phase == Phase::Spawning
@@ -879,12 +894,12 @@ fn deadline_reason(reader: &Reader, receipt: Option<&Record>) -> String {
 /// Called before old dead-owner repair. A new launch with an uncertain spawn must not
 /// be silently closed/released by the legacy owner-only repair path.
 pub(in crate::native) fn repair(store: &Store) -> Result<bool> {
-    repair_with_owner(store, super::owner::attest_recorded_owner)
+    repair_with_owner(store, attest_launch_owner)
 }
 
 fn repair_with_owner(
     store: &Store,
-    observe: impl FnOnce(&Reader) -> Result<Option<super::owner::OwnerAttestation>>,
+    observe: impl FnOnce(super::owner::OwnerRecord) -> Result<Option<super::owner::OwnerAttestation>>,
 ) -> Result<bool> {
     let Some(record) = read(store)? else {
         return Ok(false);
@@ -896,17 +911,49 @@ fn repair_with_owner(
     let Some(_lock) = store.try_lock()? else {
         return Ok(true);
     };
-    repair_locked_with_owner(store, || store.status(), observe)
+    repair_locked_with_owner(
+        store,
+        || store.status(),
+        || {
+            let owner = super::owner::observe(store);
+            if terminal::foreign::SurfaceRecords::read(store)
+                .evidence(store, &owner)
+                .is_some()
+            {
+                return Ok(None);
+            }
+            observe(owner)
+        },
+    )
 }
 
-pub(super) fn repair_locked(store: &Store, status: Result<SessionStatus>) -> Result<bool> {
-    repair_locked_with_owner(store, || status, super::owner::attest_recorded_owner)
+fn attest_launch_owner(
+    owner: super::owner::OwnerRecord,
+) -> Result<Option<super::owner::OwnerAttestation>> {
+    Ok(owner
+        .decoded()?
+        .map(|record| super::owner::attest_owner(&record.owner)))
+}
+
+pub(super) fn repair_locked_records_only(
+    store: &Store,
+    status: Result<SessionStatus>,
+) -> Result<bool> {
+    repair_locked_with_owner(store, || status, || Ok(None))
+}
+
+pub(super) fn repair_locked(
+    store: &Store,
+    status: Result<SessionStatus>,
+    owner: super::owner::OwnerRecord,
+) -> Result<bool> {
+    repair_locked_with_owner(store, || status, || attest_launch_owner(owner))
 }
 
 fn repair_locked_with_owner(
     store: &Store,
     status: impl FnOnce() -> Result<SessionStatus>,
-    observe: impl FnOnce(&Reader) -> Result<Option<super::owner::OwnerAttestation>>,
+    observe: impl FnOnce() -> Result<Option<super::owner::OwnerAttestation>>,
 ) -> Result<bool> {
     let Some(record) = read(store)? else {
         return Ok(false);
@@ -927,7 +974,7 @@ fn repair_locked_with_owner(
     if status.state == SessionState::Launching {
         if unix_ms() >= record.deadline_unix_ms {
             fail_locked(store, &record, &deadline_reason(store, Some(&record)))?;
-        } else if let Some(owner) = observe(store)? {
+        } else if let Some(owner) = observe()? {
             use crate::native::process_identity::ProcessObservation;
             match owner.process {
                 ProcessObservation::Gone(_) => fail_locked(

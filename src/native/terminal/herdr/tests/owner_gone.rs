@@ -1,4 +1,4 @@
-//! A Herdr terminal whose native-session owner is gone (os-parity, the owner's decisions of
+//! A native Herdr terminal whose owner is gone (os-parity, the owner's decisions of
 //! 2026-11-26): on every OS, Repair leaves it for an explicit close, and the explicit close
 //! proves it by its own creation record, whatever the owner record says. That close removes a
 //! finished terminal and settles an absent one, and never ends a running one: it refuses, and
@@ -1619,24 +1619,7 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
             |handle| handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(u32::MAX),
             PID,
         ),
-        (
-            "another platform's host birth",
-            |handle| {
-                let core = handle
-                    .get_mut("herdr_core")
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap();
-                core.retain(|key, _| {
-                    !matches!(
-                        key.as_str(),
-                        "host_start_seconds" | "host_start_microseconds" | "linux_birth"
-                    )
-                });
-                core.insert("host_creation_time".into(), json!(1));
-            },
-            BIRTH,
-        ),
+        ("another platform's host birth", another_host_birth, BIRTH),
     ]);
     #[cfg(target_os = "macos")]
     refused.push((
@@ -1659,16 +1642,7 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
     refused.extend([
         (
             "another platform's host birth",
-            (|handle| {
-                let core = handle
-                    .get_mut("herdr_core")
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap();
-                core.remove("host_creation_time");
-                core.insert("host_start_seconds".into(), json!(1_800_000_000));
-                core.insert("host_start_microseconds".into(), json!(1));
-            }) as Damage,
+            another_host_birth as Damage,
             BIRTH,
         ),
         (
@@ -1686,6 +1660,9 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
             .record(CoreRecord::Terminal)
             .write_json(&value)
             .unwrap();
+        if label == "another platform's host birth" {
+            fixture.claim();
+        }
         fixture.remove();
         let refused = fixture
             .close(exited, false)
@@ -2824,4 +2801,68 @@ fn a_refusal_keeps_why_no_live_owner_was_verified() {
         "{text}"
     );
     assert_eq!(fixture.mutations(), (0, 0));
+}
+
+fn another_host_birth(handle: &mut serde_json::Map<String, Value>) {
+    let core = handle["herdr_core"].as_object_mut().unwrap();
+    core.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "host_start_seconds" | "host_start_microseconds" | "linux_birth" | "host_creation_time"
+        )
+    });
+    if cfg!(windows) {
+        core.insert("host_start_seconds".into(), json!(1_800_000_000));
+        core.insert("host_start_microseconds".into(), json!(1));
+    } else {
+        core.insert("host_creation_time".into(), json!(1));
+    }
+}
+
+#[test]
+fn a_ready_copy_with_a_foreign_herdr_birth_refuses_close_without_a_core_call() {
+    let fixture = Fixture::new("ready", &complete_owner());
+    let store = fixture.store();
+    let active = store.record(CoreRecord::Terminal);
+    let mut handle = serde_json::to_value(store.terminal().unwrap()).unwrap();
+    another_host_birth(handle.as_object_mut().unwrap());
+    active.write_json(&handle).unwrap();
+    let before = active.bytes().unwrap().unwrap();
+    let origin = if cfg!(windows) { "macOS" } else { "Windows" };
+    let here = crate::native::terminal::OsTerminals::CURRENT.unwrap().os;
+    let error = fixture.close(exited, false).unwrap_err();
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::Unsupported)
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "This session was recorded on {origin} and cannot be closed on {here} while its records leave it running."
+        )
+    );
+    fixture.assert_retained("active copy", SessionState::Ready);
+    assert_eq!(active.bytes().unwrap().unwrap(), before);
+    assert!(fixture.core.methods().is_empty());
+    assert!(fixture.console.methods().is_empty());
+}
+
+#[test]
+fn a_claimed_foreign_herdr_birth_is_evidence_only_after_restore() {
+    let fixture = Fixture::new("failed", &complete_owner());
+    let store = fixture.store();
+    let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
+    another_host_birth(value.as_object_mut().unwrap());
+    store
+        .record(CoreRecord::Terminal)
+        .write_json(&value)
+        .unwrap();
+    fixture.claim();
+    assert!(fixture.close(exited, false).is_err());
+    fixture.assert_retained("restored", SessionState::Failed);
+    assert!(fixture.core.methods().is_empty());
+    assert_eq!(fixture.close(exited, false).unwrap(), CloseOutcome::Missing);
+    assert!(fixture.core.methods().is_empty());
+    assert!(fixture.console.methods().is_empty());
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
 }

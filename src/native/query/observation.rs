@@ -61,6 +61,11 @@ pub(in crate::native) struct SessionEvidence {
     /// is its one reader. None when it was not read.
     pub(in crate::native) close_tombstone: Option<Result<Option<SessionStatus>>>,
     pub(in crate::native) surface: SurfaceRecord,
+    // Repair predicts from the active slot even when the displayed record is
+    // the claim or marker. Preserve its stated kind and the strict marker projection.
+    session: String,
+    active: Option<(terminal::TerminalSession, Option<terminal::TerminalKind>)>,
+    completed_kind: Option<terminal::TerminalKind>,
     /// Made on the first request and kept for this Observation (D21).
     pub(in crate::native) owner_judgment: OnceCell<OwnerJudgment>,
     /// Judged on the first request and kept for this Observation (D21).
@@ -77,11 +82,26 @@ impl SurfaceRecord {
     /// The surface record in its precedence: the close tombstone, then a claimed close
     /// handle, then the active handle. Reads only; the first record present decides.
     pub(in crate::native) fn read(reader: &Reader) -> Self {
-        match reader
-            .record(CoreRecord::TerminalClosed)
-            .optional_json_with(session::record::terminal_tombstone_value)
-        {
-            Ok(Some(value)) => Self::Closed(Ok(value)),
+        Self::from_reads(
+            reader,
+            reader
+                .record(CoreRecord::TerminalClosed)
+                .optional_json_with(session::record::terminal_tombstone_value),
+            || {
+                reader
+                    .record(CoreRecord::Terminal)
+                    .optional_json_with(session::record::terminal)
+            },
+        )
+    }
+
+    fn from_reads(
+        reader: &Reader,
+        marker: Result<Option<Value>>,
+        active: impl FnOnce() -> Result<Option<terminal::TerminalSession>>,
+    ) -> Self {
+        match marker {
+            Ok(Some(marker)) => Self::Closed(Ok(marker)),
             Err(error) => Self::Closed(Err(error)),
             Ok(None) => match reader
                 .record(CoreRecord::TerminalClosing)
@@ -89,11 +109,7 @@ impl SurfaceRecord {
             {
                 Ok(Some(value)) => Self::Closing(Ok(value)),
                 Err(error) => Self::Closing(Err(error)),
-                Ok(None) => Self::Active(
-                    reader
-                        .record(CoreRecord::Terminal)
-                        .optional_json_with(session::record::terminal),
-                ),
+                Ok(None) => Self::Active(active()),
             },
         }
     }
@@ -106,10 +122,25 @@ pub(in crate::native) type SurfaceProbe<'a> =
 impl SessionEvidence {
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
         let owner = session::owner::observe(reader);
-        let surface = SurfaceRecord::read(reader);
+        let records = terminal::foreign::SurfaceRecords::read(reader);
+        let active = records
+            .active
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .cloned();
+        let completed_kind = records.completed_kind();
+        let surface = SurfaceRecord::from_reads(
+            reader,
+            records.marker.map(|m| m.map(|marker| marker.value)),
+            || records.active.map(|slot| slot.map(|(handle, _)| handle)),
+        );
         // An interrupted close can have its tombstone before status.json catches up.
         let close_tombstone = matches!(held, Ok(true)).then(|| reader.closed_if_present());
         Self {
+            session: session::owner::session_of(reader).to_owned(),
+            active,
+            completed_kind,
             close_tombstone,
             held,
             owner,
@@ -164,6 +195,21 @@ impl SessionEvidence {
     /// session, so later requests return the first judgment.
     pub(in crate::native) fn judge_owner(&self) -> &OwnerJudgment {
         self.judge_owner_with(&judgment::Observers::SYSTEM)
+    }
+
+    /// A copied session's records supply no local liveness verdict to Repair.
+    pub(in crate::native) fn repair_owner_with(
+        &self,
+        observers: &judgment::Observers<'_>,
+    ) -> Option<&OwnerJudgment> {
+        terminal::foreign::judge(
+            &self.session,
+            self.active.as_ref(),
+            self.completed_kind,
+            &self.owner,
+        )
+        .is_none()
+        .then(|| self.judge_owner_with(observers))
     }
 
     pub(in crate::native) fn judge_owner_with(

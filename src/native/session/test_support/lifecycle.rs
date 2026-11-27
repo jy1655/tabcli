@@ -64,6 +64,8 @@ pub(in crate::native) fn write_owned_terminal_state(directory: &Path, state: &st
         &terminal::TerminalSession::new(
             if cfg!(windows) {
                 terminal::TerminalKind::WindowsConsole
+            } else if cfg!(target_os = "linux") {
+                terminal::TerminalKind::Tmux
             } else {
                 terminal::TerminalKind::AppleTerminal
             },
@@ -125,6 +127,8 @@ pub(in crate::native) fn close_test_terminal() -> terminal::TerminalSession {
     terminal::TerminalSession::new(
         if cfg!(windows) {
             terminal::TerminalKind::WindowsConsole
+        } else if cfg!(target_os = "linux") {
+            terminal::TerminalKind::Tmux
         } else {
             terminal::TerminalKind::AppleTerminal
         },

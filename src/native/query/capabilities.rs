@@ -19,6 +19,7 @@ const LOCK_ABSENT: &str = "lifecycle_lock_absent";
 pub(super) struct FollowUpEvidence<'a> {
     pub(super) held: &'a Result<bool>,
     pub(super) recovery_required: bool,
+    pub(super) repair_owner: Option<&'a OwnerJudgment>,
     pub(super) owner: &'a OwnerJudgment,
     pub(super) surface: &'a Surface,
     pub(super) reopened: bool,
@@ -168,8 +169,10 @@ fn tell_gates(
     if evidence.recovery_required {
         return Err(Stop::unknown("recovery_required", None));
     }
-    if close::repair_examines_owner(&records.status.state) {
-        owner_gate(evidence.owner)?;
+    if close::repair_examines_owner(&records.status.state)
+        && let Some(owner) = evidence.repair_owner
+    {
+        owner_gate(owner)?;
     }
     let cli = FirstPartyCli::from_str(&records.manifest.provider).map_err(Stop::unreadable)?;
     surface_gate(evidence.surface)?;
@@ -197,7 +200,7 @@ fn tell_gates(
 }
 
 /// The liveness verdict dead-owner repair would act on, judged where convergence runs.
-/// Repair reads the Owner record under the same read policy and attests the recorded process
+/// For a native session Repair reads the Owner record under the same read policy and attests the recorded process
 /// whatever Session the record names, so every recorded owner (bound, unbound or foreign) is
 /// judged by Repair's own liveness rule: a death is Repair's, and an attestation that cannot
 /// decide fails Repair. An unreadable record fails Repair too. Without a record convergence
@@ -477,6 +480,24 @@ mod tests {
             "bound" => store.write_owner(&owner(Some("session-parity"))).unwrap(),
             "unbound" => store.write_owner(&owner(None)).unwrap(),
             "foreign" => store.write_owner(&owner(Some("session-other"))).unwrap(),
+            "copy-active" | "copy-marker" => {
+                let kind = if cfg!(windows) {
+                    "tmux"
+                } else {
+                    "windows-console"
+                };
+                store.write_owner(&owner(Some("session-parity"))).unwrap();
+                if shape == "copy-active" {
+                    store.record(session::CoreRecord::Terminal).write_json(&json!({"terminal":kind,"session_id":"surface","managed_session_id":"session-parity"})).unwrap();
+                    store
+                        .write_terminal_closed(&json!({"consumed":false}))
+                        .unwrap();
+                } else {
+                    store
+                        .write_terminal_closed(&json!({"consumed":true,"terminal":kind}))
+                        .unwrap();
+                }
+            }
             "absent" => (),
             "unreadable" => {
                 std::fs::create_dir(store.record(session::CoreRecord::Owner).path()).unwrap()
@@ -485,11 +506,16 @@ mod tests {
         }
         let reader = Reader::open_unchecked(&directory);
         let evidence = crate::native::query::observation::SessionEvidence::read(&reader, Ok(false));
-        let attest = |_: &NativeSessionOwner| answer();
-        let predicted = match owner_gate(evidence.judge_owner_with(
-            &crate::native::query::observation::judgment::Observers { attest: &attest },
-        ))
-        .map_err(|stop| stop.value())
+        let attest = |_: &NativeSessionOwner| {
+            assert!(!shape.starts_with("copy-"), "copy owner observed");
+            answer()
+        };
+        let predicted = match evidence
+            .repair_owner_with(&crate::native::query::observation::judgment::Observers {
+                attest: &attest,
+            })
+            .map_or(Ok(()), owner_gate)
+            .map_err(|stop| stop.value())
         {
             Ok(()) => Decision::Continues,
             Err(stop) if stop["reason"] == "owner_ended" => Decision::Ended,
@@ -498,15 +524,31 @@ mod tests {
                 Decision::Fails
             }
         };
+        if shape.starts_with("copy-") {
+            let observers =
+                crate::native::query::observation::judgment::Observers { attest: &attest };
+            let local = evidence.repair_owner_with(&observers);
+            assert!(local.is_none());
+            assert_eq!(
+                super::super::status::owner_flag(local.unwrap_or(&OwnerJudgment::Absent)),
+                Some(super::super::status::AttentionFlag::OwnerUnverified)
+            );
+            let poll = super::super::wait::pending_owner(&reader, &observers);
+            assert!(!poll.gone());
+            assert_eq!(poll.observation().process_alive, None);
+        }
+        // The macOS delivery wait has already passed delivery admission. Exercise it
+        // on native rows. Copies exercise the public pending-poll classifier above.
         #[cfg(target_os = "macos")]
-        let waited = match crate::native::session::turn::running_wait_owner_with(&directory, attest)
-        {
-            Ok(()) => Decision::Continues,
-            Err(error) if format!("{error:#}").starts_with("native session process 4242") => {
-                Decision::Ended
+        let waited = (!shape.starts_with("copy-")).then(|| {
+            match crate::native::session::turn::running_wait_owner_with(&directory, attest) {
+                Ok(()) => Decision::Continues,
+                Err(error) if format!("{error:#}").starts_with("native session process 4242") => {
+                    Decision::Ended
+                }
+                Err(_) => Decision::Fails,
             }
-            Err(_) => Decision::Fails,
-        };
+        });
         let repaired = match close::repair_dead_owner_attested_with(&store, attest) {
             Ok(false) => Decision::Continues,
             Ok(true) => {
@@ -515,16 +557,13 @@ mod tests {
             }
             Err(_) => Decision::Fails,
         };
-        vec![
-            predicted,
-            repaired,
-            #[cfg(target_os = "macos")]
-            waited,
-        ]
+        let decisions = vec![predicted, repaired];
+        #[cfg(target_os = "macos")]
+        let decisions = decisions.into_iter().chain(waited).collect();
+        decisions
     }
 
-    // tell's prediction, Repair and the macOS running wait agree on every record shape and
-    // every attestation answer, the foreign record with a dead process included.
+    // Compare tell's prediction with Repair for every record shape and attestation answer.
     #[test]
     fn the_owner_prediction_agrees_with_repair_on_every_record_and_answer() {
         type Answer = fn() -> OwnerAttestation;
@@ -558,10 +597,17 @@ mod tests {
                 )
             }),
         ];
-        for shape in ["bound", "unbound", "foreign", "absent", "unreadable"] {
+        for shape in ["bound", "unbound", "foreign", "absent", "unreadable"]
+            .into_iter()
+            .chain(
+                ["copy-active", "copy-marker"]
+                    .into_iter()
+                    .filter(|_| cfg!(any(target_os = "linux", target_os = "macos", windows))),
+            )
+        {
             for (name, answer) in answers {
                 let expected = match (shape, name) {
-                    ("absent", _) => Decision::Continues,
+                    ("absent" | "copy-active" | "copy-marker", _) => Decision::Continues,
                     ("unreadable", _) => Decision::Fails,
                     (_, "live") => Decision::Continues,
                     (_, "exited" | "reused") => Decision::Ended,
@@ -569,18 +615,20 @@ mod tests {
                 };
                 let decisions = parity_row(shape, answer);
                 assert_eq!(decisions[..2], [expected, expected], "{shape} {name}");
-                // The running wait ends on the same deaths; it keeps waiting on an owner
-                // it cannot decide, where Repair fails.
+                // Delivery verifies a local owner before the running wait, so copies cannot reach it.
                 #[cfg(target_os = "macos")]
-                assert_eq!(
-                    decisions[2],
-                    if shape == "unreadable" || expected != Decision::Fails {
-                        expected
-                    } else {
-                        Decision::Continues
-                    },
-                    "{shape} {name}"
-                );
+                if !shape.starts_with("copy-") {
+                    // An undecidable owner keeps the wait running even when Repair fails.
+                    assert_eq!(
+                        decisions[2],
+                        if shape == "unreadable" || expected != Decision::Fails {
+                            expected
+                        } else {
+                            Decision::Continues
+                        },
+                        "{shape} {name}"
+                    );
+                }
             }
         }
     }

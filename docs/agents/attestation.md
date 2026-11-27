@@ -14,7 +14,8 @@
   surface. A changed control identity (controlling TTY, process groups) of a live incarnation is
   not a death. A second observation of the same pid is checked against the attested incarnation
   before its control fields are compared; a later snapshot with another birth is reuse (#190).
-- Repair treats Gone from exit or reuse the same, whatever the owner record's binding.
+- For a native session Repair treats Gone from exit or reuse the same, whatever the owner record's binding.
+  For a session identified as copied, Repair and prune use its records without local process attestation.
 - For a Herdr close, only a session-bound, platform-consistent
   owner record with an attested live incarnation selects the close with a live owner (see [Herdr close](herdr.md#close-by-creation-record)).
 - The ordinary macOS and Linux dead-owner Close of other kinds requires an exited, bound
@@ -25,7 +26,7 @@
   Once an owner is recorded, no other wrapper can settle its launch or release the Claim.
   Before registration, a wrapper error settles its pending launch only when the lifecycle lock
   confirms the absence of both an owner and a spawn attempt.
-- Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
+- For native sessions startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner
   can still be registering. The launch deadline independently fails startup, without calling

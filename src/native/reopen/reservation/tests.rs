@@ -287,8 +287,14 @@ fn write_reopen_test_manifest(
 }
 
 fn reopen_test_terminal(id: &str) -> terminal::TerminalSession {
-    terminal::TerminalSession::new(terminal::TerminalKind::Iterm2, format!("{id}-terminal"))
-        .with_binding(Some(id.to_owned()))
+    let kind = if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else if cfg!(target_os = "linux") {
+        terminal::TerminalKind::Tmux
+    } else {
+        terminal::TerminalKind::Iterm2
+    };
+    terminal::TerminalSession::new(kind, format!("{id}-terminal")).with_binding(Some(id.to_owned()))
 }
 
 // A closed session with one resolved request: its turn completed (or failed, when
@@ -2849,6 +2855,15 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
     let claim = Reservation::claim(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
+    // Both Linux terminal kinds survive owner exit. Its native legacy implicit
+    // kind exercises the same no-retention Repair as the macOS/Windows fixtures.
+    #[cfg(target_os = "linux")]
+    write_json_atomic(
+        &new.join(TERMINAL_HANDLE_FILE),
+        &serde_json::json!({"session_id":"surface","managed_session_id":new_id}),
+    )
+    .unwrap();
+    #[cfg(not(target_os = "linux"))]
     write_json_atomic(
         &new.join(TERMINAL_HANDLE_FILE),
         &reopen_test_terminal(new_id),

@@ -356,8 +356,8 @@ impl StartedFromClose {
     }
 }
 
-// Closes a managed session's own visible surface through the terminal-close authority
-// checks that an explicit `close-session` uses. `cause` says why: only an explicit close
+// Closes a native surface through the terminal-close authority checks or settles an eligible
+// copy from its records. `cause` says why: only an explicit close
 // acts on a gone owner's terminal by its creation record; a cleanup after another command
 // keeps the earlier authorities. `reason` is kept in the closed status when the close itself
 // reports nothing, so a session closed because of a detected conflict still says why.
@@ -368,10 +368,12 @@ pub(super) fn close_session_surface(
     cause: CloseCause,
     deadline: std::time::Instant,
 ) -> Result<()> {
-    session::close::close(
+    session::close::close_for_cause(
         &Store::open_unchecked(directory),
         reason,
+        cause,
         deadline,
+        session::owner::attest_owner,
         |session| terminal::ownership::close_owned_surface(directory, id, session, cause, deadline),
     )
     .map(|_| ())

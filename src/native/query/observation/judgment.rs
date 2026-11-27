@@ -18,7 +18,7 @@ use serde_json::Value;
 pub(in crate::native) const FOREIGN_OWNER: &str = "owner record belongs to another session";
 
 /// The Owner record judged against the session it was read for (CONTEXT.md Attestation).
-/// Every recorded owner is attested, as Repair attests it whatever Session the record
+/// Every recorded owner is attested, as native Repair attests it whatever Session the record
 /// names; only a record bound to this session is judged for control authority.
 #[derive(Debug)]
 pub(in crate::native) enum OwnerJudgment {
@@ -657,6 +657,9 @@ pub(in crate::native) mod tests {
     /// Evidence with every auxiliary record readable and absent.
     pub(in crate::native) fn evidence() -> SessionEvidence {
         SessionEvidence {
+            session: SESSION.into(),
+            active: None,
+            completed_kind: None,
             owner: OwnerRecord::Absent,
             held: Ok(false),
             close_tombstone: None,
