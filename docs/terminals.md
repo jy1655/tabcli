@@ -39,7 +39,7 @@ fallback, where the verification does not matter. An explicit `--terminal herdr`
 instead. The fallback terminal must be usable: a Mac without Ghostty, for example, fails when
 TAB opens it, as an explicit `--terminal ghostty` would. `tabcli doctor --provider <provider>
 --probe`, run from the directory you launch from, reports the terminal `ask` would choose and
-its fallback.
+its fallback. When TAB selects the fallback, the session's `launch.log` notes why Herdr was skipped.
 
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Outside hc, Linux uses tmux.
