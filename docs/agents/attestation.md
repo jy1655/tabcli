@@ -22,7 +22,9 @@
   differences remain and are tracked in [issue #421](https://github.com/jy1655/tabcli/issues/421).
 - While a launch is pending, the registered owner is visible to startup repair before the provider version check.
   The spawn fence binds the owner record to the spawning wrapper under the lifecycle lock.
-  Only the recorded wrapper can settle its launch and release the Claim.
+  Once an owner is recorded, only that wrapper can settle its launch and release the Claim.
+  Before registration, a wrapper error settles its pending launch only when the lifecycle lock
+  confirms the absence of both an owner and a spawn attempt.
 - Startup repair consumes the typed owner attestation too: only Gone fails an unconfirmed
   launch as an exited wrapper. Live with changed or unknown control is still live; process
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner

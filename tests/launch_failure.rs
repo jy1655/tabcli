@@ -123,23 +123,59 @@ fn result_observes_expired_launch_without_repairing_files() {
 }
 
 #[test]
-fn wrapper_without_a_terminal_reports_its_error_and_preserves_the_pending_launch() {
+fn early_wrapper_error_is_recorded_and_releases_the_claim() {
     let fixture = Fixture::new("pending", false);
-    let before = fixture.status();
-    let claim = fs::read(fixture.directory.join("turn.claim")).unwrap();
     let output = fixture.run(&["native-session", "session-launch"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
-    assert_eq!(fixture.status(), before);
-    assert_eq!(
-        fs::read(fixture.directory.join("turn.claim")).unwrap(),
-        claim
+    let status = fixture.status();
+    assert_eq!(status["state"], "failed");
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap()
+            .contains("interactive terminal")
     );
-    assert!(!fixture.directory.join("native-session.json").exists());
+    assert_eq!(status["exit_code"], 1);
+    assert!(!fixture.directory.join("turn.claim").exists());
     let log = fs::read_to_string(fixture.directory.join("launch.log")).unwrap();
-    assert!(log.contains("wrapper_started"));
-    assert!(!log.contains("interactive terminal"));
-    assert!(!log.contains("wrapper_exit_code="));
+    assert!(log.contains("interactive terminal"));
+    assert!(log.contains("exit_code=1"));
+}
+
+#[test]
+fn unregistered_wrapper_preserves_an_owned_or_attempted_launch() {
+    for (phase, has_owner) in [("pending", true), ("spawning", false), ("spawned", false)] {
+        let fixture = Fixture::new(phase, false);
+        if has_owner {
+            fixture.write("native-session.json", json!({"pid": 42}));
+        }
+        let snapshot = || {
+            [
+                "status.json",
+                "turn.claim",
+                "launch.json",
+                "native-session.json",
+            ]
+            .map(|name| match fs::read(fixture.directory.join(name)) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("{name}: {error}"),
+            })
+        };
+        let before = snapshot();
+        let output = fixture.run(&["native-session", "session-launch"]);
+        assert!(!output.status.success(), "{phase}");
+        let expected_error = if has_owner {
+            "interactive terminal"
+        } else {
+            "cancelled or already attempted"
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{phase}: {stderr}");
+        assert_eq!(snapshot(), before, "{phase}");
+        let log = fs::read_to_string(fixture.directory.join("launch.log")).unwrap();
+        assert!(!log.contains("wrapper_exit_code="), "{phase}: {log}");
+    }
 }
 
 #[test]

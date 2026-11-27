@@ -295,7 +295,7 @@ fn launch_files(store: &Store) -> [Vec<u8>; 4] {
 fn registration_after_a_spawn_attempt_preserves_launch_files() {
     for phase in [Phase::Spawning, Phase::Spawned] {
         let (_directory, store) = directory(&[]);
-        register_wrapper(&store, &wrapper_owner(&store, 10)).unwrap();
+        register_wrapper(&store, || Ok(wrapper_owner(&store, 10))).unwrap();
         let mut receipt = read(&store).unwrap().unwrap();
         receipt.phase = phase;
         store
@@ -304,7 +304,7 @@ fn registration_after_a_spawn_attempt_preserves_launch_files() {
             .unwrap();
         let before = launch_files(&store);
         let log = fs::read(store.directory().join(LOG)).unwrap();
-        assert!(register_wrapper(&store, &wrapper_owner(&store, 20)).is_err());
+        assert!(register_wrapper(&store, || Ok(wrapper_owner(&store, 20))).is_err());
         assert_eq!(launch_files(&store), before);
         assert_eq!(fs::read(store.directory().join(LOG)).unwrap(), log);
     }
@@ -315,8 +315,8 @@ fn spawn_fence_selects_the_wrapper_and_only_it_settles() {
     let (_directory, store) = directory(&[]);
     let spawner = wrapper_owner(&store, 10);
     let other = wrapper_owner(&store, 20);
-    register_wrapper(&store, &spawner).unwrap();
-    register_wrapper(&store, &other).unwrap();
+    register_wrapper(&store, || Ok(spawner.clone())).unwrap();
+    register_wrapper(&store, || Ok(other.clone())).unwrap();
 
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.arg("--list").stdout(std::process::Stdio::null());
@@ -379,16 +379,20 @@ fn version_failure_of_an_unrecorded_wrapper_preserves_the_spawned_launch() {
     let spawner = wrapper_owner(&store, 10);
     let other = wrapper_owner(&store, 20);
     let mut before = None;
-    let error = wrapper::run_registered(&store, &other, |_, _, _| {
-        // The recorded snapshot at the time this version check returns.
-        store.write_owner(&spawner)?;
-        let mut receipt = read(&store)?.unwrap();
-        receipt.phase = Phase::Spawned;
-        store.record(CoreRecord::Launch).write_json(&receipt)?;
-        update_status(store.directory(), SessionState::Running, None, None)?;
-        before = Some(launch_files(&store));
-        bail!("scripted version failure")
-    })
+    let error = wrapper::run_registered(
+        &store,
+        || Ok(other.clone()),
+        |_, _, _| {
+            // The recorded snapshot at the time this version check returns.
+            store.write_owner(&spawner)?;
+            let mut receipt = read(&store)?.unwrap();
+            receipt.phase = Phase::Spawned;
+            store.record(CoreRecord::Launch).write_json(&receipt)?;
+            update_status(store.directory(), SessionState::Running, None, None)?;
+            before = Some(launch_files(&store));
+            bail!("scripted version failure")
+        },
+    )
     .unwrap_err();
     assert_eq!(error.to_string(), "scripted version failure");
     assert_eq!(launch_files(&store), before.unwrap());
@@ -398,16 +402,20 @@ fn version_failure_of_an_unrecorded_wrapper_preserves_the_spawned_launch() {
 fn owner_is_available_for_exit_repair_during_the_version_check() {
     let (_directory, store) = version_check_fixture();
     let owner = wrapper_owner(&store, 10);
-    let error = wrapper::run_registered(&store, &owner, |_, _, bound| {
-        assert!(bound.is_some());
-        repair_with_owner(&store, |_| {
-            assert!(recorded_owner_matches(&store, &owner)?);
-            Ok(Some(super::super::owner::tests::reused_attestation()))
-        })?;
-        assert!(store.status()?.error.unwrap().contains("wrapper exited"));
-        assert!(turn::current_claim_token(&store)?.is_none());
-        bail!("scripted check ended")
-    })
+    let error = wrapper::run_registered(
+        &store,
+        || Ok(owner.clone()),
+        |_, _, bound| {
+            assert!(bound.is_some());
+            repair_with_owner(&store, |_| {
+                assert!(recorded_owner_matches(&store, &owner)?);
+                Ok(Some(super::super::owner::tests::reused_attestation()))
+            })?;
+            assert!(store.status()?.error.unwrap().contains("wrapper exited"));
+            assert!(turn::current_claim_token(&store)?.is_none());
+            bail!("scripted check ended")
+        },
+    )
     .unwrap_err();
     assert_eq!(error.to_string(), "scripted check ended");
 }
@@ -416,7 +424,7 @@ fn owner_is_available_for_exit_repair_during_the_version_check() {
 fn definitive_spawn_failure_settles_before_another_registration() {
     let (directory, store) = directory(&[]);
     let spawner = wrapper_owner(&store, 10);
-    register_wrapper(&store, &spawner).unwrap();
+    register_wrapper(&store, || Ok(spawner.clone())).unwrap();
     let mut command = Command::new(directory.path().join("missing-provider"));
     let error = spawn_for_wrapper(
         &store,
@@ -431,6 +439,6 @@ fn definitive_spawn_failure_settles_before_another_registration() {
     assert_eq!(read(&store).unwrap().unwrap().phase, Phase::Pending);
     assert_eq!(store.status().unwrap().state, SessionState::Failed);
     assert!(turn::current_claim_token(&store).unwrap().is_none());
-    assert!(register_wrapper(&store, &wrapper_owner(&store, 20)).is_err());
+    assert!(register_wrapper(&store, || Ok(wrapper_owner(&store, 20))).is_err());
     assert!(recorded_owner_matches(&store, &spawner).unwrap());
 }

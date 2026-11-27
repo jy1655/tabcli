@@ -65,23 +65,27 @@ fn run_in_surface(id: &str) -> Result<()> {
     let directory = Reader::session_directory(id)?;
     let store = Store::open_unchecked(&directory);
     super::log(&store, "wrapper_started");
-    super::admit_wrapper(&store)?;
-    restore_stdout()?;
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        bail!("native-session must run in a visible interactive terminal");
-    }
-    let owner = terminal::ownership::current_surface_owner(&directory, id)?;
-    run_registered(&store, &owner, check_provider_version_until)
+    run_registered(
+        &store,
+        || {
+            restore_stdout()?;
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                bail!("native-session must run in a visible interactive terminal");
+            }
+            terminal::ownership::current_surface_owner(&directory, id)
+        },
+        check_provider_version_until,
+    )
 }
 
 pub(super) fn run_registered(
     store: &Store,
-    owner: &NativeSessionOwner,
+    identify: impl FnOnce() -> Result<NativeSessionOwner>,
     check: impl FnOnce(FirstPartyCli, &Path, Option<Instant>) -> Result<String>,
 ) -> Result<()> {
-    super::register_wrapper(store, owner)?;
-    let result = provision_for_wrapper(store.directory(), Some(owner), check);
-    if let Err(finalization_error) = super::finalize_wrapper(store, owner, &result) {
+    let owner = super::register_wrapper(store, identify)?;
+    let result = provision_for_wrapper(store.directory(), Some(&owner), check);
+    if let Err(finalization_error) = super::finalize_wrapper(store, &owner, &result) {
         return match result {
             Ok(()) => Err(finalization_error),
             Err(run_error) => Err(anyhow::anyhow!(

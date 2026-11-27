@@ -1307,10 +1307,33 @@ pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn register_wrapper(store: &Store, owner: &NativeSessionOwner) -> Result<()> {
+fn register_wrapper(
+    store: &Store,
+    identify: impl FnOnce() -> Result<NativeSessionOwner>,
+) -> Result<NativeSessionOwner> {
     let _lock = store.lock()?;
     admit_wrapper(store)?;
-    store.write_owner(owner)
+    let registered = identify().and_then(|owner| {
+        store.write_owner(&owner)?;
+        Ok(owner)
+    });
+    if let Err(error) = &registered
+        && matches!(
+            super::owner::observe(store),
+            super::owner::OwnerRecord::Absent
+        )
+        && matches!(
+            store.record(CoreRecord::ProviderProcess).present(),
+            Ok(false)
+        )
+    {
+        // Admission, registration and this decision share the lock. An ownerless
+        // failure can therefore settle only the pending launch we just admitted.
+        log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"));
+        finalize_locked(store, Some(error))
+            .with_context(|| format!("{error:#}; native session finalization also failed"))?;
+    }
+    registered
 }
 
 fn recorded_owner_matches(store: &Store, owner: &NativeSessionOwner) -> Result<bool> {
