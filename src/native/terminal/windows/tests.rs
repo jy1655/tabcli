@@ -1263,12 +1263,9 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
 }
 
-// A stored handle of a kind that Windows does not run is refused by the installed lookup, as on
-// macOS and Linux, and never reaches the console helper: doctor's probe of a WezTerm record
-// whose pane id 0 names no process is unverified, not a missing surface; the ownership proof
-// refuses it before the owner record; a send is known unsent; screen, close and presence get
-// the same refusal; an open gets it even with an expired deadline; guarded input answers with
-// WezTerm's declared refusal first, as on every OS.
+// Doctor identifies a bound WezTerm handle as a copy before probing. The row is unverified
+// with the Windows lookup's refusal. The direct presence call below exercises that lookup,
+// as do ownership, send, screen, close and open. Guarded input has its own declared refusal.
 #[test]
 fn another_kinds_handle_is_refused_by_the_installed_lookup() {
     use crate::native::doctor;

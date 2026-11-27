@@ -1613,8 +1613,8 @@ fn slice_three_origin_exceeding_the_total_returns_no_end_verdict() {
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let reference = read(&mut environment, &child);
     let mut budget = ReadBudget::for_query(None, &mut environment.clock);
-    // This caller has already spent 128 KiB of the shared allowance.
-    for _ in 0..2 {
+    // The caller has already spent 256 KiB. The native target needs another 576 KiB.
+    for _ in 0..4 {
         budget
             .read(
                 &origin.reader().record(CoreRecord::Manifest),
@@ -1658,18 +1658,16 @@ fn copied_origin_checks_surface_bytes_again_before_reporting_unknown() {
             _ => json!({"consumed":true,"terminal":kind}),
         };
         write(&path, &wire);
-        for alive in [true, false] {
-            environment.attest(move |_| panic!("origin consulted local owner (alive={alive})"));
-            let answer = observed(&mut environment, root.path(), &child);
-            assert_eq!(
-                (answer.ended, answer.reason.as_str()),
-                (None, "owner_unverified")
-            );
-            assert_eq!(
-                serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
-                wire
-            );
-        }
+        environment.attest(move |_| panic!("origin consulted local owner"));
+        let answer = observed(&mut environment, root.path(), &child);
+        assert_eq!(
+            (answer.ended, answer.reason.as_str()),
+            (None, "owner_unverified")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            wire
+        );
         let changed = path.clone();
         hooks.checkpoint(move |point, _| {
             if point == Checkpoint::OriginRead {
@@ -1683,4 +1681,63 @@ fn copied_origin_checks_surface_bytes_again_before_reporting_unknown() {
         );
         hooks.checkpoint(|_, _| {});
     }
+}
+
+#[test]
+fn a_native_origin_keeps_its_owner_verdict_while_close_claims_or_marks_its_surface() {
+    let hooks = Hooks::new();
+    let mut rows = Vec::new();
+    for alive in [true, false] {
+        for change in ["none", "claim", "marker"] {
+            let root = tempfile::tempdir().unwrap();
+            let id = "session-origin";
+            let child = Session::started_from(root.path(), "session-child", "ready", id);
+            let origin = Session::new(root.path(), id, "ready");
+            origin.owner(Some(id), 7);
+            let active = origin.record(CoreRecord::Terminal);
+            write(
+                &active,
+                &json!({"terminal":"herdr","session_id":"surface","managed_session_id":id}),
+            );
+            let closing = origin.record(CoreRecord::TerminalClosing);
+            let marker = origin.record(CoreRecord::TerminalClosed);
+            hooks.checkpoint(move |point, _| {
+                if point == Checkpoint::OriginRead {
+                    match change {
+                        "claim" => fs::rename(&active, &closing).unwrap(),
+                        "marker" => write(&marker, &json!({"consumed":true,"terminal":"herdr"})),
+                        _ => (),
+                    }
+                }
+            });
+            let mut environment = Environment::new();
+            environment.attest(move |_| {
+                attestation(
+                    if alive {
+                        ProcessObservation::Live(Attested::PidOnly)
+                    } else {
+                        ProcessObservation::Gone(Gone::Exited)
+                    },
+                    ControlAttestation::NotRecorded,
+                )
+            });
+            let answer = observed(&mut environment, root.path(), &child);
+            rows.push((change, answer.ended, answer.reason));
+        }
+    }
+    let actual: Vec<_> = rows
+        .iter()
+        .map(|(change, ended, reason)| (*change, *ended, reason.as_str()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("none", Some(false), "owner_live"),
+            ("claim", Some(false), "owner_live"),
+            ("marker", Some(false), "owner_live"),
+            ("none", Some(true), "owner_exited"),
+            ("claim", Some(true), "owner_exited"),
+            ("marker", Some(true), "owner_exited")
+        ]
+    );
 }

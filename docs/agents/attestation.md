@@ -15,7 +15,7 @@
   not a death. A second observation of the same pid is checked against the attested incarnation
   before its control fields are compared; a later snapshot with another birth is reuse (#190).
 - For a native session Repair treats Gone from exit or reuse the same, whatever the owner record's binding.
-  For a session identified as copied, Repair and prune use its records without local process attestation.
+  All consumers use a copy's records without consulting local processes or probing a local surface.
 - For a Herdr close, only a session-bound, platform-consistent
   owner record with an attested live incarnation selects the close with a live owner (see [Herdr close](herdr.md#close-by-creation-record)).
 - The ordinary macOS and Linux dead-owner Close of other kinds requires an exited, bound

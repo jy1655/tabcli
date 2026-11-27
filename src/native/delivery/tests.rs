@@ -739,20 +739,16 @@ fn copied_tell_admission_never_calls_the_ownership_proof() {
                 .with_binding(Some("session-copy".into())),
         )
         .unwrap();
-    for alive in [true, false] {
-        let error = follow_up_surface(
-            &store,
-            "session-copy",
-            Instant::now() + Duration::from_secs(2),
-            Duration::from_secs(2),
-            |_, _, _, _| {
-                panic!("copy ownership proof reached local processes or terminals (alive={alive})")
-            },
-        )
-        .unwrap_err();
-        assert_eq!(
-            crate::native::failure_kind::classify(&error),
-            Some(crate::native::failure_kind::FailureKind::Unsupported)
-        );
-    }
+    let error = follow_up_surface(
+        &store,
+        "session-copy",
+        Instant::now() + Duration::from_secs(2),
+        Duration::from_secs(2),
+        |_, _, _, _| panic!("copy ownership proof reached local processes or terminals"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::Unsupported)
+    );
 }

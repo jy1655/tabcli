@@ -4804,13 +4804,10 @@ fn copied_refused_launch_uses_no_spawn_proof_but_never_checks_a_recorded_pid() {
                 .unwrap();
         }
         let before = snapshot_directory(&dir);
-        for alive in [true, false] {
-            let cleanup = refused_launch_cleanup_with(&dir, &refusal, |_| {
-                panic!("copy probed provider (alive={alive})")
-            })
-            .unwrap();
-            assert_eq!(cleanup.releases_marker(), !has_pid);
-            assert_eq!(snapshot_directory(&dir), before);
-        }
+        let cleanup =
+            refused_launch_cleanup_with(&dir, &refusal, |_| panic!("copy probed provider"))
+                .unwrap();
+        assert_eq!(cleanup.releases_marker(), !has_pid);
+        assert_eq!(snapshot_directory(&dir), before);
     }
 }

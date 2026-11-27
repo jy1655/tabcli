@@ -2195,7 +2195,7 @@ fn a_rejected_launch_host_record_makes_the_timeline_incomplete() {
     }
 }
 
-// When the tombstone names Ghostty, doctor can rule out both the launch host and the shell probe.
+// The tombstone names a terminal this system runs without a launch host or shell capture.
 #[test]
 fn a_closed_session_s_tombstone_names_its_terminal_for_doctor() {
     let fixture = Fixture::new("codex");
@@ -2245,7 +2245,17 @@ fn copied_session_doctor_reports_the_launch_without_running_local_diagnostics() 
             args.push("--probe");
         }
         let value = report(fixture.run(&args));
-        assert_eq!(value["scope"]["executable"], env!("CARGO_BIN_EXE_tabcli"));
+        assert_eq!(
+            value["configured"]["provider_path"],
+            env!("CARGO_BIN_EXE_tabcli")
+        );
+        for field in ["executable", "executable_source"] {
+            assert_eq!(
+                value["scope"].get(field),
+                Some(&Value::Null),
+                "{field}, probe={probe}"
+            );
+        }
         assert_eq!(value["scope"]["current_version"], Value::Null);
         let rows = value["checks"].as_array().unwrap();
         for local in [

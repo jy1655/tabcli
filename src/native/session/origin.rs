@@ -31,7 +31,7 @@ use std::{
 const RECORD_LIMIT: u64 = 64 * 1024;
 /// Cooperative time and byte budget of one Origin observation inside a query.
 const OBSERVATION_TIME: Duration = Duration::from_millis(100);
-// The original 512 KiB plus the active handle and marker, each read and rechecked at 64 KiB.
+// The original 512 KiB plus two 64 KiB slots read on acquisition and rechecked for a copy.
 const OBSERVATION_BYTES: u64 = 512 * 1024 + 4 * RECORD_LIMIT;
 /// Bounds of the started-from scan that follows a successful close.
 pub(in crate::native) const SCAN_TIME: Duration = Duration::from_secs(2);
@@ -647,8 +647,7 @@ fn observe_target(
     };
     #[cfg(test)]
     tests::checkpoint(tests::Checkpoint::OriginRead, reader.directory());
-    // The verdict holds only if the tombstone is still absent, the status unchanged, and
-    // the owner record it was derived from unchanged or still absent.
+    // Recheck tombstone absence, status and the records used for this verdict.
     match budget.read(&reader.record(CoreRecord::Closed), clock) {
         Ok(None) => (),
         Ok(Some(_)) => return target(None, "origin_busy", None),
@@ -707,12 +706,13 @@ fn owner_verdict(
     if recorded.binding != OwnerBinding::Bound {
         return owner_attested(&recorded.owner, recorded.binding, attest);
     }
+    let mut surface_reads = Vec::new();
     let mut active = None;
     let mut completed = None;
     for slot in [CoreRecord::Terminal, CoreRecord::TerminalClosed] {
         let bytes = match budget.read(&reader.record(slot), clock) {
             Ok(bytes) => bytes,
-            Err(ReadFault::Unreadable(_)) => continue,
+            Err(ReadFault::Busy | ReadFault::Unreadable(_)) => continue,
             Err(fault) => return fault_target(fault, "owner_unverified"),
         };
         if let Some(text) = bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok()) {
@@ -730,7 +730,7 @@ fn owner_verdict(
                 _ => unreachable!(),
             }
         }
-        evidence.push((slot, bytes, RECORD_LIMIT));
+        surface_reads.push((slot, bytes, RECORD_LIMIT));
     }
     if let Some(copy) = crate::native::terminal::foreign::judge_records(
         id,
@@ -738,6 +738,7 @@ fn owner_verdict(
         completed,
         Some(&recorded),
     ) {
+        evidence.extend(surface_reads);
         return target(
             None,
             "owner_unverified",

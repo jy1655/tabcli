@@ -708,21 +708,27 @@ fn copied_inspect_and_partial_doctor_keep_the_hidden_active_handle_as_evidence()
             std::fs::write(store.record(CoreRecord::Status).path(), "{").unwrap();
         }
         let before = entries(&fixture.directory);
-        for alive in [true, false] {
-            let evidence = PartialObservation::read(&store, id).evidence;
-            let owner = evidence.judge_owner_with(&judgment::Observers {
-                attest: &|_| panic!("copy consulted local owner (alive={alive})"),
-            });
-            assert_eq!(owner.observation().process_alive, None);
-            let (checks, _) = doctor_records(&store);
-            assert_eq!(reason(&checks, "owner"), "owner_unverified");
-            if !damaged {
-                let value = super::super::inspect_value(&store, id).unwrap();
-                assert_eq!(value["owner_process_alive"], Value::Null);
-                assert_eq!(value["capabilities"]["tell"]["reason"], "surface_closed");
-            }
-            assert_eq!(entries(&fixture.directory), before);
+        let (checks, _) = doctor_records(&store);
+        let row = checks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "owner")
+            .unwrap();
+        assert_eq!(row["reason_code"], "owner_unverified");
+        assert_eq!(row["evidence"].get("process_alive"), Some(&Value::Null));
+        let evidence = PartialObservation::read(&store, id).evidence;
+        let owner = evidence.judge_owner_with(&judgment::Observers {
+            attest: &|_| panic!("copy consulted local owner"),
+        });
+        assert_eq!(owner.observation().process_alive, None);
+
+        if !damaged {
+            let value = super::super::inspect_value(&store, id).unwrap();
+            assert_eq!(value["owner_process_alive"], Value::Null);
+            assert_eq!(value["capabilities"]["tell"]["reason"], "surface_closed");
         }
+        assert_eq!(entries(&fixture.directory), before);
     }
 }
 
@@ -738,21 +744,19 @@ fn copied_doctor_probe_classifies_the_current_owner_after_the_snapshot() {
                 .with_binding(Some(id.into())),
         )
         .unwrap();
-    for alive in [true, false] {
-        store.record(CoreRecord::Owner).remove().unwrap();
-        let observation = Observation::read(&store).unwrap();
-        store
-            .write_owner(&session::test_support::copied_owner(id))
-            .unwrap();
-        let before = entries(&fixture.directory);
-        let answer = observation.evidence.judge_surface_presence_with(
-            &store,
-            Instant::now() + Duration::from_secs(2),
-            &|_, _, _| panic!("copy probed local terminal (present={alive})"),
-        );
-        assert!(matches!(answer, SurfacePresence::Unverified(_)));
-        assert_eq!(entries(&fixture.directory), before);
-    }
+    store.record(CoreRecord::Owner).remove().unwrap();
+    let observation = Observation::read(&store).unwrap();
+    store
+        .write_owner(&session::test_support::copied_owner(id))
+        .unwrap();
+    let before = entries(&fixture.directory);
+    let answer = observation.evidence.judge_surface_presence_with(
+        &store,
+        Instant::now() + Duration::from_secs(2),
+        &|_, _, _| panic!("copy probed local terminal"),
+    );
+    assert!(matches!(answer, SurfacePresence::Unverified(_)));
+    assert_eq!(entries(&fixture.directory), before);
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]

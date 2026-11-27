@@ -920,7 +920,7 @@ closed; it is gone when the call ends. Anything that keeps the command's output 
 | `closed`, or a close tombstone | Refused from the records, before any terminal call |
 | Surface closed or being closed | Refused from the records, before any terminal call |
 | No active terminal handle, as during `launching` before the surface is bound | Refused from the records |
-| Handle bound to another session, or a terminal of another platform | Refused from the records |
+| Copy, handle bound to another session, or a terminal of another platform | Refused from the records |
 | Ghostty or Warp | Refused before any adapter: their scripting exposes no screen text |
 | Any other state, including `exited`, `failed` and an unrecognized state | Read when the ownership check passes, returned when the second check passes, refused or withheld otherwise |
 
@@ -1305,9 +1305,9 @@ The report starts human output with `scope`, describing the inputs used by these
 
 - `session` is the requested session id, or null in provider-only mode; `provider` is the
   recognized provider, or null when absent or unrecognized.
-- For a copy, `executable` is the path from the launch record, without local validation.
-  Otherwise it is the validated absolute executable path, or null if unusable.
-  `executable_source` is `launch_record` for a reported manifest path, `resolved_path` for
+- `executable` is the locally validated absolute executable path, or null. For a copy,
+  `executable` and `executable_source` are null and `configured.provider_path` retains the recorded path.
+  `executable_source` is `launch_record` for a validated manifest path, `resolved_path` for
   provider-only PATH resolution, or null. Session paths are never replaced through PATH.
 - `current_version` is the result of a successful version probe; otherwise it is null.
   `configured.provider_version_at_launch` remains separate historical evidence.
@@ -2305,8 +2305,8 @@ this field; it grants no additional close authority.
 
 Fields: `schema_version`, `ok`, `session`, `terminal`, `observed_unix_ms`, and `screen` (see
 [screen](#screen)). An error has `schema_version`, `ok: false`, `session` and `error`, and can
-carry the optional `failure_kind`: `unsupported` for Ghostty, Warp or a terminal of another
-platform, `timed_out` for a deadline that TAB observed expire. No error carries screen text.
+carry the optional `failure_kind`: `unsupported` for a copy refused at the binding check,
+Ghostty, Warp or a terminal of another platform, `timed_out` for a deadline that TAB observed expire. No error carries screen text.
 
 ### result
 

@@ -797,31 +797,25 @@ fn copied_screen_rechecks_evidence_before_each_ownership_proof() {
     }
     let surface = handle(terminal::TerminalKind::Herdr, Some(ID));
     let fixture = Fixture::new(SessionState::Ready, Some(&surface));
-    for alive in [true, false] {
-        Store::open_unchecked(&fixture.directory)
-            .record(CoreRecord::Owner)
-            .remove()
-            .unwrap();
-        let mut access = Fake::new(&fixture);
-        access.during_read = Some(make_copy);
-        let error = refusal(fixture.observe_while_records_change(&access).0);
-        assert_eq!(
-            classify(&error),
-            Some(FailureKind::Unsupported),
-            "{error:#}"
-        );
-        assert!(matches!(
-            &access.calls.borrow()[..],
-            [Call::Verify { .. }, Call::Read { .. }]
-        ));
-        let mut access = Fake::new(&fixture);
-        access.verified = vec![Err(if alive {
-            "unexpected live proof"
-        } else {
-            "unexpected gone proof"
-        })];
-        let error = refusal(fixture.observe(&access).0);
-        assert_eq!(classify(&error), Some(FailureKind::Unsupported));
-        assert!(access.calls.borrow().is_empty());
-    }
+    Store::open_unchecked(&fixture.directory)
+        .record(CoreRecord::Owner)
+        .remove()
+        .unwrap();
+    let mut access = Fake::new(&fixture);
+    access.during_read = Some(make_copy);
+    let error = refusal(fixture.observe_while_records_change(&access).0);
+    assert_eq!(
+        classify(&error),
+        Some(FailureKind::Unsupported),
+        "{error:#}"
+    );
+    assert!(matches!(
+        &access.calls.borrow()[..],
+        [Call::Verify { .. }, Call::Read { .. }]
+    ));
+    let mut access = Fake::new(&fixture);
+    access.verified = vec![Err("unexpected ownership proof")];
+    let error = refusal(fixture.observe(&access).0);
+    assert_eq!(classify(&error), Some(FailureKind::Unsupported));
+    assert!(access.calls.borrow().is_empty());
 }

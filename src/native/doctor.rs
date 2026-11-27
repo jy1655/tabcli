@@ -523,9 +523,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     let mut scope_workspace = None;
     let mut consent_state = Value::Null;
     if let Some(provider) = provider {
-        if copied_session {
-            executable = manifest.as_ref().map(|m| m.provider_path.clone());
-        } else {
+        if !copied_session {
             let observed = match installation.take() {
                 Some(observed) => observed,
                 None => observe_installation(

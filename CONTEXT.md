@@ -237,8 +237,8 @@ _Avoid_: parent, launcher process
 The record of a session's owner, read under one policy by every reader (no link, a regular
 file, a bound size, UTF-8; anything else is unreadable) and judged by its binding: bound to the
 session, unbound (a legacy record) or foreign (naming another session). For a native session Repair attests the
-recorded process whatever the binding. A Copy has no local owner liveness for observation or Repair. Only a
-bound record grants control authority.
+recorded process whatever the binding. A Copy has no local owner liveness. Only a bound record
+grants control authority.
 _Avoid_: owner file, native-session record
 
 **Residual surface**:
