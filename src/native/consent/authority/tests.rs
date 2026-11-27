@@ -593,7 +593,7 @@ fn a_claude_target_with_no_entry_requires_exact_scope_for_another_providers_cons
             ),
         })
     );
-    // A .git file in the workspace makes it the exact scope of a prospective grant.
+    // A regular .git file establishes the scope here even with an enclosing repository.
     fs::write(workspace.join(".git"), "").unwrap();
     assert_eq!(
         verdict(&session, FirstPartyCli::Claude, &fixture),

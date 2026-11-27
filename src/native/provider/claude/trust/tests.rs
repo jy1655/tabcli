@@ -39,9 +39,6 @@ fn exact_scope_preserves_no_spawn_matching_refusal_and_runner_errors() {
     require_exact_scope_with(&workspace, &mut git).unwrap();
     assert_eq!(git.calls, 0);
     std::fs::create_dir(root.join(".git")).unwrap();
-    require_exact_scope_with(&workspace, &mut git).unwrap();
-    assert_eq!(git.calls, 0);
-    std::fs::remove_dir(workspace.join(".git")).unwrap();
     git.answer = Some(Ok(output(&workspace, true)));
     require_exact_scope_with(&workspace, &mut git).unwrap();
     assert_eq!(git.calls, 1);
@@ -120,13 +117,9 @@ fn absent_claude_entry_skips_git_with_or_without_a_workspace_git_file() {
     }
 }
 
-#[test]
-fn listed_claude_workspace_with_its_own_git_file_uses_its_exact_entry_without_git() {
-    let (directory, workspace) = nested_workspace();
-    write_git_file(&workspace);
-    let env = consent::Environment::at_home(directory.path());
-    let store = trust_store(&env).unwrap();
-    let native = consent::native_key(&workspace).unwrap();
+fn list_workspace(workspace: &Path, env: &consent::Environment) -> Trust {
+    let store = trust_store(env).unwrap();
+    let native = consent::native_key(workspace).unwrap();
     let key = if cfg!(windows) {
         native.replace('\\', "/")
     } else {
@@ -137,18 +130,51 @@ fn listed_claude_workspace_with_its_own_git_file_uses_its_exact_entry_without_gi
         &serde_json::json!({"projects": {&key: {"hasTrustDialogAccepted": true}}}),
     )
     .unwrap();
+    Trust::Trusted(Evidence {
+        provider: "claude".into(),
+        store,
+        key,
+    })
+}
+
+#[test]
+fn listed_claude_workspace_with_its_own_git_file_uses_its_exact_entry_without_git() {
+    let (directory, workspace) = nested_workspace();
+    write_git_file(&workspace);
+    let env = consent::Environment::at_home(directory.path());
+    let expected = list_workspace(&workspace, &env);
     let mut git = FakeGitScope {
         calls: 0,
-        answer: Some(Ok(output(&workspace, true))),
+        answer: None,
     };
-    let found = workspace_trust_with(&workspace, &env, None, &mut git).unwrap();
-    assert_eq!(git.calls, 0);
     assert_eq!(
-        found,
-        Trust::Trusted(Evidence {
-            provider: "claude".into(),
-            store,
-            key
-        })
+        workspace_trust_with(&workspace, &env, None, &mut git).unwrap(),
+        expected
     );
+    assert_eq!(git.calls, 0);
+}
+
+#[test]
+fn listed_nested_workspace_with_a_git_directory_uses_the_root_git_reports() {
+    let (directory, workspace) = nested_workspace();
+    std::fs::create_dir(workspace.join(".git")).unwrap();
+    let env = consent::Environment::at_home(directory.path());
+    let expected = list_workspace(&workspace, &env);
+    let parent = workspace.parent().unwrap();
+    for root in [parent, &workspace] {
+        let mut git = FakeGitScope {
+            calls: 0,
+            answer: Some(Ok(output(root, true))),
+        };
+        let found = workspace_trust_with(&workspace, &env, None, &mut git);
+        assert_eq!(git.calls, 1);
+        if root == parent {
+            assert_eq!(
+                found.unwrap_err().to_string(),
+                "Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog"
+            );
+        } else {
+            assert_eq!(found.unwrap(), expected);
+        }
+    }
 }

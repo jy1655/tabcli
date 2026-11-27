@@ -46,8 +46,9 @@ its decision, TAB does not silently choose another provider as the source.
 
 TAB reads Claude's trust store first and checks Git scope only for an accepted workspace entry.
 Applying another provider's consent to Claude also requires an exact scope.
-For these checks, a launch folder with its own `.git` file or directory is its own top level
-without running Git.
+A regular `.git` file in the launch folder establishes that folder as its own top level without
+running Git. With a `.git` directory in the launch folder, TAB asks Git for the top level only
+when an ancestor contains a `.git` entry.
 
 Linked git worktrees are the one exception to the directory rule. See the
 [consent rule, its limits and registration repair](agents/trust.md).

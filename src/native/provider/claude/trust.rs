@@ -285,9 +285,11 @@ impl GitScope for ProcessGitScope {
 
 fn require_exact_scope_with(workspace: &Path, git: &mut impl GitScope) -> Result<()> {
     // Claude saves Git-subdirectory approval at the root; exact child consent cannot authorize it.
-    // A local .git file or directory marks this folder as its own top level.
+    // A regular .git file marks the top level here. With a .git directory, an ancestor
+    // marker still requires Git to identify the root.
     match std::fs::symlink_metadata(workspace.join(".git")) {
-        Ok(entry) if entry.is_file() || entry.is_dir() => return Ok(()),
+        Ok(entry) if entry.is_file() => return Ok(()),
+        Ok(entry) if entry.is_dir() => {}
         Ok(_) => {
             bail!("cannot verify Claude's Git workspace trust scope; use its own trust dialog")
         }
