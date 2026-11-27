@@ -40,7 +40,7 @@
   Codex's configuration, from Git, or from a screen that merely lacks the dialog's
   words: an empty screen is not evidence, and a wrong inference pastes an Enter onto
   "Trust and continue".
-- Exact workspace consent takes precedence over inherited consent
+- When acquiring a source, TAB considers inheritance only if no provider trusts the workspace exactly
   (`exact_trust_comes_first_and_consent_extends_to_no_child_or_parent`).
 - A linked worktree can inherit the consent of its main working tree when Git's registration
   identifies both trees and the main tree's pinned source, identity and consent still hold
