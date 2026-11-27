@@ -206,7 +206,7 @@ impl Session {
         }
     }
 
-    /// Settles the session as the wrapper does after `provision` returned.
+    /// Settles the session after `provision` without checking a wrapper owner.
     fn finalize(&self, result: &Result<()>) {
         launch::finalize(&Store::open_unchecked(&self.directory), result).unwrap();
     }
@@ -618,4 +618,106 @@ fn a_wrapper_settling_its_timeout_after_the_launchers_deadline_leaves_the_launch
     assert_eq!(session.record().unwrap().phase, Phase::Pending);
     assert!(!session.probe_started.exists());
     assert!(!session.provider_started.exists());
+}
+
+fn registered_owner() -> crate::native::terminal::ownership::NativeSessionOwner {
+    crate::native::terminal::ownership::NativeSessionOwner {
+        pid: 42,
+        managed_session_id: Some("session-version1".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn registered_wrapper_starts_and_settles_its_provider() {
+    let session = session(PROMPT);
+    session.begin_unhurried();
+    let store = Store::open_unchecked(&session.directory);
+    launch::wrapper::run_registered(
+        &store,
+        || Ok(registered_owner()),
+        |_, _, _| {
+            let recorded = crate::native::session::owner::observe(&store)
+                .decoded()?
+                .unwrap();
+            assert_eq!(recorded.owner.pid, 42);
+            assert!(
+                fs::read_to_string(session.directory.join(launch::LOG))?.contains("owner_recorded")
+            );
+            Ok(VERSION.into())
+        },
+    )
+    .unwrap();
+    assert!(session.provider_started.exists());
+    assert_eq!(store.status().unwrap().state, SessionState::Exited);
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+    let log = fs::read_to_string(session.directory.join(launch::LOG)).unwrap();
+    assert_eq!(log.matches("owner_recorded").count(), 1);
+}
+
+#[test]
+fn registered_wrapper_preserves_the_complete_spawn_error() {
+    for settlement_fails in [false, true] {
+        let session = session(PROMPT);
+        session.begin_unhurried();
+        let store = Store::open_unchecked(&session.directory);
+        let error = launch::wrapper::run_registered(
+            &store,
+            || Ok(registered_owner()),
+            |_, path, _| {
+                fs::remove_file(path)?;
+                if settlement_fails {
+                    fs::create_dir(store.record(CoreRecord::Completion).path())?;
+                }
+                Ok(VERSION.into())
+            },
+        )
+        .unwrap_err();
+        let returned = format!("{error:#}");
+        let prefix = format!(
+            "failed to start claude at {}: failed to spawn provider process: ",
+            session.provider.display()
+        );
+        assert!(returned.starts_with(&prefix), "{returned}");
+        assert_eq!(returned.matches("failed to start claude").count(), 1);
+        if settlement_fails {
+            assert!(returned.contains("finalization also failed"), "{returned}");
+        } else {
+            assert_eq!(
+                store.status().unwrap().error.as_deref(),
+                Some(returned.as_str())
+            );
+        }
+    }
+}
+
+#[test]
+fn late_wrapper_leaves_provider_files_intact() {
+    let session = session(PROMPT);
+    session.begin_unhurried();
+    let store = Store::open_unchecked(&session.directory);
+    let settings = session.directory.join("claude-settings.json");
+    let hook = session.directory.join("claude-mod/hooks/register.js");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&settings, b"recorded settings").unwrap();
+    fs::write(&hook, b"recorded hook").unwrap();
+    let error = launch::wrapper::run_registered(
+        &store,
+        || Ok(registered_owner()),
+        |_, _, _| {
+            let mut receipt = session.record().unwrap();
+            receipt.phase = Phase::Spawned;
+            store.record(CoreRecord::Launch).write_json(&receipt)?;
+            store.write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
+                pid: 43,
+                ..registered_owner()
+            })?;
+            Ok(VERSION.into())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(fs::read(&settings).unwrap(), b"recorded settings");
+    assert_eq!(fs::read(&hook).unwrap(), b"recorded hook");
+    assert!(!session.directory.join("claude-mod/.claude-plugin").exists());
+    assert!(error.to_string().contains("already attempted"));
 }
