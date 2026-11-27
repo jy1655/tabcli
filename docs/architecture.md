@@ -413,12 +413,17 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   yields the record's bytes under one policy (no link at the final component, a regular file,
   at most 128 KiB, strict UTF-8; any violation is unreadable), `judge` decodes them and judges
   their binding to the Session (bound, unbound or foreign), and attestation is made on request.
-  Every reader uses it: Repair, launch repair, prune and the macOS running wait attest the
-  recorded process whatever the binding; the close authority and the surface-ownership probe
-  keep requiring a bound record; Origin feeds its budgeted bytes (read
-  within the same 128 KiB bound) to the same decoder; and the query Judgment attests every
-  recorded owner, reporting an unbound or foreign one for its liveness only, so `tell`'s
-  prediction and `wait` agree with Repair.
+  On native sessions Repair, launch repair and prune attest the recorded process whatever the binding.
+  An active handle bound to the session can identify a copy by a stated unsupported kind or
+  another platform's Herdr host birth. A completed consumption marker with a stated unsupported
+  kind or a bound owner with another platform's recorded identity can also identify a copy.
+  A claimed handle, an implicit kind and a marker with repeated `consumed` or `terminal` fields
+  supply no copy evidence. Once an explicit close consumes a Herdr handle whose birth was the
+  only evidence of a copy, the remaining records are indistinguishable from a local session's.
+  The close authority and surface-ownership probe require a bound owner for owner control.
+  Origin uses the same owner decoder within its 128 KiB read bound.
+  The public wait and the owner judgments predicting Repair use local process liveness only
+  for sessions whose records supply no evidence of a copy.
   Owner attestation separates incarnation birth from recorded TTY/process-group control,
   preserves inspection errors, and projects the
   public OwnerObservation. It takes only an owner value and OS observations, never a Store

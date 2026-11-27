@@ -122,7 +122,7 @@ fn parse_options(args: &[String]) -> Result<StatusRequest> {
 /// Status's owner attention: a live owner whose identity was not compared is not flagged,
 /// and an Unknown attestation is unverified, never exited (B3). A record not bound to this
 /// session is flagged by the death Repair acts on, and is otherwise unverified.
-fn owner_flag(owner: &OwnerJudgment) -> Option<AttentionFlag> {
+pub(super) fn owner_flag(owner: &OwnerJudgment) -> Option<AttentionFlag> {
     match owner.bound() {
         Some(BoundOwner::Exited) => Some(AttentionFlag::OwnerExited),
         Some(BoundOwner::Reused | BoundOwner::ControlChanged) => {
@@ -241,8 +241,18 @@ fn result_command(candidate: ResultCandidate, id: &str) -> Option<String> {
 }
 
 fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
-    let judgment = observed.observation.evidence.judge_owner();
-    let owner = owner_value(judgment);
+    let local = observed
+        .observation
+        .evidence
+        .repair_owner_with(&judgment::Observers::SYSTEM);
+    let judgment = local.unwrap_or(&OwnerJudgment::Absent);
+    let owner = local.map_or_else(
+        || OwnerObservation {
+            error: Some("session recorded on another operating system".into()),
+            ..OwnerObservation::default()
+        },
+        owner_value,
+    );
     let flags = attention(&observed, judgment, &origin);
     let observation = &observed.observation;
     let records = &observation.records;

@@ -14,7 +14,11 @@ process inside WSL would use tmux, but has not been verified. See [CLI commands]
 
 TAB refuses operations that need a terminal adapter for a kind this system does not run.
 The adapter lookup reports `<Name> is not available on <system>; use <the kinds that system runs>`.
-If closing the surface is refused, TAB keeps the handle. Close the session on the system that created it.
+If closing the surface is refused, TAB keeps the handle. When the records identify a session copied from another operating system, an explicit close
+settles a failed, exited or already closed session from its records alone.
+A completed consumption marker also permits replay, and a recorded host failure or elapsed
+launch deadline can establish that an unconfirmed launch failed.
+If the records leave the session running, close it on the system that created it.
 
 ## Selection and settings
 

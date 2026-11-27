@@ -22,6 +22,10 @@ use crate::native::terminal::close_authority::owner_exit::{RepairSurface, Repair
 use crate::native::terminal::ownership::NativeSessionOwner;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::OwnerBinding;
+use terminal::{
+    close_authority::CloseCause,
+    foreign::{CopyEvidence, SurfaceRecords},
+};
 
 use anyhow::{Context, Result, bail};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -359,10 +363,14 @@ impl Reader {
 }
 
 impl Reader {
-    /// Prune attests the recorded process whatever Session the record names; a record that
+    /// For a native session prune attests the recorded process whatever Session the record names; a record that
     /// cannot be read or decoded blocks it.
     pub(in crate::native) fn native_owner_blocks_prune(&self) -> Result<bool> {
-        Ok(match super::owner::observe(self) {
+        let owner = super::owner::observe(self);
+        if SurfaceRecords::read(self).evidence(self, &owner).is_some() {
+            return Ok(false);
+        }
+        Ok(match owner {
             OwnerRecord::Absent => false,
             OwnerRecord::Unreadable(_) | OwnerRecord::Malformed { .. } => true,
             OwnerRecord::Recorded(recorded) => prune_blocked_by(&attest_owner(&recorded.owner)),
@@ -372,6 +380,7 @@ impl Reader {
 
 // Repairs a dead native owner first, then closes. A repair failure is the recorded close
 // error; otherwise `reason` (if any) is kept in the closed status.
+#[cfg(test)]
 pub(in crate::native) fn close(
     store: &Store,
     reason: Option<String>,
@@ -383,6 +392,7 @@ pub(in crate::native) fn close(
 
 // Runs the same close procedure, with only the owner's OS observation supplied by
 // the caller. Recovery, repair policy, surface retention and close ordering stay fixed.
+#[cfg(test)]
 pub(in crate::native) fn close_with_attestation(
     store: &Store,
     reason: Option<String>,
@@ -390,10 +400,29 @@ pub(in crate::native) fn close_with_attestation(
     observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
     closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
 ) -> Result<terminal::CloseOutcome> {
-    close_transaction(
+    close_for_cause(
         store,
         reason,
-        |marker| repair_attested_locked(store, observe, deadline, marker),
+        CloseCause::Explicit,
+        deadline,
+        observe,
+        closer,
+    )
+}
+
+pub(in crate::native) fn close_for_cause(
+    store: &Store,
+    reason: Option<String>,
+    cause: CloseCause,
+    deadline: Instant,
+    observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+) -> Result<terminal::CloseOutcome> {
+    close_transaction_for(
+        store,
+        reason,
+        cause,
+        |marker, records| repair_attested_locked(store, observe, deadline, marker, records),
         closer,
         deadline,
     )
@@ -424,10 +453,29 @@ fn close_with_repair(
     close_transaction(store, reason, |_| repair(), closer, deadline)
 }
 
+#[cfg(test)]
 fn close_transaction(
     store: &Store,
     reason: Option<String>,
     repair: impl FnOnce(&mut MarkerHistory) -> Result<bool>,
+    close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+    deadline: std::time::Instant,
+) -> Result<terminal::CloseOutcome> {
+    close_transaction_for(
+        store,
+        reason,
+        CloseCause::Explicit,
+        |marker, _| repair(marker),
+        close_terminal,
+        deadline,
+    )
+}
+
+fn close_transaction_for(
+    store: &Store,
+    reason: Option<String>,
+    cause: CloseCause,
+    repair: impl FnOnce(&mut MarkerHistory, CloseRecords) -> Result<bool>,
     mut close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
@@ -441,7 +489,12 @@ fn close_transaction(
         Ok(()) => error,
     })?;
     let mut marker = MarkerHistory::default();
-    let repair_error = match repair(&mut marker) {
+    let initial = CloseRecords::acquire(store, &mut marker)?;
+    if let Some(copy) = initial.evidence(store) {
+        settle_copy(store, &mut marker, initial, copy, cause, reason)?;
+        return Ok(terminal::CloseOutcome::Missing);
+    }
+    let repair_error = match repair(&mut marker, initial) {
         Err(error) if error.is::<CloseRecordChanged>() => return Err(error),
         Err(error) => Some(format!("pre-close session repair failed: {error:#}")),
         Ok(_) => None,
@@ -456,6 +509,7 @@ fn close_transaction(
     close_session_state_locked(
         store,
         &mut marker,
+        Some(cause),
         repair_error.or(reason),
         |surface| {
             let result = close_terminal(surface)?;
@@ -467,6 +521,7 @@ fn close_transaction(
     Ok(outcome)
 }
 
+#[cfg(test)]
 fn close_session_state_with_error<F>(
     store: &Store,
     close_error: Option<String>,
@@ -482,24 +537,54 @@ where
     close_session_state_locked(
         store,
         &mut MarkerHistory::default(),
+        Some(CloseCause::Explicit),
         close_error,
         close_terminal,
         deadline,
     )
+    .map(|_| ())
 }
 
 fn close_session_state_locked<F>(
     store: &Store,
     marker: &mut MarkerHistory,
-    mut close_error: Option<String>,
-    mut close_terminal: F,
+    cause: Option<CloseCause>,
+    close_error: Option<String>,
+    close_terminal: F,
     deadline: Instant,
-) -> Result<()>
+) -> Result<bool>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
 {
-    let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let records = CloseRecords::acquire(store, marker)?;
+    if let Some(copy) = records.evidence(store) {
+        return match cause {
+            Some(cause) => {
+                settle_copy(store, marker, records, copy, cause, close_error).map(|_| true)
+            }
+            None => Ok(false), // Standalone dead-owner Repair reclassified under the lock.
+        };
+    }
+    close_native_locked(
+        store,
+        marker,
+        records,
+        close_error,
+        close_terminal,
+        deadline,
+    )?;
+    Ok(true)
+}
+
+fn close_native_locked(
+    store: &Store,
+    marker: &mut MarkerHistory,
+    records: CloseRecords,
+    mut close_error: Option<String>,
+    mut close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+    deadline: Instant,
+) -> Result<()> {
+    let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let status = records.status?;
     if status.state == SessionState::Closed {
         let consume_result =
@@ -535,8 +620,8 @@ where
             record.deadline_unix_ms
         );
     }
-    let active = records.active.decode(store);
-    let claimed = records.closing.decode(store);
+    let active = records.active.handle;
+    let claimed = records.closing.handle;
     let renamed = match store.claim_terminal_handle()? {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -573,9 +658,9 @@ where
         let handle = handle.ok_or(CloseRecordChanged("terminal handle"))?;
         let bytes = after_claim
             .closing
-            .bytes
+            .handle
             .context(CloseRecordChanged("claimed terminal handle"))?;
-        if bytes.as_deref() != Some(handle.bytes.as_slice()) {
+        if bytes.as_ref().map(|h| &h.bytes) != Some(&handle.bytes) {
             return Err(CloseRecordChanged("terminal handle").into());
         }
         handle.decoded
@@ -589,6 +674,11 @@ where
                 } else {
                     Err(restore)
                 };
+            }
+            if error.is::<CloseRecordChanged>()
+                && let Some(copy) = CloseRecords::acquire(store, marker)?.evidence(store)
+            {
+                return Err(copy.refusal());
             }
             return Err(error);
         }
@@ -673,7 +763,7 @@ impl std::error::Error for CloseRecordChanged {}
 
 struct HandleSlot {
     name: CoreRecord,
-    bytes: Result<Option<Vec<u8>>>,
+    handle: Result<Option<AcquiredHandle>>,
 }
 
 struct AcquiredHandle {
@@ -683,35 +773,68 @@ struct AcquiredHandle {
 
 impl HandleSlot {
     fn read(store: &Store, name: CoreRecord) -> Self {
-        Self {
-            name,
-            bytes: store.record(name).bytes(),
-        }
+        let record = store.record(name);
+        let handle = record.bytes().map(|bytes| {
+            bytes.map(|bytes| {
+                let decoded = std::str::from_utf8(&bytes)
+                    .map_err(|_| super::primitives::invalid_record_text(record.path()))
+                    .and_then(|text| {
+                        terminal::TerminalSession::decode_with_stated_kind(text)
+                            .with_context(|| format!("invalid JSON in {}", record.path().display()))
+                    });
+                AcquiredHandle { bytes, decoded }
+            })
+        });
+        Self { name, handle }
     }
 
     fn present(&self, store: &Store) -> Result<bool> {
-        match &self.bytes {
+        match &self.handle {
             Ok(value) => Ok(value.is_some()),
             Err(_) => store.record(self.name).present(),
         }
     }
 
-    fn decode(self, store: &Store) -> Result<Option<AcquiredHandle>> {
-        let record = store.record(self.name);
-        Ok(self.bytes?.map(|bytes| {
-            let decoded = std::str::from_utf8(&bytes)
-                .map_err(|_| super::primitives::invalid_record_text(record.path()))
-                .and_then(|text| {
-                    terminal::TerminalSession::decode_with_stated_kind(text)
-                        .with_context(|| format!("invalid JSON in {}", record.path().display()))
-                });
-            AcquiredHandle { bytes, decoded }
-        }))
+    fn retained_kind(self) -> Result<Option<terminal::TerminalKind>> {
+        self.handle?
+            .map(|h| {
+                h.decoded
+                    .map(|(surface, _)| surface.kind)
+                    .or_else(|error| {
+                        // Preserve the retention reader's UTF-8 and JSON diagnostics.
+                        super::record::utf8(&h.bytes)?;
+                        Err(anyhow::Error::new(error.downcast::<serde_json::Error>()?))
+                    })
+                    .with_context(|| {
+                        format!("invalid retained terminal handle {}", self.name.name())
+                    })
+            })
+            .transpose()
+    }
+
+    fn validate(self, store: &Store) -> Result<Option<Option<terminal::TerminalKind>>> {
+        self.handle?
+            .map(|handle| {
+                let (surface, kind) = handle.decoded?;
+                if surface.id.is_empty() {
+                    bail!("terminal handle has an empty surface ID");
+                }
+                surface.verify_managed_session(super::owner::session_of(store))?;
+                Ok(kind)
+            })
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "invalid terminal handle {}",
+                    store.record(self.name).path().display()
+                )
+            })
     }
 }
 
 #[derive(Clone, Default)]
 struct MarkerFacts {
+    completed: Option<Option<terminal::TerminalKind>>,
     committed: bool,
     reason: Option<String>,
 }
@@ -722,6 +845,7 @@ impl MarkerFacts {
             .ok()
             .and_then(|text| super::record::consumption_marker(text).ok())
             .map(|marker| Self {
+                completed: marker.completed(),
                 committed: marker.committed(),
                 reason: marker.reason().map(str::to_owned),
             })
@@ -786,16 +910,37 @@ struct CloseRecords {
     status: Result<SessionStatus>,
     closed: Result<Option<SessionStatus>>,
     marker: Result<Option<MarkerFacts>>,
+    owner: OwnerRecord,
     active: HandleSlot,
     closing: HandleSlot,
 }
 
 impl CloseRecords {
+    fn evidence(&self, store: &Store) -> Option<CopyEvidence> {
+        terminal::foreign::judge(
+            super::owner::session_of(store),
+            self.active
+                .handle
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .and_then(|h| h.decoded.as_ref().ok()),
+            self.marker
+                .as_ref()
+                .ok()
+                .and_then(|m| m.as_ref())
+                .and_then(|m| m.completed)
+                .flatten(),
+            &self.owner,
+        )
+    }
+
     fn acquire(store: &Store, history: &mut MarkerHistory) -> Result<Self> {
         let marker = history.observe(store).map(|facts| facts.cloned());
         match marker {
             Err(error) if error.is::<CloseRecordChanged>() => Err(error),
             marker => Ok(Self {
+                owner: super::owner::observe(store),
                 status: store.status(),
                 closed: store.closed_if_present(),
                 marker,
@@ -838,6 +983,26 @@ fn committed_consumption_marker(store: &Store) -> Result<bool> {
         .is_some_and(|facts| facts.committed))
 }
 
+fn publish_consumption(
+    store: &Store,
+    history: &mut MarkerHistory,
+    committed: bool,
+    terminal_kind: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    if committed {
+        return Ok(());
+    }
+    let mut value = serde_json::json!({"consumed":true,"terminal":terminal_kind});
+    if let Some(reason) = reason {
+        value["reason"] = reason.into();
+    }
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let facts = MarkerFacts::decode(&bytes);
+    history.written = Some((bytes, facts));
+    store.write_terminal_closed(&value)
+}
+
 fn consume_terminal_handle(
     store: &Store,
     history: &mut MarkerHistory,
@@ -849,24 +1014,13 @@ fn consume_terminal_handle(
     // a later close of the closed session, neither rewrites its reason nor its kind. A damaged
     // one (not a marker, or `consumed: false`) is written again, as before os-parity.
     let tombstone_result = facts.and_then(|facts| {
-        if facts.is_some_and(|marker| marker.committed) {
-            return Ok(());
-        }
-        let mut marker = serde_json::json!({
-            "consumed": true,
-            "terminal": terminal_kind,
-        });
-        if let Some(reason) = reason {
-            marker["reason"] = reason.into();
-        }
-        history.written = Some((
-            serde_json::to_vec_pretty(&marker)?,
-            MarkerFacts {
-                committed: true,
-                reason: reason.map(str::to_owned),
-            },
-        ));
-        store.write_terminal_closed(&marker)
+        publish_consumption(
+            store,
+            history,
+            facts.is_some_and(|m| m.committed),
+            terminal_kind,
+            reason,
+        )
     });
     #[cfg(test)]
     if tombstone_result.is_ok() {
@@ -1028,7 +1182,6 @@ fn mark_session_closed_with_residual_locked(
     error: Option<String>,
     residual_surface: Option<ResidualSurface>,
 ) -> Result<()> {
-    let directory = store.directory();
     let records = CloseRecords::acquire(store, marker)?;
     let facts = records.marker?;
     let error = merge_close_reason(error, facts.as_ref().and_then(|facts| facts.reason.clone()));
@@ -1048,6 +1201,114 @@ fn mark_session_closed_with_residual_locked(
     {
         return consume_result;
     }
+    finish_closed(
+        store,
+        marker,
+        claim_path,
+        error,
+        residual_surface,
+        consume_result,
+        None,
+    )
+}
+
+struct ValidatedSlots {
+    active: bool,
+    closing: bool,
+}
+
+fn settle_copy(
+    store: &Store,
+    history: &mut MarkerHistory,
+    records: CloseRecords,
+    copy: CopyEvidence,
+    cause: CloseCause,
+    reason: Option<String>,
+) -> Result<()> {
+    if cause != CloseCause::Explicit {
+        return Err(copy.refusal());
+    }
+    let active = records.active.validate(store)?;
+    let closing = records.closing.validate(store)?;
+    let facts = records.marker?;
+    let completed = facts.as_ref().filter(|m| m.completed.is_some());
+    let tombstone = records.closed?;
+    let already_closed = tombstone.is_some();
+    let mut status = match tombstone {
+        Some(closed) if closed.state == SessionState::Closed => closed,
+        Some(_) => bail!(
+            "{} does not record a closed session",
+            store.record(CoreRecord::Closed).path().display()
+        ),
+        None => records.status?,
+    };
+    if status.state == SessionState::Launching && completed.is_none() {
+        launch::repair_locked_records_only(store, Ok(status))?;
+        status = store.status()?;
+    }
+    if !status.state.ended() && completed.is_none() {
+        return Err(copy.refusal());
+    }
+    let claim = store.record(CoreRecord::TurnClaim);
+    let mut reason = merge_close_reason(reason, status.error);
+    if !already_closed
+        && let Err(error) =
+            recover_pending_completion_from_tombstone_locked(store.directory(), claim.path(), None)
+    {
+        reason = merge_close_reason(
+            reason,
+            Some(format!("completion recovery failed: {error:#}")),
+        );
+    }
+    budget::check()?;
+    if let Some(saved) = completed.and_then(|m| m.reason.clone()) {
+        reason = merge_close_reason(reason, Some(saved));
+    } else {
+        reason = merge_close_reason(
+            reason,
+            Some(
+                "settled from its records alone; no terminal or process was observed or closed"
+                    .into(),
+            ),
+        );
+    }
+    publish_consumption(
+        store,
+        history,
+        completed.is_some(),
+        active
+            .or(closing)
+            .flatten()
+            .map(terminal::TerminalKind::as_str),
+        reason.as_deref(),
+    )?;
+    #[cfg(test)]
+    interruption::at(interruption::Point::ConsumptionMarkerWritten);
+    budget::check()?;
+    finish_closed(
+        store,
+        history,
+        claim.path(),
+        reason,
+        None,
+        Ok(()),
+        Some(ValidatedSlots {
+            active: active.is_some(),
+            closing: closing.is_some(),
+        }),
+    )
+}
+
+fn finish_closed(
+    store: &Store,
+    marker: &mut MarkerHistory,
+    claim_path: &Path,
+    error: Option<String>,
+    residual_surface: Option<ResidualSurface>,
+    consume_result: Result<()>,
+    copy_slots: Option<ValidatedSlots>,
+) -> Result<()> {
+    let directory = store.directory();
     marker.check_for_change(store)?;
     let status_result = update_status_with_residual(
         directory,
@@ -1057,6 +1318,22 @@ fn mark_session_closed_with_residual_locked(
         residual_surface,
     );
     marker.check_for_change(store)?;
+    if status_result.is_ok()
+        && let Some(slots) = copy_slots
+    {
+        if slots.closing {
+            store.record(CoreRecord::TerminalClosing).remove()?;
+        }
+        RecordStore::at(
+            &store
+                .directory()
+                .join(super::names::TERMINAL_CLOSE_INTENT_FILE),
+        )
+        .remove()?;
+        if slots.active {
+            store.record(CoreRecord::Terminal).remove()?;
+        }
+    }
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
         // An event the journal disagrees with is set aside first, then the claim is
         // released, and only then is the journal removed: every interruption of this order
@@ -1128,6 +1405,7 @@ fn repair_attested_locked(
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
     deadline: Instant,
     marker: &mut MarkerHistory,
+    records: CloseRecords,
 ) -> Result<bool> {
     #[cfg(windows)]
     let mut close = |surface: &terminal::TerminalSession| {
@@ -1144,12 +1422,13 @@ fn repair_attested_locked(
     let surfaces = RepairSurfaces::Posix;
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let surfaces = RepairSurfaces::Unsupported;
-    repair_owner(
+    repair_owner_from(
         store,
         |owner| repair_owner_is_live(&attest(owner)),
         surfaces,
         deadline,
         Some(marker),
+        Some(records),
     )
 }
 
@@ -1207,7 +1486,18 @@ fn repair_owner(
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
     surfaces: RepairSurfaces<'_>,
     deadline: Instant,
+    locked: Option<&mut MarkerHistory>,
+) -> Result<bool> {
+    repair_owner_from(store, owner_is_live, surfaces, deadline, locked, None)
+}
+
+fn repair_owner_from(
+    store: &Store,
+    owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
+    surfaces: RepairSurfaces<'_>,
+    deadline: Instant,
     mut locked: Option<&mut MarkerHistory>,
+    initial: Option<CloseRecords>,
 ) -> Result<bool> {
     let directory = store.directory();
     // Completion recovery runs first so a live owner's finished turn is published before
@@ -1219,11 +1509,14 @@ fn repair_owner(
     // owner cannot be shown dead, the damage is the result.
     let claim = store.record(CoreRecord::TurnClaim);
     let recovery_damage = if let Some(marker) = locked.as_deref_mut() {
-        CloseRecords::acquire(store, marker)?
-            .closed
-            .and_then(|tombstone| {
-                recover_pending_completion_from_tombstone_locked(directory, claim.path(), tombstone)
-            })
+        match initial {
+            Some(records) => records,
+            None => CloseRecords::acquire(store, marker)?,
+        }
+        .closed
+        .and_then(|tombstone| {
+            recover_pending_completion_from_tombstone_locked(directory, claim.path(), tombstone)
+        })
     } else {
         recover_pending_completion(directory)
     }
@@ -1239,22 +1532,24 @@ fn repair_owner(
     let launch_pending = if let Some(marker) = locked.as_deref_mut() {
         // Recovery can have published an event or restored status before a later error.
         let records = CloseRecords::acquire(store, marker)?;
-        launch::repair_locked(store, records.status)?
+        if records.evidence(store).is_some() {
+            return untouched(recovery_damage);
+        }
+        launch::repair_locked(store, records.status, records.owner)?
     } else {
         launch::repair(store)?
     };
     if launch_pending {
         return untouched(recovery_damage);
     }
-    let status = match locked.as_deref_mut() {
-        Some(marker) => CloseRecords::acquire(store, marker)?.status?,
-        None => store.status()?,
-    };
-    if !repair_examines_owner(&status.state) {
+    let mut fresh = MarkerHistory::default();
+    let records = CloseRecords::acquire(store, locked.as_deref_mut().unwrap_or(&mut fresh))?;
+    let copied = records.evidence(store).is_some();
+    let status = records.status?;
+    if copied || !repair_examines_owner(&status.state) {
         return untouched(recovery_damage);
     }
-    // Repair attests the recorded process whatever Session the record names.
-    let Some(owner) = super::owner::observe(store).decoded()? else {
+    let Some(owner) = records.owner.decoded()? else {
         return untouched(recovery_damage);
     };
     let owner = owner.owner;
@@ -1270,7 +1565,13 @@ fn repair_owner(
         repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
     }
     let repair_error = Some(repair_error);
-    match surfaces.decide(store, &status.state, deadline)? {
+    match surfaces.decide(&status.state, deadline, |retention| {
+        retention.retains(
+            store,
+            || records.active.retained_kind(),
+            || records.closing.retained_kind(),
+        )
+    })? {
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         RepairSurface::Retain => return untouched(recovery_damage),
         RepairSurface::Settle(retention) => {
@@ -1284,7 +1585,15 @@ fn repair_owner(
             };
             let mut fresh = MarkerHistory::default();
             let marker = locked.unwrap_or(&mut fresh);
-            if !repair_examines_owner(&store.status()?.state) || retention.retains(store)? {
+            let records = CloseRecords::acquire(store, marker)?;
+            if records.evidence(store).is_some()
+                || !repair_examines_owner(&records.status?.state)
+                || retention.retains(
+                    store,
+                    || records.active.retained_kind(),
+                    || records.closing.retained_kind(),
+                )?
+            {
                 return untouched(recovery_damage);
             }
             mark_session_closed_locked(store, marker, claim.path(), repair_error)?;
@@ -1294,18 +1603,29 @@ fn repair_owner(
             let closer = |surface: &terminal::TerminalSession| {
                 close.close(surface, deadline).map(Into::into)
             };
-            match locked {
-                Some(marker) => budget::check().and_then(|()| {
-                    close_session_state_locked(store, marker, repair_error, closer, deadline)
-                }),
-                None => close_session_state_with_error(store, repair_error, closer, deadline),
+            let run = |marker: &mut MarkerHistory| {
+                close_session_state_locked(store, marker, None, repair_error, closer, deadline)
+            };
+            let changed = match locked {
+                Some(marker) => budget::check().and_then(|()| run(marker)),
+                None => (|| {
+                    let _budget = budget::Scope::enter(deadline);
+                    budget::close_remaining(deadline)?;
+                    let _lock = store.lock()?;
+                    run(&mut MarkerHistory::default())
+                })(),
             }
             .context(context)?;
+            if !changed {
+                return untouched(recovery_damage);
+            }
         }
     }
     Ok(true)
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod copy_tests;
 #[cfg(test)]
 mod owner_read_tests;
 #[cfg(test)]

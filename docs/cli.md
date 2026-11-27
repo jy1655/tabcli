@@ -600,8 +600,8 @@ null. Attention does not change session or request state. Owner exit, identity m
 missing observations are distinct facts; closed sessions have no owner liveness flags. A live
 owner whose identity was not observed is not flagged; a failed identity check is reported as
 `owner_unverified`. A bound owner whose attestation could not decide is `owner_unverified` only,
-never `owner_exited`, even when its process id looked absent. An unbound legacy owner record, or
-one of another managed session, is flagged by the death dead-owner repair acts on: `owner_exited`
+never `owner_exited`, even when its process id looked absent. An open copy has `owner_unverified` and unknown local owner liveness. For native sessions an
+unbound legacy owner record, or one of another managed session, is flagged by the death dead-owner repair acts on: `owner_exited`
 when its recorded process exited, `owner_identity_mismatch` when its process id now belongs to
 another process, and `owner_unverified` otherwise.
 Each session carries `origin` and `origin_observation`: the managed session recorded as the
@@ -735,7 +735,7 @@ for `pi_input_ack_unsupported`.
 not offer Windows input acknowledgement (schema 2 with `input_ack_schema: 1`), as with an older
 extension.
 
-`owner_ended` means the recorded owner is verified gone, and `tell` refuses. Dead-owner repair
+`owner_ended` means the recorded owner is verified gone, and `tell` refuses. Dead-owner repair skips the local owner check for a copy. For a native session it
 attests the recorded process whatever session the owner record names, so this applies to an
 unbound legacy record and to one of another managed session as well. Its dead-owner repair
 usually closes such a session, but may leave it open for an explicit `close-session`. On macOS this
@@ -743,7 +743,7 @@ happens when a close is already pending, or when the terminal can outlive its ow
 Ghostty, Warp, WezTerm). For Herdr on every platform, see [Herdr close](terminals.md#closing-a-herdr-session).
 On any platform it happens for a launch that was never confirmed, which
 launch repair settles instead. `recovery_required` means a completion journal is pending, and
-recovery can change every later gate. `owner_unverified` means the recorded owner's process could
+recovery can change every later gate. `owner_unverified` means the native session's recorded owner process could
 not be inspected (whatever session the record names), which dead-owner repair also cannot judge,
 or, past the terminal handle, that a bound owner's control identity could not be read. The other two owner reasons are judged only past the
 terminal handle, as part of the surface ownership check: a missing or unusable handle refuses
@@ -1146,7 +1146,8 @@ later record deletion or damage is an error, not a pending request.
 
 The wait ends on `completed`, `failed`, `cancelled`, `unresolved`, or `recovery_required`, or when a recorded
 owner is no longer live or a closed, failed, or exited session leaves the request unresolved.
-An owner is no longer live only when the recorded owner's process exited or its process id now
+A copy's pending wait uses its recorded results and state without comparing a local PID.
+For a native session an owner is no longer live only when the recorded owner's process exited or its process id now
 belongs to another process, whatever session the owner record names, as dead-owner repair attests
 it. A live owner with a changed TTY or process group, an attestation that could not decide (an
 unbound legacy record whose recorded birth could not be inspected included), and an unreadable
@@ -1740,7 +1741,7 @@ positive supported whole day count, and `--explicit` acknowledges deletion. Ther
 retention policy or dry-run flag.
 
 Both the close tombstone and status must say `closed` and be at or before the retention cutoff.
-Active capabilities or a blocking owner prevent pruning. Invalid, unsafe, or ineligible entries are
+Active capabilities prevent pruning. A local owner can block pruning only while the records provide no evidence of a copy. Invalid, unsafe, or ineligible entries are
 skipped; pruning never closes a running session to make it eligible.
 
 Human output says `pruned SESSION` per removal and gives a count, or `no eligible closed TAB
@@ -1855,8 +1856,7 @@ deep: a session started from a listed session is reported, never closed. It requ
 `--explicit` like the close itself; without the flag the command and its output are unchanged.
 The scan is the one described above, with the same bounds, and runs only after SESSION closed.
 
-Each listed session goes through the same close as an explicit `close-session` of it: the
-dead-owner repair, the owner attestation and the terminal-close authority checks. The
+Each listed session has the same native close requirements or record-only copy settlement as an explicit `close-session` of it. The
 recorded origin grants nothing; a session that its own explicit close would refuse is refused
 here with the same error. Immediately before each close, TAB re-reads the session's records
 and compares them with what the scan saw. A session that is not what the scan listed is
@@ -2264,14 +2264,15 @@ owner record, `owner.identity_matches: true` means every recorded identity field
 applies to intermediate macOS records containing birth and TTY but no process groups; it
 does not assert that unrecorded fields were verified. PID-only or otherwise unattested
 records keep the match null; an unreadable identity also keeps it null and reports an error.
-Launch repair fails an unconfirmed launch on a mismatch, and status and doctor report
+For a native session, launch repair can fail an unconfirmed launch on verified PID reuse, and status and doctor report
 `owner_identity_mismatch`; a pending public wait ends as unresolved only when the process id was
 reused. A verified intermediate
 record can therefore report an available owner in doctor; an inspection failure remains
 unverified. These effects apply to macOS intermediate records as well as Windows records.
 Completed Results still take precedence. These observations alone grant no general Surface
 close authority.
-Every owner record is attested as dead-owner repair attests it, whatever session it names. An
+Inspect reports the recorded owner attestation whatever session it names. Its prediction of
+dead-owner repair skips local owner liveness for a copy. An
 unbound legacy record, and a record of another managed session, report only that liveness:
 `owner.process_alive` (with `owner.identity_matches: false` when the process id now belongs to
 another process, and the reason in `owner.error` when the attestation could not decide), never a

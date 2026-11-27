@@ -38,7 +38,7 @@ pub(in crate::native) enum OwnerRecord {
 #[derive(Debug)]
 pub(in crate::native) struct RecordedOwner {
     pub(in crate::native) owner: NativeSessionOwner,
-    /// The binding to the Session the record was read for. Lifecycle readers attest the
+    /// The binding to the Session the record was read for. Native lifecycle readers attest the
     /// recorded process whatever it is; only a Bound record grants control authority.
     pub(in crate::native) binding: OwnerBinding,
 }
@@ -88,7 +88,7 @@ pub(in crate::native) fn absent(reader: &Reader) -> bool {
     matches!(read(reader), Ok(None))
 }
 
-fn session_of(reader: &Reader) -> &str {
+pub(in crate::native) fn session_of(reader: &Reader) -> &str {
     reader
         .directory()
         .file_name()
@@ -149,7 +149,8 @@ pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
 }
 
 /// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
-/// Launch repair attests the recorded process whatever Session the record names.
+/// Native launch repair attests the recorded process whatever Session the record names.
+#[cfg(test)]
 pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
     Ok(observe(reader)
         .decoded()?

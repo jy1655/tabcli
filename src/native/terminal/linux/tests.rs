@@ -488,7 +488,7 @@ fn interrupted_created_host_close_consumes_records_without_a_second_signal() {
         std::fs::create_dir(&dir).unwrap();
         let store = Store::open_unchecked(&dir);
         update_status(&dir, SessionState::Ready, None, None).unwrap();
-        let surface:TerminalSession=serde_json::from_value(serde_json::json!({"terminal":"warp","session_id":"fixture","managed_session_id":"session-hostclose"})).unwrap();
+        let surface:TerminalSession=serde_json::from_value(serde_json::json!({"terminal":"tmux","session_id":"fixture","managed_session_id":"session-hostclose"})).unwrap();
         store
             .record(CoreRecord::Terminal)
             .write_json(&surface)

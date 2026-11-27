@@ -368,10 +368,12 @@ pub(super) fn close_session_surface(
     cause: CloseCause,
     deadline: std::time::Instant,
 ) -> Result<()> {
-    session::close::close(
+    session::close::close_for_cause(
         &Store::open_unchecked(directory),
         reason,
+        cause,
         deadline,
+        session::owner::attest_owner,
         |session| terminal::ownership::close_owned_surface(directory, id, session, cause, deadline),
     )
     .map(|_| ())

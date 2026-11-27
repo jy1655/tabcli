@@ -4,6 +4,7 @@ pub(in crate::native) mod host;
 pub(super) use close_evidence::for_kind as close_evidence;
 use std::time::Duration;
 pub(super) mod facts;
+pub(in crate::native) mod foreign;
 mod linux_birth;
 pub(in crate::native) use linux_birth::LinuxBirth;
 
@@ -1200,13 +1201,8 @@ mod tests {
         )
     }
 
-    // An explicit close of a stored handle whose kind this OS does not run gets this OS's
-    // lookup refusal, whatever the session's records say, the same on every OS: an ownerless
-    // failed launch (on Windows Terminal.app, Warp and WezTerm used to get the startup rule's
-    // own refusal instead) and a session whose owner record comes from another OS (macOS and
-    // Linux used to answer with the owner's attestation instead). The handle, the state and
-    // the absent tombstone stay as they were, and a retry gets the same answer, so the close
-    // can still be made where the terminal runs.
+    // An unsupported bound kind settles an ended copy. A running copy keeps the
+    // platform's lookup refusal, its handle and its state on every attempt.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn explicit_close_of_another_oss_handle_gets_the_lookup_refusal_and_keeps_it() {
@@ -1237,42 +1233,50 @@ mod tests {
             if kind.supported_on_this_platform() {
                 continue;
             }
-            for owner in [None, Some(foreign_owner())] {
-                let root = tempfile::tempdir().unwrap();
-                let directory = root.path().join("session-foreign");
-                std::fs::create_dir_all(directory.join("events")).unwrap();
-                update_status(&directory, SessionState::Failed, None, None).unwrap();
-                let store = Store::open_unchecked(&directory);
-                if let Some(owner) = &owner {
-                    store.write_owner(owner).unwrap();
-                }
-                store
-                    .write_terminal(
-                        &TerminalSession::new(kind, "surface".into())
-                            .with_binding(Some("session-foreign".into())),
-                    )
-                    .unwrap();
-                let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
-                let case = format!("{kind:?}, owner {}", owner.is_some());
-                for _attempt in 0..2 {
-                    let error = crate::native::close::close_session_surface(
-                        &directory,
-                        "session-foreign",
-                        None,
-                        super::close_authority::CloseCause::Explicit,
-                        crate::native::session::close::budget::close_deadline(),
-                    )
-                    .unwrap_err();
-                    assert_eq!(format!("{error:#}"), this_os_refusal(kind), "{case}");
-                    assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
-                    assert_eq!(
-                        store.record(CoreRecord::Terminal).bytes().unwrap(),
-                        handle,
-                        "{case}"
-                    );
-                    assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
-                    assert_eq!(store.status().unwrap().state, SessionState::Failed);
-                    assert!(store.closed_if_present().unwrap().is_none(), "{case}");
+            for state in [SessionState::Failed, SessionState::Ready] {
+                for owner in [None, Some(foreign_owner())] {
+                    let root = tempfile::tempdir().unwrap();
+                    let directory = root.path().join("session-foreign");
+                    std::fs::create_dir_all(directory.join("events")).unwrap();
+                    update_status(&directory, state.clone(), None, None).unwrap();
+                    let store = Store::open_unchecked(&directory);
+                    if let Some(owner) = &owner {
+                        store.write_owner(owner).unwrap();
+                    }
+                    store
+                        .write_terminal(
+                            &TerminalSession::new(kind, "surface".into())
+                                .with_binding(Some("session-foreign".into())),
+                        )
+                        .unwrap();
+                    let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
+                    let case = format!("{kind:?}, owner {}", owner.is_some());
+                    for _attempt in 0..2 {
+                        let result = crate::native::close::close_session_surface(
+                            &directory,
+                            "session-foreign",
+                            None,
+                            super::close_authority::CloseCause::Explicit,
+                            crate::native::session::close::budget::close_deadline(),
+                        );
+                        if state == SessionState::Failed {
+                            result.unwrap();
+                            assert_eq!(store.status().unwrap().state, SessionState::Closed);
+                            assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+                            continue;
+                        }
+                        let error = result.unwrap_err();
+                        assert_eq!(format!("{error:#}"), this_os_refusal(kind), "{case}");
+                        assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
+                        assert_eq!(
+                            store.record(CoreRecord::Terminal).bytes().unwrap(),
+                            handle,
+                            "{case}"
+                        );
+                        assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+                        assert_eq!(store.status().unwrap().state, SessionState::Ready);
+                        assert!(store.closed_if_present().unwrap().is_none(), "{case}");
+                    }
                 }
             }
         }

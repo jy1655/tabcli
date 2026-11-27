@@ -84,6 +84,9 @@ pub(super) fn value(
         &super::capabilities::FollowUpEvidence {
             held: &observation.evidence.held,
             recovery_required: judgments.recovery_required,
+            repair_owner: observation
+                .evidence
+                .repair_owner_with(&super::observation::judgment::Observers::SYSTEM),
             owner: owner_judgment,
             surface: &judgments.surface,
             reopened: resumed_from.is_some(),

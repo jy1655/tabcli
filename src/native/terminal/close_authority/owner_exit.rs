@@ -317,22 +317,30 @@ pub(in crate::native) enum Retention {
 }
 
 impl Retention {
-    pub(in crate::native) fn retains(self, reader: &Reader) -> Result<bool> {
+    pub(in crate::native) fn retains(
+        self,
+        _reader: &Reader,
+        active: impl FnOnce() -> Result<Option<TerminalKind>>,
+        claimed: impl FnOnce() -> Result<Option<TerminalKind>>,
+    ) -> Result<bool> {
+        let has_kind = |retains: fn(TerminalKind) -> bool| -> Result<bool> {
+            Ok(active()?.is_some_and(retains) || claimed()?.is_some_and(retains))
+        };
         match self {
             // Even an invalid intent is evidence of possible interrupted teardown.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            Self::Posix => Ok(reader
+            Self::Posix => Ok(_reader
                 .record(crate::native::session::CoreRecord::TerminalCloseIntent)
                 .bytes()?
                 .is_some()
-                || has_retained_handle(reader, outlives_owner)?),
+                || has_kind(outlives_owner)?),
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-            Self::CoreKept => has_retained_handle(reader, core_retains_finished),
+            Self::CoreKept => has_kind(core_retains_finished),
             #[cfg(test)]
             Self::WithoutSurface => {
                 use crate::native::session::CoreRecord;
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
-                if reader
+                if _reader
                     .record(CoreRecord::TerminalCloseIntent)
                     .bytes()?
                     .is_some()
@@ -340,7 +348,7 @@ impl Retention {
                     return Ok(true);
                 }
                 for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-                    if reader.record(record).present()? {
+                    if _reader.record(record).present()? {
                         bail!("a parity row records no surface");
                     }
                 }
@@ -348,7 +356,7 @@ impl Retention {
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             Self::Nothing => {
-                let _ = reader;
+                let _ = (_reader, has_kind);
                 Ok(false)
             }
         }
@@ -358,25 +366,25 @@ impl Retention {
 impl<'a> RepairSurfaces<'a> {
     pub(in crate::native) fn decide(
         self,
-        reader: &Reader,
         state: &SessionState,
         deadline: Instant,
+        retains: impl FnOnce(Retention) -> Result<bool>,
     ) -> Result<RepairSurface<'a>> {
         match self {
             #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
-            Self::WithoutSurface => retain_or(reader, Retention::WithoutSurface, || {
+            Self::WithoutSurface => retain_or(retains, Retention::WithoutSurface, || {
                 Ok(RepairSurface::Settle(Retention::WithoutSurface))
             }),
             // No surface can be retained here; the settlement checks the fixture again.
             #[cfg(all(test, not(any(target_os = "macos", target_os = "linux", windows))))]
             Self::WithoutSurface => Ok(RepairSurface::Settle(Retention::WithoutSurface)),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            Self::Posix => retain_or(reader, Retention::Posix, || {
+            Self::Posix => retain_or(retains, Retention::Posix, || {
                 Ok(RepairSurface::Settle(Retention::Posix))
             }),
             // As on macOS and Linux, only an explicit close ends a terminal its core keeps.
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-            Self::Windows(close) => retain_or(reader, Retention::CoreKept, || {
+            Self::Windows(close) => retain_or(retains, Retention::CoreKept, || {
                 if matches!(state, SessionState::Exited | SessionState::Failed) {
                     close_remaining(deadline)?;
                     return Ok(RepairSurface::Settle(Retention::CoreKept));
@@ -385,7 +393,7 @@ impl<'a> RepairSurfaces<'a> {
             }),
             #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             Self::Unsupported | Self::Windows(_) => {
-                let _ = (reader, state, deadline);
+                let _ = (retains, state, deadline);
                 Ok(RepairSurface::Settle(Retention::Nothing))
             }
         }
@@ -394,33 +402,14 @@ impl<'a> RepairSurfaces<'a> {
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn retain_or<'a>(
-    reader: &Reader,
+    retains: impl FnOnce(Retention) -> Result<bool>,
     retention: Retention,
     otherwise: impl FnOnce() -> Result<RepairSurface<'a>>,
 ) -> Result<RepairSurface<'a>> {
-    if retention.retains(reader)? {
+    if retains(retention)? {
         return Ok(RepairSurface::Retain);
     }
     otherwise()
-}
-
-// Preserve the active-before-claimed read order, including stopping at the first match.
-// A damaged handle can be a surviving surface and must never be settled as absent.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn has_retained_handle(reader: &Reader, retains: fn(TerminalKind) -> bool) -> Result<bool> {
-    use crate::native::session::{CoreRecord, record};
-    use anyhow::Context as _;
-
-    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-        if let Some(bytes) = reader.record(record).bytes()? {
-            let surface = record::terminal_bytes(&bytes)
-                .with_context(|| format!("invalid retained terminal handle {}", record.name()))?;
-            if retains(surface.kind) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 pub(in crate::native) struct WindowsClose<'a> {

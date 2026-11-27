@@ -1619,24 +1619,7 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
             |handle| handle.get_mut("herdr_core").unwrap()["host_pid"] = json!(u32::MAX),
             PID,
         ),
-        (
-            "another platform's host birth",
-            |handle| {
-                let core = handle
-                    .get_mut("herdr_core")
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap();
-                core.retain(|key, _| {
-                    !matches!(
-                        key.as_str(),
-                        "host_start_seconds" | "host_start_microseconds" | "linux_birth"
-                    )
-                });
-                core.insert("host_creation_time".into(), json!(1));
-            },
-            BIRTH,
-        ),
+        ("another platform's host birth", another_host_birth, BIRTH),
     ]);
     #[cfg(target_os = "macos")]
     refused.push((
@@ -1659,16 +1642,7 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
     refused.extend([
         (
             "another platform's host birth",
-            (|handle| {
-                let core = handle
-                    .get_mut("herdr_core")
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap();
-                core.remove("host_creation_time");
-                core.insert("host_start_seconds".into(), json!(1_800_000_000));
-                core.insert("host_start_microseconds".into(), json!(1));
-            }) as Damage,
+            another_host_birth as Damage,
             BIRTH,
         ),
         (
@@ -1686,6 +1660,9 @@ fn a_creation_record_is_whole_exactly_when_a_released_writer_could_have_written_
             .record(CoreRecord::Terminal)
             .write_json(&value)
             .unwrap();
+        if label == "another platform's host birth" {
+            fixture.claim();
+        }
         fixture.remove();
         let refused = fixture
             .close(exited, false)
@@ -2824,4 +2801,40 @@ fn a_refusal_keeps_why_no_live_owner_was_verified() {
         "{text}"
     );
     assert_eq!(fixture.mutations(), (0, 0));
+}
+
+fn another_host_birth(handle: &mut serde_json::Map<String, Value>) {
+    let core = handle["herdr_core"].as_object_mut().unwrap();
+    core.retain(|key, _| {
+        !matches!(
+            key.as_str(),
+            "host_start_seconds" | "host_start_microseconds" | "linux_birth" | "host_creation_time"
+        )
+    });
+    if cfg!(windows) {
+        core.insert("host_start_seconds".into(), json!(1_800_000_000));
+        core.insert("host_start_microseconds".into(), json!(1));
+    } else {
+        core.insert("host_creation_time".into(), json!(1));
+    }
+}
+
+#[test]
+fn a_claimed_foreign_herdr_birth_is_evidence_only_after_restore() {
+    let fixture = Fixture::new("failed", &complete_owner());
+    let store = fixture.store();
+    let mut value = serde_json::to_value(store.terminal().unwrap()).unwrap();
+    another_host_birth(value.as_object_mut().unwrap());
+    store
+        .record(CoreRecord::Terminal)
+        .write_json(&value)
+        .unwrap();
+    fixture.claim();
+    assert!(fixture.close(exited, false).is_err());
+    fixture.assert_retained("restored", SessionState::Failed);
+    assert!(fixture.core.methods().is_empty());
+    assert_eq!(fixture.close(exited, false).unwrap(), CloseOutcome::Missing);
+    assert!(fixture.core.methods().is_empty());
+    assert!(fixture.console.methods().is_empty());
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
 }

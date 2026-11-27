@@ -161,7 +161,21 @@ fn observe(
     )
 }
 
-/// Each poll judges the Owner record afresh. Only a verified-gone owner ends the wait:
+pub(super) fn pending_owner(
+    reader: &Reader,
+    observers: &judgment::Observers<'_>,
+) -> judgment::OwnerJudgment {
+    let owner = session::owner::observe(reader);
+    if crate::native::terminal::foreign::SurfaceRecords::read(reader)
+        .evidence(reader, &owner)
+        .is_some()
+    {
+        return judgment::OwnerJudgment::Absent;
+    }
+    judgment::owner(&owner, observers)
+}
+
+/// Each pending native poll judges the Owner record afresh. Only a verified-gone owner ends the wait:
 /// a changed control identity, an Unknown attestation and a foreign record keep it (B2).
 fn observe_with_owner_state(
     snapshot: &Snapshot,
@@ -175,7 +189,7 @@ fn observe_with_owner_state(
     let mut observation = snapshot.observe_result(reader, selector)?;
     let mut owner = None;
     if !observation.state().ends_wait() {
-        let judgment = judgment::owner(&session::owner::observe(reader), observers);
+        let judgment = pending_owner(reader, observers);
         owner = Some(judgment.observation());
         observation = observation.with_owner(&judgment, snapshot.status.state.ended());
     }
@@ -625,6 +639,28 @@ mod tests {
         assert_eq!(fs::read(directory.join("status.json")).unwrap(), before);
         assert!(directory.join("turn.claim").exists());
         (value, ended == Some(WakeReason::RequestEnded))
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_pending_copy_wait_uses_no_local_owner_observation() {
+        let (value, ended) = pending_with_owner_written(
+            |directory| {
+                let kind = if cfg!(windows) {
+                    "tmux"
+                } else {
+                    "windows-console"
+                };
+                write_json_atomic(&directory.join("terminal.json"), &json!({"terminal":kind,"session_id":"surface","managed_session_id":"session-fault"})).unwrap();
+                write_json_atomic(&directory.join("native-session.json"), &json!({"pid":42}))
+                    .unwrap();
+            },
+            &judgment::Observers {
+                attest: &|_| panic!("copy owner observed"),
+            },
+        );
+        assert!(!ended);
+        assert!(value["owner_process_alive"].is_null());
     }
 
     #[test]
