@@ -1,11 +1,12 @@
-use super::record::{applied, authorized_with};
+use super::authority::{Authority, Consented, authority};
+use super::record::{self, LAUNCH_OPTION_UNAVAILABLE, Restore, transition};
 use super::store::{Environment, Trust, user_home};
 use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
 use crate::native::session::{Reader, schema::SessionManifest};
 use crate::native::{provider, terminal};
 use agent_bridge::FirstPartyCli;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail, ensure};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -81,9 +82,19 @@ pub(super) enum GuardedKey {
     },
 }
 
+// The session record's applied values that the dialog step writes or reads as its own.
+const RESPONSE_PENDING: &str = "workspace-dialog-response-pending";
+const RESPONSE_CONFIRMED: &str = "provider-workspace-dialog";
+
+// The one guarded response. The pending transition is written only while the record still
+// holds the applied value the step assessed (`assessed`), never over a pending value, and under
+// the record's lock taken by the step's deadline; the dispatch callback
+// asks the authority again after that write.
 fn respond_to_workspace_dialog(
     directory: &Path,
     guarded_key: GuardedKey,
+    assessed: Option<&str>,
+    deadline: Instant,
     input: &terminal::GuardedDialogInput,
     dispatch: impl FnOnce(&terminal::GuardedDialogInput) -> Result<bool>,
 ) -> Result<bool> {
@@ -92,7 +103,17 @@ fn respond_to_workspace_dialog(
             "the workspace trust dialog cannot be answered with a guarded key in {surface}; no key was sent; use the provider's own workspace trust prompt, then launch again"
         );
     }
-    applied(directory, "workspace-dialog-response-pending")?;
+    if assessed == Some(RESPONSE_PENDING)
+        || !transition(
+            directory,
+            assessed,
+            Some(RESPONSE_PENDING),
+            deadline,
+            Instant::now,
+        )?
+    {
+        bail!("workspace consent changed before trust dialog response");
+    }
     dispatch(input)
 }
 
@@ -172,7 +193,29 @@ struct OpenDialog<'a> {
     guarded_key: GuardedKey,
 }
 
+// A test's hook that runs at the start of every liveness check of the dialog step, with whether
+// the step has responded: a test lets time pass during that check there.
+#[cfg(test)]
+type LivenessHook = Box<dyn FnMut(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    static DURING_LIVENESS_CHECK: std::cell::RefCell<Option<LivenessHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn during_liveness_check(hook: Option<LivenessHook>) {
+    DURING_LIVENESS_CHECK.with(|slot| *slot.borrow_mut() = hook);
+}
+
 fn require_launch_dialog_live(directory: &Path, responded: bool) -> Result<()> {
+    #[cfg(test)]
+    DURING_LIVENESS_CHECK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(responded);
+        }
+    });
     let status = Reader::open_unchecked(directory)
         .status()
         .map_err(|error| launch_dialog_error(error, responded))?;
@@ -207,8 +250,17 @@ impl LaunchDialog<'_> {
             directory, target, ..
         } = self;
         require_launch_dialog_live(directory, false)?;
-        if !authorized_with(directory, target, env)? {
-            return Ok(());
+        // One typed answer decides the step. A key only for exact consent that the launch did
+        // not already apply through the target's own launch option: then the provider was told
+        // to trust the workspace and its adapter's input gate waits for its own evidence. Never
+        // for inherited consent: "Yes" would have the provider save the worktree as exact
+        // trust, and TAB writes no provider store.
+        let authority = authority(directory, target, env)?;
+        match dialog_consent(&authority, target)
+            .map_err(|error| launch_dialog_error(error, false))?
+        {
+            DialogConsent::Answerable => {}
+            DialogConsent::NoKey => return Ok(()),
         }
         let manifest = Reader::open_unchecked(directory).manifest()?;
         let bypass = if manifest.yolo {
@@ -285,11 +337,42 @@ impl LaunchDialog<'_> {
                     .map_err(|error| launch_dialog_error(error, responded))?,
                 Trust::Trusted(_)
             );
+            // The time of a confirmation is the time of the store read that shows it, taken before
+            // the liveness check that follows.
+            let confirmed_at = (trusted && responded).then(|| clock.now());
             require_launch_dialog_live(directory, responded)?;
             if trusted {
-                if responded {
-                    applied(directory, "provider-workspace-dialog")
-                        .context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")?;
+                if let Some(confirmed_at) = confirmed_at {
+                    // Recorded only within the step's deadline: a confirmation first observed at or
+                    // after it is reported as
+                    // observed late. A confirmation observed in time whose record cannot take it
+                    // in time (the lock held until the deadline, or the deadline reached once the
+                    // lock is held, on the same clock and boundary as here, also during the
+                    // liveness check above) is reported as confirmed with its recording failed.
+                    // Nothing is sent again either way, and the pending
+                    // marker stays.
+                    if confirmed_at >= deadline {
+                        bail!(
+                            "provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried"
+                        );
+                    }
+                    transition(
+                        directory,
+                        Some(RESPONSE_PENDING),
+                        Some(RESPONSE_CONFIRMED),
+                        deadline,
+                        || clock.now(),
+                    )
+                    .and_then(|recorded| {
+                        ensure!(
+                            recorded,
+                            "the session's consent record no longer holds this step's pending response"
+                        );
+                        Ok(())
+                    })
+                    .map_err(|error| {
+                        error.context("provider trust is confirmed; recording the TAB applied marker failed; no input was retried")
+                    })?;
                 }
                 return Ok(());
             }
@@ -318,13 +401,7 @@ impl LaunchDialog<'_> {
                 {
                     return Ok(());
                 }
-                if !authorized_with(directory, target, env)
-                    .map_err(|error| launch_dialog_error(error, false))?
-                {
-                    bail!(
-                        "workspace consent changed before trust dialog response; no response sent"
-                    );
-                }
+                self.require_answerable(env)?;
                 let screen = surface
                     .screen(&manifest.id, deadline)
                     .map_err(|error| launch_dialog_error(error, false))?;
@@ -343,21 +420,44 @@ impl LaunchDialog<'_> {
                         clock.sleep(Duration::from_millis(200).min(remaining));
                         continue;
                     }
-                    if !authorized_with(directory, target, env)
-                        .map_err(|error| launch_dialog_error(error, false))?
-                    {
-                        bail!(
-                            "workspace consent changed before trust dialog response; no response sent"
-                        );
-                    }
+                    let assessed = self.require_answerable(env)?;
                     require_launch_dialog_live(directory, false)?;
                     if clock.now() >= deadline {
                         continue;
                     }
                     let mut attempted = false;
+                    // Every path that proves the key unsent returns the record from this step's
+                    // own pending value to what the step assessed; only a
+                    // dispatch that may have sent the key keeps it. A record that another writer
+                    // already changed is left as it is. A restore that fails (the lock held until
+                    // the deadline, the record not writable) ends the step and says so with the
+                    // unsent key; the pending value then refuses any later
+                    // attempt.
+                    // A value another writer put there is kept, and the step stops.
+                    let restore = || match record::restore(
+                        directory,
+                        RESPONSE_PENDING,
+                        assessed.as_deref(),
+                        deadline,
+                    ) {
+                        Ok(Restore::Restored | Restore::Assessed) => None,
+                        Ok(Restore::ChangedBy(value)) => Some(format!(
+                            "the key was not sent, and the pending response marker was changed by another writer (now {})",
+                            value.as_deref().unwrap_or("none")
+                        )),
+                        Err(error) => Some(format!(
+                            "the key was not sent, and the pending response marker could not be restored ({error:#})"
+                        )),
+                    };
+                    let unsent = |error: anyhow::Error| match restore() {
+                        Some(failed) => error.context(failed),
+                        None => error,
+                    };
                     responded = respond_to_workspace_dialog(
                         directory,
                         guarded_key,
+                        assessed.as_deref(),
+                        deadline,
                         &terminal::GuardedDialogInput {
                             screen,
                             key,
@@ -365,12 +465,40 @@ impl LaunchDialog<'_> {
                             expires_unix_ms: Some(expires_unix_ms),
                         },
                         |input| {
-                            require_launch_dialog_live(directory, false)?;
+                            require_launch_dialog_live(directory, false).map_err(unsent)?;
                             if clock.now() >= deadline {
-                                bail!("workspace trust response deadline expired before dispatch");
+                                return Err(unsent(anyhow::anyhow!(
+                                    "workspace trust response deadline expired before dispatch"
+                                )));
+                            }
+                            // The authority's yes is consumed here, after the pending write and
+                            // immediately before the key: exact consent with this step's own
+                            // pending record. Otherwise the key is proven unsent.
+                            let now = authority(directory, target, env).map_err(unsent)?;
+                            if now.verdict != Ok(Consented::Exact)
+                                || now.applied.as_deref() != Some(RESPONSE_PENDING)
+                            {
+                                return Err(unsent(anyhow::anyhow!(
+                                    "workspace consent changed before trust dialog response"
+                                )));
                             }
                             attempted = true;
-                            surface.answer(input, deadline)
+                            match surface.answer(input, deadline) {
+                                // The surface saw a changed screen and sent nothing.
+                                Ok(false) => match restore() {
+                                    Some(failed) => {
+                                        attempted = false;
+                                        Err(anyhow::anyhow!(
+                                            "the screen changed before the key; {failed}"
+                                        ))
+                                    }
+                                    None => Ok(false),
+                                },
+                                Err(error) if error.is::<terminal::StaleDialogClaim>() => {
+                                    Err(unsent(error))
+                                }
+                                other => other,
+                            }
                         },
                     )
                     .map_err(|error| {
@@ -388,6 +516,64 @@ impl LaunchDialog<'_> {
             let remaining = deadline.saturating_duration_since(clock.now());
             clock.sleep(Duration::from_millis(200).min(remaining));
         }
+    }
+}
+
+// Whether the launch dialog step may answer the dialog with a key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DialogConsent {
+    Answerable,
+    NoKey,
+}
+
+// The step's reading of the one typed authority result, with every applied value handled
+// explicitly. No key for no consent or inherited consent, for consent that the launch applied
+// through the target's own option, or once the provider confirmed an earlier answer. For a
+// target whose adapter declares a launch option, the key remains only for a launch that
+// recorded the option as unavailable (a provider positively identified as older); an
+// inconclusive launch never falls back to it. Eligibility comes from what the launch recorded,
+// never from the dialog step's own pending value: a pending response that this step reads here
+// is not its own (it reads the record only before its own write), so it refuses, as do another
+// adapter's launch option and a value the step does not know.
+fn dialog_consent(authority: &Authority, target: FirstPartyCli) -> Result<DialogConsent> {
+    let Ok(consented) = authority.verdict else {
+        return Ok(DialogConsent::NoKey);
+    };
+    let own = provider::applied_marker(target);
+    let applied = authority.applied.as_deref();
+    let legacy = match applied {
+        Some(marker) if own == Some(marker) => return Ok(DialogConsent::NoKey),
+        Some(marker) if provider::launch_trust_markers().any(|known| known == marker) => {
+            bail!("the session's consent record names another provider's launch option ({marker})")
+        }
+        Some(RESPONSE_CONFIRMED) => return Ok(DialogConsent::NoKey),
+        Some(RESPONSE_PENDING) => bail!(
+            "a trust dialog response is already pending for this session (another attempt owns it, or its key may have been sent)"
+        ),
+        None => false,
+        Some(LAUNCH_OPTION_UNAVAILABLE) if own.is_some() => true,
+        Some(other) => {
+            bail!("the session's consent record holds an unknown launch value ({other})")
+        }
+    };
+    if consented != Consented::Exact || (own.is_some() && !legacy) {
+        return Ok(DialogConsent::NoKey);
+    }
+    Ok(DialogConsent::Answerable)
+}
+
+impl LaunchDialog<'_> {
+    // Before reading the screen and again before the pending write: the authority still finds
+    // exact consent that the step may answer. Returns the applied value it assessed.
+    fn require_answerable(&self, env: &Environment) -> Result<Option<String>> {
+        let authority = authority(self.directory, self.target, env)
+            .map_err(|error| launch_dialog_error(error, false))?;
+        let consent = dialog_consent(&authority, self.target)
+            .map_err(|error| launch_dialog_error(error, false))?;
+        if consent != DialogConsent::Answerable {
+            bail!("workspace consent changed before trust dialog response; no response sent");
+        }
+        Ok(authority.applied)
     }
 }
 

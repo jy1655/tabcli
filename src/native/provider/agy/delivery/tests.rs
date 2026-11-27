@@ -74,6 +74,10 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
         let result = prepared.deliver(
             "iterm2",
             &mut (),
+            || {
+                order.borrow_mut().push("dispatch-check");
+                Ok(())
+            },
             |_| {
                 order.borrow_mut().push("paste");
                 match failure {
@@ -100,9 +104,9 @@ fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
             },
         );
         let expected = if matches!(failure, "not-sent" | "send-uncertain") {
-            vec!["trust", "ready-read", "paste"]
+            vec!["trust", "ready-read", "dispatch-check", "paste"]
         } else {
-            vec!["trust", "ready-read", "paste", "receipt"]
+            vec!["trust", "ready-read", "dispatch-check", "paste", "receipt"]
         };
         assert_eq!(*order.borrow(), expected);
         match failure {
@@ -124,6 +128,7 @@ fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         26060,
         "apple-terminal",
         &mut (),
+        || Ok(()),
         |_| {
             sends.set(sends.get() + 1);
             Ok(())
@@ -153,6 +158,7 @@ fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         10,
         "iterm2",
         &mut (),
+        || Ok(()),
         |_| {
             sends.set(sends.get() + 1);
             Ok(())
@@ -169,6 +175,7 @@ fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         10,
         "iterm2",
         &mut (),
+        || Ok(()),
         |_| {
             Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
                 "deadline"
@@ -349,4 +356,62 @@ fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_
         "the turn claim stays until the caller closes or the target completes"
     );
     assert!(read_pending_turn(&directory).unwrap().is_some());
+}
+
+// The trace's paste timestamps surround the actual send. A trust check
+// that refuses immediately before the paste leaves them empty and records the input as not
+// sent; a paste that goes ahead is timed without the check.
+#[test]
+fn a_refused_dispatch_check_leaves_the_paste_timestamps_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    install_pending_turn(tmp.path(), "1-2-3").unwrap();
+    let trace_path = tmp.path().join("agy-input-1-2-3.json");
+    let prepared =
+        PreparedTerminalTurn::prepare_with(tmp.path(), &mut (), |_| Ok(()), |_| Ok(26060)).unwrap();
+    let sends = std::cell::Cell::new(0);
+    let error = prepared
+        .deliver(
+            "iterm2",
+            &mut (),
+            || bail!("consent withdrawn"),
+            |_| {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+    assert!(!error.delivery_may_have_occurred());
+    assert_eq!(sends.get(), 0);
+    let trace: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&trace_path).unwrap()).unwrap();
+    assert_eq!(trace["outcome"], "not-sent");
+    assert!(trace["paste_started_unix_ms"].is_null(), "{trace}");
+    assert!(trace["paste_returned_unix_ms"].is_null(), "{trace}");
+    assert!(
+        trace["error"]
+            .as_str()
+            .unwrap()
+            .contains("consent withdrawn")
+    );
+    // A paste that goes ahead: the started timestamp is taken after the check.
+    let prepared =
+        PreparedTerminalTurn::prepare_with(tmp.path(), &mut (), |_| Ok(()), |_| Ok(26060)).unwrap();
+    let checked_at = std::cell::Cell::new(0);
+    prepared
+        .deliver(
+            "iterm2",
+            &mut (),
+            || {
+                std::thread::sleep(Duration::from_millis(5));
+                checked_at.set(crate::native::session::primitives::unix_ms());
+                Ok(())
+            },
+            |_| Ok(()),
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    let trace: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&trace_path).unwrap()).unwrap();
+    assert!(trace["paste_started_unix_ms"].as_u64().unwrap() as u128 >= checked_at.get());
 }

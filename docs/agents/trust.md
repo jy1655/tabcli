@@ -39,7 +39,38 @@
   and no view of the bottom pane is active. Do not infer the absence of the dialog from
   Codex's configuration, from Git, or from a screen that merely lacks the dialog's
   words: an empty screen is not evidence, and a wrong inference pastes an Enter onto
-  "Trust and continue". Consent that is shared with another provider stays exact.
+  "Trust and continue".
+- When acquiring a source, TAB considers inheritance only if no provider trusts the workspace exactly
+  (`exact_trust_comes_first_and_consent_extends_to_no_child_or_parent`).
+- A linked worktree can inherit the consent of its main working tree when Git's registration
+  identifies both trees and the main tree's pinned source, identity and consent still hold
+  (`a_verified_linked_worktree_inherits_the_consent_of_its_main_working_tree`).
+- Records without `repository_root` keep their earlier bytes and meaning, and an earlier release
+  checking an inherited source pin reports `source-reset` and never grants it.
+- A registration under another spelling of the worktree path, even one differing only in case,
+  does not supply inherited consent; use `git -c core.ignorecase=false worktree repair <worktree>`
+  to repair the registration.
+- `tabcli consent revoke` or `tabcli consent reset` on the main working tree withdraws TAB's
+  inherited consent and leaves providers' own trust and independent exact consent intact.
+  After a reset, a new `ask` can acquire consent again.
+- The worktree check verifies the registration by path, without directory-handle traversal,
+  against any content of the launch folder and any local user who cannot write the main working
+  tree's `.git` or an ancestor directory of either tree.
+- The worktree verifier may inspect a claimed main tree only when a provider store lists it
+  (`the_claimed_main_working_tree_is_screened_before_any_io_on_it`).
+- A session recheck needs the original consent pins and acquires none
+  (`a_recheck_requires_the_pins_and_acquires_nothing`).
+- Inheritance for a target requires readable trust decisions with no decline from the source
+  for the worktree or from the target for either tree
+  (`a_target_that_declines_the_worktree_or_its_main_working_tree_refuses`).
+- Consent is checked at the last point provider-neutral code controls for each trust-dependent act, so a change
+  after that point affects the next act and terminal backends keep their existing behavior.
+- Only a command carrying a trust option needs a spawn-time consent check
+  (`a_command_without_a_launch_option_starts_whatever_the_consent_record_holds`).
+- A grant must still match the provider, workspace, option and any settings file named by the
+  plan (`the_spawn_fence_asks_about_the_commands_own_launch_option`).
+- Inherited consent never authorizes a dialog key
+  (`applied_or_inherited_consent_takes_no_key`).
 - A wait for workspace trust ends when its session has ended, and looks at the session
   before it looks at the evidence: the launcher of a closed session must not wait until
   its deadline, and an ended session is never pasted into. This holds for the Codex wait

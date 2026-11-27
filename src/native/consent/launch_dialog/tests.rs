@@ -241,6 +241,8 @@ fn unsupported_dialog_response_preserves_consent_without_pending_input() {
                 session: &session,
             }
             .guarded_key(),
+            None,
+            Instant::now() + Duration::from_secs(3),
             &terminal::GuardedDialogInput {
                 expected_claim: None,
                 expires_unix_ms: None,
@@ -268,6 +270,8 @@ fn the_unguarded_refusal_names_the_surface_and_records_nothing() {
         let error = respond_to_workspace_dialog(
             &c.directory,
             guarded_key_of(kind),
+            None,
+            Instant::now() + Duration::from_secs(3),
             &terminal::GuardedDialogInput {
                 expected_claim: None,
                 expires_unix_ms: None,
@@ -357,7 +361,7 @@ fn complete_launch_reads_the_manifest_only_after_verified_consent() {
         fs::remove_file(&consent).unwrap();
         c.launch_complete(target).unwrap();
         replace_private(&consent, b"{");
-        let expected = super::super::record::authorized(&c.directory, target).unwrap_err();
+        let expected = crate::native::consent::authorized(&c.directory, target).unwrap_err();
         assert_eq!(
             format!("{:#}", c.launch_complete(target).unwrap_err()),
             format!("{expected:#}"),
@@ -374,7 +378,7 @@ fn an_authorization_error_propagates_before_the_manifest() {
     replace_private(&c.directory.join("manifest.json"), b"{");
     replace_private(&c.directory.join(SESSION_FILE), b"{");
     let expected =
-        super::super::record::authorized_with(&c.directory, FirstPartyCli::Claude, &c.stores.env)
+        super::super::authority::authority(&c.directory, FirstPartyCli::Claude, &c.stores.env)
             .unwrap_err();
     let policy = FakePolicy::with_start(&[Ok(ProviderStart::Started)]);
     let mut clock = FakeClock::new(Instant::now());
@@ -615,12 +619,281 @@ fn the_policy_settle_window_holds_the_response() {
     );
 }
 
+// A launching session whose consent is inherited: its workspace is a verified linked worktree
+// of a repository whose main working tree Pi trusts exactly.
+fn inherited(provider: FirstPartyCli, yolo: bool) -> Consented {
+    let (home, _, stores) = setup();
+    let fixture = super::super::worktree::tests::registered(&home.path().canonicalize().unwrap());
+    trust_pi(&stores, &fixture.repository);
+    let (root, directory) = session(&fixture.worktree, "launching");
+    let assessment = assess_with(root.path(), &fixture.worktree, &stores.env).unwrap();
+    assert_eq!(assessment.state, "verified");
+    assert!(assessment.repository_root.is_some());
+    record(&directory, &assessment).unwrap();
+    let mut manifest = Reader::open_unchecked(&directory).manifest().unwrap();
+    manifest.provider = provider.as_str().into();
+    manifest.yolo = yolo;
+    write_json_atomic(&directory.join("manifest.json"), &manifest).unwrap();
+    Consented {
+        _home: home,
+        _root: root,
+        directory,
+        workspace: fixture.worktree,
+        stores,
+    }
+}
+
+// Consent that the launch already applied through the target's own option, and consent
+// inherited from a repository's main working tree, take no key on any surface: neither the
+// policy, the provider's store nor the surface is consulted. Before, a verified Agy launch
+// on a surface without a guarded key (Herdr, tmux, WezTerm) failed with the unguarded refusal,
+// and on one whose screen cannot be read (Ghostty, Warp) at the screen read.
+#[test]
+fn applied_or_inherited_consent_takes_no_key() {
+    for target in [FirstPartyCli::Claude, FirstPartyCli::Agy] {
+        for yolo in [false, true] {
+            let label = format!("{target:?} yolo={yolo}");
+            let c = consented(target, yolo);
+            super::super::record::applied(&c.directory, "agy-settings-override").unwrap();
+            let policy = FakePolicy::with_start(&[Ok(ProviderStart::NotStarted)]);
+            let mut clock = FakeClock::new(Instant::now());
+            let result = c.complete(
+                target,
+                LaunchDialogSupport::Answered(&policy),
+                &mut clock,
+                &mut Untouched,
+            );
+            // The target's own launch option skips the dialog; another adapter's option in
+            // this session's record is neither a reason to skip nor to answer.
+            if target == FirstPartyCli::Agy {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    format!("{:#}", result.unwrap_err()),
+                    "the session's consent record names another provider's launch option (agy-settings-override); no response sent",
+                    "{label}"
+                );
+            }
+            assert!(policy.received.borrow().is_empty(), "{label}");
+            assert_eq!(policy.start_reads.get(), 0, "{label}");
+            assert_eq!(clock.slept, Duration::ZERO, "{label}");
+            assert_eq!(
+                observe(&c.directory).applied_marker(),
+                Some("agy-settings-override"),
+                "{label}"
+            );
+
+            let c = inherited(target, yolo);
+            let consent = fs::read(c.directory.join(SESSION_FILE)).unwrap();
+            let store = fs::read(&c.stores.pi).unwrap();
+            for support in [
+                LaunchDialogSupport::Answered(&policy),
+                provider::launch_dialog(target),
+            ] {
+                c.complete(
+                    target,
+                    support,
+                    &mut FakeClock::new(Instant::now()),
+                    &mut Untouched,
+                )
+                .unwrap();
+            }
+            assert!(policy.received.borrow().is_empty(), "{label}");
+            assert_eq!(
+                fs::read(c.directory.join(SESSION_FILE)).unwrap(),
+                consent,
+                "{label}"
+            );
+            assert_eq!(fs::read(&c.stores.pi).unwrap(), store, "{label}");
+            for store in [&c.stores.codex, &c.stores.claude, &c.stores.agy] {
+                assert!(!store.exists(), "{label}: {}", store.display());
+            }
+        }
+    }
+}
+
+// A launch of an Agy positively identified as older than its session-only setting: the one
+// Agy launch that keeps the guarded dialog answer for exact consent.
+fn older_agy(yolo: bool) -> Consented {
+    let c = consented(FirstPartyCli::Agy, yolo);
+    super::super::record::option_unavailable(&c.directory).unwrap();
+    c
+}
+
+// An Agy launch that did not apply its setting and did not record
+// it as unavailable (an inconclusive version, a refused or unreadable check) never falls back
+// to the guarded key, on any surface. Only a positively older Agy takes it.
+#[test]
+fn an_inconclusive_agy_launch_never_falls_back_to_the_key() {
+    for yolo in [false, true] {
+        let c = consented(FirstPartyCli::Agy, yolo);
+        c.complete(
+            FirstPartyCli::Agy,
+            provider::launch_dialog(FirstPartyCli::Agy),
+            &mut FakeClock::new(Instant::now()),
+            &mut Untouched,
+        )
+        .unwrap();
+        assert_eq!(observe(&c.directory).applied_marker(), None);
+    }
+}
+
+// A value the step does not know refuses the step.
+#[test]
+fn an_unknown_launch_value_refuses_the_step() {
+    for target in [FirstPartyCli::Claude, FirstPartyCli::Agy] {
+        let c = consented(target, false);
+        super::super::record::applied(&c.directory, "some-future-option").unwrap();
+        let error = c
+            .complete(
+                target,
+                provider::launch_dialog(target),
+                &mut FakeClock::new(Instant::now()),
+                &mut Untouched,
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "the session's consent record holds an unknown launch value (some-future-option); no response sent"
+        );
+    }
+}
+
+// A clock that runs a hook at one chosen reading after the screen was read: the test places a
+// change of the session's consent at an exact point of the step.
+struct Hooked<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    at: usize,
+    hook: Option<Box<dyn FnOnce() + 'a>>,
+}
+
+impl Clock for Hooked<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            if self.readings == self.at
+                && let Some(hook) = self.hook.take()
+            {
+                hook();
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// The pending transition is written only while the record still
+// holds what the step assessed, and the dispatch callback asks the authority after that write.
+// A launch option recorded just before the write keeps its record and gets no key; consent
+// withdrawn just after it gets no key either, and the record returns to what was assessed.
+#[test]
+fn the_authority_is_consumed_inside_the_dispatch_after_the_pending_write() {
+    // Readings after the screen: 1 when it was observed, 2 at the deadline check right before
+    // the pending write, 3 at the deadline check inside the dispatch callback.
+    for (at, change) in [(2, "launch option"), (3, "withdrawn")] {
+        let c = older_agy(false);
+        let armed = Cell::new(false);
+        let directory = c.directory.clone();
+        let pi = c.stores.pi.clone();
+        let mut clock = Hooked {
+            clock: FakeClock::new(Instant::now()),
+            armed: &armed,
+            readings: 0,
+            at,
+            hook: Some(Box::new(move || {
+                if change == "withdrawn" {
+                    fs::remove_file(&pi).unwrap();
+                } else {
+                    super::super::record::applied(&directory, "agy-settings-override").unwrap();
+                }
+            })),
+        };
+        let deadline = clock.clock.now() + Duration::from_secs(3);
+        let error = LaunchDialog {
+            directory: &c.directory,
+            target: FirstPartyCli::Agy,
+            expected_claim: "1-2-3",
+            deadline,
+        }
+        .complete(
+            provider::launch_dialog(FirstPartyCli::Agy),
+            &c.stores.env,
+            &mut clock,
+            &mut scripted(
+                GuardedKey::Taken,
+                || {
+                    armed.set(true);
+                    Ok(agy_dialog(&c.workspace))
+                },
+                || panic!("{change}: no key"),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "workspace consent changed before trust dialog response; no response sent",
+            "{change}"
+        );
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some(if change == "withdrawn" {
+                "launch-option-unavailable"
+            } else {
+                "agy-settings-override"
+            }),
+            "{change}"
+        );
+    }
+}
+
+// The step asks the one authority again before the screen read and
+// immediately before the one dispatch. Consent withdrawn, or a launch option recorded, after
+// the screen was read sends no key.
+#[test]
+fn consent_is_asked_again_immediately_before_the_dispatch() {
+    for change in ["withdrawn", "applied"] {
+        let c = older_agy(false);
+        let reads = Cell::new(0);
+        let error = c
+            .complete(
+                FirstPartyCli::Agy,
+                provider::launch_dialog(FirstPartyCli::Agy),
+                &mut FakeClock::new(Instant::now()),
+                &mut scripted(
+                    GuardedKey::Taken,
+                    || {
+                        reads.set(reads.get() + 1);
+                        if change == "withdrawn" {
+                            let _ = fs::remove_file(&c.stores.pi);
+                        } else {
+                            super::super::record::applied(&c.directory, "agy-settings-override")
+                                .unwrap();
+                        }
+                        Ok(agy_dialog(&c.workspace))
+                    },
+                    || panic!("{change}: no key after consent changed"),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "workspace consent changed before trust dialog response; no response sent",
+            "{change}"
+        );
+        assert_eq!(reads.get(), 1, "{change}");
+    }
+}
+
 // Agy's own policy has no start signal: under `--yolo` its dialog is checked and answered
 // as without bypass, and a surface without a guarded key refuses it in the loop.
 #[test]
 fn agy_under_bypass_still_checks_the_dialog() {
     for yolo in [false, true] {
-        let c = consented(FirstPartyCli::Agy, yolo);
+        let c = older_agy(yolo);
         let answers = Cell::new(0);
         c.complete(
             FirstPartyCli::Agy,
@@ -654,7 +927,7 @@ fn agy_under_bypass_still_checks_the_dialog() {
 #[test]
 fn a_surface_without_a_guarded_key_refuses_the_dialog_in_the_loop() {
     for yolo in [false, true] {
-        let c = consented(FirstPartyCli::Agy, yolo);
+        let c = older_agy(yolo);
         let reads = Cell::new(0);
         let error = c
             .complete(
@@ -676,7 +949,11 @@ fn a_surface_without_a_guarded_key_refuses_the_dialog_in_the_loop() {
             format!("{UNGUARDED} WezTerm; {UNGUARDED_ADVICE}; no response sent")
         );
         assert_eq!(reads.get(), 1);
-        assert_eq!(observe(&c.directory).applied_marker(), None);
+        // The record still holds what the launch recorded: no pending response.
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some("launch-option-unavailable")
+        );
     }
 }
 
@@ -916,4 +1193,680 @@ fn windows_claude_under_bypass_reaches_only_an_authorized_dialog() {
             result.unwrap();
         }
     }
+}
+
+// A pending response in the session record is neither evidence of an older
+// Agy nor permission for another attempt. A step that finds one it did not write sends no key
+// and leaves the record as it found it.
+#[test]
+fn an_unowned_pending_response_refuses_the_step() {
+    for (target, older) in [
+        (FirstPartyCli::Claude, false),
+        (FirstPartyCli::Agy, false),
+        (FirstPartyCli::Agy, true),
+    ] {
+        let c = if older {
+            older_agy(false)
+        } else {
+            consented(target, false)
+        };
+        super::super::record::applied(&c.directory, RESPONSE_PENDING).unwrap();
+        let error = c
+            .complete(
+                target,
+                provider::launch_dialog(target),
+                &mut FakeClock::new(Instant::now()),
+                &mut Untouched,
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "a trust dialog response is already pending for this session (another attempt owns it, or its key may have been sent); no response sent",
+            "{target:?} older: {older}"
+        );
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some(RESPONSE_PENDING)
+        );
+    }
+}
+
+// A clock that returns a reading past every deadline at one chosen reading after the screen
+// was read, and can run a hook there first.
+struct Jumping<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    at: usize,
+    jump: Duration,
+    hook: Option<Box<dyn FnOnce() + 'a>>,
+}
+
+impl Clock for Jumping<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            if self.readings == self.at {
+                if let Some(hook) = self.hook.take() {
+                    hook();
+                }
+                return self.clock.now() + self.jump;
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// Every path that proves the key unsent after the pending write returns the
+// record to what the step assessed: the deadline passing inside the dispatch callback, the
+// authority failing to read there, the surface reporting a changed screen (`Ok(false)`) and a
+// stale claim. Only a dispatch that may have sent the key keeps the pending value.
+#[test]
+fn every_proven_unsent_path_restores_the_assessed_record() {
+    for path in [
+        "expired",
+        "authority error",
+        "screen changed",
+        "stale claim",
+    ] {
+        for older in [false, true] {
+            let (c, target, assessed) = if older {
+                (
+                    older_agy(false),
+                    FirstPartyCli::Agy,
+                    Some("launch-option-unavailable"),
+                )
+            } else {
+                (
+                    consented(FirstPartyCli::Claude, false),
+                    FirstPartyCli::Claude,
+                    None,
+                )
+            };
+            let armed = Cell::new(false);
+            let manifest = c.directory.join("manifest.json");
+            // Reading 3 is the deadline check inside the dispatch callback.
+            let mut clock = Jumping {
+                clock: FakeClock::new(Instant::now()),
+                armed: &armed,
+                readings: 0,
+                at: if matches!(path, "expired" | "authority error") {
+                    3
+                } else {
+                    usize::MAX
+                },
+                jump: if path == "expired" {
+                    Duration::from_secs(3600)
+                } else {
+                    Duration::ZERO
+                },
+                hook: (path == "authority error").then(|| {
+                    Box::new(move || fs::write(&manifest, b"{").unwrap()) as Box<dyn FnOnce()>
+                }),
+            };
+            let deadline = clock.clock.now() + Duration::from_secs(3);
+            let dispatched = Cell::new(0);
+            let screen = if older {
+                agy_dialog(&c.workspace)
+            } else {
+                DIALOG.to_owned()
+            };
+            let support = if older {
+                provider::launch_dialog(FirstPartyCli::Agy)
+            } else {
+                LaunchDialogSupport::Answered(&FakePolicy::default())
+            };
+            let result = LaunchDialog {
+                directory: &c.directory,
+                target,
+                expected_claim: "1-2-3",
+                deadline,
+            }
+            .complete(
+                support,
+                &c.stores.env,
+                &mut clock,
+                &mut scripted(
+                    GuardedKey::Taken,
+                    || {
+                        armed.set(true);
+                        Ok(screen.clone())
+                    },
+                    || {
+                        dispatched.set(dispatched.get() + 1);
+                        match path {
+                            "screen changed" => Ok(false),
+                            "stale claim" => Err(anyhow::Error::new(terminal::StaleDialogClaim)),
+                            other => panic!("{other}: no dispatch"),
+                        }
+                    },
+                ),
+            );
+            let label = format!("{path}, older Agy: {older}");
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.ends_with("no response sent"), "{label}: {error}");
+            assert_eq!(observe(&c.directory).applied_marker(), assessed, "{label}");
+            if matches!(path, "screen changed" | "stale claim") {
+                assert!(dispatched.get() >= 1, "{label}");
+            }
+        }
+    }
+}
+
+// The session record's lock is taken with the step's remaining budget. A
+// writer that holds it past the deadline ends the step as proven unsent, by the deadline, and
+// the record is unchanged.
+#[test]
+fn a_held_session_record_lock_ends_the_step_unsent_by_its_deadline() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(c.directory.join("workspace-consent.lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    let before = fs::read(c.directory.join(SESSION_FILE)).unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let directory = c.directory.clone();
+    let env = c.stores.env.clone();
+    std::thread::spawn(move || {
+        let mut clock = FakeClock::new(Instant::now());
+        let deadline = clock.now() + Duration::from_secs(1);
+        let policy = FakePolicy::default();
+        let result = LaunchDialog {
+            directory: &directory,
+            target: FirstPartyCli::Claude,
+            expected_claim: "1-2-3",
+            deadline,
+        }
+        .complete(
+            LaunchDialogSupport::Answered(&policy),
+            &env,
+            &mut clock,
+            &mut scripted(
+                GuardedKey::Taken,
+                || Ok(DIALOG.to_owned()),
+                || panic!("no key while the record is held"),
+            ),
+        );
+        let _ = sent.send(result.map_err(|error| format!("{error:#}")));
+    });
+    let outcome = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the step ends by its deadline while the lock is held");
+    let error = outcome.unwrap_err();
+    assert!(error.ends_with("no response sent"), "{error}");
+    assert_eq!(fs::read(c.directory.join(SESSION_FILE)).unwrap(), before);
+    drop(holder);
+}
+
+// A source store that becomes unreadable after the session's assessment is
+// a refusal for the dialog step, as a missing consent was in 0.4.49: no key and no error.
+#[test]
+fn an_unreadable_source_store_takes_no_key_and_is_no_error() {
+    let c = consented(FirstPartyCli::Claude, false);
+    fs::remove_file(&c.stores.pi).unwrap();
+    write_private(&c.stores.pi, b"{").unwrap();
+    c.complete(
+        FirstPartyCli::Claude,
+        provider::launch_dialog(FirstPartyCli::Claude),
+        &mut FakeClock::new(Instant::now()),
+        &mut Untouched,
+    )
+    .unwrap();
+    assert_eq!(observe(&c.directory).applied_marker(), None);
+}
+
+// The session record's lock, taken and held by the caller.
+fn hold_session_lock(directory: &Path) -> fs::File {
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("workspace-consent.lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    holder
+}
+
+// Runs a Claude dialog step for `c` in a thread, with a one-second deadline and the scripted
+// `dispatch`, and returns its outcome, or `None` when it does not end within ten seconds.
+fn step_in_thread(
+    c: &Consented,
+    dispatch: impl FnMut(&Path) -> Result<bool> + Send + 'static,
+) -> Option<std::result::Result<(), String>> {
+    let (sent, received) = std::sync::mpsc::channel();
+    let directory = c.directory.clone();
+    let env = c.stores.env.clone();
+    let mut dispatch = dispatch;
+    std::thread::spawn(move || {
+        let mut clock = FakeClock::new(Instant::now());
+        let deadline = clock.now() + Duration::from_secs(1);
+        let policy = FakePolicy::default();
+        let result = LaunchDialog {
+            directory: &directory,
+            target: FirstPartyCli::Claude,
+            expected_claim: "1-2-3",
+            deadline,
+        }
+        .complete(
+            LaunchDialogSupport::Answered(&policy),
+            &env,
+            &mut clock,
+            &mut scripted(
+                GuardedKey::Taken,
+                || Ok(DIALOG.to_owned()),
+                || dispatch(&directory),
+            ),
+        );
+        let _ = sent.send(result.map_err(|error| format!("{error:#}")));
+    });
+    received.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+// Recording the provider's confirmation takes the session record's lock
+// within the step's deadline. A writer that holds it past then ends the step with the trust
+// confirmed and its recording failed, and no input is retried.
+#[test]
+fn a_held_lock_after_the_answer_reports_confirmed_trust_and_a_failed_record() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let claude = c.stores.claude.clone();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = dispatched.clone();
+    let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let held = holder.clone();
+    let outcome = step_in_thread(&c, move |directory| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *held.lock().unwrap() = Some(hold_session_lock(directory));
+        write_json_atomic(
+            &claude,
+            &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+        )
+        .unwrap();
+        Ok(true)
+    })
+    .expect("the step ends by its deadline while the record is held");
+    let error = outcome.unwrap_err();
+    assert!(
+        error.starts_with("provider trust is confirmed; recording the TAB applied marker failed; no input was retried"),
+        "{error}"
+    );
+    assert_eq!(dispatched.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(holder);
+}
+
+// A key proven unsent whose pending marker cannot be restored (the record's
+// lock held until the deadline) stops the step and reports both facts: nothing was sent, and the
+// marker could not be restored. Nothing is dispatched again.
+#[test]
+fn a_failed_restore_stops_the_step_and_reports_both_facts() {
+    for path in ["screen changed", "stale claim"] {
+        let c = consented(FirstPartyCli::Claude, false);
+        let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = dispatched.clone();
+        let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let held = holder.clone();
+        let outcome = step_in_thread(&c, move |directory| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *held.lock().unwrap() = Some(hold_session_lock(directory));
+            if path == "screen changed" {
+                Ok(false)
+            } else {
+                Err(anyhow::Error::new(terminal::StaleDialogClaim))
+            }
+        })
+        .expect("the step ends by its deadline while the record is held");
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains("the pending response marker could not be restored")
+                && error.ends_with("no response sent"),
+            "{path}: {error}"
+        );
+        assert_eq!(
+            dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{path}"
+        );
+        drop(holder);
+        assert_eq!(
+            observe(&c.directory).applied_marker(),
+            Some(RESPONSE_PENDING),
+            "{path}"
+        );
+    }
+}
+
+// A clock that advances past every deadline, for good, at one chosen reading after the screen
+// was read.
+struct Advancing<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    at: usize,
+}
+
+impl Clock for Advancing<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            if self.readings == self.at {
+                self.clock.sleep(Duration::from_secs(3600));
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// A provider confirmation first observed after the step's deadline is not
+// recorded as timely, even with the record's lock free: the step reports the observed
+// confirmation, that the marker was not recorded and that no input was retried.
+#[test]
+fn a_confirmation_observed_after_the_deadline_is_not_recorded() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let armed = Cell::new(false);
+    // Readings after the screen: 1 observed, 2 before the pending write, 3 in the dispatch, 4 the
+    // wait after it, which passes the deadline before the next trust read.
+    let mut clock = Advancing {
+        clock: FakeClock::new(Instant::now()),
+        armed: &armed,
+        readings: 0,
+        at: 4,
+    };
+    let deadline = clock.clock.now() + Duration::from_secs(3);
+    let policy = FakePolicy::default();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = Cell::new(0);
+    let error = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline,
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        &mut clock,
+        &mut scripted(
+            GuardedKey::Taken,
+            || {
+                armed.set(true);
+                Ok(DIALOG.to_owned())
+            },
+            || {
+                dispatched.set(dispatched.get() + 1);
+                write_json_atomic(
+                    &c.stores.claude,
+                    &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        ),
+    )
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.starts_with("provider trust was observed confirmed after the step's deadline; the TAB applied marker was not recorded; no input was retried"),
+        "{error}"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}
+
+// A restore that finds the marker changed by another writer keeps that
+// writer's value, stops the step and says that the key was not sent and the marker was changed.
+#[test]
+fn a_restore_that_finds_another_writers_value_keeps_it_and_stops() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let policy = FakePolicy::default();
+    let dispatched = Cell::new(0);
+    let error = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline: Instant::now() + Duration::from_secs(3),
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        &mut FakeClock::new(Instant::now()),
+        &mut scripted(
+            GuardedKey::Taken,
+            || Ok(DIALOG.to_owned()),
+            || {
+                dispatched.set(dispatched.get() + 1);
+                super::super::record::applied(&c.directory, RESPONSE_CONFIRMED).unwrap();
+                Ok(false)
+            },
+        ),
+    )
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(
+            "the key was not sent, and the pending response marker was changed by another writer"
+        ) && error.ends_with("no response sent"),
+        "{error}"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_CONFIRMED)
+    );
+}
+
+// A clock for the recording of a provider confirmation. Readings after the screen: 1 observed,
+// 2 before the pending write, 3 in the dispatch, 4 the wait after it, 5 the check before the
+// record is changed, 6 the check once the record's lock is held. Reading 5 is within the
+// deadline; reading 6 is `late`. With `real_wait`, reading 5 also waits until the system's
+// clock has passed the deadline, for a lock-held check that reads the system's clock.
+struct RecordingLate<'a> {
+    clock: FakeClock,
+    armed: &'a Cell<bool>,
+    readings: usize,
+    deadline: Instant,
+    late: Instant,
+    real_wait: bool,
+}
+
+impl Clock for RecordingLate<'_> {
+    fn now(&mut self) -> Instant {
+        if self.armed.get() {
+            self.readings += 1;
+            match self.readings {
+                5 if self.real_wait => {
+                    while Instant::now() <= self.deadline {
+                        std::thread::sleep(
+                            self.deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(1),
+                        );
+                    }
+                }
+                6 => return self.late,
+                _ => {}
+            }
+        }
+        self.clock.now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        self.clock.sleep(duration)
+    }
+}
+
+// Runs a Claude dialog step whose provider confirms the answer at once, with `clock`, and returns
+// its error and how often it dispatched.
+fn confirmed_at_once(c: &Consented, clock: &mut RecordingLate<'_>) -> (String, usize) {
+    let policy = FakePolicy::default();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = Cell::new(0);
+    let armed = clock.armed;
+    let deadline = clock.deadline;
+    let error = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline,
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        clock,
+        &mut scripted(
+            GuardedKey::Taken,
+            || {
+                armed.set(true);
+                Ok(DIALOG.to_owned())
+            },
+            || {
+                dispatched.set(dispatched.get() + 1);
+                write_json_atomic(
+                    &c.stores.claude,
+                    &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        ),
+    )
+    .unwrap_err();
+    (format!("{error:#}"), dispatched.get())
+}
+
+const RECORDING_FAILED: &str =
+    "provider trust is confirmed; recording the TAB applied marker failed; no input was retried";
+
+// A confirmation observed within the step's deadline whose recording misses
+// it (the deadline passes while the record is locked and read) is reported as confirmed with its
+// recording failed, never as observed after the deadline. The pending marker stays and nothing is
+// sent again.
+#[test]
+fn a_timely_confirmation_whose_recording_misses_the_deadline_is_not_reported_late() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let armed = Cell::new(false);
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(300);
+    let mut clock = RecordingLate {
+        clock: FakeClock::new(start),
+        armed: &armed,
+        readings: 0,
+        deadline,
+        late: deadline + Duration::from_secs(3600),
+        real_wait: true,
+    };
+    let (error, dispatched) = confirmed_at_once(&c, &mut clock);
+    assert!(
+        error.starts_with(RECORDING_FAILED)
+            && error.contains(
+                "the deadline was reached when the session's consent record could be changed"
+            ),
+        "{error}"
+    );
+    assert_eq!(dispatched, 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}
+
+// The check once the record's lock is held has the same boundary as the
+// check before it: a recording at exactly the deadline is not made.
+#[test]
+fn a_recording_at_exactly_the_deadline_is_not_made() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let armed = Cell::new(false);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(3);
+    let mut clock = RecordingLate {
+        clock: FakeClock::new(start),
+        armed: &armed,
+        readings: 0,
+        deadline,
+        late: deadline,
+        real_wait: false,
+    };
+    let (error, dispatched) = confirmed_at_once(&c, &mut clock);
+    assert!(error.starts_with(RECORDING_FAILED), "{error}");
+    assert_eq!(dispatched, 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
+}
+
+// The time of the provider's confirmation is taken right after the store
+// read that shows it, before the liveness check that follows. A liveness check during which the
+// deadline passes (here an hour passes in it) does not make that observation late: the check
+// once the record's lock is held then refuses the recording, and the step reports the trust
+// confirmed and its recording failed. One dispatch; the pending marker stays.
+#[test]
+fn a_liveness_check_that_crosses_the_deadline_does_not_make_the_observation_late() {
+    let c = consented(FirstPartyCli::Claude, false);
+    let mut clock = FakeClock::new(Instant::now());
+    let deadline = clock.now() + Duration::from_secs(3);
+    let shared = clock.shared();
+    // The liveness checks after the response: after the dispatch, at the top of the next round,
+    // and after the store read that shows the confirmation, which takes the hour.
+    let mut after_response = 0;
+    during_liveness_check(Some(Box::new(move |responded| {
+        if responded {
+            after_response += 1;
+            if after_response == 3 {
+                shared.set(shared.get() + Duration::from_secs(3600));
+            }
+        }
+    })));
+    let policy = FakePolicy::default();
+    let key = native_key(&c.workspace).unwrap();
+    let dispatched = Cell::new(0);
+    let result = LaunchDialog {
+        directory: &c.directory,
+        target: FirstPartyCli::Claude,
+        expected_claim: "1-2-3",
+        deadline,
+    }
+    .complete(
+        LaunchDialogSupport::Answered(&policy),
+        &c.stores.env,
+        &mut clock,
+        &mut scripted(
+            GuardedKey::Taken,
+            || Ok(DIALOG.to_owned()),
+            || {
+                dispatched.set(dispatched.get() + 1);
+                write_json_atomic(
+                    &c.stores.claude,
+                    &serde_json::json!({"projects": {key.clone(): {"hasTrustDialogAccepted": true}}}),
+                )
+                .unwrap();
+                Ok(true)
+            },
+        ),
+    );
+    during_liveness_check(None);
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.starts_with(RECORDING_FAILED)
+            && error.contains(
+                "the deadline was reached when the session's consent record could be changed"
+            ),
+        "{error}"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(
+        observe(&c.directory).applied_marker(),
+        Some(RESPONSE_PENDING)
+    );
 }

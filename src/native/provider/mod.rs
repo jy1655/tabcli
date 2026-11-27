@@ -89,6 +89,10 @@ pub(super) struct LaunchContext<'a> {
     pub(super) yolo: bool,
     pub(super) model: Option<&'a str>,
     pub(super) effort: Option<&'a str>,
+    // The version text the wrapper's own probe of the installed CLI returned for this launch,
+    // right before the plan is built. An adapter that offers a launch option only from some
+    // version on judges that version here; the others ignore it.
+    pub(super) provider_version: &'a str,
 }
 
 // How the initial prompt reaches the provider process, declared by the adapter from its own
@@ -120,6 +124,10 @@ pub(super) struct LaunchPlan {
     // Caller environment variables the adapter refuses to pass to its provider process.
     // Each adapter owns this list; the shared launcher only applies it.
     pub(super) environment_removals: &'static [&'static str],
+    // The trust-bearing launch option that the adapter put in the command, if any: the spawn
+    // fence asks the authority about exactly this command before it starts. A command without
+    // one is admitted as 0.4.49 admitted it, without reading consent.
+    pub(super) trust_grant: Option<super::consent::LaunchGrant>,
 }
 
 // Launch inputs for a session that continues a closed session's provider conversation.
@@ -325,6 +333,19 @@ trait NativeProviderAdapter: Sync {
         env: &super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
+    // Whether the provider's own store, resolved from its home in `env` or the recorded source
+    // store `store` (a pinned recheck), lists exactly `workspace` as trusted, answered from the
+    // store alone: no I/O on `workspace` or its ancestors and no `git`. Consent's worktree screen
+    // asks it about a main working tree that a `.git` file names, before anything touches that
+    // path; it is a necessary condition only, never consent. Each adapter keys the path by its
+    // own rule, the one its exact-folder lookup uses. No default: each adapter states how its
+    // answer stays store-only.
+    fn store_lists_trusted(
+        &self,
+        workspace: &Path,
+        env: &super::consent::Environment,
+        store: Option<&Path>,
+    ) -> Result<bool>;
     fn result_timeout_diagnostic(&self) -> Option<super::diagnostics::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::diagnostics::Context<'_>) -> Vec<super::diagnostics::Check>;
     // Caller-environment variables removed from every short-lived provider query that
@@ -404,6 +425,11 @@ pub(super) fn launch_trust_markers() -> impl Iterator<Item = &'static str> {
         .filter_map(|provider| adapter(*provider).applied_marker())
 }
 
+// The marker that `provider`'s own launch records when it applies workspace trust.
+pub(super) fn applied_marker(provider: FirstPartyCli) -> Option<&'static str> {
+    adapter(provider).applied_marker()
+}
+
 pub(super) fn workspace_trust(
     provider: FirstPartyCli,
     workspace: &Path,
@@ -411,6 +437,15 @@ pub(super) fn workspace_trust(
     store: Option<&Path>,
 ) -> Result<super::consent::Trust> {
     adapter(provider).workspace_trust(workspace, env, store)
+}
+
+pub(super) fn store_lists_trusted(
+    provider: FirstPartyCli,
+    workspace: &Path,
+    env: &super::consent::Environment,
+    store: Option<&Path>,
+) -> Result<bool> {
+    adapter(provider).store_lists_trusted(workspace, env, store)
 }
 
 // The Codex memory workspace that the launch admission protects. Only the Codex adapter
@@ -517,6 +552,59 @@ fn transport_test_context<'a>(
         bridge_executable: Path::new("bridge"),
         prompt: "provider transport framing",
         deadline: Instant::now() + std::time::Duration::from_secs(30),
+    }
+}
+
+// A path that a store-only answer never touches, and a caller home for the stores. The path lies
+// below a `.git` file that is no repository, so a reader that probes the path's ancestors finds
+// it and runs `git` in the path, which fails; on Unix it also lies below a directory that may not
+// be searched while the fixture lives, so any stat or open under it fails (for a user other than
+// root). Each adapter's own test writes its store and asks its store-only answer about it.
+#[cfg(test)]
+pub(super) struct UntouchedPath {
+    pub(super) home: PathBuf,
+    pub(super) env: super::consent::Environment,
+    pub(super) path: PathBuf,
+    #[cfg(unix)]
+    locked: PathBuf,
+    _temp: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl UntouchedPath {
+    pub(super) fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let outer = root.join("outer");
+        let locked = outer.join("locked");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(outer.join(".git"), "not a repository\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        Self {
+            env: super::consent::Environment::at_home(&home),
+            home,
+            path: locked.join("main"),
+            #[cfg(unix)]
+            locked,
+            _temp: temp,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for UntouchedPath {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.locked, std::fs::Permissions::from_mode(0o700));
+        }
     }
 }
 
@@ -912,7 +1000,12 @@ mod tests {
                 Some("codex-config-override"),
             ),
             (FirstPartyCli::Claude, true, !cfg!(windows), None),
-            (FirstPartyCli::Agy, true, false, None),
+            (
+                FirstPartyCli::Agy,
+                true,
+                false,
+                Some("agy-settings-override"),
+            ),
             (FirstPartyCli::Pi, false, false, Some("pi-approve-once")),
         ] {
             assert_eq!(adapter(provider).applied_marker(), marker, "{provider:?}");
