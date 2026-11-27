@@ -69,16 +69,16 @@ after deadline-sensitive fake-Codex tests failed under the parallel harness in
 [issue #46](https://github.com/jy1655/tabcli/issues/46); concurrency inside individual
 tests remains enabled.
 
-Also check platform-gated code for Linux and Windows:
+Check platform-gated code for Linux and Windows and use FreeBSD to check the fallback code.
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
 cargo clippy --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
+cargo check --locked --target x86_64-unknown-freebsd --all-targets --all-features
 ```
 
-Install the Rust standard library component (`rust-std`) for each target first. These Clippy
-checks need that component, not a target linker or a runnable target environment. They check
-code; they do not execute Windows or Linux sessions.
+Install the Rust standard library component (`rust-std`) for each target first. These commands
+check compilation without linking or running target binaries.
 
 Tests requiring authenticated CLIs and visible terminal surfaces are manual live tests.
 An ignored live test is never evidence that a runtime path passed. Follow
