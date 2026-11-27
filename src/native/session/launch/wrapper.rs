@@ -131,8 +131,8 @@ fn provision_for_wrapper(
     // re-check through the preflight's executor. At that bound the executor ends only its
     // direct child: a descendant, such as a runtime under a shim script, can outlive it. A
     // session without a launch record keeps the unbounded check, and so does one whose record
-    // cannot be read here: the spawn fence reads it again under the lifecycle lock and
-    // refuses with that error, as before.
+    // cannot be read here. For a registered wrapper the check before plan preparation reads
+    // it again under the lifecycle lock. In tests without a wrapper the spawn fence does so.
     let deadline = super::read(&Reader::open_unchecked(directory))
         .ok()
         .flatten()

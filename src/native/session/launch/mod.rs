@@ -1210,40 +1210,41 @@ fn spawn_for_wrapper<F>(
 where
     F: FnOnce(&mut Child) -> Result<()>,
 {
-    let (_lock, mut record) =
-        lock_for_spawn(store, command, grant, owner).map_err(&start_context)?;
-    let settle_failure = |error: anyhow::Error| -> anyhow::Error {
-        if owner.is_some()
-            && let Err(settlement) = finalize_locked(store, Some(&error))
-        {
-            return anyhow::anyhow!(
-                "{error:#}; native session finalization also failed: {settlement:#}"
-            );
+    let (_lock, mut record) = lock_for_spawn(store, command, grant).map_err(&start_context)?;
+    let settle_failure = |error| settle_spawn_failure_locked(store, owner, error);
+    if let Some(owner) = owner
+        && !recorded_owner_matches(store, owner).map_err(&start_context)?
+    {
+        if let Err(write_error) = store.write_owner(owner) {
+            let error = start_context(write_error);
+            // The replacement can be visible even though its final sync failed.
+            if recorded_owner_matches(store, owner)
+                .with_context(|| format!("{error:#}; failed to verify the recorded owner"))?
+            {
+                return Err(settle_failure(error));
+            }
+            return Err(error);
         }
-        error
-    };
+        log(store, "owner_recorded");
+    }
     start_watcher().map_err(&settle_failure)?;
     if let Some(record) = &mut record {
         record.phase = Phase::Spawning;
         store
             .record(CoreRecord::Launch)
             .write_json(record)
-            .map_err(&start_context)?;
+            .map_err(|error| settle_failure(start_context(error)))?;
     }
     let mut child = match command.spawn().context("failed to spawn provider process") {
         Ok(child) => child,
         Err(error) => {
             let error = start_context(error);
-            // The command started no provider. Restore Pending and settle before
-            // another wrapper can register against that receipt.
-            if let Some(record) = &mut record {
-                record.phase = Phase::Pending;
-                store
-                    .record(CoreRecord::Launch)
-                    .write_json(record)
-                    .with_context(|| format!("{error:#}; failed to reset the launch receipt"))?;
-            }
-            return Err(settle_failure(error));
+            return Err(reset_failed_spawn_locked(
+                store,
+                record.as_mut(),
+                owner,
+                error,
+            ));
         }
     };
     if let Err(error) = record_process(&mut child) {
@@ -1268,11 +1269,43 @@ where
     Ok(child)
 }
 
+fn settle_spawn_failure_locked(
+    store: &Store,
+    owner: Option<&NativeSessionOwner>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if owner.is_some()
+        && let Err(settlement) = finalize_locked(store, Some(&error))
+    {
+        return anyhow::anyhow!(
+            "{error:#}; native session finalization also failed: {settlement:#}"
+        );
+    }
+    error
+}
+
+fn reset_failed_spawn_locked(
+    store: &Store,
+    record: Option<&mut Record>,
+    owner: Option<&NativeSessionOwner>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    // The command started no provider. Restore Pending and settle before
+    // another wrapper can register against that receipt.
+    let mut failure = error;
+    if let Some(record) = record {
+        record.phase = Phase::Pending;
+        if let Err(reset) = store.record(CoreRecord::Launch).write_json(record) {
+            failure = reset.context(format!("{failure:#}; failed to reset the launch receipt"));
+        }
+    }
+    settle_spawn_failure_locked(store, owner, failure)
+}
+
 fn lock_for_spawn(
     store: &Store,
     _command: &Command,
     grant: Option<&crate::native::consent::LaunchGrant>,
-    owner: Option<&NativeSessionOwner>,
 ) -> Result<(super::TurnClaimLock, Option<Record>)> {
     let directory = store.directory();
     // An exec Linux would refuse is refused here, before the launch phase moves.
@@ -1305,12 +1338,6 @@ fn lock_for_spawn(
         }
     }
     check_spawn_locked(store, record.as_ref())?;
-    if let Some(owner) = owner
-        && !recorded_owner_matches(store, owner)?
-    {
-        store.write_owner(owner)?;
-        log(store, "owner_recorded");
-    }
     Ok((lock, record))
 }
 
@@ -1362,45 +1389,56 @@ fn register_wrapper(
     let identified = identify();
     let _lock = store.lock()?;
     anyhow::ensure!(admit_wrapper(store)? == claim_token, not_pending());
-    match identified.and_then(|owner| {
-        store.write_owner(&owner)?;
-        Ok(owner)
-    }) {
-        Ok(owner) => {
-            log(store, "owner_recorded");
-            Ok(RegisteredWrapper { owner, claim_token })
-        }
-        Err(error) => {
-            match super::owner::observe(store) {
-                super::owner::OwnerRecord::Recorded(_) => return Err(WrapperRefusal(error).into()),
-                super::owner::OwnerRecord::Absent => {}
-                _ => return Err(error),
+    let owner = identified.map_err(|error| registration_failure_locked(store, None, error))?;
+    store
+        .write_owner(&owner)
+        .map_err(|error| registration_failure_locked(store, Some(&owner), error))?;
+    log(store, "owner_recorded");
+    Ok(RegisteredWrapper { owner, claim_token })
+}
+
+fn registration_failure_locked(
+    store: &Store,
+    identified: Option<&NativeSessionOwner>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match super::owner::observe(store) {
+        super::owner::OwnerRecord::Recorded(record) => {
+            if !identified.is_some_and(|owner| same_wrapper(owner, &record.owner)) {
+                return WrapperRefusal(error).into();
             }
+        }
+        super::owner::OwnerRecord::Absent => {
             match store.record(CoreRecord::ProviderProcess).present() {
-                Ok(true) => return Err(WrapperRefusal(error).into()),
-                Err(_) => return Err(error),
+                Ok(true) => return WrapperRefusal(error).into(),
+                Err(_) => return error,
                 Ok(false) => {}
             }
-            log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"));
-            finalize_locked(store, Some(&error))
-                .with_context(|| format!("{error:#}; native session finalization also failed"))?;
-            Err(error)
         }
+        _ => return error,
     }
+    log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"));
+    if let Err(settlement) = finalize_locked(store, Some(&error)) {
+        return settlement.context(format!(
+            "{error:#}; native session finalization also failed"
+        ));
+    }
+    error
+}
+
+fn same_wrapper(owner: &NativeSessionOwner, other: &NativeSessionOwner) -> bool {
+    owner.pid == other.pid
+        && owner.managed_session_id == other.managed_session_id
+        && owner.linux_birth == other.linux_birth
+        && owner.process_start_seconds == other.process_start_seconds
+        && owner.process_start_microseconds == other.process_start_microseconds
+        && owner.windows_process_identity == other.windows_process_identity
 }
 
 fn recorded_owner_matches(store: &Store, owner: &NativeSessionOwner) -> Result<bool> {
     Ok(super::owner::observe(store)
         .decoded()?
-        .is_some_and(|record| {
-            let other = record.owner;
-            owner.pid == other.pid
-                && owner.managed_session_id == other.managed_session_id
-                && owner.linux_birth == other.linux_birth
-                && owner.process_start_seconds == other.process_start_seconds
-                && owner.process_start_microseconds == other.process_start_microseconds
-                && owner.windows_process_identity == other.windows_process_identity
-        }))
+        .is_some_and(|record| same_wrapper(owner, &record.owner)))
 }
 
 fn finalize_wrapper(

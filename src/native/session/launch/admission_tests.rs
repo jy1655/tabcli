@@ -534,3 +534,168 @@ fn recorded_wrapper_settlement_errors_keep_the_bootstrap_stderr() {
         assert!(message.contains("finalization also failed"), "{message}");
     }
 }
+
+const BEFORE_RENAME: &str = "renaming a temporary record over its final path";
+const AFTER_RENAME: &str = "syncing a renamed record";
+
+#[test]
+fn registration_write_fault_settles_according_to_the_visible_owner() {
+    for (fault, previous) in [
+        (AFTER_RENAME, true),
+        (BEFORE_RENAME, true),
+        (BEFORE_RENAME, false),
+    ] {
+        let (_directory, store) = directory(&[]);
+        let wrapper = wrapper_owner(&store, 10);
+        let other = wrapper_owner(&store, 20);
+        if previous {
+            store.write_owner(&other).unwrap();
+        }
+        let error = crate::native::session::primitives::with_fault_at(fault, || {
+            register_wrapper(&store, || Ok(wrapper.clone()))
+        })
+        .unwrap_err();
+        let foreign = previous && fault == BEFORE_RENAME;
+        assert_eq!(error.is::<WrapperRefusal>(), foreign, "{fault}");
+        assert!(format!("{error:#}").contains(fault));
+        assert_eq!(
+            recorded_owner_matches(&store, &wrapper).unwrap(),
+            fault == AFTER_RENAME
+        );
+        assert_eq!(recorded_owner_matches(&store, &other).unwrap(), foreign);
+        let status = store.status().unwrap();
+        assert_eq!(
+            status.state,
+            if foreign {
+                SessionState::Launching
+            } else {
+                SessionState::Failed
+            }
+        );
+        assert_eq!(status.exit_code, (!foreign).then_some(1));
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().is_some(),
+            foreign
+        );
+        let log = fs::read_to_string(store.directory().join(LOG)).unwrap();
+        assert_eq!(log.contains(WRAPPER_EXIT_CODE_MARKER), !foreign);
+        if !foreign {
+            assert!(status.error.unwrap().contains(fault));
+            assert!(log.contains(fault));
+        }
+    }
+}
+
+#[test]
+fn spawning_write_fault_settles_before_the_fence_returns() {
+    for (fault, visible) in [
+        (BEFORE_RENAME, Phase::Pending),
+        (AFTER_RENAME, Phase::Spawning),
+    ] {
+        let (directory, store) = directory(&[]);
+        let owner = wrapper_owner(&store, 10);
+        register_wrapper(&store, || Ok(owner.clone())).unwrap();
+        let error = crate::native::session::primitives::with_fault_at(fault, || {
+            spawn_for_wrapper(
+                &store,
+                &mut Command::new(directory.path().join("unused")),
+                None,
+                Some(&owner),
+                std::convert::identity,
+                || Ok(()),
+                |_| unreachable!(),
+            )
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(fault));
+        assert_eq!(read(&store).unwrap().unwrap().phase, visible);
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        assert!(status.error.unwrap().contains(fault));
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().is_some(),
+            visible == Phase::Spawning
+        );
+        assert!(admit_wrapper(&store).is_err());
+    }
+}
+
+#[test]
+fn pending_reset_write_fault_preserves_the_spawn_error_and_settles_under_lock() {
+    for (fault, visible) in [
+        (AFTER_RENAME, Phase::Pending),
+        (BEFORE_RENAME, Phase::Spawning),
+    ] {
+        let (_directory, store) = directory(&[]);
+        let owner = wrapper_owner(&store, 10);
+        register_wrapper(&store, || Ok(owner.clone())).unwrap();
+        let _lock = store.lock().unwrap();
+        let mut record = read(&store).unwrap().unwrap();
+        record.phase = Phase::Spawning;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&record)
+            .unwrap();
+        let error = crate::native::session::primitives::with_fault_at(fault, || {
+            reset_failed_spawn_locked(
+                &store,
+                Some(&mut record),
+                Some(&owner),
+                anyhow::anyhow!("OS spawn failed"),
+            )
+        });
+        assert!(format!("{error:#}").contains(fault));
+        assert!(format!("{error:#}").contains("OS spawn failed"));
+        assert_eq!(read(&store).unwrap().unwrap().phase, visible);
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        let reason = status.error.unwrap();
+        assert!(
+            reason.contains("OS spawn failed") && reason.contains(fault),
+            "{reason}"
+        );
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().is_some(),
+            visible == Phase::Spawning
+        );
+        assert!(admit_wrapper(&store).is_err());
+    }
+}
+
+#[test]
+fn fence_owner_write_fault_settles_only_if_the_spawner_is_recorded() {
+    for fault in [AFTER_RENAME, BEFORE_RENAME] {
+        let (directory, store) = directory(&[]);
+        let spawner = wrapper_owner(&store, 10);
+        let other = wrapper_owner(&store, 20);
+        register_wrapper(&store, || Ok(other.clone())).unwrap();
+        let error = crate::native::session::primitives::with_fault_at(fault, || {
+            spawn_for_wrapper(
+                &store,
+                &mut Command::new(directory.path().join("unused")),
+                None,
+                Some(&spawner),
+                |error| error.context("provider startup"),
+                || unreachable!(),
+                |_| unreachable!(),
+            )
+        })
+        .unwrap_err();
+        let ours = fault == AFTER_RENAME;
+        assert_eq!(recorded_owner_matches(&store, &spawner).unwrap(), ours);
+        assert_eq!(recorded_owner_matches(&store, &other).unwrap(), !ours);
+        let status = store.status().unwrap();
+        assert_eq!(
+            status.state,
+            if ours {
+                SessionState::Failed
+            } else {
+                SessionState::Launching
+            }
+        );
+        if ours {
+            assert_eq!(status.error.unwrap(), format!("{error:#}"));
+        }
+        assert_eq!(turn::current_claim_token(&store).unwrap().is_none(), ours);
+    }
+}
