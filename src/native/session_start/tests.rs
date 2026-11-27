@@ -2151,7 +2151,7 @@ fn request_deadline_consumed_by_caller_verification_is_a_timeout() {
         assert_eq!(classify(&error), Some(FailureKind::TimedOut), "{error:#}");
         assert_eq!(
             error.to_string(),
-            "the request's deadline passed before checking the Herdr caller; no Session was created"
+            "the request's deadline passed before using the Herdr caller check; no Session was created"
         );
     }
 }

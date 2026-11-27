@@ -194,12 +194,25 @@ pub(super) fn with_record<T>(
     }
     use crate::native::session_start::deadline;
     deadline::before("preparing the workspace consent directory")?;
-    fs::create_dir_all(root)?;
-    match fs::create_dir(parent) {
-        Ok(()) => deadline::wrote("the workspace consent directory was created"),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && parent.is_dir() => {}
-        Err(error) => return Err(error.into()),
+    let create_directory = |directory: &Path, fact| -> std::io::Result<()> {
+        match fs::create_dir(directory) {
+            Ok(()) => deadline::wrote(fact),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    };
+    if deadline::current().is_some()
+        && !root.is_dir()
+        && let Some(ancestor) = root.parent()
+    {
+        fs::create_dir_all(ancestor)?;
+        create_directory(root, "the state root was created")?;
+    } else {
+        fs::create_dir_all(root)?;
     }
+    create_directory(parent, "the workspace consent directory was created")?;
     deadline::set_permissions(
         parent,
         "workspace consent directory permissions were set",
@@ -1314,4 +1327,26 @@ fn request_deadline_consent_record_is_absent() {
         error.to_string(),
         "the request's deadline passed before writing workspace consent; no Session was created"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn request_deadline_reports_a_state_root_created_during_consent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("missing").join("state");
+    let workspace = temp.path().canonicalize().unwrap();
+    for created in [true, false] {
+        assert_eq!(root.exists(), !created);
+        let error = crate::native::session_start::deadline::expire_at(
+            "opening the workspace consent lock",
+            || with_record(&root, &workspace, |_, _| Ok(())),
+        )
+        .unwrap_err();
+        assert!(root.is_dir());
+        assert_eq!(
+            error.to_string().contains("the state root was created"),
+            created,
+            "{error:#}"
+        );
+    }
 }

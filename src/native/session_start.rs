@@ -412,7 +412,7 @@ pub(super) fn check_caller(
         _ => false,
     };
     let outcome = verify(selection);
-    deadline::before("checking the Herdr caller")?;
+    deadline::before("using the Herdr caller check")?;
     match outcome {
         Ok(()) => Ok(CallerCheck::Passed),
         Err(error) if version_decides => Ok(CallerCheck::Failed(error)),
