@@ -300,8 +300,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   core is reached, without an account), and the Herdr adapter for the core's account on the
   connection that sends `terminal.run` (`refuse_before_core_launch`). It refuses only what it
   read; a read that fails other than by absence leaves the directory to the host. A refusal
-  (`DirectoryRefusal`) shares the settlement for failures to open a Surface without a retained
-  handle (`launch::terminal_failure`).
+  (`DirectoryRefusal`) uses the early directory-refusal decision (`launch::refused_before_surface`).
   The launcher's wait probes its surface through the adapter's `launch_surface` (by default
   its presence): a Herdr terminal its core reports finished before startup fails the launch
   through the settlement the deadline uses (`finished_before_startup`). Both are early
@@ -311,6 +310,18 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   registered launch-host dispatch, the shared binding wait, startup input flush and refusal
   log. Direct handoffs recheck the pending Claim and exact binding under the lifecycle lock
   before flushing input. The Windows Terminal tab host uses its own offer protocol.
+  An ordinary open error without a retained surface waits for the lifecycle lock within the
+  launch budget, with a final attempt even at or after the deadline. Settlement requires the
+  current Claim and launch receipt to match the launcher's expected Claim. With Launching status,
+  a Pending receipt records the open error and releases the Claim, and a Spawning receipt records
+  delivery uncertainty and retains the Claim. The failed status and best-effort launch log carry
+  the same reason, including the no-handle/no-prompt suffix only for a Pending receipt without
+  a bound or closing handle. An already Failed status with a Pending receipt releases its Claim
+  without replacing the reason or appending a log line. If there is nothing to settle, a caller
+  whose Claim remains gets a retention diagnostic and, for a receipt past Pending, a warning
+  against resending. A different current Claim leaves the original error alone. A lock still
+  held at the deadline adds a lock-timeout diagnostic and reports retention if the Claim is
+  still seen.
   Shared macOS procedures run close re-probes with adapter-owned actions, budgets and
   inspection-error policies.
   Each adapter owns the rule by which a binding names its host. Terminal.app passes its rule to

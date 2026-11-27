@@ -423,7 +423,19 @@ fn fail_locked_with_residual(
     {
         return Ok(());
     }
-    let status: SessionStatus = store.status()?;
+    fail_current_launch_locked(store, record, reason, residual_surface, store.status()?).map(|_| ())
+}
+
+// The caller holds the lifecycle lock and verified the current Claim. Return whether
+// the failure was published or an interrupted Pending failure released its Claim.
+fn fail_current_launch_locked(
+    store: &Store,
+    record: &Record,
+    reason: &str,
+    residual_surface: Option<ResidualSurface>,
+    status: SessionStatus,
+) -> Result<bool> {
+    let directory = store.directory();
     if status.state != SessionState::Launching {
         if status.state == SessionState::Failed && record.phase == Phase::Pending {
             remove_turn_claim_locked(
@@ -431,8 +443,9 @@ fn fail_locked_with_residual(
                     .record(CoreRecord::TurnClaim)
                     .path(),
             )?;
+            return Ok(true);
         }
-        return Ok(());
+        return Ok(false);
     }
     let reason = if record.phase == Phase::Spawning {
         format!("{reason}; provider spawn is uncertain; the claim is retained, do not resend")
@@ -454,7 +467,7 @@ fn fail_locked_with_residual(
         )?;
     }
     log(store, &reason);
-    Ok(())
+    Ok(true)
 }
 
 // The plain form, which the tests of this module and of close use.
@@ -525,11 +538,11 @@ fn terminal_handoff(
     clock: &mut dyn Clock,
 ) -> Result<()> {
     let Some(retained) = error.downcast_ref::<terminal::RetainedLaunchSurface>() else {
-        let recorded = error
-            .downcast_ref::<terminal::DirectoryRefusal>()
-            .map(terminal::DirectoryRefusal::recorded)
-            .unwrap_or_else(|| format!("{error:#}"));
-        return settle_open_failure(store, token, &recorded, deadline, clock);
+        return if let Some(refusal) = error.downcast_ref::<terminal::DirectoryRefusal>() {
+            refused_before_surface(store, token, &refusal.recorded(), deadline, clock)
+        } else {
+            settle_open_failure(store, token, error, deadline, clock)
+        };
     };
     let reason = format!("terminal launch failed: {error:#}");
     let _lock = store.lock()?;
@@ -629,8 +642,76 @@ fn unbound_wording(store: &Store, record: &Record, reason: &str) -> Result<Strin
     })
 }
 
-// The open error belongs to the caller. Directory refusals have a path-free recorded reason.
 fn settle_open_failure(
+    store: &Store,
+    token: &str,
+    error: &anyhow::Error,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Result<()> {
+    let lock = loop {
+        match store.try_lock_existing() {
+            Ok(ExistingLock::Held(lock)) => break Ok(Some(lock)),
+            Ok(ExistingLock::Unavailable) => break Ok(None),
+            Err(error) => break Err(error),
+            Ok(ExistingLock::Busy) => wait_for_open_lock(store, token, deadline, clock)?,
+        }
+    };
+    if turn::current_claim_token(store)?.as_deref() != Some(token) {
+        return Ok(());
+    }
+    let retained = "nothing was recorded; the claim is retained";
+    let record = read(store).context(retained)?;
+    let warning = if record
+        .as_ref()
+        .is_some_and(|record| record.phase != Phase::Pending)
+    {
+        "nothing was recorded; the claim is retained; provider startup may be in progress, do not resend"
+    } else {
+        retained
+    };
+    let Some(_lock) = lock.context(warning)? else {
+        bail!("{warning}")
+    };
+    let Some(record) =
+        record.filter(|record| record.claim_token == token && record.phase != Phase::Spawned)
+    else {
+        bail!("{warning}");
+    };
+    let reason = unbound_wording(
+        store,
+        &record,
+        &format!("terminal launch failed: {error:#}"),
+    )
+    .context(warning)?;
+    let status = store.status().context(warning)?;
+    if !fail_current_launch_locked(store, &record, &reason, None, status)? {
+        bail!("{warning}");
+    }
+    Ok(())
+}
+
+fn wait_for_open_lock(
+    store: &Store,
+    token: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(clock.now());
+    if remaining.is_zero() {
+        let retained = if turn::current_claim_token(store).ok().flatten().as_deref() == Some(token)
+        {
+            "; the claim is retained"
+        } else {
+            ""
+        };
+        bail!("the lifecycle lock was held until the launch deadline{retained}");
+    }
+    clock.sleep(remaining.min(WAIT_POLL));
+    Ok(())
+}
+
+fn refused_before_surface(
     store: &Store,
     token: &str,
     recorded: &str,
@@ -644,20 +725,7 @@ fn settle_open_failure(
                 let reason = unbound_wording(store, &record, &reason)?;
                 return fail_locked(store, &record, &reason);
             }
-            EarlyFacts::Busy => {
-                let remaining = deadline.saturating_duration_since(clock.now());
-                if !remaining.is_zero() {
-                    clock.sleep(remaining.min(WAIT_POLL));
-                    continue;
-                }
-                let retained =
-                    if turn::current_claim_token(store).ok().flatten().as_deref() == Some(token) {
-                        "; the claim is retained"
-                    } else {
-                        ""
-                    };
-                bail!("the lifecycle lock was held until the launch deadline{retained}");
-            }
+            EarlyFacts::Busy => wait_for_open_lock(store, token, deadline, clock)?,
             EarlyFacts::NotEstablished => return Ok(()),
         }
     }
@@ -2002,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn open_failure_preserves_bound_handles_and_defers_an_attempted_spawn() {
+    fn open_error_preserves_bound_handles_and_uncertain_spawn_wording() {
         // A surface bound before the failure keeps its handle, so the sentence is absent.
         let (directory, token) = fixture();
         let store = Store::open_unchecked(directory.path());
@@ -2050,7 +2118,7 @@ mod tests {
                 .is_some()
         );
 
-        // A spawn in progress belongs to confirmation or repair.
+        // The spawn may have delivered the prompt.
         let (directory, token) = fixture();
         let store = Store::open_unchecked(directory.path());
         let mut record = read(&store).unwrap().unwrap();
@@ -2066,7 +2134,18 @@ mod tests {
             anyhow::anyhow!("Ghostty start failed"),
             Instant::now() + START_TIMEOUT,
         );
-        assert_eq!(store.status().unwrap().state, SessionState::Launching);
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        let reason = "terminal launch failed: Ghostty start failed; provider spawn is uncertain; the claim is retained, do not resend";
+        assert_eq!(status.error.as_deref(), Some(reason));
+        assert!(
+            fs::read_to_string(store.directory().join(LOG))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
+                .ends_with(reason)
+        );
         assert_eq!(turn::current_claim_token(&store).unwrap(), Some(token));
     }
 

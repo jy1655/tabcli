@@ -1107,7 +1107,7 @@ fn reported_open_failure(
 ) -> anyhow::Error {
     report_handoff(
         refusal,
-        settle_open_failure(store, token, recorded, deadline, clock),
+        refused_before_surface(store, token, recorded, deadline, clock),
     )
 }
 
@@ -1458,4 +1458,189 @@ fn open_failure_preserves_a_different_pending_claim() {
         Instant::now() + START_TIMEOUT,
     );
     untouched(&store, &token);
+}
+
+const OPEN_ERROR: &str = "fixture open error";
+
+fn ordinary_open_error(
+    store: &Store,
+    token: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> String {
+    let error = anyhow::anyhow!(OPEN_ERROR);
+    let handoff = terminal_handoff(store, token, &error, deadline, clock);
+    format!("{:#}", report_handoff(error, handoff))
+}
+
+fn assert_pending_open_failed(store: &Store) {
+    let reason = format!(
+        "terminal launch failed: {OPEN_ERROR}; no surface handle was recorded and no prompt was sent"
+    );
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some(reason.as_str()));
+    assert!(turn::current_claim_token(store).unwrap().is_none());
+    assert!(
+        std::fs::read_to_string(store.directory().join(LOG))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .ends_with(&reason)
+    );
+}
+
+#[test]
+fn open_error_at_the_deadline_uses_the_newly_freed_lock() {
+    let (_dir, store, token) = fixture();
+    let lock = std::cell::RefCell::new(Some(store.lock().unwrap()));
+    let start = Instant::now();
+    let mut clock = Stepping {
+        start,
+        now: Rc::new(Cell::new(start)),
+        sleeps: vec![],
+        step: |at| {
+            if at == 200 {
+                lock.borrow_mut().take();
+            }
+        },
+    };
+    let message = ordinary_open_error(
+        &store,
+        &token,
+        start + Duration::from_millis(250),
+        &mut clock,
+    );
+    assert_eq!(clock.sleeps, [100, 100, 50], "{message}");
+    assert_pending_open_failed(&store);
+    assert_eq!(message, OPEN_ERROR);
+}
+
+#[test]
+fn open_error_after_the_launch_deadline_records_the_reason() {
+    let (_dir, store, token) = fixture();
+    test_support::apply(&store, &[test_support::Change::ReceiptExpired]);
+    let now = Instant::now();
+    assert_eq!(
+        ordinary_open_error(
+            &store,
+            &token,
+            now,
+            &mut Simulated {
+                now: Rc::new(Cell::new(now)),
+                sleeps: vec![]
+            }
+        ),
+        OPEN_ERROR
+    );
+    assert_pending_open_failed(&store);
+}
+
+#[test]
+fn open_error_with_a_failed_host_records_the_open_error() {
+    let (_dir, store, token) = fixture();
+    host::initialize(&store, &token, terminal::TerminalKind::Iterm2).unwrap();
+    host::fail(
+        &store,
+        &token,
+        None,
+        host::Failure {
+            reason: host::FailureReason::IdentityUnavailable,
+            exit_code: None,
+            signal: None,
+        },
+        0,
+        None,
+        None,
+    )
+    .unwrap();
+    let message = ordinary_open_error(
+        &store,
+        &token,
+        Instant::now() + START_TIMEOUT,
+        &mut crate::native::clock::SystemClock,
+    );
+    assert_eq!(message, OPEN_ERROR);
+    assert_pending_open_failed(&store);
+}
+
+#[test]
+fn open_error_after_failed_status_finishes_releasing_the_pending_claim() {
+    let (_dir, store, token) = fixture();
+    update_status(
+        store.directory(),
+        SessionState::Failed,
+        None,
+        Some("earlier failure".into()),
+    )
+    .unwrap();
+    let before = store.record(CoreRecord::Status).bytes().unwrap();
+    let log = std::fs::read(store.directory().join(LOG)).unwrap();
+    let message = ordinary_open_error(
+        &store,
+        &token,
+        Instant::now() + START_TIMEOUT,
+        &mut crate::native::clock::SystemClock,
+    );
+    assert_eq!(message, OPEN_ERROR);
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+    assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), before);
+    assert_eq!(std::fs::read(store.directory().join(LOG)).unwrap(), log);
+}
+
+#[test]
+fn open_error_after_a_spawn_during_the_wait_warns_against_resending() {
+    let (_dir, store, token) = fixture();
+    let lock = std::cell::RefCell::new(Some(store.lock().unwrap()));
+    let start = Instant::now();
+    let mut clock = Stepping {
+        start,
+        now: Rc::new(Cell::new(start)),
+        sleeps: vec![],
+        step: |_| {
+            spawned(&store);
+            update_status(store.directory(), SessionState::Running, None, None).unwrap();
+            lock.borrow_mut().take();
+        },
+    };
+    let message = ordinary_open_error(&store, &token, start + START_TIMEOUT, &mut clock);
+    assert!(
+        message.contains("nothing was recorded")
+            && message.contains("claim is retained")
+            && message.contains("do not resend"),
+        "{message}"
+    );
+    assert_eq!(store.status().unwrap().state, SessionState::Running);
+    assert!(claim_is(&store, &token));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn open_error_with_a_retained_surface_preserves_another_launch() {
+    let (_dir, store, token) = fixture();
+    let before = store.record(CoreRecord::Status).bytes().unwrap();
+    let log = std::fs::read(store.directory().join(LOG)).unwrap();
+    let surface =
+        terminal::TerminalSession::new(terminal::TerminalKind::Ghostty, "retained-id".into());
+    let error = terminal::RetainedLaunchSurface::new(surface, OPEN_ERROR.into()).into();
+    let error = terminal_failure(
+        &store,
+        "other-launch",
+        error,
+        Instant::now() + START_TIMEOUT,
+    );
+    assert_eq!(
+        store.record(CoreRecord::Status).bytes().unwrap(),
+        before,
+        "{error:#}"
+    );
+    assert!(claim_is(&store, &token));
+    assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+    assert_eq!(std::fs::read(store.directory().join(LOG)).unwrap(), log);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("retained-id") && message.contains(RESIDUAL_SURFACE_MARKER),
+        "{message}"
+    );
 }

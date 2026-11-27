@@ -1937,7 +1937,8 @@ A write already in progress completes. Once TAB has written a reopen marker, fin
 it, including publishing a child's launch refusal, can wait past the deadline to bind the child
 to its source or make the source reopenable after a failure. A timeout while waiting for a result
 does not cancel delivered work. A startup timeout can prevent a provider that has not started from launching. Startup has a
-separate ceiling of 30 seconds or the remaining command budget, whichever is shorter; increasing
+separate ceiling of 30 seconds or the remaining command budget, whichever is shorter, including
+the wait for the lifecycle lock after an open error without a retained surface; increasing
 `--timeout-secs` does not extend that ceiling. Inspect the recorded request before retrying. TAB
 allows one request at a time through a claim, the exclusive right to deliver that turn. If delivery
 is uncertain, it keeps the claim: another `tell` is blocked until completion or explicit close. Wait

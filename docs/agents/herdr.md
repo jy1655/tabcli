@@ -126,8 +126,8 @@
   `close-session` removes the finished terminal (`terminal.rm`). Creation removes a created
   terminal that its last live read finds finished; one that finishes after that read is bound
   and left to this probe.
-- Early launch decisions: a failure to open a Surface without a retained handle (including a directory
-  refusal) and the finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
+- Early launch decisions: the directory refusal before any Surface (every bound host) and the
+  finished Herdr terminal above end a launch before its deadline. Failing at once is, by the
   owner's decision, a different outcome from waiting for the deadline whenever the world
   changes in between; the bar for both (2026-11-26):
   (a) An early decision is taken only from facts read under the lifecycle lock at the moment of
@@ -156,8 +156,8 @@
   required, a busy or unavailable lock, or a clock that has run out establishes nothing. Each
   decision writes only on established facts, at once, under that same lock. Otherwise the
   finished-terminal probe defers to the ordinary poll, and the refusal returns the original
-  refusal; it adds that the Claim is retained only when the budget ran out while another holder
-  kept the lock and this launch's Claim is still seen at the path.
+  refusal. At the deadline, a busy lock adds a lock-timeout diagnostic, including Claim
+  retention only if this launch's Claim is still seen at the path.
   The reasons are in the failed `status.json` and, on a best-effort basis, in
   `launch.log`; `residual_surface()` and the status readers interpret the status. A later
   successful close without a terminal handle writes its closed record and status without that
