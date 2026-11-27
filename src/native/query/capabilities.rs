@@ -563,8 +563,7 @@ mod tests {
         decisions
     }
 
-    // tell's prediction, Repair and the macOS running wait agree on every record shape and
-    // every attestation answer, the foreign record with a dead process included.
+    // Compare tell's prediction with Repair for every record shape and attestation answer.
     #[test]
     fn the_owner_prediction_agrees_with_repair_on_every_record_and_answer() {
         type Answer = fn() -> OwnerAttestation;
@@ -616,18 +615,20 @@ mod tests {
                 };
                 let decisions = parity_row(shape, answer);
                 assert_eq!(decisions[..2], [expected, expected], "{shape} {name}");
-                // The running wait ends on the same deaths; it keeps waiting on an owner
-                // it cannot decide, where Repair fails.
+                // Delivery verifies a local owner before the running wait, so copies cannot reach it.
                 #[cfg(target_os = "macos")]
-                assert_eq!(
-                    decisions[2],
-                    if shape == "unreadable" || expected != Decision::Fails {
-                        expected
-                    } else {
-                        Decision::Continues
-                    },
-                    "{shape} {name}"
-                );
+                if !shape.starts_with("copy-") {
+                    // An undecidable owner keeps the wait running even when Repair fails.
+                    assert_eq!(
+                        decisions[2],
+                        if shape == "unreadable" || expected != Decision::Fails {
+                            expected
+                        } else {
+                            Decision::Continues
+                        },
+                        "{shape} {name}"
+                    );
+                }
             }
         }
     }
