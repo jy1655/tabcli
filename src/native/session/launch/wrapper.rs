@@ -1,13 +1,13 @@
 //! The wrapper operation of the launch protocol: the native session command as the bootstrap
 //! runs it in the surface. Admission, the fd handoff, the owner record, the version gate,
 //! the provider plan, the spawn with its durable identity and the exit settlement.
-use super::WRAPPER_EXIT_CODE_MARKER;
 use crate::native::provider_installation::check_provider_version_until;
 use crate::native::reopen::{ReopenGate, read_resumed_from, record_reopen_refusal};
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
 use crate::native::session::state::{SessionState, update_status};
 use crate::native::session::{self, CoreRecord, Reader, Store};
+use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::{process_env, provider, terminal};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -49,30 +49,39 @@ pub(in crate::native) fn record_provider_process(
 }
 
 pub(in crate::native) fn run(id: &str) -> Result<()> {
-    let directory = Reader::session_directory(id)?;
-    super::log(&Store::open_unchecked(&directory), "wrapper_started");
-    super::admit_wrapper(&Store::open_unchecked(&directory))?;
-    let result = (|| {
-        restore_stdout()?;
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            bail!("native-session must run in a visible interactive terminal");
+    let result = run_in_surface(id);
+    #[cfg(unix)]
+    if result.is_err() && std::env::var(STDERR_ENV).as_deref() == Ok("3") {
+        // The Unix bootstrap redirects stderr to the launch log and saves the
+        // terminal on fd 3. Report a wrapper's own error to that terminal.
+        if unsafe { libc::dup2(3, libc::STDERR_FILENO) } < 0 {
+            return result.context("failed to restore launch terminal stderr");
         }
-        let owner = terminal::ownership::current_surface_owner(&directory, id)?;
-        Store::open_unchecked(&directory).write_owner(&owner)?;
-        super::log(&Store::open_unchecked(&directory), "owner_recorded");
-        provision(&directory)
-    })();
-    match &result {
-        Ok(()) => super::log(
-            &Store::open_unchecked(&directory),
-            &format!("{WRAPPER_EXIT_CODE_MARKER}0"),
-        ),
-        Err(error) => super::log(
-            &Store::open_unchecked(&directory),
-            &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"),
-        ),
     }
-    if let Err(finalization_error) = super::finalize(&Store::open_unchecked(&directory), &result) {
+    result
+}
+
+fn run_in_surface(id: &str) -> Result<()> {
+    let directory = Reader::session_directory(id)?;
+    let store = Store::open_unchecked(&directory);
+    super::log(&store, "wrapper_started");
+    super::admit_wrapper(&store)?;
+    restore_stdout()?;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("native-session must run in a visible interactive terminal");
+    }
+    let owner = terminal::ownership::current_surface_owner(&directory, id)?;
+    run_registered(&store, &owner, check_provider_version_until)
+}
+
+pub(super) fn run_registered(
+    store: &Store,
+    owner: &NativeSessionOwner,
+    check: impl FnOnce(FirstPartyCli, &Path, Option<Instant>) -> Result<String>,
+) -> Result<()> {
+    super::register_wrapper(store, owner)?;
+    let result = provision_for_wrapper(store.directory(), Some(owner), check);
+    if let Err(finalization_error) = super::finalize_wrapper(store, owner, &result) {
         return match result {
             Ok(()) => Err(finalization_error),
             Err(run_error) => Err(anyhow::anyhow!(
@@ -83,13 +92,23 @@ pub(in crate::native) fn run(id: &str) -> Result<()> {
     result
 }
 
+#[cfg(test)]
 pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
     provision_with(directory, check_provider_version_until)
 }
 
 // `provision` with its version gate supplied, so a test can observe the bound the gate gets.
+#[cfg(test)]
 pub(in crate::native) fn provision_with(
     directory: &Path,
+    check: impl FnOnce(FirstPartyCli, &Path, Option<Instant>) -> Result<String>,
+) -> Result<()> {
+    provision_for_wrapper(directory, None, check)
+}
+
+fn provision_for_wrapper(
+    directory: &Path,
+    owner: Option<&NativeSessionOwner>,
     check: impl FnOnce(FirstPartyCli, &Path, Option<Instant>) -> Result<String>,
 ) -> Result<()> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
@@ -174,7 +193,6 @@ pub(in crate::native) fn provision_with(
             }
         };
 
-    let watcher = watcher.start(directory)?;
     let mut provider_command = process_env::provider_command(
         &manifest.provider_path,
         directory,
@@ -189,7 +207,13 @@ pub(in crate::native) fn provision_with(
         && let Err(error) = provider::reopen(provider)
             .and_then(|support| support.verify_available(&resumed_from.provider_session_id))
     {
-        let _ = watcher.stop();
+        let store = Store::open_unchecked(directory);
+        let _lock = store.lock()?;
+        if let Some(owner) = owner
+            && !super::recorded_owner_matches(&store, owner)?
+        {
+            return Err(error);
+        }
         return Err(record_reopen_refusal(
             directory,
             ReopenGate::ProviderUnsupported,
@@ -206,10 +230,16 @@ pub(in crate::native) fn provision_with(
     // Spawn and its durable identity are fenced against cancellation by the lifecycle
     // lock. Failed identity recording ends the child but stays delivery-uncertain: an
     // argument-delivered prompt could already have been consumed before cleanup.
-    let child = super::spawn_granted(
+    let mut active_watcher = None;
+    let child = super::spawn_for_wrapper(
         &Store::open_unchecked(directory),
         &mut provider_command,
         trust_grant.as_ref(),
+        owner,
+        || {
+            active_watcher = Some(watcher.start(directory)?);
+            Ok(())
+        },
         |child| {
             record_provider_process(directory, &manifest.id, child)?;
             match initial_prompt {
@@ -226,10 +256,15 @@ pub(in crate::native) fn provision_with(
             Ok(())
         },
     );
-    let mut child = match child {
-        Ok(child) => child,
+    let (mut child, watcher) = match child {
+        Ok(child) => (
+            child,
+            active_watcher.expect("watcher started before provider spawn"),
+        ),
         Err(error) => {
-            let _ = watcher.stop();
+            if let Some(watcher) = active_watcher {
+                let _ = watcher.stop();
+            }
             return Err(error).with_context(|| {
                 format!(
                     "failed to start {} at {}",

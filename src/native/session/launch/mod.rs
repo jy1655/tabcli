@@ -12,6 +12,7 @@ use crate::native::session::{
     CoreRecord, ExistingLock, Reader, RecordReader, RecordStore, Store, record, turn,
 };
 use crate::native::terminal;
+use crate::native::terminal::ownership::NativeSessionOwner;
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
 use anyhow::{Context, Result, bail};
@@ -33,7 +34,7 @@ pub(in crate::native) mod launcher;
 pub(in crate::native) mod pending;
 pub(in crate::native) mod wrapper;
 // Written at the end of the launch log by whoever sees the wrapper end: the bootstrap for a
-// wrapper that could not write, the wrapper itself, and the admission refusal.
+// wrapper that could not write, or the recorded wrapper itself.
 pub(in crate::native) const WRAPPER_EXIT_CODE_MARKER: &str = "wrapper_exit_code=";
 pub(in crate::native) use super::state::RESIDUAL_SURFACE_MARKER;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1176,10 +1177,25 @@ where
 }
 
 /// `spawn` for a command that may carry a trust-bearing launch option (`grant`, from its plan).
+#[cfg(test)]
 pub(in crate::native) fn spawn_granted<F>(
     store: &Store,
     command: &mut Command,
     grant: Option<&crate::native::consent::LaunchGrant>,
+    record_process: F,
+) -> Result<Child>
+where
+    F: FnOnce(&mut Child) -> Result<()>,
+{
+    spawn_for_wrapper(store, command, grant, None, || Ok(()), record_process)
+}
+
+fn spawn_for_wrapper<F>(
+    store: &Store,
+    command: &mut Command,
+    grant: Option<&crate::native::consent::LaunchGrant>,
+    owner: Option<&NativeSessionOwner>,
+    start_watcher: impl FnOnce() -> Result<()>,
     record_process: F,
 ) -> Result<Child>
 where
@@ -1216,23 +1232,36 @@ where
         }
     }
     check_spawn_locked(store, record.as_ref())?;
+    if let Some(owner) = owner {
+        if !recorded_owner_matches(store, owner)? {
+            store.write_owner(owner)?;
+        }
+        log(store, "owner_recorded");
+    }
     if let Some(record) = &mut record {
         record.phase = Phase::Spawning;
         Store::open_unchecked(directory)
             .record(CoreRecord::Launch)
             .write_json(record)?;
     }
-    let mut child = match command.spawn() {
+    let started =
+        start_watcher().and_then(|()| command.spawn().context("failed to spawn provider process"));
+    let mut child = match started {
         Ok(child) => child,
         Err(error) => {
-            // Command::spawn returning Err establishes that it started no provider.
+            // Neither a watcher startup error nor Command::spawn returning Err started a provider.
             if let Some(record) = &mut record {
                 record.phase = Phase::Pending;
                 Store::open_unchecked(directory)
                     .record(CoreRecord::Launch)
                     .write_json(record)?;
             }
-            return Err(error).context("failed to spawn provider process");
+            // Returning the receipt to Pending must not let another registration
+            // replace the spawner before its definitive failure is settled.
+            if owner.is_some() {
+                finalize_locked(store, Some(&error))?;
+            }
+            return Err(error);
         }
     };
     if let Err(error) = record_process(&mut child) {
@@ -1262,39 +1291,64 @@ where
 
 /// The wrapper's admission: the launch it was started for is still the pending one.
 pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<()> {
-    let directory = store.directory();
-    let reader = Reader::open_unchecked(directory);
-    if let Some(record) = read(&reader)? {
-        // The wrapper has no deadline: the spawn fence judges it under the lifecycle lock.
-        if pending::judge(
-            &reader,
+    let judged = match read(store)? {
+        Some(record) => pending::judge(
+            store,
             &record,
             &record.claim_token,
             pending::Expiry::Unchecked,
-        )?
-        .is_err()
-        {
-            log(
-                &Store::open_unchecked(directory),
-                &format!("{WRAPPER_EXIT_CODE_MARKER}1; launch cancelled or already attempted"),
-            );
-            bail!(
-                "provider launch cancelled or already attempted; the recorded session is unchanged"
-            );
+        )?,
+        None => pending::launching(store)?,
+    };
+    anyhow::ensure!(
+        judged.is_ok(),
+        "provider launch cancelled or already attempted; the recorded session is unchanged"
+    );
+    Ok(())
+}
+
+fn register_wrapper(store: &Store, owner: &NativeSessionOwner) -> Result<()> {
+    let _lock = store.lock()?;
+    admit_wrapper(store)?;
+    store.write_owner(owner)
+}
+
+fn recorded_owner_matches(store: &Store, owner: &NativeSessionOwner) -> Result<bool> {
+    Ok(super::owner::observe(store)
+        .decoded()?
+        .is_some_and(|record| {
+            let other = record.owner;
+            owner.pid == other.pid
+                && owner.managed_session_id == other.managed_session_id
+                && owner.linux_birth == other.linux_birth
+                && owner.process_start_seconds == other.process_start_seconds
+                && owner.process_start_microseconds == other.process_start_microseconds
+                && owner.windows_process_identity == other.windows_process_identity
+        }))
+}
+
+fn finalize_wrapper(store: &Store, owner: &NativeSessionOwner, result: &Result<()>) -> Result<()> {
+    let _lock = store.lock()?;
+    if recorded_owner_matches(store, owner)? {
+        match result {
+            Ok(()) => log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}0")),
+            Err(error) => log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}")),
         }
+        finalize_locked(store, result.as_ref().err())?;
     }
     Ok(())
 }
 
-/// Settles the session after the wrapper's command returned: recovers a pending completion,
-/// records Exited/Failed, keeps the claim when the spawn is uncertain, otherwise releases it.
+// Settlement tests that start with an already admitted owner.
+#[cfg(test)]
 pub(in crate::native) fn finalize(store: &Store, result: &Result<()>) -> Result<()> {
+    let _lock = store.lock()?;
+    finalize_locked(store, result.as_ref().err())
+}
+
+fn finalize_locked(store: &Store, failure: Option<&anyhow::Error>) -> Result<()> {
     let directory = store.directory();
-    let claim_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TurnClaim)
-        .path()
-        .to_owned();
-    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
+    let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     if let Some(record) = read(&Reader::open_unchecked(directory))?
         && record.phase != Phase::Spawned
         && turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
@@ -1305,9 +1359,9 @@ pub(in crate::native) fn finalize(store: &Store, result: &Result<()>) -> Result<
     recover_pending_completion_locked(directory, &claim_path)?;
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if !status.state.ended() {
-        match result {
-            Ok(()) => update_status(directory, SessionState::Exited, Some(0), None)?,
-            Err(error) => {
+        match failure {
+            None => update_status(directory, SessionState::Exited, Some(0), None)?,
+            Some(error) => {
                 let reason = if uncertain(&Reader::open_unchecked(directory)) {
                     format!(
                         "{error:#}; provider spawn is uncertain; the claim is retained, do not resend"

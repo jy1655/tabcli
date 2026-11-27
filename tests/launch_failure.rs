@@ -123,23 +123,23 @@ fn result_observes_expired_launch_without_repairing_files() {
 }
 
 #[test]
-fn early_wrapper_error_is_recorded_and_releases_the_claim() {
+fn wrapper_without_a_terminal_reports_its_error_and_preserves_the_pending_launch() {
     let fixture = Fixture::new("pending", false);
+    let before = fixture.status();
+    let claim = fs::read(fixture.directory.join("turn.claim")).unwrap();
     let output = fixture.run(&["native-session", "session-launch"]);
     assert!(!output.status.success());
-    let status = fixture.status();
-    assert_eq!(status["state"], "failed");
-    assert!(
-        status["error"]
-            .as_str()
-            .unwrap()
-            .contains("interactive terminal")
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
+    assert_eq!(fixture.status(), before);
+    assert_eq!(
+        fs::read(fixture.directory.join("turn.claim")).unwrap(),
+        claim
     );
-    assert_eq!(status["exit_code"], 1);
-    assert!(!fixture.directory.join("turn.claim").exists());
+    assert!(!fixture.directory.join("native-session.json").exists());
     let log = fs::read_to_string(fixture.directory.join("launch.log")).unwrap();
-    assert!(log.contains("interactive terminal"));
-    assert!(log.contains("exit_code=1"));
+    assert!(log.contains("wrapper_started"));
+    assert!(!log.contains("interactive terminal"));
+    assert!(!log.contains("wrapper_exit_code="));
 }
 
 #[test]
