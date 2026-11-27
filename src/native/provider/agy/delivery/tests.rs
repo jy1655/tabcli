@@ -358,7 +358,7 @@ fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_
     assert!(read_pending_turn(&directory).unwrap().is_some());
 }
 
-// Review r3, finding 14: the trace's paste timestamps surround the actual send. A trust check
+// The trace's paste timestamps surround the actual send. A trust check
 // that refuses immediately before the paste leaves them empty and records the input as not
 // sent; a paste that goes ahead is timed without the check.
 #[test]

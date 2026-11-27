@@ -542,7 +542,8 @@ Support needs an official way to interrupt this running interactive session from
 Agy's submission evidence is its receipt; it does not use Codex's composer protocol.
 
 Install and sign in to `agy` (Antigravity CLI) 1.1.12 or newer. Trust the exact project directory
-in Agy or use [shared workspace consent](agents/agy.md).
+in Agy, or with Agy 1.5.17 or newer rely on [shared workspace consent](security-and-data.md#workspace-trust-and-consent)
+(see the [Agy boundary](agents/agy.md)).
 
 On macOS and Linux, TAB passes the initial prompt with `--prompt-interactive`. Agy can run that prompt
 behind its workspace-trust dialog, so receiving the first result does not prove it is ready for
@@ -559,7 +560,7 @@ Trusting the directory in another Agy session does not establish that this sessi
 
 If TAB says the session's trust is unverified, no prompt was pasted. Look at the managed
 surface: approve a trust dialog if one is there and you trust the directory. After resolving it,
-retry a withheld macOS follow-up with `tell` if the session is `ready`. If the Windows initial
+retry a withheld follow-up with `tell` if the session is `ready`. If the Windows initial
 request failed, close that session and run a new `ask`. If the composer is already visible, or
 input remains withheld, close the session and start a new one. A missing log entry alone does not
 prove a dialog is open.

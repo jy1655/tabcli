@@ -105,7 +105,7 @@ pub(super) fn told_to_trust(
         Ok(Trust::Trusted(_)) => return Ok(Ok(TrustRoute::Store)),
         store => store,
     };
-    // A present record is decoded as the typed assessment (review r3, finding 12): valid JSON of
+    // A present record is decoded as the typed assessment: valid JSON of
     // another shape is unreadable evidence, never an absent marker.
     let applied = consent::session_applied(directory).map_err(|error| {
         anyhow::anyhow!("this session's workspace consent record could not be read: {error:#}")

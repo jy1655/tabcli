@@ -108,14 +108,14 @@ fn authority_for(
     }
     user_home(env)?;
     let root = directory.parent().context("session has no state root")?;
-    // Evidence that the recheck cannot read is a refusal marked unreadable (review r4, finding
-    // 1): a consumer that does not need the cause plans no option, sends no key and still tries
+    // Evidence that the recheck cannot read is a refusal marked unreadable: a consumer that does
+    // not need the cause plans no option, sends no key and still tries
     // its independent routes, as a missing consent did in 0.4.49; Agy reports the cause, and a
     // granted command refuses to start.
     let now = match assess_current(root, &workspace, env) {
         Ok(now) => now,
-        // TAB's own records and the workspace's identity propagate, as in 0.4.49 (review r5,
-        // finding 2); only provider and Git evidence is a typed refusal.
+        // TAB's own records and the workspace's identity propagate, as in 0.4.49; only provider and
+        // Git evidence is a typed refusal.
         Err(error) if !error.is::<EvidenceUnreadable>() => return Err(error),
         Err(error) => {
             return Ok((
@@ -201,7 +201,7 @@ pub(in crate::native) fn authorized(directory: &Path, target: FirstPartyCli) -> 
 /// A trust-bearing launch option that a launch plan put in its provider's command: the target
 /// provider, the option's marker and the identity of the workspace whose consent granted it.
 /// The plan carries it to the spawn fence, which asks the authority again about exactly this
-/// command (review r3, finding 1).
+/// command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::native) struct LaunchGrant {
     pub(in crate::native) provider: FirstPartyCli,
@@ -247,7 +247,7 @@ pub(super) fn admit_launch_within(
     })
 }
 
-// `check` answered within `budget` (review r4, finding 3). No time left refuses without asking.
+// `check` answered within `budget`. No time left refuses without asking.
 // Otherwise one absolute monotonic deadline is taken before the check starts, and an answer
 // that has not arrived by it, or arrives after it, refuses. The check writes nothing, so a late
 // answer is simply dropped.
@@ -279,10 +279,9 @@ pub(super) fn admit_launch_with(
         provider == grant.provider,
         "the launch option belongs to another provider than the session's, so the provider was not started"
     );
-    // The file the option names is the one its plan wrote, private to the user and unchanged
-    // (review r5, finding 1). It is read as a provider trust store is, so a replacement with the
-    // plan's bytes that another account could change is refused too, and the refusal says why
-    // (review r7, finding 5).
+    // The file the option names is the one its plan wrote, private to the user and unchanged. It is
+    // read as a provider trust store is, so a replacement with the
+    // plan's bytes that another account could change is refused too, and the refusal says why.
     if let Some(file) = &grant.option_file {
         let text = super::store::read_store(&file.path).map_err(|error| {
             anyhow::anyhow!(

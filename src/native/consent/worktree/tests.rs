@@ -267,7 +267,7 @@ fn a_relative_path_registration_names_its_main_working_tree() {
     assert_eq!(verified(&worktree).unwrap(), Some(repository));
 }
 
-// Review rulings, round 3: the claimed main working tree is screened, lexically and before any
+// The claimed main working tree is screened, lexically and before any
 // I/O on it, against the providers' stores alone; a destination no store lists is never touched.
 #[test]
 fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
@@ -353,7 +353,7 @@ fn the_claimed_main_working_tree_is_screened_before_any_io_on_it() {
     assert!(asked.borrow().is_empty());
 }
 
-// Review r3, finding 6: a pointer that names a component and later cancels it with `..` is
+// A pointer that names a component and later cancels it with `..` is
 // refused lexically, before any I/O and before the screen, so the walk never touches a path
 // outside both trees (an automount, say). Leading parent steps of a relative pointer stay
 // accepted (`a_relative_path_registration_names_its_main_working_tree`), and so does the
@@ -479,7 +479,7 @@ fn the_registration_must_name_this_worktree_and_its_common_directory_by_identity
     assert!(error(&fixture.worktree).contains("cannot be read"));
 }
 
-// Review r3, finding 7: the back-pointer must name `.git` in the assessed worktree directory. A
+// The back-pointer must name `.git` in the assessed worktree directory. A
 // folder whose `.git` is a hard link to the registered worktree's `.git` shares that file's
 // identity but is not the folder Git registered.
 #[test]
@@ -551,7 +551,7 @@ fn only_gits_pointer_form_is_read() {
     }
 }
 
-// Review r3, finding 8: a pointer file is opened so that a FIFO put in its place after it was
+// A pointer file is opened so that a FIFO put in its place after it was
 // inspected cannot block the open, and the opened handle is then checked. The replacement is a
 // race; the open itself is tested here on a FIFO.
 #[cfg(unix)]
@@ -601,7 +601,7 @@ fn no_link_on_the_way_counts() {
     );
     point(&fixture, &git_path(&fixture.registration));
     // The registration naming this worktree back through a linked directory: not a spelling of
-    // this worktree's `.git`, so refused before the link is reached (review r4, finding 4).
+    // this worktree's `.git`, so refused before the link is reached.
     let worktree_alias = root.join("worktree-alias");
     symlink(&fixture.worktree, &worktree_alias).unwrap();
     fs::write(
@@ -693,7 +693,7 @@ fn a_share_without_consent_evidence_is_never_touched() {
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
-// Review r4, finding 4: the back-pointer is resolved lexically first and must designate `.git`
+// The back-pointer is resolved lexically first and must designate `.git`
 // in the assessed workspace before anything on its path is walked. A stale registration that
 // names a former worktree in a third tree is refused before any I/O there (that tree does not
 // even exist here: a walk would report it unreadable), absolute or relative.
@@ -727,7 +727,7 @@ fn a_back_pointer_into_a_third_tree_is_refused_before_any_io_there() {
     }
 }
 
-// Review r5, finding 3: the registration's `commondir` is resolved lexically first and must
+// The registration's `commondir` is resolved lexically first and must
 // designate the main working tree's `.git` before anything on its path is walked. A valid
 // back-pointer with a stale `commondir` into a third tree is refused before any I/O there (the
 // tree does not even exist here: a walk would report it unreadable), absolute or relative;

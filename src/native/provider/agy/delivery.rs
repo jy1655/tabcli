@@ -230,7 +230,7 @@ pub(super) fn deliver_terminal_turn<R: Runtime>(
 // the failure between terminal injection, a late reload, and Agy's input loop.
 // Record actual dispatch times and the offset used by the receipt check without
 // copying prompt text. Diagnostic write failures never cancel or retry delivery.
-// The paste timestamps surround the send itself (review r3, finding 14): `at_dispatch` runs
+// The paste timestamps surround the send itself: `at_dispatch` runs
 // before them, and its refusal leaves them empty and records the input as not sent.
 #[allow(clippy::too_many_arguments)]
 fn trace_terminal_delivery<R, A, S, C>(

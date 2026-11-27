@@ -493,7 +493,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   root unless isolation is requested; it is not called implicitly by another command.
 - `src/native/consent.rs` preserves the public consent path and exposes the [workspace consent rules](agents/trust.md):
   `consent/store.rs` owns the exact-workspace trust-store reader used by provider adapters;
-  `consent/record.rs` owns TAB's consent Record and command; `consent/launch_dialog.rs` owns
+  `consent/record.rs` owns TAB's consent Record and command;
+  `consent/authority.rs` answers the consent question for trust-dependent acts;
+  `consent/worktree.rs` verifies linked worktree registration; `consent/launch_dialog.rs` owns
   a launch's workspace dialog step in one entry, from the decision whether to wait for the
   dialog at all to the one guarded response, through its `DialogSurface` seam (which also
   answers whether the surface takes a guarded key) and each provider adapter's launch-dialog

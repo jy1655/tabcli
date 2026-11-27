@@ -1346,7 +1346,7 @@ fn the_store_only_answer_reads_the_store_alone() {
     }
 }
 
-// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// A source store that becomes unreadable after the session's assessment is
 // a refusal for the plan through the production gate, as a missing consent was in 0.4.49: the
 // command carries no trust option and no grant, and the launch goes on. The recheck refuses on
 // the pinned fixture store before any store of the caller's own environment is read.

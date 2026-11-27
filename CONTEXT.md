@@ -305,7 +305,7 @@ A provider's own recorded consent to work in an exact workspace, read from a sto
 user can change.
 _Avoid_: approval, permission (TAB's own permission mode is a different axis)
 
-For inherited consent and consent authority, see the [Trust Store Boundary](docs/agents/trust.md).
+For inherited consent and when consent is checked, see the [Trust Store Boundary](docs/agents/trust.md).
 
 **Launch dialog**:
 The dialog a provider shows at startup, asking whether to trust the workspace. TAB answers

@@ -106,7 +106,7 @@ pub(super) fn workspace_trust_check(
     };
     // The session-only settings files are listed only for a session whose launch configured the
     // setting, so the row of any other session keeps the evidence it always had. A listing that
-    // could not be completed says so, never an empty list (review r6, finding 3).
+    // could not be completed says so, never an empty list.
     let mut evidence =
         serde_json::json!({ "workspace": workspace, "store": home.settings, "log": log_path });
     if configured {

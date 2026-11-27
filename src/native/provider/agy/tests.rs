@@ -600,7 +600,7 @@ fn consented_launch_hands_agy_the_exact_workspace_in_session_only_settings() {
 }
 
 // A refused or failing authority writes nothing; a refusal records nothing either, so the
-// dialog step sends no key for such a launch (review round 3, finding 1).
+// dialog step sends no key for such a launch.
 #[test]
 fn the_authority_decides_the_setting_and_an_inconclusive_one_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
@@ -684,7 +684,7 @@ fn the_store_only_answer_reads_the_store_alone() {
     }
 }
 
-// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// A source store that becomes unreadable after the session's assessment is
 // a refusal for the plan, as a missing consent was in 0.4.49: no session-only setting, no grant,
 // and the launch goes on.
 #[test]
@@ -717,7 +717,7 @@ fn a_source_store_unreadable_after_the_assessment_plans_no_setting() {
     assert!(session_settings_files(&directory).unwrap().is_empty());
 }
 
-// Review r5, finding 1: the command's workspace is checked against the consent record before any
+// The command's workspace is checked against the consent record before any
 // settings file is published, and each granted plan has its own file. A later plan built for
 // another directory (a stale snapshot) is refused and leaves the earlier plan's settings bytes,
 // and the directory's other files, as they were.
@@ -789,7 +789,7 @@ fn settings_names(directory: &Path) -> Vec<String> {
     names
 }
 
-// Review r6, finding 2: the plan owns its settings file from the file's exclusive creation until
+// The plan owns its settings file from the file's exclusive creation until
 // its grant is made. A write that fails after the file was created removes it, here the sync of
 // the session directory after the whole file was written, and so does a grant that is not made.
 // A removal that fails is reported with the file's path; the file is then left as it is.
@@ -905,7 +905,7 @@ impl SettingsPlan {
     }
 }
 
-// Review r7, finding 1: a grant that fails after the session record was replaced (the existing
+// A grant that fails after the session record was replaced (the existing
 // fault point after the rename, before the syncs that make it durable) returns the record's
 // applied marker to what it held before, under the record's lock, so no marker names a command
 // that was never built; an earlier plan's marker stays, with its file. A return that fails too
@@ -946,7 +946,7 @@ fn a_failed_grant_returns_the_applied_marker_to_its_earlier_value() {
     );
 }
 
-// Review r7, finding 2: the removal of a settings file that no plan was granted is made durable:
+// The removal of a settings file that no plan was granted is made durable:
 // the session directory is synced after the unlink, as after the file's creation. A removal
 // whose sync fails names the file in the plan's error.
 #[test]
@@ -982,7 +982,7 @@ fn the_removal_of_an_ungranted_settings_file_is_durable_or_named() {
     );
 }
 
-// Review r8, finding 1: the removal says which of its steps failed. The unlink of an ungranted
+// The removal says which of its steps failed. The unlink of an ungranted
 // settings file succeeds; then the session directory loses its permissions (a volume that fails
 // from that moment), so its sync fails and so would any later look at the path. The plan reports a
 // file that was removed but whose removal could not be made durable, never a file that could not

@@ -88,7 +88,7 @@ const RESPONSE_CONFIRMED: &str = "provider-workspace-dialog";
 
 // The one guarded response. The pending transition is written only while the record still
 // holds the applied value the step assessed (`assessed`), never over a pending value, and under
-// the record's lock taken by the step's deadline (review r3, finding 13); the dispatch callback
+// the record's lock taken by the step's deadline; the dispatch callback
 // asks the authority again after that write.
 fn respond_to_workspace_dialog(
     directory: &Path,
@@ -338,18 +338,18 @@ impl LaunchDialog<'_> {
                 Trust::Trusted(_)
             );
             // The time of a confirmation is the time of the store read that shows it, taken before
-            // the liveness check that follows (review r7, finding 3).
+            // the liveness check that follows.
             let confirmed_at = (trusted && responded).then(|| clock.now());
             require_launch_dialog_live(directory, responded)?;
             if trusted {
                 if let Some(confirmed_at) = confirmed_at {
-                    // Recorded only within the step's deadline (review r4, finding 5; review r5,
-                    // finding 5): a confirmation first observed at or after it is reported as
+                    // Recorded only within the step's deadline: a confirmation first observed at or
+                    // after it is reported as
                     // observed late. A confirmation observed in time whose record cannot take it
                     // in time (the lock held until the deadline, or the deadline reached once the
                     // lock is held, on the same clock and boundary as here, also during the
-                    // liveness check above) is reported as confirmed with its recording failed
-                    // (review r6, finding 4). Nothing is sent again either way, and the pending
+                    // liveness check above) is reported as confirmed with its recording failed.
+                    // Nothing is sent again either way, and the pending
                     // marker stays.
                     if confirmed_at >= deadline {
                         bail!(
@@ -427,14 +427,13 @@ impl LaunchDialog<'_> {
                     }
                     let mut attempted = false;
                     // Every path that proves the key unsent returns the record from this step's
-                    // own pending value to what the step assessed (review r3, finding 4); only a
+                    // own pending value to what the step assessed; only a
                     // dispatch that may have sent the key keeps it. A record that another writer
                     // already changed is left as it is. A restore that fails (the lock held until
                     // the deadline, the record not writable) ends the step and says so with the
-                    // unsent key (review r4, finding 6); the pending value then refuses any later
+                    // unsent key; the pending value then refuses any later
                     // attempt.
-                    // A value another writer put there is kept, and the step stops (review r5,
-                    // finding 6).
+                    // A value another writer put there is kept, and the step stops.
                     let restore = || match record::restore(
                         directory,
                         RESPONSE_PENDING,
@@ -535,7 +534,7 @@ enum DialogConsent {
 // inconclusive launch never falls back to it. Eligibility comes from what the launch recorded,
 // never from the dialog step's own pending value: a pending response that this step reads here
 // is not its own (it reads the record only before its own write), so it refuses, as do another
-// adapter's launch option and a value the step does not know (review r3, finding 4).
+// adapter's launch option and a value the step does not know.
 fn dialog_consent(authority: &Authority, target: FirstPartyCli) -> Result<DialogConsent> {
     let Ok(consented) = authority.verdict else {
         return Ok(DialogConsent::NoKey);

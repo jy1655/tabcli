@@ -428,7 +428,7 @@ fn receipt_window_starts_after_send_advances_time() {
     );
 }
 
-// Review finding 7: a paste without a startup readiness wait, which is how a Windows follow-up
+// A paste without a startup readiness wait, which is how a Windows follow-up
 // is delivered after its session's initial paste, still waits for this process's own trust
 // evidence, as every paste does. The shared path runs on every platform.
 #[test]
@@ -476,7 +476,7 @@ fn a_paste_without_readiness_still_waits_for_the_trust_evidence() {
     assert_eq!(runtime.clock.slept, Duration::ZERO);
 }
 
-// Review round 3, finding 2: the trust is consumed after every readiness wait, immediately
+// The trust is consumed after every readiness wait, immediately
 // before the paste. Agy's store entry withdrawn while the paste waited for a quiet log sends
 // nothing, through the gated path and through the one without readiness.
 #[test]
@@ -526,7 +526,7 @@ fn trust_is_consumed_immediately_before_the_paste() {
     }
 }
 
-// Review round 3, finding 2: the load line must be in the very log contents that supply the
+// The load line must be in the very log contents that supply the
 // receipt offset. A log replaced after the trust wait, which passes readiness without the
 // line, supplies no offset and nothing is pasted.
 #[test]

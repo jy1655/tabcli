@@ -125,8 +125,8 @@ impl Harness {
 
 // Claude's one-second settle on Windows: a budget below it sends nothing. The one dispatch comes
 // at 1,000 ms, and the provider's confirmation it causes is first observed one 200 ms polling
-// interval later, at 1,200 ms; a confirmation observed at the deadline is late (review r5, finding
-// 5), so the successful budget is longer than 1,200 ms.
+// interval later, at 1,200 ms; a confirmation observed at the deadline is late, so the successful
+// budget is longer than 1,200 ms.
 #[test]
 fn launch_dialog_settle_boundary_and_pending_intent_precede_one_response() {
     for timeout_ms in [999, 1201] {
@@ -227,7 +227,7 @@ fn launch_dialog_resets_on_full_screen_nonmatch_and_prewrite_changed() {
 
 // Agy's zero settle answers its first observation. The guarded key is the legacy answer for an
 // Agy positively identified as older than the session-only setting's floor, whose launch records
-// the option as unavailable (review round 3, ruling A). A launch that recorded nothing, such as
+// the option as unavailable. A launch that recorded nothing, such as
 // one whose version check was inconclusive, takes no key on this surface either: the step leaves
 // the dialog to Agy and the paste gate waits for Agy's own trust evidence.
 #[test]
@@ -372,8 +372,8 @@ fn launch_dialog_typed_prewrite_refusal_is_distinct_from_dispatch_error() {
         assert!(error.contains("dialog dispatch failed"), "{error}");
         assert_eq!(error.contains("no response sent"), refused, "{error}");
         assert_eq!(error.contains("possible response"), !refused, "{error}");
-        // A stale claim proves the key unsent: the record returns to what the step assessed
-        // (review r3, finding 4). An uncertain dispatch keeps the pending value.
+        // A stale claim proves the key unsent: the record returns to what the step assessed. An
+        // uncertain dispatch keeps the pending value.
         assert_eq!(
             observe(&h.directory).value()["applied"],
             if refused {

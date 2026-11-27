@@ -212,7 +212,7 @@ mod tests {
             }
         }
     }
-    // Review round 3, finding 11: only the target's own marker, confirmed in the one typed
+    // Only the target's own marker, confirmed in the one typed
     // authority result together with its yes, opens the gate; another adapter's marker is
     // not asked about and opens nothing.
     #[test]
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(clock.slept, Duration::from_millis(250));
     }
 
-    // Review r4, finding 1: a source store that becomes unreadable after the session's
+    // A source store that becomes unreadable after the session's
     // assessment is a refusal for the Codex wait, as a missing consent was in 0.4.49: the
     // marker route closes and the independent evidence is still checked.
     #[test]

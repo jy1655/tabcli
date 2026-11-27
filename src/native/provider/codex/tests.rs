@@ -1457,7 +1457,7 @@ fn the_store_only_answer_reads_the_store_alone() {
     }
 }
 
-// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// A source store that becomes unreadable after the session's assessment is
 // a refusal for the plan through the production gate, as a missing consent was in 0.4.49: the
 // command carries no trust option and no grant, and the launch goes on. The recheck refuses on
 // the pinned fixture store before any store of the caller's own environment is read.
@@ -1533,7 +1533,7 @@ fn a_source_store_unreadable_after_the_assessment_plans_a_plain_command() {
     );
 }
 
-// Review r4, finding 2: the grant names the workspace the command was built for. A session whose
+// The grant names the workspace the command was built for. A session whose
 // consent record was assessed for another directory than the wrapper's snapshot (which gives
 // the command its working directory and its trust override) gets no grant: the plan refuses.
 #[test]
@@ -1578,7 +1578,7 @@ fn a_grant_for_another_workspace_than_the_command_refuses_the_plan() {
     );
 }
 
-// Review r5, finding 2: TAB's own shared consent record that cannot be read or decoded after the
+// TAB's own shared consent record that cannot be read or decoded after the
 // session's resolution is an error for the plan, as in 0.4.49; only provider stores and Git's
 // registration evidence become a refusal marked unreadable.
 #[test]
@@ -1654,7 +1654,7 @@ fn a_damaged_shared_consent_record_after_resolution_is_an_error_for_the_plan() {
     );
 }
 
-// Review r6, finding 1: the main working tree of an inherited source lost between its
+// The main working tree of an inherited source lost between its
 // identification and the rest of its assessment while the plan rechecks consent withdraws the
 // inheritance. The plan goes on with a plain command through the production gate, as with a
 // registration that is gone; it does not stop. The recheck reads only the pinned fixture store.

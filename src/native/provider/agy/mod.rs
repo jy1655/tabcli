@@ -617,10 +617,10 @@ fn session_trust_settings(
     if authority(context.directory)?.verdict.is_err() {
         return Ok(None);
     }
-    // Review r5, finding 1: the command's workspace is checked against the consent record before
+    // The command's workspace is checked against the consent record before
     // anything is published, and this plan's settings file is its own: created new under a random
     // name, private, never replaced by another plan, and named in the grant with its bytes, which
-    // the spawn fence checks again. Review r6, finding 2: the plan owns the file from its
+    // the spawn fence checks again. The plan owns the file from its
     // exclusive creation until the grant is made. A write that fails after the file exists, or a
     // grant that is not made, removes it, and a removal that fails is reported with its path.
     super::super::consent::check_command_workspace(context.directory, context.workspace)?;
@@ -665,9 +665,9 @@ fn new_session_settings(directory: &Path) -> Result<(std::fs::File, PathBuf)> {
 }
 
 // Removes a settings file that no plan was granted, durably (the session directory is synced
-// after the unlink; review r7, finding 2), and returns the plan's `error`, naming the file when
-// it could not be removed or its removal could not be made durable, as the removal itself says
-// (review r8, finding 1): no Agy was started with it, and a file left stays with the session's
+// after the unlink), and returns the plan's `error`, naming the file when
+// it could not be removed or its removal could not be made durable, as the removal itself says: no
+// Agy was started with it, and a file left stays with the session's
 // records until `prune-sessions` removes the session directory.
 fn discard_ungranted(file: &Path, error: anyhow::Error) -> anyhow::Error {
     use crate::native::session::primitives::{RemovalFailure, remove_file_durably};

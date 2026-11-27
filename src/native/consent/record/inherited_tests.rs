@@ -150,7 +150,7 @@ fn exact_trust_comes_first_and_consent_extends_to_no_child_or_parent() {
     );
 }
 
-// Review finding 1: the main working tree's own consent decides, as TAB assesses that folder,
+// The main working tree's own consent decides, as TAB assesses that folder,
 // not the provider's store read past it. A revoke, a changed identity or a reset source of the
 // main working tree stops inheritance, before and after the worktree's first assessment.
 #[test]
@@ -229,7 +229,7 @@ fn the_main_working_trees_own_consent_decides() {
     );
 }
 
-// Review finding 2: a source provider's own decline of the worktree is never turned into an
+// A source provider's own decline of the worktree is never turned into an
 // approval by that provider's entry for the main working tree, at acquisition or later.
 #[test]
 fn a_source_that_declines_the_worktree_gives_it_nothing() {
@@ -423,7 +423,7 @@ fn records_keep_the_shape_an_earlier_binary_reads_and_an_inherited_one_never_ver
     );
 }
 
-// Review finding 6: the main working tree's own assessment during a worktree's start records
+// The main working tree's own assessment during a worktree's start records
 // only a verified pin; refusing, it leaves no record behind, while the workspace's own start
 // records what it found as every earlier release did.
 #[test]
@@ -451,7 +451,7 @@ fn the_main_working_tree_is_recorded_only_when_its_consent_is_verified() {
     assert!(main_record.exists());
 }
 
-// Review finding 5: a recheck requires the pins recorded at the start; a reset of the
+// A recheck requires the pins recorded at the start; a reset of the
 // worktree's record or of its main working tree's leaves nothing for it to recheck, and only a
 // new start acquires consent again.
 #[test]
@@ -539,7 +539,7 @@ impl Opened {
     }
 }
 
-// Router's answer to the open question of round 3: the screen asks each provider's own store
+// The screen asks each provider's own store
 // alone, never a reader that touches the path. A `.git` file that names a main working tree no
 // store lists makes TAB open nothing and run nothing there. A reader that probes the claimed
 // path's ancestors would find the `.git` above this destination and run `git` in it, and Git
@@ -655,7 +655,7 @@ fn a_main_working_tree_that_a_store_lists_but_its_reader_refuses_gives_nothing()
     assert!(record_path(temp.path(), &git.repository).exists());
 }
 
-// Review r3, finding 9: a pinned recheck screens the main working tree against the store its pin
+// A pinned recheck screens the main working tree against the store its pin
 // names, not against the stores the caller's environment names now. A session that inherited
 // Pi's trust from one Pi home keeps it when a later command runs with another home whose stores
 // list nothing; acquisition (no pin yet) keeps discovering in the stores the environment names.
@@ -698,7 +698,7 @@ fn a_pinned_recheck_screens_the_main_working_tree_against_the_pinned_store() {
     );
 }
 
-// Review r3, finding 12: at a recheck, a registration that cannot be read is an error, never a
+// At a recheck, a registration that cannot be read is an error, never a
 // refusal that reads as missing trust; a registration that is gone is a refusal.
 #[cfg(unix)]
 #[test]
@@ -739,7 +739,7 @@ fn nested_worktree_setup() -> (tempfile::TempDir, Fixture, Registered, PathBuf) 
     (temp, fixture, git, nest)
 }
 
-// Review r6, finding 1: the main working tree lost between its identification and the rest of its
+// The main working tree lost between its identification and the rest of its
 // assessment during a recheck withdraws the inheritance, as a registration that is gone does; it
 // is no error that would stop a plain launch's planning.
 #[test]
@@ -761,7 +761,7 @@ fn a_main_working_tree_lost_during_a_recheck_withdraws_inheritance() {
     assert!(!git.repository.exists());
 }
 
-// Review r6, finding 1: evidence of the main working tree that cannot be read between its
+// Evidence of the main working tree that cannot be read between its
 // identification and the rest of its assessment is typed as unreadable at a recheck, never a raw
 // error; TAB's own shared record of the main working tree that cannot be decoded keeps its error.
 #[cfg(unix)]

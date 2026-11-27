@@ -377,7 +377,7 @@ fn consented_session(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 // A session whose launch configured Agy's session-only setting needs no entry in Agy's store,
 // and it still needs its own log line: the setting is TAB's configuration, the line is Agy's
 // evidence that this process took it. The marker grants nothing by itself: consent's authority
-// decides at every paste (review finding 8), and only this session's own record of the Agy
+// decides at every paste, and only this session's own record of the Agy
 // setting counts.
 #[test]
 fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line() {
@@ -448,11 +448,11 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     );
     // Agy's own store must still be readable: the authority asks the target whether it
     // declines the workspace. A read failure withholds the paste and is reported as unreadable
-    // evidence, never as an absent entry (review round 3, finding 12).
+    // evidence, never as an absent entry.
     fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
     let store = root.join(".gemini/antigravity-cli/settings.json");
     // Created as Agy's own store is, private to the user, so that the reader refuses its
-    // contents rather than its access list (Windows CI, 2026-11-26; review r4, finding 8).
+    // contents rather than its access list (Windows CI, 2026-11-26).
     crate::native::session::primitives::write_private(&store, b"{\"trustedWorkspaces\":true}")
         .unwrap();
     let (outcome, check) = gate();
@@ -531,7 +531,7 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
             "{marker}"
         );
     }
-    // Review r3, finding 12: a present record is decoded as the typed assessment. Valid JSON of
+    // A present record is decoded as the typed assessment. Valid JSON of
     // another shape (a marker that is not a string, a record that is not an object) is
     // unreadable evidence, never an absent marker; Agy's own store entry still stands alone.
     for record in [
@@ -594,7 +594,7 @@ fn the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line(
     );
 }
 
-// Review r6, finding 3: the doctor row of a session whose launch configured the setting lists
+// The doctor row of a session whose launch configured the setting lists
 // every settings file the session holds, regular files only: one per granted plan, and the
 // single `agy-session-trust.json` that this change's earlier build wrote. A listing that cannot
 // be completed says so; it is never shown as an observed empty list.

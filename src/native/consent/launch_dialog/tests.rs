@@ -720,7 +720,7 @@ fn older_agy(yolo: bool) -> Consented {
     c
 }
 
-// Review round 3, finding 1: an Agy launch that did not apply its setting and did not record
+// An Agy launch that did not apply its setting and did not record
 // it as unavailable (an inconclusive version, a refused or unreadable check) never falls back
 // to the guarded key, on any surface. Only a positively older Agy takes it.
 #[test]
@@ -738,7 +738,7 @@ fn an_inconclusive_agy_launch_never_falls_back_to_the_key() {
     }
 }
 
-// Review round 3, finding 11: a value the step does not know refuses the step.
+// A value the step does not know refuses the step.
 #[test]
 fn an_unknown_launch_value_refuses_the_step() {
     for target in [FirstPartyCli::Claude, FirstPartyCli::Agy] {
@@ -786,7 +786,7 @@ impl Clock for Hooked<'_> {
     }
 }
 
-// Review round 3, finding 4: the pending transition is written only while the record still
+// The pending transition is written only while the record still
 // holds what the step assessed, and the dispatch callback asks the authority after that write.
 // A launch option recorded just before the write keeps its record and gets no key; consent
 // withdrawn just after it gets no key either, and the record returns to what was assessed.
@@ -850,7 +850,7 @@ fn the_authority_is_consumed_inside_the_dispatch_after_the_pending_write() {
     }
 }
 
-// Review finding 6: the step asks the one authority again before the screen read and
+// The step asks the one authority again before the screen read and
 // immediately before the one dispatch. Consent withdrawn, or a launch option recorded, after
 // the screen was read sends no key.
 #[test]
@@ -1195,7 +1195,7 @@ fn windows_claude_under_bypass_reaches_only_an_authorized_dialog() {
     }
 }
 
-// Review r3, finding 4: a pending response in the session record is neither evidence of an older
+// A pending response in the session record is neither evidence of an older
 // Agy nor permission for another attempt. A step that finds one it did not write sends no key
 // and leaves the record as it found it.
 #[test]
@@ -1260,7 +1260,7 @@ impl Clock for Jumping<'_> {
     }
 }
 
-// Review r3, finding 4: every path that proves the key unsent after the pending write returns the
+// Every path that proves the key unsent after the pending write returns the
 // record to what the step assessed: the deadline passing inside the dispatch callback, the
 // authority failing to read there, the surface reporting a changed screen (`Ok(false)`) and a
 // stale claim. Only a dispatch that may have sent the key keeps the pending value.
@@ -1356,7 +1356,7 @@ fn every_proven_unsent_path_restores_the_assessed_record() {
     }
 }
 
-// Review r3, finding 13: the session record's lock is taken with the step's remaining budget. A
+// The session record's lock is taken with the step's remaining budget. A
 // writer that holds it past the deadline ends the step as proven unsent, by the deadline, and
 // the record is unchanged.
 #[test]
@@ -1405,7 +1405,7 @@ fn a_held_session_record_lock_ends_the_step_unsent_by_its_deadline() {
     drop(holder);
 }
 
-// Review r4, finding 1: a source store that becomes unreadable after the session's assessment is
+// A source store that becomes unreadable after the session's assessment is
 // a refusal for the dialog step, as a missing consent was in 0.4.49: no key and no error.
 #[test]
 fn an_unreadable_source_store_takes_no_key_and_is_no_error() {
@@ -1470,7 +1470,7 @@ fn step_in_thread(
     received.recv_timeout(Duration::from_secs(10)).ok()
 }
 
-// Review r4, finding 5: recording the provider's confirmation takes the session record's lock
+// Recording the provider's confirmation takes the session record's lock
 // within the step's deadline. A writer that holds it past then ends the step with the trust
 // confirmed and its recording failed, and no input is retried.
 #[test]
@@ -1502,7 +1502,7 @@ fn a_held_lock_after_the_answer_reports_confirmed_trust_and_a_failed_record() {
     drop(holder);
 }
 
-// Review r4, finding 6: a key proven unsent whose pending marker cannot be restored (the record's
+// A key proven unsent whose pending marker cannot be restored (the record's
 // lock held until the deadline) stops the step and reports both facts: nothing was sent, and the
 // marker could not be restored. Nothing is dispatched again.
 #[test]
@@ -1567,7 +1567,7 @@ impl Clock for Advancing<'_> {
     }
 }
 
-// Review r5, finding 5: a provider confirmation first observed after the step's deadline is not
+// A provider confirmation first observed after the step's deadline is not
 // recorded as timely, even with the record's lock free: the step reports the observed
 // confirmation, that the marker was not recorded and that no input was retried.
 #[test]
@@ -1626,7 +1626,7 @@ fn a_confirmation_observed_after_the_deadline_is_not_recorded() {
     );
 }
 
-// Review r5, finding 6: a restore that finds the marker changed by another writer keeps that
+// A restore that finds the marker changed by another writer keeps that
 // writer's value, stops the step and says that the key was not sent and the marker was changed.
 #[test]
 fn a_restore_that_finds_another_writers_value_keeps_it_and_stops() {
@@ -1748,7 +1748,7 @@ fn confirmed_at_once(c: &Consented, clock: &mut RecordingLate<'_>) -> (String, u
 const RECORDING_FAILED: &str =
     "provider trust is confirmed; recording the TAB applied marker failed; no input was retried";
 
-// Review r6, finding 4: a confirmation observed within the step's deadline whose recording misses
+// A confirmation observed within the step's deadline whose recording misses
 // it (the deadline passes while the record is locked and read) is reported as confirmed with its
 // recording failed, never as observed after the deadline. The pending marker stays and nothing is
 // sent again.
@@ -1781,7 +1781,7 @@ fn a_timely_confirmation_whose_recording_misses_the_deadline_is_not_reported_lat
     );
 }
 
-// Review r6, finding 4: the check once the record's lock is held has the same boundary as the
+// The check once the record's lock is held has the same boundary as the
 // check before it: a recording at exactly the deadline is not made.
 #[test]
 fn a_recording_at_exactly_the_deadline_is_not_made() {
@@ -1806,7 +1806,7 @@ fn a_recording_at_exactly_the_deadline_is_not_made() {
     );
 }
 
-// Review r7, finding 3: the time of the provider's confirmation is taken right after the store
+// The time of the provider's confirmation is taken right after the store
 // read that shows it, before the liveness check that follows. A liveness check during which the
 // deadline passes (here an hour passes in it) does not make that observation late: the check
 // once the record's lock is held then refuses the recording, and the step reports the trust

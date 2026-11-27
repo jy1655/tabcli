@@ -45,11 +45,14 @@
 - A linked worktree can inherit the consent of its main working tree when Git's registration
   identifies both trees and the main tree's pinned source, identity and consent still hold
   (`a_verified_linked_worktree_inherits_the_consent_of_its_main_working_tree`).
+- Records without `repository_root` keep their earlier bytes and meaning, and an earlier release
+  checking an inherited source pin reports `source-reset` and never grants it.
 - A registration under another spelling of the worktree path, even one differing only in case,
   does not supply inherited consent; use `git -c core.ignorecase=false worktree repair <worktree>`
   to repair the registration.
-- Revoking consent with `tabcli consent revoke` on the main working tree withdraws TAB's
+- `tabcli consent revoke` or `tabcli consent reset` on the main working tree withdraws TAB's
   inherited consent and leaves providers' own trust and independent exact consent intact.
+  After a reset, a new `ask` can acquire consent again.
 - The worktree check verifies the registration by path, without directory-handle traversal,
   against any content of the launch folder and any local user who cannot write the main working
   tree's `.git` or an ancestor directory of either tree.

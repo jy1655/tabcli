@@ -19,9 +19,12 @@
   (`consented_launch_hands_agy_the_exact_workspace_in_session_only_settings`).
 - Only a launch identified as older and recorded as lacking the option is eligible for Agy's
   guarded dialog answer (`an_inconclusive_agy_launch_never_falls_back_to_the_key`).
-- Every paste requires this session's workspace customization load in `agy.log` and either
-  Agy's exact trust entry or the session setting's marker with current consent
+- Every paste requires this session's workspace customization load (a `hooks_manager.go` line from a
+  goroutine other than the main one) in `agy.log` and either Agy's exact trust entry or the session
+  setting's marker with current consent
   (`the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line`).
+  A paste missing either fact waits for both and fails `not_sent` if the deadline expires.
+  A refusal immediately before the paste is also `not_sent`.
   The store is shared by every Agy process, so a dialog approved in one session leaves another
   session's dialog open; the log line is per process and appears at startup in a workspace
   trusted before launch or when the dialog is approved in that session.

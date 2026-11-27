@@ -121,7 +121,7 @@ fn exact_source(path: &Path, env: &Environment) -> Option<Evidence> {
 // touched before a store lists it. The screen is a necessary condition only, never consent: the
 // main working tree that passes it is assessed afterwards by the full readers, exactly as an
 // exact folder is, and a path a store lists but its reader refuses gives no inheritance. A
-// pinned source is screened in the one store its pin names (review r3, finding 9), whatever
+// pinned source is screened in the one store its pin names, whatever
 // stores the caller's environment names now; that store's read error is the screen's error.
 // Without a pin, one provider's error does not stop the next from being asked.
 fn listed(path: &Path, env: &Environment, pin: Option<&Evidence>) -> Result<bool> {
@@ -143,9 +143,9 @@ fn listed(path: &Path, env: &Environment, pin: Option<&Evidence>) -> Result<bool
 
 /// Provider or Git evidence that a recheck could not read: a pinned source's store, the
 /// registration and the main working tree that a `.git` file names, the source's reading of the
-/// worktree. The authority reports it as a refusal marked unreadable (review r4, finding 1). Any
+/// worktree. The authority reports it as a refusal marked unreadable. Any
 /// other error, such as TAB's own shared consent record that cannot be read or decoded, or the
-/// workspace that cannot be identified, propagates as in 0.4.49 (review r5, finding 2).
+/// workspace that cannot be identified, propagates as in 0.4.49.
 #[derive(Debug)]
 pub(in crate::native) struct EvidenceUnreadable(&'static str);
 
@@ -337,7 +337,7 @@ fn decide(
         let holds = match &record.repository_root {
             // The one provider the record names rechecks the store it was read from, never
             // the store its home resolves to now. At a recheck a store that cannot be read is
-            // an error, never a reset (review r3, finding 12); a start records a reset, as every
+            // an error, never a reset; a start records a reset, as every
             // earlier release did.
             None => {
                 match provider::workspace_trust(cli, &identity.path, env, Some(&source.store)) {
@@ -405,12 +405,12 @@ fn decide(
 // source, identity and revocation), and a source provider that neither declines nor fails to
 // read the worktree itself. Anything that does not hold inherits nothing. Evidence that cannot
 // be read inherits nothing while a start looks for inheritance; at a recheck it is an error, so
-// the authority reports it as unreadable rather than as missing trust (review r3, finding 12).
+// the authority reports it as unreadable rather than as missing trust.
 // A missing file or folder is a fact, not unreadable evidence: the worktree is no longer
 // registered, or its main working tree is gone, as the verifier's own reads find it. A pinned
 // source's reader that touches the main working tree itself (Claude's scope probe) and fails is
-// the source's evidence that cannot be read, also when the folder went during that probe (review
-// r7, finding 4). TAB's own shared record of the main working tree that cannot be read or
+// the source's evidence that cannot be read, also when the folder went during that probe. TAB's own
+// shared record of the main working tree that cannot be read or
 // decoded is an error at a recheck, as the workspace's own record is.
 fn inherited(
     root: &Path,
@@ -462,7 +462,7 @@ fn inherited(
         hook(&main);
     }
     // The main working tree is identified once, and the rest of its assessment uses that
-    // identity. A failure is classified where it arises (review r6, finding 1): the folder gone
+    // identity. A failure is classified where it arises: the folder gone
     // since it was identified withdraws the inheritance, as a registration that is gone does, and
     // a folder that cannot be inspected is unreadable evidence; neither is an error that would stop
     // a plain launch. TAB's own shared record of the main working tree keeps its error below.
@@ -568,7 +568,7 @@ impl std::fmt::Display for SessionRecordBusy {
 
 impl std::error::Error for SessionRecordBusy {}
 
-// `deadline` bounds the wait for the lock (review r3, finding 13): an operation with a deadline
+// `deadline` bounds the wait for the lock: an operation with a deadline
 // takes the lock with its remaining budget, and at least one attempt, and its expiry changes
 // nothing. A launch plan records without one, as before.
 fn with_session_record<T>(
@@ -614,15 +614,14 @@ fn with_session_record<T>(
 /// workspace the session's assessment consented to. `workspace` is the one the command was built
 /// for (the wrapper's snapshot that gives it its working directory and its option): a consent
 /// record for another directory, or one whose identity is not that directory's now, grants
-/// nothing (review r4, finding 2).
+/// nothing.
 /// `option_file` is a file the option names (Agy's settings) and the bytes the plan wrote to it:
 /// the grant names it, and the spawn fence refuses a command whose file is not that one.
 /// A write that fails can already have replaced the record (the replacement comes before the
 /// syncs that make it durable): the record is then returned to its earlier value under the same
-/// lock, so no marker names a command that is never built, and an earlier plan's marker stays
-/// (review r7, finding 1). When that return fails too, the record can keep the attempted marker,
-/// and the error says that this attempt received no grant and which marker may remain (review r8,
-/// finding 2).
+/// lock, so no marker names a command that is never built, and an earlier plan's marker stays. When
+/// that return fails too, the record can keep the attempted marker,
+/// and the error says that this attempt received no grant and which marker may remain.
 pub(in crate::native) fn apply_option(
     directory: &Path,
     provider: FirstPartyCli,
@@ -668,7 +667,7 @@ fn restore_earlier(path: &Path, earlier: &Assessment) -> Result<()> {
 }
 
 /// Checks, before a plan publishes anything for its option, that the session's consent record
-/// was assessed for `workspace`, the directory the command was built for (review r5, finding 1).
+/// was assessed for `workspace`, the directory the command was built for.
 pub(in crate::native) fn check_command_workspace(directory: &Path, workspace: &Path) -> Result<()> {
     let path = Reader::open_unchecked(directory)
         .private(SESSION_FILE)
@@ -694,7 +693,7 @@ pub(in crate::native) fn applied(directory: &Path, method: &str) -> Result<()> {
 }
 
 /// The step's deadline was reached once the session record's lock was taken, so the record was
-/// not changed (review r5, finding 5).
+/// not changed.
 #[derive(Debug)]
 pub(in crate::native) struct RecordDeadlinePassed;
 
@@ -711,7 +710,7 @@ impl std::error::Error for RecordDeadlinePassed {}
 /// once the lock is held; whether it did. A lock that stays held until then is
 /// `SessionRecordBusy`, a deadline reached is `RecordDeadlinePassed`, and the record is unchanged.
 /// `now` is the caller's clock, and the deadline is reached at it, as in the caller's own check
-/// before the call (review r6, finding 4).
+/// before the call.
 pub(in crate::native) fn transition(
     directory: &Path,
     from: Option<&str>,
@@ -745,7 +744,7 @@ pub(in crate::native) enum Restore {
 
 /// Returns the applied value from `pending` to `assessed`, under the record's lock taken by
 /// `deadline` (at least one attempt, also after the deadline: a cleanup, not a commit), and says
-/// what it found (review r5, finding 6).
+/// what it found.
 pub(in crate::native) fn restore(
     directory: &Path,
     pending: &str,
@@ -1049,7 +1048,7 @@ mod tests {
 
             // Unreadable, declined or absent in the original store: source-reset at a start, as
             // every earlier release recorded it. The recheck reports an unreadable source as an
-            // error, never as a reset (review r3, finding 12).
+            // error, never as a reset.
             replace_store(store_of(&fixture, provider), b"= =\n").unwrap();
             assert!(
                 assess_current(temp.path(), &workspace, &fixture.env).is_err(),

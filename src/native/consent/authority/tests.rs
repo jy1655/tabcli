@@ -136,7 +136,7 @@ fn a_target_that_declines_the_worktree_or_its_main_working_tree_refuses() {
     );
 }
 
-// Review finding 5: the consent is bound to the directory the provider runs in, the
+// The consent is bound to the directory the provider runs in, the
 // manifest's workspace, by path and by identity.
 #[test]
 fn consent_for_another_directory_than_the_manifests_workspace_refuses() {
@@ -167,7 +167,7 @@ fn consent_for_another_directory_than_the_manifests_workspace_refuses() {
     assert!(verdict(&session, FirstPartyCli::Agy, &fixture).is_err());
 }
 
-// Review findings 1, 6 and 8: what was recorded at launch is history. A revoke of the
+// What was recorded at launch is history. A revoke of the
 // worktree or of its main working tree, or a withdrawn source, refuses at the next use, and
 // the applied marker is reported but grants nothing.
 #[test]
@@ -208,7 +208,7 @@ fn the_launch_record_is_history_and_never_authority() {
 }
 
 // The authority writes nothing, so doctor and a paste gate stay observations. A session's
-// recheck needs the pins recorded at its start (review finding 5): with the shared records
+// recheck needs the pins recorded at its start: with the shared records
 // gone, or reset, it refuses and acquires nothing, and creates no record or directory.
 #[test]
 fn the_authority_writes_nothing_and_needs_the_pins() {
@@ -259,7 +259,7 @@ fn the_authority_writes_nothing_and_needs_the_pins() {
     }
 }
 
-// The spawn fence's check (review r3, findings 1 and 2): the plan's trust-bearing option, carried
+// The spawn fence's check: the plan's trust-bearing option, carried
 // to the fence as a grant, must still have the authority's yes for its own provider, bound to the
 // workspace the plan was granted for, and the session's record must still name it. A record that
 // is gone, that names another option, or a grant for another provider or workspace, refuses; so
@@ -414,7 +414,7 @@ fn the_spawn_fence_starts_nothing_for_a_launch_option_without_consent() {
     }
 }
 
-// Review r3, finding 1: the spawn fence asks about the command it starts. A command without a
+// The spawn fence asks about the command it starts. A command without a
 // trust-bearing option follows 0.4.49's admission exactly: no consent is read for it, so a
 // damaged record, a record that names another adapter's option or no record at all does not
 // stop a plain launch (Claude's, a supported reopen, a plain Codex or Pi command).
@@ -448,7 +448,7 @@ fn a_command_without_a_launch_option_starts_whatever_the_consent_record_holds() 
     }
 }
 
-// Review r4, finding 3: the bounded question takes one absolute deadline before it starts. No
+// The bounded question takes one absolute deadline before it starts. No
 // time left refuses without asking, and an answer that comes after the deadline refuses.
 #[test]
 fn the_bounded_question_refuses_without_time_and_after_its_deadline() {
@@ -480,7 +480,7 @@ fn the_bounded_question_refuses_without_time_and_after_its_deadline() {
     );
 }
 
-// Review r5, finding 1: a grant names the file its option points at and the bytes its plan wrote
+// A grant names the file its option points at and the bytes its plan wrote
 // there. The fence refuses a command whose file was replaced, changed or removed.
 #[test]
 fn the_spawn_fence_refuses_a_grant_whose_option_file_is_not_the_one_its_plan_wrote() {
@@ -530,7 +530,7 @@ fn the_spawn_fence_refuses_a_grant_whose_option_file_is_not_the_one_its_plan_wro
     );
 }
 
-// Review r7, finding 5: the spawn fence reads the option's file as a provider trust store is read
+// The spawn fence reads the option's file as a provider trust store is read
 // before it compares the digest. A replacement with the plan's own bytes that another account
 // could change is refused, and the refusal names the file and the reader's reason, so that it is
 // not mistaken for changed contents.

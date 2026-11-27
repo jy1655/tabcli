@@ -44,7 +44,9 @@ owner, and provider that supplied the decision. Consent does not extend to paren
 directories, and a symlink alias cannot supply fresh consent. If the original provider removes
 its decision, TAB does not silently choose another provider as the source.
 
-For linked worktrees, see the [consent rule, its limits and registration repair](agents/trust.md).
+Linked git worktrees are the one exception to the directory rule. See the
+[consent rule, its limits and registration repair](agents/trust.md).
+Anyone who can write the trusted repository's `.git` can register a worktree there, but cloning or fetching cannot register one.
 For Agy's session-only setting and dialog eligibility, see the [Agy boundary](agents/agy.md).
 
 With verified exact consent, TAB can answer eligible Claude or Agy startup trust dialogs once in
@@ -99,14 +101,15 @@ Some initial prompts wait rather than risk typing a submission key onto a trust 
 - Codex on native Windows waits for exact trust, verified shared consent, or its empty composer.
   An empty screen or missing dialog text is not enough.
 - Agy on native Windows requires the [Agy paste evidence](agents/agy.md) and startup readiness.
-  On macOS its initial prompt is an argument and can run behind the dialog; follow-ups wait for the trust and log evidence before input.
+  On macOS its initial prompt is an argument and can run behind the dialog.
+  Follow-ups on every platform wait for the trust and log evidence before input.
 - Pi on native Windows waits for the current turn's startup event after the trust procedure.
   That event can follow a decline; it is not shared consent.
 - Claude on native Windows delivers the initial prompt through official cross-session messaging
   rather than typing it into the console.
 
 A trust wait stops when the session ends or the deadline expires. After resolving a trust dialog,
-retry a withheld macOS Agy follow-up with `tell` only if the session is `ready`. If a Windows
+retry a withheld Agy follow-up with `tell` only if the session is `ready`. If a Windows
 initial request failed, close that session and run a new `ask`; a failed session cannot take
 `tell`. The [provider page](providers.md) gives the recovery steps for each CLI.
 

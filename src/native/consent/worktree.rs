@@ -85,7 +85,7 @@ pub(super) fn main_worktree(
         Err(error) => return Err(error.into()),
         Ok(_) => bail!("the main working tree's .git names a common directory of its own"),
     }
-    // Review r4, finding 4: the back-pointer must designate `.git` in this workspace lexically,
+    // The back-pointer must designate `.git` in this workspace lexically,
     // in a spelling Git writes (absolute from its volume's root, or relative to the
     // registration), before anything on its path is walked: a stale registration that names a
     // former worktree in a third tree is refused without touching that tree. The physical
@@ -107,7 +107,7 @@ pub(super) fn main_worktree(
                 == object_id(workspace)?,
         "the worktree registration names a .git file in another folder"
     );
-    // Review r5, finding 3: the registration's `commondir` must designate the main working
+    // The registration's `commondir` must designate the main working
     // tree's `.git` lexically (Git writes `../..`, or an absolute path) before anything on its
     // path is walked; the identity comparison below still follows.
     let common_text = read_git_file(&registration.join("commondir"))?;
@@ -199,7 +199,7 @@ fn start<'a>(base: &Path, target: &'a Path) -> Result<(PathBuf, Vec<Component<'a
         root
     };
     let components: Vec<_> = components.collect();
-    // Review r3, finding 6: a name cancelled by a later `..` would make the walk touch a path
+    // A name cancelled by a later `..` would make the walk touch a path
     // outside both trees that the screen never approved. Only leading parent steps are taken,
     // as Git writes them for relative paths.
     let mut named = false;
@@ -294,7 +294,7 @@ fn walk(base: &Path, target: &Path, kind: Kind) -> Result<PathBuf> {
 
 // The identity of what `path` names, its last component not followed: the device and inode on
 // Unix; on Windows the volume and the full 128-bit file id (`FileIdInfo`), because the 64-bit
-// file index can repeat on ReFS (review r3, finding 11). An identity that cannot be read is an
+// file index can repeat on ReFS. An identity that cannot be read is an
 // error, so nothing is inherited.
 fn object_id(path: &Path) -> Result<(u64, u128)> {
     #[cfg(unix)]
@@ -377,7 +377,7 @@ fn read_git_file(path: &Path) -> Result<String> {
 }
 
 // Opens one of Git's pointer files without following a link and, on Unix, without blocking
-// on a FIFO put there after it was inspected (review r3, finding 8), then checks the handle it
+// on a FIFO put there after it was inspected, then checks the handle it
 // opened: a regular file. A regular file reads the same with `O_NONBLOCK`.
 fn open_pointer(path: &Path) -> Result<fs::File> {
     let mut options = OpenOptions::new();
