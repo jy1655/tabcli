@@ -151,18 +151,7 @@ pub(in crate::native) fn observe_owner(reader: &Reader) -> OwnerObservation {
 /// Preserve process evidence for lifecycle callers; the diagnostic bools are lossy.
 /// Launch repair attests the recorded process whatever Session the record names.
 pub(super) fn attest_recorded_owner(reader: &Reader) -> Result<Option<OwnerAttestation>> {
-    let observed = observe(reader);
-    // A Session whose own Records say it belongs to another OS (`terminal::foreign`), judged
-    // from this decoded owner: its owner is not attested here, and launch repair decides
-    // nothing from it, as if no owner were recorded.
-    if let OwnerRecord::Recorded(recorded) = &observed
-        && crate::native::terminal::foreign::HandleRecords::read(reader)
-            .elsewhere(session_of(reader), Some(recorded))
-            .is_some()
-    {
-        return Ok(None);
-    }
-    Ok(observed
+    Ok(observe(reader)
         .decoded()?
         .map(|recorded| attest_owner(&recorded.owner)))
 }

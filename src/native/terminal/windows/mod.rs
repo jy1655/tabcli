@@ -162,7 +162,6 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     match preferred {
         None | Some(TerminalKind::WindowsConsole) => Ok(TerminalKind::WindowsConsole),
         Some(TerminalKind::Herdr) => Ok(TerminalKind::Herdr),
-        // The lookup's own refusal, as macOS and Linux select.
         Some(kind) => Err(super::OsTerminals::WINDOWS.unavailable(kind)),
     }
 }

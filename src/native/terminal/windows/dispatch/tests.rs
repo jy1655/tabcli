@@ -203,7 +203,10 @@ fn every_other_kind_is_refused_by_the_lookup_before_any_adapter() {
             continue;
         }
         let dispatch = recording_dispatch();
-        let refusal = format!("{} is not available on Windows", kind.display_name());
+        let refusal = format!(
+            "{} is not available on Windows; use windows-console or herdr",
+            kind.display_name()
+        );
         let registration = kind.registration();
         let screen = registration
             .screen_read_refusal
@@ -286,30 +289,44 @@ fn an_expired_open_of_another_kind_gets_the_lookup_refusal() {
         || panic!("a refused kind is never unbound"),
     )
     .unwrap_err();
-    assert_eq!(format!("{error:#}"), "WezTerm is not available on Windows");
+    assert_eq!(
+        format!("{error:#}"),
+        "WezTerm is not available on Windows; use windows-console or herdr"
+    );
     assert!(dispatch.console.calls().is_empty());
 }
 
 // Doctor's probe of a stored handle of another OS's terminal reads the lookup's refusal on
 // Windows, as on macOS and Linux: the presence is unverified, never a missing surface. Before
 // the lookup refused it, the managed console parsed a WezTerm pane id `0` as a process id and
-// reported the surface missing. This test reads the Windows lookup directly, on every host.
+// reported the surface missing.
 #[test]
 fn doctor_probe_of_another_kinds_handle_is_unverified() {
     use crate::native::doctor;
-    use crate::native::query::observation::judgment::SurfacePresence;
+    use crate::native::query::observation::{SessionEvidence, judgment::SurfacePresence};
+    use crate::native::session::{Reader, Store};
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-foreign");
+    std::fs::create_dir(&directory).unwrap();
     let handle = TerminalSession::new(TerminalKind::WezTerm, "0".into())
         .with_binding(Some("session-foreign".into()));
+    Store::open_unchecked(&directory)
+        .write_terminal(&handle)
+        .unwrap();
+    let reader = Reader::open_unchecked(&directory);
+    let evidence = SessionEvidence::read(&reader, Ok(false));
     let dispatch = recording_dispatch();
-    let presence = SurfacePresence::of(surface_present(
-        &dispatch,
-        Path::new("unused"),
-        &handle,
-        Duration::from_secs(2),
-    ));
-    let refusal = "WezTerm is not available on Windows";
-    assert_eq!(presence, SurfacePresence::Unverified(refusal.into()));
-    let check = doctor::surface_presence_check(&presence);
+    let probe = |directory: &Path, session: &TerminalSession, timeout: Duration| {
+        surface_present(&dispatch, directory, session, timeout)
+    };
+    let presence = evidence.judge_surface_presence_with(
+        &reader,
+        Instant::now() + Duration::from_secs(2),
+        &probe,
+    );
+    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
+    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
+    let check = doctor::surface_presence_check(presence);
     assert_eq!(check.reason_code, "terminal_surface_unverified");
     assert!(dispatch.console.calls().is_empty());
 }

@@ -45,13 +45,6 @@ pub(in crate::native) mod wezterm;
 // it the same way on every platform): inside hc, whose programs get `TERM_PROGRAM=ghostty`,
 // that is Ghostty.
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
-    // An explicit kind macOS does not run is refused before anything exists, naming the
-    // kinds macOS runs, as Linux and Windows select. The automatic choice is unchanged.
-    if let Some(kind) = preferred
-        && !OsTerminals::MACOS.runs(kind)
-    {
-        return Err(OsTerminals::MACOS.unavailable(kind));
-    }
     let term_program = env::var("TERM_PROGRAM").ok();
     let term = env::var("TERM").ok();
     Ok(select_macos_terminal(
@@ -126,10 +119,9 @@ where
             TerminalKind::WezTerm => Ok(&self.wezterm),
             TerminalKind::Warp => Ok(&self.warp),
             TerminalKind::Herdr => Ok(&self.herdr),
-            // A stored handle of a kind macOS does not run gets the refusal every OS gives
-            // such a handle.
+            // A kind macOS does not run gets the refusal every OS gives such a kind.
             TerminalKind::WindowsConsole | TerminalKind::Tmux => {
-                Err(OsTerminals::MACOS.not_here(kind))
+                Err(OsTerminals::MACOS.unavailable(kind))
             }
         }
     }
@@ -509,9 +501,12 @@ mod adapter_tests {
             }
         }
         // A kind macOS does not run has no adapter here: the lookup refuses it as Linux and
-        // Windows refuse theirs, naming macOS and no terminal to use instead.
+        // Windows refuse theirs, naming macOS and the kinds it runs.
         for kind in [TerminalKind::WindowsConsole, TerminalKind::Tmux] {
-            let refusal = format!("{} is not available on macOS", kind.display_name());
+            let refusal = format!(
+                "{} is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+                kind.display_name()
+            );
             assert_eq!(
                 dispatch
                     .adapter(kind)
@@ -573,7 +568,10 @@ mod adapter_tests {
             key: DialogKey::Enter,
         };
         for kind in [TerminalKind::WindowsConsole, TerminalKind::Tmux] {
-            let refusal = format!("{} is not available on macOS", kind.display_name());
+            let refusal = format!(
+                "{} is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+                kind.display_name()
+            );
             let session = handle(kind).with_binding(Some("session-foreign".into()));
             let failure =
                 send_file(INSTALLED, &session, Path::new("unused"), deadline).unwrap_err();
@@ -613,28 +611,6 @@ mod adapter_tests {
                 .to_string();
             let declared = kind.registration().guarded_input_refusal;
             assert_eq!(guarded, declared.map_or(refusal, str::to_owned), "{kind:?}");
-        }
-    }
-
-    // Selection refuses an explicit kind macOS does not run before anything exists, naming the
-    // kinds macOS runs, as Linux and Windows do; an explicit kind it runs is selected.
-    #[test]
-    fn selection_refuses_an_explicit_kind_macos_does_not_run() {
-        use crate::native::failure_kind::{FailureKind, classify};
-        for kind in TerminalKind::ALL {
-            if OsTerminals::MACOS.runs(kind) {
-                assert_eq!(select(Some(kind)).unwrap(), kind);
-                continue;
-            }
-            let error = select(Some(kind)).unwrap_err();
-            assert_eq!(
-                format!("{error:#}"),
-                format!(
-                    "{} is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
-                    kind.display_name()
-                )
-            );
-            assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{kind:?}");
         }
     }
 

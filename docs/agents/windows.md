@@ -4,30 +4,16 @@
 
 - The seven surface operations on Windows (open, send, screen, guarded key, verify, close and
   presence) resolve their adapter through one lookup (`windows/dispatch.rs`), as `posix.rs`
-  does on macOS and Linux: the Herdr adapter for a Herdr terminal and `ManagedConsole`
+  does on macOS and Linux: the Herdr adapter for a Herdr terminal, and `ManagedConsole`
   (`windows/mod.rs`) for a managed console. Screen and guarded key first answer with the kind's
-  declared refusal, if it has one. The lookup refuses a kind Windows does not run (a record can
-  name another OS's terminal) with `OsTerminals::not_here` (`terminal/mod.rs`), the refusal
-  macOS and Linux give such a handle (owner's principle, 2026-11-26: the same on every OS
-  unless a difference is unavoidable): `<Name> is not available on Windows`, unsupported, a
-  send known unsent. Selection refuses an explicit such kind for a new launch with
-  `OsTerminals::unavailable`, which adds `; use windows-console or herdr`. Whether a whole
-  Session belongs to another OS is judged in `terminal::foreign` (`docs/architecture.md`).
-  Such a handle never reaches the console helper, which still refuses anything but a managed
-  console. Releases up to 0.4.49 sent it to the managed console: a started helper
-  refused it, and a send refused there was classified as delivery uncertain (a handle without
-  its session binding was refused before the helper started, as not sent); the surface proof
-  passed it to the owner check; and doctor's probe could read a pane id as a dead process and
-  report the surface missing. Give a new
-  Windows surface its own adapter in that lookup and list its kind in `OsTerminals::WINDOWS`;
-  do not branch one of these operations on the kind. `attach_command` and `admit_selection`
-  still check kinds outside those operations.
+  declared refusal, if it has one. See [Stored terminal handles](../terminals.md#stored-terminal-handles)
+  for other kinds. Give a new
+  Windows surface its own adapter in that lookup; do not branch one of these operations on the
+  kind. `attach_command` and `admit_selection` still check kinds outside those operations.
   Dead-owner Repair decides whether it needs a close transaction in
   `terminal::close_authority::owner_exit`. Only a managed console or a registration whose core
   keeps a finished terminal can reach the Windows close adapter from that transaction. The
-  claimed handle is checked independently of the retained-handle scan. Repair never attests
-  the owner of a Session whose own Records say it belongs to another OS: see
-  `terminal::foreign`. The lookup's portable tests run
+  claimed handle is checked independently of the retained-handle scan. The lookup's portable tests run
   on every CI target; the installed lookup, over the console helper and the core's pipe, is
   tested on the Windows runner only.
 - A Herdr terminal is not a managed console: its handle never reaches the console control

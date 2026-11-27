@@ -324,7 +324,8 @@ mod tests {
             assert_eq!(value["requests"].as_array().unwrap().len(), 1);
             // The capabilities map the same judgments: a required recovery leaves tell
             // unknown before the owner; past a live owner, the handle bound to another
-            // session (on a platform that supports it) refuses.
+            // session refuses as unbound on every OS (on Linux its kind is Terminal.app,
+            // which the binding answers before).
             let tell = &value["capabilities"]["tell"];
             if recovery {
                 assert_eq!(
@@ -333,14 +334,7 @@ mod tests {
                 );
             } else {
                 assert_eq!(tell["state"], "refused");
-                assert_eq!(
-                    tell["reason"],
-                    if cfg!(any(windows, target_os = "macos")) {
-                        "surface_unbound"
-                    } else {
-                        "surface_unsupported"
-                    }
-                );
+                assert_eq!(tell["reason"], "surface_unbound");
             }
             assert_eq!(
                 value["capabilities"]["questions"]["emission_observation"],

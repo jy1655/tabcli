@@ -10,6 +10,12 @@ TAB creates a new surface for each session: a tab, window, pane, or console. It 
 one of your existing tabs or attach to an independently running provider CLI. A Linux TAB
 process inside WSL would use tmux, but has not been verified. See [CLI commands](cli.md) for a worked session.
 
+## Stored terminal handles
+
+TAB refuses operations that need a terminal adapter for a kind this system does not run.
+The adapter lookup reports `<Name> is not available on <system>; use <the kinds that system runs>`.
+If closing the surface is refused, TAB keeps the handle. Close the session on the system that created it.
+
 ## Selection and settings
 
 `ask` and `self-test` accept `--terminal`; `reopen` currently supports native Windows Claude only.
@@ -17,47 +23,6 @@ The documented terminal names are `ghostty`, `herdr`, `iterm2`, `terminal`, `tmu
 `windows-console`. Parsing is case-insensitive. Accepted aliases are `iterm`, `iterm.app`,
 `apple-terminal`, `apple_terminal`, `default`, `terminal.app`, `warpterminal`, `windows`, and
 `console`, and `hc` or `herdr-core` (Herdr). Structured output names Terminal.app `apple-terminal`.
-
-Each operating system runs only its own terminals: macOS iTerm2, Terminal.app, Ghostty, Warp,
-WezTerm and Herdr; Linux tmux and Herdr; Windows its managed console and Herdr. A new launch that
-names another terminal is refused the same way on all three, before any session exists:
-`<Name> is not available on <system>; use <the terminals it runs>`.
-
-A state directory copied from another operating system can hold sessions that belong to it. A
-session belongs to another system only when one of its own records says so: its active handle,
-bound to the session, names a terminal this system does not run (or a Herdr Core started on
-another system); its consumption record says it consumed such a terminal; or its owner record,
-bound to the session, carries the identity another system records. Nothing else counts: a handle
-that does not name its terminal (older records that omit it are read as iTerm2), a handle left
-claimed by an interrupted close, a record of another session or of none, a field that does not
-belong to the terminal, a consumption record that repeats a field or does not say it consumed,
-and a missing, empty or unreadable record.
-
-Only three things treat such a session differently, all of them steps that change a session's
-records. `close-session --explicit` settles it from its records alone when they show it ended
-(exited or failed): it consumes the recorded handle, active or left claimed by an interrupted
-close, without addressing any terminal or process, names the consumed terminal only when the
-handle's record named it, keeps the session's failure in its records, and closes the session.
-Every handle it would remove must be readable and this session's; otherwise the close reports
-that handle and leaves both where they are. A close whose consumption record already says it
-consumed finishes as for any session, keeping the terminal it names; the reason that record
-gives is kept as this system's close keeps it, and only a consumption record without one keeps
-the session's failure. Any other such session is refused and nothing is written; TAB cannot end
-a copy whose records leave it running. `prune-sessions` removes an eligible closed copy without
-observing its owner. Dead-owner repair, which `sessions`, `tell` and `close-session` run, does
-not judge its owner from this machine's processes and leaves it as it is.
-
-Every other command answers for such a session as it answers for any session. `status`,
-`inspect`, `wait`, `doctor` and the origin a session reports can include the liveness of an
-unrelated process of this machine that happens to have the recorded process id; `tell`,
-`screen` and `doctor --probe` address the terminal its handle names, which this system refuses
-for a terminal it does not run (`<Name> is not available on <system>`); and a refused `reopen`
-of such a session is judged by the recorded provider process id on this machine.
-
-Once nothing in a settled copy's remaining records names another system (a Herdr copy, or a copy
-an older TAB closed again, which forgets the consumed terminal), it is an ordinary closed
-session. Closing or pruning a copy does not change the session on the system it came from, and
-closing that session there does not change the copy.
 
 Inside an hc terminal (`TERM_PROGRAM=ghostty` and a nonempty `HC_TERMINAL_ID`, which hc gives
 every program) TAB chooses the same way on every OS unless `--terminal` says otherwise. It uses

@@ -1245,8 +1245,8 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
         "iTerm2 is not available on Windows; use windows-console or herdr"
     );
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
-    // The installed lookup refuses another kind's open, before any process, binding or
-    // unbinding, as it refuses a stored handle: naming no terminal to use instead.
+    // The installed lookup refuses another kind's open with the same text, before any
+    // process, binding or unbinding.
     let refused = terminal::open_bound_tab(
         terminal::TerminalKind::Iterm2,
         "command",
@@ -1256,7 +1256,10 @@ fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
         || unreachable!("a refused kind is never unbound"),
     )
     .unwrap_err();
-    assert_eq!(format!("{refused:#}"), "iTerm2 is not available on Windows");
+    assert_eq!(
+        format!("{refused:#}"),
+        "iTerm2 is not available on Windows; use windows-console or herdr"
+    );
     assert_eq!(classify(&refused), Some(FailureKind::Unsupported));
 }
 
@@ -1272,7 +1275,7 @@ fn another_kinds_handle_is_refused_by_the_installed_lookup() {
     use crate::native::failure_kind::{FailureKind, classify};
     use crate::native::query::observation::{SessionEvidence, judgment::SurfacePresence};
     use crate::native::session::{Reader, Store};
-    let refusal = "WezTerm is not available on Windows";
+    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-foreign");
     fs::create_dir(&directory).unwrap();

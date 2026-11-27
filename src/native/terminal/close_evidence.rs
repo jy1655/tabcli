@@ -23,7 +23,7 @@ pub(in crate::native::terminal) fn created_host_incarnation(
     // the refusal its lookup gives every such kind, as a close of any other such handle does.
     #[cfg(not(target_os = "linux"))]
     match super::OsTerminals::CURRENT {
-        Some(os) if !os.runs(session.kind) => Err(os.not_here(session.kind)),
+        Some(os) if !os.runs(session.kind) => Err(os.unavailable(session.kind)),
         _ => anyhow::bail!("TAB-created host evidence is unsupported on this platform"),
     }
 }
@@ -154,9 +154,9 @@ mod foreign_host_tests {
         let bound = unbound.with_binding(Some("session-tmux".into()));
         let error = created_host_incarnation("session-tmux", &bound).unwrap_err();
         let expected = if cfg!(windows) {
-            "tmux is not available on Windows"
+            "tmux is not available on Windows; use windows-console or herdr"
         } else {
-            "tmux is not available on macOS"
+            "tmux is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"
         };
         assert_eq!(format!("{error:#}"), expected);
         assert_eq!(classify(&error), Some(FailureKind::Unsupported));

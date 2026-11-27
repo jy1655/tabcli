@@ -346,12 +346,14 @@ pub(in crate::native) enum ActiveHandle {
 }
 
 impl ActiveHandle {
-    /// Platform support is decided before the binding; an empty id is no binding.
+    /// The binding is decided before platform support; an empty id is no binding. Whether a
+    /// handle is this session's is the same fact on every OS, while whether this OS runs its
+    /// kind is not, so the same records get the same answer on every OS wherever they can.
     pub(in crate::native) fn of(supported: bool, bound: bool, empty_id: bool) -> Self {
-        if !supported {
-            Self::Unsupported
-        } else if !bound || empty_id {
+        if !bound || empty_id {
             Self::BindingUnverified
+        } else if !supported {
+            Self::Unsupported
         } else {
             Self::Bound
         }
@@ -1290,13 +1292,26 @@ pub(in crate::native) mod tests {
                 ),
                 None,
             ),
+            // The binding is the same fact on every OS; whether this OS runs the kind is not,
+            // so a handle that is not this session's is judged unbound everywhere.
             (
-                "unsupported active handle, even unbound",
+                "unbound active handle of a kind this OS does not run",
                 SurfaceRecord::Active(Ok(Some(handle(unsupported, None)))),
                 Surface::Active {
                     kind: unsupported,
                     supported: false,
                     bound: false,
+                    empty_id: false,
+                },
+                Some(ActiveHandle::BindingUnverified),
+            ),
+            (
+                "bound active handle of a kind this OS does not run",
+                SurfaceRecord::Active(Ok(Some(handle(unsupported, Some(SESSION))))),
+                Surface::Active {
+                    kind: unsupported,
+                    supported: false,
+                    bound: true,
                     empty_id: false,
                 },
                 Some(ActiveHandle::Unsupported),

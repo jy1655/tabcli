@@ -24,14 +24,6 @@
   Unknown or an unreadable owner returns an error without retiring the claim. A missing owner
   can still be registering. The launch deadline independently fails startup, without calling
   the owner observer or implying process death.
-- A Session whose own Records say it belongs to another OS (`terminal::foreign`) has no process
-  on this machine to attest, and the steps that change its Records do not attest one: Repair,
-  launch repair, prune and the explicit close each take one early branch on that judgment, made
-  from the Records the step decoded once (the owner it would attest among them), and leave the
-  rest of the step unchanged. Other readers attest such an owner as any owner.
-  `tests/foreign_session.rs` runs the explicit close, prune and the commands that run Repair with
-  every recorded PID alive here and again with every one absent, and requires the same answer
-  and records.
 - Attestation reads the owner value and OS evidence only and takes no session lock; launch repair
   and close call it under their own lock. Callers (prune, repair, wait, close resume, the
   terminal adapters, reopen, the Claude registry) map the four answers in their own vocabulary

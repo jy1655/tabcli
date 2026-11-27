@@ -14,8 +14,7 @@ pub(super) static INSTALLED: Installed = Installed;
 static HERDR: super::herdr::InstalledAdapter = super::herdr::Adapter::installed();
 static TMUX: tmux::Adapter<tmux::Installed> = tmux::Adapter::installed();
 impl Adapters for Installed {
-    // A stored handle of a kind Linux does not run gets the refusal every OS gives such a
-    // handle.
+    // A kind Linux does not run gets the refusal every OS gives such a kind.
     fn adapter(&self, kind: TerminalKind) -> Result<&dyn PosixTerminalAdapter> {
         match kind {
             TerminalKind::Tmux => Ok(&TMUX),
@@ -25,7 +24,7 @@ impl Adapters for Installed {
             | TerminalKind::Ghostty
             | TerminalKind::Warp
             | TerminalKind::WezTerm
-            | TerminalKind::WindowsConsole => Err(OsTerminals::LINUX.not_here(kind)),
+            | TerminalKind::WindowsConsole => Err(OsTerminals::LINUX.unavailable(kind)),
         }
     }
 }
@@ -33,10 +32,7 @@ impl Adapters for Installed {
 // the same way on every platform): an explicit kind it registers, or tmux.
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     let kind = preferred.unwrap_or(TerminalKind::Tmux);
-    // An explicit kind Linux does not run is refused naming the kinds Linux runs.
-    if !OsTerminals::LINUX.runs(kind) {
-        return Err(OsTerminals::LINUX.unavailable(kind));
-    }
+    INSTALLED.adapter(kind)?;
     Ok(kind)
 }
 #[cfg(test)]

@@ -165,18 +165,9 @@ fn write_reopen_test_manifest(
     .unwrap();
 }
 
-// A terminal this OS runs: an active handle of a kind it does not run would make the session
-// one of another OS, which Repair leaves as it is and the explicit close settles from its
-// records (`terminal::foreign`).
 fn reopen_test_terminal(id: &str) -> terminal::TerminalSession {
-    let kind = if cfg!(windows) {
-        terminal::TerminalKind::WindowsConsole
-    } else if cfg!(target_os = "linux") {
-        terminal::TerminalKind::Tmux
-    } else {
-        terminal::TerminalKind::Iterm2
-    };
-    terminal::TerminalSession::new(kind, format!("{id}-terminal")).with_binding(Some(id.to_owned()))
+    terminal::TerminalSession::new(terminal::TerminalKind::Iterm2, format!("{id}-terminal"))
+        .with_binding(Some(id.to_owned()))
 }
 
 // A closed session with one resolved request: its turn completed (or failed, when
@@ -2771,16 +2762,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
         &Store::open_unchecked(&new),
         Some("refused".to_owned()),
         session_close::budget::close_deadline(),
-        |_| {
-            // Repair settles a failed dead owner's handle without an adapter where the
-            // terminal cannot outlive its owner (iTerm2, the managed console); a tmux pane can,
-            // so on Linux the close reaches the adapter.
-            if cfg!(target_os = "linux") {
-                Ok(terminal::CloseOutcome::Closed.into())
-            } else {
-                panic!("failed dead-owner repair must consume the handle without an adapter")
-            }
-        },
+        |_| panic!("failed dead-owner repair must consume the handle without an adapter"),
     )
     .unwrap();
     assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());

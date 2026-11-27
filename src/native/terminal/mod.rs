@@ -1,5 +1,4 @@
 pub(super) mod close_evidence;
-pub(in crate::native) mod foreign;
 pub(in crate::native) mod host;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) use close_evidence::for_kind as close_evidence;
@@ -200,13 +199,7 @@ impl FromStr for TerminalKind {
     }
 }
 
-/// The kinds one OS runs, and its refusals of every other kind, the same on macOS, Linux and
-/// Windows. Each OS's selection refuses an explicit such kind for a new launch with
-/// `unavailable` (`<Name> is not available on <OS>; use <its kinds>`). Each OS's adapter lookup
-/// refuses a stored handle of such a kind with `not_here` (`<Name> is not available on <OS>`)
-/// before any adapter is reached; only a kind's declared screen or guarded-input refusal
-/// answers before it. Whether a whole Session belongs to another OS, for the explicit close,
-/// prune and Repair, is judged in `foreign`.
+/// The terminal kinds available on each supported operating system.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::native::terminal) struct OsTerminals {
     os: &'static str,
@@ -256,23 +249,7 @@ impl OsTerminals {
         false
     }
 
-    /// The refusal of a stored handle of a kind this OS does not run. It names no terminal to
-    /// use instead: only a new launch could choose one.
-    pub(in crate::native::terminal) fn not_here(self, kind: TerminalKind) -> anyhow::Error {
-        debug_assert!(!self.runs(kind), "{} runs {kind:?}", self.os);
-        anyhow::Error::new(crate::native::failure_kind::Unsupported::new(format!(
-            "{} is not available on {}",
-            kind.display_name(),
-            self.os
-        )))
-    }
-
-    /// The refusal of a kind this OS does not run, requested for a new launch: it names the
-    /// kinds this OS runs. Callers ask it only for such a kind.
-    #[cfg_attr(
-        not(any(target_os = "macos", target_os = "linux", windows)),
-        allow(dead_code)
-    )]
+    /// The refusal of a kind this OS does not run. Callers ask it only for such a kind.
     pub(in crate::native::terminal) fn unavailable(self, kind: TerminalKind) -> anyhow::Error {
         debug_assert!(!self.runs(kind), "{} runs {kind:?}", self.os);
         let names: Vec<_> = self.kinds.iter().map(|kind| kind.as_str()).collect();
@@ -1149,7 +1126,6 @@ mod tests {
                 assert_eq!(TerminalKind::from_str(kind.as_str()), Ok(*kind), "{name}");
             }
             for kind in TerminalKind::ALL.into_iter().filter(|kind| !os.runs(*kind)) {
-                // A new launch is told the kinds this OS runs.
                 let error = os.unavailable(kind);
                 assert_eq!(
                     format!("{error:#}"),
@@ -1157,13 +1133,6 @@ mod tests {
                         "{} is not available on {name}; use {alternatives}",
                         kind.display_name()
                     )
-                );
-                assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{name}");
-                // A stored handle is not: only a new launch could choose another terminal.
-                let error = os.not_here(kind);
-                assert_eq!(
-                    format!("{error:#}"),
-                    format!("{} is not available on {name}", kind.display_name())
                 );
                 assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{name}");
             }
@@ -1186,429 +1155,100 @@ mod tests {
         }
     }
 
-    // The refusal this OS gives a stored handle of every kind it does not run, as the tests
-    // below expect it.
+    // The refusal this OS gives every kind it does not run, as the tests below expect it.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn this_os_refusal(kind: TerminalKind) -> String {
-        let os = if cfg!(target_os = "macos") {
-            "macOS"
+        let (os, alternatives) = if cfg!(target_os = "macos") {
+            (
+                "macOS",
+                "iterm2, apple-terminal, ghostty, warp, wezterm or herdr",
+            )
         } else if cfg!(target_os = "linux") {
-            "Linux"
+            ("Linux", "tmux or herdr")
         } else {
-            "Windows"
+            ("Windows", "windows-console or herdr")
         };
-        format!("{} is not available on {os}", kind.display_name())
+        format!(
+            "{} is not available on {os}; use {alternatives}",
+            kind.display_name()
+        )
     }
 
-    // The Owner record that `os`'s writer records, bound to `id`, for `pid`.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn owner_written_on(
-        os: &str,
-        id: &str,
-        pid: u32,
-    ) -> crate::native::terminal::ownership::NativeSessionOwner {
-        let mut owner = crate::native::terminal::ownership::NativeSessionOwner {
-            pid,
-            managed_session_id: Some(id.into()),
-            ..Default::default()
-        };
-        match os {
-            "macOS" | "Linux" => {
-                owner.terminal_tty = Some("/dev/ttys009".into());
-                owner.terminal_tty_device = Some(9);
-                owner.process_group = Some(pid);
-                owner.terminal_process_group = Some(pid);
-                if os == "macOS" {
-                    owner.process_start_seconds = Some(1);
-                    owner.process_start_microseconds = Some(2);
-                } else {
-                    owner.linux_birth = Some(
-                        serde_json::from_value(serde_json::json!({
-                            "boot_id": "00112233-4455-6677-8899-aabbccddeeff",
-                            "starttime_ticks": 7
-                        }))
-                        .unwrap(),
-                    );
-                }
-            }
-            _ => {
-                owner.windows_process_identity = Some(super::WindowsProcessIdentity {
-                    creation_time: 1,
-                    executable_path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
-                });
-            }
-        }
-        owner
-    }
-
-    // Every Session of another OS, as a copied state directory holds it, with the Owner record
-    // its own OS writes: each kind this OS does not run with its OS's owner, and a Herdr
-    // terminal with each other OS's owner. Its owner's PID is absent here.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn sessions_of_other_oss() -> Vec<(TerminalKind, &'static str, String)> {
-        let here = super::OsTerminals::CURRENT.unwrap().os;
-        let mut cases = Vec::new();
-        for kind in TerminalKind::ALL {
-            let os = match kind {
-                TerminalKind::WindowsConsole => "Windows",
-                TerminalKind::Tmux => "Linux",
-                TerminalKind::Herdr => continue,
-                _ => "macOS",
-            };
-            if !kind.supported_on_this_platform() {
-                cases.push((kind, os, this_os_refusal(kind)));
-            }
-        }
-        for os in ["macOS", "Linux", "Windows"] {
-            if os != here {
-                cases.push((
-                    TerminalKind::Herdr,
-                    os,
-                    format!("a session recorded on {os} is not available on {here}"),
-                ));
-            }
-        }
-        cases
-    }
-
-    // A Session of another OS whose owner's PID is absent here: nothing on this machine is
-    // evidence about it. Repair (as `sessions`, `tell` and `close-session` run it) leaves it
-    // exactly as it is, the same on every OS. The explicit close decides from its Records
-    // alone: a ready one is refused twice and keeps its handle; a failed one is settled, its
-    // handle consumed with no terminal call, and prune may then remove it. Before, macOS read a
-    // Windows owner (and Windows a macOS owner) as a PID-only owner, so Repair settled a
-    // session from an unrelated local PID.
+    // An explicit close of a stored handle whose kind this OS does not run gets this OS's
+    // lookup refusal, whatever the session's records say, the same on every OS: an ownerless
+    // failed launch (on Windows Terminal.app, Warp and WezTerm used to get the startup rule's
+    // own refusal instead) and a session whose owner record comes from another OS (macOS and
+    // Linux used to answer with the owner's attestation instead). The handle, the state and
+    // the absent tombstone stay as they were, and a retry gets the same answer, so the close
+    // can still be made where the terminal runs.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
-    fn a_session_of_another_os_is_never_judged_from_this_machine() {
+    fn explicit_close_of_another_oss_handle_gets_the_lookup_refusal_and_keeps_it() {
         use crate::native::failure_kind::{FailureKind, classify};
-        use crate::native::session::test_support::lifecycle::reaped_child_pid;
-        use crate::native::session::{CoreRecord, Reader, SessionState, Store, update_status};
-        let absent = reaped_child_pid();
-        for (kind, os, head) in sessions_of_other_oss() {
-            for state in [SessionState::Ready, SessionState::Failed] {
+        use crate::native::session::{CoreRecord, SessionState, Store, update_status};
+        use crate::native::terminal::ownership::NativeSessionOwner;
+        let foreign_owner = || {
+            let mut owner = NativeSessionOwner {
+                pid: 4242,
+                managed_session_id: Some("session-foreign".into()),
+                ..Default::default()
+            };
+            if cfg!(target_os = "linux") {
+                owner.process_start_seconds = Some(1);
+                owner.process_start_microseconds = Some(1);
+            } else {
+                owner.linux_birth = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "boot_id": "00112233-4455-6677-8899-aabbccddeeff",
+                        "starttime_ticks": 1
+                    }))
+                    .unwrap(),
+                );
+            }
+            owner
+        };
+        for kind in TerminalKind::ALL {
+            if kind.supported_on_this_platform() {
+                continue;
+            }
+            for owner in [None, Some(foreign_owner())] {
                 let root = tempfile::tempdir().unwrap();
                 let directory = root.path().join("session-foreign");
                 std::fs::create_dir_all(directory.join("events")).unwrap();
-                update_status(&directory, state.clone(), None, None).unwrap();
+                update_status(&directory, SessionState::Failed, None, None).unwrap();
                 let store = Store::open_unchecked(&directory);
+                if let Some(owner) = &owner {
+                    store.write_owner(owner).unwrap();
+                }
                 store
-                    .write_owner(&owner_written_on(os, "session-foreign", absent))
+                    .write_terminal(
+                        &TerminalSession::new(kind, "surface".into())
+                            .with_binding(Some("session-foreign".into())),
+                    )
                     .unwrap();
-                let surface = TerminalSession::new(kind, "surface".into())
-                    .with_binding(Some("session-foreign".into()));
-                store.write_terminal(&surface).unwrap();
                 let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
-                let case = format!("{kind:?} recorded on {os}, {state}");
-                let refusal = format!(
-                    "{head}: TAB on this machine cannot judge or end this session; once its \
-                     records show it ended, an explicit close settles it (its records are in {})",
-                    directory.display()
-                );
-                let unchanged = |case: &str| {
+                let case = format!("{kind:?}, owner {}", owner.is_some());
+                for _attempt in 0..2 {
+                    let error = crate::native::close::close_session_surface(
+                        &directory,
+                        "session-foreign",
+                        None,
+                        crate::native::session::close::budget::close_deadline(),
+                    )
+                    .unwrap_err();
+                    assert_eq!(format!("{error:#}"), this_os_refusal(kind), "{case}");
+                    assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
                     assert_eq!(
                         store.record(CoreRecord::Terminal).bytes().unwrap(),
                         handle,
                         "{case}"
                     );
                     assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
-                    assert_eq!(store.status().unwrap().state, state, "{case}");
+                    assert_eq!(store.status().unwrap().state, SessionState::Failed);
                     assert!(store.closed_if_present().unwrap().is_none(), "{case}");
-                };
-                let deadline = crate::native::session::close::budget::close_deadline();
-                // Repair leaves it exactly as it is, and so does convergence.
-                assert!(
-                    !crate::native::session::close::repair_dead_owner(&store).unwrap(),
-                    "{case}"
-                );
-                unchanged(&case);
-                store.converge_until(deadline).unwrap();
-                unchanged(&case);
-                let close = || {
-                    crate::native::close::close_session_surface(
-                        &directory,
-                        "session-foreign",
-                        None,
-                        crate::native::session::close::budget::close_deadline(),
-                    )
-                };
-                if state == SessionState::Ready {
-                    for _attempt in 0..2 {
-                        let error = close().unwrap_err();
-                        assert_eq!(format!("{error:#}"), refusal, "{case}");
-                        assert_eq!(classify(&error), Some(FailureKind::Unsupported), "{case}");
-                        unchanged(&case);
-                    }
-                    continue;
                 }
-                close().unwrap_or_else(|error| panic!("{case}: {error:#}"));
-                assert_eq!(
-                    store.status().unwrap().state,
-                    SessionState::Closed,
-                    "{case}"
-                );
-                assert!(store.closed_if_present().unwrap().is_some(), "{case}");
-                assert!(
-                    !store.record(CoreRecord::Terminal).present().unwrap(),
-                    "{case}"
-                );
-                assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
-                let tombstone: serde_json::Value = store
-                    .record(CoreRecord::TerminalClosed)
-                    .json_with(|text| serde_json::from_str(text))
-                    .unwrap();
-                assert_eq!(tombstone["consumed"], true, "{case}");
-                assert_eq!(tombstone["terminal"], serde_json::json!(kind), "{case}");
-                assert!(
-                    store
-                        .status()
-                        .unwrap()
-                        .error
-                        .unwrap()
-                        .contains(&format!("settled from its records alone ({head})")),
-                    "{case}"
-                );
-                // Settling again changes nothing, and prune is not kept back by the owner.
-                let closed = store.record(CoreRecord::Closed).bytes().unwrap();
-                close().unwrap();
-                assert_eq!(store.record(CoreRecord::Closed).bytes().unwrap(), closed);
-                assert!(
-                    !Reader::open_unchecked(&directory)
-                        .native_owner_blocks_prune()
-                        .unwrap(),
-                    "{case}"
-                );
             }
         }
-    }
-
-    // What a Session of another OS's own Records already settle still settles, with no
-    // observation: a close that a tombstone and a closed status already finished consumes the
-    // handle it left, and a session that has no handle closes.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    #[test]
-    fn a_session_of_another_os_still_closes_from_its_records_alone() {
-        use crate::native::session::test_support::lifecycle::reaped_child_pid;
-        use crate::native::session::{CoreRecord, SessionState, Store, update_status};
-        let absent = reaped_child_pid();
-        for (kind, os, _) in sessions_of_other_oss() {
-            for with_handle in [true, false] {
-                let root = tempfile::tempdir().unwrap();
-                let directory = root.path().join("session-foreign");
-                std::fs::create_dir_all(directory.join("events")).unwrap();
-                let store = Store::open_unchecked(&directory);
-                store
-                    .write_owner(&owner_written_on(os, "session-foreign", absent))
-                    .unwrap();
-                if with_handle {
-                    update_status(&directory, SessionState::Closed, None, None).unwrap();
-                    store
-                        .write_terminal(
-                            &TerminalSession::new(kind, "surface".into())
-                                .with_binding(Some("session-foreign".into())),
-                        )
-                        .unwrap();
-                } else {
-                    update_status(&directory, SessionState::Failed, None, None).unwrap();
-                }
-                let case = format!("{kind:?} recorded on {os}, handle {with_handle}");
-                crate::native::close::close_session_surface(
-                    &directory,
-                    "session-foreign",
-                    None,
-                    crate::native::session::close::budget::close_deadline(),
-                )
-                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
-                assert_eq!(
-                    store.status().unwrap().state,
-                    SessionState::Closed,
-                    "{case}"
-                );
-                assert!(
-                    !store.record(CoreRecord::Terminal).present().unwrap(),
-                    "{case}"
-                );
-            }
-        }
-    }
-
-    // A kind this OS runs other than Herdr, and one it does not run.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    fn native_and_foreign_kinds() -> (TerminalKind, TerminalKind) {
-        let native = TerminalKind::ALL
-            .into_iter()
-            .find(|kind| kind.supported_on_this_platform() && *kind != TerminalKind::Herdr)
-            .unwrap();
-        let foreign = TerminalKind::ALL
-            .into_iter()
-            .find(|kind| !kind.supported_on_this_platform())
-            .unwrap();
-        (native, foreign)
-    }
-
-    // Records that are not this session's own, or that say nothing, are no evidence: the
-    // session is this OS's, and the explicit close takes its ordinary path to the terminal
-    // (here an injected closer), never the settlement. The reviewer's two fixtures: a bound
-    // handle of a kind this OS runs carrying another OS's Herdr host field beside a live PID,
-    // and an Owner record of another OS's shape bound to another session.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    #[test]
-    fn records_that_are_not_the_sessions_own_never_settle_its_close() {
-        use crate::native::session::{CoreRecord, SessionState, Store, update_status};
-        let (native, _) = native_and_foreign_kinds();
-        let other = ["macOS", "Linux", "Windows"]
-            .into_iter()
-            .find(|os| *os != super::OsTerminals::CURRENT.unwrap().os)
-            .unwrap();
-        let mut herdr_field = serde_json::json!({
-            "terminal": native, "session_id": "surface", "managed_session_id": "session-native",
-            "herdr_core": {"socket": "/tmp/core.sock", "core_id": "core-a", "created_ms": 1,
-                "host_pid": 4}
-        });
-        let birth = if other == "Linux" {
-            serde_json::json!({"linux_birth": {
-                "boot_id": "00112233-4455-6677-8899-aabbccddeeff", "starttime_ticks": 7}})
-        } else if other == "Windows" {
-            serde_json::json!({"host_creation_time": 1})
-        } else {
-            serde_json::json!({"host_start_seconds": 1, "host_start_microseconds": 2})
-        };
-        for (key, value) in birth.as_object().unwrap() {
-            herdr_field["herdr_core"][key] = value.clone();
-        }
-        let live = crate::native::terminal::ownership::NativeSessionOwner {
-            pid: std::process::id(),
-            managed_session_id: Some("session-native".into()),
-            windows_process_identity:
-                crate::native::session::test_support::lifecycle::test_windows_process_identity(
-                    std::process::id(),
-                ),
-            ..Default::default()
-        };
-        let mut elsewhere_bound = owner_written_on(other, "session-other", std::process::id());
-        elsewhere_bound.managed_session_id = Some("session-other".into());
-        let bound_native = serde_json::json!({
-            "terminal": native, "session_id": "surface", "managed_session_id": "session-native"
-        });
-        for (name, handle, owner) in [
-            (
-                "a native handle with another OS's Herdr field",
-                herdr_field,
-                live,
-            ),
-            (
-                "an Owner record of another OS bound to another session",
-                bound_native,
-                elsewhere_bound,
-            ),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let directory = root.path().join("session-native");
-            std::fs::create_dir_all(directory.join("events")).unwrap();
-            update_status(&directory, SessionState::Exited, None, None).unwrap();
-            let store = Store::open_unchecked(&directory);
-            store
-                .record(CoreRecord::Terminal)
-                .write_json(&handle)
-                .unwrap();
-            store.write_owner(&owner).unwrap();
-            assert_eq!(super::foreign::of_records(&store), None, "{name}");
-            let calls = std::cell::Cell::new(0);
-            crate::native::session::close::close(
-                &store,
-                None,
-                crate::native::session::close::budget::close_deadline(),
-                |_| {
-                    calls.set(calls.get() + 1);
-                    Ok(super::CloseOutcome::Closed.into())
-                },
-            )
-            .unwrap_or_else(|error| panic!("{name}: {error:#}"));
-            assert_eq!(
-                calls.get(),
-                1,
-                "{name}: the ordinary path reaches its terminal"
-            );
-            assert!(
-                !store
-                    .status()
-                    .unwrap()
-                    .error
-                    .unwrap_or_default()
-                    .contains("settled from its records"),
-                "{name}"
-            );
-        }
-    }
-
-    // A consumption marker that says `consumed: false` is no completed consumption and no
-    // evidence: a running copy with one is refused and keeps every record, and a closed
-    // native session with one whose owner is live here stays for prune, as before.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    #[test]
-    fn a_marker_that_says_not_consumed_completes_nothing() {
-        use crate::native::session::{CoreRecord, Reader, SessionState, Store, update_status};
-        let (_, foreign) = native_and_foreign_kinds();
-        let root = tempfile::tempdir().unwrap();
-        // A running copy (its bound handle says so) with a marker that says not consumed.
-        let directory = root.path().join("session-copy");
-        std::fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, SessionState::Working, None, None).unwrap();
-        let store = Store::open_unchecked(&directory);
-        store
-            .write_terminal(
-                &TerminalSession::new(foreign, "surface".into())
-                    .with_binding(Some("session-copy".into())),
-            )
-            .unwrap();
-        store
-            .record(CoreRecord::TerminalClosed)
-            .write_json(&serde_json::json!({"consumed": false, "terminal": foreign}))
-            .unwrap();
-        // The lifecycle lock exists, as in every session, so that taking it writes nothing.
-        drop(store.lock().unwrap());
-        let before = crate::native::reopen::tests::snapshot_directory(&directory);
-        let error = crate::native::close::close_session_surface(
-            &directory,
-            "session-copy",
-            None,
-            crate::native::session::close::budget::close_deadline(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("TAB on this machine cannot judge or end this session"),
-            "{error:#}"
-        );
-        assert_eq!(
-            crate::native::reopen::tests::snapshot_directory(&directory),
-            before
-        );
-        // A closed native session whose marker says not consumed, with a live owner.
-        let directory = root.path().join("session-native");
-        std::fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, SessionState::Closed, None, None).unwrap();
-        let store = Store::open_unchecked(&directory);
-        store
-            .record(CoreRecord::TerminalClosed)
-            .write_json(&serde_json::json!({"consumed": false, "terminal": foreign}))
-            .unwrap();
-        store
-            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
-                pid: std::process::id(),
-                managed_session_id: Some("session-native".into()),
-                windows_process_identity:
-                    crate::native::session::test_support::lifecycle::test_windows_process_identity(
-                        std::process::id(),
-                    ),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(super::foreign::of_records(&store), None);
-        assert!(
-            Reader::open_unchecked(&directory)
-                .native_owner_blocks_prune()
-                .unwrap()
-        );
     }
 
     // Guarded input through the terminal entry point, for a kind this OS does not run and a

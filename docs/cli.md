@@ -1739,10 +1739,8 @@ positive supported whole day count, and `--explicit` acknowledges deletion. Ther
 retention policy or dry-run flag.
 
 Both the close tombstone and status must say `closed` and be at or before the retention cutoff.
-Active capabilities or a blocking owner prevent pruning. The owner of a closed session whose own
-records say it belongs to another operating system ([copied sessions](terminals.md#selection-and-settings))
-does not block it: nothing on this machine can observe that owner. Invalid, unsafe, or ineligible
-entries are skipped; pruning never closes a running session to make it eligible.
+Active capabilities or a blocking owner prevent pruning. Invalid, unsafe, or ineligible entries are
+skipped; pruning never closes a running session to make it eligible.
 
 Human output says `pruned SESSION` per removal and gives a count, or `no eligible closed TAB
 sessions`. JSON has `ok`, `closed_before_days`, and `pruned`.
@@ -1773,11 +1771,6 @@ failed sessions. Repeating a completed close succeeds without closing another su
 process teardown, and terminal automation. It does not guarantee that the close finishes.
 A timeout means the close was not confirmed and may have partly happened. A rerun observes
 the session and establishes authority again; it may still refuse the close.
-
-A session whose own records say it belongs to another operating system is closed from its
-records alone (see [copied sessions](terminals.md#selection-and-settings)): an exited or failed
-copy is settled without addressing any terminal or process, any other is refused, and the
-refusal names the directory of its records.
 
 For a tmux session, explicit close ends the session's entire tmux server, including windows you added.
 The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;
