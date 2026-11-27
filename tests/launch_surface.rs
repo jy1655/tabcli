@@ -910,3 +910,61 @@ fn an_automatic_herdr_gives_way_to_the_fallback_where_the_provider_version_is_no
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn launch_log_records_why_an_automatic_choice_fell_back_from_herdr() {
+    const PREFIX: &str = "Herdr was not used for this launch: ";
+    let fixture = Fixture::new();
+    let core = ScriptedCore::start();
+    // A tab in the workspace path stops the bootstrap command after Session creation,
+    // before it opens any real terminal.
+    let workspace = fixture.base.join("work\tspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let homes = fixture.homes();
+    for (version, terminal, fallback) in [
+        ("codex-cli 0.168.0", None, true),
+        ("codex-cli 0.168.0\nextra detail", None, true),
+        ("codex-cli 0.168.0", Some(FALLBACK), false),
+        ("codex-cli 0.170.0", None, false),
+    ] {
+        let path = fixture.printing("codex", version);
+        let mut command = fixture.command_from(
+            &fixture.base,
+            &[
+                "ask",
+                "codex",
+                "--prompt",
+                "test",
+                "--json",
+                "--title",
+                "test",
+                "--workspace",
+            ],
+            Caller::Herdr,
+            &[("HC_SOCKET", core.socket.as_os_str()), ("PATH", &path)],
+        );
+        command
+            .arg(&workspace)
+            .envs(homes.iter().map(|(key, value)| (key, value)));
+        if let Some(terminal) = terminal {
+            command.args(["--terminal", terminal]);
+        }
+        let reply = refusal(command.output().unwrap());
+        assert!(
+            error(&reply).contains("workspace contains terminal control U+0009"),
+            "{reply}"
+        );
+        let directory = fixture
+            .state_root()
+            .join(reply["session"].as_str().unwrap());
+        let log = std::fs::read_to_string(directory.join("launch.log")).unwrap();
+        let lines: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once(' ')?.1.strip_prefix(PREFIX))
+            .collect();
+        let expected =
+            fallback.then(|| format!("{CODEX_HERDR_FLOOR}{}", version.replace('\n', "\\n")));
+        assert_eq!(lines, expected.iter().collect::<Vec<_>>(), "{log}");
+    }
+}
