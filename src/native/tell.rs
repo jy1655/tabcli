@@ -96,14 +96,12 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
     Store::open_unchecked(&directory).converge_until(deadline)?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    let terminal_session: terminal::TerminalSession =
-        Reader::open_unchecked(&directory).terminal()?;
-    delivery::verify_terminal_surface_ownership_until(
-        &directory,
+    let terminal_session = delivery::follow_up_surface(
+        &Reader::open_unchecked(&directory),
         &request.id,
-        &terminal_session,
         deadline,
         request.timeout,
+        terminal::ownership::verify_terminal_surface_ownership_with_timeout,
     )?;
     let previous_state =
         session::hold::follow_up_admission(&Reader::open_unchecked(&directory), &request.id)?;

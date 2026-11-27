@@ -308,7 +308,8 @@ tabcli tell SESSION (--prompt TEXT | --prompt-file PATH)
 See the command and output in the [opening workflow](#command-reference).
 
 TAB checks the hold before changing any target records, then finishes interrupted record
-updates and verifies that it still controls the surface. The session must be `ready` and not held;
+updates and verifies that it still controls the surface. A copy is refused before ownership proof,
+a new claim or input. The session must be `ready` and not held;
 an unfinished request blocks another follow-up. A hold set after delivery began does not stop that
 turn. All listed options follow the shared rules; the timeout defaults to 900 seconds. There are no workspace, model,
 effort, title, terminal, or bypass options for a follow-up.
@@ -485,6 +486,7 @@ resume can start between them.
 After refusing a launch, TAB releases the source marker only when it proves the refused launch
 cannot still hold the conversation. Otherwise it keeps the marker. A later `reopen` checks the
 recorded refusal again and can release the marker once the provider process is verified gone.
+A recorded provider process in a copied target stays unverified on this system.
 `doctor` reports this condition but never releases the marker. See [architecture](architecture.md).
 
 ## sessions
@@ -521,7 +523,8 @@ publication of recorded completions, completion of interrupted closes, and repai
 owner died before reading their state. The state filter is applied afterward. The internal read-only
 listing is not a public flag. Use `status`, `inspect`, `result`, or `search` when records must not change.
 Each row also carries `origin` and `origin_observation`, read the same way as in `status`. That
-reading only observes: it runs after the repair above and changes no record.
+reading only observes: it runs after the repair above and changes no record. A copied origin can
+show a recorded end, but its owner supplies no local liveness verdict.
 
 Human rows show id, state, provider, workspace, terminal, bypass flag, and recorded event count. An
 empty list prints `no native TAB sessions`. JSON is an array, not an `ok` envelope. The
@@ -576,8 +579,8 @@ The ten-second budget is checked between operations, not a hard command deadline
 session read retries for at most 250 ms or the remaining budget, whichever is shorter.
 Slow filesystem and process observations can outlast the budget. Each remaining session gets
 an incomplete reason when the budget is exhausted. Session state is read consistently; owner
-and terminal records are observed separately. The owner process is checked, but the terminal
-surface is not probed. At most two result events are decoded per listed session: the latest
+and terminal records are observed separately. Native owner processes are checked. A copy has unknown
+local owner liveness, and the listing probes no terminal surface. At most two result events are decoded per listed session: the latest
 published event and the active request's published event when they differ. Result bodies are
 not returned.
 
@@ -708,8 +711,8 @@ timeline output do not include capabilities.
 `capabilities.tell` evaluates only the gates `tell` decides from TAB records, in the command's
 order, and stops at the first gate that does not pass: the hold; what interrupted-update recovery
 and dead-owner repair would find about the owner's liveness, without performing either; the
-recorded terminal handle; the owner record's side of the surface ownership check, which `tell`'s
-probe verifies after it reads that handle; the stored state; an installed claim; and the provider
+recorded terminal handle and any evidence of a copy (`surface_unsupported`); the owner record's side of the
+surface ownership check, which `tell`'s probe verifies after it reads that handle; the stored state; an installed claim; and the provider
 adapter's own record gate. `state` is
 `admissible`, `refused` or `unknown`, never `available`, with a stable `reason` and an optional
 `detail`:
@@ -852,8 +855,8 @@ owner record as the first. It sends no
 input, key, selection or activation request, starts no provider, and repairs, recovers, writes or
 closes nothing.
 
-The ownership check requires a handle bound to this session and a live recorded owner attached to
-the surface. On macOS the terminal adapter must find exactly the recorded surface (an iTerm2 session
+A copy at either binding check prevents screen output. The ownership check requires a handle bound to this
+session and a live recorded owner attached to the surface. On macOS the terminal adapter must find exactly the recorded surface (an iTerm2 session
 by its unique id, a Terminal.app tab by its window id and TTY, a WezTerm pane of the recorded GUI
 process) and report its TTY, and the recorded owner must be alive with its recorded birth, TTY and
 process groups on that TTY. On native Windows the recorded owner's process identity must match, and
@@ -1302,8 +1305,9 @@ The report starts human output with `scope`, describing the inputs used by these
 
 - `session` is the requested session id, or null in provider-only mode; `provider` is the
   recognized provider, or null when absent or unrecognized.
-- `executable` is the validated absolute executable path, or null if unusable.
-  `executable_source` is `launch_record` for a usable manifest path, `resolved_path` for
+- For a copy, `executable` is the path from the launch record, without local validation.
+  Otherwise it is the validated absolute executable path, or null if unusable.
+  `executable_source` is `launch_record` for a reported manifest path, `resolved_path` for
   provider-only PATH resolution, or null. Session paths are never replaced through PATH.
 - `current_version` is the result of a successful version probe; otherwise it is null.
   `configured.provider_version_at_launch` remains separate historical evidence.
@@ -1344,7 +1348,8 @@ On Linux, the `platform` check reports a supported platform. When the default se
 The session `owner` check is `unavailable` / `owner_exited` or `owner_identity_mismatch` only for a
 bound owner attested gone or changed; a bound owner whose attestation could not decide is
 `unknown` / `owner_unverified`, even when its process id looked absent.
-For a session identified as a copy, `doctor` still judges the recorded owner from local process state.
+For a copy, owner liveness is unknown and the surface probe cannot confirm a local terminal.
+The report omits local installation, provider-adapter and shell diagnostics for that session, including with `--probe`.
 
 Session reports append a `hold` check after the other record checks: `available` / `not_held`,
 `unavailable` / `session_held`, or `unknown` / `hold_unreadable`. A held session's next action
@@ -1367,9 +1372,9 @@ absence is not evidence that the host never started), `launch_host_identity_mism
 `launch_host_record_unreadable`, `launch_host_schema_unsupported` and
 `launch_stage_not_applicable`. Owner and provider records can show that the launch went further.
 
-With `--probe`, on macOS for iTerm2, WezTerm or Herdr, a `shell_environment` check runs the shell
-environment preparation of a launch once, in the caller's current environment, within the
-remaining shared probe budget. It reports the outcome (`shell_environment_ready`,
+For native macOS iTerm2, WezTerm or Herdr sessions and their provider-only probes, the
+`shell_environment` check runs shell preparation once with `--probe`, in the caller's current environment,
+within the remaining shared probe budget. It reports the outcome (`shell_environment_ready`,
 `shell_environment_failed`, `shell_environment_probe_budget_exhausted`), elapsed milliseconds,
 the budget in milliseconds that the preparation enforced, the variable count, stopped background processes and a numeric exit status or
 signal; never the startup files' output or any environment value. It is not a reconstruction
@@ -2206,7 +2211,7 @@ authenticated identity.
 | `owner_exited` | managed | true | The origin's bound owner process is attested gone. |
 | `owner_reused` | managed | true | The owner's process id now belongs to another process, which grants no authority. |
 | `owner_live` | managed | false | The owner is attested live; `detail` notes a process-id-only record. |
-| `owner_unverified` | managed | null | No owner record, an unbound or foreign one, an unreadable one (the 128 KiB owner bound included), or an attestation that could not decide. |
+| `owner_unverified` | managed | null | A copied origin, no owner record, an unbound or foreign one, an unreadable one (the 128 KiB owner bound included), or an attestation that could not decide. |
 | `origin_missing` | managed | null | No session directory with that id in this state root; a pruned, deleted or foreign session looks the same. |
 | `origin_unreadable` | managed | null | A linked or damaged directory, manifest, status or tombstone. |
 | `origin_unverified` | managed | null | A recorded state this version does not know. |
@@ -2219,7 +2224,7 @@ authenticated identity.
 | `invalid_source` | unknown | null | The recorded source is not a session id or names the session itself. |
 
 Only the origin itself is read, in the same state root, through bounded regular-file reads: at
-most 100 ms, 64 KiB per record and 512 KiB per origin. No lock is taken and no record is written;
+most 100 ms, 64 KiB per record (128 KiB for the owner) and 768 KiB per origin. No lock is taken and no record is written;
 origins of origins are not followed.
 
 ### close-session
@@ -2274,8 +2279,8 @@ record can therefore report an available owner in doctor; an inspection failure 
 unverified. These effects apply to macOS intermediate records as well as Windows records.
 Completed Results still take precedence. These observations alone grant no general Surface
 close authority.
-Inspect reports the recorded owner attestation whatever session it names. Its prediction of
-dead-owner repair skips local owner liveness for a copy. An
+Inspect reports native owner attestation whatever session the record names. For a copy,
+inspect and its prediction of dead-owner repair leave local owner liveness unknown. An
 unbound legacy record, and a record of another managed session, report only that liveness:
 `owner.process_alive` (with `owner.identity_matches: false` when the process id now belongs to
 another process, and the reason in `owner.error` when the attestation could not decide), never a

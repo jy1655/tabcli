@@ -5,7 +5,6 @@ use crate::native::session::primitives::{unix_ms, valid_session_id};
 use crate::native::session::schema::{ProviderProcessRecord, RecordedReopenRefusal, ReopenMarker};
 use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
 use crate::native::session::{self, CoreRecord, Reader, RecordStore, SessionState, Store, record};
-#[cfg(any(windows, test))]
 use crate::native::terminal;
 use agent_bridge::process_is_alive;
 use anyhow::{Context, Result, bail};
@@ -368,6 +367,12 @@ fn refused_launch_cleanup_with(
             record.managed_session_id, record.schema
         )));
     }
+    let surfaces = terminal::foreign::SurfaceRecords::read(&store);
+    if let Some(copy) = surfaces.evidence(&store, &session::owner::observe(&store)) {
+        return Ok(RefusedLaunchCleanup::Pending(
+            copy.observation_refusal().to_string(),
+        ));
+    }
     let evidence = match observe(&record) {
         ProviderProcessObservation::Gone(evidence) => evidence,
         ProviderProcessObservation::Alive => {
@@ -384,9 +389,11 @@ fn refused_launch_cleanup_with(
         }
     };
     let surface_closed = state == SessionState::Closed
-        && Reader::open_unchecked(refused_directory)
-            .record(CoreRecord::TerminalClosed)
-            .is_regular_file()?
+        && match surfaces.marker {
+            Ok(marker) => marker.is_some(),
+            // A malformed or unreadable regular marker still counts as a file here.
+            Err(_) => store.record(CoreRecord::TerminalClosed).is_regular_file()?,
+        }
         && Reader::open_unchecked(refused_directory)
             .closed_if_present()?
             .is_some_and(|closed| closed.state == SessionState::Closed);

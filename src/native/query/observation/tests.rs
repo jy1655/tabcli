@@ -458,7 +458,7 @@ fn surface_presence_is_judged_once_per_observation() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("terminal.json"),
-        &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
+        &json!({"terminal": "herdr", "session_id": "surface-1", "managed_session_id": "session-fault"}),
     )
     .unwrap();
     let reader = Reader::open_unchecked(&fixture.directory);
@@ -501,7 +501,7 @@ fn surface_presence_is_judged_once_per_observation() {
     let expired = Observation::read(&reader).unwrap();
     crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("terminal.json"),
-        &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
+        &json!({"terminal": "herdr", "session_id": "surface-1", "managed_session_id": "session-fault"}),
     )
     .unwrap();
     let presence =
@@ -670,4 +670,129 @@ fn owner_judgment_is_made_once_per_observation() {
         Some(true)
     );
     assert_eq!(calls.get(), 1);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_inspect_and_partial_doctor_keep_the_hidden_active_handle_as_evidence() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let id = "session-fault";
+    let store = Store::open_unchecked(&fixture.directory);
+    session::turn::recover_pending_completion(&fixture.directory).unwrap();
+    let kind = if cfg!(windows) {
+        terminal::TerminalKind::Tmux
+    } else {
+        terminal::TerminalKind::WindowsConsole
+    };
+    store
+        .write_terminal(
+            &terminal::TerminalSession::new(kind, "bound".into()).with_binding(Some(id.into())),
+        )
+        .unwrap();
+    store
+        .record(CoreRecord::TerminalClosing)
+        .write_json(
+            &terminal::TerminalSession::new(terminal::TerminalKind::Herdr, "claimed".into())
+                .with_binding(Some(id.into())),
+        )
+        .unwrap();
+    store
+        .write_owner(&terminal::ownership::NativeSessionOwner {
+            pid: std::process::id(),
+            managed_session_id: Some(id.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    for damaged in [false, true] {
+        if damaged {
+            std::fs::write(store.record(CoreRecord::Status).path(), "{").unwrap();
+        }
+        let before = entries(&fixture.directory);
+        for alive in [true, false] {
+            let evidence = PartialObservation::read(&store, id).evidence;
+            let owner = evidence.judge_owner_with(&judgment::Observers {
+                attest: &|_| panic!("copy consulted local owner (alive={alive})"),
+            });
+            assert_eq!(owner.observation().process_alive, None);
+            let (checks, _) = doctor_records(&store);
+            assert_eq!(reason(&checks, "owner"), "owner_unverified");
+            if !damaged {
+                let value = super::super::inspect_value(&store, id).unwrap();
+                assert_eq!(value["owner_process_alive"], Value::Null);
+                assert_eq!(value["capabilities"]["tell"]["reason"], "surface_closed");
+            }
+            assert_eq!(entries(&fixture.directory), before);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_doctor_probe_classifies_the_current_owner_after_the_snapshot() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let store = Store::open_unchecked(&fixture.directory);
+    let id = "session-fault";
+    store
+        .write_terminal(
+            &terminal::TerminalSession::new(terminal::TerminalKind::Herdr, "bound".into())
+                .with_binding(Some(id.into())),
+        )
+        .unwrap();
+    for alive in [true, false] {
+        store.record(CoreRecord::Owner).remove().unwrap();
+        let observation = Observation::read(&store).unwrap();
+        store
+            .write_owner(&session::test_support::copied_owner(id))
+            .unwrap();
+        let before = entries(&fixture.directory);
+        let answer = observation.evidence.judge_surface_presence_with(
+            &store,
+            Instant::now() + Duration::from_secs(2),
+            &|_, _, _| panic!("copy probed local terminal (present={alive})"),
+        );
+        assert!(matches!(answer, SurfacePresence::Unverified(_)));
+        assert_eq!(entries(&fixture.directory), before);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn a_copied_ready_session_refuses_predicted_and_actual_delivery_on_a_native_kind() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let id = "session-fault";
+    let store = Store::open_unchecked(&fixture.directory);
+    session::turn::recover_pending_completion(&fixture.directory).unwrap();
+    let selected = terminal::TerminalSession::new(terminal::TerminalKind::Herdr, "bound".into())
+        .with_binding(Some(id.into()));
+    store.write_terminal(&selected).unwrap();
+    // The handle from admission remains the same, but the owner for the delivery proof changed.
+    store
+        .write_owner(&session::test_support::copied_owner(id))
+        .unwrap();
+    let before = entries(&fixture.directory);
+    let inspected = super::super::inspect_value(&store, id).unwrap();
+    let refusal = crate::native::delivery::verify_terminal_surface_ownership_until(
+        &fixture.directory,
+        id,
+        &selected,
+        Instant::now() + Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .unwrap_err();
+    let origin = if cfg!(windows) { "macOS" } else { "Windows" };
+    let expected = format!(
+        "This session was recorded on {origin}. Its processes and terminal cannot be verified on this system."
+    );
+    assert_eq!(
+        (&inspected["capabilities"]["tell"], refusal.to_string()),
+        (
+            &json!({"state":"refused","reason":"surface_unsupported","detail":expected}),
+            expected
+        )
+    );
+    assert_eq!(
+        crate::native::failure_kind::classify(&refusal),
+        Some(crate::native::failure_kind::FailureKind::Unsupported)
+    );
+    assert_eq!(entries(&fixture.directory), before);
 }

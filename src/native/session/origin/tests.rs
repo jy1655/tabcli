@@ -1287,7 +1287,7 @@ fn failed_reads_are_charged_against_the_cumulative_allowance() {
     let _hooks = Hooks::new();
     let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
-    // The observation allowance holds eight full records; each failed read reserves one.
+    // Each failed read reserves one full record from the observation allowance.
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
     malformed_manifest(&origin);
@@ -1541,5 +1541,146 @@ fn an_owner_record_is_read_within_the_owner_bound() {
             (ended, reason, detail),
             "{size}"
         );
+    }
+}
+
+fn max_native_origin(root: &Path) -> Session {
+    let id = "session-origin";
+    let origin = Session::new(root, id, "ready");
+    origin.owner(Some(id), 7);
+    write(
+        &origin.record(CoreRecord::Terminal),
+        &json!({"terminal":"herdr","session_id":"surface","managed_session_id":id}),
+    );
+    write(
+        &origin.record(CoreRecord::TerminalClosed),
+        &json!({"consumed":true,"terminal":"herdr"}),
+    );
+    for (record, size) in [
+        (CoreRecord::Manifest, RECORD_LIMIT),
+        (CoreRecord::Status, RECORD_LIMIT),
+        (CoreRecord::Owner, owner::LIMIT),
+        (CoreRecord::Terminal, RECORD_LIMIT),
+        (CoreRecord::TerminalClosed, RECORD_LIMIT),
+    ] {
+        let path = origin.record(record);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(size as usize, b' ');
+        fs::write(path, bytes).unwrap();
+    }
+    origin
+}
+
+#[test]
+fn slice_three_maximum_native_origin_retains_its_owner_verdict() {
+    let root = tempfile::tempdir().unwrap();
+    let mut environment = Environment::new();
+    let origin = max_native_origin(root.path());
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let reference = read(&mut environment, &child);
+    for alive in [true, false] {
+        environment.attest(move |_| {
+            attestation(
+                if alive {
+                    ProcessObservation::Live(Attested::PidOnly)
+                } else {
+                    ProcessObservation::Gone(Gone::Exited)
+                },
+                ControlAttestation::NotRecorded,
+            )
+        });
+        let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+        let answer = observe(
+            root.path(),
+            reference.clone(),
+            &mut budget,
+            &mut environment.origin(),
+        );
+        assert_eq!(answer.ended, Some(!alive));
+        assert_eq!(
+            answer.reason,
+            if alive { "owner_live" } else { "owner_exited" }
+        );
+    }
+    assert_eq!(origin.reader().status().unwrap().state, SessionState::Ready);
+}
+
+#[test]
+fn slice_three_origin_exceeding_the_total_returns_no_end_verdict() {
+    let root = tempfile::tempdir().unwrap();
+    let mut environment = Environment::new();
+    let origin = max_native_origin(root.path());
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let reference = read(&mut environment, &child);
+    let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+    // This caller has already spent 128 KiB of the shared allowance.
+    for _ in 0..2 {
+        budget
+            .read(
+                &origin.reader().record(CoreRecord::Manifest),
+                &mut environment.clock,
+            )
+            .unwrap();
+    }
+    let answer = observe(
+        root.path(),
+        reference,
+        &mut budget,
+        &mut environment.origin(),
+    );
+    assert_eq!(
+        (answer.ended, answer.reason.as_str()),
+        (None, "origin_budget_exhausted")
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_origin_checks_surface_bytes_again_before_reporting_unknown() {
+    let hooks = Hooks::new();
+    let mut environment = Environment::new();
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-origin";
+    let child = Session::started_from(root.path(), "session-child", "ready", id);
+    let origin = Session::new(root.path(), id, "ready");
+    origin.owner(Some(id), 7);
+    let kind = if cfg!(windows) {
+        "tmux"
+    } else {
+        "windows-console"
+    };
+    for record in [CoreRecord::Terminal, CoreRecord::TerminalClosed] {
+        let path = origin.record(record);
+        let wire = match record {
+            CoreRecord::Terminal => {
+                json!({"terminal":kind,"session_id":"surface","managed_session_id":id})
+            }
+            _ => json!({"consumed":true,"terminal":kind}),
+        };
+        write(&path, &wire);
+        for alive in [true, false] {
+            environment.attest(move |_| panic!("origin consulted local owner (alive={alive})"));
+            let answer = observed(&mut environment, root.path(), &child);
+            assert_eq!(
+                (answer.ended, answer.reason.as_str()),
+                (None, "owner_unverified")
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+                wire
+            );
+        }
+        let changed = path.clone();
+        hooks.checkpoint(move |point, _| {
+            if point == Checkpoint::OriginRead {
+                fs::remove_file(&changed).unwrap()
+            }
+        });
+        let answer = observed(&mut environment, root.path(), &child);
+        assert_eq!(
+            (answer.ended, answer.reason.as_str()),
+            (None, "origin_busy")
+        );
+        hooks.checkpoint(|_, _| {});
     }
 }

@@ -657,9 +657,7 @@ pub(in crate::native) mod tests {
     /// Evidence with every auxiliary record readable and absent.
     pub(in crate::native) fn evidence() -> SessionEvidence {
         SessionEvidence {
-            session: SESSION.into(),
-            active: None,
-            completed_kind: None,
+            copy: None,
             owner: OwnerRecord::Absent,
             held: Ok(false),
             close_tombstone: None,

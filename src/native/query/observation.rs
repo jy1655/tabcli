@@ -61,15 +61,12 @@ pub(in crate::native) struct SessionEvidence {
     /// is its one reader. None when it was not read.
     pub(in crate::native) close_tombstone: Option<Result<Option<SessionStatus>>>,
     pub(in crate::native) surface: SurfaceRecord,
-    // Repair predicts from the active slot even when the displayed record is
-    // the claim or marker. Preserve its stated kind and the strict marker projection.
-    session: String,
-    active: Option<(terminal::TerminalSession, Option<terminal::TerminalKind>)>,
-    completed_kind: Option<terminal::TerminalKind>,
+    pub(in crate::native) copy: Option<terminal::foreign::CopyEvidence>,
     /// Made on the first request and kept for this Observation (D21).
     pub(in crate::native) owner_judgment: OnceCell<OwnerJudgment>,
     /// Judged on the first request and kept for this Observation (D21).
-    pub(in crate::native) surface_presence: OnceCell<SurfacePresence>,
+    pub(in crate::native) surface_presence:
+        OnceCell<(SurfacePresence, Option<terminal::foreign::CopyEvidence>)>,
 }
 
 pub(in crate::native) enum SurfaceRecord {
@@ -79,29 +76,17 @@ pub(in crate::native) enum SurfaceRecord {
 }
 
 impl SurfaceRecord {
-    /// The surface record in its precedence: the close tombstone, then a claimed close
-    /// handle, then the active handle. Reads only; the first record present decides.
+    #[cfg(test)]
     pub(in crate::native) fn read(reader: &Reader) -> Self {
-        Self::from_reads(
-            reader,
-            reader
-                .record(CoreRecord::TerminalClosed)
-                .optional_json_with(session::record::terminal_tombstone_value),
-            || {
-                reader
-                    .record(CoreRecord::Terminal)
-                    .optional_json_with(session::record::terminal)
-            },
-        )
+        Self::from_records(reader, terminal::foreign::SurfaceRecords::read(reader))
     }
 
-    fn from_reads(
+    pub(super) fn from_records(
         reader: &Reader,
-        marker: Result<Option<Value>>,
-        active: impl FnOnce() -> Result<Option<terminal::TerminalSession>>,
+        records: terminal::foreign::SurfaceRecords,
     ) -> Self {
-        match marker {
-            Ok(Some(marker)) => Self::Closed(Ok(marker)),
+        match records.marker {
+            Ok(Some(marker)) => Self::Closed(Ok(marker.value)),
             Err(error) => Self::Closed(Err(error)),
             Ok(None) => match reader
                 .record(CoreRecord::TerminalClosing)
@@ -109,7 +94,7 @@ impl SurfaceRecord {
             {
                 Ok(Some(value)) => Self::Closing(Ok(value)),
                 Err(error) => Self::Closing(Err(error)),
-                Ok(None) => Self::Active(active()),
+                Ok(None) => Self::Active(records.active.map(|slot| slot.map(|(handle, _)| handle))),
             },
         }
     }
@@ -123,24 +108,12 @@ impl SessionEvidence {
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
         let owner = session::owner::observe(reader);
         let records = terminal::foreign::SurfaceRecords::read(reader);
-        let active = records
-            .active
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .cloned();
-        let completed_kind = records.completed_kind();
-        let surface = SurfaceRecord::from_reads(
-            reader,
-            records.marker.map(|m| m.map(|marker| marker.value)),
-            || records.active.map(|slot| slot.map(|(handle, _)| handle)),
-        );
+        let copy = records.evidence(reader, &owner);
+        let surface = SurfaceRecord::from_records(reader, records);
         // An interrupted close can have its tombstone before status.json catches up.
         let close_tombstone = matches!(held, Ok(true)).then(|| reader.closed_if_present());
         Self {
-            session: session::owner::session_of(reader).to_owned(),
-            active,
-            completed_kind,
+            copy,
             close_tombstone,
             held,
             owner,
@@ -167,28 +140,36 @@ impl SessionEvidence {
         deadline: Instant,
         probe: SurfaceProbe<'_>,
     ) -> &SurfacePresence {
-        self.surface_presence.get_or_init(|| {
-            let directory = reader.directory();
-            SurfacePresence::of((|| -> Result<bool> {
-                let session = Reader::open_unchecked(directory)
-                    .record(CoreRecord::Terminal)
-                    .optional_json_with(session::record::terminal)?
-                    .context("no active terminal handle is recorded")?;
-                session.verify_managed_session(
-                    directory
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .context("invalid session path")?,
-                )?;
-                let budget = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(2));
-                if budget.is_zero() {
-                    bail!("diagnostic probe deadline exhausted")
-                }
-                probe(directory, &session, budget)
-            })())
-        })
+        &self
+            .surface_presence
+            .get_or_init(|| {
+                let directory = reader.directory();
+                let records = terminal::foreign::SurfaceRecords::read(reader);
+                let copy = records.evidence(reader, &session::owner::observe(reader));
+                let presence = SurfacePresence::of((|| -> Result<bool> {
+                    let (session, _) = records
+                        .active?
+                        .context("no active terminal handle is recorded")?;
+                    session.verify_managed_session(
+                        directory
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .context("invalid session path")?,
+                    )?;
+                    if let Some(copy) = copy {
+                        return Err(copy.observation_refusal());
+                    }
+                    let budget = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(2));
+                    if budget.is_zero() {
+                        bail!("diagnostic probe deadline exhausted")
+                    }
+                    probe(directory, &session, budget)
+                })());
+                (presence, copy)
+            })
+            .0
     }
 
     /// The owner judgment, made on the first request. One Observation describes one
@@ -202,22 +183,30 @@ impl SessionEvidence {
         &self,
         observers: &judgment::Observers<'_>,
     ) -> Option<&OwnerJudgment> {
-        terminal::foreign::judge(
-            &self.session,
-            self.active.as_ref(),
-            self.completed_kind,
-            &self.owner,
-        )
-        .is_none()
-        .then(|| self.judge_owner_with(observers))
+        self.copy
+            .is_none()
+            .then(|| self.judge_owner_with(observers))
     }
 
     pub(in crate::native) fn judge_owner_with(
         &self,
         observers: &judgment::Observers<'_>,
     ) -> &OwnerJudgment {
-        self.owner_judgment
-            .get_or_init(|| judgment::owner(&self.owner, observers))
+        self.owner_judgment.get_or_init(|| match self.copy {
+            Some(copy) => judgment::owner(
+                &self.owner,
+                &judgment::Observers {
+                    attest: &|_| session::owner::OwnerAttestation {
+                        process: crate::native::process_identity::ProcessObservation::Unknown(
+                            copy.observation_refusal().to_string(),
+                        ),
+                        control: session::owner::ControlAttestation::NotRecorded,
+                        pid_alive: None,
+                    },
+                },
+            ),
+            None => judgment::owner(&self.owner, observers),
+        })
     }
 }
 

@@ -3,7 +3,7 @@ use super::ownership::OwnerBinding;
 use super::{OsTerminals, TerminalKind, TerminalSession};
 use crate::native::session::{
     CoreRecord, Reader,
-    owner::{OwnerRecord, session_of},
+    owner::{self, OwnerRecord, RecordedOwner, session_of},
     record,
 };
 use anyhow::Result;
@@ -28,6 +28,15 @@ impl CopyEvidence {
         }
     }
 
+    pub(in crate::native) fn observation_refusal(self) -> anyhow::Error {
+        match self {
+            Self::Kind(_) => self.running_refusal(),
+            Self::Origin(origin) => crate::native::failure_kind::Unsupported::new(format!(
+                "This session was recorded on {origin}. Its processes and terminal cannot be verified on this system."
+            )).into(),
+        }
+    }
+
     pub(in crate::native) fn cleanup_refusal(self) -> anyhow::Error {
         match self {
             Self::Kind(_) => self.running_refusal(),
@@ -38,13 +47,26 @@ impl CopyEvidence {
     }
 }
 
-type StatedHandle = (TerminalSession, Option<TerminalKind>);
+pub(in crate::native) type StatedHandle = (TerminalSession, Option<TerminalKind>);
 
 pub(in crate::native) fn judge(
     id: &str,
     active: Option<&StatedHandle>,
     marker: Option<TerminalKind>,
     owner: &OwnerRecord,
+) -> Option<CopyEvidence> {
+    let recorded = match owner {
+        OwnerRecord::Recorded(record) => Some(record),
+        _ => None,
+    };
+    judge_records(id, active, marker, recorded)
+}
+
+pub(in crate::native) fn judge_records(
+    id: &str,
+    active: Option<&StatedHandle>,
+    marker: Option<TerminalKind>,
+    owner: Option<&RecordedOwner>,
 ) -> Option<CopyEvidence> {
     let os = OsTerminals::CURRENT?;
     if let Some((surface, Some(kind))) = active
@@ -74,9 +96,7 @@ pub(in crate::native) fn judge(
     {
         return Some(CopyEvidence::Kind(kind));
     }
-    let OwnerRecord::Recorded(record) = owner else {
-        return None;
-    };
+    let record = owner?;
     if record.binding != OwnerBinding::Bound {
         return None;
     }
@@ -108,24 +128,38 @@ pub(in crate::native) struct SurfaceRecords {
     pub(in crate::native) marker: Result<Option<record::ConsumptionMarker>>,
 }
 
+fn read_marker(reader: &Reader) -> Result<Option<record::ConsumptionMarker>> {
+    reader
+        .record(CoreRecord::TerminalClosed)
+        .optional_json_with(record::consumption_marker)
+}
+
+fn completed_kind(marker: Option<&record::ConsumptionMarker>) -> Option<TerminalKind> {
+    marker?.completed().flatten()
+}
+
+/// A required active handle has already been selected by tell.
+pub(in crate::native) fn evidence_for_active(
+    reader: &Reader,
+    active: &StatedHandle,
+) -> Option<CopyEvidence> {
+    let marker = read_marker(reader).ok().flatten();
+    judge(
+        session_of(reader),
+        Some(active),
+        completed_kind(marker.as_ref()),
+        &owner::observe(reader),
+    )
+}
+
 impl SurfaceRecords {
     pub(in crate::native) fn read(reader: &Reader) -> Self {
         Self {
             active: reader
                 .record(CoreRecord::Terminal)
                 .optional_json_with(TerminalSession::decode_with_stated_kind),
-            marker: reader
-                .record(CoreRecord::TerminalClosed)
-                .optional_json_with(record::consumption_marker),
+            marker: read_marker(reader),
         }
-    }
-    pub(in crate::native) fn completed_kind(&self) -> Option<TerminalKind> {
-        self.marker
-            .as_ref()
-            .ok()
-            .and_then(|m| m.as_ref())
-            .and_then(|m| m.completed())
-            .flatten()
     }
 
     pub(in crate::native) fn evidence(
@@ -136,7 +170,7 @@ impl SurfaceRecords {
         judge(
             session_of(reader),
             self.active.as_ref().ok().and_then(|slot| slot.as_ref()),
-            self.completed_kind(),
+            completed_kind(self.marker.as_ref().ok().and_then(Option::as_ref)),
             owner,
         )
     }

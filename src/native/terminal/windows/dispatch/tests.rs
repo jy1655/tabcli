@@ -308,8 +308,13 @@ fn doctor_probe_of_another_kinds_handle_is_unverified() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-foreign");
     std::fs::create_dir(&directory).unwrap();
-    let handle = TerminalSession::new(TerminalKind::WezTerm, "0".into())
-        .with_binding(Some("session-foreign".into()));
+    let kind = if cfg!(target_os = "linux") {
+        TerminalKind::Tmux
+    } else {
+        TerminalKind::WezTerm
+    };
+    let handle =
+        TerminalSession::new(kind, "0".into()).with_binding(Some("session-foreign".into()));
     Store::open_unchecked(&directory)
         .write_terminal(&handle)
         .unwrap();
@@ -324,8 +329,8 @@ fn doctor_probe_of_another_kinds_handle_is_unverified() {
         Instant::now() + Duration::from_secs(2),
         &probe,
     );
-    let refusal = "WezTerm is not available on Windows; use windows-console or herdr";
-    assert_eq!(*presence, SurfacePresence::Unverified(refusal.into()));
+    let refusal = OsTerminals::WINDOWS.unavailable(kind).to_string();
+    assert_eq!(*presence, SurfacePresence::Unverified(refusal));
     let check = doctor::surface_presence_check(presence);
     assert_eq!(check.reason_code, "terminal_surface_unverified");
     assert!(dispatch.console.calls().is_empty());

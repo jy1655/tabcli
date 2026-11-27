@@ -468,6 +468,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         }
     }
     let mut session_terminal = None;
+    let mut copied_session = false;
     let manifest = directory.as_ref().and_then(|directory| {
         let mut clock = SystemClock;
         let (manifest, evidence, launch_host) = record_checks(
@@ -486,6 +487,11 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                 &mut checks,
             );
         }
+        copied_session = evidence.copy.is_some()
+            || evidence
+                .surface_presence
+                .get()
+                .is_some_and(|(_, copy)| copy.is_some());
         reopen::marker_check(
             &Reader::open_unchecked(directory),
             request.session.as_deref().unwrap(),
@@ -517,20 +523,24 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
     let mut scope_workspace = None;
     let mut consent_state = Value::Null;
     if let Some(provider) = provider {
-        let observed = match installation.take() {
-            Some(observed) => observed,
-            None => observe_installation(
-                provider,
-                manifest.as_ref(),
-                request.probe,
-                VersionRun::Isolated,
-                deadline,
-            ),
-        };
-        checks.push(observed.executable_row);
-        executable = observed.executable;
-        checks.push(observed.version_row);
-        current_version = observed.version;
+        if copied_session {
+            executable = manifest.as_ref().map(|m| m.provider_path.clone());
+        } else {
+            let observed = match installation.take() {
+                Some(observed) => observed,
+                None => observe_installation(
+                    provider,
+                    manifest.as_ref(),
+                    request.probe,
+                    VersionRun::Isolated,
+                    deadline,
+                ),
+            };
+            checks.push(observed.executable_row);
+            executable = observed.executable;
+            checks.push(observed.version_row);
+            current_version = observed.version;
+        }
         let workspace = manifest
             .as_ref()
             .map(|m| m.workspace.clone())
@@ -551,39 +561,43 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                 "Launch-time workspace consent and its provider-owned source. This is historical evidence, not a new trust grant.",
                 "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent.into_value()));
         }
-        let environment = consent::Environment::current();
-        checks.extend(provider::diagnose(
-            provider,
-            Context {
-                directory: directory.as_deref(),
-                manifest: manifest.as_ref(),
-                executable: executable.as_deref(),
-                current_version: current_version.as_deref(),
-                workspace: &workspace,
-                probe: request.probe,
-                deadline,
-                environment: &environment,
-            },
-        ));
+        if !copied_session {
+            let environment = consent::Environment::current();
+            checks.extend(provider::diagnose(
+                provider,
+                Context {
+                    directory: directory.as_deref(),
+                    manifest: manifest.as_ref(),
+                    executable: executable.as_deref(),
+                    current_version: current_version.as_deref(),
+                    workspace: &workspace,
+                    probe: request.probe,
+                    deadline,
+                    environment: &environment,
+                },
+            ));
+        }
         scope_workspace = Some(workspace);
     }
-    let probe_context = if !request.probe {
-        shell_startup::ProbeContext::NotRequested
-    } else if request.session.is_some() {
-        session_terminal.map_or(
-            shell_startup::ProbeContext::Unknown,
-            shell_startup::ProbeContext::Terminal,
-        )
-    } else {
-        selected_terminal.map_or(
-            shell_startup::ProbeContext::Unknown,
-            shell_startup::ProbeContext::Terminal,
-        )
-    };
-    checks.push(shell_startup::shell_environment_check(
-        probe_context,
-        || shell_startup::run_probe(deadline),
-    ));
+    if !copied_session {
+        let probe_context = if !request.probe {
+            shell_startup::ProbeContext::NotRequested
+        } else if request.session.is_some() {
+            session_terminal.map_or(
+                shell_startup::ProbeContext::Unknown,
+                shell_startup::ProbeContext::Terminal,
+            )
+        } else {
+            selected_terminal.map_or(
+                shell_startup::ProbeContext::Unknown,
+                shell_startup::ProbeContext::Terminal,
+            )
+        };
+        checks.push(shell_startup::shell_environment_check(
+            probe_context,
+            || shell_startup::run_probe(deadline),
+        ));
+    }
     let workspace = scope_workspace
         .or_else(|| manifest.as_ref().map(|m| m.workspace.clone()))
         .or_else(|| std::env::current_dir().ok());
@@ -1245,8 +1259,8 @@ mod attestation_tests {
                 pid: 4242,
                 managed_session_id: Some("session-test".into()),
                 terminal_tty_device: Some(9),
-                process_start_seconds: Some(10),
-                process_start_microseconds: Some(20),
+                process_start_seconds: cfg!(target_os = "macos").then_some(10),
+                process_start_microseconds: cfg!(target_os = "macos").then_some(20),
                 ..Default::default()
             })
             .unwrap();

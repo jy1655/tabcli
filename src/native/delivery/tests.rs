@@ -723,3 +723,36 @@ fn temporary_prompt_lifetime_preserves_initial_and_follow_up_failure_order() {
         }
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn copied_tell_admission_never_calls_the_ownership_proof() {
+    use crate::native::session::{Store, test_support::copied_owner};
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("session-copy");
+    std::fs::create_dir(&dir).unwrap();
+    let store = Store::open_unchecked(&dir);
+    store.write_owner(&copied_owner("session-copy")).unwrap();
+    store
+        .write_terminal(
+            &terminal::TerminalSession::new(terminal::TerminalKind::Herdr, "surface".into())
+                .with_binding(Some("session-copy".into())),
+        )
+        .unwrap();
+    for alive in [true, false] {
+        let error = follow_up_surface(
+            &store,
+            "session-copy",
+            Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(2),
+            |_, _, _, _| {
+                panic!("copy ownership proof reached local processes or terminals (alive={alive})")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::native::failure_kind::classify(&error),
+            Some(crate::native::failure_kind::FailureKind::Unsupported)
+        );
+    }
+}

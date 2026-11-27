@@ -31,7 +31,8 @@ use std::{
 const RECORD_LIMIT: u64 = 64 * 1024;
 /// Cooperative time and byte budget of one Origin observation inside a query.
 const OBSERVATION_TIME: Duration = Duration::from_millis(100);
-const OBSERVATION_BYTES: u64 = 512 * 1024;
+// The original 512 KiB plus the active handle and marker, each read and rechecked at 64 KiB.
+const OBSERVATION_BYTES: u64 = 512 * 1024 + 4 * RECORD_LIMIT;
 /// Bounds of the started-from scan that follows a successful close.
 pub(in crate::native) const SCAN_TIME: Duration = Duration::from_secs(2);
 const SCAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -629,9 +630,7 @@ fn observe_target(
         Ok(status) => status,
         Err(fault) => return fault_target(fault, "origin_unreadable"),
     };
-    // The owner record a verdict was derived from: its bytes, or `Some(None)` for "no
-    // owner record". `None` when no owner-derived verdict depends on it.
-    let mut owner_bytes: Option<Option<Vec<u8>>> = None;
+    let mut evidence = Vec::new();
     let (ended, reason, detail) = match &status.state {
         SessionState::Closed => (Some(true), "recorded_closed", None),
         SessionState::Failed => (Some(true), "recorded_failed", None),
@@ -642,8 +641,7 @@ fn observe_target(
             Some("the recorded state is not one this version knows".to_owned()),
         ),
         _ => {
-            let (owner, read) = owner_verdict(&reader, id, budget, clock, &**attest);
-            owner_bytes = read;
+            let owner = owner_verdict(&reader, id, budget, clock, &**attest, &mut evidence);
             (owner.ended, owner.reason, owner.detail)
         }
     };
@@ -661,9 +659,9 @@ fn observe_target(
         Ok(_) => return target(None, "origin_busy", None),
         Err(fault) => return fault_target(fault, "origin_unreadable"),
     }
-    if let Some(owner_bytes) = owner_bytes {
-        match budget.read_within(&reader.record(CoreRecord::Owner), clock, owner::LIMIT) {
-            Ok(bytes) if bytes == owner_bytes => (),
+    for (record, original, limit) in evidence {
+        match budget.read_within(&reader.record(record), clock, limit) {
+            Ok(bytes) if bytes == original => (),
             Ok(_) => return target(None, "origin_busy", None),
             Err(fault) => return fault_target(fault, "origin_unreadable"),
         }
@@ -676,38 +674,77 @@ fn observe_target(
     }
 }
 
-/// The owner verdict and the owner record bytes it was derived from (`Some(None)` when
-/// there was no owner record, `None` when the record could not be read).
+/// Retain bytes and absences for the stability pass over each record used by this verdict.
 fn owner_verdict(
     reader: &Reader,
     id: &str,
     budget: &mut ReadBudget,
     clock: &mut dyn Clock,
     attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
-) -> (Target, Option<Option<Vec<u8>>>) {
+    evidence: &mut Vec<(CoreRecord, Option<Vec<u8>>, u64)>,
+) -> Target {
     let record = reader.record(CoreRecord::Owner);
     let bytes = match budget.read_within(&record, clock, owner::LIMIT) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            return (
-                target(None, "owner_unverified", Some("no owner record".to_owned())),
-                Some(None),
+        Ok(bytes) => bytes,
+        Err(fault) => return fault_target(fault, "owner_unverified"),
+    };
+    let decoded = bytes.as_deref().map(|bytes| owner::decode(bytes, id));
+    evidence.push((CoreRecord::Owner, bytes, owner::LIMIT));
+    let recorded = match decoded {
+        None => return target(None, "owner_unverified", Some("no owner record".to_owned())),
+        Some(Err(error)) => {
+            return target(
+                None,
+                "owner_unverified",
+                Some(format!(
+                    "invalid JSON in {}: {error}",
+                    record.path().display()
+                )),
             );
         }
-        Err(fault) => return (fault_target(fault, "owner_unverified"), None),
+        Some(Ok(recorded)) => recorded,
     };
-    let verdict = match owner::decode(&bytes, id) {
-        Ok(recorded) => owner_attested(&recorded.owner, recorded.binding, attest),
-        Err(error) => target(
+    if recorded.binding != OwnerBinding::Bound {
+        return owner_attested(&recorded.owner, recorded.binding, attest);
+    }
+    let mut active = None;
+    let mut completed = None;
+    for slot in [CoreRecord::Terminal, CoreRecord::TerminalClosed] {
+        let bytes = match budget.read(&reader.record(slot), clock) {
+            Ok(bytes) => bytes,
+            Err(ReadFault::Unreadable(_)) => continue,
+            Err(fault) => return fault_target(fault, "owner_unverified"),
+        };
+        if let Some(text) = bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok()) {
+            match slot {
+                CoreRecord::Terminal => {
+                    active =
+                        crate::native::terminal::TerminalSession::decode_with_stated_kind(text).ok()
+                }
+                CoreRecord::TerminalClosed => {
+                    completed = record::consumption_marker(text)
+                        .ok()
+                        .and_then(|marker| marker.completed())
+                        .flatten()
+                }
+                _ => unreachable!(),
+            }
+        }
+        evidence.push((slot, bytes, RECORD_LIMIT));
+    }
+    if let Some(copy) = crate::native::terminal::foreign::judge_records(
+        id,
+        active.as_ref(),
+        completed,
+        Some(&recorded),
+    ) {
+        return target(
             None,
             "owner_unverified",
-            Some(format!(
-                "invalid JSON in {}: {error}",
-                record.path().display()
-            )),
-        ),
-    };
-    (verdict, Some(Some(bytes)))
+            Some(copy.observation_refusal().to_string()),
+        );
+    }
+    owner_attested(&recorded.owner, recorded.binding, attest)
 }
 
 fn owner_attested(
