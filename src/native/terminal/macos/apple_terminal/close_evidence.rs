@@ -218,6 +218,45 @@ mod tests {
     use crate::native::terminal::ownership::NativeProcessIdentity;
     use crate::native::tests::write_attested_apple_terminal_state;
 
+    #[test]
+    fn listed_window_only_establishes_absence_with_a_known_ended_app() {
+        let app = MacTerminalAppIdentity {
+            pid: 42,
+            start_seconds: 100,
+            start_microseconds: 1,
+        };
+        let replacement = MacTerminalAppIdentity {
+            pid: 43,
+            ..app.clone()
+        };
+        let evidence = with_observations(
+            |pid| {
+                assert_eq!(pid, app.pid);
+                Ok(None)
+            },
+            || Ok(vec![replacement.clone()]),
+        );
+        let owner = NativeSessionOwner {
+            terminal_app: Some(app.clone()),
+            ..Default::default()
+        };
+        assert!(
+            evidence
+                .surface_absent(Some(&owner), Box::new(|| panic!("recorded app ended")))
+                .unwrap()
+        );
+        assert!(
+            !evidence
+                .surface_absent(None, Box::new(|| Ok(true)))
+                .unwrap()
+        );
+        assert!(
+            evidence
+                .surface_absent(None, Box::new(|| Ok(false)))
+                .unwrap()
+        );
+    }
+
     const LIVE: NativeProcessIdentity = NativeProcessIdentity {
         birth: crate::native::terminal::ownership::ProcessBirth::Macos(1_790_000_000, 42),
         pid: 4242,

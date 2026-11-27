@@ -121,24 +121,12 @@ impl WindowsTerminalAdapter for ManagedConsole {
 
     fn surface_present(
         &self,
-        directory: &Path,
+        _directory: &Path,
         session: &TerminalSession,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<bool> {
-        surface_present(directory, session, timeout)
+        super::windows_incarnation::console_root_present(session, observe_process_identity)
     }
-}
-
-fn surface_present(directory: &Path, session: &TerminalSession, timeout: Duration) -> Result<bool> {
-    let _ = (directory, timeout);
-    let pid: u32 = session.id.parse().context("invalid Windows console pid")?;
-    if !agent_bridge::process_is_alive(pid) {
-        return Ok(false);
-    }
-    let identity = session
-        .windows_identity()
-        .context("console identity is missing")?;
-    Ok(query_process_identity(pid)? == *identity)
 }
 
 // A window that this launch brought to the front can take the foreground again while it

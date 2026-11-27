@@ -209,7 +209,7 @@ impl TerminalSession {
         self
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(in crate::native) fn windows_identity(&self) -> Option<&WindowsProcessIdentity> {
         self.windows_process_identity.as_ref()
     }
