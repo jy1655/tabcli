@@ -178,3 +178,41 @@ fn listed_nested_workspace_with_a_git_directory_uses_the_root_git_reports() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn listed_workspace_with_a_git_symlink_refuses_scope_without_git() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let env = consent::Environment::at_home(&root);
+    list_workspace(&workspace, &env);
+
+    std::fs::write(root.join("file"), "").unwrap();
+    std::fs::create_dir(root.join("directory")).unwrap();
+    let link = workspace.join(".git");
+    for enclosing_git in [false, true] {
+        if enclosing_git {
+            std::fs::create_dir(root.join(".git")).unwrap();
+        }
+        for target in ["file", "directory", "missing"] {
+            std::os::unix::fs::symlink(root.join(target), &link).unwrap();
+            let mut git = FakeGitScope {
+                calls: 0,
+                answer: Some(Ok(output(&workspace, true))),
+            };
+            let result = workspace_trust_with(&workspace, &env, None, &mut git);
+            assert_eq!(
+                git.calls, 0,
+                "target={target}, enclosing_git={enclosing_git}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "cannot verify Claude's Git workspace trust scope; use its own trust dialog",
+                "target={target}, enclosing_git={enclosing_git}"
+            );
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
+}

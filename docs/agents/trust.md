@@ -43,8 +43,10 @@
 - Claude's trust store supplies an exact source only for an accepted workspace entry whose
   scope TAB then verifies. Granting another provider's consent to Claude also requires exact
   scope. A regular `.git` file makes the launch folder its own top level without a Git
-  process. For a `.git` directory, an ancestor's `.git` entry requires Git to identify the
-  top level. TAB refuses scope if the launch folder's `.git` is a link or another special file.
+  process. TAB does not read Git configuration for this rule, so `core.worktree` does not
+  move the top level it uses. For a `.git` directory, an ancestor's `.git` entry requires Git
+  to identify the top level. TAB refuses scope if the launch folder's `.git` is a link or
+  another special file.
 - When acquiring a source, TAB considers inheritance only if no provider trusts the workspace exactly
   (`exact_trust_comes_first_and_consent_extends_to_no_child_or_parent`).
 - A linked worktree can inherit the consent of its main working tree when Git's registration

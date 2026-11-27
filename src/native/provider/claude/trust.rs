@@ -284,15 +284,16 @@ impl GitScope for ProcessGitScope {
 }
 
 fn require_exact_scope_with(workspace: &Path, git: &mut impl GitScope) -> Result<()> {
+    const UNVERIFIED_SCOPE: &str =
+        "cannot verify Claude's Git workspace trust scope; use its own trust dialog";
     // Claude saves Git-subdirectory approval at the root; exact child consent cannot authorize it.
     // A regular .git file marks the top level here. With a .git directory, an ancestor
     // marker still requires Git to identify the root.
     match std::fs::symlink_metadata(workspace.join(".git")) {
+        Ok(entry) if consent::is_link(&entry) => bail!(UNVERIFIED_SCOPE),
         Ok(entry) if entry.is_file() => return Ok(()),
         Ok(entry) if entry.is_dir() => {}
-        Ok(_) => {
-            bail!("cannot verify Claude's Git workspace trust scope; use its own trust dialog")
-        }
+        Ok(_) => bail!(UNVERIFIED_SCOPE),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -308,7 +309,7 @@ fn require_exact_scope_with(workspace: &Path, git: &mut impl GitScope) -> Result
     }
     let output = git.output(workspace)?;
     if !output.status.success() {
-        bail!("cannot verify Claude's Git workspace trust scope; use its own trust dialog");
+        bail!(UNVERIFIED_SCOPE);
     }
     let root = PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end_matches(['\r', '\n']))
         .canonicalize()?;
