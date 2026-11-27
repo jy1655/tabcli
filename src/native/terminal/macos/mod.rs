@@ -606,6 +606,8 @@ mod adapter_tests {
                 .unwrap_err(),
                 surface_present(INSTALLED, &directory, &session, Duration::from_secs(1))
                     .unwrap_err(),
+                launch_surface(INSTALLED, &directory, &session, Duration::from_secs(1))
+                    .unwrap_err(),
             ];
             for error in errors {
                 assert_eq!(format!("{error:#}"), refusal, "{kind:?}");

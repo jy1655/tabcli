@@ -273,6 +273,8 @@ fn the_installed_lookup_refuses_every_operation_on_a_kind_linux_does_not_run() {
             .unwrap_err(),
             posix::surface_present(&INSTALLED, &directory, &session, Duration::from_secs(1))
                 .unwrap_err(),
+            posix::launch_surface(&INSTALLED, &directory, &session, Duration::from_secs(1))
+                .unwrap_err(),
         ];
         for error in errors {
             assert_eq!(format!("{error:#}"), refusal, "{kind:?}");

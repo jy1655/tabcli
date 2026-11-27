@@ -321,7 +321,7 @@ pub(in crate::native) enum Surface {
     Closed { consumed: bool },
     /// A claimed close handle, bound to this session or not.
     Closing { bound: bool },
-    /// An active handle. Platform support is judged before the binding, and a legacy
+    /// An active handle. The binding is judged before platform support, and a legacy
     /// iTerm2 handle without a binding counts as bound (`verify_managed_session`).
     Active {
         kind: TerminalKind,

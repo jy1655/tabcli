@@ -350,10 +350,10 @@ pub(super) enum CallerCheck {
 // The terminal a launch asked for or its caller's environment selects, the one entry of `ask`
 // and `reopen`, each at its own place in its order (`Resolution::surface`), and the caller
 // check of an automatic Herdr choice, run there as in 0.4.49. Selection reads the environment
-// only and is the same on every platform: an explicit `--terminal` (`requested`) wins, and the
-// platform's selection decides whether to accept it here or to leave a kind it does not run
-// to its adapter; otherwise inside an hc terminal it is Herdr, with the Surface this platform
-// chooses outside Herdr as its fallback, and elsewhere that Surface.
+// only. Every platform selects an explicit `--terminal` (`requested`) or refuses it here
+// before creating a session if it does not run that kind. Without an explicit request, an hc
+// terminal selects Herdr with the platform's usual Surface as its fallback; elsewhere the
+// platform selects its usual Surface.
 //
 // An automatic Herdr choice proves that this process runs in the caller's Herdr terminal on
 // the running core (`terminal::admit_selection`, the only step that opens a connection). A
