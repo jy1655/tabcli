@@ -253,8 +253,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   in-process test adapter uses the same decoder, provider resolution, and reply interpretation.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Windows retains console attachment, Win32 effects, and lifecycle-locked input dispatch.
-  The seven Windows surface operations (open, send, screen, guarded key, verify, close and
-  presence) resolve their adapter through one lookup (`windows/dispatch.rs`), as the shared
+  The eight Windows surface operations (open, send, screen, guarded key, verify, close,
+  presence and launch probe) resolve their adapter through one lookup (`windows/dispatch.rs`), as the shared
   POSIX dispatch does on macOS and Linux: the Herdr adapter, or `ManagedConsole` in
   `windows/mod.rs` for a managed console (see [Stored terminal handles](terminals.md#stored-terminal-handles)); screen and guarded key first answer with the kind's
   declared refusal. That module is compiled into every test build, so a test builds the lookup
