@@ -7,12 +7,12 @@ use crate::native::session::schema::{
 };
 use crate::native::session::state::{SessionState, SessionStatus, update_status};
 use crate::native::session::{CoreRecord, CoreRecordReader, Reader, RecordStore, Store, requests};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::terminal::ownership::NativeSessionOwner;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::process_identity::{Gone, ProcessObservation};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::session::owner::{OwnerAttestation, attest_owner};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Context, Result, bail};
@@ -1077,12 +1077,15 @@ fn write_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> 
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+// An attached `ask` or `tell` stops waiting once the recorded owner is verified gone, on every
+// OS: Repair leaves a terminal that outlives its owner for an explicit close, so a closed
+// session can no longer be the only sign of the owner's death.
 fn running_wait_owner(directory: &Path) -> Result<()> {
     running_wait_owner_with(directory, attest_owner)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(in crate::native) fn running_wait_owner_with(
     directory: &Path,
     observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
@@ -1126,7 +1129,7 @@ pub(in crate::native) fn wait_for_status(
                     .unwrap_or_else(|| format!("session entered state {}", status.state));
                 bail!("{reason}");
             }
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             running_wait_owner(directory)?;
             if status.state == expected_state {
                 return Ok(status);
@@ -1192,7 +1195,7 @@ fn wait_for_event_for_turn_until(
                 .unwrap_or_else(|| format!("session entered state {}", status.state));
             bail!("{reason}");
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         running_wait_owner(directory)?;
         let remaining = deadline
             .checked_duration_since(Instant::now())

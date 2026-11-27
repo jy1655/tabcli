@@ -272,7 +272,6 @@ pub(in crate::native) fn terminal_tombstone_value(text: &str) -> serde_json::Res
 
 /// Close only asks for a reason. Malformed JSON or a non-string reason means none;
 /// neither a typed terminal kind nor a consumed fact is required by this projection.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(in crate::native) fn terminal_consumption_reason(text: &str) -> Option<String> {
     terminal_tombstone_value(text)
         .ok()?

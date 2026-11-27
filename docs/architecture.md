@@ -746,14 +746,12 @@ handle, records the transition and tombstones, and converges interrupted Close.
 `terminal::close_authority::owner_exit` owns the ordinary dead-owner Close decision on macOS
 and Linux and the dead-owner Surface decision in Repair. Repair scans active then claimed
 handles through the same reader and retains damaged evidence. On macOS and Linux, Repair
-preserves an intent or a Surface that can outlive its owner for explicit Close. The ordinary
-dead-owner Close can remove a registered core-retained terminal after the adapter verifies
-that it has finished. Windows Repair closes a core-retained terminal through the Windows
-lookup, even for an exited or failed session. This uses the adapter's proof and ordinary
-close of a live or finished terminal. An exited or failed console session settles from its
+preserves an intent or a Surface that can outlive its owner for explicit Close. For a
+core-retained terminal see [Herdr close](agents/herdr.md#close-by-creation-record).
+An exited or failed console session settles from its
 Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
-The platform differences carry forward 0.4.48 behavior and still await owner confirmation
-(architecture round 17, card 01).
+For terminal kinds other than Herdr, the platform differences remain and are tracked in
+[issue #421](https://github.com/jy1655/tabcli/issues/421).
 
 ## Where to add things
 

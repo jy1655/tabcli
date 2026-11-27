@@ -419,7 +419,9 @@ impl SurfaceProbe {
                     Self::WindowsProcess | Self::Unprobed => OwnerRequirement::Met,
                 },
                 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-                ControlAttestation::Unknown(_) => OwnerRequirement::Uninspected,
+                ControlAttestation::Unknown(_) | ControlAttestation::Exited => {
+                    OwnerRequirement::Uninspected
+                }
                 ControlAttestation::NotRecorded => self.uncompared(),
             },
             // A Windows record without its process identity is attested PID-only.
@@ -882,8 +884,8 @@ pub(in crate::native::terminal) fn teardown_absent_owner_with(
     )?;
     close_remaining(deadline)?;
     Ok(terminal::CloseResult {
-        outcome: CloseOutcome::Missing,
         reason: Some(OWNER_TEARDOWN_REASON.to_owned()),
+        ..CloseOutcome::Missing.into()
     })
 }
 

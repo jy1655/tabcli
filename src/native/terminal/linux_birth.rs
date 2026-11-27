@@ -15,6 +15,13 @@ impl std::fmt::Display for BootId {
         Ok(())
     }
 }
+impl BootId {
+    /// The all-zero identity no kernel reports for a boot.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(in crate::native) fn is_nil(self) -> bool {
+        self.0 == [0; 16]
+    }
+}
 impl std::fmt::Debug for BootId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)

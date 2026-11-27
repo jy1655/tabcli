@@ -5,6 +5,7 @@ use crate::native::session::close::budget::CLOSE_TIMEOUT;
 use crate::native::session::origin::{Candidate, StartedFrom, Verified, verify_started_from};
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::{Reader, Store};
+use crate::native::terminal::close_authority::CloseCause;
 use crate::native::{NativeCommand, session, terminal};
 use agent_bridge::{
     PUBLIC_COMMAND, checked_deadline_from, confirm_explicit_close, terminal_safe_text,
@@ -69,8 +70,14 @@ pub(super) fn run(request: CloseRequest) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     confirm_explicit_close(request.explicit)?;
     let directory = Reader::session_directory(&request.id)?;
-    close_session_surface(&directory, &request.id, None, deadline)
-        .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
+    close_session_surface(
+        &directory,
+        &request.id,
+        None,
+        CloseCause::Explicit,
+        deadline,
+    )
+    .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
     // Reported after the close succeeded, within what is left of its deadline. The scan
     // reads records only and never fails the close.
     let root = directory.parent().unwrap_or(Path::new(""));
@@ -107,7 +114,10 @@ pub(super) fn run(request: CloseRequest) -> Result<()> {
         &started_from,
         deadline,
         &mut SystemClock,
-        &mut |directory, id, reason| close_session_surface(directory, id, Some(reason), deadline),
+        // Each listed session is closed as `close-session --explicit` closes it.
+        &mut |directory, id, reason| {
+            close_session_surface(directory, id, Some(reason), CloseCause::Explicit, deadline)
+        },
     );
     if request.json {
         println!(
@@ -346,21 +356,23 @@ impl StartedFromClose {
     }
 }
 
-// Closes a managed session's own visible surface exactly as an explicit `close-session`
-// does, through the same terminal-close authority checks. `reason` is kept in the closed
-// status when the close itself reports nothing, so a session closed because of a detected
-// conflict still says why.
+// Closes a managed session's own visible surface through the terminal-close authority
+// checks that an explicit `close-session` uses. `cause` says why: only an explicit close
+// acts on a gone owner's terminal by its creation record; a cleanup after another command
+// keeps the earlier authorities. `reason` is kept in the closed status when the close itself
+// reports nothing, so a session closed because of a detected conflict still says why.
 pub(super) fn close_session_surface(
     directory: &Path,
     id: &str,
     reason: Option<String>,
+    cause: CloseCause,
     deadline: std::time::Instant,
 ) -> Result<()> {
     session::close::close(
         &Store::open_unchecked(directory),
         reason,
         deadline,
-        |session| terminal::ownership::close_owned_surface(directory, id, session, deadline),
+        |session| terminal::ownership::close_owned_surface(directory, id, session, cause, deadline),
     )
     .map(|_| ())
 }

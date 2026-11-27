@@ -740,7 +740,8 @@ attests the recorded process whatever session the owner record names, so this ap
 unbound legacy record and to one of another managed session as well. Its dead-owner repair
 usually closes such a session, but may leave it open for an explicit `close-session`. On macOS this
 happens when a close is already pending, or when the terminal can outlive its owner (Terminal.app,
-Ghostty, Warp, WezTerm). On any platform it happens for a launch that was never confirmed, which
+Ghostty, Warp, WezTerm). For Herdr on every platform, see [Herdr close](terminals.md#closing-a-herdr-session).
+On any platform it happens for a launch that was never confirmed, which
 launch repair settles instead. `recovery_required` means a completion journal is pending, and
 recovery can change every later gate. `owner_unverified` means the recorded owner's process could
 not be inspected (whatever session the record names), which dead-owner repair also cannot judge,

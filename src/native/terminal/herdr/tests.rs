@@ -1,28 +1,12 @@
+use super::super::scripted_herdr_core::test_birth;
+use super::framed::TestRequest;
+use super::linked::{REQUIRED_METHODS, validate_hello};
 use super::*;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
     rc::Rc,
 };
-
-fn test_birth(start: u64) -> HerdrHostBirth {
-    #[cfg(target_os = "macos")]
-    return HerdrHostBirth::Macos {
-        host_start_seconds: 1_800_000_000,
-        host_start_microseconds: start,
-    };
-    #[cfg(target_os = "linux")]
-    return HerdrHostBirth::Linux {
-        linux_birth: crate::native::terminal::LinuxBirth {
-            boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
-            starttime_ticks: start,
-        },
-    };
-    #[cfg(windows)]
-    return HerdrHostBirth::Windows {
-        host_creation_time: 134_000_000_000_000_000 + start,
-    };
-}
 
 // The recorded endpoint each platform addresses: a socket path, or a local named pipe.
 #[cfg(unix)]
@@ -38,6 +22,8 @@ enum Injected {
     Instead(CallError),
     /// The core acts, then the reply is lost with this error.
     After(CallError),
+    /// The core acts and answers as usual: lets an earlier call of the method through.
+    Pass,
 }
 
 #[derive(Default)]
@@ -216,7 +202,13 @@ impl FakeConnection {
 }
 
 impl Connection for FakeConnection {
-    fn call(&mut self, method: &str, params: Value, _: Instant) -> Result<Value, CallError> {
+    fn call(
+        &mut self,
+        _: Permit,
+        method: &str,
+        params: Value,
+        _: Instant,
+    ) -> Result<Value, CallError> {
         self.0
             .borrow_mut()
             .calls
@@ -230,7 +222,7 @@ impl Connection for FakeConnection {
         let unanswered = match injected {
             Some(Injected::Instead(error)) => return Err(error),
             Some(Injected::After(error)) => Some(error),
-            None => None,
+            Some(Injected::Pass) | None => None,
         };
         let result = self.act(method, &params);
         if result.is_ok() {
@@ -1080,6 +1072,10 @@ fn close_kills_then_removes_and_repeats_idempotently() {
     assert!(core.params("terminal.kill").is_empty());
 }
 
+// The launch label is part of the creation record that a close without a live owner relies
+// on. The close with a live, attested owner and the read-only presence probe keep the
+// identity they had before: a relabelled terminal whose program,
+// directory and birth still verify is closed by its owner and reported present.
 #[test]
 fn ordinary_close_removes_a_finished_terminal_with_a_changed_launch_label() {
     let core = FakeCore::new();
@@ -1089,6 +1085,11 @@ fn ordinary_close_removes_a_finished_terminal_with_a_changed_launch_label() {
     let mut labels = core.terminal("t7").unwrap()["labels"].clone();
     labels[LAUNCH_LABEL] = json!("fedcba9876543210fedcba9876543210");
     core.set("t7", "labels", labels);
+    assert!(
+        adapter
+            .present(Path::new(DIRECTORY), &session, Duration::from_secs(1))
+            .unwrap()
+    );
     core.clear_calls();
     assert_eq!(
         adapter
@@ -1134,135 +1135,6 @@ fn an_interrupted_close_is_finished_by_the_next_one() {
         CloseOutcome::Closed
     );
     assert_eq!(core.params("terminal.kill").len(), 1);
-}
-
-// The Windows Repair policy and adapter lookup are portable. Only the owner's OS
-// observation and the core connection are scripted here.
-#[test]
-fn windows_repair_closes_through_the_core_and_resumes_after_removal_fails() {
-    use crate::native::process_identity::{Gone, ProcessObservation};
-    use crate::native::session::close::repair_dead_owner_windows_with;
-    use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
-    use crate::native::session::test_support::lifecycle::write_owned_terminal_state;
-    use crate::native::session::{CoreRecord, SessionState, Store};
-    use crate::native::terminal::windows_dispatch::Dispatch;
-
-    for (state, binding, initially_finished) in [
-        ("working", Some(SESSION), false),
-        ("exited", Some("session-foreign"), true),
-        ("failed", None, true),
-    ] {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(SESSION);
-        fs::create_dir(&directory).unwrap();
-        write_owned_terminal_state(&directory, state, std::process::id());
-        let store = Store::open_unchecked(&directory);
-        let mut owner = store.owner().unwrap();
-        owner.managed_session_id = binding.map(str::to_owned);
-        store.write_owner(&owner).unwrap();
-        let core = FakeCore::new();
-        let surface = opened(&core, &directory);
-        store
-            .record(CoreRecord::Terminal)
-            .write_json(&surface)
-            .unwrap();
-        let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
-        let claim = store.record(CoreRecord::TurnClaim).bytes().unwrap();
-        if initially_finished {
-            core.set("t7", "state", json!("finished"));
-            core.set("t7", "labels", json!({}));
-            // Start with a handle claimed by an interrupted Close.
-            store.claim_terminal_handle().unwrap().unwrap();
-        }
-        core.clear_calls();
-        core.inject("terminal.rm", Injected::Instead(refused("internal")));
-        let console = FakeCore::new();
-        let adapters = Dispatch::new(
-            Adapter::with_core(console.clone()),
-            Adapter::with_core(core.clone()),
-        );
-        let repair = || {
-            let claimed_directory = directory.clone();
-            let expected_handle = handle.clone();
-            core.after_call("hello", move |_| {
-                let store = Store::open_unchecked(&claimed_directory);
-                assert_eq!(
-                    store.record(CoreRecord::TerminalClosing).bytes().unwrap(),
-                    expected_handle
-                );
-                assert!(
-                    store
-                        .record(CoreRecord::Terminal)
-                        .bytes()
-                        .unwrap()
-                        .is_none()
-                );
-            });
-            repair_dead_owner_windows_with(
-                &store,
-                |recorded| {
-                    assert_eq!(recorded.managed_session_id.as_deref(), binding);
-                    OwnerAttestation {
-                        process: ProcessObservation::Gone(if initially_finished {
-                            Gone::Reused("different birth".into())
-                        } else {
-                            Gone::Exited
-                        }),
-                        control: ControlAttestation::NotRecorded,
-                        pid_alive: Some(initially_finished),
-                    }
-                },
-                &adapters,
-                later(),
-            )
-        };
-
-        let text = error_text(&repair().unwrap_err());
-        assert!(text.contains("its handle is retained"), "{text}");
-        assert_eq!(core.terminal("t7").unwrap()["state"], "finished");
-        assert_eq!(store.status().unwrap().state.as_str(), state);
-        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
-        assert_eq!(store.record(CoreRecord::TurnClaim).bytes().unwrap(), claim);
-        assert!(store.closed_if_present().unwrap().is_none());
-
-        assert!(repair().unwrap());
-        assert_eq!(
-            core.params("terminal.kill").len(),
-            usize::from(!initially_finished)
-        );
-        assert_eq!(
-            core.params("terminal.rm"),
-            [json!({"terminal": "t7"}), json!({"terminal": "t7"})]
-        );
-        assert!(core.terminal("t7").is_none());
-        assert!(console.methods().is_empty());
-        assert!(
-            store
-                .record(CoreRecord::Terminal)
-                .bytes()
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .record(CoreRecord::TerminalClosing)
-                .bytes()
-                .unwrap()
-                .is_none()
-        );
-        assert!(store.record(CoreRecord::TerminalClosed).present().unwrap());
-        assert!(
-            store
-                .record(CoreRecord::TurnClaim)
-                .bytes()
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(store.status().unwrap().state, SessionState::Closed);
-        core.clear_calls();
-        assert!(!repair().unwrap());
-        assert!(core.methods().is_empty());
-    }
 }
 
 #[test]
@@ -1721,15 +1593,15 @@ fn the_socket_connection_bounds_every_reply() {
     );
     assert_eq!(
         connection
-            .call("hello", json!({"generation": 1}), later())
+            .exchange_for_test(TestRequest::Hello, json!({"generation": 1}), later())
             .unwrap(),
         json!({"ok": true})
     );
     let mut connection = super::unix::open(&socket, later()).unwrap();
     let started = Instant::now();
     let error = connection
-        .call(
-            "terminal.send",
+        .exchange_for_test(
+            TestRequest::Send,
             json!({}),
             Instant::now() + Duration::from_millis(200),
         )
@@ -1738,7 +1610,7 @@ fn the_socket_connection_bounds_every_reply() {
     assert!(started.elapsed() < Duration::from_millis(550));
     let mut connection = super::unix::open(&socket, later()).unwrap();
     let error = connection
-        .call("terminal.get", json!({}), later())
+        .exchange_for_test(TestRequest::Get, json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();
@@ -2252,8 +2124,8 @@ fn the_shared_framing_reports_unsent_only_before_any_byte_was_written() {
     use std::io::ErrorKind::{BrokenPipe, Interrupted, TimedOut, WouldBlock};
     let call = |stream: ScriptedStream| {
         let mut framed = Framed::new(stream);
-        let result = framed.call("terminal.send", json!({"text": "x"}), later());
-        (result, framed.stream.written)
+        let result = framed.exchange_for_test(TestRequest::Send, json!({"text": "x"}), later());
+        (result, framed.stream().written.clone())
     };
     let reply =
         |id: u64| format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"turn":1}}}}"#).into_bytes();
@@ -2421,7 +2293,7 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     );
     assert_eq!(
         connection
-            .call("hello", json!({"generation": 1}), later())
+            .exchange_for_test(TestRequest::Hello, json!({"generation": 1}), later())
             .unwrap(),
         json!({"ok": true})
     );
@@ -2429,8 +2301,8 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     let started = Instant::now();
     let error = connection
-        .call(
-            "terminal.send",
+        .exchange_for_test(
+            TestRequest::Send,
             json!({}),
             Instant::now() + Duration::from_millis(200),
         )
@@ -2440,7 +2312,7 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
     drop(connection);
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
     let error = connection
-        .call("terminal.get", json!({}), later())
+        .exchange_for_test(TestRequest::Get, json!({}), later())
         .unwrap_err();
     assert!(matches!(error, CallError::Unanswered(_)), "{error:?}");
     server.join().unwrap();
@@ -2552,3 +2424,84 @@ fn the_powershell_attach_line_scopes_hc_socket_to_hc() {
 // #399: the dead-owner close of a terminal that ended outside TAB.
 #[cfg(unix)]
 mod ended_close;
+
+// os-parity: Repair and explicit close of a terminal whose owner is verified gone, on every OS.
+mod owner_gone;
+
+// In production code only `linked.rs`, the
+// verified connection, names `terminal.kill` or `terminal.rm`, and it sends them only for a
+// grant. This fails if either name appears in any other production source, where a request with
+// it could be built. Test sources are not production code: the scripted core receives these
+// names and the tests assert on them.
+#[test]
+fn only_the_verified_connection_names_the_mutation_calls() {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+    fn production_sources(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            if path.is_dir() {
+                if name != "tests" {
+                    production_sources(&path, found);
+                }
+            } else if name.ends_with(".rs")
+                && name != "tests.rs"
+                && name != "test_support.rs"
+                && !name.ends_with("_tests.rs")
+            {
+                found.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let linked = root.join("native/terminal/herdr/linked.rs");
+    let mut sources = Vec::new();
+    production_sources(&root, &mut sources);
+    assert!(sources.contains(&linked), "{sources:?}");
+    // A test-only module named outside those conventions: the scripted core that serves the
+    // installed adapter over a real endpoint. It counts as a test source only while its parent
+    // declares it under `cfg(test)`.
+    let test_only = [("native/terminal/mod.rs", "scripted_herdr_core")];
+    for (parent, module) in test_only {
+        let text = std::fs::read_to_string(root.join(parent)).unwrap();
+        let declaration = syn::parse_file(&text)
+            .unwrap()
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(item) if item.ident == module => Some(item),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{parent} declares no {module}"));
+        let guarded = declaration.attrs.iter().any(|attr| {
+            use syn::{Meta, Token, punctuated::Punctuated};
+            if !attr.path().is_ident("cfg") {
+                return false;
+            }
+            match attr.parse_args::<Meta>().unwrap() {
+                Meta::Path(path) => path.is_ident("test"),
+                Meta::List(all) if all.path.is_ident("all") => all
+                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .unwrap()
+                    .iter()
+                    .any(|operand| matches!(operand, Meta::Path(path) if path.is_ident("test"))),
+                _ => false,
+            }
+        });
+        assert!(guarded, "{parent} declares {module} outside test builds");
+    }
+    let test_only: Vec<PathBuf> = test_only
+        .iter()
+        .map(|(parent, module)| root.join(parent).with_file_name(format!("{module}.rs")))
+        .collect();
+    let named: Vec<_> = sources
+        .iter()
+        .filter(|path| **path != linked && !test_only.contains(path))
+        .filter(|path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            text.contains("\"terminal.kill\"") || text.contains("\"terminal.rm\"")
+        })
+        .collect();
+    assert!(named.is_empty(), "{named:?}");
+}
