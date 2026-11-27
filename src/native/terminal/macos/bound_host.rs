@@ -161,6 +161,7 @@ fn every_host_admits_in_one_order_with_one_refusal_vocabulary() {
 
 #[test]
 fn identity_binding_and_flush_failures_keep_exact_log_boundaries() {
+    const PROBE: &str = "native::terminal::macos::bound_host_app_tests::failure_probe";
     for mode in [
         "terminal-identity",
         "iterm-missing",
@@ -177,12 +178,7 @@ fn identity_binding_and_flush_failures_keep_exact_log_boundaries() {
             .tempdir()
             .unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native::terminal::macos::bound_host_app_tests::failure_probe",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", PROBE, "--nocapture", "--test-threads=1"])
             .env("AB_BOUND_HOST_PROBE", mode)
             .env("AB_BOUND_HOST_DIRECTORY", directory.path())
             .env_remove("ITERM_SESSION_ID")
@@ -191,11 +187,13 @@ fn identity_binding_and_flush_failures_keep_exact_log_boundaries() {
             .stdin(Stdio::null())
             .output()
             .unwrap();
+        println!("probe mode {mode}");
+        crate::native::tests::assert_child_test_passed(&output, PROBE);
+        // The probe passes without its variable too; only this line shows it checked `mode`.
         assert!(
-            output.status.success(),
-            "{mode}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stdout).contains(&format!("PROBE CHECKED {mode}\n")),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 }
@@ -295,4 +293,5 @@ fn failure_probe() {
         test_support::host_log_messages(&directory, prefix),
         [format!("{prefix}refused: {expected}\n")]
     );
+    println!("PROBE CHECKED {mode}");
 }

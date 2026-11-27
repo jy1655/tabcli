@@ -20,7 +20,11 @@
   uses and, for an existing handle, the recorded permanent `core.id`) and acts on that same
   connection. A missing or refusing socket or a different core id is unknown, never absence;
   only `not_found` from the recorded core proves a terminal gone (addresses are not reused on
-  a core). Calls pass no `caller`, so TAB marks nothing seen for another terminal.
+  a core). Calls pass no `caller`, so TAB marks nothing seen for another terminal. On the
+  Unix socket a read waits with `poll`, never a receive timeout: macOS refuses one (EINVAL)
+  once the core has closed its end, which lost a reply already received (2026-11-26). It
+  then receives without blocking and, with nothing to receive, waits again until the
+  deadline: Linux reports a queue holding only an urgent byte as readable.
 - `terminal.run` gets argv `[tabcli, native-herdr-host, <session directory>,
   --launch-command, <script>]`, `no_notify`, `keep: false`, `rm: false`, the
   labels `tabcli-session` and a random `tabcli-launch`, and a random local name

@@ -494,9 +494,15 @@ mod tests {
         ];
         (dir, base)
     }
+    // A capture that ends by itself (an exit, a signal, too much output, or success), with
+    // the whole budget a launch has. Its time is not what these cases test: with the 1.5 s
+    // budget of a 4 s deadline, the 4 MiB output flood ran out of time under background QoS
+    // (`taskpolicy -b`, the throttling of a loaded machine), where it took 2.9-4.7 s; idle it
+    // takes about 0.3 s and every other case about 0.15 s.
     fn run(script: &[u8]) -> Result<Captured, CaptureFailure> {
+        use crate::native::terminal::shell_environment_budget::{HANDOFF_RESERVE, LIMIT};
         let (_dir, base) = fixture(script);
-        capture(base, Instant::now() + Duration::from_secs(4))
+        capture(base, Instant::now() + LIMIT + HANDOFF_RESERVE + CLEANUP)
     }
     #[test]
     fn key_read_has_no_terminal_and_export_bytes_survive_exec() {
