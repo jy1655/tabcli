@@ -706,16 +706,34 @@ const timer = setInterval(() => {
         format!("session files: {files:?}; Node start record: {node:?}")
     };
     // One absolute deadline, taken before the observer and the send start, bounds both, so
-    // the observer does not expire before the sender's delivery deadline.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // the observer does not expire before the sender's delivery deadline. It only bounds a
+    // fixture that never answers; what this test checks comes after the send. In the Windows
+    // runner's per-test timing of 45 runs (2026-11-25 and 26, the fixture unchanged in 44)
+    // it took 2.3-3.6 s in 38 runs and 5.1-14.6 s in six, all passing, and failed once at its
+    // former 15 s deadline (15.34 s). 60 s is four times the slowest pass.
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(60);
     let observed_directory = directory.clone();
     let observer = thread::spawn(move || {
+        // When this observer first saw the wrapper's and Node's start records. If the envelope
+        // is still missing at the deadline, the failure reports both. A sender that runs out
+        // of time after the envelope appeared reports its own error alone.
+        let (mut wrapper_seen, mut node_seen) = (None, None);
         while !observed_directory.join("messenger-envelope.ready").exists() {
+            for (seen, record) in [
+                (&mut wrapper_seen, "messenger-wrapper-started"),
+                (&mut node_seen, "messenger-node-started.json"),
+            ] {
+                if seen.is_none() && observed_directory.join(record).exists() {
+                    *seen = Some(started.elapsed());
+                }
+            }
             if Instant::now() >= deadline {
-                return Err(
+                return Err(format!(
                     "the controlled messenger published no envelope before the shared deadline; \
-                     this alone does not show that its stdin was missing",
-                );
+                     this alone does not show that its stdin was missing; first seen after: \
+                     wrapper start {wrapper_seen:?}, Node start {node_seen:?}"
+                ));
             }
             thread::sleep(Duration::from_millis(10));
         }

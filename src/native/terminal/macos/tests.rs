@@ -7,6 +7,7 @@ use crate::native::terminal;
 #[test]
 fn herdr_host_selection_precedes_its_ghostty_terminal_identity() {
     const CHILD: &str = "TABCLI_TEST_HERDR_SELECTION";
+    const TEST: &str = "native::terminal::macos::tests::herdr_host_selection_precedes_its_ghostty_terminal_identity";
     if std::env::var_os(CHILD).is_some() {
         // Herdr, and Ghostty, the identity hc gives, where Herdr is not admitted.
         assert_eq!(
@@ -25,23 +26,14 @@ fn herdr_host_selection_precedes_its_ghostty_terminal_identity() {
     // Run selection in a separate process: no shared test environment is changed and
     // no terminal is opened. hc 0.1.21 supplies this exact conflicting identity.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "native::terminal::macos::tests::herdr_host_selection_precedes_its_ghostty_terminal_identity",
-            "--nocapture",
-        ])
+        .args(["--exact", TEST, "--nocapture"])
         .env(CHILD, "1")
         .env("HC_TERMINAL_ID", "t7")
         .env("TERM_PROGRAM", "ghostty")
         .env("TERM", "xterm-256color")
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::native::tests::assert_child_ran_this_test(&output);
 }
 
 #[cfg(target_os = "macos")]

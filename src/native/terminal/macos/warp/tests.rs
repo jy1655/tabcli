@@ -629,12 +629,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        crate::native::tests::assert_child_ran_this_test(&output);
         return;
     }
     let (temp, client, attempt) = fixture();
@@ -2065,12 +2060,8 @@ fn bundled_discovery_and_dispatch_ignore_invoking_terminal() {
                 child.env("WEZTERM_EXECUTABLE", "/not-an-owned-app/wezterm");
             }
             let output = child.output().unwrap();
-            assert!(
-                output.status.success(),
-                "host case {name}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            println!("host case {name}");
+            crate::native::tests::assert_child_ran_this_test(&output);
         }
         return;
     };
@@ -2689,6 +2680,30 @@ fn mode_open_fixture(
     bound: &Cell<bool>,
     force_new_window: bool,
 ) -> Result<TerminalSession> {
+    open_fixture_within(
+        runner,
+        client,
+        directory,
+        attempt,
+        bound,
+        force_new_window,
+        Duration::from_millis(450),
+    )
+}
+
+// `launch` bounds the whole fake launch, its title proof included. Both deadlines come from
+// one start in production's order: cleanup keeps its reserve after the launch deadline, so a
+// close that the launch attempts is made, and recorded, rather than refused for time.
+fn open_fixture_within(
+    runner: &mut FakeRunner,
+    client: &ControlClient,
+    directory: &Path,
+    attempt: &str,
+    bound: &Cell<bool>,
+    force_new_window: bool,
+    launch: Duration,
+) -> Result<TerminalSession> {
+    let deadline = Instant::now() + launch;
     open_bound_tab_with(
         runner,
         OpenRequest {
@@ -2696,8 +2711,8 @@ fn mode_open_fixture(
             clients: std::slice::from_ref(client),
             command: "ignored",
             directory,
-            deadline: Instant::now() + Duration::from_millis(450),
-            cleanup_deadline: Instant::now() + Duration::from_secs(1),
+            deadline,
+            cleanup_deadline: deadline + STARTUP_CLEANUP_RESERVE,
             attempt,
         },
         |_| {
@@ -2712,6 +2727,13 @@ fn mode_open_fixture(
 
 #[test]
 fn warp_r2_proof_uncertain_executed_reply_reacquires_same_title() {
+    // A hung first proof call spends a third of what the launch deadline leaves, by design,
+    // and the launch's work after the proof has the rest. With 450 ms that rest was about
+    // 250 ms on an idle Mac, and a macOS runner ran out of it once ("Warp launch deadline
+    // expired after binding and before provider start"); 300 ms more work after the proof
+    // reproduces that for the timeout case alone. The cases test the reacquisition, not the
+    // deadline: 3 s leaves about 2 s after the hung call.
+    const LAUNCH: Duration = Duration::from_secs(3);
     for code in ["lost", "malformed", "timeout"] {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
@@ -2720,7 +2742,16 @@ fn warp_r2_proof_uncertain_executed_reply_reacquires_same_title() {
         runner.proof_failures = 1;
         runner.proof_reply = Some(code);
         let bound = Cell::new(false);
-        proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).unwrap();
+        open_fixture_within(
+            &mut runner,
+            &client,
+            &directory,
+            &attempt,
+            &bound,
+            false,
+            LAUNCH,
+        )
+        .unwrap();
         assert!(bound.get());
         assert_eq!(runner.proof_calls, 2);
         assert_eq!(runner.proof_executed, 2);
