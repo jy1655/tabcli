@@ -267,10 +267,7 @@ fn ended_close_checks_the_launch_label_with_current_and_legacy_records() {
     }
 }
 
-// A Herdr terminal is never closed on the surface alone: when the
-// decision leaves the close to the surface alone, the adapter closes on the creation record. It
-// refuses a running terminal with nothing sent, removes a finished one and settles an absent
-// one on `not_found` from the recorded core.
+// Exercise the adapter's retained SurfaceOnly mapping directly.
 #[test]
 fn a_herdr_terminal_left_to_the_surface_alone_closes_on_its_creation_record() {
     type Change = fn(&Fixture);

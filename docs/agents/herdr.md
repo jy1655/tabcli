@@ -377,12 +377,12 @@
 - Without a [verified live owner](attestation.md), an explicit close acting on a whole creation record
   removes only the finished terminal the verified core identifies, settles the session on
   that core's `not_found` for the recorded address, and refuses a running terminal.
-- A saved teardown intent replays under 0.4.49's rules, with its relation to this rule left
-  as a follow-up (`an_interrupted_teardown_keeps_the_replay_of_0_4_49`).
+- On macOS and Linux, a saved teardown intent must match the session and exact handle and
+  give a nonempty reason. Its saved owner must be bound to the session, have a complete
+  control record and a nonempty TTY, and lead the saved foreground process group
+  (1 through `i32::MAX`). Replay with a live attested owner requires that same owner in
+  the intent. Without a verified live owner, explicit close uses the creation record.
 - An unreadable close-intent file refuses a close that needs an intent decision.
-- When the decision leaves the close to the surface alone, either cause runs the same
-  creation-record close with that decision's result and no stored diagnosis
-  (`a_replayed_intent_whose_owner_goes_after_validation_closes_on_the_creation_record`).
 - Cleanup after a refused reopen refuses the creation record selected for lack of a live owner
   (`a_cleanup_never_acts_on_a_terminal_without_a_live_owner`).
 - Each kill or removal requires a grant for the terminal observed on the verified core
