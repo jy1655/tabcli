@@ -589,6 +589,14 @@ pub(in crate::native) fn close_owned_surface(
     cause: CloseCause,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
+    // Check the binding before refusing an unavailable surface.
+    if let Some(os) = terminal::OsTerminals::CURRENT
+        && !os.runs(session.kind)
+    {
+        close_remaining(deadline)?;
+        session.verify_managed_session(id)?;
+        return Err(os.unavailable(session.kind));
+    }
     let observation = Production::new(directory, id, session, deadline).for_cause(cause);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     return observation.close_posix_surface();

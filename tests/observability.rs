@@ -674,11 +674,9 @@ fn screen_refuses_closed_and_unbound_sessions_from_records_without_writing() {
         "terminal": if cfg!(windows) { "windows-console" } else { "apple-terminal" },
         "session_id": "4242", "window_id": "1001", "managed_session_id": "session-other"
     });
-    let unbound = if cfg!(any(target_os = "macos", windows)) {
-        "the recorded terminal handle is not bound to session session-observe"
-    } else {
-        "is not supported on this platform"
-    };
+    // The handle names another session: that is the same fact on every OS, so it answers
+    // before whether this OS runs the handle's kind (Terminal.app on Linux).
+    let unbound = "the recorded terminal handle is not bound to session session-observe";
     for (record, value, expected) in [
         (
             None,
