@@ -69,7 +69,8 @@ after deadline-sensitive fake-Codex tests failed under the parallel harness in
 [issue #46](https://github.com/jy1655/tabcli/issues/46); concurrency inside individual
 tests remains enabled.
 
-Check platform-gated code for Linux and Windows and use FreeBSD to check the fallback code.
+Check platform-gated code for Linux and Windows. CI uses Rust 1.97.1 and the FreeBSD target
+to check the build for other Unix systems, which have no terminal transport.
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
