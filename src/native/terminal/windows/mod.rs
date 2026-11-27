@@ -545,8 +545,11 @@ pub(in crate::native) fn console_launch_command_line(
 ) -> Result<String> {
     let arguments = console_root_arguments(command)?;
     // PowerShell derives PSHOME and its module search path from the launch path.
+    crate::native::session_start::launch_path_text(powershell, "PowerShell 7 executable")?;
     let powershell = crate::native::provider_process::windows_command_path(powershell);
-    let powershell_text = powershell.to_string_lossy();
+    let powershell_text = powershell
+        .to_str()
+        .context("PowerShell 7 executable path is not Unicode text")?;
     if powershell_text.contains('"') {
         bail!("PowerShell 7 executable path contains an unsupported double quote");
     }

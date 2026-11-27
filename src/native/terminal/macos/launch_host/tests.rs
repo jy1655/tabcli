@@ -148,9 +148,11 @@ fn bootstrap(executable: &Path, dir: &Path, command: &str, kind: TerminalKind) -
     }
     match kind {
         TerminalKind::Iterm2 => {
-            iterm2::test_iterm_arguments(&iterm2::host_command(executable, dir, command))
+            iterm2::test_iterm_arguments(&iterm2::host_command(executable, dir, command).unwrap())
         }
-        TerminalKind::WezTerm => wezterm::host_program(executable, dir, command).into(),
+        TerminalKind::WezTerm => wezterm::host_program(executable, dir, command)
+            .unwrap()
+            .into(),
         _ => unreachable!(),
     }
 }

@@ -42,7 +42,7 @@ pub(super) fn bootstrap(executable: &OsStr) -> Result<String> {
         "/bin/zsh -f -i -c {}",
         crate::native::terminal::shell_quote(OsStr::new(&format!(
             "start=$({} {HOST_COMMAND}) || exit; . \"$start\"",
-            crate::native::terminal::shell_quote(executable)
+            crate::native::terminal::shell_quote_path(Path::new(executable), "TAB executable")?
         )))
     ))
 }
@@ -256,7 +256,7 @@ fn launch_command(
     validate_shell_command_component(script.as_os_str(), "Ghostty startup path")?;
     let input = format!(
         ". {}",
-        crate::native::terminal::shell_quote(script.as_os_str())
+        crate::native::terminal::shell_quote_path(&script, "Ghostty startup")?
     );
     if input.len() >= 1024 {
         bail!("Ghostty startup path exceeds the canonical input line limit");

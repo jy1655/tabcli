@@ -229,12 +229,16 @@ pub(super) struct Resolution<'a> {
 // automatic Herdr choice that depends on the version, with the caller check's outcome), title,
 // and workspace consent. The consent assessment may update shared records before a Session exists.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
-    resolve_with(resolution, |provider| {
-        let provider_path = resolve_provider(provider)?;
-        let provider_version =
-            check_provider_version_until(provider, &provider_path, Some(deadline))?;
-        Ok((provider_path, provider_version))
-    })
+    resolve_with(resolution, |provider| probe_for_launch(provider, deadline))
+}
+
+pub(super) fn probe_for_launch(
+    provider: FirstPartyCli,
+    deadline: Instant,
+) -> Result<(PathBuf, String)> {
+    let provider_path = resolve_provider(provider)?;
+    let provider_version = check_provider_version_until(provider, &provider_path, Some(deadline))?;
+    Ok((provider_path, provider_version))
 }
 
 // `probe` is the resolution's one look at the installed CLI: its executable path and its
@@ -242,6 +246,22 @@ pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<R
 // the Surface reads too). Tests resolve without an installed provider through it.
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
+    probe: impl FnOnce(FirstPartyCli) -> Result<(PathBuf, String)>,
+) -> Result<Resolved> {
+    let _ = choose_before_probe(resolution.provider, resolution.surface)?;
+    deadline::before("resolving the workspace")?;
+    let workspace =
+        LaunchWorkspace::read(resolution.workspace)?.directory(resolution.workspace_noun)?;
+    let root = Reader::state_root().map_err(resolution.admission_refusal)?;
+    check_launch_environment(&root)?;
+    resolve_at(resolution, &root, workspace, probe)
+}
+
+// Reopen resolves its paths before it can repair an interrupted launch in the source's records.
+pub(super) fn resolve_at(
+    resolution: Resolution<'_>,
+    root: &Path,
+    workspace: PathBuf,
     probe: impl FnOnce(FirstPartyCli) -> Result<(PathBuf, String)>,
 ) -> Result<Resolved> {
     let Resolution {
@@ -257,29 +277,11 @@ pub(super) fn resolve_with(
         surface,
         caller,
         context_sources,
-        workspace_noun,
+        workspace_noun: _,
         admission_refusal,
     } = resolution;
-    // A surface the provider's adapter cannot run on at all on this platform is refused
-    // before anything is resolved or probed.
-    let _ = choose_before_probe(provider, surface)?;
-    deadline::before("resolving the workspace")?;
-    let workspace = requested.canonicalize().with_context(|| {
-        format!(
-            "{workspace_noun} does not exist or cannot be resolved: {}",
-            requested.display()
-        )
-    })?;
-    if !workspace.is_dir() {
-        bail!(
-            "{workspace_noun} is not a directory: {}",
-            workspace.display()
-        );
-    }
     deadline::before("checking launch admission")?;
-    let root = Reader::state_root()
-        .and_then(|root| admission::check(&root, &workspace).map(|()| root))
-        .map_err(admission_refusal)?;
+    admission::check(root, &workspace).map_err(admission_refusal)?;
     let (provider_path, provider_version) = probe(provider)?;
     // Once the installed CLI version is known, the choice is made again with it, before
     // title, consent, session, or surface creation: a surface-specific version floor refuses
@@ -312,7 +314,7 @@ pub(super) fn resolve_with(
     let title = sanitize_title(&requested_title)?;
     deadline::before("assessing workspace consent")?;
     let consent = consent::assess(
-        &root,
+        root,
         match consent_path {
             ConsentPath::Requested => requested,
             ConsentPath::Canonical => &workspace,
@@ -336,6 +338,58 @@ pub(super) fn resolve_with(
         herdr_refusal,
         consent: Some(consent),
     })
+}
+
+/// Paths embedded in a launch command must survive conversion to text exactly.
+pub(in crate::native) fn launch_path_text<'a>(path: &'a Path, field: &str) -> Result<&'a str> {
+    path.to_str()
+        .with_context(|| format!("{field} path is not Unicode text"))
+}
+
+// Reopen checks the spelling before recovering a prior launch, but reports an absent
+// workspace only after judging the source, as it does for other workspace failures.
+pub(super) struct LaunchWorkspace<'a> {
+    requested: &'a Path,
+    canonical: std::io::Result<PathBuf>,
+}
+
+impl<'a> LaunchWorkspace<'a> {
+    pub(super) fn read(requested: &'a Path) -> Result<Self> {
+        launch_path_text(requested, "workspace")?;
+        let canonical = requested.canonicalize();
+        if let Ok(path) = &canonical {
+            launch_path_text(path, "workspace")?;
+        }
+        Ok(Self {
+            requested,
+            canonical,
+        })
+    }
+
+    pub(super) fn directory(self, noun: &str) -> Result<PathBuf> {
+        let path = self.canonical.with_context(|| {
+            format!(
+                "{noun} does not exist or cannot be resolved: {}",
+                self.requested.display()
+            )
+        })?;
+        if !path.is_dir() {
+            bail!("{noun} is not a directory: {}", path.display());
+        }
+        Ok(path)
+    }
+}
+
+pub(super) fn check_launch_environment(root: &Path) -> Result<()> {
+    // Session creation expands a relative state root against the current directory.
+    if root.is_absolute() {
+        launch_path_text(root, "state root")?;
+    } else {
+        launch_path_text(&std::env::current_dir()?.join(root), "state root")?;
+    }
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
+    launch_path_text(&executable, "TAB executable")?;
+    Ok(())
 }
 
 fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {

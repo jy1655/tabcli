@@ -14,7 +14,7 @@ use crate::native::session::{
 use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
 #[cfg(unix)]
-use crate::native::terminal::shell_quote;
+use crate::native::terminal::shell_quote_path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::process::Child;
@@ -56,8 +56,9 @@ pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result
     #[cfg(unix)]
     {
         let path = directory.join("launch.sh");
+        let command = format!(". {}", shell_quote_path(&path, "launch script")?);
         RecordStore::at(&path).write_private(contents.as_bytes())?;
-        Ok(format!(". {}", shell_quote(path.as_os_str())))
+        Ok(command)
     }
     #[cfg(not(unix))]
     {

@@ -308,13 +308,18 @@ impl ResolvedReopen {
         // The source, and so its provider, is not read yet: an automatic Herdr choice is
         // checked against its caller here, as in 0.4.49, and refused here when that fails.
         let (surface, caller) = session_start::choose_launch_surface(request.terminal, None)?;
-        let source_directory = Reader::session_directory(&request.id)?;
+        let root = Reader::state_root()?;
+        session_start::check_launch_environment(&root)?;
+        let source_directory = Reader::session_directory_in(&root, &request.id)?;
         session_start::deadline::before("inspecting the reopen source")?;
+        let manifest = Reader::open_unchecked(&source_directory).manifest()?;
+        let workspace = session_start::LaunchWorkspace::read(&manifest.workspace)?
+            .directory("source workspace");
         let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not
         // alter the record it continues from.
-        let source = inspect_reopen_source(&source_directory, &request.id)?;
+        let source = inspect_reopen_manifest(&source_directory, &request.id, manifest)?;
         provider::reopen(source.provider)
             .and_then(|support| support.verify_available(&source.provider_session_id))
             .map_err(|error| {
@@ -322,7 +327,8 @@ impl ResolvedReopen {
             })?;
         // Shared consent may already have changed when resolution fails. The source
         // stays reopenable because its reservation belongs to creation.
-        let start = session_start::resolve(
+        let _ = session_start::choose_before_probe(source.provider, surface)?;
+        let start = session_start::resolve_at(
             resolution(
                 &request,
                 source.provider,
@@ -330,7 +336,9 @@ impl ResolvedReopen {
                 surface,
                 caller,
             ),
-            deadline,
+            &root,
+            workspace?,
+            |provider| session_start::probe_for_launch(provider, deadline),
         )?;
         Ok(Self {
             source_id: request.id,
@@ -494,8 +502,17 @@ fn create_reopened_session(
 
 // Require a tombstoned, settled source with resolved receipts and a provider identity.
 // Validate receipts first so corrupt events consistently refuse as request-unresolved.
+#[cfg(test)]
 fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
+    inspect_reopen_manifest(directory, id, manifest)
+}
+
+fn inspect_reopen_manifest(
+    directory: &Path,
+    id: &str,
+    manifest: SessionManifest,
+) -> Result<ReopenSource> {
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     verify_reopen_source_is_closed(directory, id)?;
     // Reject linked or non-directory events paths before reads can escape the session.

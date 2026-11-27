@@ -103,23 +103,37 @@ fn bridge_shell_command_rejects_controls_in_dynamic_components() {
     }
 }
 
-// The launch command carries the workspace, the state root and TAB's executable as 0.4.49
-// did, lossily when one is not Unicode text (a pre-existing limit), and Ghostty's caller
-// `PATH` with an unused entry that is not Unicode text still passes the same check. Only the
-// session directory is refused when it cannot be sent exactly, by the launcher's admission.
+#[test]
+fn launch_command_refuses_non_unicode_paths() {
+    #[cfg(unix)]
+    let inexact = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"/tmp/state-\xff".to_vec())
+    };
+    #[cfg(windows)]
+    let inexact = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xD800])
+    };
+    let inexact = Path::new(&inexact);
+    let normal = Path::new("/tmp/normal");
+    for (workspace, root, executable, field) in [
+        (inexact, normal, normal, "workspace"),
+        (normal, inexact, normal, "state root"),
+        (normal, normal, inexact, "TAB executable"),
+    ] {
+        let result = bridge_shell_command(workspace, root, executable, "session-safe123");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("{field} path is not Unicode text")
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
-fn the_launch_command_check_refuses_controls_only() {
+fn ghostty_path_can_contain_a_non_unicode_entry() {
     use std::os::unix::ffi::OsStrExt;
-    let inexact = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/state-\xff"));
-    let normal = Path::new("/tmp/normal");
-    for (workspace, root, executable) in [
-        (inexact, normal, normal),
-        (normal, inexact, normal),
-        (normal, normal, inexact),
-    ] {
-        bridge_shell_command(workspace, root, executable, "session-safe123").unwrap();
-    }
     crate::native::session::launch::launcher::validate_shell_command_component(
         std::ffi::OsStr::from_bytes(b"/usr/bin:/opt/\xff/bin"),
         "Ghostty launch PATH",

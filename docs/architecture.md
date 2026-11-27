@@ -145,8 +145,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   initial Claim is settled in `session::launch` (`settle_unfenced_start`) as a fenced launch
   failure is; a failure after the fence keeps the launcher's own settlement, and Reopen
   settles its launch failures itself. The launchable-spec resolution that `ask` and `reopen`
-  share (`resolve`, fed a `Resolution` of what each supplies) lives here: it admits the selected
-  surface through `provider::admit_surface` before workspace resolution and probing (refusing
+  share lives here. It admits the selected surface through `provider::admit_surface` before probing (refusing
   unconditionally unsupported platform/surface pairs) and again with the probed version right
   after the provider version probe (refusing surface-specific version requirements before title,
   consent, session, or terminal creation) and carries the admitted initial `Transport` into
@@ -155,11 +154,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   terminal, else the caller's environment (`terminal::select_for`: inside hc Herdr, with the
   platform's own choice as its fallback). An automatic Herdr choice gets the caller check
   (`terminal::admit_selection`) there, where 0.4.49 ran it, and its outcome
-  (`CallerCheck`) goes with the selection. `resolve` decides that choice with the provider and
+  (`CallerCheck`) goes with the selection. `resolve_at` decides that choice with the provider and
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
-  explicit choice is refused; a Herdr choice whose check failed is refused. Steps after the caller
-  check keep their 0.4.49 order. An expired request is refused at the first deadline check
-  it reaches.
+  explicit choice is refused; a Herdr choice whose check failed is refused. Reopen requires
+  representable launch paths before recovering an interrupted child launch. An expired request
+  is refused at the first deadline check it reaches.
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option

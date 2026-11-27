@@ -176,3 +176,41 @@ fn the_settings_command_reports_and_changes_the_admission() {
     let changed: Value = serde_json::from_slice(&changed.stdout).unwrap();
     assert_eq!(changed["codex_memory_workspace"], "allow");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ask_refuses_non_unicode_paths_before_creating_the_state_root() {
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+    let fixture = Fixture::new();
+    let workspace = fixture
+        .base
+        .join(std::ffi::OsStr::from_bytes(b"workspace-\xff"));
+    std::fs::create_dir(&workspace).unwrap();
+    let bin = fixture.directory("bin");
+    let codex = bin.join("codex");
+    std::fs::write(&codex, "#!/bin/sh\necho 'codex-cli 0.169.0'\n").unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
+        command.args(["ask", "codex", "--terminal", "tmux", "--prompt", "test"]);
+        if explicit {
+            command.arg("--workspace").arg(&workspace);
+        }
+        let output = command
+            .current_dir(&workspace)
+            .env("HOME", &fixture.base)
+            .env("PATH", &bin)
+            .env_remove("CODEX_HOME")
+            .env_remove("AGENT_BRIDGE_NATIVE_SESSION_ID")
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &fixture.root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!fixture.root.exists(), "created the state root: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap().trim(),
+            "Error: workspace path is not Unicode text"
+        );
+    }
+}

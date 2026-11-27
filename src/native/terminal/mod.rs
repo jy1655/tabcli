@@ -955,6 +955,12 @@ pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(unix)]
+pub(in crate::native) fn shell_quote_path(path: &Path, field: &str) -> Result<String> {
+    let text = crate::native::session_start::launch_path_text(path, field)?;
+    Ok(shell_quote(text.as_ref()))
+}
+
 pub(super) fn validate_terminal_send_budget(
     submit_count: usize,
     terminal_kind: TerminalKind,
