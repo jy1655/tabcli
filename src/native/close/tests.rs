@@ -687,7 +687,15 @@ fn an_exhausted_scan_still_closes_what_it_listed() {
 
 /// The production closer: the ordinary explicit close of the target with the reason.
 fn real_closer(deadline: Instant) -> impl FnMut(&Path, &str, String) -> Result<()> {
-    move |directory, id, reason| close_session_surface(directory, id, Some(reason), deadline)
+    move |directory, id, reason| {
+        close_session_surface(
+            directory,
+            id,
+            Some(reason),
+            crate::native::terminal::close_authority::CloseCause::Explicit,
+            deadline,
+        )
+    }
 }
 
 #[test]

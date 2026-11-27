@@ -39,7 +39,7 @@ fallback, where the verification does not matter. An explicit `--terminal herdr`
 instead. The fallback terminal must be usable: a Mac without Ghostty, for example, fails when
 TAB opens it, as an explicit `--terminal ghostty` would. `tabcli doctor --provider <provider>
 --probe`, run from the directory you launch from, reports the terminal `ask` would choose and
-its fallback.
+its fallback. When TAB selects the fallback, the session's `launch.log` notes why Herdr was skipped.
 
 On Linux, select a running local Herdr Core with `--terminal herdr` or a private tmux server
 with `--terminal tmux`. Outside hc, Linux uses tmux.
@@ -189,9 +189,6 @@ binding even when the caller's `HC_SESSION` or `HC_SOCKET` changes. A replaced o
 core is not evidence that a terminal is gone. Queries connect without starting a service.
 A parented session counts in the caller's `hc wait --children`. The core does not type child
 notifications into the caller, and the session continues when the caller ends.
-If the original program ends outside TAB with keep off, run
-`tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
-finished terminal and closes the session record.
 
 Codex requires stable 0.169.0 or newer here: `--terminal herdr` refuses an older Codex, and
 inside an hc terminal the automatic choice gives it Ghostty (macOS) or tmux (Linux) instead.
@@ -208,6 +205,27 @@ TAB removes the caller identity rather than forcing persistence on a nested sess
 core's environment for other terminals. TAB reads only the visible screen (`lines=0`) and
 never scrolls history. It cannot atomically compare a dialog and press a key through hc, so
 workspace trust dialogs must be handled by the user through Herdr or `hc attach`.
+
+### Closing a Herdr session
+
+If the original program ends outside TAB with keep off, run
+`tabcli close-session <session> --explicit` as usual. TAB verifies and removes the
+finished terminal and closes the session record. If the core cannot be reached, the session
+keeps its handle and a later close finishes it.
+
+If TAB cannot verify a live owner and refuses to close a running terminal, wait for it to
+finish or end it on the recorded core, then run `tabcli close-session <session> --explicit`.
+Before ending it yourself, run `tabcli doctor <session> --probe` and check with `hc get
+<address>` on that core that the program arguments name this session's directory.
+See [Close by creation record](agents/herdr.md#close-by-creation-record) for the close rule
+and its limits.
+
+In 0.4.49 an explicit close could end a running Herdr terminal after a failed start, when
+resuming an ordinary close whose owner was gone, or during a launch whose wrapper had not
+yet recorded its owner. Windows dead-owner repair could also end it.
+These cases now leave the running terminal for you. When TAB closes on the creation record,
+the owner record no longer prevents closing a session whose verified terminal is finished
+or absent. This lets you close sessions stranded under 0.4.49.
 
 ### Herdr Core on native Windows
 
@@ -241,10 +259,8 @@ receipts), delivered by Herdr's `terminal.send`; Claude uses its own messaging. 
 its Windows initial prompt is pasted and then submitted against the exact console screen, which
 Herdr cannot do, so use `--terminal windows-console` for it; inside an hc terminal the automatic
 choice already gives it the managed console. The returned `attach_command` is a
-PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. Close ends the
-whole terminal. When a provider ends on its own, the next close or repair removes its finished
-terminal through the core; if the core cannot be reached, the session keeps its handle and a
-later close finishes it. Only Pi has been run live on Windows Herdr.
+PowerShell line that sets `HC_SOCKET` for `hc attach` only and then restores it. For close, see
+[Closing a Herdr session](#closing-a-herdr-session). Only Pi has been run live on Windows Herdr.
 
 ## Linux / tmux
 

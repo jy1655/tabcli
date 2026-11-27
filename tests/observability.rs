@@ -1828,7 +1828,7 @@ fn wait_one_matches_public_result_wait_and_preserves_journal_and_dead_owner() {
                 false,
                 "unresolved",
                 json!(
-                    "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request"
+                    "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request; close-session --explicit closes a terminal that outlived its owner"
                 ),
             ),
             "recovery_required" => (

@@ -1,8 +1,8 @@
-//! The seven Windows surface operations (open, send, screen, guarded key, verify, close and
-//! presence). Screen and guarded key first read the kind's declared refusal; then every
-//! operation resolves its adapter through one lookup (`Adapters::adapter`): the managed
-//! console or Herdr, and for every other kind the refusal that each OS gives a kind it does
-//! not run (`OsTerminals::unavailable`). macOS and Linux do the same through `posix.rs`.
+//! The eight Windows surface operations are open, send, screen, guarded key, verify, close,
+//! presence and launch probe. Close can also act on the creation record. Screen and guarded
+//! key first read the kind's declared refusal. Every operation resolves its adapter through
+//! `Adapters::adapter`: the managed console or Herdr, with `OsTerminals::unavailable` for
+//! a kind Windows does not run. macOS and Linux do the same through `posix.rs`.
 //! Compiled into every test build, so that the lookup and the refusals are tested on every
 //! CI target; the installed adapters stay in `windows/mod.rs` (the managed console) and
 //! `herdr.rs`.
@@ -63,6 +63,27 @@ pub(in crate::native) trait WindowsTerminalAdapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome>;
+    /// Closes the surface with no live owner of this session left, on the creation record in
+    /// the handle and the decision's `evidence`. Only a kind whose core keeps its terminals has
+    /// such a record, and the dispatch refuses every other kind before its adapter, so the
+    /// default is an invariant failure and never an ordinary answer.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
+    fn close_created_surface(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        evidence: super::close_authority::CreationEvidence,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        let _ = (directory, evidence, deadline);
+        bail!(
+            "{} keeps no creation record; the shared dispatch must refuse before its adapter",
+            session.kind.display_name()
+        )
+    }
     fn surface_present(
         &self,
         directory: &Path,
@@ -204,6 +225,31 @@ pub(in crate::native) fn close_session_until(
     adapters
         .adapter(session.kind)?
         .close_session_until(directory, session, deadline)
+}
+
+/// The close of a gone owner's surface, on its creation record. As on macOS and Linux, a kind
+/// whose core keeps no terminals is refused before its adapter.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", windows)),
+    allow(dead_code)
+)]
+pub(in crate::native) fn close_created_surface(
+    adapters: &dyn Adapters,
+    directory: &Path,
+    session: &TerminalSession,
+    evidence: super::close_authority::CreationEvidence,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    crate::native::session::close::budget::close_remaining(deadline)?;
+    if !super::close_authority::owner_exit::core_retains_finished(session.kind) {
+        bail!(
+            "{} keeps no creation record that proves its surface without the owner; no close was sent and the handle is retained",
+            session.kind.display_name()
+        );
+    }
+    adapters
+        .adapter(session.kind)?
+        .close_created_surface(directory, session, evidence, deadline)
 }
 
 pub(in crate::native::terminal) fn surface_present(

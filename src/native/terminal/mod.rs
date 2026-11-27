@@ -343,6 +343,11 @@ pub(super) enum CloseOutcome {
 pub(in crate::native) struct CloseResult {
     pub outcome: CloseOutcome,
     pub reason: Option<String>,
+    /// The closed record keeps the session's stored diagnosis, read under the lifecycle lock:
+    /// a close on a terminal's creation record, which no live owner reported on.
+    pub keeps_diagnosis: bool,
+    /// What the closed record says when the session stored no diagnosis.
+    pub generated_reason: Option<String>,
 }
 
 impl From<CloseOutcome> for CloseResult {
@@ -350,6 +355,26 @@ impl From<CloseOutcome> for CloseResult {
         Self {
             outcome,
             reason: None,
+            keeps_diagnosis: false,
+            generated_reason: None,
+        }
+    }
+}
+
+impl CloseResult {
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", windows)),
+        allow(dead_code)
+    )]
+    pub(in crate::native) fn keeping_diagnosis(
+        outcome: CloseOutcome,
+        generated_reason: Option<String>,
+    ) -> Self {
+        Self {
+            outcome,
+            reason: None,
+            keeps_diagnosis: true,
+            generated_reason,
         }
     }
 }
@@ -794,9 +819,10 @@ pub(super) fn verify_windows_surface(
     windows_dispatch::verify_surface(windows_installed(), session, timeout)
 }
 
+// Windows production closes through the authority's own mapping in `close_authority`.
 #[cfg(any(
-    all(test, target_os = "macos"),
-    not(any(target_os = "macos", target_os = "linux"))
+    all(test, any(target_os = "macos", windows)),
+    not(any(target_os = "macos", target_os = "linux", windows))
 ))]
 pub(super) fn close_session_until(
     directory: &Path,
@@ -1233,6 +1259,7 @@ mod tests {
                         &directory,
                         "session-foreign",
                         None,
+                        super::close_authority::CloseCause::Explicit,
                         crate::native::session::close::budget::close_deadline(),
                     )
                     .unwrap_err();

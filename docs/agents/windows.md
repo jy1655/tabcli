@@ -11,8 +11,8 @@
   Windows surface its own adapter in that lookup; do not branch one of these operations on the
   kind. `attach_command` and `admit_selection` still check kinds outside those operations.
   Dead-owner Repair decides whether it needs a close transaction in
-  `terminal::close_authority::owner_exit`. Only a managed console or a registration whose core
-  keeps a finished terminal can reach the Windows close adapter from that transaction. The
+  `terminal::close_authority::owner_exit`. Only a managed console reaches the Windows close
+  adapter from that transaction (see [Herdr close](herdr.md#close-by-creation-record)). The
   claimed handle is checked independently of the retained-handle scan. The lookup's portable tests run
   on every CI target; the installed lookup, over the console helper and the core's pipe, is
   tested on the Windows runner only.

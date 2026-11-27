@@ -511,11 +511,13 @@ where
             return Err(error);
         }
     };
-    if result.reason.is_some() {
-        close_error = merge_close_reason(
-            merge_close_reason(close_error, status.error.clone()),
-            result.reason,
-        );
+    if result.reason.is_some() || result.keeps_diagnosis {
+        let diagnosis = if result.keeps_diagnosis {
+            status.error.clone().or(result.generated_reason)
+        } else {
+            status.error.clone()
+        };
+        close_error = merge_close_reason(merge_close_reason(close_error, diagnosis), result.reason);
     }
 
     let consume_result =
@@ -540,29 +542,46 @@ fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<
         })
 }
 
+// Every OS records the close's reason in the consumption marker, so that a close interrupted
+// after it and before the closed record keeps that reason (os-parity).
 fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read
-        // is strict, and an undecodable tombstone never keeps a close from finishing.
-        Ok(store
-            .record(CoreRecord::TerminalClosed)
-            .bytes()?
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|text| super::record::terminal_consumption_reason(&text)))
+    // Bytes that are not UTF-8 carry no reason, as malformed JSON carries none: the read is
+    // strict, and an undecodable tombstone never keeps a close from finishing.
+    Ok(store
+        .record(CoreRecord::TerminalClosed)
+        .bytes()?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| super::record::terminal_consumption_reason(&text)))
+}
+
+/// Joins two close reasons with `; `. A reason that the other already carries, whole or as a
+/// run of its `; `-joined parts, is not added again: a replay of a committed consumption marker
+/// meets the reason it committed, and the retry's own reason is already part of it.
+fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<String> {
+    fn carries(whole: &str, part: &str) -> bool {
+        whole == part
+            || whole.starts_with(&format!("{part}; "))
+            || whole.ends_with(&format!("; {part}"))
+            || whole.contains(&format!("; {part}; "))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = store;
-        Ok(None)
+    match (first, second) {
+        (Some(first), Some(second)) if carries(&first, &second) => Some(first),
+        (Some(first), Some(second)) if carries(&second, &first) => Some(second),
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (first, second) => first.or(second),
     }
 }
 
-fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) if first != second => Some(format!("{first}; {second}")),
-        (first, second) => first.or(second),
-    }
+/// Whether the consumption marker is present and decodes as JSON with `consumed: true`, whatever
+/// else it holds (a terminal kind this build does not know included). Bytes that are not such a
+/// marker are a damaged marker, which the next consumption writes again.
+fn committed_consumption_marker(store: &Store) -> Result<bool> {
+    Ok(store
+        .record(CoreRecord::TerminalClosed)
+        .bytes()?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| super::record::terminal_tombstone_value(&text).ok())
+        .is_some_and(|marker| marker.get("consumed") == Some(&serde_json::Value::Bool(true))))
 }
 
 fn consume_terminal_handle(
@@ -570,17 +589,23 @@ fn consume_terminal_handle(
     terminal_kind: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
-    let mut marker = serde_json::json!({
-        "consumed": true,
-        "terminal": terminal_kind,
+    // A committed marker (one that decodes with `consumed: true`) keeps its bytes: a replay, and
+    // a later close of the closed session, neither rewrites its reason nor its kind. A damaged
+    // one (not a marker, or `consumed: false`) is written again, as before os-parity.
+    let tombstone_result = committed_consumption_marker(store).and_then(|committed| {
+        if committed {
+            return Ok(());
+        }
+        let mut marker = serde_json::json!({
+            "consumed": true,
+            "terminal": terminal_kind,
+        });
+        if let Some(reason) = reason {
+            marker["reason"] = reason.into();
+        }
+        store.write_terminal_closed(&marker)
     });
-    if cfg!(any(target_os = "macos", target_os = "linux"))
-        && let Some(reason) = reason
-    {
-        marker["reason"] = reason.into();
-    }
-    let tombstone_result = store.write_terminal_closed(&marker);
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(test)]
     if tombstone_result.is_ok() {
         interruption::at(interruption::Point::ConsumptionMarkerWritten);
     }
@@ -589,7 +614,7 @@ fn consume_terminal_handle(
     budget::check()?;
     let active_result = RecordStore::at(store.record(CoreRecord::Terminal).path()).remove();
     let closing_result = RecordStore::at(store.record(CoreRecord::TerminalClosing).path()).remove();
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(test)]
     if active_result.is_ok() && closing_result.is_ok() {
         interruption::at(interruption::Point::HandleRemoved);
     }
@@ -714,6 +739,8 @@ fn set_aside_unverified_completion_event_for_close(store: &Store) -> Result<()> 
     Ok(())
 }
 
+// Repair settles under the lock it already holds; the tests settle a session directly.
+#[cfg(test)]
 fn mark_session_closed(store: &Store, error: Option<String>) -> Result<()> {
     let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let _lock = store.lock()?;
@@ -797,7 +824,9 @@ pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instan
     repair_dead_owner_attested_until(store, attest_owner, deadline)
 }
 
-fn repair_dead_owner_attested_until(
+/// Dead-owner Repair with the owner's OS observation supplied by the caller, under this
+/// platform's surface policy.
+pub(in crate::native) fn repair_dead_owner_attested_until(
     store: &Store,
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
     deadline: Instant,
@@ -906,9 +935,19 @@ fn repair_dead_owner_with(
     }
     let repair_error = Some(repair_error);
     match surfaces.decide(store, &status.state, deadline)? {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         RepairSurface::Retain => return untouched(recovery_damage),
-        RepairSurface::Settle => mark_session_closed(store, repair_error)?,
+        RepairSurface::Settle(retention) => {
+            // The scan ran without the lifecycle lock; an explicit close that holds it can
+            // have restored its claimed handle meanwhile. Look again under the lock, so that
+            // a restored handle is never consumed by this settlement.
+            let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
+            let _lock = store.lock()?;
+            if !repair_examines_owner(&store.status()?.state) || retention.retains(store)? {
+                return untouched(recovery_damage);
+            }
+            mark_session_closed_locked(store, &claim_path, repair_error)?;
+        }
         RepairSurface::CloseOnWindows(mut close) => {
             // Reuse the explicit-close claim so an interrupted attempt can be resumed
             // and concurrent repair cannot close the same surface twice.
@@ -933,8 +972,10 @@ mod tests;
 
 // A panic models interruption, not an operation error: no caller's restore/settle
 // handler runs. File locks unwind; only the selected thread's one checkpoint fires.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Additional macOS interruption scenarios stay application-local.
+// Every OS interrupts at the consumption marker and the handle removal; the other points and
+// the expiry checkpoint serve macOS scenarios.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(in crate::native) mod interruption {
     use std::{
         cell::{Cell, RefCell},

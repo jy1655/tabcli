@@ -475,6 +475,7 @@ fn a_herdr_terminal_that_finished_before_startup_ends_the_wait_at_the_next_probe
             store.directory(),
             id,
             None,
+            crate::native::terminal::close_authority::CloseCause::Explicit,
             crate::native::session::close::budget::close_deadline(),
         )
         .unwrap();

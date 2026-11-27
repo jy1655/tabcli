@@ -22,12 +22,16 @@
 use super::bound_host::HostAccount;
 use super::record::HerdrHostBirth;
 use crate::native::session::close::budget::close_remaining;
+use crate::native::terminal::close_authority::CreationEvidence;
 use crate::native::terminal::{
     CloseOutcome, RetainedLaunchSurface, TerminalKind, TerminalSendFailure, TerminalSendResult,
     TerminalSession,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use authority::{Basis, Grant};
+use framed::Framed;
 use identity::{CLOSE_STOPPED, Launch, Recorded, Requirement, binding_names_host, target};
+use linked::{Linked, Permit, link};
 use serde_json::{Value, json};
 use std::{
     ffi::OsStr,
@@ -37,7 +41,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod authority;
+mod framed;
 mod identity;
+mod linked;
 #[cfg(windows)]
 mod pipe;
 #[cfg(unix)]
@@ -53,14 +60,6 @@ pub(in crate::native::terminal) use unix::Installed;
 
 const HOST_COMMAND: &str = TerminalKind::Herdr.registration().host_command;
 const GENERATION: u64 = 1;
-const REQUIRED_METHODS: [&str; 6] = [
-    "terminal.run",
-    "terminal.get",
-    "terminal.kill",
-    "terminal.rm",
-    "terminal.send",
-    "terminal.read",
-];
 /// The labels TAB gives its terminals: the session, and the launch attempt.
 const SESSION_LABEL: &str = "tabcli-session";
 const LAUNCH_LABEL: &str = "tabcli-launch";
@@ -125,9 +124,18 @@ impl CallError {
     }
 }
 
-/// One connection to a core: one request, then its one reply line.
+/// One connection to a core: one request, then its one reply line. Only `linked` constructs the
+/// `Permit` a call takes, so the installed code sends every request through the verified
+/// connection there; an implementation holds the permit it receives for that call, and nothing
+/// in the type system stops it from passing it on.
 pub(in crate::native::terminal) trait Connection {
-    fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError>;
+    fn call(
+        &mut self,
+        permit: Permit,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, CallError>;
     /// The account of the process that serves this connection, as its transport identified
     /// that process: the core, whose terminals' programs, the launch host among them, run as
     /// it.
@@ -272,93 +280,6 @@ fn timed_out(error: &std::io::Error) -> bool {
     )
 }
 
-/// One request, then its one reply line, at a time over a bounded stream: the framing both
-/// installed transports share. A request is unsent only while none of its bytes was
-/// written; after that, a missing or invalid reply leaves it unanswered, never unsent.
-pub(super) struct Framed<S> {
-    stream: S,
-    next_id: u64,
-    pending: Vec<u8>,
-}
-
-impl<S> Framed<S> {
-    pub(super) fn new(stream: S) -> Self {
-        Self {
-            stream,
-            next_id: 1,
-            pending: Vec::new(),
-        }
-    }
-}
-
-impl<S: Stream> Framed<S> {
-    fn read_line(&mut self, deadline: Instant) -> Result<Vec<u8>> {
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            if let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-                let line = self.pending.drain(..=end).collect();
-                return Ok(line);
-            }
-            if self.pending.len() > MAX_REPLY {
-                bail!("Herdr reply exceeds {MAX_REPLY} bytes");
-            }
-            let read = match self.stream.read_before(&mut buffer, deadline) {
-                Ok(read) => read,
-                Err(error) if timed_out(&error) => bail!("Herdr reply timed out"),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error).context("lost the Herdr Core connection"),
-            };
-            if read == 0 {
-                bail!("the Herdr Core closed the connection");
-            }
-            self.pending.extend_from_slice(&buffer[..read]);
-        }
-    }
-}
-
-impl<S: Stream> Connection for Framed<S> {
-    fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, CallError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-            .to_string()
-            .into_bytes();
-        request.push(b'\n');
-        let lost = |written: usize, error: anyhow::Error| {
-            if written == 0 {
-                CallError::NotSent(error)
-            } else {
-                CallError::Unanswered(error)
-            }
-        };
-        let mut written = 0;
-        while written < request.len() {
-            match self.stream.write_before(&request[written..], deadline) {
-                Ok(0) => {
-                    return Err(lost(written, anyhow!("the Herdr Core stopped reading")));
-                }
-                Ok(count) => written += count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) if timed_out(&error) => {
-                    return Err(lost(written, anyhow!("Herdr request timed out")));
-                }
-                Err(error) => {
-                    return Err(lost(
-                        written,
-                        anyhow::Error::new(error).context("cannot write to the Herdr Core"),
-                    ));
-                }
-            }
-        }
-        let line = self.read_line(deadline).map_err(CallError::Unanswered)?;
-        parse_reply(&line, id)
-    }
-
-    fn core_account(&self) -> Result<HostAccount> {
-        self.stream.peer_account()
-    }
-}
-
 /// One JSON-RPC reply line for request `id`.
 pub(super) fn parse_reply(line: &[u8], id: u64) -> Result<Value, CallError> {
     let reply: Value = serde_json::from_slice(line)
@@ -389,70 +310,6 @@ pub(super) fn parse_reply(line: &[u8], id: u64) -> Result<Value, CallError> {
         .get("result")
         .cloned()
         .ok_or_else(|| CallError::Unanswered(anyhow!("Herdr reply has neither result nor error")))
-}
-
-/// A connection whose `hello` named this core: generation 1, the methods TAB uses, and,
-/// when one is expected, the recorded core id.
-struct Linked<'a> {
-    connection: Box<dyn Connection + 'a>,
-    socket: PathBuf,
-    core_id: String,
-}
-
-fn link<'a>(
-    core: &'a dyn Core,
-    socket: &Path,
-    expected_core: Option<&str>,
-    deadline: Instant,
-) -> Result<Linked<'a>> {
-    let mut connection = core.connect(socket, deadline)?;
-    let hello = connection
-        .call("hello", json!({"generation": GENERATION}), deadline)
-        .map_err(|error| error.into_error("hello"))?;
-    let core_id = validate_hello(&hello)?;
-    if let Some(expected) = expected_core
-        && expected != core_id
-    {
-        bail!(
-            "a different Herdr Core (id {core_id}) answers at {}; the recorded core {expected} is not reachable there, so the state of this terminal is unknown",
-            socket.display()
-        );
-    }
-    Ok(Linked {
-        connection,
-        socket: socket.to_path_buf(),
-        core_id,
-    })
-}
-
-/// The core id of a `hello` result that speaks generation 1 and offers TAB's methods.
-pub(super) fn validate_hello(hello: &Value) -> Result<String> {
-    if hello.get("generation").and_then(Value::as_u64) != Some(GENERATION) {
-        bail!("Herdr Core does not speak protocol generation {GENERATION}");
-    }
-    hello
-        .get("version")
-        .and_then(Value::as_str)
-        .context("Herdr hello has no version")?;
-    let methods: Vec<&str> = hello
-        .get("methods")
-        .and_then(Value::as_array)
-        .context("Herdr hello has no method list")?
-        .iter()
-        .map(|method| method.as_str().context("Herdr method name is not text"))
-        .collect::<Result<_>>()?;
-    if let Some(missing) = REQUIRED_METHODS
-        .iter()
-        .find(|method| !methods.contains(method))
-    {
-        bail!("Herdr Core does not offer {missing}");
-    }
-    let id = hello
-        .pointer("/core/id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .context("Herdr hello has no core id")?;
-    Ok(id.to_owned())
 }
 
 /// A local terminal address: `t` and lowercase letters or digits. A remote terminal's
@@ -562,10 +419,7 @@ pub(super) fn parse_terminal(value: &Value) -> Result<Observed> {
 /// One terminal, by its address or by its local name; the answer must be the terminal asked
 /// for (that address, or a terminal that carries that name).
 fn get(linked: &mut Linked<'_>, terminal: &str, deadline: Instant) -> Result<Option<Observed>> {
-    match linked
-        .connection
-        .call("terminal.get", json!({"terminal": terminal}), deadline)
-    {
+    match linked.call("terminal.get", json!({"terminal": terminal}), deadline) {
         Ok(value) => {
             let observed = parse_terminal(&value)?;
             let answers = if valid_address(terminal) {
@@ -652,7 +506,8 @@ fn create(
                 // A failed read can leave a partial reply on this connection. No run has
                 // been sent. An explicit launch can still proceed without a parent if the
                 // same core answers on a fresh connection.
-                linked = link(core, &socket, Some(&linked.core_id), startup_deadline)
+                let core_id = linked.core_id().to_owned();
+                linked = link(core, &socket, Some(&core_id), startup_deadline)
                     .context("the Herdr terminal was not created")?;
                 None
             }
@@ -668,16 +523,13 @@ fn create(
     // that sends `terminal.run`, right before it, a session directory that the host's
     // admission would refuse is refused before any Surface exists. A connection that cannot
     // name its server's account leaves the owner to the host.
-    let account = linked.connection.core_account().ok();
+    let account = linked.core_account().ok();
     core.admit_launch_directory(directory, account.as_ref())
         .context("the Herdr terminal was not created")?;
-    let core_id = linked.core_id.clone();
+    let core_id = linked.core_id().to_owned();
     let reconcile =
         |cause: anyhow::Error| reconcile(core, &socket, &core_id, &launch, cleanup_deadline, cause);
-    let address = match linked
-        .connection
-        .call("terminal.run", params, startup_deadline)
-    {
+    let address = match linked.call("terminal.run", params, startup_deadline) {
         Ok(result) => result
             .get("address")
             .and_then(Value::as_str)
@@ -779,13 +631,16 @@ fn remove_created(
     let mut handle = None;
     let removed = (|| -> Result<()> {
         let mut linked = link(core, socket, Some(core_id), deadline)?;
-        let Some(first) = get(&mut linked, address, deadline)? else {
+        let Some(first) = linked.observe(address, deadline)? else {
             return Ok(());
         };
-        let same = |observed: &Observed| launch.check_cleanup(&first, observed);
-        same(&first)?;
-        handle = launch.recover_handle(core, &linked, &first);
-        end_and_remove(core, &mut linked, address, deadline, &same).map(|_| ())
+        launch.check_cleanup(first.observed(), first.observed())?;
+        handle = launch.recover_handle(core, &linked, first.observed());
+        let basis = Basis::Launch {
+            launch,
+            first: &first,
+        };
+        end_and_remove(core, &mut linked, address, deadline, &basis).map(|_| ())
     })();
     match (removed, handle) {
         (Ok(()), _) => cause.context(format!(
@@ -811,17 +666,17 @@ fn retain_unremoved(surface: TerminalSession, reason: String) -> anyhow::Error {
 }
 
 /// Ends the program of `address` and removes the finished terminal, on a linked connection.
-/// Every step reads the terminal again and checks that observation before it acts, so a
+/// Every step reads the terminal again and asks `authority::grant` before it acts, so a
 /// repeated call finishes what an earlier one left (a removed terminal is not killed, a
-/// finished one is only removed), and a terminal that changed in between is left alone.
-/// The core offers no conditional kill or remove: another client of the same user can still
-/// change the terminal between the last read and the action.
+/// finished one is only removed), and a terminal that changed in between is left alone. The
+/// core offers no conditional kill or remove: another client of the same user can still change
+/// the terminal between the last read and the action.
 fn end_and_remove(
     core: &dyn Core,
     linked: &mut Linked<'_>,
     address: &str,
     deadline: Instant,
-    same: &dyn Fn(&Observed) -> Result<()>,
+    basis: &Basis<'_>,
 ) -> Result<CloseOutcome> {
     let mut outcome = CloseOutcome::Missing;
     let mut killed = false;
@@ -831,44 +686,24 @@ fn end_and_remove(
                 "Herdr terminal {address} did not end before the close deadline; handle retained"
             );
         }
-        let Some(observed) = get(linked, address, deadline)? else {
+        let Some(seen) = linked.observe(address, deadline)? else {
             return Ok(outcome);
         };
-        same(&observed).context(CLOSE_STOPPED)?;
-        match observed.state {
-            State::Live if !killed => {
-                match linked.connection.call(
-                    "terminal.kill",
-                    json!({"terminal": address}),
-                    deadline,
-                ) {
-                    Ok(_) => {}
-                    Err(CallError::Refused { kind, .. })
-                        if kind == "not_found" || kind == "finished" => {}
-                    Err(error) => return Err(error.into_error("terminal.kill")),
-                }
+        match authority::grant(core, basis, &seen, killed).context(CLOSE_STOPPED)? {
+            Grant::Kill(kill) => {
+                linked.end_program(kill, deadline)?;
                 killed = true;
                 outcome = CloseOutcome::Closed;
-                continue;
             }
-            State::Live => core.pause(deadline),
-            State::Finished => {
-                match linked
-                    .connection
-                    .call("terminal.rm", json!({"terminal": address}), deadline)
-                {
-                    Ok(_) => {}
-                    Err(CallError::Refused { kind, .. }) if kind == "not_found" => {}
-                    Err(error) => return Err(error.into_error("terminal.rm")),
-                }
-                outcome = CloseOutcome::Closed;
-            }
+            Grant::Wait => core.pause(deadline),
+            Grant::Remove(remove) => return linked.remove_confirmed(remove, deadline, outcome),
         }
     }
 }
 
-/// Closes exactly the recorded terminal: absent only when its own core no longer holds it.
-fn close_until(
+/// The close of a live, attested owner of this session, or of the launcher that bound the
+/// terminal: exactly the recorded terminal, absent only when its own core no longer holds it.
+fn close_owned(
     core: &dyn Core,
     session: &TerminalSession,
     directory: &Path,
@@ -880,47 +715,54 @@ fn close_until(
     else {
         return Ok(CloseOutcome::Missing);
     };
-    let same = |observed: &Observed| recorded.check(core, observed);
     close_remaining(deadline)?;
-    end_and_remove(core, &mut linked, &session.id, deadline, &same)
+    end_and_remove(
+        core,
+        &mut linked,
+        &session.id,
+        deadline,
+        &Basis::Owned(&recorded),
+    )
 }
 
-/// After the native-session owner's verified death: removes the recorded terminal only when
-/// its program has ended (the user closed its tab or pane, ran `hc kill`, or the program
-/// exited), with one `terminal.rm`. A running terminal is never ended here, and one that is
-/// kept or is not the terminal this session created is left alone with its handle retained.
-/// The core holding the address no more confirms the removal (addresses are not reused).
-#[cfg(unix)]
-fn remove_ended(
+/// With no live owner of this session to close with, on every OS: the terminal's creation
+/// record decides, through `authority::grant`, which removes a finished terminal and never ends
+/// a running one. A cleanup that `core_kept` sent here gets nothing; a close the decision left to
+/// the surface alone is admitted (`authority::admit`). The handle's creation record is validated
+/// before its core is asked, so only a whole record can be settled as absent by `not_found`. A
+/// running terminal, one set to keep, or one that is not this session's, is left alone with its
+/// handle retained.
+fn close_created(
     core: &dyn Core,
     session: &TerminalSession,
     directory: &Path,
+    evidence: CreationEvidence,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    close_remaining(deadline)?;
-    let Some((_, mut linked)) =
-        Recorded::open(core, session, Requirement::Finished(directory), deadline)?
-    else {
-        return Ok(CloseOutcome::Missing);
-    };
-    let address = &session.id;
-    close_remaining(deadline)?;
-    match linked
-        .connection
-        .call("terminal.rm", json!({"terminal": address}), deadline)
-    {
-        Ok(_) => {}
-        Err(CallError::Refused { kind, .. }) if kind == "not_found" => {
+    let admitted = authority::admit(evidence)?;
+    // Every refusal of the admitted operation, from the handle's own checks and the first read
+    // to the confirming read after a removal, keeps why no live owner was verified: it is
+    // attached here once.
+    (|| {
+        close_remaining(deadline)?;
+        let Some((recorded, mut linked)) =
+            Recorded::open(core, session, Requirement::Created(directory), deadline)?
+        else {
             return Ok(CloseOutcome::Missing);
-        }
-        Err(error) => return Err(error.into_error("terminal.rm")),
-    }
-    if get(&mut linked, address, deadline)?.is_some() {
-        bail!(
-            "Herdr terminal {address} is still held by its core after terminal.rm; the handle is retained"
-        );
-    }
-    Ok(CloseOutcome::Closed)
+        };
+        close_remaining(deadline)?;
+        end_and_remove(
+            core,
+            &mut linked,
+            &session.id,
+            deadline,
+            &Basis::Created {
+                recorded: &recorded,
+                admitted: &admitted,
+            },
+        )
+    })()
+    .map_err(|error| admitted.explain(error))
 }
 
 fn surface_present(
@@ -980,7 +822,6 @@ fn verify_surface(
 fn read_screen(core: &dyn Core, session: &TerminalSession, deadline: Instant) -> Result<String> {
     let mut linked = live_target(core, session, deadline)?;
     let read = linked
-        .connection
         .call(
             "terminal.read",
             json!({"terminal": session.id, "lines": 0}),
@@ -1012,7 +853,7 @@ fn send_file(
         })
         .map_err(TerminalSendFailure::not_sent)?;
     let mut linked = live_target(core, session, deadline).map_err(TerminalSendFailure::not_sent)?;
-    match linked.connection.call(
+    match linked.call(
         "terminal.send",
         json!({"terminal": session.id, "text": text}),
         deadline,
@@ -1058,7 +899,7 @@ fn caller_on(core: &dyn Core, linked: &mut Linked<'_>, deadline: Instant) -> Res
     let Some(observed) = get(linked, &address, deadline)? else {
         return Ok(Caller::Outside(format!(
             "HC_TERMINAL_ID names {address}, which the Herdr Core at {} does not hold",
-            linked.socket.display()
+            linked.socket().display()
         )));
     };
     let (State::Live, Some(program)) = (observed.state, observed.pid) else {
@@ -1193,7 +1034,7 @@ impl<C: Core> Adapter<C> {
             |startup_deadline| create(&self.core, command, directory, startup_deadline, deadline),
             |_, _| Ok(()),
             |session, deadline| {
-                close_until(&self.core, session, directory, deadline)
+                close_owned(&self.core, session, directory, deadline)
                     .map(|_| ())
                     .map_err(|error| {
                         retain_unremoved(
@@ -1260,7 +1101,17 @@ impl<C: Core> Adapter<C> {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_until(&self.core, session, directory, deadline)
+        close_owned(&self.core, session, directory, deadline)
+    }
+
+    pub(in crate::native::terminal) fn close_created(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        evidence: CreationEvidence,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_created(&self.core, session, directory, evidence, deadline)
     }
 }
 
@@ -1350,13 +1201,26 @@ mod posix_adapter {
             close: OwnedSurfaceClose,
             deadline: Instant,
         ) -> Result<CloseOutcome> {
-            if close == OwnedSurfaceClose::RemoveEnded {
-                return super::remove_ended(&self.core, session, directory, deadline);
+            match close {
+                OwnedSurfaceClose::CreatedSurface(evidence) => {
+                    self.close_created(directory, session, evidence, deadline)
+                }
+                OwnedSurfaceClose::LiveOwner => {
+                    record_live_owner_intent(directory, id, session, deadline)?;
+                    self.close(directory, session, deadline)
+                }
+                // The decision, 0.4.49's code, left the close to the surface alone: a replayed
+                // teardown intent whose owner record is then found absent, in a launching or
+                // failed session. The terminal is closed on its creation record: settled on
+                // `not_found` and removed when finished, as 0.4.49 did, and never ended while
+                // it runs (the owner's decision of 2026-11-26).
+                OwnedSurfaceClose::SurfaceOnly => self.close_created(
+                    directory,
+                    session,
+                    crate::native::terminal::close_authority::CreationEvidence::surface_only(),
+                    deadline,
+                ),
             }
-            if close == OwnedSurfaceClose::LiveOwner {
-                record_live_owner_intent(directory, id, session, deadline)?;
-            }
-            self.close(directory, session, deadline)
         }
     }
 
@@ -1447,6 +1311,15 @@ mod windows_adapter {
             deadline: Instant,
         ) -> Result<CloseOutcome> {
             self.close(directory, session, deadline)
+        }
+        fn close_created_surface(
+            &self,
+            directory: &Path,
+            session: &TerminalSession,
+            evidence: crate::native::terminal::close_authority::CreationEvidence,
+            deadline: Instant,
+        ) -> Result<CloseOutcome> {
+            self.close_created(directory, session, evidence, deadline)
         }
         fn surface_present(
             &self,

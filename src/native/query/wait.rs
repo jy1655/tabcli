@@ -737,7 +737,7 @@ mod tests {
                 if ends {
                     assert_eq!(
                         value["error"],
-                        "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request"
+                        "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request; close-session --explicit closes a terminal that outlived its owner"
                     );
                 }
             }

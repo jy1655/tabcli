@@ -39,13 +39,14 @@ fn usable_endpoint(endpoint: &str) -> bool {
 /// | Operations | Directory | State | Additional evidence |
 /// | --- | --- | --- | --- |
 /// | Send, screen, verify | Managed Session id | Live | Program still exists |
-/// | Presence, close, cleanup after binding fails | Exact path | Either | |
-/// | Remove after owner exits (Unix) | Exact path | Finished | Launch label |
+/// | Presence, close with a live owner, cleanup after binding fails | Exact path | Either | |
+/// | Close with no live owner (`Created`) | Exact path | Either | A whole creation record, launch label |
+///
+/// A `Created` close never ends a running terminal (`still_running`).
 pub(super) enum Requirement<'a> {
     Live,
     Bound(&'a Path),
-    #[cfg(unix)]
-    Finished(&'a Path),
+    Created(&'a Path),
 }
 
 pub(super) struct Recorded<'a> {
@@ -89,6 +90,11 @@ impl<'a> Recorded<'a> {
             surface,
             requirement,
         };
+        // Absence from the core settles a close on the creation record only for a handle whose
+        // creation record is whole, so it is checked before the core is asked.
+        if let Requirement::Created(_) = recorded.requirement {
+            recorded.check_creation_record_whole()?;
+        }
         let mut linked = link(
             core,
             Path::new(&surface.socket),
@@ -102,11 +108,25 @@ impl<'a> Recorded<'a> {
         Ok(Some((recorded, linked, observed)))
     }
 
+    /// The permanent id of the core the handle records.
+    pub(super) fn core_id(&self) -> &str {
+        &self.surface.core_id
+    }
+
+    /// The terminal address the handle records.
+    pub(super) fn address(&self) -> &str {
+        &self.session.id
+    }
+
     /// Applies the same proof to a fresh observation on the verified connection.
     pub(super) fn check(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
         let identity = self.check_identity(core, observed);
         match self.requirement {
             Requirement::Bound(_) => identity,
+            Requirement::Created(_) => {
+                identity?;
+                self.check_launch(observed)
+            }
             Requirement::Live => {
                 identity?;
                 let address = &observed.address;
@@ -118,12 +138,84 @@ impl<'a> Recorded<'a> {
                 }
                 Ok(())
             }
-            #[cfg(unix)]
-            Requirement::Finished(_) => {
-                identity.context(CLOSE_STOPPED)?;
-                self.check_finished(observed)
-            }
         }
+    }
+
+    /// The proof `authority::grant` asks of a close on the creation record: the handle was
+    /// opened for one, and the observation matches its identity and launch label.
+    pub(super) fn check_creation_record(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
+        if !matches!(self.requirement, Requirement::Created(_)) {
+            bail!("a close on the creation record needs a handle opened for one");
+        }
+        self.check(core, observed)
+    }
+
+    /// The handle's own creation record is whole when its decoded values pass three checks,
+    /// each derived from the released writers (0.4.45 to 0.4.49): a host PID that this
+    /// platform's process reader reports (`host_pid_reported`), a host birth of this platform's
+    /// kind with values its writers record (`host_birth_written`), and a launch label as the
+    /// generators wrote it, 32 lowercase hexadecimal digits (on Windows, where every writer saved
+    /// it, present; never an explicit `null`). The macOS and Linux writers of 0.4.45 and 0.4.46
+    /// omitted the field; their label is checked on the terminal and compared with its name
+    /// (`check_launch`). The wire spelling is not examined (the shared decoder's aliases,
+    /// unknown fields, case): this path ends nothing and removes only a terminal the verified
+    /// core identifies, so settling an oddly spelled handle on `not_found` can at worst leave a
+    /// terminal the core still lists, while refusing it would strand the session.
+    fn check_creation_record_whole(&self) -> Result<()> {
+        let address = &self.session.id;
+        let damaged = |what: &str| {
+            anyhow::anyhow!(
+                "Herdr handle for terminal {address} records {what}; the handle is retained"
+            )
+        };
+        if !host_pid_reported(self.surface.host_pid) {
+            return Err(damaged(
+                "a host PID that this platform's process reader never reports",
+            ));
+        }
+        if !host_birth_written(&self.surface.birth) {
+            return Err(damaged(
+                "a host birth that no writer on this platform records",
+            ));
+        }
+        if self.session.herdr_launch_nonce_is_null() {
+            return Err(damaged("a null launch label, which no writer saved"));
+        }
+        match self.session.herdr_launch_nonce() {
+            Some(nonce) if written_launch_label(nonce) => Ok(()),
+            Some(_) => Err(damaged("a damaged launch label")),
+            #[cfg(unix)]
+            None => Ok(()),
+            #[cfg(windows)]
+            None => Err(damaged(
+                "no launch label, which every Windows Herdr handle TAB wrote has",
+            )),
+        }
+    }
+
+    /// The refusal of a close on the creation record for a running terminal: TAB does not end
+    /// it (the owner's decision of 2026-11-26). It says what TAB established (it could not
+    /// verify a live owner of this session, and why when the owner record or its process could
+    /// not be read), names the recorded core, and names what works, in this platform's `hc`
+    /// form on the recorded endpoint: look at the terminal, check the core and the session
+    /// directory as the guide says, end the terminal there or wait for it to finish, then close
+    /// the session again, which removes the finished terminal.
+    pub(super) fn still_running(&self, address: &str, unverified: Option<&str>) -> String {
+        let socket = &self.surface.socket;
+        let core_id = &self.surface.core_id;
+        let session = self
+            .session
+            .managed_session_id
+            .as_deref()
+            .unwrap_or("<session>");
+        let get = hc_command(socket, "get", address, cfg!(windows));
+        let kill = hc_command(socket, "kill", address, cfg!(windows));
+        let why = unverified
+            .map(|why| format!(" ({why})"))
+            .unwrap_or_default();
+        format!(
+            "Herdr terminal {address} on the recorded Herdr Core {core_id} is still running, and TAB could not verify a live owner for this session{why}, so it does not end the terminal; nothing was sent and the handle is retained. Look at it with `{get}`. Before ending it yourself, run `tabcli doctor {session} --probe` to check that the recorded core answers at its endpoint, and check that the program arguments `hc get` shows name this session's directory. Then end it with `{kill}`, or wait for it to finish, and run close-session again: it removes the finished terminal and closes the session"
+        )
     }
 
     fn check_identity(&self, core: &dyn Core, observed: &Observed) -> Result<()> {
@@ -131,9 +223,7 @@ impl<'a> Recorded<'a> {
         let address = &observed.address;
         let directory = match self.requirement {
             Requirement::Live => None,
-            Requirement::Bound(directory) => Some(directory),
-            #[cfg(unix)]
-            Requirement::Finished(directory) => Some(directory),
+            Requirement::Bound(directory) | Requirement::Created(directory) => Some(directory),
         };
         let argv_directory = observed.argv.get(2);
         let session_directory = match directory {
@@ -159,16 +249,25 @@ impl<'a> Recorded<'a> {
         {
             bail!("Herdr terminal {address} is not the terminal this session created");
         }
+        // Every check runs on a connection whose `hello` named the recorded core id, so a refusal
+        // from here on says that the recorded core answered at its endpoint.
+        let core_id = &recorded.core_id;
         if observed.keep {
             if observed.state == State::Finished {
                 let get = hc_command(&recorded.socket, "get", address, cfg!(windows));
                 let remove = hc_command(&recorded.socket, "rm", address, cfg!(windows));
                 bail!(
-                    "finished Herdr terminal {address} is set to keep; verify it with `{get}`, run `{remove}`, then retry close-session"
+                    "finished Herdr terminal {address} is set to keep on the recorded Herdr Core {core_id}, which answered at its endpoint; verify it with `{get}`, run `{remove}`, then retry close-session"
                 );
             }
+            let keep_off = hc_command(
+                &recorded.socket,
+                "keep",
+                &format!("{address} --off"),
+                cfg!(windows),
+            );
             bail!(
-                "Herdr terminal {address} is set to keep, so a replacement program can run in it; run `hc keep {address} --off` first"
+                "Herdr terminal {address} is set to keep on the recorded Herdr Core {core_id}, which answered at its endpoint, so a replacement program can run in it; run `{keep_off}` first"
             );
         }
         if observed.state == State::Live
@@ -182,27 +281,30 @@ impl<'a> Recorded<'a> {
         Ok(())
     }
 
-    #[cfg(unix)]
-    fn check_finished(&self, observed: &Observed) -> Result<()> {
+    /// The launch label TAB set at creation, part of the creation record every close checks in
+    /// either terminal state.
+    fn check_launch(&self, observed: &Observed) -> Result<()> {
         let address = &observed.address;
-        if observed.state != State::Finished {
-            bail!(
-                "Herdr terminal {address} is still running although its native-session owner is no longer live; TAB does not end it without that owner, so no close was sent and the handle is retained"
-            );
-        }
         let nonce = observed
             .launch
             .as_deref()
-            .context("finished Herdr terminal is missing its launch label")?;
+            .with_context(|| format!("Herdr terminal {address} is missing its launch label"))?;
         let matches_launch = match self.session.herdr_launch_nonce() {
             Some(expected) => nonce == expected,
-            // Records from 0.4.45 and 0.4.46 omitted the nonce.
+            // Records from 0.4.45 and 0.4.46, on macOS and Linux only, omitted the nonce. Every
+            // Windows writer (0.4.47 on) saved it, so a Windows handle without one is not TAB's
+            // (`check_creation_record_whole` refuses it first).
+            // The observed label must itself be one the generators wrote before its name is
+            // compared (`launch_name` refuses any other form).
+            #[cfg(unix)]
             None => observed.name.as_deref() == Some(launch_name(nonce)?.as_str()),
+            #[cfg(windows)]
+            None => bail!(
+                "Herdr handle for terminal {address} records no launch label, which every Windows Herdr handle TAB wrote has; the handle is retained"
+            ),
         };
         if !matches_launch {
-            bail!(
-                "finished Herdr terminal {address} has a different launch label; the handle is retained"
-            );
+            bail!("Herdr terminal {address} has a different launch label; the handle is retained");
         }
         Ok(())
     }
@@ -306,8 +408,8 @@ impl<'a> Launch<'a> {
     ) -> TerminalSession {
         TerminalSession::new(TerminalKind::Herdr, observed.address.clone()).with_herdr_core(
             HerdrSurface {
-                socket: linked.socket.to_string_lossy().into_owned(),
-                core_id: linked.core_id.clone(),
+                socket: linked.socket().to_string_lossy().into_owned(),
+                core_id: linked.core_id().to_owned(),
                 created_ms: observed.created_ms,
                 host_pid: pid,
                 birth,
@@ -317,9 +419,49 @@ impl<'a> Launch<'a> {
     }
 }
 
+/// The form every launch-token generator wrote (0.4.45 on, `unix.rs` and `pipe.rs` today): 16
+/// random bytes as 32 lowercase hexadecimal digits.
+fn written_launch_label(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A PID that this platform's process reader reports for the program a core started. Every
+/// writer took the PID the core reported (above zero) and recorded a handle only after that
+/// reader returned the program's birth: on macOS (`macos_process_info`) and Linux (procfs
+/// `read_stat`) the reader refuses anything above `i32::MAX`; on Windows (`OpenProcess`) it
+/// takes any nonzero `DWORD`.
+fn host_pid_reported(pid: u32) -> bool {
+    #[cfg(unix)]
+    return pid > 0 && pid <= i32::MAX as u32;
+    #[cfg(windows)]
+    return pid > 0;
+}
+
+/// A host birth of this platform's kind with values its writers record: on macOS the kernel's
+/// start `timeval`, whose microseconds are below a second; on Linux the kernel's boot identity,
+/// a random UUID that is never all zero, and any procfs start tick, zero included (a program
+/// started in its time namespace's first tick); on Windows any `GetProcessTimes` creation time.
+fn host_birth_written(birth: &HerdrHostBirth) -> bool {
+    match *birth {
+        HerdrHostBirth::Macos {
+            host_start_microseconds,
+            ..
+        } => cfg!(target_os = "macos") && host_start_microseconds < 1_000_000,
+        HerdrHostBirth::Linux { linux_birth } => {
+            cfg!(target_os = "linux") && !linux_birth.boot_id.is_nil()
+        }
+        HerdrHostBirth::Windows { .. } => cfg!(windows),
+    }
+}
+
+/// The local name TAB gives the terminal of a launch label, which must be one the generators
+/// wrote.
 fn launch_name(nonce: &str) -> Result<String> {
-    if nonce.len() < NAME_ENTROPY || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("the Herdr launch token is not hexadecimal");
+    if !written_launch_label(nonce) {
+        bail!("the Herdr launch label is not 32 lowercase hexadecimal digits");
     }
     Ok(format!("{NAME_PREFIX}{}", &nonce[..NAME_ENTROPY]))
 }

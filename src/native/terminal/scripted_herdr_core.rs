@@ -31,6 +31,25 @@ const CREATED_MS: u64 = 1_794_000_000_007;
 const HOST_PID: u32 = 4_194_305;
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 
+pub(super) fn test_birth(start: u64) -> HerdrHostBirth {
+    #[cfg(target_os = "macos")]
+    return HerdrHostBirth::Macos {
+        host_start_seconds: 1_800_000_000,
+        host_start_microseconds: start,
+    };
+    #[cfg(target_os = "linux")]
+    return HerdrHostBirth::Linux {
+        linux_birth: crate::native::terminal::LinuxBirth {
+            boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
+            starttime_ticks: start,
+        },
+    };
+    #[cfg(windows)]
+    return HerdrHostBirth::Windows {
+        host_creation_time: 134_000_000_000_000_000 + start,
+    };
+}
+
 pub(in crate::native) struct ScriptedHerdrCore {
     endpoint: PathBuf,
     runs: Arc<AtomicUsize>,
@@ -81,10 +100,7 @@ impl ScriptedHerdrCore {
                     core_id: CORE_ID.into(),
                     created_ms: CREATED_MS,
                     host_pid: HOST_PID,
-                    birth: HerdrHostBirth::Macos {
-                        host_start_seconds: 1,
-                        host_start_microseconds: 0,
-                    },
+                    birth: test_birth(1),
                 },
                 NONCE,
             );
