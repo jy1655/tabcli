@@ -894,11 +894,23 @@ pub(super) fn recover_pending_completion_locked(
     directory: &Path,
     claim_path: &Path,
 ) -> Result<bool> {
+    recover_pending_completion_from_tombstone_locked(
+        directory,
+        claim_path,
+        Reader::open_unchecked(directory).closed_if_present()?,
+    )
+}
+
+pub(super) fn recover_pending_completion_from_tombstone_locked(
+    directory: &Path,
+    claim_path: &Path,
+    tombstone: Option<SessionStatus>,
+) -> Result<bool> {
     let completion_path = Reader::open_unchecked(directory)
         .record(CoreRecord::Completion)
         .path()
         .to_owned();
-    if let Some(tombstone) = Reader::open_unchecked(directory).closed_if_present()? {
+    if let Some(tombstone) = tombstone {
         return super::close::converge_interrupted(
             &Store::open_unchecked(directory),
             claim_path,

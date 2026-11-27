@@ -287,8 +287,8 @@ pub(in crate::native) enum RepairSurfaces<'a> {
 pub(in crate::native) enum RepairSurface<'a> {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     Retain,
-    /// Settle from the Records, after `Retention` finds nothing to keep again under the
-    /// lifecycle lock: the scan that chose to settle ran without it.
+    /// Settle from the Records after `Retention` rechecks under the lifecycle lock.
+    /// Standalone Repair makes its initial choice before taking that lock.
     Settle(Retention),
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "linux", windows)),
@@ -297,10 +297,9 @@ pub(in crate::native) enum RepairSurface<'a> {
     CloseOnWindows(WindowsClose<'a>),
 }
 
-/// What a dead owner's Repair keeps for an explicit close instead of settling it. The scan
-/// runs once without the lifecycle lock to choose, and again under that lock before a
-/// settlement: an explicit close holds the lock from its handle claim to its restore, so the
-/// first scan can miss a handle that the close then restores.
+/// What a dead owner's Repair keeps for an explicit close. Standalone Repair scans
+/// before taking the lifecycle lock and rechecks under the lock before settlement.
+/// Its first scan can miss a handle that a concurrent explicit close later restores.
 #[derive(Clone, Copy)]
 pub(in crate::native) enum Retention {
     /// macOS and Linux: a close intent, even an invalid one, and a handle of a kind whose

@@ -6,7 +6,7 @@ mod locks;
 mod state_root;
 
 // Preserve the existing namespace, including helpers now used only inside a child.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(in crate::native) use durable::with_step_at;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 pub(in crate::native) use durable::with_sync_delay;
@@ -156,14 +156,15 @@ pub(in crate::native) fn read_regular_record(
 /// A core record's bytes as strict UTF-8 text. Invalid bytes are reported as the text
 /// readers report them (`fs::read_to_string`), under `failed to read {path}`.
 pub(in crate::native) fn strict_text(path: &Path, bytes: Vec<u8>) -> Result<String> {
-    String::from_utf8(bytes)
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
-        })
-        .with_context(|| format!("failed to read {}", path.display()))
+    String::from_utf8(bytes).map_err(|_| invalid_record_text(path))
+}
+
+pub(super) fn invalid_record_text(path: &Path) -> anyhow::Error {
+    anyhow::Error::from(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "stream did not contain valid UTF-8",
+    ))
+    .context(format!("failed to read {}", path.display()))
 }
 pub(in crate::native) fn read_manifest(directory: &Path) -> Result<SessionManifest> {
     // The manifest decides a session's scope (workspace, provider) for every read-only
