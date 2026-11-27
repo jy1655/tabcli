@@ -245,11 +245,10 @@ core's account before it creates the terminal and fails at once with the reason;
 own token cannot read the directory's access list, it leaves the check to the host. An
 elevated TAB, such as an administrator's SSH session, normally gives the directory the
 Administrators group as owner, which the host of a core that is not elevated refuses: run TAB
-without elevation, as the core runs. A refusal only the host can know, such as a directory
-changed after TAB's check, goes to the launch log when the host can still write it; once the
-core reports the terminal finished, the start fails at TAB's next check of the terminal,
-normally about a second later, when TAB can read that the launch is still its own and pending,
-and its error names the launch log. `close-session` removes the finished terminal.
+without elevation, as the core runs. If the host refuses the directory after TAB's check,
+it leaves the directory untouched. Once the core reports the terminal finished, the start fails
+at TAB's next check of the terminal, normally about a second later, when TAB can read that the
+launch is still its own and pending, and its error names the launch log. `close-session` removes the finished terminal.
 
 ```powershell
 tabcli ask pi --terminal herdr --workspace C:\path\to\project --prompt "Explain this project."

@@ -205,8 +205,8 @@ there and is returned with the refusal; the log line is best effort, and a failu
 is not reported. The directory is judged once, as TAB saw it: correcting it while the start
 waits does not change the outcome, so correct it and run the command again. TAB cannot know a
 change made after its check, a host started under another account than the one it named, or an
-error only the host meets; the host still refuses those and appends to its launch log when it
-can. A Herdr start then fails at TAB's next check of the terminal, normally about a second
+error only the host meets. A host that refuses the directory leaves its contents untouched.
+A Herdr start then fails at TAB's next check of the terminal, normally about a second
 after the core reports it finished, when TAB can read that the launch is still its own and
 pending and that no provider was started (when TAB completes that settlement, the session
 records `terminal surface finished before provider launch was confirmed` and the error adds the

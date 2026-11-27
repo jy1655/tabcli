@@ -133,6 +133,7 @@ pub(super) fn while_capture_eligible<T>(
     act()
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(super) fn run_bound_host<T>(
     directory: &Path,
     spec: &BoundHostSpec,
@@ -531,11 +532,11 @@ fn run_handoff_with<T>(
     use launch::pending::{self, Expiry};
 
     let name = kind.display_name();
-    let store = Store::open_unchecked(directory);
     let start = clock.now();
-    // Direct hosts have always logged admission refusals as well as later errors.
+    let id = admit(directory, &BoundHostSpec { name })?;
+    let store = Store::open_unchecked(directory);
     let refused = |error: &anyhow::Error| log_refusal(&store, kind, &format_args!(": {error:#}"));
-    let (initial, surface, flushed) = run_bound_host(directory, &BoundHostSpec { name }, |id| {
+    let prepare_handoff = || {
         let initial =
             launch::read(&store)?.with_context(|| format!("missing {name} launch receipt"))?;
         let surface = wait_for_host_binding(&store, id, kind, clock, validate)?;
@@ -552,8 +553,8 @@ fn run_handoff_with<T>(
             "{name} binding changed"
         );
         Ok((initial, surface, flush()))
-    })
-    .inspect_err(refused)?;
+    };
+    let (initial, surface, flushed) = prepare_handoff().inspect_err(refused)?;
 
     let (reason, outcome) = match flushed {
         Ok(()) => (FailureReason::LaunchShellExecFailed, handoff()),
