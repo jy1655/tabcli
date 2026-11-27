@@ -798,6 +798,8 @@ fn mark_session_closed_with_residual_locked(
     let consume_result = (|| {
         if store.record(CoreRecord::Terminal).present()?
             || store.record(CoreRecord::TerminalClosing).present()?
+            || (store.record(CoreRecord::TerminalClosed).present()?
+                && !committed_consumption_marker(store)?)
         {
             consume_terminal_handle(store, None, error.as_deref())
         } else {
