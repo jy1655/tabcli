@@ -325,6 +325,7 @@ fn spawn_fence_selects_the_wrapper_and_only_it_settles() {
         &mut command,
         None,
         Some(&spawner),
+        std::convert::identity,
         || {
             assert!(recorded_owner_matches(&store, &spawner)?);
             Ok(())
@@ -340,6 +341,7 @@ fn spawn_fence_selects_the_wrapper_and_only_it_settles() {
         &mut command,
         None,
         Some(&other),
+        std::convert::identity,
         || panic!("refused wrapper started a watcher"),
         |_| panic!("only one provider can start"),
     )
@@ -389,13 +391,19 @@ fn version_failure_of_an_unrecorded_wrapper_preserves_the_spawned_launch() {
             receipt.phase = Phase::Spawned;
             store.record(CoreRecord::Launch).write_json(&receipt)?;
             update_status(store.directory(), SessionState::Running, None, None)?;
-            before = Some(launch_files(&store));
+            before = Some((launch_files(&store), fs::read(store.directory().join(LOG))?));
             bail!("scripted version failure")
         },
     )
     .unwrap_err();
     assert_eq!(error.to_string(), "scripted version failure");
-    assert_eq!(launch_files(&store), before.unwrap());
+    assert_eq!(
+        (
+            launch_files(&store),
+            fs::read(store.directory().join(LOG)).unwrap()
+        ),
+        before.unwrap()
+    );
 }
 
 #[test]
@@ -431,6 +439,7 @@ fn definitive_spawn_failure_settles_before_another_registration() {
         &mut command,
         None,
         Some(&spawner),
+        std::convert::identity,
         || Ok(()),
         |_| unreachable!(),
     )
@@ -441,4 +450,87 @@ fn definitive_spawn_failure_settles_before_another_registration() {
     assert!(turn::current_claim_token(&store).unwrap().is_none());
     assert!(register_wrapper(&store, || Ok(wrapper_owner(&store, 20))).is_err());
     assert!(recorded_owner_matches(&store, &spawner).unwrap());
+}
+
+#[test]
+fn watcher_start_failure_observes_pending_and_settles_under_the_fence() {
+    let (directory, store) = directory(&[]);
+    let owner = wrapper_owner(&store, 10);
+    register_wrapper(&store, || Ok(owner.clone())).unwrap();
+    let mut command = Command::new(directory.path().join("unused"));
+    let error = spawn_for_wrapper(
+        &store,
+        &mut command,
+        None,
+        Some(&owner),
+        std::convert::identity,
+        || {
+            assert_eq!(read(&store)?.unwrap().phase, Phase::Pending);
+            bail!("watcher start failed")
+        },
+        |_| unreachable!(),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "watcher start failed");
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some("watcher start failed")
+    );
+    assert_eq!(read(&store).unwrap().unwrap().phase, Phase::Pending);
+    assert!(turn::current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
+fn registration_identifies_without_the_lock_and_rechecks_admission() {
+    let (_directory, store) = directory(&[]);
+    let original = wrapper_owner(&store, 10);
+    register_wrapper(&store, || Ok(original.clone())).unwrap();
+    let error = register_wrapper(&store, || {
+        let _lock = store.try_lock()?.expect("identification must be unlocked");
+        update_status(store.directory(), SessionState::Running, None, None)?;
+        bail!("identification failed")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled or already attempted"));
+    assert!(recorded_owner_matches(&store, &original).unwrap());
+}
+
+#[test]
+fn reopen_refusal_is_recorded_only_for_the_registered_owner() {
+    let (_directory, store) = directory(&[]);
+    let owner = wrapper_owner(&store, 10);
+    store.write_owner(&owner).unwrap();
+    let refusal = || anyhow::anyhow!("conversation already held");
+    let other = wrapper_owner(&store, 20);
+    let skipped = wrapper::reopen_refusal(&store, Some(&other), refusal()).unwrap();
+    assert!(skipped.is::<WrapperRefusal>());
+    assert!(!store.record(CoreRecord::ReopenRefusal).present().unwrap());
+    let recorded = wrapper::reopen_refusal(&store, Some(&owner), refusal()).unwrap();
+    assert!(!recorded.is::<WrapperRefusal>());
+    let detail: serde_json::Value = store.record(CoreRecord::ReopenRefusal).json().unwrap();
+    assert_eq!(detail["detail"], "conversation already held");
+}
+
+#[test]
+fn recorded_wrapper_settlement_errors_keep_the_bootstrap_stderr() {
+    for damaged in [CoreRecord::Owner, CoreRecord::Completion] {
+        let (_directory, store) = version_check_fixture();
+        let error = wrapper::run_registered(
+            &store,
+            || Ok(wrapper_owner(&store, 10)),
+            |_, _, _| {
+                if matches!(damaged, CoreRecord::Owner) {
+                    store.record(damaged).write_json(&"malformed")?;
+                } else {
+                    fs::create_dir(store.record(damaged).path())?;
+                }
+                bail!("version check failed")
+            },
+        )
+        .unwrap_err();
+        assert!(!error.is::<WrapperRefusal>());
+        let message = format!("{error:#}");
+        assert!(message.contains("version check failed"), "{message}");
+        assert!(message.contains("finalization also failed"), "{message}");
+    }
 }

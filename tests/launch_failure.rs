@@ -386,3 +386,65 @@ fn doctor_reports_launch_failure_instead_of_waiting_for_the_request() {
     assert_eq!(turn["reason_code"], "launch_failed");
     assert_eq!(fixture.status(), before);
 }
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_stderr_follows_the_wrapper_decision() {
+    for (case, terminal_only) in [
+        ("refused", true),
+        ("other owner", true),
+        ("single", false),
+        ("bad receipt", false),
+        ("bad lock", false),
+        ("bad directory", false),
+        ("failed settlement", false),
+    ] {
+        let fixture = Fixture::new(
+            if case == "refused" {
+                "spawned"
+            } else {
+                "pending"
+            },
+            false,
+        );
+        let id = match case {
+            "bad directory" => "../invalid",
+            _ => "session-launch",
+        };
+        match case {
+            "other owner" => fixture.write("native-session.json", json!({"pid":42})),
+            "bad receipt" => fixture.write("launch.json", json!("broken")),
+            "bad lock" => fs::create_dir(fixture.directory.join("turn.claim.lock")).unwrap(),
+            "failed settlement" => {
+                fs::create_dir(fixture.directory.join("turn.completion.json")).unwrap()
+            }
+            _ => {}
+        }
+        let terminal = fixture.root.path().join("terminal-stderr");
+        let captured = fixture.root.path().join("captured-stderr");
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"exec "$1" native-session "$2" 3>"$3" 2>"$4""#,
+                "bootstrap",
+            ])
+            .arg(env!("CARGO_BIN_EXE_tabcli"))
+            .arg(id)
+            .arg(&terminal)
+            .arg(&captured)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
+            .env("AGENT_BRIDGE_LAUNCH_STDERR_FD", "3")
+            .env_remove("AGENT_BRIDGE_LAUNCH_STDOUT_FD")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "{case}");
+        let terminal = fs::read_to_string(terminal).unwrap();
+        let captured = fs::read_to_string(captured).unwrap();
+        assert_eq!(!terminal.is_empty(), terminal_only, "{case}: {terminal}");
+        assert_eq!(captured.is_empty(), terminal_only, "{case}: {captured}");
+        if case == "failed settlement" {
+            assert!(captured.contains("finalization also failed"), "{captured}");
+        }
+    }
+}

@@ -33,8 +33,8 @@ pub(in crate::native) mod host;
 pub(in crate::native) mod launcher;
 pub(in crate::native) mod pending;
 pub(in crate::native) mod wrapper;
-// Written at the end of the launch log by whoever sees the wrapper end: the bootstrap for a
-// wrapper that could not write, or the recorded wrapper itself.
+// The bootstrap records the wrapper exit. A wrapper also records its own settlement,
+// including an early failure that settles an ownerless pending launch.
 pub(in crate::native) const WRAPPER_EXIT_CODE_MARKER: &str = "wrapper_exit_code=";
 pub(in crate::native) use super::state::RESIDUAL_SURFACE_MARKER;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1187,7 +1187,15 @@ pub(in crate::native) fn spawn_granted<F>(
 where
     F: FnOnce(&mut Child) -> Result<()>,
 {
-    spawn_for_wrapper(store, command, grant, None, || Ok(()), record_process)
+    spawn_for_wrapper(
+        store,
+        command,
+        grant,
+        None,
+        std::convert::identity,
+        || Ok(()),
+        record_process,
+    )
 }
 
 fn spawn_for_wrapper<F>(
@@ -1195,19 +1203,84 @@ fn spawn_for_wrapper<F>(
     command: &mut Command,
     grant: Option<&crate::native::consent::LaunchGrant>,
     owner: Option<&NativeSessionOwner>,
+    start_context: impl Fn(anyhow::Error) -> anyhow::Error,
     start_watcher: impl FnOnce() -> Result<()>,
     record_process: F,
 ) -> Result<Child>
 where
     F: FnOnce(&mut Child) -> Result<()>,
 {
+    let (_lock, mut record) =
+        lock_for_spawn(store, command, grant, owner).map_err(&start_context)?;
+    let settle_failure = |error: anyhow::Error| -> anyhow::Error {
+        if owner.is_some()
+            && let Err(settlement) = finalize_locked(store, Some(&error))
+        {
+            return anyhow::anyhow!(
+                "{error:#}; native session finalization also failed: {settlement:#}"
+            );
+        }
+        error
+    };
+    start_watcher().map_err(&settle_failure)?;
+    if let Some(record) = &mut record {
+        record.phase = Phase::Spawning;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(record)
+            .map_err(&start_context)?;
+    }
+    let mut child = match command.spawn().context("failed to spawn provider process") {
+        Ok(child) => child,
+        Err(error) => {
+            let error = start_context(error);
+            // The command started no provider. Restore Pending and settle before
+            // another wrapper can register against that receipt.
+            if let Some(record) = &mut record {
+                record.phase = Phase::Pending;
+                store
+                    .record(CoreRecord::Launch)
+                    .write_json(record)
+                    .with_context(|| format!("{error:#}; failed to reset the launch receipt"))?;
+            }
+            return Err(settle_failure(error));
+        }
+    };
+    if let Err(error) = record_process(&mut child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        // The child existed and could already have consumed its argument prompt. Keep
+        // Spawning even after cleanup; missing durable evidence is never a retry permit.
+        return Err(start_context(error));
+    }
+    if let Some(record) = &mut record {
+        record.phase = Phase::Spawned;
+        // The authoritative process record is already durable. An auxiliary handshake
+        // write must not kill a successfully started provider; readers also see its record.
+        if let Err(error) = store.record(CoreRecord::Launch).write_json(record) {
+            log(
+                store,
+                &format!("launch receipt update failed after spawn: {error:#}"),
+            );
+        }
+    }
+    log(store, &format!("provider_spawned pid={}", child.id()));
+    Ok(child)
+}
+
+fn lock_for_spawn(
+    store: &Store,
+    _command: &Command,
+    grant: Option<&crate::native::consent::LaunchGrant>,
+    owner: Option<&NativeSessionOwner>,
+) -> Result<(super::TurnClaimLock, Option<Record>)> {
     let directory = store.directory();
     // An exec Linux would refuse is refused here, before the launch phase moves.
     #[cfg(target_os = "linux")]
-    crate::native::provider_process::linux_exec_budget(command)
+    crate::native::provider_process::linux_exec_budget(_command)
         .context("provider launch was refused before spawn")?;
-    let _lock = Store::open_unchecked(directory).lock()?;
-    let mut record = read(store)?;
+    let lock = store.lock()?;
+    let record = read(store)?;
     // A command that carries a trust-bearing launch option is asked about here, under the lock
     // and immediately before the deadline check, so that the order (deadline, `Spawning`,
     // spawn) is unchanged: its consent, bound to the provider and workspace its plan was
@@ -1232,108 +1305,88 @@ where
         }
     }
     check_spawn_locked(store, record.as_ref())?;
-    if let Some(owner) = owner {
-        if !recorded_owner_matches(store, owner)? {
-            store.write_owner(owner)?;
-        }
+    if let Some(owner) = owner
+        && !recorded_owner_matches(store, owner)?
+    {
+        store.write_owner(owner)?;
         log(store, "owner_recorded");
     }
-    if let Some(record) = &mut record {
-        record.phase = Phase::Spawning;
-        Store::open_unchecked(directory)
-            .record(CoreRecord::Launch)
-            .write_json(record)?;
+    Ok((lock, record))
+}
+
+// Only this outcome sends the command's diagnostic to its own terminal when
+// the Unix bootstrap would otherwise capture stderr in the shared launch log.
+#[derive(Debug)]
+struct WrapperRefusal(anyhow::Error);
+
+impl std::fmt::Display for WrapperRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
     }
-    let started =
-        start_watcher().and_then(|()| command.spawn().context("failed to spawn provider process"));
-    let mut child = match started {
-        Ok(child) => child,
-        Err(error) => {
-            // Neither a watcher startup error nor Command::spawn returning Err started a provider.
-            if let Some(record) = &mut record {
-                record.phase = Phase::Pending;
-                Store::open_unchecked(directory)
-                    .record(CoreRecord::Launch)
-                    .write_json(record)?;
-            }
-            // Returning the receipt to Pending must not let another registration
-            // replace the spawner before its definitive failure is settled.
-            if owner.is_some() {
-                finalize_locked(store, Some(&error))?;
-            }
-            return Err(error);
-        }
-    };
-    if let Err(error) = record_process(&mut child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        // The child existed and could already have consumed its argument prompt. Keep
-        // Spawning even after cleanup; missing durable evidence is never a retry permit.
-        return Err(error);
-    }
-    if let Some(record) = &mut record {
-        record.phase = Phase::Spawned;
-        // The authoritative process record is already durable. An auxiliary handshake
-        // write must not kill a successfully started provider; readers also see its record.
-        if let Err(error) = Store::open_unchecked(directory)
-            .record(CoreRecord::Launch)
-            .write_json(record)
-        {
-            log(
-                store,
-                &format!("launch receipt update failed after spawn: {error:#}"),
-            );
-        }
-    }
-    log(store, &format!("provider_spawned pid={}", child.id()));
-    Ok(child)
+}
+impl std::error::Error for WrapperRefusal {}
+
+fn not_pending() -> WrapperRefusal {
+    WrapperRefusal(anyhow::anyhow!(
+        "provider launch cancelled or already attempted; the recorded session is unchanged"
+    ))
+}
+
+#[derive(Debug)]
+struct RegisteredWrapper {
+    owner: NativeSessionOwner,
+    claim_token: Option<String>,
 }
 
 /// The wrapper's admission: the launch it was started for is still the pending one.
-pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<()> {
-    let judged = match read(store)? {
+pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<Option<String>> {
+    let record = read(store)?;
+    let judged = match &record {
         Some(record) => pending::judge(
             store,
-            &record,
+            record,
             &record.claim_token,
             pending::Expiry::Unchecked,
         )?,
         None => pending::launching(store)?,
     };
-    anyhow::ensure!(
-        judged.is_ok(),
-        "provider launch cancelled or already attempted; the recorded session is unchanged"
-    );
-    Ok(())
+    anyhow::ensure!(judged.is_ok(), not_pending());
+    Ok(record.map(|receipt| receipt.claim_token))
 }
 
 fn register_wrapper(
     store: &Store,
     identify: impl FnOnce() -> Result<NativeSessionOwner>,
-) -> Result<NativeSessionOwner> {
+) -> Result<RegisteredWrapper> {
+    let claim_token = admit_wrapper(store)?;
+    let identified = identify();
     let _lock = store.lock()?;
-    admit_wrapper(store)?;
-    let registered = identify().and_then(|owner| {
+    anyhow::ensure!(admit_wrapper(store)? == claim_token, not_pending());
+    match identified.and_then(|owner| {
         store.write_owner(&owner)?;
         Ok(owner)
-    });
-    if let Err(error) = &registered
-        && matches!(
-            super::owner::observe(store),
-            super::owner::OwnerRecord::Absent
-        )
-        && matches!(
-            store.record(CoreRecord::ProviderProcess).present(),
-            Ok(false)
-        )
-    {
-        // Admission, registration and this decision share the lock. An ownerless
-        // failure can therefore settle only the pending launch we just admitted.
-        log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"));
-        finalize_locked(store, Some(error))
-            .with_context(|| format!("{error:#}; native session finalization also failed"))?;
+    }) {
+        Ok(owner) => {
+            log(store, "owner_recorded");
+            Ok(RegisteredWrapper { owner, claim_token })
+        }
+        Err(error) => {
+            match super::owner::observe(store) {
+                super::owner::OwnerRecord::Recorded(_) => return Err(WrapperRefusal(error).into()),
+                super::owner::OwnerRecord::Absent => {}
+                _ => return Err(error),
+            }
+            match store.record(CoreRecord::ProviderProcess).present() {
+                Ok(true) => return Err(WrapperRefusal(error).into()),
+                Err(_) => return Err(error),
+                Ok(false) => {}
+            }
+            log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"));
+            finalize_locked(store, Some(&error))
+                .with_context(|| format!("{error:#}; native session finalization also failed"))?;
+            Err(error)
+        }
     }
-    registered
 }
 
 fn recorded_owner_matches(store: &Store, owner: &NativeSessionOwner) -> Result<bool> {
@@ -1350,7 +1403,11 @@ fn recorded_owner_matches(store: &Store, owner: &NativeSessionOwner) -> Result<b
         }))
 }
 
-fn finalize_wrapper(store: &Store, owner: &NativeSessionOwner, result: &Result<()>) -> Result<()> {
+fn finalize_wrapper(
+    store: &Store,
+    owner: &NativeSessionOwner,
+    result: &Result<()>,
+) -> Result<bool> {
     let _lock = store.lock()?;
     if recorded_owner_matches(store, owner)? {
         match result {
@@ -1358,11 +1415,12 @@ fn finalize_wrapper(store: &Store, owner: &NativeSessionOwner, result: &Result<(
             Err(error) => log(store, &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}")),
         }
         finalize_locked(store, result.as_ref().err())?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
-// Settlement tests that start with an already admitted owner.
+// Settlement without the wrapper owner check, for tests of settlement itself.
 #[cfg(test)]
 pub(in crate::native) fn finalize(store: &Store, result: &Result<()>) -> Result<()> {
     let _lock = store.lock()?;
