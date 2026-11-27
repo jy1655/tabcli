@@ -3,7 +3,9 @@
 //! reaches it only through `Connection::call`, whose `Permit` only `linked` makes. Test builds
 //! also have `exchange_for_test`, limited to `hello`, `terminal.get` and `terminal.send`, and
 //! `stream`, which hands out the raw stream for the framing tests' inspection.
-use super::{CallError, Connection, MAX_REPLY, Permit, Stream, parse_reply, timed_out};
+use super::{
+    CallError, Connection, HostAccount, MAX_REPLY, Permit, Stream, parse_reply, timed_out,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -61,6 +63,10 @@ impl<S: Stream> Connection for Framed<S> {
         deadline: Instant,
     ) -> Result<Value, CallError> {
         self.request(method, params, deadline)
+    }
+
+    fn core_account(&self) -> Result<HostAccount> {
+        self.stream.peer_account()
     }
 }
 

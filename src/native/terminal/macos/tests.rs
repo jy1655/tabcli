@@ -7,11 +7,18 @@ use crate::native::terminal;
 #[test]
 fn herdr_host_selection_precedes_its_ghostty_terminal_identity() {
     const CHILD: &str = "TABCLI_TEST_HERDR_SELECTION";
+    const TEST: &str = "native::terminal::macos::tests::herdr_host_selection_precedes_its_ghostty_terminal_identity";
     if std::env::var_os(CHILD).is_some() {
-        assert_eq!(terminal::macos::select(None).unwrap().as_str(), "herdr");
+        // Herdr, and Ghostty, the identity hc gives, where Herdr is not admitted.
         assert_eq!(
-            terminal::macos::select(Some(terminal::TerminalKind::Iterm2)).unwrap(),
-            terminal::TerminalKind::Iterm2,
+            terminal::select_for(None).unwrap(),
+            terminal::Selection::Herdr {
+                fallback: terminal::TerminalKind::Ghostty
+            }
+        );
+        assert_eq!(
+            terminal::select_for(Some(terminal::TerminalKind::Iterm2)).unwrap(),
+            terminal::Selection::Kind(terminal::TerminalKind::Iterm2),
             "an explicit surface choice still wins inside Herdr"
         );
         return;
@@ -19,23 +26,14 @@ fn herdr_host_selection_precedes_its_ghostty_terminal_identity() {
     // Run selection in a separate process: no shared test environment is changed and
     // no terminal is opened. hc 0.1.21 supplies this exact conflicting identity.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "native::terminal::macos::tests::herdr_host_selection_precedes_its_ghostty_terminal_identity",
-            "--nocapture",
-        ])
+        .args(["--exact", TEST, "--nocapture"])
         .env(CHILD, "1")
         .env("HC_TERMINAL_ID", "t7")
         .env("TERM_PROGRAM", "ghostty")
         .env("TERM", "xterm-256color")
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    crate::native::tests::assert_child_ran_this_test(&output);
 }
 
 #[cfg(target_os = "macos")]

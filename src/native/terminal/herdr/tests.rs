@@ -55,11 +55,16 @@ struct FakeState {
     births: BTreeMap<u32, HerdrHostBirth>,
     parents: BTreeMap<u32, u32>,
     unreadable_parent: Option<u32>,
+    unknown_parent: Option<u32>,
     caller: Option<String>,
     current_pid: u32,
     /// Terminals of configured remote machines, which hc's list also returns.
     remote: Vec<Value>,
     after_call: Option<(&'static str, Mutation)>,
+    /// Each session directory the launch host's admission was asked about, with the number
+    /// of calls made before it, and the refusal that admission gives, if any.
+    admitted: Vec<(PathBuf, usize)>,
+    refused_directory: Option<String>,
 }
 
 type Mutation = Box<dyn FnOnce(&mut BTreeMap<String, Value>)>;
@@ -254,6 +259,10 @@ impl Connection for FakeConnection {
             None => result,
         }
     }
+    // The scripted core runs as this process.
+    fn core_account(&self) -> Result<HostAccount> {
+        HostAccount::current()
+    }
 }
 
 impl Core for FakeCore {
@@ -279,18 +288,35 @@ impl Core for FakeCore {
     fn current_pid(&self) -> u32 {
         self.0.borrow().current_pid
     }
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    fn parent_pid(&self, pid: u32) -> Result<Parent> {
         let state = self.0.borrow();
         if state.unreadable_parent == Some(pid) {
             bail!("process {pid} is unreadable");
         }
-        Ok(state.parents.get(&pid).copied())
+        if state.unknown_parent == Some(pid) {
+            return Ok(Parent::Unknown(format!(
+                "the parent of process {pid} ended"
+            )));
+        }
+        Ok(state
+            .parents
+            .get(&pid)
+            .map_or(Parent::Root, |parent| Parent::Process(*parent)))
     }
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
         Ok(self.0.borrow().births.get(&pid).copied())
     }
     fn launch_nonce(&self) -> Result<String> {
         Ok("0123456789abcdef0123456789abcdef".into())
+    }
+    fn admit_launch_directory(&self, directory: &Path, _: Option<&HostAccount>) -> Result<()> {
+        let mut state = self.0.borrow_mut();
+        let made = state.calls.len();
+        state.admitted.push((directory.to_owned(), made));
+        match &state.refused_directory {
+            Some(reason) => bail!("{reason}"),
+            None => Ok(()),
+        }
     }
     fn pause(&self, _: Instant) {}
 }
@@ -451,6 +477,17 @@ fn config_socket_reads_only_a_string_setting() {
         error_text(&read_config_socket(&unreadable).unwrap_err())
             .contains("does not guess the core's socket")
     );
+}
+
+// A configuration linked to the null device reads as an empty one, as hc reads it: no
+// `socket` setting, so the default socket is used.
+#[cfg(unix)]
+#[test]
+fn a_configuration_linked_to_the_null_device_is_empty() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    std::os::unix::fs::symlink("/dev/null", &config).unwrap();
+    assert_eq!(read_config_socket(&config).unwrap(), None);
 }
 
 #[test]
@@ -693,6 +730,102 @@ fn creation_needs_a_running_core_and_never_starts_one() {
     assert!(core.methods().is_empty());
 }
 
+// The launch host is the core's program: a session directory that its admission would refuse,
+// for the account of the process that serves the connection, is refused on that connection
+// before `terminal.run`, so no terminal exists; an admitted directory goes on to the run.
+#[test]
+fn creation_refuses_a_directory_the_cores_launch_host_would_refuse() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().refused_directory = Some(
+        "the Herdr launch host would refuse the session directory /state/session-herdr1: Herdr launch directory is not private to the current user".into(),
+    );
+    let error = error_text(&try_open(core.clone(), "launch", Path::new(DIRECTORY)).unwrap_err());
+    assert_eq!(
+        error,
+        "the Herdr terminal was not created: the Herdr launch host would refuse the session directory /state/session-herdr1: Herdr launch directory is not private to the current user"
+    );
+    assert_eq!(core.methods(), ["connect", "hello"]);
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), 2)]);
+    assert!(core.0.borrow().terminals.is_empty());
+    let core = FakeCore::new();
+    created(&core);
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), 2)]);
+    assert_eq!(core.methods()[..3], ["connect", "hello", "terminal.run"]);
+}
+
+// When the caller check fails on the first connection, the terminal is created on a new one.
+// The directory is admitted on that connection, for the account that serves it, right before
+// `terminal.run`, not on the connection that was given up.
+#[cfg(unix)]
+#[test]
+fn creation_admits_the_directory_on_the_connection_that_runs_the_terminal() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().caller = Some("t3".into());
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": 300, "argv": ["shell"], "created_ms": 1}),
+    );
+    core.inject("terminal.get", Injected::Instead(refused("unavailable")));
+    created(&core);
+    let methods = core.methods();
+    let run = methods
+        .iter()
+        .position(|method| method == "terminal.run")
+        .unwrap();
+    assert_eq!(
+        methods[..run],
+        ["connect", "hello", "terminal.get", "connect", "hello"]
+    );
+    assert_eq!(core.0.borrow().admitted, [(PathBuf::from(DIRECTORY), run)]);
+}
+
+// The launcher's probe before startup is confirmed reads the exact terminal this launch
+// created, with the presence proof: live is present, the core's `not_found` is absence, and a
+// finished terminal is the end of its program, with its exit code when the core gives one. A
+// finished terminal with another launch label, one set to keep, or one that is not this
+// launch's is an inspection error, which ends nothing.
+#[test]
+fn the_launch_probe_reports_a_finished_launch_terminal() {
+    let core = FakeCore::new();
+    let session = created(&core);
+    let adapter = Adapter::with_core(core.clone());
+    let probe = || adapter.during_launch(Path::new(DIRECTORY), &session, Duration::from_secs(5));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Present
+    );
+    core.set("t7", "state", json!("finished"));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Finished("Herdr terminal t7 finished".into())
+    );
+    core.set("t7", "exit_code", json!(3));
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Finished(
+            "Herdr terminal t7 exited with code 3".into()
+        )
+    );
+    let labels = core.terminal("t7").unwrap()["labels"].clone();
+    core.set(
+        "t7",
+        "labels",
+        json!({SESSION_LABEL: SESSION, LAUNCH_LABEL: "another"}),
+    );
+    assert!(error_text(&probe().unwrap_err()).contains("different launch label"));
+    core.set("t7", "labels", labels);
+    core.set("t7", "keep", json!(true));
+    assert!(error_text(&probe().unwrap_err()).contains("set to keep"));
+    core.set("t7", "keep", json!(false));
+    core.set("t7", "created_ms", json!(1));
+    assert!(error_text(&probe().unwrap_err()).contains("is not the terminal this session created"));
+    core.0.borrow_mut().terminals.clear();
+    assert_eq!(
+        probe().unwrap(),
+        crate::native::terminal::LaunchSurface::Absent
+    );
+}
+
 #[test]
 fn a_refused_run_creates_nothing_and_is_not_recovered() {
     let core = FakeCore::new();
@@ -848,14 +981,21 @@ fn an_unconfirmed_creation_is_removed_by_its_address() {
         fn current_pid(&self) -> u32 {
             1
         }
-        fn parent_pid(&self, _: u32) -> Result<Option<u32>> {
-            Ok(None)
+        fn parent_pid(&self, _: u32) -> Result<Parent> {
+            Ok(Parent::Root)
         }
         fn process_start(&self, _: u32) -> Result<Option<HerdrHostBirth>> {
             Ok(None)
         }
         fn launch_nonce(&self) -> Result<String> {
             self.0.launch_nonce()
+        }
+        fn admit_launch_directory(
+            &self,
+            directory: &Path,
+            account: Option<&HostAccount>,
+        ) -> Result<()> {
+            self.0.admit_launch_directory(directory, account)
         }
         fn pause(&self, _: Instant) {}
     }
@@ -1260,6 +1400,63 @@ fn an_automatic_choice_proves_the_caller_runs_inside_its_terminal() {
     );
 }
 
+// The ancestry walk compares every process it reaches, the last one within its bound
+// included, and tells a bound it reached from a chain that ended: the first is inconclusive,
+// the second proves the command is outside the terminal's program. Both refuse the choice.
+#[test]
+fn the_caller_check_compares_the_last_ancestor_and_reports_its_bound_apart() {
+    let core = FakeCore::new();
+    core.0.borrow_mut().caller = Some("t3".into());
+    // This process is 900; its ancestors are 1000, 1001, ...: `links` parent links up to
+    // the terminal's program, which is then the last process the walk reaches.
+    let chain = |links: u32| -> BTreeMap<u32, u32> {
+        let mut parents = BTreeMap::from([(900, 1000)]);
+        for pid in 1000..1000 + links {
+            parents.insert(pid, pid + 1);
+        }
+        parents
+    };
+    let program_at = |links: u32| 999 + links;
+    let limit = u32::try_from(MAX_ANCESTRY).unwrap();
+    for links in [1, limit - 1, limit] {
+        core.0.borrow_mut().terminals.insert(
+            "t3".into(),
+            json!({"address": "t3", "state": "live", "pid": program_at(links),
+                   "argv": ["sh"], "created_ms": 1, "labels": {}}),
+        );
+        core.0.borrow_mut().parents = chain(limit + 5);
+        verify_caller(&core, later()).unwrap_or_else(|error| {
+            panic!("a program {links} links above is the caller's: {error:#}")
+        });
+    }
+    // One link beyond the bound: not found within it, which proves nothing about the chain.
+    core.0.borrow_mut().terminals.insert(
+        "t3".into(),
+        json!({"address": "t3", "state": "live", "pid": program_at(limit + 1),
+               "argv": ["sh"], "created_ms": 1, "labels": {}}),
+    );
+    let text = error_text(&verify_caller(&core, later()).unwrap_err());
+    assert!(
+        text.contains(&format!("within {MAX_ANCESTRY} parent processes")),
+        "{text}"
+    );
+    assert!(text.contains("could not verify"), "{text}");
+    assert!(!text.contains("does not run inside its program"), "{text}");
+    assert!(text.contains("no other terminal was opened"), "{text}");
+    // A parent that could not be established (on Windows: it ended, its PID was reused, or it
+    // may not be inspected) is not the end of the chain: the check is unverified.
+    core.0.borrow_mut().unknown_parent = Some(1002);
+    let text = error_text(&verify_caller(&core, later()).unwrap_err());
+    assert!(text.contains("could not verify"), "{text}");
+    assert!(text.contains("the parent of process 1002 ended"), "{text}");
+    assert!(!text.contains("does not run inside its program"), "{text}");
+    core.0.borrow_mut().unknown_parent = None;
+    // A chain that ends at a root before the bound proves the command is outside.
+    core.0.borrow_mut().parents = chain(3);
+    let text = error_text(&verify_caller(&core, later()).unwrap_err());
+    assert!(text.contains("does not run inside its program"), "{text}");
+}
+
 #[test]
 fn the_attach_command_names_the_recorded_socket() {
     let core = FakeCore::new();
@@ -1405,6 +1602,13 @@ fn the_socket_connection_bounds_every_reply() {
         }
     });
     let mut connection = super::unix::open(&socket, later()).unwrap();
+    // The core's account is the peer's, which open required to be this process's.
+    assert!(
+        connection
+            .core_account()
+            .unwrap()
+            .same(&HostAccount::current().unwrap())
+    );
     assert_eq!(
         connection
             .exchange_for_test(TestRequest::Hello, json!({"generation": 1}), later())
@@ -1433,6 +1637,191 @@ fn the_socket_connection_bounds_every_reply() {
     let error = super::unix::open(&socket, later()).err().unwrap();
     assert!(error_text(&error).contains("is not a protected Herdr Core socket"));
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+// A core that answers and then closes its end leaves its reply in the socket. macOS refuses
+// a receive timeout (SO_RCVTIMEO) with EINVAL once the peer has closed, so a read that set
+// one first lost a reply that had arrived: the test above failed once on the macOS runner
+// (2026-11-26) with "lost the Herdr Core connection: Invalid argument (os error 22)" for an
+// answered hello. The transport reads the reply, then the end of the stream, and an open core
+// that says nothing still ends the read at its deadline.
+#[cfg(unix)]
+#[test]
+fn a_reply_sent_before_the_core_closed_its_end_is_read() {
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::net::UnixStream;
+    let line = [
+        br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
+        b"\n",
+    ]
+    .concat();
+    let mut buffer = [0_u8; 256];
+    let (mut tab, mut core) = UnixStream::pair().unwrap();
+    core.write_all(&line).unwrap();
+    drop(core);
+    let read = super::Stream::read_before(&mut tab, &mut buffer, later()).unwrap();
+    assert_eq!(&buffer[..read], line.as_slice());
+    assert_eq!(
+        super::Stream::read_before(&mut tab, &mut buffer, later()).unwrap(),
+        0
+    );
+    let (mut tab, _core) = UnixStream::pair().unwrap();
+    let started = Instant::now();
+    let error =
+        super::Stream::read_before(&mut tab, &mut buffer, started + Duration::from_millis(100))
+            .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+}
+
+// Sends one urgent (out-of-band) byte from the core's end. `false` where the system keeps no
+// out-of-band data on Unix stream sockets and refuses the send: macOS, and Linux before 5.15
+// or without CONFIG_AF_UNIX_OOB. Any other error fails the test.
+#[cfg(unix)]
+fn send_urgent_byte(core: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let sent = unsafe { libc::send(core.as_raw_fd(), b"!".as_ptr().cast(), 1, libc::MSG_OOB) };
+    if sent == 1 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+    false
+}
+
+// A socket can be readable with nothing to read in order: Linux keeps an urgent byte on a
+// Unix stream socket in its receive queue and reports the socket readable, and an ordinary
+// blocking read then waits for ordinary data. The read still ends at its deadline. Where the
+// system refuses the urgent byte, the same read covers a silent peer.
+#[cfg(unix)]
+#[test]
+fn a_read_ends_at_its_deadline_when_only_an_urgent_byte_is_queued() {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixStream;
+    let (mut tab, core) = UnixStream::pair().unwrap();
+    let urgent = send_urgent_byte(&core);
+    let (sender, outcome) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buffer = [0_u8; 16];
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let result = super::Stream::read_before(&mut tab, &mut buffer, deadline);
+        let _ = sender.send((result.map_err(|error| error.kind()), started.elapsed()));
+    });
+    // The core's end stays open, so a read that outlives its deadline would block for good.
+    let (result, elapsed) = outcome
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the read was still blocked ten seconds after its 100 ms deadline");
+    assert_eq!(
+        result,
+        Err(ErrorKind::TimedOut),
+        "urgent byte sent: {urgent}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+        "a 100 ms read returned after {elapsed:?} (urgent byte sent: {urgent})"
+    );
+    reader.join().unwrap();
+    drop(core);
+}
+
+// After a receive that finds nothing, the read waits again at once for the time left before
+// its original deadline, so that a reply the core sends while time is left is read. The clock
+// is simulated and the read's two steps are scripted on it; the socket tests above cover what
+// the kernels do. The deadline is 10 ms away. The socket becomes readable at 2 ms with nothing
+// to receive, as on Linux for a queue that holds only an urgent byte, and the reply arrives at
+// 5 ms. A read that pauses through its clock after the empty receive spends time asleep while
+// time is left, and is late or misses the reply: 8f316da paused for up to 10 ms of the time
+// left, here all 8 ms, and then found its deadline passed. Without a reply, the read ends at
+// its deadline without another receive.
+#[cfg(unix)]
+#[test]
+fn after_an_empty_receive_the_read_waits_again_at_once_for_the_time_left() {
+    use crate::native::clock::FakeClock;
+    use std::collections::VecDeque;
+    use std::io::ErrorKind;
+    // Each step with its simulated time since the read began.
+    #[derive(Debug, PartialEq)]
+    enum Step {
+        Wait { at: Duration, up_to: Duration },
+        Receive { at: Duration },
+    }
+    let ms = Duration::from_millis;
+    let (wait, receive) = (
+        |at, up_to| Step::Wait { at, up_to },
+        |at| Step::Receive { at },
+    );
+    let reply = [
+        br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.as_slice(),
+        b"\n",
+    ]
+    .concat();
+    // One read with a 10 ms deadline. The socket becomes readable at each time in `readable`,
+    // and a receive at `arrives` or later returns the reply. Returns the outcome, the steps
+    // and the time the read spent asleep on its clock.
+    let read = |readable: &[Duration], arrives: Option<Duration>| {
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let steps = RefCell::new(Vec::new());
+        let mut readable = readable.iter().copied().collect::<VecDeque<_>>();
+        let mut buffer = [0_u8; 256];
+        let result = super::unix::wait_and_receive(
+            &mut clock,
+            &mut buffer,
+            start + ms(10),
+            |up_to| {
+                let at = now.get() - start;
+                steps.borrow_mut().push(Step::Wait { at, up_to });
+                match readable.front().copied() {
+                    Some(ready) if ready <= at + up_to => {
+                        readable.pop_front();
+                        now.set(start + ready.max(at));
+                        Ok(true)
+                    }
+                    _ => {
+                        now.set(start + at + up_to);
+                        Ok(false)
+                    }
+                }
+            },
+            |buffer| {
+                let at = now.get() - start;
+                steps.borrow_mut().push(Step::Receive { at });
+                match arrives {
+                    Some(arrives) if at >= arrives => {
+                        buffer[..reply.len()].copy_from_slice(&reply);
+                        Ok(reply.len())
+                    }
+                    _ => Err(ErrorKind::WouldBlock.into()),
+                }
+            },
+        )
+        .map(|read| buffer[..read].to_vec())
+        .map_err(|error| error.kind());
+        (result, steps.into_inner(), clock.slept)
+    };
+    assert_eq!(
+        read(&[ms(2), ms(5)], Some(ms(5))),
+        (
+            Ok(reply.clone()),
+            vec![
+                wait(ms(0), ms(10)),
+                receive(ms(2)),
+                wait(ms(2), ms(8)),
+                receive(ms(5)),
+            ],
+            Duration::ZERO,
+        )
+    );
+    assert_eq!(
+        read(&[ms(2)], None),
+        (
+            Err(ErrorKind::TimedOut),
+            vec![wait(ms(0), ms(10)), receive(ms(2)), wait(ms(2), ms(8))],
+            Duration::ZERO,
+        )
+    );
 }
 
 // --- Review regressions (2026-11-18): each was written and run before its fix. ---
@@ -1736,6 +2125,9 @@ impl Stream for ScriptedStream {
         buffer[..bytes.len()].copy_from_slice(&bytes);
         Ok(bytes.len())
     }
+    fn peer_account(&self) -> Result<HostAccount> {
+        bail!("a scripted stream has no peer process")
+    }
 }
 
 fn io(kind: std::io::ErrorKind) -> std::io::Error {
@@ -1910,6 +2302,13 @@ fn the_pipe_connection_bounds_every_reply_and_checks_its_server() {
         }
     });
     let mut connection = super::pipe::open(Path::new(&name), later()).unwrap();
+    // This process serves the pipe, so the core's account is this process's own.
+    assert!(
+        connection
+            .core_account()
+            .unwrap()
+            .same(&HostAccount::current().unwrap())
+    );
     assert_eq!(
         connection
             .exchange_for_test(TestRequest::Hello, json!({"generation": 1}), later())
@@ -1966,14 +2365,17 @@ fn the_windows_core_reads_births_parents_and_random_tokens() {
         .args(["/C", "ping -n 3 127.0.0.1 >NUL"])
         .spawn()
         .unwrap();
-    assert_eq!(core.parent_pid(child.id()).unwrap(), Some(pid));
-    let parent = core.parent_pid(pid).unwrap();
-    if let Some(parent) = parent {
+    assert_eq!(core.parent_pid(child.id()).unwrap(), Parent::Process(pid));
+    if let Parent::Process(parent) = core.parent_pid(pid).unwrap() {
         assert!(super::pipe::creation_time(parent).unwrap().unwrap() <= created);
     }
     child.kill().unwrap();
     child.wait().unwrap();
-    assert_eq!(core.parent_pid(child.id()).unwrap(), None);
+    // An ended process's parent is unknown, never a root.
+    assert!(matches!(
+        core.parent_pid(child.id()).unwrap(),
+        Parent::Unknown(_)
+    ));
     let token = core.launch_nonce().unwrap();
     assert_eq!(token.len(), 32);
     assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -2075,9 +2477,29 @@ fn only_the_verified_connection_names_the_mutation_calls() {
     let mut sources = Vec::new();
     production_sources(&root, &mut sources);
     assert!(sources.contains(&linked), "{sources:?}");
+    // A test-only module named outside those conventions: the scripted core that serves the
+    // installed adapter over a real endpoint. It counts as a test source only while its parent
+    // declares it under `cfg(test)`.
+    let test_only = [("native/terminal/mod.rs", "scripted_herdr_core")];
+    for (parent, module) in test_only {
+        let text = std::fs::read_to_string(root.join(parent)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let declared = lines
+            .iter()
+            .position(|line| line.ends_with(&format!(" mod {module};")))
+            .unwrap_or_else(|| panic!("{parent} declares no {module}"));
+        assert!(
+            declared > 0 && lines[declared - 1].starts_with("#[cfg(all(test,"),
+            "{parent} declares {module} outside test builds"
+        );
+    }
+    let test_only: Vec<PathBuf> = test_only
+        .iter()
+        .map(|(parent, module)| root.join(parent).with_file_name(format!("{module}.rs")))
+        .collect();
     let named: Vec<_> = sources
         .iter()
-        .filter(|path| **path != linked)
+        .filter(|path| **path != linked && !test_only.contains(path))
         .filter(|path| {
             let text = std::fs::read_to_string(path).unwrap();
             text.contains("\"terminal.kill\"") || text.contains("\"terminal.rm\"")

@@ -1,7 +1,10 @@
 //! The macOS and Linux transport of the Herdr adapter: the core's protected Unix socket,
 //! located as `hc` locates it (herdr-core 0.1.21 `paths.rs`), and this machine's processes.
 use super::{Core, Framed, Stream, core_session, not_running};
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
+use crate::native::terminal::TerminalKind;
+use crate::native::terminal::bound_host::HostAccount;
 use crate::native::terminal::record::HerdrHostBirth;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -14,7 +17,7 @@ use std::{
         net::UnixStream,
     },
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 // sockaddr_un.sun_path reserves one byte for the trailing NUL.
@@ -46,14 +49,19 @@ impl Core for Installed {
         std::process::id()
     }
 
-    fn parent_pid(&self, pid: u32) -> Result<Option<u32>> {
+    // A process that is not running has no parent to show; orphans are adopted by init, so a
+    // live process always names one.
+    fn parent_pid(&self, pid: u32) -> Result<super::Parent> {
         #[cfg(target_os = "macos")]
-        return Ok(
-            crate::native::terminal::macos::process::macos_process_info(pid)?
-                .map(|info| info.parent_pid),
-        );
+        let parent = crate::native::terminal::macos::process::macos_process_info(pid)?
+            .map(|info| info.parent_pid);
         #[cfg(target_os = "linux")]
-        return crate::native::terminal::linux::process::parent_pid(pid);
+        let parent = crate::native::terminal::linux::process::parent_pid(pid)?;
+        Ok(match parent {
+            Some(0) => super::Parent::Root,
+            Some(parent) => super::Parent::Process(parent),
+            None => super::Parent::Unknown(format!("process {pid} is absent or invisible to TAB")),
+        })
     }
 
     fn process_start(&self, pid: u32) -> Result<Option<HerdrHostBirth>> {
@@ -75,6 +83,18 @@ impl Core for Installed {
         let mut bytes = [0_u8; 16];
         fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn admit_launch_directory(
+        &self,
+        directory: &Path,
+        account: Option<&HostAccount>,
+    ) -> Result<()> {
+        crate::native::terminal::bound_host::refuse_before_core_launch(
+            directory,
+            TerminalKind::Herdr,
+            account,
+        )
     }
 }
 
@@ -251,6 +271,105 @@ pub(super) fn open(socket: &Path, deadline: Instant) -> Result<Framed<UnixStream
     Ok(Framed::new(stream))
 }
 
+/// The read of `Stream::read_before`. It waits with poll(2), not a receive timeout: macOS
+/// refuses SO_RCVTIMEO with EINVAL once the core has closed its end, and a reply the core
+/// sent before it closed is still in the socket to be read. Readiness does not promise
+/// ordinary bytes (Linux reports a queue that holds only an urgent byte as readable), so the
+/// receive itself never blocks: with nothing to read it waits again, against the deadline.
+fn receive_before(
+    stream: &UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    wait_and_receive(
+        &mut SystemClock,
+        buffer,
+        deadline,
+        |timeout| wait_readable(stream, timeout),
+        |buffer| receive_now(stream, buffer),
+    )
+}
+
+/// The loop of `receive_before`, with its clock and its two steps as parameters so that a
+/// test can script them. Before each wait it reads the time left before `deadline` from the
+/// clock and ends with `TimedOut` when none is left. `wait` waits at most that long and tells
+/// whether the socket became readable; `receive` takes what is there without blocking.
+pub(super) fn wait_and_receive(
+    clock: &mut dyn Clock,
+    buffer: &mut [u8],
+    deadline: Instant,
+    mut wait: impl FnMut(Duration) -> std::io::Result<bool>,
+    mut receive: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    loop {
+        if !wait(time_left(clock, deadline)?)? {
+            continue;
+        }
+        let error = match receive(buffer) {
+            Ok(count) => return Ok(count),
+            Err(error) => error,
+        };
+        match error.kind() {
+            // Readable with nothing to receive: wait again at once, so that a reply the core
+            // sends before the deadline is read. This cannot spin. On Linux the ordinary
+            // receive drops a lone urgent byte from the queue (`manage_oob` in af_unix.c),
+            // so the next poll waits; where Unix sockets keep no out-of-band data (macOS,
+            // Linux before 5.15 or without CONFIG_AF_UNIX_OOB), readable means bytes or the
+            // end of the stream, which the receive returns.
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+    }
+}
+
+/// The time left before `deadline` on `clock`, or `TimedOut` once none is left.
+fn time_left(clock: &mut dyn Clock, deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(clock.now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+}
+
+/// One receive of what `stream` holds, without blocking: the number of bytes received, or
+/// `Ok(0)` once the peer has closed its end and every byte it sent has been received. An open
+/// stream that holds nothing to receive gives `WouldBlock`.
+fn receive_now(stream: &UnixStream, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let received = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    usize::try_from(received).map_err(|_| std::io::Error::last_os_error())
+}
+
+/// Waits at most `timeout` for `stream` to become readable (bytes, the end of the stream or an
+/// error is waiting, or, on Linux, an urgent byte): `true` once it is, `false` when the time
+/// passed or a signal interrupted the wait.
+fn wait_readable(stream: &UnixStream, timeout: Duration) -> std::io::Result<bool> {
+    // Rounded up to whole milliseconds, so that no wait ends before the deadline.
+    let timeout = timeout.as_micros().div_ceil(1000);
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut poll, 1, i32::try_from(timeout).unwrap_or(i32::MAX)) } {
+        0 => Ok(false),
+        ready if ready > 0 => Ok(true),
+        _ => {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 impl Stream for UnixStream {
     fn write_before(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<usize> {
         self.set_write_timeout(Some(super::remaining(deadline)?))?;
@@ -258,7 +377,13 @@ impl Stream for UnixStream {
     }
 
     fn read_before(&mut self, buffer: &mut [u8], deadline: Instant) -> std::io::Result<usize> {
-        self.set_read_timeout(Some(super::remaining(deadline)?))?;
-        Read::read(self, buffer)
+        receive_before(self, buffer, deadline)
+    }
+
+    /// The peer's effective uid, which `open` already required to be this process's.
+    fn peer_account(&self) -> Result<HostAccount> {
+        Ok(HostAccount::of_uid(
+            peer_uid(self).context("cannot identify the Herdr Core socket's user")?,
+        ))
     }
 }

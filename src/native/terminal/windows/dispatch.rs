@@ -86,6 +86,17 @@ pub(in crate::native) trait WindowsTerminalAdapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool>;
+    /// The launcher's probe before startup is confirmed: presence, and for an adapter whose
+    /// surface outlives its program (Herdr), whether that program has finished.
+    fn launch_surface(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<super::LaunchSurface> {
+        self.surface_present(directory, session, timeout)
+            .map(super::LaunchSurface::from_presence)
+    }
 }
 
 /// The adapter of a kind. Every operation resolves its adapter here and nowhere else;
@@ -244,6 +255,17 @@ pub(in crate::native::terminal) fn surface_present(
     adapters
         .adapter(session.kind)
         .surface_present(directory, session, timeout)
+}
+
+pub(in crate::native::terminal) fn launch_surface(
+    adapters: &dyn Adapters,
+    directory: &Path,
+    session: &TerminalSession,
+    timeout: Duration,
+) -> Result<super::LaunchSurface> {
+    adapters
+        .adapter(session.kind)
+        .launch_surface(directory, session, timeout)
 }
 
 // Loaded through `#[path]` beside `windows/mod.rs`, whose own `tests.rs` is the Windows-only

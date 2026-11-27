@@ -11,7 +11,7 @@
 //! test builds can reach a raw stream, and the type system does not stop a new `Connection`
 //! implementation from forwarding the permit it receives to another request.
 use super::authority::{Kill, Remove};
-use super::{CallError, CloseOutcome, Connection, Core, GENERATION, Observed, get};
+use super::{CallError, CloseOutcome, Connection, Core, GENERATION, HostAccount, Observed, get};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
@@ -85,6 +85,12 @@ impl Linked<'_> {
     /// The permanent id of the core that answered `hello` on this connection.
     pub(super) fn core_id(&self) -> &str {
         &self.core_id
+    }
+
+    /// The account of the process that serves this connection (`Connection::core_account`).
+    /// It sends no request.
+    pub(super) fn core_account(&self) -> Result<HostAccount> {
+        self.connection.core_account()
     }
 
     /// Any call that neither ends nor removes a terminal.

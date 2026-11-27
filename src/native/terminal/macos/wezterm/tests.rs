@@ -1155,19 +1155,17 @@ fn explicit_target_dispatch_and_startup_ignore_the_invoking_host() {
                 child.env("TERM_SESSION_ID", "caller-terminal");
             }
             let output = child.output().unwrap();
-            assert!(
-                output.status.success(),
-                "{name}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            println!("host case {name}");
+            crate::native::tests::assert_child_ran_this_test(&output);
         }
         return;
     }
-    let selected = crate::native::terminal::select_for(Some(TerminalKind::WezTerm), None).unwrap();
+    let selected = crate::native::terminal::select_for(Some(TerminalKind::WezTerm)).unwrap();
     let host = fake();
     let handle = match selected {
-        TerminalKind::WezTerm => create_tab(&host, soon()).unwrap(),
+        crate::native::terminal::Selection::Kind(TerminalKind::WezTerm) => {
+            create_tab(&host, soon()).unwrap()
+        }
         other => panic!("explicit target dispatched to {other:?}"),
     };
     let command = gui_command(env::vars_os().map(|(key, _)| key), &program());

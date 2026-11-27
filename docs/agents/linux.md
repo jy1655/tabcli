@@ -1,7 +1,9 @@
 # Current Linux Surface Boundary
 
 - Linux supports tmux and a running local [Herdr Core](herdr.md). Inside an hc terminal,
-  automatic selection verifies the caller on that core. Elsewhere it defaults to tmux.
+  automatic selection chooses Herdr, after verifying the caller on that core, where the
+  provider's version is admitted on Herdr, and tmux otherwise (the rule every OS shares).
+  Elsewhere it defaults to tmux.
   tmux requires version 3.2+ on an absolute PATH entry and uses its canonical path.
   WSL is not verified. The tmux server rules below apply only to tmux.
 - One server belongs to one managed session (owner's decision). Keep its socket at
@@ -17,6 +19,12 @@
   just before `new-session`, with exactly one session and pane. Before every later operation,
   verify that recorded incarnation through a pidfd. Absence comes only from that incarnation
   being gone (exit, PID reuse, another boot); a live server whose socket refuses is an error.
+- Before tmux starts a server, the launcher reproduces the pane host's session-directory
+  admission for TAB's own account, which the server and its pane run as
+  (`bound_host::refuse_before_launch`); a refusal is a failure to open the Surface, and a read
+  that fails other than by absence leaves the directory to the host. Herdr's is judged before
+  the core is reached for what needs no account, and on the connection that creates the
+  terminal for the core's account.
 - The pane host waits for its exact binding, discards startup input, then runs
   `bash --noprofile --norc -m -c`. Keep job control and the wrapper's foreground process group.
   The same Linux bash handoff serves Herdr after checking its terminal address and host PID.
@@ -36,7 +44,15 @@
   close and already-ended servers send no further signal. Pane hangup can take a few seconds
   to end owner/provider processes after close returns.
 - Read owner identity from procfs: boot id plus start ticks, process group, session,
-  controlling TTY and foreground group. A zombie retains its incarnation until reaped.
+  controlling TTY and foreground group. A zombie retains its incarnation until reaped. An
+  entry printed for a task whose signal state was released (process group and session -1)
+  proves no exit: an exec in a thread other than the leader releases the old leader while
+  the PID and start time live on. Every procfs reader refuses it. The tmux server
+  observation holds a pidfd on the server before it reads: on that entry an exit the pidfd
+  reports proves the server gone, and otherwise the birth is read once more. The repeated
+  close of a real-tmux test failed once on the Ubuntu runner (2026-11-25) with only an
+  integer parse error in its log; such an entry is the explanation reproduced from the
+  kernel's code, not an observed line.
 - Measure Linux provider commands before spawn: each argument or environment string including
   NUL fits `MAX_ARG_STRLEN` (32 pages, 131072 bytes on 4 KiB pages), and argv plus environment
   fits `ARG_MAX`. Refuse oversized commands with nothing sent, including Codex queue messages.

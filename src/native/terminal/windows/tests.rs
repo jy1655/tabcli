@@ -1236,10 +1236,10 @@ fn attached_dispatch_holds_claim_until_write_returns() {
 fn unsupported_terminal_gates_keep_their_text_and_carry_the_unsupported_hint() {
     use crate::native::failure_kind::{FailureKind, classify};
     assert_eq!(
-        super::select_from(None, false, None, false).unwrap(),
+        super::select(None).unwrap(),
         terminal::TerminalKind::WindowsConsole
     );
-    let refused = super::select(Some(terminal::TerminalKind::Iterm2), false).unwrap_err();
+    let refused = super::select(Some(terminal::TerminalKind::Iterm2)).unwrap_err();
     assert_eq!(
         format!("{refused:#}"),
         "iTerm2 is not available on Windows; use windows-console or herdr"
@@ -1362,34 +1362,18 @@ fn claim_dispatch_refuses_replaced_claim_and_keeps_not_ended_policy() {
     );
 }
 
-// Inside a Herdr terminal (hc gives every program HC_TERMINAL_ID and TERM_PROGRAM=ghostty)
-// the automatic choice is Herdr when the provider's adapter runs there; any other provider,
-// and a reopen whose provider is not yet known, keeps the managed console it had before.
-// An inherited marker under another TERM_PROGRAM is ignored, and an explicit choice always
-// wins (admission then asks the provider).
+// Windows's own choice is the managed console, or an explicit kind it runs; inside a Herdr
+// terminal that console is the fallback of the automatic Herdr choice, which
+// `terminal::select_for` makes the same way on every platform (its portable test is in
+// `terminal::tests`).
 #[test]
-fn windows_selection_chooses_herdr_from_hc_identity_for_a_provider_that_runs_there() {
+fn windows_chooses_the_managed_console_or_an_explicit_kind_it_runs() {
     use terminal::TerminalKind::{Herdr, WindowsConsole};
-    for (preferred, hc_terminal, term_program, runs, expected) in [
-        (None, true, Some("ghostty"), true, Herdr),
-        (None, true, Some("Ghostty"), true, Herdr),
-        (None, true, Some("ghostty"), false, WindowsConsole),
-        (None, true, None, true, WindowsConsole),
-        (None, true, Some("vscode"), true, WindowsConsole),
-        (None, false, Some("ghostty"), true, WindowsConsole),
-        (
-            Some(WindowsConsole),
-            true,
-            Some("ghostty"),
-            true,
-            WindowsConsole,
-        ),
-        (Some(Herdr), false, None, false, Herdr),
+    for (preferred, expected) in [
+        (None, WindowsConsole),
+        (Some(WindowsConsole), WindowsConsole),
+        (Some(Herdr), Herdr),
     ] {
-        assert_eq!(
-            super::select_from(preferred, hc_terminal, term_program, runs).unwrap(),
-            expected,
-            "{preferred:?} {hc_terminal} {term_program:?} {runs}"
-        );
+        assert_eq!(super::select(preferred).unwrap(), expected, "{preferred:?}");
     }
 }

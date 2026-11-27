@@ -586,6 +586,7 @@ fn prompt_file_matrix() {
 #[test]
 fn cwd_and_literal_prompt_file_subprocess() {
     const CHILD: &str = "TABCLI_START_PARSE_CHILD";
+    const TEST: &str = "native::tests::start_parse::cwd_and_literal_prompt_file_subprocess";
     if let Ok(mode) = std::env::var(CHILD) {
         if mode == "deleted" {
             let cwd = std::env::current_dir().unwrap();
@@ -626,16 +627,11 @@ fn cwd_and_literal_prompt_file_subprocess() {
         let cwd = root.path().join("cwd");
         fs::create_dir(&cwd).unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native::tests::start_parse::cwd_and_literal_prompt_file_subprocess",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .current_dir(cwd)
             .env(CHILD, mode)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
+        super::assert_child_ran_this_test(&out);
     }
 }
