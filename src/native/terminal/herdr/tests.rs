@@ -1,3 +1,4 @@
+use super::super::scripted_herdr_core::test_birth;
 use super::framed::TestRequest;
 use super::linked::{REQUIRED_METHODS, validate_hello};
 use super::*;
@@ -6,25 +7,6 @@ use std::{
     collections::{BTreeMap, VecDeque},
     rc::Rc,
 };
-
-fn test_birth(start: u64) -> HerdrHostBirth {
-    #[cfg(target_os = "macos")]
-    return HerdrHostBirth::Macos {
-        host_start_seconds: 1_800_000_000,
-        host_start_microseconds: start,
-    };
-    #[cfg(target_os = "linux")]
-    return HerdrHostBirth::Linux {
-        linux_birth: crate::native::terminal::LinuxBirth {
-            boot_id: "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap(),
-            starttime_ticks: start,
-        },
-    };
-    #[cfg(windows)]
-    return HerdrHostBirth::Windows {
-        host_creation_time: 134_000_000_000_000_000 + start,
-    };
-}
 
 // The recorded endpoint each platform addresses: a socket path, or a local named pipe.
 #[cfg(unix)]
@@ -2483,15 +2465,31 @@ fn only_the_verified_connection_names_the_mutation_calls() {
     let test_only = [("native/terminal/mod.rs", "scripted_herdr_core")];
     for (parent, module) in test_only {
         let text = std::fs::read_to_string(root.join(parent)).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        let declared = lines
-            .iter()
-            .position(|line| line.ends_with(&format!(" mod {module};")))
+        let declaration = syn::parse_file(&text)
+            .unwrap()
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(item) if item.ident == module => Some(item),
+                _ => None,
+            })
             .unwrap_or_else(|| panic!("{parent} declares no {module}"));
-        assert!(
-            declared > 0 && lines[declared - 1].starts_with("#[cfg(all(test,"),
-            "{parent} declares {module} outside test builds"
-        );
+        let guarded = declaration.attrs.iter().any(|attr| {
+            use syn::{Meta, Token, punctuated::Punctuated};
+            if !attr.path().is_ident("cfg") {
+                return false;
+            }
+            match attr.parse_args::<Meta>().unwrap() {
+                Meta::Path(path) => path.is_ident("test"),
+                Meta::List(all) if all.path.is_ident("all") => all
+                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .unwrap()
+                    .iter()
+                    .any(|operand| matches!(operand, Meta::Path(path) if path.is_ident("test"))),
+                _ => false,
+            }
+        });
+        assert!(guarded, "{parent} declares {module} outside test builds");
     }
     let test_only: Vec<PathBuf> = test_only
         .iter()
