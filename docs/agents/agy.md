@@ -23,7 +23,7 @@
   goroutine other than the main one) in `agy.log` and either Agy's exact trust entry or the session
   setting's marker with current consent
   (`the_session_only_setting_stands_for_the_store_entry_but_not_for_the_log_line`).
-  A paste missing either fact waits for both and fails `not_sent` if the deadline expires.
+  A paste missing either fact is not sent: it ends `not_sent`, at the latest when the deadline expires.
   A refusal immediately before the paste is also `not_sent`.
   The store is shared by every Agy process, so a dialog approved in one session leaves another
   session's dialog open; the log line is per process and appears at startup in a workspace
