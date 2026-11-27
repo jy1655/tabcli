@@ -1199,3 +1199,64 @@ fn reuse_diagnostics_keep_the_macos_birth_text() {
         "(100, 12)"
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn native_close_rechecks_an_attestable_replacement_owner_after_intent() {
+    use crate::native::session::{CoreRecord, SessionState, Store, close};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let (surface, original, live, shell) = owner_fixture();
+    store
+        .update_status(SessionState::Ready, None, None, None)
+        .unwrap();
+    store.write_owner(&original).unwrap();
+    store.write_terminal(&surface).unwrap();
+    let mut replacement = original.clone();
+    replacement.process_start_microseconds = Some(201);
+    let mut proofs = 0;
+    let error = close::close_with_attestation(
+        &store,
+        None,
+        close::budget::close_deadline(),
+        |_| crate::native::session::owner::OwnerAttestation {
+            process: crate::native::process_identity::ProcessObservation::Live(
+                crate::native::process_identity::Attested::Incarnation,
+            ),
+            control: crate::native::session::owner::ControlAttestation::NotRecorded,
+            pid_alive: Some(true),
+        },
+        |claimed| {
+            super::teardown_absent_owner_with(
+                &store,
+                SESSION_ID,
+                claimed,
+                || {
+                    let mut identity = live;
+                    if proofs == 1 {
+                        assert!(store.record(CoreRecord::TerminalCloseIntent).present()?);
+                        store.write_owner(&replacement)?;
+                        identity.birth = super::ProcessBirth::Macos(100, 201);
+                    }
+                    let result = verify_native_terminal_owner_with(
+                        SESSION_ID,
+                        claimed,
+                        Some(OWNER_TTY),
+                        store.owner()?,
+                        |pid| Ok(if pid == original.pid { identity } else { shell }),
+                        |_| Ok(7),
+                    )?;
+                    proofs += 1;
+                    Ok(result)
+                },
+                |_| panic!("replacement owner signalled"),
+                close::budget::close_deadline(),
+            )
+        },
+    )
+    .unwrap_err();
+    assert_eq!(proofs, 2);
+    assert!(format!("{error:#}").contains("the teardown owner changed after intent publication"));
+    assert_eq!(store.terminal().unwrap(), surface);
+    assert!(store.closed_if_present().unwrap().is_none());
+}

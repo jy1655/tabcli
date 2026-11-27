@@ -896,10 +896,22 @@ fn repair_with_owner(
     let Some(_lock) = store.try_lock()? else {
         return Ok(true);
     };
+    repair_locked_with_owner(store, || store.status(), observe)
+}
+
+pub(super) fn repair_locked(store: &Store, status: Result<SessionStatus>) -> Result<bool> {
+    repair_locked_with_owner(store, || status, super::owner::attest_recorded_owner)
+}
+
+fn repair_locked_with_owner(
+    store: &Store,
+    status: impl FnOnce() -> Result<SessionStatus>,
+    observe: impl FnOnce(&Reader) -> Result<Option<super::owner::OwnerAttestation>>,
+) -> Result<bool> {
     let Some(record) = read(store)? else {
         return Ok(false);
     };
-    let status: SessionStatus = store.status()?;
+    let status = status()?;
     if confirmed(store, &record, &status) {
         return Ok(false);
     }

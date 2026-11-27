@@ -835,7 +835,13 @@ fn close_deadline_preclose_repair_does_not_get_another_budget() {
         deadline,
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
-    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        [std::ffi::OsStr::new(TURN_CLAIM_LOCK_FILE)]
+    );
 }
 
 fn deadline_fixture() -> (tempfile::TempDir, Store) {
@@ -4133,4 +4139,342 @@ fn a_retained_surface_of_another_kind_closes_with_its_earlier_outcome() {
     )
     .unwrap();
     assert_eq!(store.closed_if_present().unwrap().unwrap().error, None);
+}
+
+#[test]
+fn native_close_marker_write_failures_settle_from_the_visible_records() {
+    use crate::native::session::primitives::with_fault_at;
+    for (step, published) in [
+        ("renaming a temporary record over its final path", false),
+        ("syncing a renamed record", true),
+    ] {
+        let (_directory, store) = deadline_fixture();
+        let handle = store.terminal().unwrap();
+        store
+            .record(CoreRecord::TerminalClosing)
+            .write_json(&handle)
+            .unwrap();
+        let error = with_fault_at(step, || {
+            close(&store, None, budget::close_deadline(), |_| {
+                Ok(terminal::CloseOutcome::Missing.into())
+            })
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(step), "{error:#}");
+        assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+        assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        assert_eq!(
+            store.closed_if_present().unwrap().unwrap().state,
+            SessionState::Closed
+        );
+        let marker = store.record(CoreRecord::TerminalClosed).bytes().unwrap();
+        assert_eq!(marker.is_some(), published);
+        if published {
+            assert_eq!(store.terminal_closed().unwrap().terminal, Some(handle.kind));
+        }
+        close(&store, None, budget::close_deadline(), |_| {
+            panic!("closed replay dispatched")
+        })
+        .unwrap();
+        if published {
+            assert_eq!(
+                store.record(CoreRecord::TerminalClosed).bytes().unwrap(),
+                marker
+            );
+        }
+    }
+}
+
+#[test]
+fn native_close_claim_sync_failure_leaves_a_resumable_claim() {
+    use crate::native::session::primitives::with_fault_at;
+    let (_directory, store) = deadline_fixture();
+    let bytes = store.record(CoreRecord::Terminal).bytes().unwrap();
+    let error = with_fault_at("syncing the claimed terminal handle's directory", || {
+        close(&store, None, budget::close_deadline(), |_| {
+            panic!("claim sync failed")
+        })
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("syncing the claimed terminal handle's directory"));
+    assert_eq!(
+        store.record(CoreRecord::TerminalClosing).bytes().unwrap(),
+        bytes
+    );
+    assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+    assert!(store.closed_if_present().unwrap().is_none());
+    let mut calls = 0;
+    close(&store, None, budget::close_deadline(), |handle| {
+        assert_eq!(handle.id, "deadline-fixture");
+        calls += 1;
+        Ok(terminal::CloseOutcome::Missing.into())
+    })
+    .unwrap();
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn native_close_dispatches_a_replacement_only_on_retry() {
+    use crate::native::session::primitives::with_step_at;
+    let (_directory, store) = deadline_fixture();
+    let replacement = terminal::TerminalSession::new(
+        if cfg!(windows) {
+            terminal::TerminalKind::Tmux
+        } else {
+            terminal::TerminalKind::WindowsConsole
+        },
+        "replacement".into(),
+    )
+    .with_binding(Some(
+        store
+            .directory()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+    ));
+    let path = store.record(CoreRecord::Terminal).path().to_owned();
+    let mut dispatched = Vec::new();
+    let mut run = || {
+        close(&store, None, budget::close_deadline(), |handle| {
+            dispatched.push(handle.id.clone());
+            Ok(terminal::CloseOutcome::Missing.into())
+        })
+    };
+    let first = with_step_at(
+        "claiming the terminal handle for close",
+        move || {
+            write_json_atomic(&path, &replacement).unwrap();
+        },
+        &mut run,
+    );
+    assert!(first.is_err(), "first attempt returned {first:?}");
+    assert_eq!(store.terminal().unwrap().id, "replacement");
+    assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+    assert!(store.closed_if_present().unwrap().is_none());
+    run().unwrap();
+    assert_eq!(dispatched, ["replacement"]);
+}
+
+#[test]
+fn native_close_refuses_an_unexpected_marker_before_consumption() {
+    let (_directory, store) = deadline_fixture();
+    let marker = br#"{ "consumed":true, "reason":"another close" }"#;
+    let result = close(&store, None, budget::close_deadline(), |_| {
+        store
+            .record(CoreRecord::TerminalClosed)
+            .write_private(marker)?;
+        Ok(terminal::CloseOutcome::Missing.into())
+    });
+    assert!(result.is_err(), "unexpected marker accepted: {result:?}");
+    assert_eq!(
+        store
+            .record(CoreRecord::TerminalClosed)
+            .bytes()
+            .unwrap()
+            .unwrap(),
+        marker
+    );
+    assert!(store.closed_if_present().unwrap().is_none());
+    close(&store, None, budget::close_deadline(), |_| {
+        panic!("marker replay dispatched")
+    })
+    .unwrap();
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some("another close")
+    );
+}
+
+#[test]
+fn native_close_reports_a_malformed_active_handle_under_its_acquired_name() {
+    let (_directory, store) = deadline_fixture();
+    let path = store.record(CoreRecord::Terminal).path().to_owned();
+    fs::write(&path, b"{").unwrap();
+    let error = close(&store, None, budget::close_deadline(), |_| {
+        panic!("invalid handle dispatched")
+    })
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("invalid JSON in {}", path.display())),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(path).unwrap(), b"{");
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn native_close_nested_windows_repair_retries_after_failed_restore() {
+    use crate::native::session::primitives::with_fault_at;
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(root.path());
+    write_owned_terminal_state(root.path(), "working", 42);
+    let handle =
+        terminal::TerminalSession::new(terminal::TerminalKind::WindowsConsole, "42".into());
+    store.write_terminal(&handle).unwrap();
+    let deadline = budget::close_deadline();
+    let repair = |marker: &mut MarkerHistory| {
+        let result = with_fault_at("renaming a record file", || {
+            repair_owner(
+                &store,
+                |_| Ok(false),
+                RepairSurfaces::Windows(&mut |_| bail!("scripted console refusal")),
+                deadline,
+                Some(marker),
+            )
+        });
+        assert!(
+            format!("{:#}", result.as_ref().unwrap_err())
+                .contains("failed to restore terminal handle")
+        );
+        assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+        assert_eq!(
+            store
+                .record(CoreRecord::TerminalClosing)
+                .json_with(super::super::record::terminal)
+                .unwrap(),
+            handle
+        );
+        result
+    };
+    let mut calls = 0;
+    close_transaction(
+        &store,
+        None,
+        repair,
+        |claimed| {
+            assert_eq!(claimed, &handle);
+            calls += 1;
+            Ok(terminal::CloseOutcome::Missing.into())
+        },
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert!(
+        store
+            .status()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("failed to restore terminal handle")
+    );
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+}
+
+#[test]
+fn native_close_runs_launch_repair_inside_one_lifecycle_lock() {
+    use crate::native::session::primitives::close_io_test::{self, Point};
+    let (dir, store, _) = crate::native::session::launch::test_support::pending_launch(
+        "session-",
+        &std::env::temp_dir(),
+        Duration::from_secs(30),
+    );
+    let mut receipt = launch::read(&store).unwrap().unwrap();
+    receipt.deadline_unix_ms = 1;
+    store
+        .record(CoreRecord::Launch)
+        .write_json(&receipt)
+        .unwrap();
+    let generation = store.status().unwrap().generation;
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = seen.clone();
+    close_io_test::during(
+        move |point| {
+            if point == Point::BeforeLock("turn claim lifecycle") {
+                count.set(count.get() + 1);
+            }
+        },
+        || {
+            close(&store, None, budget::close_deadline(), |_| {
+                panic!("no handle")
+            })
+        },
+    )
+    .unwrap();
+    assert!(!dir.path().join(TURN_CLAIM_FILE).exists());
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+    assert_eq!(
+        store.status().unwrap().generation,
+        generation + 2,
+        "launch repair must publish Failed before Closed"
+    );
+    assert_eq!(seen.get(), 1);
+}
+
+#[test]
+fn native_close_replay_keeps_last_marker_fields_and_active_handle_precedence() {
+    for (wire, committed, reason) in [
+        (Some("{"), false, None),
+        (
+            Some(r#"{"consumed":false,"consumed":true,"reason":"old","reason":42}"#),
+            true,
+            None,
+        ),
+        (
+            Some(r#"{"consumed":true,"consumed":false,"reason":"retained"}"#),
+            false,
+            Some("retained"),
+        ),
+        (None, false, None),
+    ] {
+        let (_directory, store) = deadline_fixture();
+        store
+            .record(CoreRecord::Terminal)
+            .write_json(&json!({"iterm_session_id":"active"}))
+            .unwrap();
+        store
+            .record(CoreRecord::TerminalClosing)
+            .write_json(&json!({"terminal":"tmux","session_id":"claimed"}))
+            .unwrap();
+        store.record(CoreRecord::Owner).write_private(b"{").unwrap();
+        if let Some(wire) = wire {
+            store
+                .record(CoreRecord::TerminalClosed)
+                .write_private(wire.as_bytes())
+                .unwrap();
+        }
+        let mut calls = 0;
+        close(&store, None, budget::close_deadline(), |handle| {
+            assert_eq!(handle.id, "active");
+            assert_eq!(handle.kind, terminal::TerminalKind::Iterm2);
+            calls += 1;
+            Ok(terminal::CloseOutcome::Missing.into())
+        })
+        .unwrap();
+        assert_eq!(calls, usize::from(wire.is_none()));
+        let marker = store
+            .record(CoreRecord::TerminalClosed)
+            .bytes()
+            .unwrap()
+            .unwrap();
+        if committed {
+            assert_eq!(marker, wire.unwrap().as_bytes());
+        } else {
+            let value: Value = serde_json::from_slice(&marker).unwrap();
+            assert_eq!(value["terminal"], Value::Null);
+            assert_eq!(value["consumed"], true);
+        }
+        let error = store.status().unwrap().error.unwrap();
+        assert!(error.contains("pre-close session repair failed"), "{error}");
+        assert_eq!(error.contains("retained"), reason.is_some());
+        assert!(!error.contains("old"));
+    }
+}
+
+#[test]
+fn native_close_preserves_the_preclose_repair_lock_timeout_diagnostic() {
+    let (_directory, store) = deadline_fixture();
+    let _held = store.lock().unwrap();
+    let error = expire_at_contended_lock("turn claim lifecycle", |deadline| {
+        close(&store, None, deadline, |_| {
+            panic!("locked close dispatched")
+        })
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("pre-close session repair failed: another close or turn holds the session's turn claim lifecycle lock"), "{error:#}");
+    assert!(store.record(CoreRecord::Terminal).present().unwrap());
+    assert!(store.closed_if_present().unwrap().is_none());
 }

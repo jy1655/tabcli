@@ -180,7 +180,7 @@ pub(in crate::native) fn with_fault_at<T>(label: &str, run: impl FnOnce() -> T) 
 
 /// Runs `run` while `step` runs, once, at the first boundary named `label`, which then passes:
 /// what happens at that moment outside this process, such as a directory losing its permissions.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(in crate::native) fn with_step_at<T>(
     label: &str,
     step: impl FnOnce() + 'static,
