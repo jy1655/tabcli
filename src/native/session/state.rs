@@ -247,7 +247,7 @@ impl Store {
         };
         if state == SessionState::Closed {
             store.record(CoreRecord::Closed).write_json(&status)?;
-            #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+            #[cfg(test)]
             super::close::interruption::at(
                 super::close::interruption::Point::ClosedTombstoneWritten,
             );

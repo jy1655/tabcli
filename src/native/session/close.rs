@@ -1635,8 +1635,7 @@ mod tests;
 
 // A panic models interruption, not an operation error: no caller's restore/settle
 // handler runs. File locks unwind; only the selected thread's one checkpoint fires.
-// Every OS interrupts at the consumption marker and the handle removal; the other points and
-// the expiry checkpoint serve macOS scenarios.
+// Tests on every supported OS can interrupt after the closed tombstone is written.
 #[cfg(test)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(in crate::native) mod interruption {
