@@ -45,6 +45,11 @@ pub(in crate::native) mod wezterm;
 // it the same way on every platform): inside hc, whose programs get `TERM_PROGRAM=ghostty`,
 // that is Ghostty.
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
+    if let Some(kind) = preferred
+        && !OsTerminals::MACOS.runs(kind)
+    {
+        return Err(OsTerminals::MACOS.unavailable(kind));
+    }
     let term_program = env::var("TERM_PROGRAM").ok();
     let term = env::var("TERM").ok();
     Ok(select_macos_terminal(

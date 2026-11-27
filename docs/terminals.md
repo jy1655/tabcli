@@ -4,7 +4,7 @@ Choose the terminal where TAB opens your sessions, and check what it will close 
 On macOS, TAB detects the invoking terminal or uses Terminal.app; on native Windows, it tries a
 Windows Terminal tab, then a separate console window, or Herdr inside an hc terminal. Linux
 detects Herdr and otherwise uses tmux.
-Use `--terminal` to override the selection.
+Use `--terminal` to override the selection. If this operating system does not run the named terminal, TAB refuses the selection before creating a session and lists the terminal kinds the system runs.
 
 TAB creates a new surface for each session: a tab, window, pane, or console. It does not adopt
 one of your existing tabs or attach to an independently running provider CLI. A Linux TAB

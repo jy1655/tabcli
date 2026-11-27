@@ -910,3 +910,31 @@ fn an_automatic_herdr_gives_way_to_the_fallback_where_the_provider_version_is_no
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+fn assert_macos_selection_refuses(option: &str, name: &str) {
+    let fixture = Fixture::new();
+    let expected = format!(
+        "{name} is not available on macOS; use iterm2, apple-terminal, ghostty, warp, wezterm or herdr"
+    );
+    for provider in PROVIDERS {
+        let reply = fixture.ask(provider, Some(option), Caller::InheritedMarker);
+        assert_eq!(error(&reply), expected, "{provider} {option}: {reply}");
+        assert_eq!(reply["failure_kind"], "unsupported", "{reply}");
+    }
+    let reply = fixture.reopen(Some(option));
+    assert_eq!(error(&reply), expected, "reopen {option}: {reply}");
+    assert_eq!(reply["failure_kind"], "unsupported", "{reply}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_selection_refuses_explicit_tmux_before_creating_a_session() {
+    assert_macos_selection_refuses("tmux", "tmux");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_selection_refuses_explicit_windows_console_before_creating_a_session() {
+    assert_macos_selection_refuses("windows-console", "Windows Console");
+}
