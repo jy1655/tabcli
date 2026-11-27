@@ -17,6 +17,11 @@ One managed provider conversation in one terminal surface, identified by a sessi
 owned by TAB from launch to close.
 _Avoid_: child, tab, process
 
+**Copy**:
+A Session whose records show evidence of another operating system. A bound active handle
+can supply that evidence through its stated terminal kind or Herdr host birth, a completed
+consumption marker through its stated kind, or a bound owner record through its process identity.
+
 **Session directory**:
 The private directory that holds every record of one session.
 _Avoid_: state dir, workdir
@@ -263,15 +268,16 @@ only inside the incarnation that created them.
 _Avoid_: app instance, app process
 
 **Close**:
-The explicit end of a session: its surface is ended and a tombstone is recorded.
+The explicit end of a session, committed by a closed tombstone. An eligible Copy is
+closed from its records alone.
 _Avoid_: kill, teardown, cleanup
 
 **Close authority**:
 What a close may do to a surface, decided from the session's records and what is observed
 now: act with a live attested owner, act on the surface alone, remove a verified finished
 surface by its [creation record](docs/agents/herdr.md#close-by-creation-record), end a live attested owner whose surface is proven absent, or
-do nothing because the surface is proven absent. Anything else
-refuses the close and keeps the surface handle.
+do nothing because the surface is proven absent. A native close that needs surface authority
+keeps the handle if it cannot establish that authority.
 _Avoid_: permission, ownership check
 
 **Repair**:

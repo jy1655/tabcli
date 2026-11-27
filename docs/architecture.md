@@ -608,7 +608,9 @@ before deciding that the operation never happened.
 | `reopen.refusal.json` | New session's recorded launch-phase reopen refusal |
 
 When close writes `terminal.closed.json` for a handle that omits its terminal kind, it records
-`"terminal": null`. Earlier releases recorded `"iterm2"`. A committed marker keeps its bytes.
+`"terminal": null`. Earlier releases recorded `"iterm2"`. Native close preserves the bytes
+of a committed marker. Settlement of a copy preserves them only when the marker contains
+one `consumed` field set to `true` and at most one `terminal` field whose value is a string or null.
 
 For launch failure details, read `status.json` and `launch.log` alongside `launch.json` and the
 claim. The receipt records spawn phase, not a failed or cancelled state.
@@ -754,7 +756,7 @@ diagnostics; adapters return the typed retained-surface handoff and its cleanup 
 The recovery close in #87 is not implemented. Its authority decision waits for Warp runtime
 evidence from a `warp_control_cli` build or an upstream change.
 
-`terminal::close_authority` decides explicit Close over its observation seam. Close can act
+`terminal::close_authority` decides what a native explicit Close may do to a Surface. It can act
 with a live attested owner, act on a proven Surface alone, remove a verified finished Surface,
 end a live attested owner whose Surface is proven absent, or settle a proven absence or
 completed teardown. An ambiguous identity retains the handle. The platform adapters perform

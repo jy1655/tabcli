@@ -233,6 +233,80 @@ fn replacement_copy_is_never_dispatched() {
 }
 
 #[test]
+fn an_ended_replacement_copy_settles_only_on_retry() {
+    let (_root, store) = fixture(SessionState::Ready);
+    store.write_terminal(&handle(TerminalKind::Herdr)).unwrap();
+    let directory = store.directory().to_owned();
+    let replacement = herdr_wire();
+    let wire = replacement.clone();
+    let error = with_step_at(
+        "claiming the terminal handle for close",
+        move || {
+            let store = Store::open_unchecked(&directory);
+            store
+                .record(CoreRecord::Terminal)
+                .write_json(&wire)
+                .unwrap();
+            update_status(&directory, SessionState::Failed, None, None).unwrap();
+        },
+        || attempt(&store),
+    )
+    .unwrap_err();
+    assert!(error.is::<CloseRecordChanged>(), "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        CloseRecordChanged("terminal handle").to_string()
+    );
+    assert_eq!(
+        store.record(CoreRecord::Terminal).json::<Value>().unwrap(),
+        replacement
+    );
+    assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+    assert!(!store.record(CoreRecord::TerminalClosed).present().unwrap());
+    assert_eq!(store.status().unwrap().state, SessionState::Failed);
+    attempt(&store).unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+    assert!(!store.record(CoreRecord::Terminal).present().unwrap());
+}
+
+#[test]
+fn cleanup_refuses_an_ended_copy_without_claiming_it_is_running() {
+    let origin = if cfg!(windows) { "macOS" } else { "Windows" };
+    for birth in [true, false] {
+        let (_root, store) = fixture(SessionState::Exited);
+        if birth {
+            store
+                .record(CoreRecord::Terminal)
+                .write_json(&herdr_wire())
+                .unwrap();
+        } else {
+            store.write_owner(&foreign_owner(ID)).unwrap();
+        }
+        let before = snapshot(&store);
+        let error = close_for_cause(
+            &store,
+            None,
+            CloseCause::Cleanup,
+            budget::close_deadline(),
+            |_| panic!("cleanup attested a copy"),
+            |_| panic!("cleanup dispatched a copy"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::native::failure_kind::classify(&error),
+            Some(crate::native::failure_kind::FailureKind::Unsupported)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "This session was recorded on {origin}. Only an explicit close can settle it from its records."
+            )
+        );
+        assert_eq!(snapshot(&store), before);
+    }
+}
+
+#[test]
 fn only_a_strict_completion_supplies_the_copy_reason() {
     let deep = format!(
         r#"{{"consumed":true,"reason":"marker-token\u0000","extra":{}0{}}}"#,
@@ -373,6 +447,72 @@ fn restored_copy_supersedes_the_unlocked_dead_owner_verdict() {
 }
 
 #[test]
+fn nested_windows_repair_rechecks_a_restored_copy_before_dispatch() {
+    use crate::native::session::primitives::close_io_test::{self, Point};
+    for restore in [false, true] {
+        let (_root, store) = fixture(SessionState::Working);
+        store
+            .write_owner(&NativeSessionOwner {
+                pid: 42,
+                ..Default::default()
+            })
+            .unwrap();
+        // Windows Repair dispatches a console. Its restored copy must state a foreign kind on this OS.
+        let kind = if restore {
+            foreign_kind()
+        } else {
+            TerminalKind::WindowsConsole
+        };
+        let claimed = store.record(CoreRecord::TerminalClosing);
+        claimed.write_json(&handle(kind)).unwrap();
+        let bytes = claimed.bytes().unwrap().unwrap();
+        let from = claimed.path().to_owned();
+        let to = store.record(CoreRecord::Terminal).path().to_owned();
+        let mut locks = 0;
+        let mut calls = 0;
+        let changed = close_io_test::during(
+            move |point| {
+                if point == Point::BeforeLock("turn claim lifecycle") {
+                    locks += 1;
+                    if restore && locks == 2 {
+                        fs::rename(&from, &to).unwrap();
+                    }
+                }
+            },
+            || {
+                repair_owner(
+                    &store,
+                    |_| Ok(false),
+                    RepairSurfaces::Windows(&mut |surface| {
+                        assert_eq!(surface.kind, TerminalKind::WindowsConsole);
+                        calls += 1;
+                        Ok(terminal::CloseOutcome::Missing)
+                    }),
+                    budget::close_deadline(),
+                    None,
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(changed, !restore);
+        assert_eq!(calls, usize::from(!restore));
+        assert_eq!(
+            store.status().unwrap().state,
+            if restore {
+                SessionState::Working
+            } else {
+                SessionState::Closed
+            }
+        );
+        assert_eq!(
+            store.record(CoreRecord::Terminal).bytes().unwrap(),
+            restore.then_some(bytes)
+        );
+        assert!(!claimed.present().unwrap());
+    }
+}
+
+#[test]
 fn prune_and_repair_classify_marker_owner_and_active_records() {
     for evidence in ["marker", "owner", "active"] {
         let (_root, store) = fixture(SessionState::Exited);
@@ -425,11 +565,31 @@ fn copy_launch_uses_only_the_recorded_deadline() {
                 .record(CoreRecord::Launch)
                 .write_json(&record)
                 .unwrap();
+        }
+        let before = snapshot(&store);
+        let cleanup = close_for_cause(
+            &store,
+            None,
+            CloseCause::Cleanup,
+            budget::close_deadline(),
+            |_| panic!("cleanup attested a launching copy"),
+            |_| panic!("cleanup dispatched a launching copy"),
+        )
+        .unwrap_err();
+        assert_eq!(snapshot(&store), before);
+        if expired {
+            let origin = if cfg!(windows) { "macOS" } else { "Windows" };
+            assert_eq!(
+                cleanup.to_string(),
+                format!(
+                    "This session was recorded on {origin}. Only an explicit close can settle it from its records."
+                )
+            );
             attempt(&store).unwrap();
             assert_eq!(store.status().unwrap().state, SessionState::Closed);
         } else {
-            let before = snapshot(&store);
             let error = attempt(&store).unwrap_err();
+            assert_eq!(cleanup.to_string(), error.to_string());
             assert_eq!(
                 crate::native::failure_kind::classify(&error),
                 Some(crate::native::failure_kind::FailureKind::Unsupported)
@@ -567,7 +727,7 @@ fn only_positive_bound_evidence_refuses_a_running_session() {
         let records = SurfaceRecords::read(&store);
         records
             .evidence(&store, &super::super::owner::observe(&store))
-            .map(|copy| copy.refusal().to_string())
+            .map(|copy| copy.running_refusal().to_string())
     };
     for value in [
         json!({"session_id":"s","managed_session_id":ID}),

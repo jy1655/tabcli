@@ -356,8 +356,8 @@ impl StartedFromClose {
     }
 }
 
-// Closes a managed session's own visible surface through the terminal-close authority
-// checks that an explicit `close-session` uses. `cause` says why: only an explicit close
+// Closes a native surface through the terminal-close authority checks or settles an eligible
+// copy from its records. `cause` says why: only an explicit close
 // acts on a gone owner's terminal by its creation record; a cleanup after another command
 // keeps the earlier authorities. `reason` is kept in the closed status when the close itself
 // reports nothing, so a session closed because of a detected conflict still says why.

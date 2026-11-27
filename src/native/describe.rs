@@ -349,7 +349,7 @@ pub(super) const PRUNE: Contract = Contract {
     ],
 };
 pub(super) const CLOSE: Contract = Contract {
-    summary: "Close a managed session's recorded terminal surface.",
+    summary: "Close a native session or settle an eligible copy from its records.",
     synopsis: &[
         "close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]",
     ],
@@ -357,7 +357,7 @@ pub(super) const CLOSE: Contract = Contract {
     examples: &[&["close-session", "session-example", "--explicit", "--json"]],
     features: &["with_started_from"],
     notes: &[
-        "Requires explicit authority over the target. --with-started-from includes one level of recorded children within the same deadline. Records are retained.",
+        "Acting on a terminal requires close authority. --with-started-from includes one level of recorded children within the same deadline. Records are retained.",
         "JSON output is one object with ok, session, closed and started_from, without schema_version, printed only after the session closed; ok is false when a --with-started-from target failed. Errors are reported on stderr without a JSON error object.",
     ],
 };

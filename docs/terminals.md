@@ -458,10 +458,10 @@ On a slow terminal, give `close-session` a longer `--timeout-secs` budget. When 
 WezTerm GUI does not answer its pane listing in time, TAB reports it as busy instead of
 opening another window.
 
-`close-session` targets the surface TAB created for that session, not whichever tab you have
-selected. It preserves surfaces outside that session; tmux close includes every window added to
-the session's server. If TAB cannot prove ownership or absence of the recorded
-surface, it refuses the close and keeps the handle.
+For a native session, `close-session` targets the surface TAB created for that session.
+It preserves surfaces outside that session; tmux close includes every window added to
+the session's server. If a native surface close lacks proof of ownership or absence,
+TAB refuses it and keeps the handle.
 
 The owner is the TAB process that launched the session. Before signalling it, TAB checks that
 the recorded owner is still the same process. On macOS it compares the PID, process birth,
@@ -479,8 +479,9 @@ them.
 Those checks determine whether TAB can act with the live owner, act on the recorded surface
 alone, end a live attested owner whose surface is proven absent, or leave it alone because it
 is proven absent. That decision is close authority. A newly
-selected tab or a window that appeared during launch provides no such authority. If none of the
-four outcomes is proven, TAB refuses and keeps the handle. The
+selected tab or a window that appeared during launch provides no such authority. A native close
+that needs one of these proofs keeps the handle if none is available. An explicit close of
+an eligible copy settles its records without contacting the surface. The
 [architecture reference](architecture.md) explains the records behind this decision.
 
 If a macOS terminal application has gone but the session's processes survive, as observed

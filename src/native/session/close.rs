@@ -378,8 +378,6 @@ impl Reader {
     }
 }
 
-// Repairs a dead native owner first, then closes. A repair failure is the recorded close
-// error; otherwise `reason` (if any) is kept in the closed status.
 #[cfg(test)]
 pub(in crate::native) fn close(
     store: &Store,
@@ -410,6 +408,8 @@ pub(in crate::native) fn close_with_attestation(
     )
 }
 
+// Explicit close can settle a copy from its records. For a native session, Repair runs
+// before close and its failure takes precedence over the caller's reason in the closed status.
 pub(in crate::native) fn close_for_cause(
     store: &Store,
     reason: Option<String>,
@@ -675,10 +675,13 @@ fn close_native_locked(
                     Err(restore)
                 };
             }
-            if error.is::<CloseRecordChanged>()
-                && let Some(copy) = CloseRecords::acquire(store, marker)?.evidence(store)
-            {
-                return Err(copy.refusal());
+            if error.is::<CloseRecordChanged>() {
+                let restored = CloseRecords::acquire(store, marker)?;
+                if let Some(copy) = restored.evidence(store)
+                    && restored.leave_running(store)
+                {
+                    return Err(copy.running_refusal());
+                }
             }
             return Err(error);
         }
@@ -916,6 +919,18 @@ struct CloseRecords {
 }
 
 impl CloseRecords {
+    fn leave_running(&self, reader: &Reader) -> bool {
+        let (Ok(None), Ok(status), Ok(marker)) = (&self.closed, &self.status, &self.marker) else {
+            return false;
+        };
+        !status.state.ended()
+            && marker
+                .as_ref()
+                .is_none_or(|facts| facts.completed.is_none())
+            && (status.state != SessionState::Launching
+                || launch::records_leave_launch_pending(reader, status).unwrap_or(false))
+    }
+
     fn evidence(&self, store: &Store) -> Option<CopyEvidence> {
         terminal::foreign::judge(
             super::owner::session_of(store),
@@ -1010,7 +1025,7 @@ fn consume_terminal_handle(
     terminal_kind: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
-    // A committed marker (one that decodes with `consumed: true`) keeps its bytes: a replay, and
+    // A native committed marker (one that decodes with `consumed: true`) keeps its bytes: a replay, and
     // a later close of the closed session, neither rewrites its reason nor its kind. A damaged
     // one (not a marker, or `consumed: false`) is written again, as before os-parity.
     let tombstone_result = facts.and_then(|facts| {
@@ -1226,7 +1241,11 @@ fn settle_copy(
     reason: Option<String>,
 ) -> Result<()> {
     if cause != CloseCause::Explicit {
-        return Err(copy.refusal());
+        return Err(if records.leave_running(store) {
+            copy.running_refusal()
+        } else {
+            copy.cleanup_refusal()
+        });
     }
     let active = records.active.validate(store)?;
     let closing = records.closing.validate(store)?;
@@ -1247,7 +1266,7 @@ fn settle_copy(
         status = store.status()?;
     }
     if !status.state.ended() && completed.is_none() {
-        return Err(copy.refusal());
+        return Err(copy.running_refusal());
     }
     let claim = store.record(CoreRecord::TurnClaim);
     let mut reason = merge_close_reason(reason, status.error);

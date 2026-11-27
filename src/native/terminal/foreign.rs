@@ -15,7 +15,7 @@ pub(in crate::native) enum CopyEvidence {
 }
 
 impl CopyEvidence {
-    pub(in crate::native) fn refusal(self) -> anyhow::Error {
+    pub(in crate::native) fn running_refusal(self) -> anyhow::Error {
         let os = OsTerminals::CURRENT.expect("copy evidence requires a terminal platform");
         match self {
             Self::Kind(kind) => os.unavailable(kind),
@@ -25,6 +25,15 @@ impl CopyEvidence {
                     "This session was recorded on {origin} and cannot be closed on {here} while its records leave it running."
                 )).into()
             }
+        }
+    }
+
+    pub(in crate::native) fn cleanup_refusal(self) -> anyhow::Error {
+        match self {
+            Self::Kind(_) => self.running_refusal(),
+            Self::Origin(origin) => crate::native::failure_kind::Unsupported::new(format!(
+                "This session was recorded on {origin}. Only an explicit close can settle it from its records."
+            )).into(),
         }
     }
 }

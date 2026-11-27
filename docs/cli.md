@@ -1344,6 +1344,7 @@ On Linux, the `platform` check reports a supported platform. When the default se
 The session `owner` check is `unavailable` / `owner_exited` or `owner_identity_mismatch` only for a
 bound owner attested gone or changed; a bound owner whose attestation could not decide is
 `unknown` / `owner_unverified`, even when its process id looked absent.
+For a session identified as a copy, `doctor` still judges the recorded owner from local process state.
 
 Session reports append a `hold` check after the other record checks: `available` / `not_held`,
 `unavailable` / `session_held`, or `unknown` / `hold_unreadable`. A held session's next action
@@ -1763,18 +1764,19 @@ tabcli close-session SESSION --explicit [--with-started-from] [--timeout-secs N]
 
 See the command and output in the [opening workflow](#command-reference).
 
-`--explicit` is required because this ends the session's surface. You can close active, exited, or
-failed sessions. Repeating a completed close succeeds without closing another surface; with
-`--with-started-from` it can still discover and close another session started from this one
+`--explicit` is required because close can end a native session's surface. You can close active,
+exited, or failed native sessions. A copy can be settled from its records alone when they
+establish that it ended or that consumption completed. Repeating a completed close succeeds
+without closing another surface; with `--with-started-from` it can still discover and close another session started from this one
 (see below). TAB records the close in a tombstone and keeps the result history.
 
 `--timeout-secs N` sets the maximum time the close may take, in whole seconds from 1 through
 3600; the default is 60 seconds. The budget covers observation, ownership checks, lock waits,
 process teardown, and terminal automation. It does not guarantee that the close finishes.
-A timeout means the close was not confirmed and may have partly happened. A rerun observes
-the session and establishes authority again; it may still refuse the close.
+A timeout means the close was not confirmed and may have partly happened. A retry checks
+the current records and, for a native surface action, establishes authority again.
 
-For a tmux session, explicit close ends the session's entire tmux server, including windows you added.
+For a native tmux session, explicit close ends the session's entire tmux server, including windows you added.
 The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;
 a repeated close or a server already ended sends no further signal. Pane processes can take
 a few seconds to end after close returns. See [Linux / tmux](terminals.md#linux--tmux).
@@ -1804,7 +1806,7 @@ gone. EPERM, including for a group containing only zombies, is not proof of disa
 Observation and signal are not one atomic operation. The group's disappearance does not
 prove that processes which left it ended.
 
-While a session is `launching` with no surface handle and a pending launch deadline still in the
+While a native session is `launching` with no surface handle and a pending launch deadline still in the
 future, close refuses without changing the session or its claim:
 
 ```text

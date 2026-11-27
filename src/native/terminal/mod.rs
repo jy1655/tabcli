@@ -1205,7 +1205,7 @@ mod tests {
     // platform's lookup refusal, its handle and its state on every attempt.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
-    fn explicit_close_of_another_oss_handle_gets_the_lookup_refusal_and_keeps_it() {
+    fn explicit_close_of_another_oss_handle_settles_an_ended_copy_and_refuses_a_running_one() {
         use crate::native::failure_kind::{FailureKind, classify};
         use crate::native::session::{CoreRecord, SessionState, Store, update_status};
         use crate::native::terminal::ownership::NativeSessionOwner;

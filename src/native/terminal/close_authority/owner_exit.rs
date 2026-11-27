@@ -319,17 +319,19 @@ pub(in crate::native) enum Retention {
 impl Retention {
     pub(in crate::native) fn retains(
         self,
-        _reader: &Reader,
+        reader: &Reader,
         active: impl FnOnce() -> Result<Option<TerminalKind>>,
         claimed: impl FnOnce() -> Result<Option<TerminalKind>>,
     ) -> Result<bool> {
+        #[cfg(all(windows, not(test)))]
+        let _ = reader; // Windows retention uses only the two handle kinds.
         let has_kind = |retains: fn(TerminalKind) -> bool| -> Result<bool> {
             Ok(active()?.is_some_and(retains) || claimed()?.is_some_and(retains))
         };
         match self {
             // Even an invalid intent is evidence of possible interrupted teardown.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            Self::Posix => Ok(_reader
+            Self::Posix => Ok(reader
                 .record(crate::native::session::CoreRecord::TerminalCloseIntent)
                 .bytes()?
                 .is_some()
@@ -340,7 +342,7 @@ impl Retention {
             Self::WithoutSurface => {
                 use crate::native::session::CoreRecord;
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
-                if _reader
+                if reader
                     .record(CoreRecord::TerminalCloseIntent)
                     .bytes()?
                     .is_some()
@@ -348,7 +350,7 @@ impl Retention {
                     return Ok(true);
                 }
                 for record in [CoreRecord::Terminal, CoreRecord::TerminalClosing] {
-                    if _reader.record(record).present()? {
+                    if reader.record(record).present()? {
                         bail!("a parity row records no surface");
                     }
                 }
@@ -356,7 +358,7 @@ impl Retention {
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             Self::Nothing => {
-                let _ = (_reader, has_kind);
+                let _ = (reader, has_kind);
                 Ok(false)
             }
         }

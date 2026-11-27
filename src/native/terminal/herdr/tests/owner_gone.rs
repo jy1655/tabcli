@@ -1,4 +1,4 @@
-//! A Herdr terminal whose native-session owner is gone (os-parity, the owner's decisions of
+//! A native Herdr terminal whose owner is gone (os-parity, the owner's decisions of
 //! 2026-11-26): on every OS, Repair leaves it for an explicit close, and the explicit close
 //! proves it by its own creation record, whatever the owner record says. That close removes a
 //! finished terminal and settles an absent one, and never ends a running one: it refuses, and
@@ -2817,6 +2817,34 @@ fn another_host_birth(handle: &mut serde_json::Map<String, Value>) {
     } else {
         core.insert("host_creation_time".into(), json!(1));
     }
+}
+
+#[test]
+fn a_ready_copy_with_a_foreign_herdr_birth_refuses_close_without_a_core_call() {
+    let fixture = Fixture::new("ready", &complete_owner());
+    let store = fixture.store();
+    let active = store.record(CoreRecord::Terminal);
+    let mut handle = serde_json::to_value(store.terminal().unwrap()).unwrap();
+    another_host_birth(handle.as_object_mut().unwrap());
+    active.write_json(&handle).unwrap();
+    let before = active.bytes().unwrap().unwrap();
+    let origin = if cfg!(windows) { "macOS" } else { "Windows" };
+    let here = crate::native::terminal::OsTerminals::CURRENT.unwrap().os;
+    let error = fixture.close(exited, false).unwrap_err();
+    assert_eq!(
+        crate::native::failure_kind::classify(&error),
+        Some(crate::native::failure_kind::FailureKind::Unsupported)
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "This session was recorded on {origin} and cannot be closed on {here} while its records leave it running."
+        )
+    );
+    fixture.assert_retained("active copy", SessionState::Ready);
+    assert_eq!(active.bytes().unwrap().unwrap(), before);
+    assert!(fixture.core.methods().is_empty());
+    assert!(fixture.console.methods().is_empty());
 }
 
 #[test]

@@ -799,6 +799,19 @@ fn host_record_pending(reader: &Reader, receipt: &Record) -> bool {
     }
 }
 
+/// Whether a launching copy's records support a running refusal before a retry can repair it.
+pub(super) fn records_leave_launch_pending(
+    reader: &Reader,
+    status: &SessionStatus,
+) -> Result<bool> {
+    let Some(receipt) = read(reader)? else {
+        return Ok(true);
+    };
+    Ok(confirmed(reader, &receipt, status)
+        || turn::current_claim_token(reader)?.as_deref() != Some(receipt.claim_token.as_str())
+        || (unix_ms() < receipt.deadline_unix_ms && host_record_pending(reader, &receipt)))
+}
+
 fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
     record.phase == Phase::Spawned
         || (record.phase == Phase::Spawning
