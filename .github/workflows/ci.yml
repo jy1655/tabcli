@@ -82,6 +82,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  freebsd-check:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.97.1
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain and FreeBSD target
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-freebsd
+      - run: cargo check --locked --target x86_64-unknown-freebsd --all-targets --all-features
+
   release-build:
     # Keep these check names stable so that the main ruleset can require them.
     # Without a name the check would carry the archive name, which changes with

@@ -16,10 +16,12 @@ For each item, state what ran and the result, or why it was not run. See
 - [ ] `git diff --check`
 - [ ] Linux cross-target Clippy below
 - [ ] Windows cross-target Clippy below
+- [ ] FreeBSD cross-target check below (CI runs it on Rust 1.97.1)
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
 cargo clippy --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
+cargo check --locked --target x86_64-unknown-freebsd --all-targets --all-features
 ```
 
 Name the behavior tests you added or updated, or explain why none are needed:

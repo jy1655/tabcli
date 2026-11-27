@@ -215,7 +215,7 @@ including tests (341 `Reader`, 437 `Store`). Its benefit over the hooks above is
 hygiene, since those hooks already reproduce the transitions the rule requires. A future review
 should not re-propose it without a new reason.
 
-Also check platform-gated code with the two cross-target Clippy commands in
+Also check platform-gated code with the Linux and Windows Clippy commands and the FreeBSD check in
 [Contributing](../CONTRIBUTING.md). Installing `rust-std` for each target is enough for those
 checks. Cross-target checks do not run tests on the target platform.
 
@@ -243,7 +243,9 @@ trip rather than enabling every ignored test, which also runs the subprocess fix
 | --- | --- | --- |
 | Minimum Rust | Ubuntu, Rust 1.97.1 | Formatting, all-feature Clippy, serial all-feature tests |
 | Stable Rust | Ubuntu, macOS, Windows | Formatting, all-feature Clippy, serial all-feature tests |
-| Release candidate | Apple Silicon macOS, x86-64 Windows | Locked build and package checks |
+| FreeBSD check | Ubuntu, Rust 1.97.1 | Locked `cargo check` for `x86_64-unknown-freebsd` with all targets and features |
+| Release candidate | Apple Silicon macOS, x86-64 Windows, x86-64 Linux | Locked build and package checks |
+| Integration packages | Ubuntu | Build, verify and upload host integration packages |
 
 The formatting command in CI is `cargo fmt --all -- --check`; Clippy uses
 `cargo clippy --all-targets --all-features -- -D warnings`. Tests use the serial command above.
@@ -251,8 +253,9 @@ Each serial test step has a `timeout-minutes` bound so that a hang fails in boun
 minutes for the minimum Rust job, 30 for Linux and macOS, and 60 for Windows and for both Release
 test steps, one of which also runs Windows tests for historical tags.
 The macOS stable job installs Ghostty and iTerm2 for the AppleScript compile test.
-The release-candidate job packages the executable and license, checks the archive checksum,
-extracts it, and checks the extracted binary's version. This is not an authenticated live test.
+The release-candidate job packages the executable and license and includes third-party notices
+for `tabcli`. It checks the archive checksum, extracts the archive and checks the extracted binary's version.
+This is not an authenticated live test.
 Linux CI runs portable and Linux surface tests, including a real-tmux test that is skipped
 when tmux is absent. These checks do not authenticate provider CLIs. The separate
 [2026-11-17 Linux record](verification/2026-11-17-linux-6-tmux-3.6.md) covers four providers
