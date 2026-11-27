@@ -1279,6 +1279,7 @@ fn repair_owner(
             let _lock = if locked.is_none() {
                 Some(store.lock()?)
             } else {
+                budget::check()?;
                 None
             };
             let mut fresh = MarkerHistory::default();
@@ -1294,9 +1295,9 @@ fn repair_owner(
                 close.close(surface, deadline).map(Into::into)
             };
             match locked {
-                Some(marker) => {
+                Some(marker) => budget::check().and_then(|()| {
                     close_session_state_locked(store, marker, repair_error, closer, deadline)
-                }
+                }),
                 None => close_session_state_with_error(store, repair_error, closer, deadline),
             }
             .context(context)?;

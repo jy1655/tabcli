@@ -4478,3 +4478,109 @@ fn native_close_preserves_the_preclose_repair_lock_timeout_diagnostic() {
     assert!(store.record(CoreRecord::Terminal).present().unwrap());
     assert!(store.closed_if_present().unwrap().is_none());
 }
+
+fn close_expiring_during_owner_observation(
+    store: &Store,
+    surfaces: RepairSurfaces<'_>,
+) -> anyhow::Error {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(1);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = budget::Scope::with_clock(fake);
+    close_transaction(
+        store,
+        None,
+        |marker| {
+            repair_owner(
+                store,
+                |_| {
+                    clock.set(deadline);
+                    Ok(false)
+                },
+                surfaces,
+                deadline,
+                Some(marker),
+            )
+        },
+        |_| panic!("expired explicit close dispatched"),
+        deadline,
+    )
+    .unwrap_err()
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn close_deadline_in_repair_never_claims_an_expired_windows_console() {
+    use crate::native::session::primitives::{with_fault_at, with_step_at};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(dir.path());
+    write_owned_terminal_state(dir.path(), "working", 42);
+    store
+        .write_terminal(&terminal::TerminalSession::new(
+            terminal::TerminalKind::WindowsConsole,
+            "42".into(),
+        ))
+        .unwrap();
+    let original = store.record(CoreRecord::Terminal).bytes().unwrap().unwrap();
+    let claims = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = claims.clone();
+    let error = with_step_at(
+        "claiming the terminal handle for close",
+        move || observed.set(observed.get() + 1),
+        || {
+            with_fault_at("renaming a record file", || {
+                close_expiring_during_owner_observation(
+                    &store,
+                    RepairSurfaces::Windows(&mut |_| panic!("expired Repair dispatched")),
+                )
+            })
+        },
+    );
+
+    assert_eq!(claims.get(), 0, "{error:#}");
+    assert_eq!(
+        store.record(CoreRecord::Terminal).bytes().unwrap(),
+        Some(original)
+    );
+    assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
+    assert!(
+        format!("{error:#}").contains(
+            "failed to close a Windows console whose native owner exited: close deadline expired"
+        ),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn close_deadline_in_repair_reports_settlement_expiry_before_marker_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(dir.path());
+    update_status(dir.path(), SessionState::Exited, None, None).unwrap();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 42,
+            ..Default::default()
+        })
+        .unwrap();
+    let marker = store.record(CoreRecord::TerminalClosed);
+    fs::create_dir(marker.path()).unwrap();
+    let original = store.record(CoreRecord::Status).bytes().unwrap();
+
+    let error = close_expiring_during_owner_observation(&store, RepairSurfaces::WithoutSurface);
+    assert!(
+        error.to_string().starts_with("close deadline expired"),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .root_cause()
+            .to_string()
+            .starts_with("pre-close session repair failed: close deadline expired"),
+        "{error:#}"
+    );
+    assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), original);
+    assert!(marker.path().is_dir());
+    assert!(store.closed_if_present().unwrap().is_none());
+}
