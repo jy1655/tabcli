@@ -458,7 +458,8 @@ On a slow terminal, give `close-session` a longer `--timeout-secs` budget. When 
 WezTerm GUI does not answer its pane listing in time, TAB reports it as busy instead of
 opening another window.
 
-For a native session, `close-session` targets the surface TAB created for that session.
+For a native session, `close-session` targets the surface TAB created for that session,
+not whichever tab you have selected.
 It preserves surfaces outside that session; tmux close includes every window added to
 the session's server. If a native surface close lacks proof of ownership or absence,
 TAB refuses it and keeps the handle.

@@ -550,7 +550,12 @@ fn prune_and_repair_classify_marker_owner_and_active_records() {
 
 #[test]
 fn copy_launch_uses_only_the_recorded_deadline() {
-    for expired in [false, true] {
+    for (expired, host) in [
+        (false, None),
+        (true, None),
+        (false, Some("{")),
+        (false, Some(r#"{"schema":99}"#)),
+    ] {
         let (dir, store, _) = launch::test_support::pending_launch(
             "session-copy-",
             &std::env::temp_dir(),
@@ -558,6 +563,12 @@ fn copy_launch_uses_only_the_recorded_deadline() {
         );
         let id = dir.path().file_name().unwrap().to_str().unwrap();
         store.write_owner(&foreign_owner(id)).unwrap();
+        if let Some(wire) = host {
+            store
+                .record(CoreRecord::LaunchHost)
+                .write_private(wire.as_bytes())
+                .unwrap();
+        }
         if expired {
             let mut record = launch::read(&store).unwrap().unwrap();
             record.deadline_unix_ms = 1;
@@ -589,13 +600,54 @@ fn copy_launch_uses_only_the_recorded_deadline() {
             assert_eq!(store.status().unwrap().state, SessionState::Closed);
         } else {
             let error = attempt(&store).unwrap_err();
-            assert_eq!(cleanup.to_string(), error.to_string());
+            assert_eq!(cleanup.to_string(), error.to_string(), "host: {host:?}");
             assert_eq!(
                 crate::native::failure_kind::classify(&error),
                 Some(crate::native::failure_kind::FailureKind::Unsupported)
             );
             assert_eq!(snapshot(&store), before);
             repair_dead_owner(&store).unwrap();
+            assert_eq!(snapshot(&store), before);
+        }
+    }
+}
+
+#[test]
+fn cleanup_and_explicit_close_report_the_same_unreadable_launch_receipt_or_claim() {
+    for record in [CoreRecord::Launch, CoreRecord::TurnClaim] {
+        let (dir, store, _) = launch::test_support::pending_launch(
+            "session-copy-",
+            &std::env::temp_dir(),
+            Duration::from_secs(60),
+        );
+        store
+            .write_owner(&foreign_owner(
+                dir.path().file_name().unwrap().to_str().unwrap(),
+            ))
+            .unwrap();
+        fs::write(store.record(record).path(), [0xff]).unwrap();
+        let before = snapshot(&store);
+        let read_error = match record {
+            CoreRecord::Launch => launch::read(&store).unwrap_err(),
+            CoreRecord::TurnClaim => super::super::turn::current_claim_token(&store).unwrap_err(),
+            _ => unreachable!(),
+        };
+        for cause in [CloseCause::Explicit, CloseCause::Cleanup] {
+            let error = close_for_cause(
+                &store,
+                None,
+                cause,
+                budget::close_deadline(),
+                |_| panic!("copy owner observed"),
+                |_| panic!("copy dispatched"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!("{read_error:#}"),
+                "{} {cause:?}",
+                store.record(record).path().display()
+            );
             assert_eq!(snapshot(&store), before);
         }
     }

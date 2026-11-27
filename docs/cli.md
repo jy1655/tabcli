@@ -1775,6 +1775,7 @@ without closing another surface; with `--with-started-from` it can still discove
 process teardown, and terminal automation. It does not guarantee that the close finishes.
 A timeout means the close was not confirmed and may have partly happened. A retry checks
 the current records and, for a native surface action, establishes authority again.
+It may still refuse the close.
 
 For a native tmux session, explicit close ends the session's entire tmux server, including windows you added.
 The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;

@@ -678,7 +678,7 @@ fn close_native_locked(
             if error.is::<CloseRecordChanged>() {
                 let restored = CloseRecords::acquire(store, marker)?;
                 if let Some(copy) = restored.evidence(store)
-                    && restored.leave_running(store)
+                    && restored.leave_running(store)?
                 {
                     return Err(copy.running_refusal());
                 }
@@ -919,16 +919,16 @@ struct CloseRecords {
 }
 
 impl CloseRecords {
-    fn leave_running(&self, reader: &Reader) -> bool {
+    fn leave_running(&self, reader: &Reader) -> Result<bool> {
         let (Ok(None), Ok(status), Ok(marker)) = (&self.closed, &self.status, &self.marker) else {
-            return false;
+            return Ok(false);
         };
-        !status.state.ended()
+        Ok(!status.state.ended()
             && marker
                 .as_ref()
                 .is_none_or(|facts| facts.completed.is_none())
             && (status.state != SessionState::Launching
-                || launch::records_leave_launch_pending(reader, status).unwrap_or(false))
+                || launch::records_leave_launch_pending(reader, status)?))
     }
 
     fn evidence(&self, store: &Store) -> Option<CopyEvidence> {
@@ -1241,7 +1241,7 @@ fn settle_copy(
     reason: Option<String>,
 ) -> Result<()> {
     if cause != CloseCause::Explicit {
-        return Err(if records.leave_running(store) {
+        return Err(if records.leave_running(store)? {
             copy.running_refusal()
         } else {
             copy.cleanup_refusal()

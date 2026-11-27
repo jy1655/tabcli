@@ -809,7 +809,9 @@ pub(super) fn records_leave_launch_pending(
     };
     Ok(confirmed(reader, &receipt, status)
         || turn::current_claim_token(reader)?.as_deref() != Some(receipt.claim_token.as_str())
-        || (unix_ms() < receipt.deadline_unix_ms && host_record_pending(reader, &receipt)))
+        || (unix_ms() < receipt.deadline_unix_ms
+            && !matches!(host::observe(reader, Some(&receipt)),
+                host::HostObservation::Recorded(record) if record.failure.is_some())))
 }
 
 fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
