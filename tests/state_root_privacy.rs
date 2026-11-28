@@ -40,6 +40,83 @@ fn diagnosis(root: &Path, args: &[&str]) -> Value {
         .expect("doctor must report state_root")
 }
 
+#[cfg(windows)]
+fn root_sddl(path: &Path) -> String {
+    use std::{
+        io,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Globalization::lstrlenW,
+        Security::{
+            Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+                SDDL_REVISION_1, SE_FILE_OBJECT,
+            },
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        },
+        Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL},
+    };
+
+    let root = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap_or_else(|error| panic!("open {} for READ_CONTROL: {error}", path.display()));
+    let information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            root.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(
+        status,
+        ERROR_SUCCESS,
+        "GetSecurityInfo on {}",
+        path.display()
+    );
+
+    let mut text = ptr::null_mut();
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            information,
+            &mut text,
+            ptr::null_mut(),
+        )
+    };
+    let error = (converted == 0).then(io::Error::last_os_error);
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if let Some(error) = error {
+        panic!(
+            "convert security descriptor to SDDL on {}: {error}",
+            path.display()
+        );
+    }
+    let units = unsafe { std::slice::from_raw_parts(text, lstrlenW(text) as usize) };
+    let sddl = String::from_utf16(units);
+    unsafe {
+        LocalFree(text.cast());
+    }
+    let sddl = sddl.expect("Windows returned invalid UTF-16 SDDL");
+    assert!(!sddl.is_empty(), "empty SDDL for {}", path.display());
+    sddl
+}
+
 #[test]
 fn doctor_reports_a_missing_root_without_creating_it() {
     let parent = tempfile::tempdir().unwrap();
@@ -121,18 +198,7 @@ fn queries_preserve_root_permissions_and_session_records() {
         }
         #[cfg(windows)]
         {
-            let out = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "(Get-Acl -LiteralPath $env:TABCLI_ROOT_FIXTURE -ErrorAction Stop).Sddl",
-                ])
-                .env("TABCLI_ROOT_FIXTURE", root)
-                .output()
-                .unwrap();
-            assert!(out.status.success() && !out.stdout.is_empty(), "{out:?}");
-            out.stdout
+            root_sddl(root)
         }
     };
     let before = permissions();
