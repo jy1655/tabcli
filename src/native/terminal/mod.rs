@@ -344,8 +344,8 @@ pub(super) enum CloseOutcome {
 pub(in crate::native) struct CloseResult {
     pub outcome: CloseOutcome,
     pub reason: Option<String>,
-    /// The closed record keeps the session's stored diagnosis, read under the lifecycle lock:
-    /// a close on a terminal's creation record, which no live owner reported on.
+    /// A close on creation evidence or on proven console absence keeps the session's
+    /// stored diagnosis, read under the lifecycle lock.
     pub keeps_diagnosis: bool,
     /// What the closed record says when the session stored no diagnosis.
     pub generated_reason: Option<String>,

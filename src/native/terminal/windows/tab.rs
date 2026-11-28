@@ -160,6 +160,8 @@ pub(super) fn recorded_host(directory: &Path) -> Result<Option<(u32, WindowsProc
     // The record is written once, by a rename, before the root exists. Only another
     // handle on the file can keep it from being read, and not for long.
     let deadline = Instant::now() + HOST_RECORD_READ_WAIT;
+    let deadline = crate::native::session::close::budget::deadline()
+        .map_or(deadline, |close| close.min(deadline));
     loop {
         let read = read_record::<HostProcess>(&path).and_then(|record| match record {
             Some(host) if host.schema != 1 => {
@@ -177,7 +179,9 @@ pub(super) fn recorded_host(directory: &Path) -> Result<Option<(u32, WindowsProc
                     )
                 });
             }
-            Err(_) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => std::thread::sleep(
+                POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            ),
         }
     }
 }

@@ -277,15 +277,10 @@ impl Fixture {
     /// and the macOS and Linux one on those systems.
     fn repair(&self, observe: Observe) -> Vec<Result<bool>> {
         let store = self.store();
-        let dispatch = crate::native::terminal::windows_dispatch::Dispatch::new(
-            Adapter::with_core(self.console.clone()),
-            Adapter::with_core(self.core.clone()),
-        );
         #[allow(unused_mut)]
         let mut results = vec![session::close::repair_dead_owner_windows_with(
             &store,
             |_| observe(),
-            &dispatch,
             later(),
         )];
         #[cfg(unix)]
@@ -1077,20 +1072,30 @@ fn repair_finds_a_restored_handle_again_under_the_lifecycle_lock() {
     type Repair = fn(&Fixture) -> Result<bool>;
     #[cfg_attr(windows, allow(unused_mut))]
     let mut policies: Vec<(&str, Repair)> = vec![("windows", |f| {
-        let dispatch = crate::native::terminal::windows_dispatch::Dispatch::new(
-            Adapter::with_core(f.console.clone()),
-            Adapter::with_core(f.core.clone()),
-        );
-        session::close::repair_dead_owner_windows_with(&f.store(), |_| exited(), &dispatch, later())
+        session::close::repair_dead_owner_windows_with(&f.store(), |_| exited(), later())
     })];
     #[cfg(unix)]
     policies.push(("posix", |f| {
         session::close::repair_dead_owner_attested_until(&f.store(), |_| exited(), later())
     }));
     for (policy, repair) in policies {
-        for state in ["exited", "failed"] {
-            let label = format!("{policy}, {state}");
+        let mut cases = vec![
+            ("exited", TerminalKind::Herdr),
+            ("failed", TerminalKind::Herdr),
+        ];
+        if policy == "windows" {
+            cases.push(("working", TerminalKind::WindowsConsole));
+        }
+        for (state, kind) in cases {
+            let label = format!("{policy}, {state}, {kind:?}");
             let fixture = Fixture::new(state, &complete_owner());
+            if kind == TerminalKind::WindowsConsole {
+                // An unbound fixture exercises local retention under the projected Windows policy on POSIX too.
+                fixture
+                    .store()
+                    .write_terminal(&TerminalSession::new(kind, "42".into()))
+                    .unwrap();
+            }
             let handle = fixture
                 .store()
                 .record(CoreRecord::Terminal)

@@ -15,10 +15,10 @@ use crate::native::session::turn::{
 };
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::native::terminal::close_authority::owner_exit::RepairSurfaces;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use crate::native::terminal::close_authority::owner_exit::core_retains_finished;
 pub(in crate::native) use crate::native::terminal::close_authority::owner_exit::repair_owner_is_live;
-use crate::native::terminal::close_authority::owner_exit::{RepairSurface, RepairSurfaces};
 use crate::native::terminal::ownership::NativeSessionOwner;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::native::terminal::ownership::OwnerBinding;
@@ -376,6 +376,10 @@ impl Reader {
             OwnerRecord::Recorded(recorded) => prune_blocked_by(&attest_owner(&recorded.owner)),
         })
     }
+}
+
+pub(in crate::native) fn gone_owner_reason(pid: u32) -> String {
+    format!("native session process {pid} is no longer running")
 }
 
 #[cfg(test)]
@@ -1402,7 +1406,7 @@ pub(in crate::native) fn repair_dead_owner_attested_until(
     deadline: Instant,
 ) -> Result<bool> {
     #[cfg(windows)]
-    return repair_dead_owner_windows_with(store, attest, terminal::windows_installed(), deadline);
+    return repair_dead_owner_windows_with(store, attest, deadline);
 
     #[cfg(not(windows))]
     {
@@ -1427,16 +1431,7 @@ fn repair_attested_locked(
     records: CloseRecords,
 ) -> Result<bool> {
     #[cfg(windows)]
-    let mut close = |surface: &terminal::TerminalSession| {
-        terminal::windows_dispatch::close_session_until(
-            terminal::windows_installed(),
-            store.directory(),
-            surface,
-            deadline,
-        )
-    };
-    #[cfg(windows)]
-    let surfaces = RepairSurfaces::Windows(&mut close);
+    let surfaces = RepairSurfaces::Windows;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let surfaces = RepairSurfaces::Posix;
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
@@ -1470,21 +1465,12 @@ pub(in crate::native) fn repair_dead_owner_attested_with(
 pub(in crate::native) fn repair_dead_owner_windows_with(
     store: &Store,
     attest: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
-    adapters: &dyn terminal::windows_dispatch::Adapters,
     deadline: Instant,
 ) -> Result<bool> {
-    let mut close = |surface: &terminal::TerminalSession| {
-        terminal::windows_dispatch::close_session_until(
-            adapters,
-            store.directory(),
-            surface,
-            deadline,
-        )
-    };
     repair_dead_owner_with(
         store,
         |owner| repair_owner_is_live(&attest(owner)),
-        RepairSurfaces::Windows(&mut close),
+        RepairSurfaces::Windows,
         deadline,
     )
 }
@@ -1492,7 +1478,7 @@ pub(in crate::native) fn repair_dead_owner_windows_with(
 fn repair_dead_owner_with(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
-    surfaces: RepairSurfaces<'_>,
+    surfaces: RepairSurfaces,
     deadline: Instant,
 ) -> Result<bool> {
     repair_owner(store, owner_is_live, surfaces, deadline, None)
@@ -1503,7 +1489,7 @@ fn repair_dead_owner_with(
 fn repair_owner(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
-    surfaces: RepairSurfaces<'_>,
+    surfaces: RepairSurfaces,
     deadline: Instant,
     locked: Option<&mut MarkerHistory>,
 ) -> Result<bool> {
@@ -1513,7 +1499,7 @@ fn repair_owner(
 fn repair_owner_from(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
-    surfaces: RepairSurfaces<'_>,
+    surfaces: RepairSurfaces,
     deadline: Instant,
     mut locked: Option<&mut MarkerHistory>,
     initial: Option<CloseRecords>,
@@ -1579,67 +1565,78 @@ fn repair_owner_from(
     let mut repair_error = status
         .error
         .clone()
-        .unwrap_or_else(|| format!("native session process {} is no longer running", owner.pid));
+        .unwrap_or_else(|| gone_owner_reason(owner.pid));
     if let Some(damage) = &recovery_damage {
         repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
     }
     let repair_error = Some(repair_error);
-    match surfaces.decide(&status.state, deadline, |retention| {
-        retention.retains(
+    #[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+    let _windows_budget = if matches!(surfaces, RepairSurfaces::Windows) {
+        budget::close_remaining(deadline)?;
+        (!matches!(status.state, SessionState::Exited | SessionState::Failed))
+            .then(|| budget::Scope::enter(deadline))
+    } else {
+        None
+    };
+    #[cfg(not(any(windows, all(test, any(target_os = "macos", target_os = "linux")))))]
+    let _ = deadline;
+    if surfaces.retains(
+        store,
+        &status.state,
+        || records.active.retained_kind(),
+        || records.closing.retained_kind(),
+    )? {
+        return untouched(recovery_damage);
+    }
+    let _lock = if locked.is_none() {
+        Some(store.lock()?)
+    } else {
+        budget::check()?;
+        None
+    };
+    let mut fresh = MarkerHistory::default();
+    let marker = locked.unwrap_or(&mut fresh);
+    let records = CloseRecords::acquire(store, marker)?;
+    if records.evidence(store).is_some() {
+        return untouched(recovery_damage);
+    }
+    let state = records.status?.state;
+    if !repair_examines_owner(&state)
+        || surfaces.retains(
             store,
+            &state,
             || records.active.retained_kind(),
             || records.closing.retained_kind(),
-        )
-    })? {
-        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-        RepairSurface::Retain => return untouched(recovery_damage),
-        RepairSurface::Settle(retention) => {
-            // Standalone Repair scans before taking the lock. Check retention under
-            // the lock in case a closer restored a handle after that scan.
-            let _lock = if locked.is_none() {
-                Some(store.lock()?)
-            } else {
-                budget::check()?;
-                None
-            };
-            let mut fresh = MarkerHistory::default();
-            let marker = locked.unwrap_or(&mut fresh);
-            let records = CloseRecords::acquire(store, marker)?;
-            if records.evidence(store).is_some()
-                || !repair_examines_owner(&records.status?.state)
-                || retention.retains(
-                    store,
-                    || records.active.retained_kind(),
-                    || records.closing.retained_kind(),
-                )?
-            {
-                return untouched(recovery_damage);
-            }
-            mark_session_closed_locked(store, marker, claim.path(), repair_error)?;
-        }
-        RepairSurface::CloseOnWindows(mut close) => {
-            let context = close.failure_context();
-            let closer = |surface: &terminal::TerminalSession| {
-                close.close(surface, deadline).map(Into::into)
-            };
-            let run = |marker: &mut MarkerHistory| {
-                close_session_state_locked(store, marker, None, repair_error, closer, deadline)
-            };
-            let changed = match locked {
-                Some(marker) => budget::check().and_then(|()| run(marker)),
-                None => (|| {
-                    let _budget = budget::Scope::enter(deadline);
-                    budget::close_remaining(deadline)?;
-                    let _lock = store.lock()?;
-                    run(&mut MarkerHistory::default())
-                })(),
-            }
-            .context(context)?;
-            if !changed {
-                return untouched(recovery_damage);
-            }
-        }
+        )?
+    {
+        return untouched(recovery_damage);
     }
+    #[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+    if matches!(surfaces, RepairSurfaces::Windows)
+        && !matches!(state, SessionState::Exited | SessionState::Failed)
+    {
+        // Preserve the pending-launch fence, marker recovery and exact claim checks.
+        // A recognized active surface was retained above; no handle can authorize Repair to close it.
+        return close_session_state_locked(
+            store,
+            marker,
+            None,
+            repair_error,
+            |surface| {
+                if surface.kind == terminal::TerminalKind::WindowsConsole
+                    || core_retains_finished(surface.kind)
+                {
+                    bail!(
+                        "the terminal handle changed during Repair; retry with the current records"
+                    );
+                }
+                bail!("dead Windows native owner has a non-Windows terminal handle")
+            },
+            deadline,
+        )
+        .context("failed to close a Windows console whose native owner exited");
+    }
+    mark_session_closed_locked(store, marker, claim.path(), repair_error)?;
     Ok(true)
 }
 

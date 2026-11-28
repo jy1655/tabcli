@@ -122,7 +122,7 @@ impl NativeSessionOwner {
     // Two rules read the macOS control fields, and they differ on purpose (CONTEXT.md
     // Attestation, Close authority):
     // - `control_record` classifies all five. The macOS ownership proof
-    //   (`verify_native_terminal_owner_with`), the dead-owner close authority, the close and
+    //   (`verify_native_terminal_owner_with`), a dead owner's recorded app identity, the close and
     //   teardown intents, Terminal.app's failed-start absence and Warp's close require it to be
     //   complete; `native_owner_identity_matches` also treats a record with none of the five
     //   as a legacy match and a partial one as a mismatch.

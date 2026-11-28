@@ -1,6 +1,7 @@
 use super::*;
+use crate::native::session::test_support::lifecycle::DisabledDebugPrivilege;
 use std::cell::RefCell;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Stdio};
 use std::rc::Rc;
 
@@ -25,115 +26,6 @@ impl Fault {
     }
 }
 
-struct DisabledDebugPrivilege {
-    token: OwnedHandle,
-    previous: windows_sys::Win32::Security::TOKEN_PRIVILEGES,
-}
-
-impl DisabledDebugPrivilege {
-    fn in_isolated_process() -> Self {
-        use windows_sys::Win32::{
-            Foundation::{ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError},
-            Security::{
-                AdjustTokenPrivileges, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
-                TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-            },
-            System::Threading::{GetCurrentProcess, OpenProcessToken},
-        };
-
-        assert_eq!(
-            std::env::var_os(CHILD).as_deref(),
-            Some(std::ffi::OsStr::new("1"))
-        );
-        let mut raw = std::ptr::null_mut();
-        assert_ne!(
-            unsafe {
-                OpenProcessToken(
-                    GetCurrentProcess(),
-                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
-                    &mut raw,
-                )
-            },
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut disabled = TOKEN_PRIVILEGES {
-            PrivilegeCount: 1,
-            ..Default::default()
-        };
-        assert_ne!(
-            unsafe {
-                LookupPrivilegeValueW(
-                    std::ptr::null(),
-                    SE_DEBUG_NAME,
-                    &mut disabled.Privileges[0].Luid,
-                )
-            },
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-        let mut previous = TOKEN_PRIVILEGES::default();
-        let mut length = 0;
-        let adjusted = unsafe {
-            AdjustTokenPrivileges(
-                token.as_raw_handle(),
-                0,
-                &disabled,
-                std::mem::size_of_val(&previous) as u32,
-                &mut previous,
-                &mut length,
-            )
-        };
-        let error = unsafe { GetLastError() };
-        assert_ne!(
-            adjusted,
-            0,
-            "{}",
-            std::io::Error::from_raw_os_error(error as i32)
-        );
-        assert!(
-            matches!(error, ERROR_SUCCESS | ERROR_NOT_ALL_ASSIGNED),
-            "token adjustment: {error}"
-        );
-        println!(
-            "isolated SeDebugPrivilege: absent={}, disabled_previous_enabled={}",
-            error == ERROR_NOT_ALL_ASSIGNED,
-            previous.PrivilegeCount == 1
-                && previous.Privileges[0].Attributes & SE_PRIVILEGE_ENABLED != 0
-        );
-        Self { token, previous }
-    }
-}
-
-impl Drop for DisabledDebugPrivilege {
-    fn drop(&mut self) {
-        if self.previous.PrivilegeCount == 0 {
-            return;
-        }
-        let restored = unsafe {
-            windows_sys::Win32::Security::AdjustTokenPrivileges(
-                self.token.as_raw_handle(),
-                0,
-                &self.previous,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        assert_ne!(
-            restored,
-            0,
-            "{}",
-            std::io::Error::from_raw_os_error(error as i32)
-        );
-        assert_eq!(error, windows_sys::Win32::Foundation::ERROR_SUCCESS);
-    }
-}
-
 struct OwnedChild(Child, Option<Vec<u8>>);
 
 impl Drop for OwnedChild {
@@ -154,62 +46,6 @@ impl Drop for OwnedChild {
         let status = self.0.wait().unwrap();
         println!("fixture process pid={} reaped with {status}", self.0.id());
     }
-}
-
-fn deny_process_synchronize(child: &Child) -> Vec<u8> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
-
-    // Only this test-owned child's new handles lose SYNCHRONIZE. Its existing Child
-    // handle still allows waiting, and EOF on its private stdin ends it without a kill.
-    let mut size = 0;
-    unsafe {
-        windows_sys::Win32::Security::GetKernelObjectSecurity(
-            child.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            0,
-            &mut size,
-        );
-    }
-    assert!(size > 0);
-    let mut original = vec![0u8; size as usize];
-    assert_ne!(
-        unsafe {
-            windows_sys::Win32::Security::GetKernelObjectSecurity(
-                child.as_raw_handle(),
-                DACL_SECURITY_INFORMATION,
-                original.as_mut_ptr().cast(),
-                size,
-                &mut size,
-            )
-        },
-        0
-    );
-    let sddl: Vec<u16> = "D:(A;;0x1000;;;WD)\0".encode_utf16().collect();
-    let mut descriptor = std::ptr::null_mut();
-    unsafe {
-        assert_ne!(
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                std::ptr::null_mut(),
-            ),
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-        let changed =
-            SetKernelObjectSecurity(child.as_raw_handle(), DACL_SECURITY_INFORMATION, descriptor);
-        let error = std::io::Error::last_os_error();
-        LocalFree(descriptor);
-        assert_ne!(changed, 0, "{error}");
-    }
-    original
 }
 
 fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
@@ -265,7 +101,7 @@ fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
                         ProviderProcessObservation::Alive
                     ),
                     Fault::UnknownProcess => {
-                        child.1 = Some(deny_process_synchronize(&child.0));
+                        child.1 = Some(crate::native::session::test_support::lifecycle::deny_process_synchronize(&child.0));
                         assert_eq!(
                             terminal::windows_process_identity(record.pid).unwrap(),
                             record.windows_process_identity.clone().unwrap()
@@ -371,8 +207,8 @@ fn reproduce(test_name: &str, fault: Fault) {
         return;
     }
 
-    let _privilege =
-        matches!(fault, Fault::UnknownProcess).then(DisabledDebugPrivilege::in_isolated_process);
+    let _privilege = matches!(fault, Fault::UnknownProcess)
+        .then(|| DisabledDebugPrivilege::in_isolated_process(CHILD));
     let root = Reader::state_root().unwrap();
     let source = write_closed_reopen_source(
         &root,

@@ -18,9 +18,18 @@
   All consumers use a copy's records without consulting local processes or probing a local surface.
 - For a Herdr close, only a session-bound, platform-consistent
   owner record with an attested live incarnation selects the close with a live owner (see [Herdr close](herdr.md#close-by-creation-record)).
-- The ordinary macOS and Linux dead-owner Close of other kinds requires an exited, bound
-  owner with complete recorded control. For terminal kinds other than Herdr, the platform
-  differences remain and are tracked in [issue #421](https://github.com/jy1655/tabcli/issues/421).
+- Ordinary explicit close of a macOS application surface without a verified owner requires
+  positive absence. Only a complete, session-bound owner record with a controlling TTY and
+  no other platform's identity can supply the Terminal.app incarnation on that path, including
+  after wrapper PID reuse.
+- Without a verified owner, a retained Windows console requires proof of root absence before tab-host cleanup and settlement.
+  A bound owner whose process may still be live and whose ownership cannot be verified prevents both.
+- When the Herdr core proves the terminal absent, explicit close on macOS and Linux ends the
+  live attested owner's foreground process group and settles the session. Windows refuses the
+  close because it has no foreground process group ([#421](https://github.com/jy1655/tabcli/issues/421)).
+- An owned Windows console close can
+  settle on root exit while the verified wrapper survives
+  ([#460](https://github.com/jy1655/tabcli/issues/460)).
 - While a launch is pending, the registered owner is visible to startup repair before the provider version check.
   The spawn fence binds the owner record to the spawning wrapper under the lifecycle lock.
   Once an owner is recorded, no other wrapper can settle its launch or release the Claim.

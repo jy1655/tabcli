@@ -119,6 +119,13 @@ impl WindowsTerminalAdapter for ManagedConsole {
         console_control::installed().close_session_until(directory, session, deadline)
     }
 
+    fn end_recorded_tab_host(&self, directory: &Path, deadline: Instant) -> Result<()> {
+        let _budget = crate::native::session::close::budget::Scope::enter(deadline);
+        let host = tab::recorded_host(directory)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
+        end_tab_host(host.as_ref())
+    }
+
     fn surface_present(
         &self,
         _directory: &Path,
@@ -775,7 +782,7 @@ pub(in crate::native) fn console_control(
     result?;
     if close_requested {
         std::thread::sleep(std::time::Duration::from_millis(250));
-        if verify_control_process_identity(pid, identity).is_ok() {
+        if verify_control_process_identity(pid, identity)? {
             terminate_console_processes(&console_processes, pid, tab_host)?;
         }
         wait_for_console_process_exit(pid, identity)?;
@@ -812,7 +819,15 @@ fn end_tab_host(recorded: Option<&(u32, WindowsProcessIdentity)>) -> Result<()> 
         query_process_identity_from_handle(watched.as_raw_handle())
             .is_ok_and(|live| live == *identity)
     };
-    if ended(Duration::ZERO) || !is_host() || ended(TAB_HOST_EXIT_WAIT) {
+    let host_wait = || -> Result<Duration> {
+        use crate::native::session::close::budget;
+        Ok(budget::deadline()
+            .map(budget::close_remaining)
+            .transpose()?
+            .unwrap_or(TAB_HOST_EXIT_WAIT)
+            .min(TAB_HOST_EXIT_WAIT))
+    };
+    if ended(Duration::ZERO) || !is_host() || ended(host_wait()?) {
         return Ok(());
     }
     // The pid cannot be given to another process while `watched` is open, so this is
@@ -824,13 +839,14 @@ fn end_tab_host(recorded: Option<&(u32, WindowsProcessIdentity)>) -> Result<()> 
         });
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    crate::native::session::close::budget::check()?;
     let terminated = unsafe { TerminateProcess(handle.as_raw_handle(), 0) };
     let error = std::io::Error::last_os_error();
     if terminated == 0 && !ended(Duration::ZERO) {
         return Err(error)
             .with_context(|| format!("failed to end the stalled Windows Terminal tab host {pid}"));
     }
-    if !ended(TAB_HOST_EXIT_WAIT) {
+    if !ended(host_wait()?) {
         bail!("the stalled Windows Terminal tab host {pid} did not end");
     }
     Ok(())
@@ -1177,29 +1193,15 @@ fn terminate_by_identity(
     identity: &WindowsProcessIdentity,
     deadline: Instant,
 ) -> Result<()> {
-    let handle: HANDLE = unsafe {
-        OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            0,
-            pid,
-        )
+    anyhow::ensure!(pid != 0, "invalid Windows console pid");
+    let Some((handle, live)) = process::open_observed_process(pid, PROCESS_TERMINATE)? else {
+        return Ok(());
     };
-    if handle.is_null() {
-        if !agent_bridge::process_is_alive(pid) {
-            return Ok(());
-        }
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to open the managed console root {pid}"));
-    }
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    // An ended process can still be opened while a handle to it exists, but its identity
-    // can no longer be read. A different process behind the pid means the same: the
-    // root has already ended.
-    if unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } == WAIT_OBJECT_0
-        || query_process_identity_from_handle(handle.as_raw_handle())? != *identity
-    {
+    if live.creation_time != identity.creation_time {
         return Ok(());
     }
+    process::check_identity_values(&live, identity.creation_time, &identity.executable_path)
+        .map_err(anyhow::Error::msg)?;
     terminate_process_until(handle.as_raw_handle(), deadline)
 }
 
@@ -1251,14 +1253,15 @@ fn console_close_message() -> u32 {
 fn wait_for_console_process_exit(pid: u32, identity: &WindowsProcessIdentity) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        match verify_control_process_identity(pid, identity) {
-            Err(_) if !agent_bridge::process_is_alive(pid) => return Ok(()),
-            Err(error) => return Err(error).context("managed Windows console identity changed"),
-            Ok(()) if std::time::Instant::now() >= deadline => {
-                bail!("managed Windows console did not close within 5 seconds")
-            }
-            Ok(()) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        if !verify_control_process_identity(pid, identity)
+            .context("could not verify managed Windows console exit")?
+        {
+            return Ok(());
         }
+        if std::time::Instant::now() >= deadline {
+            bail!("managed Windows console did not close within 5 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

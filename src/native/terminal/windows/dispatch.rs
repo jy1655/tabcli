@@ -63,6 +63,11 @@ pub(in crate::native) trait WindowsTerminalAdapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome>;
+    /// Only the managed console has a recorded Windows Terminal tab host.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn end_recorded_tab_host(&self, _directory: &Path, _deadline: Instant) -> Result<()> {
+        bail!("this terminal has no managed console tab host")
+    }
     /// Closes the surface with no live owner of this session left, on the creation record in
     /// the handle and the decision's `evidence`. Only a kind whose core keeps its terminals has
     /// such a record, and the dispatch refuses every other kind before its adapter, so the

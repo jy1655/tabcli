@@ -15,39 +15,22 @@ use super::WindowsProcessIdentity;
 pub(super) fn verify_control_process_identity(
     pid: u32,
     identity: &WindowsProcessIdentity,
-) -> Result<()> {
-    match verify_process_identity(pid, identity.creation_time, &identity.executable_path) {
-        Ok(()) => Ok(()),
-        Err(_) if !agent_bridge::process_is_alive(pid) => {
-            bail!("console process is no longer available")
-        }
-        Err(error) => Err(error),
-    }
+) -> Result<bool> {
+    anyhow::ensure!(pid != 0, "invalid Windows console pid");
+    let Some(live) = observe_process_identity(pid)? else {
+        return Ok(false);
+    };
+    verify_identity_values(&live, identity.creation_time, &identity.executable_path)?;
+    Ok(true)
 }
 
 pub(super) fn open_verified_control_process(
     pid: u32,
     identity: &WindowsProcessIdentity,
 ) -> Result<OwnedHandle> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
-    if handle.is_null() {
-        if !agent_bridge::process_is_alive(pid) {
-            bail!("console process is no longer available")
-        }
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to retain Windows console process {pid}"));
-    }
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
-        WAIT_OBJECT_0 => bail!("console process is no longer available"),
-        WAIT_TIMEOUT => {}
-        WAIT_FAILED => {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to inspect retained Windows console process");
-        }
-        other => bail!("unexpected retained Windows console wait result {other}"),
-    }
-    let live = query_process_identity_from_handle(handle.as_raw_handle())?;
+    anyhow::ensure!(pid != 0, "invalid Windows console pid");
+    let (handle, live) =
+        open_observed_process(pid, 0)?.context(crate::native::console_control::MISSING_PROCESS)?;
     verify_identity_values(&live, identity.creation_time, &identity.executable_path)?;
     Ok(handle)
 }
@@ -153,7 +136,21 @@ pub(super) fn check_identity_values(
 pub(in crate::native) fn observe_process_identity(
     pid: u32,
 ) -> Result<Option<WindowsProcessIdentity>> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    Ok(open_observed_process(pid, 0)?.map(|(_, identity)| identity))
+}
+
+/// Keep the kernel object pinned from the first observation through any subsequent action.
+pub(super) fn open_observed_process(
+    pid: u32,
+    additional_access: u32,
+) -> Result<Option<(OwnedHandle, WindowsProcessIdentity)>> {
+    let handle = unsafe {
+        OpenProcess(
+            additional_access | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         // Win32 reports ERROR_INVALID_PARAMETER for a nonexistent PID. Access denial
@@ -164,7 +161,10 @@ pub(in crate::native) fn observe_process_identity(
         return Err(error).with_context(|| format!("failed to open Windows process {pid}"));
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    observe_process_identity_from_handle(handle.as_raw_handle())
+    Ok(
+        observe_process_identity_from_handle(handle.as_raw_handle())?
+            .map(|identity| (handle, identity)),
+    )
 }
 
 fn observe_process_identity_from_handle(
@@ -183,6 +183,11 @@ fn observe_process_identity_from_handle(
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    #[test]
+    fn observing_pid_zero_reports_no_process() {
+        assert!(observe_process_identity(0).unwrap().is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn retained_exited_process_is_unqueryable_and_observed_absent() {

@@ -810,7 +810,7 @@ fn close_deadline_repair_after_slow_owner_observation_does_not_settle() {
             );
             Ok(false)
         },
-        RepairSurfaces::Windows(&mut |_| panic!("expired repair must not close")),
+        RepairSurfaces::Windows,
         deadline,
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
@@ -1564,24 +1564,11 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         write_owned_terminal_state(directory.path(), state, reaped_child_pid());
 
-        #[cfg(windows)]
-        assert!(
-            repair_dead_owner_with(
-                &Store::open_unchecked(directory.path()),
-                |owner| repair_owner_is_live(&attest_owner(owner)),
-                RepairSurfaces::Windows(&mut |surface| {
-                    assert_eq!(surface.kind, terminal::TerminalKind::WindowsConsole);
-                    Ok(terminal::CloseOutcome::Missing)
-                }),
-                budget::close_deadline()
-            )
-            .unwrap()
-        );
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         assert!(
             session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap()
         );
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             assert!(
                 !session_close::repair_dead_owner(&Store::open_unchecked(directory.path()))
@@ -1592,11 +1579,58 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
             let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
             assert_eq!(status.state.as_str(), state);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
             let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
             assert_eq!(status.state.as_str(), "closed");
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn windows_dead_owner_repair_keeps_active_console_and_settles_ended_records() {
+    for state in [
+        "working",
+        "claimed",
+        "awaiting-initial-input",
+        "ready",
+        "failed",
+        "exited",
+    ] {
+        for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("session-repair");
+            fs::create_dir(&directory).unwrap();
+            write_owned_terminal_state(&directory, state, 4242);
+            let store = Store::open_unchecked(&directory);
+            fs::remove_file(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+            let surface = terminal::TerminalSession::new(
+                terminal::TerminalKind::WindowsConsole,
+                "damaged-root".into(),
+            );
+            write_json_atomic(&directory.join(name), &surface).unwrap();
+            let before = fs::read(directory.join(name)).unwrap();
+            let ended = matches!(state, "exited" | "failed");
+            for _ in 0..2 {
+                let changed = repair_dead_owner_with(
+                    &store,
+                    |_| Ok(false),
+                    RepairSurfaces::Windows,
+                    budget::close_deadline(),
+                )
+                .unwrap();
+                assert_eq!(changed, ended, "{state} {name}");
+                if ended {
+                    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+                    assert!(store.closed_if_present().unwrap().is_some());
+                    break;
+                }
+                assert_eq!(fs::read(directory.join(name)).unwrap(), before);
+                assert_eq!(store.status().unwrap().state.as_str(), state);
+                assert!(store.closed_if_present().unwrap().is_none());
+            }
         }
     }
 }
@@ -1616,9 +1650,7 @@ fn windows_repair_retains_unreadable_surface_identity() {
         let result = repair_dead_owner_with(
             &store,
             |_| Ok(false),
-            RepairSurfaces::Windows(&mut |_| {
-                panic!("an unreadable handle grants no close authority")
-            }),
+            RepairSurfaces::Windows,
             budget::close_deadline(),
         );
         assert!(result.is_err(), "repair accepted a damaged {name}");
@@ -1643,13 +1675,17 @@ fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
     let error = repair_dead_owner_with(
         &store,
         |_| Ok(false),
-        RepairSurfaces::Windows(&mut |_| panic!("a foreign surface must never reach an adapter")),
+        RepairSurfaces::Windows,
         budget::close_deadline(),
     )
     .unwrap_err();
-    assert!(
-        format!("{error:#}")
-            .contains("dead Windows native owner has a non-Windows terminal handle")
+    assert_eq!(
+        error.to_string(),
+        "failed to close a Windows console whose native owner exited"
+    );
+    assert_eq!(
+        error.root_cause().to_string(),
+        "dead Windows native owner has a non-Windows terminal handle"
     );
     assert_eq!(record.bytes().unwrap(), before);
     assert_eq!(store.status().unwrap().state, SessionState::Working);
@@ -1683,9 +1719,7 @@ fn a_dead_owners_windows_herdr_terminal_is_left_for_an_explicit_close() {
                     !repair_dead_owner_with(
                         &store,
                         |_| Ok(false),
-                        RepairSurfaces::Windows(&mut |_| panic!(
-                            "Repair never closes a terminal its core keeps"
-                        )),
+                        RepairSurfaces::Windows,
                         budget::close_deadline(),
                     )
                     .unwrap(),
@@ -1713,9 +1747,7 @@ fn a_dead_owners_windows_herdr_terminal_is_left_for_an_explicit_close() {
             repair_dead_owner_with(
                 &store,
                 |_| Ok(false),
-                RepairSurfaces::Windows(&mut |_| panic!(
-                    "an ended console session needs no helper"
-                )),
+                RepairSurfaces::Windows,
                 budget::close_deadline(),
             )
             .unwrap()
@@ -1751,25 +1783,11 @@ fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
         // Repair does not stop at that damage: the owner is dead, so the session is
         // closed, which settles the journal the way every close settles a journal with
         // no event to verify, and the damage is reported in the close error.
-        #[cfg(windows)]
-        if state == "working" {
-            assert!(
-                repair_dead_owner_with(
-                    &Store::open_unchecked(&directory),
-                    |owner| repair_owner_is_live(&attest_owner(owner)),
-                    RepairSurfaces::Windows(&mut |surface| {
-                        assert_eq!(surface.kind, terminal::TerminalKind::WindowsConsole);
-                        Ok(terminal::CloseOutcome::Missing)
-                    }),
-                    budget::close_deadline()
-                )
-                .unwrap(),
-                "{label}"
-            );
-        }
         let listing = cli_sessions(fixture.root.path());
         assert_eq!(listing.len(), 1, "{label}: {listing:?}");
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
+        if cfg!(any(target_os = "macos", target_os = "linux"))
+            || (cfg!(windows) && state == "working")
+        {
             // A dead owner and unreadable journal prove nothing about its window.
             assert_eq!(listing[0]["state"], state, "{label}: {listing:?}");
             assert!(directory.join(TERMINAL_HANDLE_FILE).exists());
@@ -4305,8 +4323,7 @@ fn native_close_nested_windows_repair_retries_after_failed_restore() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(root.path());
     write_owned_terminal_state(root.path(), "working", 42);
-    let handle =
-        terminal::TerminalSession::new(terminal::TerminalKind::WindowsConsole, "42".into());
+    let handle = terminal::TerminalSession::new(terminal::TerminalKind::Iterm2, "42".into());
     store.write_terminal(&handle).unwrap();
     let deadline = budget::close_deadline();
     let repair = |marker: &mut MarkerHistory| {
@@ -4314,7 +4331,7 @@ fn native_close_nested_windows_repair_retries_after_failed_restore() {
             repair_owner(
                 &store,
                 |_| Ok(false),
-                RepairSurfaces::Windows(&mut |_| bail!("scripted console refusal")),
+                RepairSurfaces::Windows,
                 deadline,
                 Some(marker),
             )
@@ -4482,7 +4499,7 @@ fn native_close_preserves_the_preclose_repair_lock_timeout_diagnostic() {
 
 fn close_expiring_during_owner_observation(
     store: &Store,
-    surfaces: RepairSurfaces<'_>,
+    surfaces: RepairSurfaces,
 ) -> anyhow::Error {
     let now = Instant::now();
     let deadline = now + Duration::from_secs(1);
@@ -4532,10 +4549,7 @@ fn close_deadline_in_repair_never_claims_an_expired_windows_console() {
         move || observed.set(observed.get() + 1),
         || {
             with_fault_at("renaming a record file", || {
-                close_expiring_during_owner_observation(
-                    &store,
-                    RepairSurfaces::Windows(&mut |_| panic!("expired Repair dispatched")),
-                )
+                close_expiring_during_owner_observation(&store, RepairSurfaces::Windows)
             })
         },
     );
@@ -4547,9 +4561,10 @@ fn close_deadline_in_repair_never_claims_an_expired_windows_console() {
     );
     assert!(!store.record(CoreRecord::TerminalClosing).present().unwrap());
     assert!(
-        format!("{error:#}").contains(
-            "failed to close a Windows console whose native owner exited: close deadline expired"
-        ),
+        error.chain().any(|cause| cause.to_string()
+            == budget::close_remaining(Instant::now())
+                .unwrap_err()
+                .to_string()),
         "{error:#}"
     );
 }

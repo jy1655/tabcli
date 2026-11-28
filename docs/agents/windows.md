@@ -10,10 +10,9 @@
   for other kinds. Give a new
   Windows surface its own adapter in that lookup; do not branch one of these operations on the
   kind. `attach_command` and `admit_selection` still check kinds outside those operations.
-  Dead-owner Repair decides whether it needs a close transaction in
-  `terminal::close_authority::owner_exit`. Only a managed console reaches the Windows close
-  adapter from that transaction (see [Herdr close](herdr.md#close-by-creation-record)). The
-  claimed handle is checked independently of the retained-handle scan. The lookup's portable tests run
+  Dead-owner Repair retains an active managed console under either handle name.
+  An exited or failed console session settles from the records. Herdr retains its terminal
+  in both cases (see [Herdr close](herdr.md#close-by-creation-record)). The lookup's portable tests run
   on every CI target; the installed lookup, over the console helper and the core's pipe, is
   tested on the Windows runner only.
 - A Herdr terminal is not a managed console: its handle never reaches the console control
@@ -83,10 +82,13 @@
   and without a failure code; it recognises the host by the pid and identity that the
   host records about itself in the session directory (`console-host-process.json`). The
   host offers no root before it has written that record, and a close that finds the
-  record but cannot read it ends nothing. A host that is still there a second after the
-  root has ended is stalled; the close ends it, without a failure code, so that no tab
-  outlives its session.
-- A close ends the console processes it found when it attached. A process that the
+  record but cannot read it ends nothing. A host still running a second after its root exits is stalled.
+  An authorized close ends the recorded host with a successful exit code, including when
+  explicit close settles a retained console on proven root absence.
+- A separate console window can stay open while clients remain attached after the root exits.
+  In Windows Terminal, successful host exit closes the tab and ends attached clients,
+  including any wrapper or provider still attached.
+- An owned close ends the console processes it found when it attached. A process that the
   session starts while it is being closed can survive the close; this is unchanged and
   holds for both surfaces.
 - Windows refuses to replace a file while any other handle to it is open, and a launcher

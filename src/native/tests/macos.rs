@@ -458,8 +458,7 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
                             observed += 1;
                             match mode {
                                 "read-error" => bail!("injected unreadable target"),
-                                "present" => Ok(true),
-                                _ => panic!("unproven owner must not inspect a surface"),
+                                _ => Ok(true),
                             }
                         })
                         .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
@@ -480,11 +479,7 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
         }
         .map(|_| ());
         assert!(result.is_err(), "{mode}");
-        assert_eq!(
-            observed,
-            usize::from(matches!(mode, "read-error" | "present")),
-            "{mode}"
-        );
+        assert_eq!(observed, 1, "{mode}");
         assert!(
             directory.path().join(TERMINAL_HANDLE_FILE).exists(),
             "{mode}"
@@ -574,7 +569,7 @@ fn write_failed_launch_with_owner(
 }
 
 // A failed launch is no close intent. A surface that can outlive its owner follows the
-// dead-owner rules whatever the launch phase: the whole owner identity, then the read-only
+// dead-owner rules whatever the launch phase: the adapter supplies read-only
 // proof of absence, and never a close or a signal.
 #[cfg(target_os = "macos")]
 #[test]
@@ -617,6 +612,8 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                 assert_eq!(claim.is_some(), phase == launch::Phase::Spawning, "{case}");
                 assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
 
+                let handle_path = directory.path().join(TERMINAL_HANDLE_FILE);
+                let original_handle = fs::read(&handle_path).unwrap();
                 let (mut observations, mut adapter_calls) = (0, 0);
                 let result = { let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
                             let deadline = crate::native::session::close::budget::close_deadline();
@@ -656,11 +653,26 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                         }; session_close::close(&Store::open_unchecked(directory.path()), None, session_close::budget::close_deadline(), |surface| closer(surface).map(Into::into)) }
                 .map(|_| ());
 
+                if mode != "absent" {
+                    let expected = if mode == "present" {
+                        format!(
+                            "The recorded {} surface is still present. End it, then run `tabcli close-session session-owner123 --explicit` again.",
+                            kind.display_name()
+                        )
+                    } else {
+                        "injected unreadable target".to_owned()
+                    };
+                    assert_eq!(
+                        result.as_ref().unwrap_err().root_cause().to_string(),
+                        expected,
+                        "{case}"
+                    );
+                    assert_eq!(fs::read(&handle_path).unwrap(), original_handle, "{case}");
+                }
                 if adapter_calls != 0 {
                     failures.push(format!("{case}: {adapter_calls} close/signal step reached"));
                 }
-                let wanted_observations =
-                    usize::from(matches!(mode, "absent" | "present" | "read-error"));
+                let wanted_observations = 1;
                 if observations != wanted_observations {
                     failures.push(format!(
                         "{case}: {observations} surface observations, wanted {wanted_observations}"
