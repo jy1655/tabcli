@@ -33,6 +33,7 @@ pub(in crate::native) use store::{
 pub(in crate::native) use wait::{
     SleepBound, TrustPoll, TrustReadiness, wait_for_native_trust, wait_until_trusted,
 };
+pub(in crate::native) use worktree::is_link;
 #[cfg(test)]
 pub(in crate::native) use worktree::tests::registered;
 

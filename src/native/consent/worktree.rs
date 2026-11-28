@@ -126,7 +126,7 @@ pub(super) fn main_worktree(
 
 /// Whether `metadata`, read without following links, is a link: a symbolic link, or on
 /// Windows any reparse point (a junction as well).
-pub(super) fn is_link(metadata: &fs::Metadata) -> bool {
+pub(in crate::native) fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;

@@ -44,6 +44,12 @@ owner, and provider that supplied the decision. Consent does not extend to paren
 directories, and a symlink alias cannot supply fresh consent. If the original provider removes
 its decision, TAB does not silently choose another provider as the source.
 
+TAB reads Claude's trust store first and checks Git scope only for an accepted workspace entry.
+Applying another provider's consent to Claude also requires an exact scope.
+A regular `.git` file in the launch folder establishes that folder as its own top level without
+running Git. With a `.git` directory in the launch folder, TAB asks Git for the top level only
+when an ancestor contains a `.git` entry.
+
 Linked git worktrees are the one exception to the directory rule. See the
 [consent rule, its limits and registration repair](agents/trust.md).
 Anyone who can write the trusted repository's `.git` can register a worktree there, but cloning or fetching cannot register one.

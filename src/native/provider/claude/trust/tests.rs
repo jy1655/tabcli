@@ -35,7 +35,6 @@ fn exact_scope_preserves_no_spawn_matching_refusal_and_runner_errors() {
         answer: None,
     };
     require_exact_scope_with(&workspace, &mut git).unwrap();
-    // The workspace's own .git is skipped, including a nested repository.
     std::fs::create_dir(workspace.join(".git")).unwrap();
     require_exact_scope_with(&workspace, &mut git).unwrap();
     assert_eq!(git.calls, 0);
@@ -70,4 +69,150 @@ fn exact_scope_preserves_no_spawn_matching_refusal_and_runner_errors() {
         );
     }
     assert_eq!(git.calls, 5);
+}
+
+fn nested_workspace() -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    (directory, workspace)
+}
+
+// Only the injected Git runner can be called. Its result is independent of the file's contents.
+fn write_git_file(workspace: &Path) {
+    let pointer = if cfg!(windows) {
+        r"gitdir: \\localhost\unused\registration"
+    } else {
+        "gitdir: unused/registration"
+    };
+    std::fs::write(workspace.join(".git"), pointer).unwrap();
+}
+
+#[test]
+fn absent_claude_entry_skips_git_with_or_without_a_workspace_git_file() {
+    let (directory, workspace) = nested_workspace();
+    let env = consent::Environment::at_home(directory.path());
+    crate::native::session::primitives::write_json_atomic(
+        &trust_store(&env).unwrap(),
+        &serde_json::json!({"projects": {}}),
+    )
+    .unwrap();
+    for own_git in [true, false] {
+        if own_git {
+            write_git_file(&workspace);
+        } else {
+            std::fs::remove_file(workspace.join(".git")).unwrap();
+        }
+        let mut git = FakeGitScope {
+            calls: 0,
+            answer: Some(Ok(output(&workspace, true))),
+        };
+        assert_eq!(
+            workspace_trust_with(&workspace, &env, None, &mut git).unwrap(),
+            Trust::Absent
+        );
+        assert_eq!(git.calls, 0, "own .git file: {own_git}");
+    }
+}
+
+fn list_workspace(workspace: &Path, env: &consent::Environment) -> Trust {
+    let store = trust_store(env).unwrap();
+    let native = consent::native_key(workspace).unwrap();
+    let key = if cfg!(windows) {
+        native.replace('\\', "/")
+    } else {
+        native
+    };
+    crate::native::session::primitives::write_json_atomic(
+        &store,
+        &serde_json::json!({"projects": {&key: {"hasTrustDialogAccepted": true}}}),
+    )
+    .unwrap();
+    Trust::Trusted(Evidence {
+        provider: "claude".into(),
+        store,
+        key,
+    })
+}
+
+#[test]
+fn listed_claude_workspace_with_its_own_git_file_uses_its_exact_entry_without_git() {
+    let (directory, workspace) = nested_workspace();
+    write_git_file(&workspace);
+    let env = consent::Environment::at_home(directory.path());
+    let expected = list_workspace(&workspace, &env);
+    let mut git = FakeGitScope {
+        calls: 0,
+        answer: None,
+    };
+    assert_eq!(
+        workspace_trust_with(&workspace, &env, None, &mut git).unwrap(),
+        expected
+    );
+    assert_eq!(git.calls, 0);
+}
+
+#[test]
+fn listed_nested_workspace_with_a_git_directory_uses_the_root_git_reports() {
+    let (directory, workspace) = nested_workspace();
+    std::fs::create_dir(workspace.join(".git")).unwrap();
+    let env = consent::Environment::at_home(directory.path());
+    let expected = list_workspace(&workspace, &env);
+    let parent = workspace.parent().unwrap();
+    for root in [parent, &workspace] {
+        let mut git = FakeGitScope {
+            calls: 0,
+            answer: Some(Ok(output(root, true))),
+        };
+        let found = workspace_trust_with(&workspace, &env, None, &mut git);
+        assert_eq!(git.calls, 1);
+        if root == parent {
+            assert_eq!(
+                found.unwrap_err().to_string(),
+                "Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog"
+            );
+        } else {
+            assert_eq!(found.unwrap(), expected);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn listed_workspace_with_a_git_symlink_refuses_scope_without_git() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let env = consent::Environment::at_home(&root);
+    list_workspace(&workspace, &env);
+
+    std::fs::write(root.join("file"), "").unwrap();
+    std::fs::create_dir(root.join("directory")).unwrap();
+    let link = workspace.join(".git");
+    for enclosing_git in [false, true] {
+        if enclosing_git {
+            std::fs::create_dir(root.join(".git")).unwrap();
+        }
+        for target in ["file", "directory", "missing"] {
+            std::os::unix::fs::symlink(root.join(target), &link).unwrap();
+            let mut git = FakeGitScope {
+                calls: 0,
+                answer: Some(Ok(output(&workspace, true))),
+            };
+            let result = workspace_trust_with(&workspace, &env, None, &mut git);
+            assert_eq!(
+                git.calls, 0,
+                "target={target}, enclosing_git={enclosing_git}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "cannot verify Claude's Git workspace trust scope; use its own trust dialog",
+                "target={target}, enclosing_git={enclosing_git}"
+            );
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
 }

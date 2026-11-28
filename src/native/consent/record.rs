@@ -531,6 +531,8 @@ fn inherited(
         Err(error) => return unread(anyhow::Error::msg(error)),
     };
     match provider::workspace_trust(cli, workspace, env, Some(&source.store)) {
+        // An absent Claude entry needs no further scope check because the worktree verifier
+        // requires the worktree's .git to be a regular file and rejects links.
         Ok(Trust::Absent | Trust::Trusted(_)) => Ok(Some((source, main_identity))),
         Ok(Trust::Declined) => Ok(None),
         Err(error) => evidence(error, "the source's trust of the worktree cannot be read"),

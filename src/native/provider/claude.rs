@@ -26,6 +26,7 @@ pub(in crate::native) use completion::CompletionRecordFixture;
 mod messenger;
 mod registry;
 mod trust;
+pub(in crate::native) use trust::require_exact_claude_trust_scope;
 mod turn;
 
 use messenger::{ClaudeMessage, run_message_guard, run_message_receipt};
@@ -169,8 +170,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         trust::workspace_trust(workspace, env, store)
     }
 
-    // The store-only body: `workspace_trust` first probes the path's ancestors for `.git` and
-    // may run `git` there, which the screen must not.
+    // The worktree screen needs only the store entry, even for a listed workspace.
     fn store_lists_trusted(
         &self,
         workspace: &Path,

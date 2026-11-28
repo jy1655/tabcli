@@ -574,3 +574,29 @@ fn the_spawn_fence_names_an_option_file_that_another_account_could_change() {
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
     admit().unwrap();
 }
+
+#[test]
+fn a_claude_target_with_no_entry_requires_exact_scope_for_another_providers_consent() {
+    use super::super::worktree::tests::{Git, git_path};
+    let (temp, workspace, fixture) = setup();
+    Git::new().run(&["init", "--quiet", &git_path(temp.path())]);
+    trust_pi(&fixture, &workspace);
+    let session = launched(&workspace, &fixture);
+    let found = authority(&session.directory, FirstPartyCli::Claude, &fixture.env).unwrap();
+    assert_eq!(
+        found.verdict,
+        Err(Refusal {
+            unreadable: true,
+            reason: format!(
+                "claude's trust of {} cannot be read: Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog",
+                workspace.display()
+            ),
+        })
+    );
+    // A regular .git file establishes the scope here even with an enclosing repository.
+    fs::write(workspace.join(".git"), "").unwrap();
+    assert_eq!(
+        verdict(&session, FirstPartyCli::Claude, &fixture),
+        Ok(Consented::Exact)
+    );
+}
