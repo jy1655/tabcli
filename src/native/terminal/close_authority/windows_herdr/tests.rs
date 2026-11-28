@@ -72,6 +72,7 @@ impl Fixture {
                     (WRAPPER, "wrapper denied") | (PROVIDER, "provider denied") => {
                         bail!("access denied")
                     }
+                    (WRAPPER, "exited at pin") => Ok(ProcessPin::Exited),
                     (PROVIDER, _) if self.provider_exited.get() => Ok(ProcessPin::Exited),
                     _ => Ok(ProcessPin::Live(Process { pid, fixture: self })),
                 }
@@ -288,6 +289,38 @@ fn a_wrapper_pin_failure_names_the_wrapper_and_retains_the_handle() {
 }
 
 #[test]
+fn an_exited_or_reused_wrapper_refuses_before_the_provider_pin() {
+    for (state, expected) in [
+        (
+            "exited at pin",
+            "recorded wrapper PID 41 has exited; the handle is retained; retry close",
+        ),
+        (
+            "reused",
+            "recorded wrapper PID 41 was reused; the handle is retained; retry close",
+        ),
+    ] {
+        let mut fixture = Fixture::new();
+        if state == "reused" {
+            fixture
+                .owner
+                .windows_process_identity
+                .as_mut()
+                .unwrap()
+                .creation_time += 1;
+            fixture.store.write_owner(&fixture.owner).unwrap();
+        } else {
+            fixture.failure.set(state);
+        }
+        let error = fixture
+            .close(|| panic!("wrapper pin must refuse before presence"))
+            .unwrap_err();
+        assert_eq!(format!("{error:#}"), expected);
+        assert_eq!(*fixture.calls.borrow(), [(WRAPPER, "pin")]);
+    }
+}
+
+#[test]
 fn expiry_after_both_stops_reports_the_confirmed_provider_and_wrapper() {
     let fixture = Fixture::new();
     fixture.failure.set("expire after wrapper");
@@ -353,7 +386,7 @@ fn absent_herdr_requires_the_same_absence_and_live_wrapper_before_the_first_stop
 
 #[cfg(windows)]
 #[test]
-fn partial_windows_close_restores_the_handle_and_retry_skips_the_exited_provider() {
+fn partial_windows_close_keeps_the_handle_and_retry_skips_the_exited_provider() {
     use crate::native::{
         process_identity::{Attested, ProcessObservation},
         session::{
@@ -369,6 +402,8 @@ fn partial_windows_close_restores_the_handle_and_retry_skips_the_exited_provider
         "expire",
         "expire after wrapper",
         "expire after adapter",
+        "expire at marker write",
+        "expire after marker write",
     ] {
         let fixture = Fixture::new();
         let store = &fixture.store;
@@ -406,6 +441,56 @@ fn partial_windows_close_restores_the_handle_and_retry_skips_the_exited_provider
             )
         };
         fixture.failure.set(failure);
+        if matches!(
+            failure,
+            "expire at marker write" | "expire after marker write"
+        ) {
+            let now = fixture.now.clone();
+            let deadline = fixture.deadline;
+            // The marker is the first atomic write after the adapter confirms both stops.
+            let published = failure == "expire after marker write";
+            let step = if published {
+                "syncing a renamed record"
+            } else {
+                "renaming a temporary record over its final path"
+            };
+            let error = session::primitives::with_step_at(step, move || now.set(deadline), run)
+                .unwrap_err();
+            let reason = "Herdr terminal absent; recorded provider PID 42 was already ended by TAB; recorded wrapper PID 41 was ended by TAB";
+            let expiry = budget::close_remaining(deadline).unwrap_err().to_string();
+            assert_eq!(error.root_cause().to_string(), expiry);
+            if published {
+                assert_eq!(error.to_string(), expiry);
+                let marker = store.terminal_closed().unwrap();
+                assert!(marker.consumed);
+                assert_eq!(marker.reason.as_deref(), Some(reason));
+            } else {
+                assert_eq!(
+                    error.to_string(),
+                    format!("{reason}; the claimed handle is kept for a retry")
+                );
+                assert!(!store.record(CoreRecord::TerminalClosed).present().unwrap());
+            }
+            assert_eq!(
+                *fixture.calls.borrow(),
+                [
+                    (WRAPPER, "pin"),
+                    (PROVIDER, "pin"),
+                    (PROVIDER, "stop"),
+                    (WRAPPER, "stop")
+                ]
+            );
+            assert!(handle.bytes().unwrap().is_none());
+            assert_eq!(
+                store
+                    .record(CoreRecord::TerminalClosing)
+                    .bytes()
+                    .unwrap()
+                    .unwrap(),
+                initial
+            );
+            continue;
+        }
         let error = run().unwrap_err();
         assert_eq!(
             error.to_string(),

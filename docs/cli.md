@@ -1826,10 +1826,10 @@ prove that processes which left it ended.
 For Herdr, only the recorded core's `not_found` for the local address proves absence.
 With a live attested owner, explicit close on macOS and Linux can end its foreground process
 group. On Windows, explicit close ends the recorded provider and then the wrapper, confirming
-each exit. It skips the provider and records why if its record is missing, unreadable, foreign
-or mismatched, or its recorded incarnation is proven gone. If a validly recorded provider could
-still be running and cannot be verified, close refuses before ending either process and keeps
-the terminal handle.
+each exit. It skips the provider and records why if its record is missing, unreadable, foreign,
+invalid, or changed during the close, or if its recorded incarnation is proven gone. If a validly
+recorded provider could still be running and cannot be verified, close refuses before ending
+either process and keeps the terminal handle.
 If wrapper exit cannot be confirmed, the refusal reports any confirmed provider stop and the
 handle stays available for a retry. Windows has no foreground process group and TAB places
 the interactive provider in no job object, so descendants may survive.

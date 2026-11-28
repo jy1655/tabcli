@@ -25,8 +25,9 @@
   The targets are the session's provider in `provider-process.json` and wrapper in
   `native-session.json`. Each verified target has one handle for its PID, creation time,
   case-insensitive image path, termination and bounded exit confirmation.
-  Close skips the provider if its record is missing, unreadable, foreign or mismatched, or its
-  recorded incarnation is proven gone. The close result identifies the skipped provider or record error.
+  Close skips the provider if its record is missing, unreadable, foreign, invalid, or changed
+  during the close, or if its recorded incarnation is proven gone. The close result identifies
+  the skipped provider or record error.
   If a validly recorded provider could still be live and its identity cannot be verified, close
   keeps the terminal handle and ends neither process.
   Windows has no foreground process group and TAB places the interactive provider in no job
