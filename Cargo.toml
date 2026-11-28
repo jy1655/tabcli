@@ -1,6 +1,6 @@
 [package]
 name = "tabcli"
-version = "0.4.50"
+version = "0.4.51"
 edition = "2024"
 description = "TAB: run Codex, Claude Code, Agy, and Pi CLIs in visible terminal tabs"
 license = "MIT"
