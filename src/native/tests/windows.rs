@@ -280,10 +280,7 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
         let bootstrap = bridge_shell_command(&root, &root, &stub, ID).unwrap();
         let powershell = terminal::windows_powershell_executable().unwrap();
         let line = terminal::windows_console_launch_command_line(&powershell, &bootstrap).unwrap();
-        let powershell = provider_process::windows_command_path(&powershell);
-        let arguments = line
-            .strip_prefix(&format!("\"{}\" ", powershell.to_string_lossy()))
-            .unwrap();
+        let arguments = line.strip_prefix(&format!("\"{powershell}\" ")).unwrap();
         let mut command = process_env::helper_command(&powershell);
         command.raw_arg(arguments).env(STAGE, "wrapper");
         run(&mut command);
@@ -361,5 +358,76 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
             assert_eq!(stage, "hook");
             fs::write(root.join("hook-verified"), b"verified").unwrap();
         }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_program_and_script_paths_require_unicode_text() {
+    use std::os::windows::ffi::OsStringExt;
+    const MARK: &str = "TABCLI_TEST_PWSH_PATH";
+    if std::env::var_os(MARK).is_some() {
+        let error = terminal::windows_powershell_executable().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "PowerShell 7 executable path is not Unicode text"
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(std::ffi::OsString::from_wide(&[0xd800]));
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("pwsh.exe"), b"fixture").unwrap();
+    let thread = std::thread::current();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", thread.name().unwrap(), "--test-threads=1"])
+        .env(MARK, "1")
+        .env("PATH", &directory)
+        .output()
+        .unwrap();
+    crate::native::tests::assert_child_ran_this_test(&output);
+
+    let folder = directory.canonicalize().unwrap();
+    let error = provider_process::version_command(&folder.join("probe.ps1")).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "PowerShell script path is not Unicode text"
+    );
+    let error =
+        provider_process_command(&folder.join("provider.cmd"), root.path(), vec![]).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "provider executable path is not Unicode text"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn wrapper_paths_round_trip_through_powershell_single_quoted_literals() {
+    for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+        let path = format!(r"C:\work\a{quote}b");
+        let command = bridge_shell_command(
+            Path::new(&path),
+            Path::new(r"C:\state"),
+            Path::new(r"C:\tabcli.exe"),
+            "session-test",
+        )
+        .unwrap();
+        let literal = command
+            .split_once("Set-Location -LiteralPath ")
+            .unwrap()
+            .1
+            .split_once(" -ErrorAction")
+            .unwrap()
+            .0;
+        let script = format!(
+            "[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); [Console]::Write({literal})"
+        );
+        let output = Command::new(terminal::windows_powershell_executable().unwrap())
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), path);
     }
 }

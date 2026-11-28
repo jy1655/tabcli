@@ -24,7 +24,7 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub(crate) struct Request {
-    ask: AskRequest,
+    pub(crate) ask: AskRequest,
     isolated: bool,
 }
 
@@ -127,7 +127,7 @@ struct Report {
     provider: String,
     provider_version: Option<String>,
     terminal: Option<String>,
-    // Null only when admission refused an isolated self-test before its root existed.
+    // Null on admission refusal if the root is isolated or cannot be represented as text.
     state_root: Option<PathBuf>,
     isolated: bool,
     marker: String,
@@ -443,7 +443,10 @@ fn orchestrate(
     };
     let title = format!("TAB self-test {}", report.marker);
     let mut args = arguments(&["ask", ask.provider.as_str(), "--workspace"]);
-    args.push(ask.workspace.to_string_lossy().into_owned());
+    match session_start::launch_path_text(&ask.workspace, "workspace") {
+        Ok(workspace) => args.push(workspace.to_owned()),
+        Err(error) => return refused(request, report.state_root, report.marker, started, &error),
+    }
     args.extend(arguments(&[
         "--prompt",
         &prompt,
@@ -707,15 +710,19 @@ fn orchestrate(
 // command, discovery or cleanup exists. The ordinary mode applies the ordinary root's
 // setting; the isolated mode copies no setting and refuses as the default does.
 fn admit(request: &Request, ordinary_root: Option<&Path>) -> Result<()> {
-    let workspace = request.ask.workspace.canonicalize().with_context(|| {
-        format!(
-            "workspace does not exist or cannot be resolved: {}",
-            request.ask.workspace.display()
-        )
-    })?;
-    if !workspace.is_dir() {
-        bail!("workspace is not a directory: {}", workspace.display());
-    }
+    let isolated_parent;
+    let root = match ordinary_root {
+        Some(root) => root,
+        None => {
+            isolated_parent = std::env::var_os(STATE_DIR_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            &isolated_parent
+        }
+    };
+    session_start::check_launch_environment(root)?;
+    let workspace =
+        session_start::LaunchWorkspace::read(&request.ask.workspace)?.directory("workspace")?;
     match ordinary_root {
         Some(root) => session_start::admission::check(root, &workspace),
         None => session_start::admission::check_isolated(&workspace),
@@ -737,7 +744,7 @@ fn refused(
         provider: request.ask.provider.as_str().to_owned(),
         provider_version: None,
         terminal: request.ask.terminal.map(|kind| kind.as_str().to_owned()),
-        state_root: ordinary_root,
+        state_root: ordinary_root.filter(|path| path.to_str().is_some()),
         isolated: request.isolated,
         marker,
         session: None,
@@ -828,7 +835,12 @@ fn print_report(request: &Request, report: &Report) -> Result<()> {
             ),
             report.terminal.as_deref().unwrap_or("not verified"),
             report.state_root.as_ref().map_or_else(
-                || "not created".to_owned(),
+                || if report.isolated {
+                    "not created"
+                } else {
+                    "not Unicode text"
+                }
+                .to_owned(),
                 |root| terminal_safe_text(&root.display().to_string(), false)
             ),
             report.session.as_deref().unwrap_or("none"),

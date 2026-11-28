@@ -269,9 +269,19 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
         return Ok(Launch::CommandHelp(page));
     }
     if native::is_command(&command) {
-        return Ok(Launch::Native(native::parse_args(
-            std::iter::once(command).chain(rest),
-        )?));
+        let mut parsed = native::parse_args(std::iter::once(command).chain(rest))?;
+        // The CLI grammar uses strings, but launch admission needs the original path.
+        if let Some([_, workspace]) = args
+            .array_windows()
+            .find(|[option, value]| option == "--workspace" && value.to_str().is_none())
+        {
+            match &mut parsed {
+                native::NativeCommand::Ask(ask) => ask.workspace = workspace.into(),
+                native::NativeCommand::SelfTest(test) => test.ask.workspace = workspace.into(),
+                _ => {}
+            }
+        }
+        return Ok(Launch::Native(parsed));
     }
 
     if LEGACY_COMMANDS.contains(&command.as_str())

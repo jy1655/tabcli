@@ -176,9 +176,7 @@ fn open_bound_tab(
         .context("Windows console startup timeout leaves no room for exact process cleanup")?;
     // Both surfaces pass this path as CreateProcessW's application name, which
     // PowerShell uses for PSHOME independently of the command line.
-    let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(
-        &powershell_executable()?,
-    ));
+    let powershell = powershell_executable()?;
     let command_line = console_launch_command_line(&powershell, command)?;
     // The window is the user's setting. One that cannot be read is no reason to open the
     // tab in a window they work in, which only an explicit choice does.
@@ -225,7 +223,8 @@ fn open_bound_tab(
             // The session has no tab host. What an abandoned one left must be readable
             // or gone before a surface is created: a close would not get past it.
             tab::forget_unreadable_host(directory)?;
-            Surface::Window(ConsoleWindow::create(&powershell, &command_line, deadline)?)
+            let console = ConsoleWindow::create(Path::new(&powershell), &command_line, deadline)?;
+            Surface::Window(console)
         }
     };
     let mut session = TerminalSession::new(kind, surface.pid().to_string())
@@ -528,17 +527,14 @@ fn console_command_line(command: &str) -> String {
 // quoted `-Command` argument, so neither it nor the executable path may hold a double
 // quote: it would end the argument.
 pub(in crate::native) fn console_launch_command_line(
-    powershell: &Path,
+    powershell: &str,
     command: &str,
 ) -> Result<String> {
     let arguments = console_root_arguments(command)?;
-    // PowerShell derives PSHOME and its module search path from the launch path.
-    let powershell = crate::native::provider_process::windows_command_path(powershell);
-    let powershell_text = powershell.to_string_lossy();
-    if powershell_text.contains('"') {
+    if powershell.contains('"') {
         bail!("PowerShell 7 executable path contains an unsupported double quote");
     }
-    Ok(format!("\"{powershell_text}\" {arguments}"))
+    Ok(format!("\"{powershell}\" {arguments}"))
 }
 
 // The console root's arguments after its executable. A Windows launch host that starts the
@@ -625,10 +621,11 @@ fn resolve_executable_from_path(name: &str, path: &OsStr) -> Result<PathBuf> {
     bail!("{name} was not found on an absolute PATH entry")
 }
 
-pub(in crate::native) fn powershell_executable() -> Result<PathBuf> {
+pub(in crate::native) fn powershell_executable() -> Result<String> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;
-    resolve_executable_from_path("pwsh.exe", &path)
-        .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")
+    let executable = resolve_executable_from_path("pwsh.exe", &path)
+        .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")?;
+    crate::native::provider_process::windows_command_path(&executable, "PowerShell 7 executable")
 }
 
 pub(in crate::native) fn console_control(

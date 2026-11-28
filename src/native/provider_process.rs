@@ -88,12 +88,11 @@ $Cmd = Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe'
 & $Cmd /d /v:off /s /c ('"' + $CommandLine + '"')
 exit $LASTEXITCODE
 "#;
+        let provider = windows_command_path(executable, "provider executable")?;
         let forwarder = _directory.join("provider-launch.ps1");
         ensure_private_forwarder(&forwarder, FORWARDER.as_bytes())?;
         let mut command = powershell_file_command(&forwarder)?;
-        command
-            .arg(windows_command_path(executable))
-            .args(arguments);
+        command.arg(provider).args(arguments);
         return Ok(command);
     }
 
@@ -282,9 +281,8 @@ pub(super) fn version_command(executable: &Path) -> Result<Command> {
 
 #[cfg(windows)]
 fn powershell_file_command(script: &Path) -> Result<Command> {
-    let mut command = Command::new(windows_command_path(
-        &terminal::windows_powershell_executable()?,
-    ));
+    let script = windows_command_path(script, "PowerShell script")?;
+    let mut command = Command::new(terminal::windows_powershell_executable()?);
     command.args([
         "-NoLogo",
         "-NoProfile",
@@ -292,7 +290,7 @@ fn powershell_file_command(script: &Path) -> Result<Command> {
         "Bypass",
         "-File",
     ]);
-    command.arg(windows_command_path(script));
+    command.arg(script);
     Ok(command)
 }
 
@@ -304,14 +302,12 @@ fn has_extension(path: &Path, expected: &str) -> bool {
 }
 
 #[cfg(windows)]
-pub(in crate::native) fn windows_command_path(path: &Path) -> OsString {
-    let value = path.as_os_str().to_string_lossy();
+pub(in crate::native) fn windows_command_path(path: &Path, field: &str) -> Result<String> {
+    let value = crate::native::session_start::launch_path_text(path, field)?;
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
-        return OsString::from(format!(r"\\{rest}"));
+        return Ok(format!(r"\\{rest}"));
     }
-    value
-        .strip_prefix(r"\\?\")
-        .map_or_else(|| path.as_os_str().to_owned(), OsString::from)
+    Ok(value.strip_prefix(r"\\?\").unwrap_or(value).to_owned())
 }
 
 /// Linux refuses an exec when one argument or environment string, with its NUL, is longer

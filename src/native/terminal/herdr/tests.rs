@@ -2597,3 +2597,16 @@ fn only_the_verified_connection_names_the_mutation_calls() {
         .collect();
     assert!(named.is_empty(), "{named:?}");
 }
+
+#[test]
+fn powershell_attach_doubles_each_single_quote_in_the_endpoint() {
+    for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+        let endpoint = format!("a{quote}b");
+        assert_eq!(
+            hc_command(&endpoint, "attach", "t7", true),
+            format!(
+                "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = 'a{quote}{quote}b'; try {{ hc attach t7 }} finally {{ $env:HC_SOCKET = $prior }} }}"
+            )
+        );
+    }
+}

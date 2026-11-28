@@ -4811,3 +4811,62 @@ fn copied_refused_launch_uses_no_spawn_proof_but_never_checks_a_recorded_pid() {
         assert_eq!(snapshot_directory(&dir), before);
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
+fn reopen_retries_the_child_fence_before_returning_a_manifest_error() {
+    in_review_case(
+        "reopen_retries_the_child_fence_before_returning_a_manifest_error",
+        |root| {
+            let (source, child) = interrupted_reopen(root, "session-source", "session-child");
+            fs::write(source.join("manifest.json"), b"{").unwrap();
+            let before = snapshot_directory(&source);
+            let expected = Reader::open_unchecked(&source).manifest().unwrap_err();
+            let error = ResolvedReopen::resolve(
+                review_request("session-source", Some(review_explicit_terminal())),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(format!("{error:#}"), format!("{expected:#}"));
+            assert_eq!(snapshot_directory(&source), before);
+            let status = Reader::open_unchecked(&child).status().unwrap();
+            assert_eq!(status.state, SessionState::Failed);
+            assert_eq!(status.error.as_deref(), Some("interrupted launch failure"));
+            assert!(!child.join(TURN_CLAIM_FILE).exists());
+        },
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reopen_preserves_the_source_and_child_on_a_non_unicode_workspace() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+    in_review_case(
+        "reopen_preserves_the_source_and_child_on_a_non_unicode_workspace",
+        |root| {
+            let (source, child) = interrupted_reopen(root, "session-source", "session-child");
+            let workspace = root.join(std::ffi::OsStr::from_bytes(b"workspace-\xff"));
+            fs::create_dir(&workspace).unwrap();
+            let alias = root.join("workspace-alias");
+            symlink(&workspace, &alias).unwrap();
+            let mut manifest = read_manifest(&source).unwrap();
+            manifest.workspace = alias;
+            Store::open_unchecked(&source)
+                .write_manifest(&manifest)
+                .unwrap();
+            let before = (snapshot_directory(&source), snapshot_directory(&child));
+            let error = ResolvedReopen::resolve(
+                review_request("session-source", Some(review_explicit_terminal())),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .err()
+            .expect("the source workspace is refused");
+            assert_eq!(format!("{error:#}"), "workspace path is not Unicode text");
+            assert_eq!(
+                (snapshot_directory(&source), snapshot_directory(&child)),
+                before
+            );
+        },
+    );
+}

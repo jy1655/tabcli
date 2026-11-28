@@ -834,17 +834,22 @@ pub(super) fn create_surface(
 
 fn host_pane_program(command: &str, directory: &Path) -> Result<[String; 5]> {
     let executable = env::current_exe().context("failed to resolve TAB executable")?;
-    Ok(host_program(&executable, directory, command))
+    host_program(&executable, directory, command)
 }
 
-pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -> [String; 5] {
-    [
-        executable.to_string_lossy().into_owned(),
+pub(super) fn host_program(
+    executable: &Path,
+    directory: &Path,
+    command: &str,
+) -> Result<[String; 5]> {
+    use crate::native::session_start::launch_path_text;
+    Ok([
+        launch_path_text(executable, "TAB executable")?.to_owned(),
         HOST_COMMAND.into(),
-        directory.to_string_lossy().into_owned(),
+        launch_path_text(directory, "session directory")?.to_owned(),
         crate::native::terminal::host::LAUNCH_COMMAND_FLAG.into(),
         command.into(),
-    ]
+    ])
 }
 
 fn create(

@@ -29,8 +29,7 @@ pub(super) struct StartOptions {
     pub(super) json: bool,
 }
 
-// Only `resolve` constructs one: a Resolved is the outcome of the operations below, never of
-// a caller's own assembly.
+// In production, only `resolve_at` constructs a Resolved.
 pub(super) struct Resolved {
     // Attachments are applied, but delegation framing belongs to create.
     spec: SessionSpec,
@@ -193,12 +192,11 @@ impl DefaultTitle<'_> {
     }
 }
 
-// What a fresh start and a reopen resolve differently; the resolution itself is the same
-// operations (`resolve`). `ask` fills it from its request, `reopen` from its request and the
-// closed source.
+// Inputs to shared resolution (`resolve_at`). Ask supplies its request, and reopen
+// also uses the closed source.
 pub(super) struct Resolution<'a> {
     pub(super) provider: FirstPartyCli,
-    // The workspace as requested; the resolution canonicalizes it.
+    // The workspace as requested by ask or recorded in the reopen source manifest.
     pub(super) workspace: &'a Path,
     pub(super) consent_path: ConsentPath,
     pub(super) title: Option<String>,
@@ -215,7 +213,7 @@ pub(super) struct Resolution<'a> {
     // What the caller check found when the surface was chosen.
     pub(super) caller: CallerCheck,
     pub(super) context_sources: Vec<requests::ContextSource>,
-    // The noun of the two workspace errors: "workspace", or "source workspace" for a reopen.
+    // Used by resolve_with (ask in production). Reopen checks its source workspace before recovery.
     pub(super) workspace_noun: &'static str,
     // How an admission refusal is reported: unchanged for `ask`, typed as reopen's
     // workspace-refused gate for a reopen.
@@ -229,12 +227,16 @@ pub(super) struct Resolution<'a> {
 // automatic Herdr choice that depends on the version, with the caller check's outcome), title,
 // and workspace consent. The consent assessment may update shared records before a Session exists.
 pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<Resolved> {
-    resolve_with(resolution, |provider| {
-        let provider_path = resolve_provider(provider)?;
-        let provider_version =
-            check_provider_version_until(provider, &provider_path, Some(deadline))?;
-        Ok((provider_path, provider_version))
-    })
+    resolve_with(resolution, |provider| probe_for_launch(provider, deadline))
+}
+
+pub(super) fn probe_for_launch(
+    provider: FirstPartyCli,
+    deadline: Instant,
+) -> Result<(PathBuf, String)> {
+    let provider_path = resolve_provider(provider)?;
+    let provider_version = check_provider_version_until(provider, &provider_path, Some(deadline))?;
+    Ok((provider_path, provider_version))
 }
 
 // `probe` is the resolution's one look at the installed CLI: its executable path and its
@@ -242,6 +244,22 @@ pub(super) fn resolve(resolution: Resolution<'_>, deadline: Instant) -> Result<R
 // the Surface reads too). Tests resolve without an installed provider through it.
 pub(super) fn resolve_with(
     resolution: Resolution<'_>,
+    probe: impl FnOnce(FirstPartyCli) -> Result<(PathBuf, String)>,
+) -> Result<Resolved> {
+    let _ = choose_before_probe(resolution.provider, resolution.surface)?;
+    deadline::before("resolving the workspace")?;
+    let workspace =
+        LaunchWorkspace::read(resolution.workspace)?.directory(resolution.workspace_noun)?;
+    let root = Reader::state_root().map_err(resolution.admission_refusal)?;
+    check_launch_environment(&root)?;
+    resolve_at(resolution, &root, workspace, probe)
+}
+
+// Reopen resolves its paths before it can repair an interrupted launch in the source's records.
+pub(super) fn resolve_at(
+    resolution: Resolution<'_>,
+    root: &Path,
+    workspace: PathBuf,
     probe: impl FnOnce(FirstPartyCli) -> Result<(PathBuf, String)>,
 ) -> Result<Resolved> {
     let Resolution {
@@ -257,29 +275,11 @@ pub(super) fn resolve_with(
         surface,
         caller,
         context_sources,
-        workspace_noun,
+        workspace_noun: _,
         admission_refusal,
     } = resolution;
-    // A surface the provider's adapter cannot run on at all on this platform is refused
-    // before anything is resolved or probed.
-    let _ = choose_before_probe(provider, surface)?;
-    deadline::before("resolving the workspace")?;
-    let workspace = requested.canonicalize().with_context(|| {
-        format!(
-            "{workspace_noun} does not exist or cannot be resolved: {}",
-            requested.display()
-        )
-    })?;
-    if !workspace.is_dir() {
-        bail!(
-            "{workspace_noun} is not a directory: {}",
-            workspace.display()
-        );
-    }
     deadline::before("checking launch admission")?;
-    let root = Reader::state_root()
-        .and_then(|root| admission::check(&root, &workspace).map(|()| root))
-        .map_err(admission_refusal)?;
+    admission::check(root, &workspace).map_err(admission_refusal)?;
     let (provider_path, provider_version) = probe(provider)?;
     // Once the installed CLI version is known, the choice is made again with it, before
     // title, consent, session, or surface creation: a surface-specific version floor refuses
@@ -312,7 +312,7 @@ pub(super) fn resolve_with(
     let title = sanitize_title(&requested_title)?;
     deadline::before("assessing workspace consent")?;
     let consent = consent::assess(
-        &root,
+        root,
         match consent_path {
             ConsentPath::Requested => requested,
             ConsentPath::Canonical => &workspace,
@@ -338,6 +338,58 @@ pub(super) fn resolve_with(
     })
 }
 
+/// Paths embedded in a launch command must survive conversion to text exactly.
+pub(in crate::native) fn launch_path_text<'a>(path: &'a Path, field: &str) -> Result<&'a str> {
+    path.to_str()
+        .with_context(|| format!("{field} path is not Unicode text"))
+}
+
+// Reopen checks the spelling before recovering a prior launch, but reports an absent
+// workspace only after judging the source, as it does for other workspace failures.
+pub(super) struct LaunchWorkspace<'a> {
+    requested: &'a Path,
+    canonical: std::io::Result<PathBuf>,
+}
+
+impl<'a> LaunchWorkspace<'a> {
+    pub(super) fn read(requested: &'a Path) -> Result<Self> {
+        launch_path_text(requested, "workspace")?;
+        let canonical = requested.canonicalize();
+        if let Ok(path) = &canonical {
+            launch_path_text(path, "workspace")?;
+        }
+        Ok(Self {
+            requested,
+            canonical,
+        })
+    }
+
+    pub(super) fn directory(self, noun: &str) -> Result<PathBuf> {
+        let path = self.canonical.with_context(|| {
+            format!(
+                "{noun} does not exist or cannot be resolved: {}",
+                self.requested.display()
+            )
+        })?;
+        if !path.is_dir() {
+            bail!("{noun} is not a directory: {}", path.display());
+        }
+        Ok(path)
+    }
+}
+
+pub(super) fn check_launch_environment(root: &Path) -> Result<()> {
+    // Session creation expands a relative state root against the current directory.
+    if root.is_absolute() {
+        launch_path_text(root, "state root")?;
+    } else {
+        launch_path_text(&std::env::current_dir()?.join(root), "state root")?;
+    }
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
+    launch_path_text(&executable, "TAB executable")?;
+    Ok(())
+}
+
 fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
     // Resolve attachments before Session creation. Subsequent workspace consent assessment may
     // update shared records even if the start is refused.
@@ -351,7 +403,7 @@ fn resolve_fresh(request: &AskRequest, deadline: Instant) -> Result<Resolved> {
 
 // What the caller check of an automatic Herdr choice found where `choose_launch_surface` ran
 // it: the place where 0.4.49 ran it, before the workspace, the probe and, for a reopen, the
-// source. The resolution uses it once the choice is decided (`resolve_with`).
+// source. The resolution uses it once the choice is decided (`resolve_at`).
 pub(super) enum CallerCheck {
     // Nothing to prove: an explicit choice, a choice outside hc, or an automatic choice the
     // provider takes on its fallback at every version.
@@ -378,10 +430,11 @@ pub(super) enum CallerCheck {
 // the version (Claude, Agy, Pi); for `reopen`, which does not know its provider before it
 // reads its source, always, as in 0.4.49 (every provider that supports reopen runs on Herdr,
 // so no reopen that would take the fallback is refused). Where the version decides (Codex off
-// Windows), the outcome is kept for `resolve_with` only while the request has time left.
-// A provider that takes its fallback at
-// every version is not checked. `resolve` then decides with the provider, before the
-// workspace (`choose_before_probe`) and again with the probed version (`admit_choice`).
+// Windows), the outcome is kept for `resolve_at` only while the request has time left.
+// A provider that takes its fallback at every version is not checked. Ask runs
+// `choose_before_probe` before workspace resolution. Reopen checks the source workspace's
+// spelling before child recovery and reports other workspace errors after `choose_before_probe`.
+// Both use `admit_choice` in `resolve_at` with the probed version.
 pub(super) fn choose_launch_surface(
     requested: Option<terminal::TerminalKind>,
     provider: Option<FirstPartyCli>,

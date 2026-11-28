@@ -327,19 +327,20 @@ fn create_tab(
 
 fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     let executable = std::env::current_exe().context("failed to resolve TAB executable")?;
-    Ok(host_command(&executable, directory, command))
+    host_command(&executable, directory, command)
 }
 
-pub(super) fn host_command(executable: &Path, directory: &Path, command: &str) -> String {
-    [
-        executable.to_string_lossy().as_ref(),
+pub(super) fn host_command(executable: &Path, directory: &Path, command: &str) -> Result<String> {
+    use crate::native::session_start::launch_path_text;
+    Ok([
+        launch_path_text(executable, "TAB executable")?,
         HOST_COMMAND,
-        directory.to_string_lossy().as_ref(),
+        launch_path_text(directory, "session directory")?,
         crate::native::terminal::host::LAUNCH_COMMAND_FLAG,
         command,
     ]
     .map(iterm_argument)
-    .join(" ")
+    .join(" "))
 }
 
 // Native command creation prevents launch-line editing; login/interactive zsh retains PATH and
@@ -2129,7 +2130,7 @@ end run
             crate::native::terminal::shell_quote(directory.join("launch.sh").as_os_str())
         );
         assert_eq!(
-            iterm2_arguments(&host_command(&executable, &directory, &command)),
+            iterm2_arguments(&host_command(&executable, &directory, &command).unwrap()),
             [
                 executable.to_str().unwrap(),
                 HOST_COMMAND,

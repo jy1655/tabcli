@@ -7,12 +7,11 @@ use crate::native::session::launch::{self, WRAPPER_EXIT_CODE_MARKER};
 use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::turn::Claim;
 use crate::native::session::{CoreRecord, Store};
+use crate::native::session_start::launch_path_text;
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
 use crate::native::{CreatedSession, terminal};
 use anyhow::{Context, Result, bail};
-#[cfg(unix)]
-use std::ffi::OsString;
 use std::{path::Path, time::Instant};
 
 // The start operation: from the launch receipt to the bound surface whose wrapper has
@@ -94,68 +93,47 @@ pub(in crate::native) fn start(
     Ok(terminal_session)
 }
 
-#[cfg(unix)]
 pub(in crate::native) fn bridge_shell_command(
     workspace: &Path,
     state_root: &Path,
     executable: &Path,
     id: &str,
 ) -> Result<String> {
-    for (value, field) in [
-        (workspace.as_os_str(), "workspace"),
-        (state_root.as_os_str(), "state root"),
-        (executable.as_os_str(), "TAB executable"),
-        (std::ffi::OsStr::new(id), "session id"),
-    ] {
-        validate_shell_command_component(value, field)?;
+    #[cfg(unix)]
+    let quote = |value: &str| shell_quote(value.as_ref());
+    #[cfg(windows)]
+    let quote = terminal::powershell_quote;
+    let quote_path = |path: &Path, field: &str| -> Result<String> {
+        let text = launch_path_text(path, field)?;
+        validate_shell_command_component(text.as_ref(), field)?;
+        Ok(quote(text))
+    };
+    let workspace = quote_path(workspace, "workspace")?;
+    let log_path = state_root.join(id).join(launch::LOG);
+    let state_root = quote_path(state_root, "state root")?;
+    let executable = quote_path(executable, "TAB executable")?;
+    validate_shell_command_component(id.as_ref(), "session id")?;
+    let id = quote(id);
+    let log = quote(launch_path_text(&log_path, "launch log")?);
+    #[cfg(unix)]
+    {
+        let location = format!("cd {workspace} &&");
+        let invocation = format!("{STATE_DIR_ENV}={state_root} {executable} native-session {id}");
+        let start = format!("{location} {invocation}");
+        let logged_start = format!("{location} {STDERR_ENV}=3 {STDOUT_ENV}=4 {invocation}");
+        Ok(format!(
+            "if (umask 077; : >> {log}) 2>/dev/null; then {{ {logged_start}; bridge_status=$?; printf '{WRAPPER_EXIT_CODE_MARKER}%s\\n' \"$bridge_status\" >> {log}; }} 3>&2 4>&1 >> {log} 2>&1; else {start}; bridge_status=$?; fi; exit \"$bridge_status\""
+        ))
     }
-    let log = shell_quote(state_root.join(id).join(launch::LOG).as_os_str());
-    let location = format!("cd {} &&", shell_quote(workspace.as_os_str()));
-    let invocation = format!(
-        "{STATE_DIR_ENV}={} {} native-session {}",
-        shell_quote(state_root.as_os_str()),
-        shell_quote(executable.as_os_str()),
-        shell_quote(OsString::from(id).as_os_str())
-    );
-    let start = format!("{location} {invocation}");
-    let logged_start = format!("{location} {STDERR_ENV}=3 {STDOUT_ENV}=4 {invocation}");
-    Ok(format!(
-        "if (umask 077; : >> {log}) 2>/dev/null; then {{ {logged_start}; bridge_status=$?; printf '{WRAPPER_EXIT_CODE_MARKER}%s\\n' \"$bridge_status\" >> {log}; }} 3>&2 4>&1 >> {log} 2>&1; else {start}; bridge_status=$?; fi; exit \"$bridge_status\""
-    ))
-}
-
-#[cfg(windows)]
-fn powershell_quote(value: &std::ffi::OsStr) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
-}
-
-#[cfg(windows)]
-pub(in crate::native) fn bridge_shell_command(
-    workspace: &Path,
-    state_root: &Path,
-    executable: &Path,
-    id: &str,
-) -> Result<String> {
-    for (value, field) in [
-        (workspace.as_os_str(), "workspace"),
-        (state_root.as_os_str(), "state root"),
-        (executable.as_os_str(), "TAB executable"),
-        (std::ffi::OsStr::new(id), "session id"),
-    ] {
-        validate_shell_command_component(value, field)?;
+    #[cfg(windows)]
+    {
+        // The console launch passes this to PowerShell as one double-quoted `-Command`
+        // argument and refuses a command that holds a double quote, so every string here is
+        // single-quoted.
+        Ok(format!(
+            "$bridgeStatus = 1; try {{ Set-Location -LiteralPath {workspace} -ErrorAction Stop; $env:{STATE_DIR_ENV} = {state_root}; & {executable} native-session {id}; $bridgeStatus = $LASTEXITCODE }} catch {{ try {{ Add-Content -LiteralPath {log} -Value $_ -ErrorAction Stop }} catch {{}} }}; try {{ Add-Content -LiteralPath {log} -Value ('{WRAPPER_EXIT_CODE_MARKER}' + $bridgeStatus) -ErrorAction Stop }} catch {{}}; exit $bridgeStatus",
+        ))
     }
-    let log = powershell_quote(state_root.join(id).join(launch::LOG).as_os_str());
-    // The console launch passes this to PowerShell as one double-quoted `-Command`
-    // argument and refuses a command that holds a double quote, so every string here is
-    // single-quoted.
-    Ok(format!(
-        "$bridgeStatus = 1; try {{ Set-Location -LiteralPath {} -ErrorAction Stop; $env:{} = {}; & {} native-session {}; $bridgeStatus = $LASTEXITCODE }} catch {{ try {{ Add-Content -LiteralPath {log} -Value $_ -ErrorAction Stop }} catch {{}} }}; try {{ Add-Content -LiteralPath {log} -Value ('{WRAPPER_EXIT_CODE_MARKER}' + $bridgeStatus) -ErrorAction Stop }} catch {{}}; exit $bridgeStatus",
-        powershell_quote(workspace.as_os_str()),
-        STATE_DIR_ENV,
-        powershell_quote(state_root.as_os_str()),
-        powershell_quote(executable.as_os_str()),
-        powershell_quote(std::ffi::OsStr::new(id)),
-    ))
 }
 
 pub(in crate::native) fn validate_shell_command_component(

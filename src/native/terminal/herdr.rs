@@ -505,14 +505,19 @@ fn get(linked: &mut Linked<'_>, terminal: &str, deadline: Instant) -> Result<Opt
 
 /// The program TAB asks the core to run: its launch host, given the session directory
 /// and the launch command.
-pub(super) fn host_program(executable: &Path, directory: &Path, command: &str) -> Vec<String> {
-    vec![
-        executable.to_string_lossy().into_owned(),
+pub(super) fn host_program(
+    executable: &Path,
+    directory: &Path,
+    command: &str,
+) -> Result<Vec<String>> {
+    use crate::native::session_start::launch_path_text;
+    Ok(vec![
+        launch_path_text(executable, "TAB executable")?.to_owned(),
         HOST_COMMAND.into(),
-        directory.to_string_lossy().into_owned(),
+        launch_path_text(directory, "session directory")?.to_owned(),
         crate::native::terminal::host::LAUNCH_COMMAND_FLAG.into(),
         command.into(),
-    ]
+    ])
 }
 
 /// The live terminal of this handle on its recorded core, on a connection that proved it.
@@ -541,7 +546,7 @@ fn create(
     let socket = core.endpoint(startup_deadline)?;
     let mut linked = link(core, &socket, None, startup_deadline)
         .context("the Herdr terminal was not created")?;
-    let argv = host_program(&core.executable()?, directory, command);
+    let argv = host_program(&core.executable()?, directory, command)?;
     let session_id = directory
         .file_name()
         .and_then(OsStr::to_str)
@@ -1061,8 +1066,8 @@ pub(in crate::native) fn attach_command(session: &TerminalSession) -> Option<Str
 fn hc_command(endpoint: &str, command: &str, address: &str, powershell: bool) -> String {
     if powershell {
         format!(
-            "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = '{}'; try {{ hc {command} {address} }} finally {{ $env:HC_SOCKET = $prior }} }}",
-            endpoint.replace('\'', "''")
+            "& {{ $prior = $env:HC_SOCKET; $env:HC_SOCKET = {}; try {{ hc {command} {address} }} finally {{ $env:HC_SOCKET = $prior }} }}",
+            super::powershell_quote(endpoint)
         )
     } else {
         format!(

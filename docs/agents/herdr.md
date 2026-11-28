@@ -240,10 +240,11 @@
   which does not know its provider yet, always (every provider that supports reopen runs on
   Herdr, so no reopen that would take the fallback is refused). Where the version decides
   (Codex off Windows), the outcome is kept (`session_start::CallerCheck`) only while the
-  request has time left. `resolve` then
-  decides with the provider (`session_start::admit_choice`), before the workspace and again
-  with the probed version: an automatic choice is Herdr where the adapter admits it and its
-  fallback otherwise (Codex below stable 0.169.0 off Windows, any Codex on Windows), and an
+  request has time left. For `ask`, the pre-probe surface decision precedes workspace resolution.
+  For `reopen`, the source workspace spelling is checked before child recovery, and other
+  workspace errors are reported after the pre-probe surface decision. Both use the probed
+  version in `resolve_at` (`session_start::admit_choice`). An automatic choice is Herdr where
+  the adapter admits it and its fallback otherwise (Codex below stable 0.169.0 off Windows, any Codex on Windows), and an
   explicit `--terminal herdr` it does not admit is refused with the adapter's text. An
   automatic choice that ends on Herdr launches there only if its check passed, and is
   otherwise refused with the check's error; one that takes the fallback ignores the check.
@@ -259,7 +260,9 @@
   reopen gets, because the probes after it happen later.
   For `reopen`, the settlement of an interrupted launch failure of the source's last child
   (`retry_interrupted_launch_fence`) runs after the selection, the caller check and the
-  lookup of the source directory, as in 0.4.49. The judgment of the source's marker, the
+  lookup of the source directory, as in 0.4.49. Before this retry TAB checks the state root,
+  executable and, when the manifest is readable, the source workspace for representable paths.
+  A manifest read error is returned after the retry. The judgment of the source's marker, the
   other source gates, the provider's reopen support and the rest of the resolution, the
   consent assessment included, can still refuse afterwards and leave that child `Failed`, as
   in 0.4.49. The caller's terminal must be live on the addressed

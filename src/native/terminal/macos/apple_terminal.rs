@@ -263,8 +263,8 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     let executable = std::env::current_exe().context("failed to resolve TAB executable")?;
     let host = format!(
         "{} {HOST_COMMAND} {}",
-        crate::native::terminal::shell_quote(executable.as_os_str()),
-        crate::native::terminal::shell_quote(directory.as_os_str())
+        crate::native::terminal::shell_quote_path(&executable, "TAB executable")?,
+        crate::native::terminal::shell_quote_path(directory, "session directory")?
     );
     install_bootstrap(directory, &host, command)
 }
@@ -276,11 +276,12 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
         .private(BOOTSTRAP_FILE)
         .path()
         .to_owned();
-    RecordStore::at(&path).write_private(format!("{host} || exit\n{command}\n").as_bytes())?;
-    Ok(format!(
+    let start = format!(
         ". {}",
-        crate::native::terminal::shell_quote(path.as_os_str())
-    ))
+        crate::native::terminal::shell_quote_path(&path, "bootstrap")?
+    );
+    RecordStore::at(&path).write_private(format!("{host} || exit\n{command}\n").as_bytes())?;
+    Ok(start)
 }
 
 // The typed start precedes tty discovery; wait for restored focus and the exact tty binding.
