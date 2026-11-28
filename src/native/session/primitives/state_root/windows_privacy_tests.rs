@@ -111,11 +111,11 @@ impl SavedAccess {
         }
         value.trim_end_matches('\0').to_owned()
     }
-    fn restore_dacl(&self) {
+    fn apply_dacl_to(&self, file: &fs::File) {
         assert_eq!(
             unsafe {
                 SetSecurityInfo(
-                    self.root.as_raw_handle(),
+                    file.as_raw_handle(),
                     SE_FILE_OBJECT,
                     DACL_SECURITY_INFORMATION,
                     std::ptr::null_mut(),
@@ -124,7 +124,8 @@ impl SavedAccess {
                     std::ptr::null_mut(),
                 )
             },
-            0
+            ERROR_SUCCESS,
+            "SetSecurityInfo: apply saved DACL"
         );
     }
 }
@@ -213,6 +214,24 @@ fn child_token(user_default: bool) {
     }
 }
 
+fn probe_right(root: &Path, right: u32) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .access_mode(right)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)
+}
+
+fn assert_denied(root: &Path, right: u32, stage: &str) {
+    let access = probe_right(root, right);
+    eprintln!("{stage}: open for {right:#x} returned {access:?}");
+    assert_eq!(
+        access.as_ref().err().and_then(std::io::Error::raw_os_error),
+        Some(ERROR_ACCESS_DENIED as i32),
+        "{stage}: open for {right:#x} returned {access:?}; {}",
+        SavedAccess::capture(root, 0).as_text()
+    );
+}
+
 #[test]
 fn windows_state_root_owners_and_dacl() {
     if let Some(case) = std::env::var_os(CHILD) {
@@ -240,31 +259,45 @@ fn windows_state_root_owners_and_dacl() {
         };
         crate::native::doctor::run(request).unwrap();
         assert_eq!(SavedAccess::capture(&root, 0).as_text(), before);
-        let probe = |right| {
-            fs::OpenOptions::new()
-                .access_mode(right)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(&root)
-        };
         if matches!(case, "repair" | "partial") {
-            probe(WRITE_OWNER).unwrap_or_else(|error| {
+            probe_right(&root, WRITE_OWNER).unwrap_or_else(|error| {
                 panic!("{case}: fixture must grant WRITE_OWNER: {error}; {before}")
             });
         }
-        if matches!(case, "denied" | "partial") {
-            let right = if case == "denied" {
-                WRITE_OWNER
-            } else {
-                WRITE_DAC
-            };
-            let access = probe(right);
-            assert_eq!(
-                access.as_ref().err().and_then(std::io::Error::raw_os_error),
-                Some(ERROR_ACCESS_DENIED as i32),
-                "{case}: fixture open for {right:#x} returned {access:?}; {before}"
-            );
+        if case == "denied" {
+            assert_denied(&root, WRITE_OWNER, "denied before preparation");
         }
-        let result = create_directory(&root, &[]);
+        if case == "unmarked" {
+            assert!(unsafe { (*observed.dacl).AceCount } > 1);
+        }
+        let create = || create_directory(&root, &[]);
+        let result = if case == "partial" {
+            assert_denied(&root, WRITE_DAC, "partial before preparation");
+            let path = root.clone();
+            let user = account.owners[0].clone();
+            crate::native::session::primitives::with_step_at(
+                "after setting the state root owner",
+                move || {
+                    let transferred = SavedAccess::capture(&path, 0);
+                    assert_eq!(transferred.owner(), user, "partial after owner transfer");
+                    eprintln!("partial after owner transfer: {}", transferred.as_text());
+                    // Taking ownership can disable the OWNER RIGHTS ACE. Reapply
+                    // the original DACL for the new owner while we can still write it.
+                    match probe_right(&path, READ_CONTROL | WRITE_DAC) {
+                        Ok(writer) => observed.apply_dacl_to(&writer),
+                        Err(error) => assert_eq!(
+                            error.raw_os_error(),
+                            Some(ERROR_ACCESS_DENIED as i32),
+                            "partial after owner transfer: {error}"
+                        ),
+                    }
+                    assert_denied(&path, WRITE_DAC, "partial before DACL repair");
+                },
+                create,
+            )
+        } else {
+            create()
+        };
         match &result {
             Ok(session) => eprintln!("{case}: create_directory returned Ok({session:?}); {before}"),
             Err(error) => eprintln!("{case}: create_directory returned Err({error:#}); {before}"),
@@ -302,7 +335,6 @@ fn windows_state_root_owners_and_dacl() {
                     account.owners.join(" or ")
                 );
                 assert_eq!(format!("{:#}", result.unwrap_err()), expected);
-                assert!(unsafe { (*observed.dacl).AceCount } > 1);
                 assert_private_dacl(&SavedAccess::capture(&root, 0));
                 let error =
                     crate::native::session::Store::create_settings_root(&root, &[]).unwrap_err();
@@ -378,7 +410,7 @@ fn windows_state_root_owners_and_dacl() {
                 .env("TABCLI_ROOT_FIXTURE", path)
                 .output()
                 .unwrap();
-            original.restore_dacl();
+            original.apply_dacl_to(&original.root);
             assert!(
                 output.status.success(),
                 "{case}: child exited with {}\n{}",

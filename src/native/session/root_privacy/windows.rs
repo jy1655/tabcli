@@ -416,6 +416,8 @@ pub(super) fn check(path: &Path, action: Action) -> Result<bool> {
                 return Err(issue);
             }
             set(&root, &descriptor, true).with_context(|| issue.to_string())?;
+            #[cfg(test)]
+            crate::native::session::primitives::fault_point("after setting the state root owner")?;
         }
         Ok(())
     })();
