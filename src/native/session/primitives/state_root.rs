@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::native::session::root_privacy::{self, FailurePolicy};
 use crate::native::session_start::deadline;
 
 use super::durable::{
@@ -20,7 +21,70 @@ pub(in crate::native) struct StateRootDurabilityReceipt {
     synced_unix_ms: u128,
 }
 
-/// Creates the state root and every missing ancestor, then makes the root's ancestry
+pub(in crate::native) fn create_root_directories(
+    root: &Path,
+    root_fact: &'static str,
+    policy: FailurePolicy,
+) -> Result<bool> {
+    let mut created = Vec::new();
+    let mut probe = root;
+    loop {
+        match fs::symlink_metadata(probe) {
+            Ok(_) => break,
+            // Darwin can deny path stat (readsecurity) while a read-open succeeds.
+            // Let the opened-root check judge this leaf before any child write.
+            #[cfg(target_os = "macos")]
+            Err(error) if probe == root && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                created.push(probe.to_path_buf());
+                match probe.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+                    _ => break,
+                }
+            }
+            Err(error) => {
+                return Err(root_privacy::path_error(
+                    probe,
+                    root_privacy::Observation::InspectPath,
+                    error,
+                ));
+            }
+        }
+    }
+    let mut made_root = false;
+    for directory in created.iter().rev() {
+        // A concurrent creator may win the race; the ancestry walk below covers its
+        // entries and this creator's alike.
+        deadline::before("creating state directories")?;
+        let leaf = directory == root;
+        let result = if leaf {
+            root_privacy::create_leaf(directory, policy)
+        } else {
+            fs::create_dir(directory)
+        };
+        match result {
+            Ok(()) if leaf => {
+                made_root = true;
+                deadline::wrote(root_fact);
+            }
+            Ok(()) => deadline::wrote("state directories were created"),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => {
+                return Err(root_privacy::path_error(
+                    directory,
+                    root_privacy::Observation::CreatePath,
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(made_root)
+}
+
+/// Establishes root privacy before any receipt or Session write, then makes its ancestry
 /// durable unless the durability receipt already proves it is. A directory entry is a
 /// record like the files inside it: the session directory is only durable once the root's
 /// entry is, and the root's entry is only durable once every ancestor's entry is.
@@ -42,42 +106,16 @@ pub(in crate::native) fn create_state_root(
     root: &Path,
     durable_directories: &[PathBuf],
 ) -> Result<Option<String>> {
-    let mut created = Vec::new();
-    let mut probe = root;
-    loop {
-        match fs::symlink_metadata(probe) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                created.push(probe.to_path_buf());
-                match probe.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
-                    _ => break,
-                }
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to inspect state directory {}", probe.display())
-                });
-            }
-        }
-    }
-    for directory in created.iter().rev() {
-        // A concurrent creator may win the race; the ancestry walk below covers its
-        // entries and this creator's alike.
-        deadline::before("creating state directories")?;
-        match fs::create_dir(directory) {
-            Ok(()) => deadline::wrote("state directories were created"),
-            Err(_) if directory.is_dir() => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to create state directory {}", directory.display())
-                });
-            }
-        }
-    }
-    deadline::set_permissions(root, "state root permissions were set", || {
-        set_private_directory_permissions(root)
-    })?;
+    create_state_root_with(root, durable_directories, FailurePolicy::Refuse)
+}
+
+pub(in crate::native) fn create_state_root_with(
+    root: &Path,
+    durable_directories: &[PathBuf],
+    policy: FailurePolicy,
+) -> Result<Option<String>> {
+    let created = create_root_directories(root, "state directories were created", policy)?;
+    root_privacy::prepare(root, created, policy)?;
     if state_root_durability_receipt_present(root) {
         return Ok(None);
     }
@@ -333,3 +371,113 @@ mod request_deadline_tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+mod privacy_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn unreadable_link_target_requires_owner_mode_repair() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        let link = parent.path().join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = create_state_root(&link, &[]);
+        let after = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "creation repaired an unreadable linked root"
+        );
+        assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn direct_owner_root_with_no_read_mode_is_repaired() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        create_state_root(root.path(), &[]).unwrap();
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_acl_names_the_entry_and_remedy_before_retry() {
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        fs::create_dir(path.join("workspace-consent")).unwrap();
+        let apply = |tool: &str, args: &[&str]| {
+            let output = Command::new(tool).args(args).arg(path).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        apply(
+            "/bin/chmod",
+            &["+a", "everyone allow add_file,delete_child"],
+        );
+        apply("chflags", &["uchg"]);
+        let result = create_directory(path, &[]);
+        apply("chflags", &["nouchg"]);
+        let error = result.unwrap_err();
+        let reason = error
+            .chain()
+            .map(ToString::to_string)
+            .find(|reason| reason.starts_with("ACL entry 0 (allow, principal "))
+            .unwrap();
+        assert!(
+            reason
+                == format!(
+                    "ACL entry 0 (allow, principal abcdefab-cdef-abcd-efab-cdef0000000c); user immutable flag is set; clear the immutable flag with chflags nouchg '{}' and retry",
+                    path.display()
+                ),
+            "{reason}"
+        );
+        assert_eq!(fs::read_dir(path).unwrap().count(), 1);
+        create_directory(path, &[]).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn acl_removal_requires_a_tab_entry_in_an_existing_directory() {
+        use std::process::Command;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        let status = Command::new("/bin/chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            create_directory(path, &[]).is_err(),
+            "unrecognized directory was used for a Session"
+        );
+        assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+        fs::create_dir(path.join("workspace-consent")).unwrap();
+        create_directory(path, &[]).unwrap();
+        let listing = Command::new("/bin/ls")
+            .arg("-de")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        assert!(
+            !listing
+                .stdout
+                .split(|b| *b == b'\n')
+                .any(|line| line.starts_with(b" 0:"))
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_privacy_tests;

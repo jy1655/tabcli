@@ -54,7 +54,7 @@ use process::{
     verify_control_process_identity,
 };
 pub(super) use process::{pin_teardown_process, verify_process_identity};
-pub(in crate::native) use security::{process_user_sid, set_private_permissions};
+pub(in crate::native) use security::{private_sddl, process_user_sid, set_private_permissions};
 pub(super) use tab::run_host as run_console_host;
 
 /// The managed console: a Windows Terminal tab or a console window of its own, opened here

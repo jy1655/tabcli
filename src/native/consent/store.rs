@@ -202,7 +202,7 @@ fn windows_store_is_private(owner: &str, writers: &[String], own: &[String]) -> 
 #[cfg(windows)]
 fn windows_is_private(noun: &str, owner: &str, writers: &[String], own: &[String]) -> Result<()> {
     const SYSTEM_WRITERS: [&str; 3] = ["S-1-5-18", "S-1-5-32-544", "S-1-3-4"];
-    if !own.iter().any(|sid| sid == owner) {
+    if !windows_owner_is_accepted(owner, own) {
         bail!("{noun} owner differs from current user");
     }
     if let Some(other) = writers
@@ -212,6 +212,11 @@ fn windows_is_private(noun: &str, owner: &str, writers: &[String], own: &[String
         bail!("{noun} can be changed by another account ({other})");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn windows_owner_is_accepted(owner: &str, own: &[String]) -> bool {
+    own.iter().any(|sid| sid == owner)
 }
 
 /// A session directory that a Windows launch host is about to trust, read through
@@ -489,7 +494,7 @@ fn windows_owner(path: &Path) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn windows_sid(sid: windows_sys::Win32::Security::PSID) -> Result<String> {
+pub(in crate::native) fn windows_sid(sid: windows_sys::Win32::Security::PSID) -> Result<String> {
     use windows_sys::Win32::{
         Foundation::LocalFree, Security::Authorization::ConvertSidToStringSidW,
     };

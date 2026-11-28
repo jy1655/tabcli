@@ -33,6 +33,7 @@ use turn::{JournaledEventRead, JournaledEventState, PendingTurnCompletion};
 pub(in crate::native) mod primitives;
 mod reads;
 pub(in crate::native) mod record;
+pub(in crate::native) mod root_privacy;
 pub(in crate::native) mod schema;
 pub(in crate::native) mod snapshot;
 use names::*;
@@ -577,11 +578,11 @@ impl Store {
     ) -> Result<(PathBuf, String, Option<String>)> {
         create_directory(root, durable)
     }
-    pub(in crate::native) fn create_state_root(
+    pub(in crate::native) fn create_settings_root(
         root: &Path,
         durable: &[PathBuf],
     ) -> Result<Option<String>> {
-        create_state_root(root, durable)
+        create_state_root_with(root, durable, root_privacy::FailurePolicy::Warn)
     }
     pub(in crate::native) fn new_event_file_name() -> Result<String> {
         new_event_file_name()

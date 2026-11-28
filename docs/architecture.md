@@ -157,8 +157,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   (`CallerCheck`) goes with the selection. `resolve_at` decides that choice with the provider and
   its probed version (`admit_choice`): Herdr where admitted, its fallback otherwise, while an
   explicit choice is refused; a Herdr choice whose check failed is refused. Reopen requires
-  representable launch paths before recovering an interrupted child launch. An expired request
-  is refused at the first deadline check it reaches.
+  representable launch paths before recovering an interrupted child launch. Workspace consent
+  can create the state root before Session creation, under the same root privacy rule. An
+  expired request is refused at the first deadline check it reaches.
   `doctor` reports the same decision without the caller check (`automatic_surface` and
   `choose_before_probe`), deciding a version-dependent choice with the launch's own probe
   (`read_installed_version`). The common option

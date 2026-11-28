@@ -2,6 +2,7 @@ use super::store::{Environment, Evidence, Trust, read_store, user_home};
 use super::worktree;
 use super::{Identity, identity};
 use crate::native::provider;
+use crate::native::session::root_privacy::{self, FailurePolicy};
 use crate::native::session::{Reader, RecordReader, RecordStore, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -187,6 +188,15 @@ pub(super) fn with_record<T>(
     workspace: &Path,
     f: impl FnOnce(&Path, Option<Record>) -> Result<T>,
 ) -> Result<T> {
+    with_record_under(root, workspace, FailurePolicy::Refuse, f)
+}
+
+fn with_record_under<T>(
+    root: &Path,
+    workspace: &Path,
+    policy: FailurePolicy,
+    f: impl FnOnce(&Path, Option<Record>) -> Result<T>,
+) -> Result<T> {
     let path = record_path(root, workspace);
     let parent = path.parent().unwrap();
     if fs::symlink_metadata(parent).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink()) {
@@ -203,15 +213,12 @@ pub(super) fn with_record<T>(
         }
         Ok(())
     };
-    if deadline::current().is_some()
-        && !root.is_dir()
-        && let Some(ancestor) = root.parent()
-    {
-        fs::create_dir_all(ancestor)?;
-        create_directory(root, "the state root was created")?;
-    } else {
-        fs::create_dir_all(root)?;
-    }
+    let created = crate::native::session::primitives::create_root_directories(
+        root,
+        "the state root was created",
+        policy,
+    )?;
+    root_privacy::prepare(root, created, policy)?;
     create_directory(parent, "the workspace consent directory was created")?;
     deadline::set_permissions(
         parent,
@@ -874,12 +881,17 @@ pub(in crate::native) fn run(args: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    with_record(&root, &identity.path.clone(), |path, existing| {
-        let record = changed(existing, identity, action == "revoke");
-        RecordStore::at(path).write_json(&record)?;
-        println!("{}", serde_json::to_string_pretty(&record)?);
-        Ok(())
-    })
+    with_record_under(
+        &root,
+        &identity.path.clone(),
+        FailurePolicy::Warn,
+        |path, existing| {
+            let record = changed(existing, identity, action == "revoke");
+            RecordStore::at(path).write_json(&record)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        },
+    )
 }
 
 // The record that `consent revoke` (`revoke`) or `consent reset` writes over `existing`. A
@@ -1344,6 +1356,15 @@ fn request_deadline_reports_a_state_root_created_during_consent() {
             || with_record(&root, &workspace, |_, _| Ok(())),
         )
         .unwrap_err();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+        assert!(!root.join("state-root.durable").exists());
         assert!(root.is_dir());
         assert_eq!(
             error.to_string().contains("the state root was created"),

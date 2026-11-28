@@ -1,0 +1,848 @@
+mod support;
+
+use serde_json::Value;
+use std::{
+    io::ErrorKind,
+    path::Path,
+    process::{Command, Output},
+};
+
+fn run(root: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
+    command
+        .args(args)
+        .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+    }
+    command.output().unwrap()
+}
+
+fn successful(output: Output) -> Value {
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn diagnosis(root: &Path, args: &[&str]) -> Value {
+    let value = successful(run(root, args));
+    value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "state_root")
+        .cloned()
+        .expect("doctor must report state_root")
+}
+
+#[cfg(windows)]
+fn root_sddl(path: &Path) -> String {
+    use std::{
+        io,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Globalization::lstrlenW,
+        Security::{
+            Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+                SDDL_REVISION_1, SE_FILE_OBJECT,
+            },
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        },
+        Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL},
+    };
+
+    let root = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap_or_else(|error| panic!("open {} for READ_CONTROL: {error}", path.display()));
+    let information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            root.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(
+        status,
+        ERROR_SUCCESS,
+        "GetSecurityInfo on {}",
+        path.display()
+    );
+
+    let mut text = ptr::null_mut();
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            information,
+            &mut text,
+            ptr::null_mut(),
+        )
+    };
+    let error = (converted == 0).then(io::Error::last_os_error);
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if let Some(error) = error {
+        panic!(
+            "convert security descriptor to SDDL on {}: {error}",
+            path.display()
+        );
+    }
+    let units = unsafe { std::slice::from_raw_parts(text, lstrlenW(text) as usize) };
+    let sddl = String::from_utf16(units);
+    unsafe {
+        LocalFree(text.cast());
+    }
+    let sddl = sddl.expect("Windows returned invalid UTF-16 SDDL");
+    assert!(!sddl.is_empty(), "empty SDDL for {}", path.display());
+    sddl
+}
+
+#[test]
+fn doctor_reports_a_missing_root_without_creating_it() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("missing");
+    for args in [
+        &["doctor", "--provider", "pi", "--json"][..],
+        &["doctor", "session-missing", "--json"],
+    ] {
+        let row = diagnosis(&root, args);
+        assert_eq!(row["reason_code"], "state_root_absent");
+        assert_eq!(row["next_action"], "TAB creates it at the first session.");
+        assert!(!root.exists());
+    }
+}
+
+const SELECT_ROOT: &str = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+
+fn directory_link(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let output = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+}
+
+fn failed_open_detail(root: &Path, expected_kinds: &[ErrorKind]) -> String {
+    #[cfg(unix)]
+    let error = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(root)
+            .unwrap_err()
+    };
+    #[cfg(windows)]
+    let error = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL,
+        };
+        std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root)
+            .unwrap_err()
+    };
+    assert!(expected_kinds.contains(&error.kind()), "{root:?}: {error}");
+    let operation = match error.kind() {
+        ErrorKind::NotADirectory => "expected a directory",
+        ErrorKind::NotFound if cfg!(windows) => {
+            "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES"
+        }
+        ErrorKind::NotFound => "open state directory",
+        other => panic!("unexpected open error {other:?} for {root:?}"),
+    };
+    format!(
+        "state root {}: {operation}; {SELECT_ROOT}: {error}",
+        root.display()
+    )
+}
+
+#[test]
+fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path();
+    let target = parent.join("target");
+    let root = parent.join("root");
+    std::fs::create_dir(&target).unwrap();
+    directory_link(&target, &root);
+    let destination = std::fs::read_link(&root).unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    let detail = failed_open_detail(&root, &[ErrorKind::NotFound]);
+    let warning = format!("warning: {detail}");
+    for args in [
+        &["settings", "macos-open-mode", "tab-first"][..],
+        &["consent", "revoke", parent.to_str().unwrap(), "--json"],
+    ] {
+        let output = run(&root, args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr.lines().next(),
+            Some(warning.as_str()),
+            "{args:?}: {stderr}"
+        );
+    }
+    let doctor = diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+    assert_eq!(doctor["reason_code"], "state_root_unreadable");
+    assert_eq!(doctor["next_action"], SELECT_ROOT);
+    assert_eq!(doctor["detail"], detail);
+    assert_eq!(std::fs::read_link(&root).unwrap(), destination);
+    assert!(!target.exists());
+}
+
+#[test]
+fn doctor_and_settings_select_another_root_when_an_ancestor_link_dangles() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let ancestor = temp.path().join("ancestor");
+    std::fs::create_dir(&target).unwrap();
+    directory_link(&target, &ancestor);
+    let destination = std::fs::read_link(&ancestor).unwrap();
+    let missing_parent = ancestor.join("missing");
+    let root = missing_parent.join("root");
+
+    let doctor = || diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+    let row = doctor();
+    assert_eq!(row["reason_code"], "state_root_absent");
+    assert_eq!(row["next_action"], "TAB creates it at the first session.");
+    // This succeeds only if inspection left the linked directory empty.
+    std::fs::remove_dir(&target).unwrap();
+
+    let row = doctor();
+    let output = run(&root, &["settings", "macos-open-mode", "tab-first"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = format!(
+        "Error: failed to create state directory {}; {SELECT_ROOT}",
+        missing_parent.display()
+    );
+    assert_eq!(stderr.lines().next(), Some(expected.as_str()), "{stderr}");
+    assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
+    assert_eq!(row["next_action"], SELECT_ROOT);
+    assert_eq!(
+        row["detail"],
+        failed_open_detail(&root, &[ErrorKind::NotFound])
+    );
+    assert_eq!(std::fs::read_link(&ancestor).unwrap(), destination);
+    assert!(!target.exists());
+}
+
+#[test]
+fn doctor_distinguishes_a_selected_file_from_a_root_below_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("file");
+    std::fs::write(&file, b"fixture").unwrap();
+    let root = file.join("x");
+    let args = ["doctor", "--provider", "pi", "--json"];
+    let row = diagnosis(&root, &args);
+    assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
+    assert_eq!(row["availability"], "unknown");
+    assert_eq!(row["next_action"], SELECT_ROOT);
+    #[cfg(unix)]
+    let expected_kinds = &[ErrorKind::NotADirectory][..];
+    #[cfg(windows)]
+    let expected_kinds = &[ErrorKind::NotADirectory, ErrorKind::NotFound][..];
+    assert_eq!(row["detail"], failed_open_detail(&root, expected_kinds));
+
+    let check_selected = |selected: &Path| {
+        let row = diagnosis(selected, &args);
+        assert_eq!(row["reason_code"], "state_root_not_private", "{row}");
+        assert_eq!(row["availability"], "unavailable");
+        assert_eq!(row["next_action"], SELECT_ROOT);
+        #[cfg(unix)]
+        let detail = failed_open_detail(selected, &[ErrorKind::NotADirectory]);
+        #[cfg(windows)]
+        let detail = format!(
+            "state root {}: expected a directory; {SELECT_ROOT}",
+            selected.display()
+        );
+        assert_eq!(row["detail"], detail);
+    };
+    check_selected(&file);
+    #[cfg(unix)]
+    {
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        check_selected(&link);
+        assert_eq!(std::fs::read_link(&link).unwrap(), file);
+
+        let broken = temp.path().join("broken");
+        std::os::unix::fs::symlink(&root, &broken).unwrap();
+        let row = diagnosis(&broken, &args);
+        assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
+        assert_eq!(
+            row["detail"],
+            failed_open_detail(&broken, &[ErrorKind::NotADirectory])
+        );
+        assert_eq!(row["next_action"], SELECT_ROOT);
+        assert_eq!(std::fs::read_link(&broken).unwrap(), root);
+    }
+    assert_eq!(std::fs::read(file).unwrap(), b"fixture");
+}
+
+#[test]
+fn queries_preserve_root_permissions_and_session_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let session = root.join("session-query");
+    std::fs::create_dir_all(session.join("events")).unwrap();
+    support::write(
+        &session.join("manifest.json"),
+        &support::manifest(
+            "session-query",
+            "pi",
+            Path::new("pi"),
+            "1.0",
+            root,
+            "root privacy query",
+        ),
+    );
+    support::write(
+        &session.join("status.json"),
+        &support::status("exited", 2, None),
+    );
+    successful(run(root, &["sessions", "--json"]));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        Command::new("/bin/chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    #[cfg(windows)]
+    assert!(
+        Command::new("icacls")
+            .arg(root)
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let permissions = || {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(root).unwrap();
+            #[cfg(target_os = "macos")]
+            let acl = {
+                let out = Command::new("/bin/ls")
+                    .arg("-den")
+                    .arg(root)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+                out.stdout
+            };
+            #[cfg(not(target_os = "macos"))]
+            let acl = Vec::<u8>::new();
+            (meta.uid(), meta.mode(), acl)
+        }
+        #[cfg(windows)]
+        {
+            root_sddl(root)
+        }
+    };
+    let before = permissions();
+    let records = support::entries(root);
+    for args in [
+        &["sessions", "--json"][..],
+        &["status", "--json"],
+        &["inspect", "session-query", "--json"],
+        &["result", "session-query", "--list", "--json"],
+        &["doctor", "session-query", "--json"],
+    ] {
+        successful(run(root, args));
+        assert_eq!(permissions(), before, "{args:?}");
+        assert_eq!(support::entries(root), records, "{args:?}");
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn doctor_mode_remedy_depends_on_a_real_tab_entry() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let select = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let chmod = format!(
+            "restore owner permissions with chmod 700 '{}'",
+            root.path().display()
+        );
+        for (marked, suffix, action) in [
+            (
+                false,
+                format!(
+                    "the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); {select}"
+                ),
+                select,
+            ),
+            (true, chmod.clone(), chmod.as_str()),
+        ] {
+            if marked {
+                fs::create_dir(root.path().join("workspace-consent")).unwrap();
+            }
+            let row = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+            assert_eq!(
+                row["detail"],
+                format!(
+                    "state root {}: mode 0750, expected 0700; {suffix}",
+                    root.path().display()
+                )
+            );
+            assert_eq!(row["next_action"], action);
+            assert_eq!(mode(root.path()), 0o750);
+        }
+    }
+
+    #[test]
+    fn doctor_reports_a_failed_tab_entry_check_without_changing_search_access() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("requires a caller subject to directory search permissions");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("workspace-consent")).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o400)).unwrap();
+        let row = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+        let after = mode(root.path());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let remedy = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(
+            row["detail"],
+            format!(
+                "state root {}: mode 0400, expected 0700; cannot determine whether the directory holds a TAB entry (inspect TAB entries: {denied}); {remedy}",
+                root.path().display()
+            )
+        );
+        assert_eq!(row["next_action"], remedy);
+        assert_eq!(after, 0o400);
+    }
+
+    #[test]
+    fn standalone_consent_prepares_the_root_before_creating_its_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        for action in ["revoke", "reset"] {
+            successful(run(
+                &root,
+                &["consent", action, tmp.path().to_str().unwrap(), "--json"],
+            ));
+            assert_eq!(mode(&root), 0o700);
+            assert!(!root.join("state-root.durable").exists());
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn doctor_observes_a_linked_root_and_settings_repairs_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("link");
+        let dir = tmp.path().join("directory");
+        fs::create_dir(&dir).unwrap();
+        symlink(&dir, &root).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+        let row = diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+        assert_eq!(row["reason_code"], "state_root_not_private");
+        assert_eq!(
+            row["next_action"],
+            "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
+        );
+        assert_eq!(mode(&dir), 0o750);
+        successful(run(&root, &["settings", "macos-open-mode", "tab-first"]));
+        assert_eq!(mode(&dir), 0o700);
+        let row = diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+        assert_eq!(row["reason_code"], "state_root_private");
+        assert_eq!(row["next_action"], "No action is needed.");
+    }
+
+    #[test]
+    fn warning_writers_continue_on_an_unreadable_linked_root() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let root = temp.path().join("root");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &root).unwrap();
+        successful(run(&root, &["settings", "macos-open-mode", "tab-first"]));
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o300)).unwrap();
+        let reason = format!(
+            "warning: state root {}: open state directory; cannot determine whether the directory holds a TAB entry; set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB: {}",
+            root.display(),
+            std::io::Error::from_raw_os_error(libc::EACCES)
+        );
+        for action in ["revoke", "reset"] {
+            let output = run(
+                &root,
+                &["consent", action, temp.path().to_str().unwrap(), "--json"],
+            );
+            let warning = String::from_utf8(output.stderr.clone()).unwrap();
+            let record = successful(output);
+            assert_eq!(record["revoked"], action == "revoke");
+            assert_eq!(warning.lines().next(), Some(reason.as_str()), "{warning}");
+            assert_eq!(mode(&target), 0o300);
+        }
+        let output = run(&root, &["settings", "macos-open-mode", "tab-first"]);
+        let warning = String::from_utf8(output.stderr).unwrap();
+        // Syncing a settings write may itself need read access to the root.
+        assert_eq!(warning.lines().next(), Some(reason.as_str()), "{warning}");
+        assert_eq!(mode(&target), 0o300);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn unsearchable_parent_reports_where_inspection_failed() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("requires a caller subject to directory search permissions");
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let row = diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+        let output = run(&root, &["settings", "macos-open-mode", "tab-first"]);
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let inspection = format!("failed to inspect state directory {}", root.display());
+        assert!(stderr.contains(&inspection), "{stderr}");
+        assert_eq!(row["reason_code"], "state_root_unreadable");
+        assert_eq!(
+            row["next_action"],
+            "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
+        );
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn isolated_self_test_only_prepares_a_parent_it_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("container");
+        for expected in [0o700, 0o750] {
+            use std::os::unix::process::CommandExt;
+            let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o022);
+                    Ok(())
+                });
+            }
+            let out = command
+                .args(["self-test", "pi", "--isolated", "--json"])
+                .current_dir(temp.path())
+                .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &parent)
+                .env("HOME", temp.path())
+                .env("PATH", "")
+                .env_remove("HC_TERMINAL_ID")
+                .output()
+                .unwrap();
+            let report: Value =
+                serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{out:?}"));
+            let child = Path::new(report["state_root"].as_str().unwrap());
+            assert_eq!(child.parent(), Some(parent.as_path()));
+            assert_eq!(mode(child), 0o700);
+            assert_eq!(mode(&parent), expected);
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_named_user_acl_is_masked_after_preparation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Linux's posix_acl_xattr uapi, including a named user and an rwx mask.
+        let uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (1u16, 7u16, u32::MAX),
+            (2, 7, uid),
+            (4, 0, u32::MAX),
+            (16, 7, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        let dir = fs::File::open(tmp.path()).unwrap();
+        use std::os::fd::AsRawFd;
+        let key = c"system.posix_acl_access";
+        let result = unsafe {
+            libc::fsetxattr(
+                dir.as_raw_fd(),
+                key.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                eprintln!(
+                    "skipping POSIX ACL readback: temporary directory does not support ACLs ({error})"
+                );
+                return;
+            }
+            panic!("setting fixture POSIX access ACL: {error}");
+        }
+        assert_eq!(mode(tmp.path()), 0o770);
+        successful(run(
+            tmp.path(),
+            &["settings", "macos-open-mode", "tab-first"],
+        ));
+        let mut readback = vec![0; acl.len()];
+        assert_eq!(
+            unsafe {
+                libc::fgetxattr(
+                    dir.as_raw_fd(),
+                    key.as_ptr(),
+                    readback.as_mut_ptr().cast(),
+                    readback.len(),
+                )
+            },
+            acl.len() as isize
+        );
+        acl[30..32].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(readback, acl);
+        assert_eq!(mode(tmp.path()), 0o700);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_acl(path: &Path) -> bool {
+        use std::{ffi::c_void, os::fd::AsRawFd};
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: i32, kind: i32) -> *mut c_void;
+            fn acl_free(acl: *mut c_void) -> i32;
+        }
+        let directory = fs::File::open(path).unwrap();
+        let acl = unsafe { acl_get_fd_np(directory.as_raw_fd(), 0x100) };
+        if acl.is_null() {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            return false;
+        }
+        assert_eq!(unsafe { acl_free(acl) }, 0);
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn chmod(path: &Path, entry: &str) {
+        let output = Command::new("/bin/chmod")
+            .args(["+a", entry])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_directory_list_denial_reports_unknown_tab_membership() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("requires a caller subject to directory access checks");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        chmod(root.path(), "everyone deny list");
+        let row = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+        let output = run(root.path(), &["settings", "macos-open-mode", "tab-first"]);
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let remedy = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let reason = format!(
+            "state root {}: owner mode permits access but the directory open was denied; cannot determine whether the directory holds a TAB entry; {remedy}: {}",
+            root.path().display(),
+            std::io::Error::from_raw_os_error(libc::EACCES)
+        );
+        assert_eq!(row["reason_code"], "state_root_unreadable");
+        assert_eq!(row["detail"], reason);
+        assert_eq!(row["next_action"], remedy);
+        assert_eq!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+            format!("warning: {reason}")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_writers_require_a_tab_entry_before_removing_a_deny_acl() {
+        let root = tempfile::tempdir().unwrap();
+        chmod(root.path(), "everyone deny delete");
+        // Darwin's well-known GUID for the everyone principal.
+        let refusal = "ACL entry 0 (deny, principal abcdefab-cdef-abcd-efab-cdef0000000c); the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let workspace = root.path().to_str().unwrap();
+        let doctor = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+        assert_eq!(
+            doctor["detail"],
+            format!("state root {workspace}: {refusal}")
+        );
+        assert_eq!(
+            doctor["next_action"],
+            "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
+        );
+        for args in [
+            &["settings", "macos-open-mode", "tab-first"][..],
+            &["consent", "revoke", workspace, "--json"],
+            &["consent", "reset", workspace, "--json"],
+        ] {
+            let output = run(root.path(), args);
+            assert!(!output.status.success(), "{args:?}: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.lines().take(4).collect::<Vec<_>>().join("\n"),
+                format!("Error: state root {workspace}\n\nCaused by:\n    {refusal}"),
+                "{args:?}: {stderr}"
+            );
+            assert!(has_acl(root.path()));
+            assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+        }
+        fs::create_dir(root.path().join("workspace-consent")).unwrap();
+        assert!(has_acl(root.path()));
+        assert_eq!(
+            diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"])["reason_code"],
+            "state_root_not_private"
+        );
+        successful(run(
+            root.path(),
+            &["settings", "macos-open-mode", "tab-first"],
+        ));
+        assert!(!has_acl(root.path()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_clears_an_inherited_acl_before_consent_and_repairs_a_read_denial() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("state");
+        chmod(parent.path(), "everyone allow add_file,directory_inherit");
+        successful(run(
+            &root,
+            &[
+                "consent",
+                "reset",
+                parent.path().to_str().unwrap(),
+                "--json",
+            ],
+        ));
+        assert!(!has_acl(&root));
+        chmod(&root, "everyone deny readsecurity");
+        successful(run(
+            &root,
+            &[
+                "consent",
+                "revoke",
+                parent.path().to_str().unwrap(),
+                "--json",
+            ],
+        ));
+        assert!(!has_acl(&root));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_existing_tab_root_loses_its_extended_acl() {
+        let tmp = tempfile::tempdir().unwrap();
+        successful(run(
+            tmp.path(),
+            &["settings", "macos-open-mode", "tab-first"],
+        ));
+        let perms = Command::new("/bin/chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        assert!(perms.status.success(), "{perms:?}");
+        let listing = || {
+            Command::new("/bin/ls")
+                .arg("-den")
+                .arg(tmp.path())
+                .output()
+                .unwrap()
+                .stdout
+        };
+        let before = listing();
+        assert!(has_acl(tmp.path()));
+        assert!(
+            before
+                .split(|b| *b == b'\n')
+                .any(|line| line.starts_with(b" 0:"))
+        );
+        assert_eq!(
+            diagnosis(tmp.path(), &["doctor", "--provider", "pi", "--json"])["reason_code"],
+            "state_root_not_private"
+        );
+        assert_eq!(listing(), before);
+        successful(run(
+            tmp.path(),
+            &["settings", "macos-open-mode", "tab-first"],
+        ));
+        assert!(!has_acl(tmp.path()));
+        assert!(
+            !listing()
+                .split(|b| *b == b'\n')
+                .any(|line| line.starts_with(b" 0:"))
+        );
+    }
+}

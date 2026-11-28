@@ -101,7 +101,7 @@ fn token_user_sid(token: OwnedHandle) -> Result<String> {
     sid.context("Windows user SID is not valid UTF-16")
 }
 
-pub(super) fn private_sddl(sid: &str, directory: bool) -> String {
+pub(in crate::native) fn private_sddl(sid: &str, directory: bool) -> String {
     format!("D:P(A;{};FA;;;{sid})", if directory { "OICI" } else { "" })
 }
 

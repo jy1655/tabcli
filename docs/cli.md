@@ -1304,6 +1304,16 @@ exchange has its own additional ten-second maximum. It does not launch a model t
 deliver a prompt, start a daemon, repair records, or change settings. Historical launch
 configuration and current observations are reported separately.
 
+The `state_root` check reports `available` for `state_root_private`, `unavailable` for
+`state_root_not_private`, and `unknown` for `state_root_absent` or `state_root_unreadable`.
+A selected path that resolves to a non-directory gives `state_root_not_private`. A path
+below a non-directory gives `state_root_unreadable`.
+A root privacy failure refuses session creation by `ask`, `reopen`, or `self-test`.
+Settings setters, `consent revoke`, and `consent reset` also refuse when removing a macOS ACL
+or changing a Windows owner would require an existing TAB entry and the directory has none.
+For other root privacy failures they warn on stderr and attempt their writes. See
+[local records](security-and-data.md#local-records) for the ownership and ACL limits.
+
 The report starts human output with `scope`, describing the inputs used by these checks:
 
 - `session` is the requested session id, or null in provider-only mode; `provider` is the
@@ -1962,7 +1972,8 @@ For `ask`, `tell`, and `reopen`, the timeout is one command deadline shared by p
 or delivery, and result waiting. Before a Session exists, the deadline bounds the automatic
 Herdr caller check (also limited to ten seconds), the wait for a reopen reservation, and the
 start of each write to workspace consent, the state root, the Session directory and the reopen
-marker, except that state-root preparation makes the root private even if the deadline has passed.
+marker, except that making the root private and verifying it, including during consent
+preparation, can finish after the deadline.
 A write already in progress completes. Once TAB has written a reopen marker, finalizing or releasing
 it, including publishing a child's launch refusal, can wait past the deadline to bind the child
 to its source or make the source reopenable after a failure. A timeout while waiting for a result
@@ -2450,7 +2461,7 @@ Unknown future category values require a reviewed allowlist update. List positio
 to the supplied input; they are not identifiers and do not correlate separate exports.
 
 Limits are 4 MiB of strict UTF-8 input, 32 nested containers, 100,000 JSON value nodes,
-24 items per projected array and 64 KiB of ASCII output. Omitted array items are counted.
+25 items per projected array and 64 KiB of ASCII output. Omitted array items are counted.
 Integers must be nonnegative and at most `2^53 - 1`; booleans and numeric strings do not
 coerce to integers. Duplicate keys and non-finite numbers are refused. Markdown contains a
 fenced JSON projection with no unvalidated text. See the

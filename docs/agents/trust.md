@@ -17,11 +17,11 @@
   the Administrators group (a token's default owner can differ by policy or per process), so a
   directory an elevated TAB creates is normally not private to the user of a core that is not
   elevated. The rule itself is unchanged.
-- TAB treats its state root as the user's own, as it did before this check: at every session
-  creation it sets the root's mode to 0700 (macOS, Linux) or its access list to the user alone
-  (Windows), and fails where it cannot. It does not verify that nobody else can change the
-  root: on macOS an extended ACL entry survives the mode change, and on Windows the owner is
-  neither checked nor changed.
+- The state root has its own [ownership and permissions rule](../security-and-data.md#local-records),
+  including when shared consent creates it before a Session exists.
+  Failure to establish root privacy refuses a Session start. If an existing root lacks the TAB
+  entry required for ACL removal or owner repair, standalone revoke and reset also refuse.
+  For other privacy failures they warn and attempt the requested consent write.
 - The check describes the store at the time of the read. It cannot tell who wrote the
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: TAB polls Agy's store every

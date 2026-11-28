@@ -11,7 +11,7 @@ import sys
 MAX_INPUT_BYTES = 4 * 1024 * 1024
 MAX_DEPTH = 32
 MAX_NODES = 100000
-MAX_ITEMS = 24
+MAX_ITEMS = 25
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_INTEGER = (1 << 53) - 1
 MISSING = object()
@@ -38,7 +38,7 @@ ATTENTION = enum("""
     session_failed session_exited origin_ended question_emitted
 """)
 CHECK_IDS = enum("""
-    platform session_records session_state active_request turn completion request_index
+    state_root platform session_records session_state active_request turn completion request_index
     terminal_selection terminal_surface terminal_record powershell tmux provider provider_executable
     provider_version workspace workspace_consent owner hold cancel origin reopen_marker
     claude_inbound_setting claude_caller_markers claude_messaging claude_resumed_conversation_holders
@@ -50,6 +50,7 @@ CHECK_IDS = enum("""
     launch_stage shell_environment
 """)
 REASONS = enum("""
+    state_root_absent state_root_not_private state_root_private state_root_unreadable
     platform_supported platform_unsupported session_unavailable records_read records_busy
     records_unreadable stored_state active_request_unknown delivery_unconfirmed turn_in_progress
     no_active_turn recovery_required no_pending_completion request_index_incomplete
