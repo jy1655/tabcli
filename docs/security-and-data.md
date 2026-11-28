@@ -50,6 +50,13 @@ A regular `.git` file in the launch folder establishes that folder as its own to
 running Git. With a `.git` directory in the launch folder, TAB asks Git for the top level only
 when an ancestor contains a `.git` entry.
 
+On Windows, TAB compares Codex project keys ignoring ASCII letter case and refuses ambiguous matches.
+A single untrusted ASCII-case match declines even if its spelling differs.
+If no key matches by ASCII case, TAB still honors a decline when the key and folder have
+the same Unicode lowercase spelling. A trusted entry cannot grant consent on that basis.
+A trusted entry must use the exact folder spelling under a case-sensitive directory or
+when TAB cannot read a directory's case-sensitivity flag on the path to the folder's parent.
+
 Linked git worktrees are the one exception to the directory rule. See the
 [consent rule, its limits and registration repair](agents/trust.md).
 Anyone who can write the trusted repository's `.git` can register a worktree there, but cloning or fetching cannot register one.

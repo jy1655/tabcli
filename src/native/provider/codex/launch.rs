@@ -189,10 +189,9 @@ fn wait_for_submission_with(
 }
 
 pub(super) fn workspace_trust_override(workspace: &Path) -> Result<String> {
-    let mut key = crate::native::consent::native_key(workspace)?;
-    if cfg!(windows) {
-        key = key.to_lowercase();
-    }
+    let key = crate::native::consent::native_key(workspace)?;
+    #[cfg(windows)]
+    let key = super::trust::windows_override_key(&key);
     // Codex config/src/overrides.rs splits the left side on every dot and does
     // not parse quoted TOML keys. Put the path in the TOML VALUE instead: quoted
     // dotted keys on the left create a different project and leave the dialog up.

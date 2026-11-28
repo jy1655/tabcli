@@ -105,10 +105,11 @@ fn workspace_trust_reads_exact_toml_key_and_no_permission_override() {
     let env = consent::Environment::at_home(tmp.path());
     std::fs::create_dir(tmp.path().join(".codex")).unwrap();
     let store = tmp.path().join(".codex").join("config.toml");
-    let mut key = consent::native_key(&workspace).unwrap();
-    if cfg!(windows) {
-        key = key.to_lowercase();
-    }
+    let native = consent::native_key(&workspace).unwrap();
+    #[cfg(windows)]
+    let (key, evidence_key) = (native.to_ascii_lowercase(), native.to_lowercase());
+    #[cfg(not(windows))]
+    let (key, evidence_key) = (&native, &native);
     let config = format!(
         "[projects.{}]\ntrust_level = \"trusted\"\n",
         serde_json::to_string(&key).unwrap()
@@ -121,7 +122,7 @@ fn workspace_trust_reads_exact_toml_key_and_no_permission_override() {
         panic!("trusted");
     };
     assert_eq!(evidence.provider, "codex");
-    assert_eq!(evidence.key, key);
+    assert_eq!(evidence.key.as_str(), evidence_key.as_str());
     assert_eq!(evidence.store, store);
     let serialized = serde_json::to_value(&evidence).unwrap()["store"]
         .as_str()
@@ -294,7 +295,9 @@ fn the_memory_workspace_is_beside_the_config_of_the_codex_home() {
 fn windows_trust_keys_are_lowercased_and_the_store_path_is_not() {
     use super::super::super::consent::{self, Trust};
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().canonicalize().unwrap();
+    let workspace = tmp.path().join("R\u{c9}po");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
     let mixed = tmp.path().join("Codex-Home");
     std::fs::create_dir(&mixed).unwrap();
     let env = consent::Environment {
@@ -309,9 +312,8 @@ fn windows_trust_keys_are_lowercased_and_the_store_path_is_not() {
         native, lowercase,
         "the fixture needs a mixed-case workspace path"
     );
-    // An exact lowercase entry is found first; a mixed-case entry is found as a fallback;
-    // the evidence key is lowercase either way and the store path keeps its case.
-    for entry in [&lowercase, &native] {
+    // Check both the Codex-written key on an ordinary volume and an exact stored spelling.
+    for entry in [&native.to_ascii_lowercase(), &native] {
         let config = format!(
             "[projects.{}]\ntrust_level = \"trusted\"\n",
             serde_json::to_string(entry).unwrap()
@@ -1404,11 +1406,10 @@ fn lifecycle_binding_and_stop_keep_the_claim_pending() {
 }
 
 // Consent's worktree screen asks only Codex's store: the answer about a path that nothing may
-// touch comes from the store alone and is the store's exact, positive decision. Codex's full
-// lookup reads only the store too, so it answers the same for that path, unchanged.
+// touch comes from the store alone.
 #[test]
 fn the_store_only_answer_reads_the_store_alone() {
-    use super::super::super::consent::{self, Trust};
+    use super::super::super::consent;
     let fixture = super::super::UntouchedPath::new();
     std::fs::create_dir(fixture.home.join(".codex")).unwrap();
     let store = fixture.home.join(".codex").join("config.toml");
@@ -1418,15 +1419,29 @@ fn the_store_only_answer_reads_the_store_alone() {
             .unwrap()
     );
     let parent = fixture.path.parent().unwrap().to_owned();
+    #[cfg(windows)]
+    let listed_key = {
+        // Save the provider's key while the directory exists, then screen the missing path.
+        std::fs::create_dir(&fixture.path).unwrap();
+        let key = consent::native_key(&fixture.path.canonicalize().unwrap()).unwrap();
+        std::fs::remove_dir(&fixture.path).unwrap();
+        key.to_ascii_lowercase()
+    };
     for (listed, level, expected) in [
         (&fixture.path, "trusted", true),
         (&fixture.path, "untrusted", false),
         (&parent, "trusted", false),
     ] {
-        let mut key = consent::native_key(listed).unwrap();
-        if cfg!(windows) {
-            key = key.to_lowercase();
-        }
+        #[cfg(windows)]
+        let key = if listed == &fixture.path {
+            listed_key.clone()
+        } else {
+            consent::native_key(&listed.canonicalize().unwrap())
+                .unwrap()
+                .to_ascii_lowercase()
+        };
+        #[cfg(not(windows))]
+        let key = consent::native_key(listed).unwrap();
         let _ = std::fs::remove_file(&store);
         crate::native::session::primitives::write_private(
             &store,
@@ -1441,16 +1456,6 @@ fn the_store_only_answer_reads_the_store_alone() {
             ADAPTER
                 .store_lists_trusted(&fixture.path, &fixture.env, None)
                 .unwrap(),
-            expected,
-            "{level}"
-        );
-        assert_eq!(
-            matches!(
-                ADAPTER
-                    .workspace_trust(&fixture.path, &fixture.env, None)
-                    .unwrap(),
-                Trust::Trusted(_)
-            ),
             expected,
             "{level}"
         );

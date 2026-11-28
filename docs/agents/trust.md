@@ -47,6 +47,15 @@
   move the top level it uses. For a `.git` directory, an ancestor's `.git` entry requires Git
   to identify the top level. TAB refuses scope if the launch folder's `.git` is a link or
   another special file.
+- On Windows, a Codex grant requires a project key matching the folder spelling up to ASCII letter case.
+  TAB refuses multiple ASCII-case matches as ambiguous.
+  A single untrusted match declines regardless of spelling.
+  When there is no ASCII-case match, TAB declines if any untrusted key has the same Unicode
+  lowercase spelling as the folder. If none does, the lookup is absent.
+  A single trusted match passes the worktree screen without inspecting the claimed folder.
+  To grant consent under a different spelling, every directory from the volume root through
+  the folder's parent must report case-insensitive names.
+  A case-sensitive directory or an unreadable flag requires an exact spelling for a grant.
 - When acquiring a source, TAB considers inheritance only if no provider trusts the workspace exactly
   (`exact_trust_comes_first_and_consent_extends_to_no_child_or_parent`).
 - A linked worktree can inherit the consent of its main working tree when Git's registration

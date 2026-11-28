@@ -243,7 +243,7 @@ fn workspace_trust_override_uses_a_toml_value_for_paths_with_dots_and_quotes() {
         let parsed: toml::Value = format!("value={value}").parse().unwrap();
         let mut workspace_key = crate::native::consent::native_key(workspace).unwrap();
         if cfg!(windows) {
-            workspace_key = workspace_key.to_lowercase();
+            workspace_key = workspace_key.to_ascii_lowercase();
         }
         assert_eq!(
             parsed["value"][&workspace_key]["trust_level"].as_str(),
