@@ -777,6 +777,29 @@ fn dead_owner_surface_absent_or_present() {
 }
 
 #[test]
+fn macos_owner_with_a_stray_windows_identity_cannot_authorize_an_ordinary_close() {
+    for present in [false, true] {
+        let mut row = Row::new(AppleTerminal);
+        row.live = true;
+        row.present = present;
+        row.owner.as_mut().unwrap().windows_process_identity =
+            Some(terminal::WindowsProcessIdentity {
+                creation_time: 42,
+                executable_path: r"C:\tabcli.exe".into(),
+            });
+        let calls = with(
+            &OWNED,
+            &["resumable", "owner", "instances", "presence", "instances"],
+        );
+        if present {
+            row.check_error_chain(&["The recorded Terminal.app surface is still present. End it, then run `tabcli close-session session-close-table --explicit` again."], &calls);
+        } else {
+            row.check(Ok(TerminalCloseAuthority::Absent), &calls);
+        }
+    }
+}
+
+#[test]
 fn recorded_app_absence_requires_a_bound_complete_owner_even_after_wrapper_pid_reuse() {
     for bound in [false, true] {
         let mut row = Row::new(AppleTerminal);
@@ -974,7 +997,11 @@ fn dead_owner_presence_error_never_grants_absence() {
         }
         calls.push("presence");
         row.check_error_chain(
-            &["injected presence failure", "injected presence cause"],
+            &[
+                "could not prove absence of the recorded terminal surface; no close was sent",
+                "injected presence failure",
+                "injected presence cause",
+            ],
             &calls,
         );
     }
@@ -1041,7 +1068,14 @@ fn terminal_process_birth_errors_preserve_reason_and_stop_at_observation() {
         row.intent = path == "resumable";
         row.live = path == "live";
         row.observation_error = Some(("birth", occurrence));
-        row.check_error_chain(&["injected birth failure: injected birth cause"], &calls);
+        let mut chain = vec![];
+        if path == "dead" {
+            chain.push(
+                "could not prove absence of the recorded terminal surface; no close was sent",
+            );
+        }
+        chain.push("injected birth failure: injected birth cause");
+        row.check_error_chain(&chain, &calls);
     }
 }
 
@@ -1165,10 +1199,14 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
             row.state = SessionState::Launching;
         }
         row.observation_error = Some(("instances", occurrence));
-        row.check_error_chain(
-            &["injected instances failure", "injected instances cause"],
-            &calls,
-        );
+        let mut chain = vec![];
+        if path == "dead" {
+            chain.push(
+                "could not prove absence of the recorded terminal surface; no close was sent",
+            );
+        }
+        chain.extend(["injected instances failure", "injected instances cause"]);
+        row.check_error_chain(&chain, &calls);
     }
 }
 
@@ -1243,6 +1281,11 @@ fn check_unspawned_surface(
     let Some(present) = presence else {
         row.observation_error = Some(("presence", 1));
         let mut chain = vec![];
+        if shape != "missing" {
+            chain.push(
+                "could not prove absence of the recorded terminal surface; no close was sent",
+            );
+        }
         if kind != AppleTerminal && !attests {
             chain.push(
                 "could not prove absence of the ownerless terminal surface; no close was sent",

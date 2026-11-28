@@ -1798,6 +1798,11 @@ longer `--timeout-secs`.
 
 For an ordinary macOS application surface without a verified owner, explicit close requires proof that the recorded surface is absent. If it is still present, end it and repeat `tabcli close-session SESSION --explicit`.
 
+On Windows, ordinary explicit close of a retained managed console without a verified owner
+settles once the recorded console root has ended and cleanup of any recorded tab host succeeds.
+While the root runs, close the console window or tab and repeat `tabcli close-session SESSION --explicit`.
+A live or uninspectable owner bound to the session whose ownership cannot be verified prevents settlement.
+
 On macOS, a terminal application can end while the session's processes survive, as observed
 after iTerm2 was killed. If the ownership proof fails, TAB checks whether the recorded
 surface is absent. Terminal.app requires its incarnation-aware absence proof. Proven absence

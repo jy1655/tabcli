@@ -33,7 +33,7 @@ use crate::native::session::{self, Store};
 use crate::native::session::{Reader, SessionState, launch};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use agent_bridge::process_is_alive;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use anyhow::Context;
 use anyhow::{Result, bail};
 use std::{path::Path, time::Instant};
@@ -57,6 +57,8 @@ pub(in crate::native) enum TerminalCloseAuthority {
     /// function decides what may be sent from it and from its own observation of the terminal.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     CreatedSurface(CreationEvidence),
+    #[cfg(windows)]
+    AbsentConsoleWithGoneOwner(u32),
     Absent,
 }
 
@@ -403,6 +405,10 @@ impl CloseObservation for Production<'_> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+const ABSENCE_CONTEXT: &str =
+    "could not prove absence of the recorded terminal surface; no close was sent";
+
 /// An ordinary unowned surface grants only settlement on positive absence. The adapter
 /// may use a trustworthy recorded app identity, even if the wrapper itself has exited.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -417,13 +423,20 @@ fn unowned_close(
     #[cfg(unix)]
     let absent = observation
         .evidence()
-        .surface_absent(owner, Box::new(surface_present))?;
+        .surface_absent(owner, Box::new(surface_present))
+        .context(ABSENCE_CONTEXT)?;
     #[cfg(windows)]
     let absent = {
-        let _ = (observation, owner);
-        !surface_present()?
+        let _ = observation;
+        !surface_present().context(ABSENCE_CONTEXT)?
     };
     if absent {
+        #[cfg(windows)]
+        if let Some(owner) = owner {
+            return Ok(TerminalCloseAuthority::AbsentConsoleWithGoneOwner(
+                owner.pid,
+            ));
+        }
         return Ok(TerminalCloseAuthority::Absent);
     }
     bail!(
@@ -662,7 +675,7 @@ pub(in crate::native) fn decide(
                         _ => return unowned(None),
                     };
                     let reason = match observation.console_owner(&owner) {
-                        ProcessObservation::Gone(_) => return unowned(None),
+                        ProcessObservation::Gone(_) => return unowned(Some(&owner)),
                         ProcessObservation::Unknown(reason) => reason,
                         ProcessObservation::Live(
                             crate::native::process_identity::Attested::PidOnly,
@@ -675,15 +688,17 @@ pub(in crate::native) fn decide(
                         {
                             "The recorded owner has conflicting platform identities".to_owned()
                         }
-                        ProcessObservation::Live(_) => match ownership_proof() {
-                            Ok(()) => return Ok(TerminalCloseAuthority::LiveOwner),
-                            Err(error) => {
-                                unowned(None)?;
-                                return Err(error);
-                            }
-                        },
+                        ProcessObservation::Live(_) => {
+                            ownership_proof()?;
+                            return Ok(TerminalCloseAuthority::LiveOwner);
+                        }
                     };
-                    unowned(None)?;
+                    session.verify_managed_session(expected_session_id)?;
+                    if surface_present().context(ABSENCE_CONTEXT)? {
+                        bail!(
+                            "The recorded Windows Console surface is still present, and the recorded owner cannot be verified: {reason}"
+                        );
+                    }
                     bail!("{reason}");
                 }
                 ownership_proof()?;
@@ -789,37 +804,46 @@ pub(in crate::native) fn close_windows_owned_surface_with(
     close_remaining(deadline)?;
     let authority = authority()?;
     close_remaining(deadline)?;
-    match authority {
-        TerminalCloseAuthority::Absent => {
-            if session.kind == terminal::TerminalKind::WindowsConsole {
-                adapters
-                    .adapter(session.kind)?
-                    .end_recorded_tab_host(directory, deadline)?;
-                close_remaining(deadline)?;
-            }
-            Ok(terminal::CloseOutcome::Missing.into())
-        }
+    let gone_owner: Option<u32> = match authority {
+        TerminalCloseAuthority::Absent => None,
+        #[cfg(windows)]
+        TerminalCloseAuthority::AbsentConsoleWithGoneOwner(pid) => Some(pid),
         TerminalCloseAuthority::CreatedSurface(evidence) => {
             let generated = evidence.generated_reason();
-            windows_dispatch::close_created_surface(
+            return windows_dispatch::close_created_surface(
                 adapters, directory, session, evidence, deadline,
             )
-            .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated))
+            .map(|outcome| terminal::CloseResult::keeping_diagnosis(outcome, generated));
         }
         // Retained adapter mapping. No current decision selects SurfaceOnly for Herdr.
         TerminalCloseAuthority::SurfaceOnly if owner_exit::core_retains_finished(session.kind) => {
-            windows_dispatch::close_created_surface(
+            return windows_dispatch::close_created_surface(
                 adapters,
                 directory,
                 session,
                 CreationEvidence::surface_only(),
                 deadline,
             )
-            .map(Into::into)
+            .map(Into::into);
         }
-        _ => windows_dispatch::close_session_until(adapters, directory, session, deadline)
-            .map(Into::into),
+        _ => {
+            return windows_dispatch::close_session_until(adapters, directory, session, deadline)
+                .map(Into::into);
+        }
+    };
+    if session.kind == terminal::TerminalKind::WindowsConsole {
+        adapters
+            .adapter(session.kind)?
+            .end_recorded_tab_host(directory, deadline)?;
+        close_remaining(deadline)?;
     }
+    Ok(match gone_owner {
+        Some(pid) => terminal::CloseResult::keeping_diagnosis(
+            terminal::CloseOutcome::Missing,
+            Some(crate::native::session::close::gone_owner_reason(pid)),
+        ),
+        None => terminal::CloseOutcome::Missing.into(),
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -996,9 +1020,7 @@ mod projected_authority_tests {
                         calls.extend(["owner", "owner-record"]);
                     }
                     calls.push("proof");
-                    if !proof_succeeds
-                        && (!cfg!(windows) || kind == terminal::TerminalKind::WindowsConsole)
-                    {
+                    if !proof_succeeds && !cfg!(windows) {
                         calls.push("presence");
                     }
                 }
@@ -1015,11 +1037,7 @@ mod projected_authority_tests {
                 } else {
                     assert_eq!(
                         result.unwrap_err().to_string(),
-                        if cfg!(windows) && kind == terminal::TerminalKind::WindowsConsole {
-                            "The recorded Windows Console surface is still present. End it, then run `tabcli close-session session-test --explicit` again."
-                        } else {
-                            "injected full ownership proof failure"
-                        }
+                        "injected full ownership proof failure"
                     );
                 }
             }
@@ -1315,11 +1333,45 @@ mod projected_authority_tests {
                     };
                     let label = format!("{kind:?} {record:?} {:?} {presence:?}", process());
                     match presence {
-                        None => assert_eq!(
-                            result.unwrap_err().root_cause().to_string(),
-                            "terminal inspection denied",
-                            "{label}"
-                        ),
+                        None => {
+                            let error = result.unwrap_err();
+                            assert_eq!(
+                                error.to_string(),
+                                "could not prove absence of the recorded terminal surface; no close was sent",
+                                "{label}"
+                            );
+                            assert_eq!(
+                                error.root_cause().to_string(),
+                                "terminal inspection denied",
+                                "{label}"
+                            );
+                        }
+                        #[cfg(windows)]
+                        Some(present)
+                            if matches!(process(), ProcessObservation::Unknown(_))
+                                || matches!(
+                                    record,
+                                    Record::PidOnly | Record::ConflictingNested
+                                ) =>
+                        {
+                            let reason = match record {
+                                Record::PidOnly => {
+                                    "The recorded owner PID 4242 is live, but its process identity was not recorded"
+                                }
+                                Record::ConflictingNested => {
+                                    "The recorded owner has conflicting platform identities"
+                                }
+                                _ => "owner inspection denied",
+                            };
+                            let expected = if present {
+                                format!(
+                                    "The recorded Windows Console surface is still present, and the recorded owner cannot be verified: {reason}"
+                                )
+                            } else {
+                                reason.to_owned()
+                            };
+                            assert_eq!(result.unwrap_err().to_string(), expected, "{label}");
+                        }
                         Some(true) => assert_eq!(
                             result.unwrap_err().to_string(),
                             format!(
@@ -1329,27 +1381,11 @@ mod projected_authority_tests {
                             "{label}"
                         ),
                         #[cfg(windows)]
-                        Some(false) if matches!(process(), ProcessObservation::Unknown(_)) => {
-                            assert_eq!(
-                                result.unwrap_err().to_string(),
-                                "owner inspection denied",
-                                "{label}"
-                            )
-                        }
-                        #[cfg(windows)]
-                        Some(false)
-                            if matches!(record, Record::PidOnly | Record::ConflictingNested) =>
-                        {
-                            assert_eq!(
-                                result.unwrap_err().to_string(),
-                                if matches!(record, Record::PidOnly) {
-                                    "The recorded owner PID 4242 is live, but its process identity was not recorded"
-                                } else {
-                                    "The recorded owner has conflicting platform identities"
-                                },
-                                "{label}"
-                            )
-                        }
+                        Some(false) if matches!(record, Record::Bound) => assert_eq!(
+                            result.unwrap(),
+                            TerminalCloseAuthority::AbsentConsoleWithGoneOwner(4242),
+                            "{label}"
+                        ),
                         Some(false) => {
                             assert_eq!(result.unwrap(), TerminalCloseAuthority::Absent, "{label}")
                         }

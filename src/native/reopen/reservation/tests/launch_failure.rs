@@ -156,62 +156,6 @@ impl Drop for OwnedChild {
     }
 }
 
-fn deny_process_synchronize(child: &Child) -> Vec<u8> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
-
-    // Only this test-owned child's new handles lose SYNCHRONIZE. Its existing Child
-    // handle still allows waiting, and EOF on its private stdin ends it without a kill.
-    let mut size = 0;
-    unsafe {
-        windows_sys::Win32::Security::GetKernelObjectSecurity(
-            child.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            0,
-            &mut size,
-        );
-    }
-    assert!(size > 0);
-    let mut original = vec![0u8; size as usize];
-    assert_ne!(
-        unsafe {
-            windows_sys::Win32::Security::GetKernelObjectSecurity(
-                child.as_raw_handle(),
-                DACL_SECURITY_INFORMATION,
-                original.as_mut_ptr().cast(),
-                size,
-                &mut size,
-            )
-        },
-        0
-    );
-    let sddl: Vec<u16> = "D:(A;;0x1000;;;WD)\0".encode_utf16().collect();
-    let mut descriptor = std::ptr::null_mut();
-    unsafe {
-        assert_ne!(
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                std::ptr::null_mut(),
-            ),
-            0,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-        let changed =
-            SetKernelObjectSecurity(child.as_raw_handle(), DACL_SECURITY_INFORMATION, descriptor);
-        let error = std::io::Error::last_os_error();
-        LocalFree(descriptor);
-        assert_ne!(changed, 0, "{error}");
-    }
-    original
-}
-
 fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
     terminal::launch_failure_test_support::inject(move |directory| {
         let store = Store::open_unchecked(directory);
@@ -265,7 +209,7 @@ fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
                         ProviderProcessObservation::Alive
                     ),
                     Fault::UnknownProcess => {
-                        child.1 = Some(deny_process_synchronize(&child.0));
+                        child.1 = Some(crate::native::session::test_support::lifecycle::deny_process_synchronize(&child.0));
                         assert_eq!(
                             terminal::windows_process_identity(record.pid).unwrap(),
                             record.windows_process_identity.clone().unwrap()

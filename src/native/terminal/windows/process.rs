@@ -16,6 +16,7 @@ pub(super) fn verify_control_process_identity(
     pid: u32,
     identity: &WindowsProcessIdentity,
 ) -> Result<bool> {
+    anyhow::ensure!(pid != 0, "invalid Windows console pid");
     let Some(live) = observe_process_identity(pid)? else {
         return Ok(false);
     };
@@ -27,6 +28,7 @@ pub(super) fn open_verified_control_process(
     pid: u32,
     identity: &WindowsProcessIdentity,
 ) -> Result<OwnedHandle> {
+    anyhow::ensure!(pid != 0, "invalid Windows console pid");
     let (handle, live) =
         open_observed_process(pid, 0)?.context(crate::native::console_control::MISSING_PROCESS)?;
     verify_identity_values(&live, identity.creation_time, &identity.executable_path)?;
@@ -142,7 +144,6 @@ pub(super) fn open_observed_process(
     pid: u32,
     additional_access: u32,
 ) -> Result<Option<(OwnedHandle, WindowsProcessIdentity)>> {
-    anyhow::ensure!(pid != 0, "invalid Windows console pid");
     let handle = unsafe {
         OpenProcess(
             additional_access | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
@@ -182,6 +183,11 @@ fn observe_process_identity_from_handle(
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    #[test]
+    fn observing_pid_zero_reports_no_process() {
+        assert!(observe_process_identity(0).unwrap().is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn retained_exited_process_is_unqueryable_and_observed_absent() {

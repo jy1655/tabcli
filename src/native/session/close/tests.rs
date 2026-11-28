@@ -1679,9 +1679,13 @@ fn windows_repair_refuses_a_claimed_foreign_surface_before_close() {
         budget::close_deadline(),
     )
     .unwrap_err();
-    assert!(
-        format!("{error:#}")
-            .contains("dead Windows native owner has a non-Windows terminal handle")
+    assert_eq!(
+        error.to_string(),
+        "failed to close a Windows console whose native owner exited"
+    );
+    assert_eq!(
+        error.root_cause().to_string(),
+        "dead Windows native owner has a non-Windows terminal handle"
     );
     assert_eq!(record.bytes().unwrap(), before);
     assert_eq!(store.status().unwrap().state, SessionState::Working);

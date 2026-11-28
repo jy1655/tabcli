@@ -86,8 +86,8 @@
   An authorized close ends the recorded host with a successful exit code, including when
   explicit close settles a retained console on proven root absence.
 - A separate console window can stay open while clients remain attached after the root exits.
-  In Windows Terminal, successful host exit closes the tab and ends clients still attached,
-  including the wrapper and provider.
+  In Windows Terminal, successful host exit closes the tab and ends attached clients,
+  including any wrapper or provider still attached.
 - An owned close ends the console processes it found when it attached. A process that the
   session starts while it is being closed can survive the close; this is unchanged and
   holds for both surfaces.

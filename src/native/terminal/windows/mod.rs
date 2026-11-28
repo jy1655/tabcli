@@ -1193,6 +1193,7 @@ fn terminate_by_identity(
     identity: &WindowsProcessIdentity,
     deadline: Instant,
 ) -> Result<()> {
+    anyhow::ensure!(pid != 0, "invalid Windows console pid");
     let Some((handle, live)) = process::open_observed_process(pid, PROCESS_TERMINATE)? else {
         return Ok(());
     };

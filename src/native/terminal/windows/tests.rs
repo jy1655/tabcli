@@ -774,6 +774,188 @@ fn absent_console_close_settles_only_after_cleaning_the_bound_tab_host() {
 }
 
 #[test]
+fn installed_console_owner_classifies_live_reused_ended_and_uninspectable_processes() {
+    use crate::native::{
+        process_identity::{Attested, Gone, ProcessObservation},
+        session::test_support::lifecycle::deny_process_synchronize,
+        terminal::{
+            close_authority::{CloseObservation, Production},
+            ownership::NativeSessionOwner,
+        },
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let session = super::TerminalSession::new(super::TerminalKind::WindowsConsole, "42".into());
+    let observation = Production::new(
+        directory.path(),
+        "session-test",
+        &session,
+        crate::native::session::close::budget::close_deadline(),
+    );
+    let pid = std::process::id();
+    let identity = query_process_identity(pid).unwrap();
+    let owner = |pid, identity| NativeSessionOwner {
+        managed_session_id: Some("session-test".into()),
+        pid,
+        windows_process_identity: identity,
+        ..Default::default()
+    };
+    let classify = |identity| observation.console_owner(&owner(pid, Some(identity)));
+    assert_eq!(
+        classify(identity.clone()),
+        ProcessObservation::Live(Attested::Incarnation)
+    );
+    let mut changed = identity.clone();
+    changed.creation_time += 1;
+    assert_eq!(
+        classify(changed),
+        ProcessObservation::Gone(Gone::Reused(format!("owner PID {pid} was reused")))
+    );
+    let mut changed = identity.clone();
+    changed.executable_path.push_str(".different");
+    assert_eq!(
+        classify(changed),
+        ProcessObservation::Unknown(
+            "The recorded Windows owner executable identity changed".into()
+        )
+    );
+    let mut incomplete = identity;
+    incomplete.executable_path.clear();
+    assert_eq!(
+        classify(incomplete),
+        ProcessObservation::Unknown(
+            "The recorded Windows owner has an incomplete process identity".into()
+        )
+    );
+
+    let (mut child, _pin) = private_console_process();
+    let recorded = owner(
+        child.id(),
+        Some(query_process_identity(child.id()).unwrap()),
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        observation.console_owner(&recorded),
+        ProcessObservation::Gone(Gone::Exited)
+    );
+
+    let (restricted, _pin) = private_console_process();
+    let pid = restricted.id();
+    let _original = deny_process_synchronize(&restricted);
+    // The Child handle was opened before the restriction and still reaps the private child.
+    let error = super::process::observe_process_identity(pid).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+    );
+    assert_eq!(
+        observation.console_owner(&owner(pid, None)),
+        ProcessObservation::Unknown(format!("{error:#}"))
+    );
+}
+
+#[test]
+fn explicit_close_of_a_retained_console_preserves_the_gone_owner_diagnosis() {
+    use crate::native::{
+        close::close_session_surface,
+        session::{
+            CoreRecord, SessionState, Store, close, owner::attest_owner,
+            test_support::lifecycle::write_owned_terminal_state,
+        },
+        terminal::{
+            close_authority::CloseCause,
+            ownership::{NativeSessionOwner, close_owned_surface},
+        },
+    };
+    let id = "session-retained";
+    for reused in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(id);
+        std::fs::create_dir(&path).unwrap();
+        let (mut root, _pin) = private_console_process();
+        write_owned_terminal_state(&path, "working", root.id());
+        let store = Store::open_unchecked(&path);
+        root.kill().unwrap();
+        root.wait().unwrap();
+        let (mut host, _pin) = private_console_process();
+        crate::native::session::RecordStore::at(&path.join("console-host-process.json"))
+            .write_json(&serde_json::json!({"schema":1,"pid":host.id(),"identity":query_process_identity(host.id()).unwrap()})).unwrap();
+        let pid = std::process::id();
+        let identity = query_process_identity(pid).unwrap();
+        let mut wrong_path = identity.clone();
+        wrong_path.executable_path.push_str(".different");
+        let mut owner = NativeSessionOwner {
+            pid,
+            managed_session_id: Some(id.into()),
+            windows_process_identity: Some(wrong_path),
+            ..Default::default()
+        };
+        store.write_owner(&owner).unwrap();
+        let deadline = close::budget::close_deadline;
+        let before = store.record(CoreRecord::Terminal).bytes().unwrap();
+        let refused =
+            close_session_surface(&path, id, None, CloseCause::Explicit, deadline()).unwrap_err();
+        assert_eq!(
+            refused.root_cause().to_string(),
+            "The recorded Windows owner executable identity changed"
+        );
+        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), before);
+        assert!(host.try_wait().unwrap().is_none());
+
+        let reason = if reused {
+            let mut old = identity;
+            old.creation_time += 1;
+            owner.windows_process_identity = Some(old);
+            "existing session diagnosis".to_owned()
+        } else {
+            owner.pid = root.id();
+            owner.windows_process_identity = store.terminal().unwrap().windows_identity().cloned();
+            format!("native session process {} is no longer running", owner.pid)
+        };
+        store.write_owner(&owner).unwrap();
+        if reused {
+            let mut status = store.status().unwrap();
+            status.error = Some(reason.clone());
+            store.write_status(&status).unwrap();
+        }
+        let mut calls = 0;
+        let budget = deadline();
+        let result = close::close_for_cause(
+            &store,
+            None,
+            CloseCause::Explicit,
+            budget,
+            attest_owner,
+            |handle| {
+                calls += 1;
+                assert!(
+                    host.try_wait().unwrap().is_none(),
+                    "pre-close Repair ended the host"
+                );
+                close_owned_surface(&path, id, handle, CloseCause::Explicit, budget)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1, "pre-close Repair must retain the active console");
+        assert_eq!(result, super::CloseOutcome::Missing);
+        assert_eq!(host.try_wait().unwrap().and_then(|s| s.code()), Some(0));
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        assert_eq!(
+            store.closed_if_present().unwrap().unwrap().error,
+            Some(reason.clone())
+        );
+        close_session_surface(&path, id, None, CloseCause::Explicit, deadline()).unwrap();
+        assert_eq!(
+            store.closed_if_present().unwrap().unwrap().error,
+            Some(reason)
+        );
+    }
+}
+
+#[test]
 fn console_newline_modes_preserve_text_and_plain_submission_records() {
     use super::ConsoleNewline;
     use windows_sys::Win32::System::Console::{KEY_EVENT, SHIFT_PRESSED};

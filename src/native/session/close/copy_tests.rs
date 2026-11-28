@@ -447,7 +447,7 @@ fn restored_copy_supersedes_the_unlocked_dead_owner_verdict() {
 }
 
 #[test]
-fn nested_windows_repair_rechecks_a_restored_copy_before_dispatch() {
+fn windows_repair_leaves_the_restored_copy_open() {
     use crate::native::session::primitives::close_io_test::{self, Point};
     for restore in [false, true] {
         let (_root, store) = fixture(SessionState::Working);

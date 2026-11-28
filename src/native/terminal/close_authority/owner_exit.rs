@@ -115,7 +115,7 @@ impl CreationEvidence {
     /// session's owner, as 0.4.49's Repair wrote it.
     pub(in crate::native::terminal) fn generated_reason(&self) -> Option<String> {
         self.gone_owner
-            .map(|pid| format!("native session process {pid} is no longer running"))
+            .map(crate::native::session::close::gone_owner_reason)
     }
 
     /// Why a live owner of this session could not be verified, when the owner record or its

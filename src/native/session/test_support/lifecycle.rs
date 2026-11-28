@@ -16,6 +16,64 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
+pub(in crate::native) fn deny_process_synchronize(child: &std::process::Child) -> Vec<u8> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
+
+    // Only this test-owned child's new handles lose SYNCHRONIZE. Its existing Child
+    // handle still allows waiting, and EOF on its private stdin ends it without a kill.
+    let mut size = 0;
+    unsafe {
+        windows_sys::Win32::Security::GetKernelObjectSecurity(
+            child.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut size,
+        );
+    }
+    assert!(size > 0);
+    let mut original = vec![0u8; size as usize];
+    assert_ne!(
+        unsafe {
+            windows_sys::Win32::Security::GetKernelObjectSecurity(
+                child.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                original.as_mut_ptr().cast(),
+                size,
+                &mut size,
+            )
+        },
+        0
+    );
+    let sddl: Vec<u16> = "D:(A;;0x1000;;;WD)\0".encode_utf16().collect();
+    let mut descriptor = std::ptr::null_mut();
+    unsafe {
+        assert_ne!(
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            ),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let changed =
+            SetKernelObjectSecurity(child.as_raw_handle(), DACL_SECURITY_INFORMATION, descriptor);
+        let error = std::io::Error::last_os_error();
+        LocalFree(descriptor);
+        assert_ne!(changed, 0, "{error}");
+    }
+    original
+}
+
+#[cfg(windows)]
 pub(in crate::native) fn test_windows_process_identity(
     pid: u32,
 ) -> Option<terminal::WindowsProcessIdentity> {

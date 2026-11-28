@@ -378,6 +378,10 @@ impl Reader {
     }
 }
 
+pub(in crate::native) fn gone_owner_reason(pid: u32) -> String {
+    format!("native session process {pid} is no longer running")
+}
+
 #[cfg(test)]
 pub(in crate::native) fn close(
     store: &Store,
@@ -1561,7 +1565,7 @@ fn repair_owner_from(
     let mut repair_error = status
         .error
         .clone()
-        .unwrap_or_else(|| format!("native session process {} is no longer running", owner.pid));
+        .unwrap_or_else(|| gone_owner_reason(owner.pid));
     if let Some(damage) = &recovery_damage {
         repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
     }
@@ -1629,7 +1633,8 @@ fn repair_owner_from(
                 bail!("dead Windows native owner has a non-Windows terminal handle")
             },
             deadline,
-        );
+        )
+        .context("failed to close a Windows console whose native owner exited");
     }
     mark_session_closed_locked(store, marker, claim.path(), repair_error)?;
     Ok(true)

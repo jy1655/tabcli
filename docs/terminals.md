@@ -555,7 +555,7 @@ Windows Repair retains an active managed console whose owner has gone and settle
 or failed session from its records. Without a verified owner, explicit close of a retained console requires proof that
 its root process has ended. A live or uninspectable owner bound to the session without verified
 ownership prevents tab-host cleanup and settlement. TAB cannot close an active console with an
-invalid root PID or unusable root identity. End the console manually.
+invalid root PID or unusable root identity. The session stays open even after you end the console manually.
 Missing or unreadable evidence can stop repair. Run
 `sessions` to attempt repair. Use `inspect`, timeline, `result`, `search`, or `doctor` when you want
 to read the records without changing them.
