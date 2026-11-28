@@ -3,7 +3,7 @@
 use super::*;
 use crate::native::session::owner::attest_owner;
 use crate::native::terminal::{self, close_authority, windows_dispatch};
-use close_authority::windows_herdr::PinnedProcess;
+use close_authority::windows_herdr::{PinnedProcess, ProcessPin};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Command, Stdio},
@@ -80,19 +80,32 @@ fn absent_herdr_stops_the_recorded_provider_and_wrapper_leaving_the_grandchild()
     let provider_identity = terminal::windows_process_identity(provider_pid).unwrap();
     let mut stale = provider_identity.clone();
     stale.creation_time ^= 1;
-    assert!(terminal::windows::pin_teardown_process(provider_pid, &stale).is_err());
+    assert!(matches!(
+        terminal::windows::pin_teardown_process(provider_pid, &stale).unwrap(),
+        ProcessPin::Reused
+    ));
     stale = provider_identity.clone();
     stale.executable_path.push_str(".other");
-    assert!(terminal::windows::pin_teardown_process(provider_pid, &stale).is_err());
-    let provider = terminal::windows::pin_teardown_process(provider_pid, &provider_identity)
-        .unwrap()
-        .unwrap();
-    let grandchild = terminal::windows::pin_teardown_process(
+    assert_eq!(
+        terminal::windows::pin_teardown_process(provider_pid, &stale)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "recorded Windows process {provider_pid} has a different executable at the same creation time"
+        )
+    );
+    let ProcessPin::Live(provider) =
+        terminal::windows::pin_teardown_process(provider_pid, &provider_identity).unwrap()
+    else {
+        panic!("the fixture provider must be live");
+    };
+    let ProcessPin::Live(grandchild) = terminal::windows::pin_teardown_process(
         tree["grandchild"],
         &terminal::windows_process_identity(tree["grandchild"]).unwrap(),
     )
-    .unwrap()
-    .unwrap();
+    .unwrap() else {
+        panic!("the fixture grandchild must be live");
+    };
     let owner = NativeSessionOwner {
         pid: wrapper_pid,
         windows_process_identity: Some(terminal::windows_process_identity(wrapper_pid).unwrap()),
@@ -147,6 +160,7 @@ fn absent_herdr_stops_the_recorded_provider_and_wrapper_leaving_the_grandchild()
     )
     .unwrap();
     fixture.assert_closed("live owner, absent terminal");
+    assert_eq!(fixture.store().closed_if_present().unwrap().unwrap().error.as_deref(), Some(format!("Herdr terminal absent; recorded provider PID {provider_pid} was already ended by TAB; recorded wrapper PID {wrapper_pid} was ended by TAB").as_str()));
     assert!(provider.exited().unwrap());
     assert!(wrapper.try_wait().unwrap().is_some());
     assert!(!grandchild.exited().unwrap());

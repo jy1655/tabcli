@@ -61,16 +61,19 @@ impl Fixture {
             present,
             |pid, recorded| {
                 self.calls.borrow_mut().push((pid, "pin"));
+                if recorded.creation_time != identity(pid).creation_time {
+                    return Ok(ProcessPin::Reused);
+                }
                 ensure!(
-                    recorded == &identity(pid),
-                    "recorded birth or image differs"
+                    recorded.executable_path == identity(pid).executable_path,
+                    "recorded Windows process {pid} has a different executable at the same creation time"
                 );
                 match (pid, self.failure.get()) {
                     (WRAPPER, "wrapper denied") | (PROVIDER, "provider denied") => {
                         bail!("access denied")
                     }
-                    (PROVIDER, _) if self.provider_exited.get() => Ok(None),
-                    _ => Ok(Some(Process { pid, fixture: self })),
+                    (PROVIDER, _) if self.provider_exited.get() => Ok(ProcessPin::Exited),
+                    _ => Ok(ProcessPin::Live(Process { pid, fixture: self })),
                 }
             },
             self.deadline,
@@ -108,6 +111,7 @@ impl PinnedProcess for Process<'_> {
         match (self.pid, self.fixture.failure.get()) {
             (WRAPPER, "wrapper stop") | (PROVIDER, "provider stop") => bail!("stop denied"),
             (WRAPPER, "wrapper confirmation") => bail!("confirmation failed"),
+            (WRAPPER, "expire after wrapper") => self.fixture.now.set(self.fixture.deadline),
             (PROVIDER, "expire") => self.fixture.now.set(self.fixture.deadline),
             _ => {}
         }
@@ -150,13 +154,18 @@ fn both_pins_precede_either_stop_and_wrapper_failure_reports_the_confirmed_provi
 }
 
 #[test]
-fn absent_unreadable_foreign_changed_or_unpinnable_provider_ends_only_the_wrapper() {
+fn missing_unreadable_foreign_or_changed_provider_record_ends_only_the_wrapper() {
     for case in [
         "absent",
         "unreadable",
         "foreign",
-        "mismatch",
-        "provider denied",
+        "reused",
+        "incomplete birth",
+        "incomplete image",
+        "no identity",
+        "invalid pid",
+        "wrapper pid",
+        "unsupported schema",
         "changed",
     ] {
         let fixture = Fixture::new();
@@ -165,16 +174,22 @@ fn absent_unreadable_foreign_changed_or_unpinnable_provider_ends_only_the_wrappe
         match case {
             "absent" => std::fs::remove_file(file.path()).unwrap(),
             "unreadable" => std::fs::write(file.path(), [0xff]).unwrap(),
-            "foreign" => {
-                record.managed_session_id = "session-other".into();
+            _ => {
+                let windows_identity = record.windows_process_identity.as_mut().unwrap();
+                match case {
+                    "foreign" => record.managed_session_id = "session-other".into(),
+                    "reused" => windows_identity.creation_time += 1,
+                    "incomplete birth" => windows_identity.creation_time = 0,
+                    "incomplete image" => windows_identity.executable_path.clear(),
+                    "no identity" => record.windows_process_identity = None,
+                    "invalid pid" => record.pid = 0,
+                    "wrapper pid" => record.pid = WRAPPER,
+                    "unsupported schema" => record.schema = 9,
+                    "changed" => {}
+                    _ => unreachable!(),
+                }
                 fixture.store.write_provider_process(&record).unwrap();
             }
-            "mismatch" => {
-                record.windows_process_identity = Some(identity(77));
-                fixture.store.write_provider_process(&record).unwrap();
-            }
-            "provider denied" => fixture.failure.set(case),
-            _ => {}
         }
         let result = fixture
             .close(|| {
@@ -185,19 +200,117 @@ fn absent_unreadable_foreign_changed_or_unpinnable_provider_ends_only_the_wrappe
                 Ok(false)
             })
             .unwrap();
-        assert!(
-            result
-                .reason
-                .unwrap()
-                .starts_with("Herdr terminal absent; no provider process was ended by TAB: ")
+        let record_error;
+        let cause = match case {
+            "incomplete birth" | "incomplete image" => {
+                "the recorded provider has an incomplete Windows identity"
+            }
+            "no identity" => "the recorded provider has no Windows identity",
+            "invalid pid" | "wrapper pid" => {
+                "the provider process record has an invalid provider PID"
+            }
+            "changed" => "the recorded provider identity changed",
+            "foreign" | "unsupported schema" => {
+                "the provider process record is unsupported or belongs to another session"
+            }
+            "absent" => "the provider process record is missing",
+            "unreadable" => {
+                record_error = format!(
+                    "{:#}",
+                    fixture.store.provider_process_if_present().unwrap_err()
+                );
+                &record_error
+            }
+            "reused" => "",
+            _ => unreachable!(),
+        };
+        let skip_reason = if case == "reused" {
+            "recorded provider PID 42 was reused; no provider process was ended by TAB".to_owned()
+        } else {
+            format!("no provider process was ended by TAB: {cause}")
+        };
+        assert_eq!(
+            result.reason.unwrap(),
+            format!(
+                "Herdr terminal absent; {skip_reason}; recorded wrapper PID 41 was ended by TAB"
+            )
         );
         let mut expected = vec![(WRAPPER, "pin")];
-        if matches!(case, "mismatch" | "provider denied" | "changed") {
+        if matches!(case, "reused" | "changed") {
             expected.push((PROVIDER, "pin"));
         }
         expected.push((WRAPPER, "stop"));
         assert_eq!(*fixture.calls.borrow(), expected, "{case}");
     }
+}
+
+#[test]
+fn a_recorded_provider_inspection_failure_retains_the_handle_and_stops_neither_process() {
+    for cause in [
+        "access denied",
+        "recorded Windows process 42 has a different executable at the same creation time",
+    ] {
+        let fixture = Fixture::new();
+        if cause == "access denied" {
+            fixture.failure.set("provider denied");
+        } else {
+            let mut record = provider_record();
+            record
+                .windows_process_identity
+                .as_mut()
+                .unwrap()
+                .executable_path
+                .push_str(".other");
+            fixture.store.write_provider_process(&record).unwrap();
+        }
+        let error = fixture.close(|| Ok(false)).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("could not verify recorded provider PID 42; the handle is retained: {cause}")
+        );
+        assert_eq!(
+            *fixture.calls.borrow(),
+            [(WRAPPER, "pin"), (PROVIDER, "pin")]
+        );
+    }
+}
+
+#[test]
+fn a_wrapper_pin_failure_names_the_wrapper_and_retains_the_handle() {
+    let fixture = Fixture::new();
+    fixture.failure.set("wrapper denied");
+    let error = fixture.close(|| Ok(false)).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "could not verify recorded wrapper PID 41; the handle is retained: access denied"
+    );
+    assert_eq!(*fixture.calls.borrow(), [(WRAPPER, "pin")]);
+}
+
+#[test]
+fn expiry_after_both_stops_reports_the_confirmed_provider_and_wrapper() {
+    let fixture = Fixture::new();
+    fixture.failure.set("expire after wrapper");
+    let error = fixture.close(|| Ok(false)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Herdr terminal absent; recorded provider PID 42 was already ended by TAB; recorded wrapper PID 41 was ended by TAB; the handle is retained"
+    );
+    assert_eq!(
+        error.root_cause().to_string(),
+        budget::close_remaining(fixture.deadline)
+            .unwrap_err()
+            .to_string()
+    );
+    assert_eq!(
+        *fixture.calls.borrow(),
+        [
+            (WRAPPER, "pin"),
+            (PROVIDER, "pin"),
+            (PROVIDER, "stop"),
+            (WRAPPER, "stop")
+        ]
+    );
 }
 
 #[test]
@@ -249,7 +362,14 @@ fn partial_windows_close_restores_the_handle_and_retry_skips_the_exited_provider
         },
         terminal::{TerminalKind, TerminalSession},
     };
-    for failure in ["wrapper stop", "wrapper confirmation", "expire"] {
+    for failure in [
+        "provider denied",
+        "wrapper stop",
+        "wrapper confirmation",
+        "expire",
+        "expire after wrapper",
+        "expire after adapter",
+    ] {
         let fixture = Fixture::new();
         let store = &fixture.store;
         session::test_support::lifecycle::write_owned_terminal_state(
@@ -276,25 +396,43 @@ fn partial_windows_close_restores_the_handle_and_retry_skips_the_exited_provider
                     control: ControlAttestation::NotRecorded,
                     pid_alive: Some(true),
                 },
-                |_| fixture.close(|| Ok(false)),
+                |_| {
+                    let result = fixture.close(|| Ok(false))?;
+                    if fixture.failure.get() == "expire after adapter" {
+                        fixture.now.set(fixture.deadline);
+                    }
+                    Ok(result)
+                },
             )
         };
         fixture.failure.set(failure);
         let error = run().unwrap_err();
         assert_eq!(
             error.to_string(),
-            "recorded provider PID 42 was already ended by TAB; could not confirm exit of recorded wrapper PID 41; the handle is retained"
+            match failure {
+                "provider denied" =>
+                    "could not verify recorded provider PID 42; the handle is retained",
+                "expire after wrapper" | "expire after adapter" =>
+                    "Herdr terminal absent; recorded provider PID 42 was already ended by TAB; recorded wrapper PID 41 was ended by TAB; the handle is retained",
+                _ =>
+                    "recorded provider PID 42 was already ended by TAB; could not confirm exit of recorded wrapper PID 41; the handle is retained",
+            }
         );
         assert_eq!(handle.bytes().unwrap().unwrap(), initial);
         assert!(!store.record(CoreRecord::TerminalClosed).present().unwrap());
+        if matches!(failure, "expire after wrapper" | "expire after adapter") {
+            continue; // The wrapper is gone. A real retry must acquire fresh owner authority.
+        }
         fixture.failure.set("");
         fixture.now.set(fixture.deadline - Duration::from_secs(10));
         fixture.calls.borrow_mut().clear();
         assert_eq!(run().unwrap(), CloseOutcome::Missing);
-        assert_eq!(
-            *fixture.calls.borrow(),
-            [(WRAPPER, "pin"), (PROVIDER, "pin"), (WRAPPER, "stop")]
-        );
+        let mut expected = vec![(WRAPPER, "pin"), (PROVIDER, "pin")];
+        if failure == "provider denied" {
+            expected.push((PROVIDER, "stop"));
+        }
+        expected.push((WRAPPER, "stop"));
+        assert_eq!(*fixture.calls.borrow(), expected);
         assert!(store.terminal_closed().unwrap().consumed);
     }
 }

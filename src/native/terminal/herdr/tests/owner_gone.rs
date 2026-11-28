@@ -2358,6 +2358,41 @@ fn live_herdr_owner_requires_teardown_only_on_proven_absence() {
     }
 }
 
+#[test]
+fn cleanup_of_an_absent_live_herdr_terminal_never_selects_windows_teardown() {
+    use crate::native::terminal::{close_authority, windows_dispatch};
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.remove();
+    let surface = fixture.store().terminal().unwrap();
+    let dispatch = windows_dispatch::Dispatch::new(
+        Adapter::with_core(fixture.console.clone()),
+        Adapter::with_core(fixture.core.clone()),
+    );
+    let proof = || windows_dispatch::verify_surface(&dispatch, &surface, None);
+    let presence = || panic!("cleanup cannot request presence for teardown");
+    let error =
+        close_authority::windows_live_herdr_teardown(proof(), CloseCause::Cleanup, presence)
+            .unwrap_err();
+    assert_eq!(error.to_string(), "Herdr terminal t7 no longer exists");
+    #[cfg(windows)]
+    {
+        let deadline = later();
+        let observation = close_authority::test_support::TestObservation::on_records(
+            &fixture.directory,
+            SESSION,
+            &surface,
+            deadline,
+        )
+        .with_owner_record(|_| live_other())
+        .with_cause(CloseCause::Cleanup)
+        .with_proof(proof)
+        .with_presence(presence);
+        let error = close_authority::decide(&observation, SESSION, &surface, deadline).unwrap_err();
+        assert_eq!(error.to_string(), "Herdr terminal t7 no longer exists");
+    }
+    assert_eq!(fixture.mutations(), (0, 0));
+}
+
 // The attestation reads the owner's birth, then its control identity.
 // When the birth matched but the control read finds no process at the PID, the owner exited
 // during attestation: the decision takes the creation record (with the diagnosis), instead of

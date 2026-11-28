@@ -11,6 +11,7 @@ use windows_sys::Win32::{
 };
 
 use super::WindowsProcessIdentity;
+use crate::native::terminal::close_authority::windows_herdr::ProcessPin;
 
 pub(super) fn verify_control_process_identity(
     pid: u32,
@@ -183,20 +184,32 @@ fn observe_process_identity_from_handle(
 pub(in crate::native::terminal) fn pin_teardown_process(
     pid: u32,
     identity: &WindowsProcessIdentity,
-) -> Result<Option<OwnedHandle>> {
+) -> Result<ProcessPin<OwnedHandle>> {
     anyhow::ensure!(
         identity.creation_time != 0 && !identity.executable_path.is_empty(),
         "incomplete recorded Windows process identity"
     );
     let Some((handle, live)) = open_observed_process(pid, PROCESS_TERMINATE)? else {
-        return Ok(None);
+        return Ok(ProcessPin::Exited);
     };
+    let live_pid = unsafe { GetProcessId(handle.as_raw_handle()) };
+    if live_pid == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not read the pinned Windows process PID");
+    }
     anyhow::ensure!(
-        unsafe { GetProcessId(handle.as_raw_handle()) } == pid,
-        "Windows process handle has a different PID"
+        live_pid == pid,
+        "recorded Windows process {pid} pinned a handle for PID {live_pid}"
     );
-    verify_identity_values(&live, identity.creation_time, &identity.executable_path)?;
-    Ok(Some(handle))
+    if live.creation_time != identity.creation_time {
+        return Ok(ProcessPin::Reused);
+    }
+    anyhow::ensure!(
+        live.executable_path
+            .eq_ignore_ascii_case(&identity.executable_path),
+        "recorded Windows process {pid} has a different executable at the same creation time"
+    );
+    Ok(ProcessPin::Live(handle))
 }
 
 impl crate::native::terminal::close_authority::windows_herdr::PinnedProcess for OwnedHandle {

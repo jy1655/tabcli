@@ -773,8 +773,11 @@ core-retained terminal see [Herdr close](agents/herdr.md#close-by-creation-recor
 Windows Repair retains an active managed console for explicit Close and settles an exited
 or failed session from its Records. When the Herdr core proves the terminal absent, explicit Close
 on macOS and Linux ends the live attested owner's foreground process group and settles the session.
-On Windows, Close ends the recorded provider if its identity can be pinned, then ends the pinned
-wrapper and confirms its exit before settling the session ([#421](https://github.com/jy1655/tabcli/issues/421)).
+On Windows, Close ends the recorded provider and then the wrapper and settles after confirming
+their exits. If a validly recorded provider could still be live and cannot be inspected, Close
+retains the handle and ends neither process. Windows has no foreground process group, and TAB
+places the interactive provider in no job object, so descendants can survive
+([#461](https://github.com/jy1655/tabcli/issues/461)).
 An owned Windows console close can settle after root exit while the wrapper survives
 ([#460](https://github.com/jy1655/tabcli/issues/460)).
 

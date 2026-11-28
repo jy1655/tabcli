@@ -4,8 +4,15 @@ use crate::native::{
     session::{Reader, close::budget::close_remaining},
     terminal::{CloseOutcome, CloseResult, WindowsProcessIdentity},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::time::Instant;
+
+#[derive(Debug)]
+pub(in crate::native::terminal) enum ProcessPin<H> {
+    Live(H),
+    Exited,
+    Reused,
+}
 
 /// Both operations use the kernel handle that proved the recorded incarnation.
 pub(in crate::native::terminal) trait PinnedProcess {
@@ -29,6 +36,10 @@ fn provider(reader: &Reader, session: &str, wrapper: u32) -> Result<(u32, Window
     let identity = record
         .windows_process_identity
         .context("the recorded provider has no Windows identity")?;
+    ensure!(
+        identity.creation_time != 0 && !identity.executable_path.is_empty(),
+        "the recorded provider has an incomplete Windows identity"
+    );
     Ok((record.pid, identity))
 }
 
@@ -36,7 +47,7 @@ pub(super) fn teardown<H: PinnedProcess>(
     reader: &Reader,
     owner: &NativeSessionOwner,
     present: impl FnOnce() -> Result<bool>,
-    mut pin: impl FnMut(u32, &WindowsProcessIdentity) -> Result<Option<H>>,
+    mut pin: impl FnMut(u32, &WindowsProcessIdentity) -> Result<ProcessPin<H>>,
     deadline: Instant,
 ) -> Result<CloseResult> {
     close_remaining(deadline)?;
@@ -49,13 +60,28 @@ pub(super) fn teardown<H: PinnedProcess>(
         .windows_process_identity
         .as_ref()
         .context("missing Herdr owner identity")?;
-    let wrapper = pin(pid, identity)?
-        .with_context(|| format!("recorded wrapper PID {pid} has exited; retry close"))?;
-    let selected = provider(reader, session, pid).and_then(|(pid, identity)| {
-        let process = pin(pid, &identity)
-            .with_context(|| format!("could not verify recorded provider PID {pid}"))?;
-        Ok((pid, process, identity))
-    });
+    let wrapper = match pin(pid, identity).with_context(|| {
+        format!("could not verify recorded wrapper PID {pid}; the handle is retained")
+    })? {
+        ProcessPin::Live(handle) => handle,
+        ProcessPin::Exited => {
+            bail!("recorded wrapper PID {pid} has exited; the handle is retained; retry close")
+        }
+        ProcessPin::Reused => {
+            bail!("recorded wrapper PID {pid} was reused; the handle is retained; retry close")
+        }
+    };
+    let selected = match provider(reader, session, pid) {
+        Ok((provider_pid, identity)) => {
+            let process = pin(provider_pid, &identity).with_context(|| {
+                format!(
+                    "could not verify recorded provider PID {provider_pid}; the handle is retained"
+                )
+            })?;
+            Ok((provider_pid, process, identity))
+        }
+        Err(record_error) => Err(record_error),
+    };
 
     // The caller holds the session lifecycle lock across both pins and the last evidence read.
     ensure!(
@@ -79,10 +105,16 @@ pub(super) fn teardown<H: PinnedProcess>(
     });
     close_remaining(deadline)?;
     let provider_outcome = match verified {
-        Ok((provider_pid, process)) => {
-            let stopped = process.as_ref().map(|process| process.stop(deadline)).transpose()
+        Ok((provider_pid, ProcessPin::Reused)) => format!(
+            "recorded provider PID {provider_pid} was reused; no provider process was ended by TAB"
+        ),
+        Ok((provider_pid, ProcessPin::Exited)) => {
+            format!("recorded provider PID {provider_pid} had already exited")
+        }
+        Ok((provider_pid, ProcessPin::Live(process))) => {
+            let stopped = process.stop(deadline)
                 .with_context(|| format!("could not confirm exit of recorded provider PID {provider_pid}; the handle is retained"))?;
-            if stopped == Some(true) {
+            if stopped {
                 format!("recorded provider PID {provider_pid} was already ended by TAB")
             } else {
                 format!("recorded provider PID {provider_pid} had already exited")
@@ -97,10 +129,12 @@ pub(super) fn teardown<H: PinnedProcess>(
     } else {
         "had already exited"
     };
+    let reason = format!(
+        "Herdr terminal absent; {provider_outcome}; recorded wrapper PID {pid} {wrapper_outcome}"
+    );
+    close_remaining(deadline).with_context(|| format!("{reason}; the handle is retained"))?;
     Ok(CloseResult {
-        reason: Some(format!(
-            "Herdr terminal absent; {provider_outcome}; recorded wrapper PID {pid} {wrapper_outcome}"
-        )),
+        reason: Some(reason),
         ..CloseOutcome::Missing.into()
     })
 }

@@ -693,7 +693,16 @@ fn close_native_locked(
     let result = match crate::native::session::close::budget::close_remaining(deadline)
         .and_then(|_| close_terminal(&terminal))
         .and_then(|result| {
-            crate::native::session::close::budget::close_remaining(deadline)?;
+            let remaining = budget::close_remaining(deadline);
+            // Windows Herdr has no teardown intent to replay the confirmed stops.
+            #[cfg(windows)]
+            let remaining = remaining.map_err(|expired| match &result.reason {
+                Some(reason) if terminal.kind == terminal::TerminalKind::Herdr => {
+                    expired.context(format!("{reason}; the handle is retained"))
+                }
+                _ => expired,
+            });
+            remaining?;
             Ok(result)
         }) {
         Ok(result) => result,
