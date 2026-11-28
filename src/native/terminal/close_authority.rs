@@ -41,11 +41,15 @@ use std::{path::Path, time::Instant};
 pub(in crate::native) mod owner_exit;
 #[cfg(test)]
 pub(in crate::native) mod test_support;
+#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+pub(in crate::native::terminal) mod windows_herdr;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::native) enum TerminalCloseAuthority {
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     LiveOwner,
+    #[cfg(windows)]
+    WindowsHerdrTeardown(Box<NativeSessionOwner>),
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     OwnerTeardown,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -445,6 +449,19 @@ fn unowned_close(
     )
 }
 
+#[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+pub(in crate::native::terminal) fn windows_live_herdr_teardown(
+    proof: Result<()>,
+    cause: CloseCause,
+    present: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    match proof {
+        Ok(()) => Ok(false),
+        Err(_) if cause == CloseCause::Explicit && matches!(present(), Ok(false)) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 // The decision. Its Record reads and their order are part of its contract: teardown
 // intent first, owner presence by text, the launch record before the failed-start tests,
 // then status and owner in that branch, resumability as a fresh call, the owner again
@@ -702,6 +719,21 @@ pub(in crate::native) fn decide(
                     }
                     bail!("{reason}");
                 }
+                if let Some((owner, _)) = core_kept_owner
+                    && session.kind == terminal::TerminalKind::Herdr
+                {
+                    return Ok(
+                        if windows_live_herdr_teardown(
+                            ownership_proof(),
+                            observation.cause(),
+                            surface_present,
+                        )? {
+                            TerminalCloseAuthority::WindowsHerdrTeardown(Box::new(owner))
+                        } else {
+                            TerminalCloseAuthority::LiveOwner
+                        },
+                    );
+                }
                 ownership_proof()?;
                 return Ok(TerminalCloseAuthority::LiveOwner);
             }
@@ -809,6 +841,23 @@ pub(in crate::native) fn close_windows_owned_surface_with(
         TerminalCloseAuthority::Absent => None,
         #[cfg(windows)]
         TerminalCloseAuthority::AbsentConsoleWithGoneOwner(pid) => Some(pid),
+        #[cfg(windows)]
+        TerminalCloseAuthority::WindowsHerdrTeardown(owner) => {
+            return windows_herdr::teardown(
+                &Reader::open_unchecked(directory),
+                &owner,
+                || {
+                    windows_dispatch::surface_present(
+                        adapters,
+                        directory,
+                        session,
+                        close_remaining(deadline)?,
+                    )
+                },
+                terminal::windows::pin_teardown_process,
+                deadline,
+            );
+        }
         TerminalCloseAuthority::CreatedSurface(evidence) => {
             let generated = evidence.generated_reason();
             return windows_dispatch::close_created_surface(
@@ -1396,6 +1445,32 @@ mod projected_authority_tests {
                 }
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_console_live_owner_keeps_owned_close_even_when_its_root_is_gone() {
+        let surface = TerminalSession::new(terminal::TerminalKind::WindowsConsole, "73".into())
+            .with_binding(Some("session-test".into()));
+        let observation = TestObservation::from_values(RecordValues {
+            owner: owner_record(Record::Bound),
+            state: SessionState::Ready,
+            launch: None,
+        })
+        .with_owner_record(|_| attestation(|| ProcessObservation::Live(Attested::Incarnation)))
+        .with_proof(|| Ok(()))
+        .with_presence(|| Ok(false));
+        assert_eq!(
+            observation
+                .decide(
+                    "session-test",
+                    &surface,
+                    crate::native::session::close::budget::close_deadline()
+                )
+                .unwrap(),
+            TerminalCloseAuthority::LiveOwner
+        );
+        assert!(!observation.calls().contains(&"presence"));
     }
 
     #[test]

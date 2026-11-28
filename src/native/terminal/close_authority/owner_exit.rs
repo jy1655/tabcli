@@ -157,7 +157,7 @@ pub(super) enum CoreKept {
 ///
 /// The owner record answers exactly one question: is there an attested live incarnation of this
 /// session's own owner, from a record whose fields do not contradict each other (no other
-/// platform's incarnation fields)? If so, the close with a live owner applies, unchanged. In
+/// platform's incarnation fields)? If so, the close with a live owner applies. In
 /// every other case the close on the creation record applies, which never ends a running
 /// terminal: a record that cannot be read, none, one that cannot be decoded, another session's
 /// or an unbound one (whose process is not inspected), a contradictory one, a process that

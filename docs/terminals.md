@@ -217,6 +217,12 @@ If the original program ends outside TAB with keep off, run
 finished terminal and closes the session record. If the core cannot be reached, the session
 keeps its handle and a later close finishes it.
 
+If the recorded core reports the local terminal address absent while the owner is still live,
+explicit close on macOS and Linux can end the attested owner's foreground process group.
+On Windows, TAB can end the session's recorded provider process and wrapper after verifying
+their identities. Windows has no foreground process group and TAB places the interactive
+provider in no job object, so descendants can keep running, including a provider behind a shim.
+
 If TAB cannot verify a live owner and refuses to close a running terminal, wait for it to
 finish or end it on the recorded core, then run `tabcli close-session <session> --explicit`.
 Before ending it yourself, run `tabcli doctor <session> --probe` and check with `hc get
