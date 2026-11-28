@@ -17,15 +17,19 @@
 //! creation-record rule applies.
 //!
 //! Other kinds keep their platform's rule: macOS and Linux Repair retain a handle that can
-//! outlive the owner, and a close intent; Windows Repair closes the managed console of an
-//! active session through its root identity and settles an ended one from its Records.
-use super::super::{self as terminal, CloseOutcome, TerminalKind, TerminalSession};
+//! outlive the owner, and a close intent; Windows Repair retains an active managed console
+//! and settles an exited or failed console session from its records.
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
+use super::super as terminal;
+use super::super::TerminalKind;
 use crate::native::process_identity::ProcessObservation;
-use crate::native::session::close::budget::close_remaining;
 use crate::native::session::owner::OwnerAttestation;
 use crate::native::session::{Reader, SessionState};
 use anyhow::{Result, bail};
-use std::time::Instant;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+use terminal::TerminalSession;
+
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 use terminal::facts::OwnerSurvival;
 
 pub(in crate::native) fn repair_owner_is_live(attestation: &OwnerAttestation) -> Result<bool> {
@@ -44,6 +48,7 @@ pub(in crate::native::terminal) fn outlives_owner(kind: TerminalKind) -> bool {
 /// A kind whose core keeps its terminals until they are removed. Its handle records the
 /// terminal's creation (core, address, creation time, program and launch label), which proves
 /// the terminal without the owner.
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub(in crate::native) fn core_retains_finished(kind: TerminalKind) -> bool {
     terminal::facts(kind).owner_survival == OwnerSurvival::CoreRetainsFinished
 }
@@ -268,64 +273,32 @@ pub(super) fn explicit_close(
     )
 }
 
-type CloseSurface<'a> = &'a mut dyn FnMut(&TerminalSession) -> Result<CloseOutcome>;
-
-pub(in crate::native) enum RepairSurfaces<'a> {
+/// A dead owner's surface retention policy, checked again under the lifecycle lock.
+#[derive(Clone, Copy)]
+pub(in crate::native) enum RepairSurfaces {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     Posix,
-    #[cfg_attr(
-        not(any(windows, all(test, any(target_os = "macos", target_os = "linux")))),
-        allow(dead_code)
-    )]
-    Windows(CloseSurface<'a>),
+    #[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+    Windows,
+    /// The parity fixtures record no surface; only a POSIX close intent is kept.
     #[cfg(test)]
     WithoutSurface,
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     Unsupported,
 }
 
-pub(in crate::native) enum RepairSurface<'a> {
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    Retain,
-    /// Settle from the Records after `Retention` rechecks under the lifecycle lock.
-    /// Standalone Repair makes its initial choice before taking that lock.
-    Settle(Retention),
-    #[cfg_attr(
-        not(any(target_os = "macos", target_os = "linux", windows)),
-        allow(dead_code)
-    )]
-    CloseOnWindows(WindowsClose<'a>),
-}
-
-/// What a dead owner's Repair keeps for an explicit close. Standalone Repair scans
-/// before taking the lifecycle lock and rechecks under the lock before settlement.
-/// Its first scan can miss a handle that a concurrent explicit close later restores.
-#[derive(Clone, Copy)]
-pub(in crate::native) enum Retention {
-    /// macOS and Linux: a close intent, even an invalid one, and a handle of a kind whose
-    /// surface can outlive its owner.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    Posix,
-    /// Windows: a handle of a kind whose core keeps its terminals.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-    CoreKept,
-    /// The parity fixtures record no surface; only a POSIX close intent is kept.
-    #[cfg(test)]
-    WithoutSurface,
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    Nothing,
-}
-
-impl Retention {
+impl RepairSurfaces {
     pub(in crate::native) fn retains(
         self,
         reader: &Reader,
+        state: &SessionState,
         active: impl FnOnce() -> Result<Option<TerminalKind>>,
         claimed: impl FnOnce() -> Result<Option<TerminalKind>>,
     ) -> Result<bool> {
         #[cfg(all(windows, not(test)))]
         let _ = reader; // Windows retention uses only the two handle kinds.
-        let has_kind = |retains: fn(TerminalKind) -> bool| -> Result<bool> {
+        let _ = state;
+        let has_kind = |retains: &dyn Fn(TerminalKind) -> bool| -> Result<bool> {
             Ok(active()?.is_some_and(retains) || claimed()?.is_some_and(retains))
         };
         match self {
@@ -335,9 +308,13 @@ impl Retention {
                 .record(crate::native::session::CoreRecord::TerminalCloseIntent)
                 .bytes()?
                 .is_some()
-                || has_kind(outlives_owner)?),
-            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-            Self::CoreKept => has_kind(core_retains_finished),
+                || has_kind(&outlives_owner)?),
+            #[cfg(any(windows, all(test, any(target_os = "macos", target_os = "linux"))))]
+            Self::Windows => has_kind(&|kind| {
+                core_retains_finished(kind)
+                    || (kind == TerminalKind::WindowsConsole
+                        && !matches!(state, SessionState::Exited | SessionState::Failed))
+            }),
             #[cfg(test)]
             Self::WithoutSurface => {
                 use crate::native::session::CoreRecord;
@@ -357,90 +334,10 @@ impl Retention {
                 Ok(false)
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-            Self::Nothing => {
+            Self::Unsupported => {
                 let _ = (reader, has_kind);
                 Ok(false)
             }
         }
-    }
-}
-
-impl<'a> RepairSurfaces<'a> {
-    pub(in crate::native) fn decide(
-        self,
-        state: &SessionState,
-        deadline: Instant,
-        retains: impl FnOnce(Retention) -> Result<bool>,
-    ) -> Result<RepairSurface<'a>> {
-        match self {
-            #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
-            Self::WithoutSurface => retain_or(retains, Retention::WithoutSurface, || {
-                Ok(RepairSurface::Settle(Retention::WithoutSurface))
-            }),
-            // No surface can be retained here; the settlement checks the fixture again.
-            #[cfg(all(test, not(any(target_os = "macos", target_os = "linux", windows))))]
-            Self::WithoutSurface => Ok(RepairSurface::Settle(Retention::WithoutSurface)),
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            Self::Posix => retain_or(retains, Retention::Posix, || {
-                Ok(RepairSurface::Settle(Retention::Posix))
-            }),
-            // As on macOS and Linux, only an explicit close ends a terminal its core keeps.
-            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-            Self::Windows(close) => retain_or(retains, Retention::CoreKept, || {
-                if matches!(state, SessionState::Exited | SessionState::Failed) {
-                    close_remaining(deadline)?;
-                    return Ok(RepairSurface::Settle(Retention::CoreKept));
-                }
-                Ok(RepairSurface::CloseOnWindows(WindowsClose { close }))
-            }),
-            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-            Self::Unsupported | Self::Windows(_) => {
-                let _ = (retains, state, deadline);
-                Ok(RepairSurface::Settle(Retention::Nothing))
-            }
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn retain_or<'a>(
-    retains: impl FnOnce(Retention) -> Result<bool>,
-    retention: Retention,
-    otherwise: impl FnOnce() -> Result<RepairSurface<'a>>,
-) -> Result<RepairSurface<'a>> {
-    if retains(retention)? {
-        return Ok(RepairSurface::Retain);
-    }
-    otherwise()
-}
-
-pub(in crate::native) struct WindowsClose<'a> {
-    close: CloseSurface<'a>,
-}
-
-impl WindowsClose<'_> {
-    /// Check the claimed handle too. The earlier scan only decides whether Repair needs
-    /// a close transaction. It conveys no proof over whatever handle that transaction claims.
-    pub(in crate::native) fn close(
-        &mut self,
-        surface: &TerminalSession,
-        deadline: Instant,
-    ) -> Result<CloseOutcome> {
-        if core_retains_finished(surface.kind) {
-            bail!(
-                "Repair never ends a terminal its core keeps; close it with close-session --explicit"
-            );
-        }
-        if surface.kind != TerminalKind::WindowsConsole {
-            bail!("dead Windows native owner has a non-Windows terminal handle");
-        }
-        close_remaining(deadline)?;
-        let outcome = (self.close)(surface)?;
-        close_remaining(deadline)?;
-        Ok(outcome)
-    }
-
-    pub(in crate::native) fn failure_context(&self) -> &'static str {
-        "failed to close a Windows console whose native owner exited"
     }
 }

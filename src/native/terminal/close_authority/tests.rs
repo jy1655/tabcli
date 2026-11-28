@@ -14,8 +14,7 @@ use std::collections::HashMap;
 use terminal::TerminalKind::*;
 
 const ID: &str = "session-close-table";
-const DEAD_IDENTITY: &str = "identity is incomplete, foreign, or its PID is reused";
-const DEAD_PRESENT: &str = "visible terminal cleanup is unverified";
+const DEAD_PRESENT: &str = "surface is still present. End it, then run";
 
 // The Record reads of a row with an owner record before its first observation: the
 // teardown intent, the owner's presence by text, and the launch record.
@@ -79,6 +78,7 @@ struct Row {
     observed: fn() -> OwnerAttestation,
     pid_alive: bool,
     live: bool,
+    reused: bool,
     proof_error: bool,
     present: bool,
     birth: Option<(u64, u64)>,
@@ -110,6 +110,7 @@ impl Row {
             observed: || test_owner_attestation(false),
             pid_alive: false,
             live: false,
+            reused: false,
             proof_error: false,
             present: false,
             birth: Some((100, 42)),
@@ -243,6 +244,9 @@ impl Row {
             .with_posix_owner_live(|owner| {
                 assert_eq!(owner.pid, 123);
                 match fault("mac-live") {
+                    Ok(()) if self.reused => {
+                        crate::native::session::owner::tests::reused_attestation()
+                    }
                     Ok(()) => test_owner_attestation(self.live),
                     Err(error) => OwnerAttestation {
                         process: ProcessObservation::Unknown(format!("{error:#}")),
@@ -563,13 +567,13 @@ fn failed_start_shortcut_requires_failed_bound_owner_and_unspawned_launch() {
         } else {
             OWNED.to_vec()
         };
-        calls.extend(["resumable", "owner", "mac-live", "pid-alive"]);
         if case == "foreign" {
-            row.check(Err(DEAD_IDENTITY), &calls);
+            calls.pop(); // the failed-start read already found a foreign owner
         } else {
-            calls.push("presence");
-            row.check(Ok(TerminalCloseAuthority::Absent), &calls);
+            calls.extend(["resumable", "owner", "mac-live"]);
         }
+        calls.push("presence");
+        row.check(Ok(TerminalCloseAuthority::Absent), &calls);
     }
 }
 
@@ -665,7 +669,7 @@ fn resumable_terminal_without_incarnation_absent_or_error() {
 }
 
 #[test]
-fn dead_owner_incomplete_foreign_or_reused_pid_refused_before_surface() {
+fn dead_owner_incomplete_foreign_or_reused_pid_requires_absence() {
     for case in [
         "incomplete",
         "foreign",
@@ -682,18 +686,23 @@ fn dead_owner_incomplete_foreign_or_reused_pid_refused_before_surface() {
             "missing-tty" => owner.terminal_tty = None,
             _ => owner.terminal_tty = Some(String::new()),
         }
+        if case == "reused" {
+            row.check(
+                Ok(TerminalCloseAuthority::Absent),
+                &with(&OWNED, &["resumable", "owner", "mac-live", "presence"]),
+            );
+            continue;
+        }
         row.check(
-            Err(DEAD_IDENTITY),
-            &with(&OWNED, &["resumable", "owner", "mac-live", "pid-alive"]),
+            Ok(TerminalCloseAuthority::Absent),
+            &with(&OWNED, &["resumable", "owner", "presence"]),
         );
     }
 }
 
-// The dead-owner route requires the owner record bound to this Session and all five control
-// fields recorded: an unbound legacy record, one with none of them, and one missing any single
-// field are refused before any surface observation.
+// Unusable control records permit only the ownerless surface observation.
 #[test]
-fn dead_owner_unbound_or_without_all_five_control_fields_refused_before_surface() {
+fn dead_owner_unbound_or_without_all_five_control_fields_requires_absence() {
     for case in [
         "unbound",
         "no control fields",
@@ -721,14 +730,14 @@ fn dead_owner_unbound_or_without_all_five_control_fields_refused_before_surface(
             _ => owner.terminal_process_group = None,
         }
         row.check(
-            Err(DEAD_IDENTITY),
-            &with(&OWNED, &["resumable", "owner", "mac-live", "pid-alive"]),
+            Ok(TerminalCloseAuthority::Absent),
+            &with(&OWNED, &["resumable", "owner", "presence"]),
         );
     }
 }
 
 // The failed-start shortcut requires the owner record bound to this Session: an unbound
-// legacy record falls through to the dead-owner route, which refuses it as well.
+// legacy record instead needs independent proof of absence.
 #[test]
 fn failed_start_shortcut_refuses_an_unbound_owner() {
     let mut row = Row::new(Iterm2);
@@ -736,11 +745,8 @@ fn failed_start_shortcut_refuses_an_unbound_owner() {
     row.phase = Some(launch::Phase::Spawning);
     row.owner.as_mut().unwrap().managed_session_id = None;
     row.check(
-        Err(DEAD_IDENTITY),
-        &with(
-            &FAILED_START,
-            &["resumable", "owner", "mac-live", "pid-alive"],
-        ),
+        Ok(TerminalCloseAuthority::Absent),
+        &with(&FAILED_START[..5], &["presence"]),
     );
 }
 
@@ -750,7 +756,7 @@ fn dead_owner_surface_absent_or_present() {
         for present in [false, true] {
             let mut row = Row::new(kind);
             row.present = present;
-            let mut calls = with(&OWNED, &["resumable", "owner", "mac-live", "pid-alive"]);
+            let mut calls = with(&OWNED, &["resumable", "owner", "mac-live"]);
             if kind == AppleTerminal {
                 calls.extend(["birth", "instances"]);
             }
@@ -771,15 +777,39 @@ fn dead_owner_surface_absent_or_present() {
 }
 
 #[test]
+fn recorded_app_absence_requires_a_bound_complete_owner_even_after_wrapper_pid_reuse() {
+    for bound in [false, true] {
+        let mut row = Row::new(AppleTerminal);
+        row.birth = None;
+        row.pid_alive = true;
+        row.reused = true;
+        row.instances = vec![MacTerminalAppIdentity { pid: 457, ..app() }];
+        row.present = true; // the replacement app lists the old window ID
+        if bound {
+            row.check(
+                Ok(TerminalCloseAuthority::Absent),
+                &with(&OWNED, &["resumable", "owner", "mac-live", "birth"]),
+            );
+        } else {
+            row.owner.as_mut().unwrap().managed_session_id = Some("foreign".into());
+            row.check(
+                Err(DEAD_PRESENT),
+                &with(
+                    &OWNED,
+                    &["resumable", "owner", "instances", "presence", "instances"],
+                ),
+            );
+        }
+    }
+}
+
+#[test]
 fn dead_terminal_owner_ended_incarnation_absent_without_surface_query() {
     let mut row = Row::new(AppleTerminal);
     row.birth = None;
     row.check(
         Ok(TerminalCloseAuthority::Absent),
-        &with(
-            &OWNED,
-            &["resumable", "owner", "mac-live", "pid-alive", "birth"],
-        ),
+        &with(&OWNED, &["resumable", "owner", "mac-live", "birth"]),
     );
 }
 
@@ -832,7 +862,7 @@ fn live_terminal_owner_ended_incarnation_teardown() {
 }
 
 #[test]
-fn ownerless_non_startup_status_refused_without_observation() {
+fn ownerless_non_startup_status_settles_on_proven_absence() {
     for state in [
         SessionState::Ready,
         SessionState::Working,
@@ -842,8 +872,8 @@ fn ownerless_non_startup_status_refused_without_observation() {
         row.owner = None;
         row.state = state;
         row.check(
-            Err("terminal close requires a live native-session owner"),
-            &OWNERLESS,
+            Ok(TerminalCloseAuthority::Absent),
+            &with(&OWNERLESS, &["presence"]),
         );
     }
 }
@@ -914,12 +944,22 @@ fn resumability_error_stops_before_owner_liveness() {
 }
 
 #[test]
-fn posix_owner_liveness_error_stops_before_pid_surface_and_proof() {
+fn posix_unknown_owner_can_settle_only_the_absent_surface() {
     let mut row = Row::new(AppleTerminal);
     row.observation_error = Some(("mac-live", 1));
-    row.check_error_chain(
-        &["injected mac-live failure: injected mac-live cause"],
-        &with(&OWNED, &["resumable", "owner", "mac-live"]),
+    row.check(
+        Ok(TerminalCloseAuthority::Absent),
+        &with(
+            &OWNED,
+            &[
+                "resumable",
+                "owner",
+                "mac-live",
+                "instances",
+                "presence",
+                "instances",
+            ],
+        ),
     );
 }
 
@@ -928,17 +968,13 @@ fn dead_owner_presence_error_never_grants_absence() {
     for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
         let mut row = Row::new(kind);
         row.observation_error = Some(("presence", 1));
-        let mut calls = with(&OWNED, &["resumable", "owner", "mac-live", "pid-alive"]);
+        let mut calls = with(&OWNED, &["resumable", "owner", "mac-live"]);
         if kind == AppleTerminal {
             calls.extend(["birth", "instances"]);
         }
         calls.push("presence");
         row.check_error_chain(
-            &[
-                "could not prove absence of the dead owner's exact terminal surface; no close was sent",
-                "injected presence failure",
-                "injected presence cause",
-            ],
+            &["injected presence failure", "injected presence cause"],
             &calls,
         );
     }
@@ -957,7 +993,7 @@ fn ownerless_startup_presence_error_never_grants_absence() {
             calls.push("instances");
         } else {
             chain.push(
-                "could not prove absence of the ownerless startup surface; no close was sent",
+                "could not prove absence of the ownerless terminal surface; no close was sent",
             );
         }
         chain.extend(["injected presence failure", "injected presence cause"]);
@@ -982,10 +1018,7 @@ fn terminal_process_birth_errors_preserve_reason_and_stop_at_observation() {
         (
             "dead",
             1,
-            with(
-                &OWNED,
-                &["resumable", "owner", "mac-live", "pid-alive", "birth"],
-            ),
+            with(&OWNED, &["resumable", "owner", "mac-live", "birth"]),
         ),
         (
             "dead",
@@ -996,7 +1029,6 @@ fn terminal_process_birth_errors_preserve_reason_and_stop_at_observation() {
                     "resumable",
                     "owner",
                     "mac-live",
-                    "pid-alive",
                     "birth",
                     "instances",
                     "presence",
@@ -1009,13 +1041,7 @@ fn terminal_process_birth_errors_preserve_reason_and_stop_at_observation() {
         row.intent = path == "resumable";
         row.live = path == "live";
         row.observation_error = Some(("birth", occurrence));
-        let mut chain = vec![];
-        if path == "dead" {
-            chain.push("could not prove absence of the dead owner's exact terminal surface; no close was sent");
-        }
-        // Incarnation classification preserves the reason as one string.
-        chain.push("injected birth failure: injected birth cause");
-        row.check_error_chain(&chain, &calls);
+        row.check_error_chain(&["injected birth failure: injected birth cause"], &calls);
     }
 }
 
@@ -1077,14 +1103,7 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
             1,
             with(
                 &OWNED,
-                &[
-                    "resumable",
-                    "owner",
-                    "mac-live",
-                    "pid-alive",
-                    "birth",
-                    "instances",
-                ],
+                &["resumable", "owner", "mac-live", "birth", "instances"],
             ),
         ),
         (
@@ -1097,7 +1116,6 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
                     "resumable",
                     "owner",
                     "mac-live",
-                    "pid-alive",
                     "birth",
                     "instances",
                     "presence",
@@ -1110,10 +1128,7 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
             "dead",
             false,
             1,
-            with(
-                &OWNED,
-                &["resumable", "owner", "mac-live", "pid-alive", "instances"],
-            ),
+            with(&OWNED, &["resumable", "owner", "mac-live", "instances"]),
         ),
         (
             "dead",
@@ -1125,7 +1140,6 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
                     "resumable",
                     "owner",
                     "mac-live",
-                    "pid-alive",
                     "instances",
                     "presence",
                     "instances",
@@ -1151,12 +1165,10 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
             row.state = SessionState::Launching;
         }
         row.observation_error = Some(("instances", occurrence));
-        let mut chain = vec![];
-        if path == "dead" {
-            chain.push("could not prove absence of the dead owner's exact terminal surface; no close was sent");
-        }
-        chain.extend(["injected instances failure", "injected instances cause"]);
-        row.check_error_chain(&chain, &calls);
+        row.check_error_chain(
+            &["injected instances failure", "injected instances cause"],
+            &calls,
+        );
     }
 }
 
@@ -1169,7 +1181,7 @@ fn failed_unspawned_terminal_warp_wezterm_skip_native_identity_recovery() {
         row.state = SessionState::Failed;
         row.phase = Some(launch::Phase::Spawning);
         row.present = true;
-        let mut calls = with(&OWNED, &["resumable", "owner", "mac-live", "pid-alive"]);
+        let mut calls = with(&OWNED, &["resumable", "owner", "mac-live"]);
         if kind == AppleTerminal {
             calls.extend(["birth", "instances"]);
         }
@@ -1188,10 +1200,7 @@ fn iterm_recorded_close_intent_does_not_resume() {
     row.present = true;
     row.check(
         Err(DEAD_PRESENT),
-        &with(
-            &OWNED,
-            &["resumable", "owner", "mac-live", "pid-alive", "presence"],
-        ),
+        &with(&OWNED, &["resumable", "owner", "mac-live", "presence"]),
     );
 }
 
@@ -1249,7 +1258,6 @@ fn dead_terminal_owner_without_incarnation_requires_stable_absence() {
                     "resumable",
                     "owner",
                     "mac-live",
-                    "pid-alive",
                     "instances",
                     "presence",
                     "instances",
@@ -1317,7 +1325,7 @@ fn production_reader_decision_changes_no_record() {
     rows.push((row, Ok(TerminalCloseAuthority::SurfaceOnly)));
     let mut row = Row::new(Iterm2);
     row.owner.as_mut().unwrap().managed_session_id = Some("foreign".into());
-    rows.push((row, Err(DEAD_IDENTITY)));
+    rows.push((row, Ok(TerminalCloseAuthority::Absent)));
     for kind in [Warp, Iterm2] {
         let mut row = Row::new(kind);
         row.owner = None;
@@ -1332,10 +1340,7 @@ fn production_reader_decision_changes_no_record() {
         ));
         let mut row = Row::new(kind);
         row.owner = None;
-        rows.push((
-            row,
-            Err("terminal close requires a live native-session owner"),
-        ));
+        rows.push((row, Ok(TerminalCloseAuthority::Absent)));
     }
     for (mut row, expected) in rows {
         row.backed = true;
@@ -1395,7 +1400,7 @@ fn no_owner_reads_status_once_in_the_ownerless_branch() {
 }
 
 // The owner is read again before attestation. The decision uses that read: a changed
-// binding refuses as foreign, and a failed read stops the decision with its own error.
+// binding or a failed read permits only independent proof of absence.
 #[test]
 fn second_owner_read_is_fresh_and_its_answer_decides() {
     for later in ["changed", "failed"] {
@@ -1432,7 +1437,7 @@ fn second_owner_read_is_fresh_and_its_answer_decides() {
             control: ControlAttestation::Verified,
             pid_alive: Some(true),
         })
-        .with_presence(|| panic!("no surface observation after a refused owner"))
+        .with_presence(|| Ok(false))
         .with_evidence(terminal::close_evidence(Ghostty))
         .with_pid_alive(|_| false)
         .with_posix_owner_live(|_| test_owner_attestation(false))
@@ -1440,7 +1445,7 @@ fn second_owner_read_is_fresh_and_its_answer_decides() {
         .with_group_gone(|_| panic!("no teardown intent"))
         .with_proof(|| panic!("dead owner"));
         let result = observation.decide(ID, &handle, deadline);
-        let error = result.unwrap_err();
+        assert_eq!(result.unwrap(), TerminalCloseAuthority::Absent);
         let mut expected = vec![
             Call::new("teardown-intent", "Ok(None)"),
             Call::new("owner-present", "Ok(true)"),
@@ -1455,15 +1460,10 @@ fn second_owner_read_is_fresh_and_its_answer_decides() {
         ];
         if later == "failed" {
             expected.push(Call::new("owner", "Err(injected owner read failure)"));
-            assert_eq!(error.to_string(), "injected owner read failure");
         } else {
-            expected.extend([
-                Call::new("owner", &owner_of("foreign")),
-                Call::new("mac-live", "Gone(Exited)"),
-                Call::new("pid-alive", "false"),
-            ]);
-            assert!(error.to_string().contains(DEAD_IDENTITY), "{error:#}");
+            expected.extend([Call::new("owner", &owner_of("foreign"))]);
         }
+        expected.push(Call::new("presence", "Ok(false)"));
         assert_eq!(observation.trace(), expected, "{later}");
     }
 }

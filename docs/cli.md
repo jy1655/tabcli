@@ -746,7 +746,7 @@ attests the recorded process whatever session the owner record names, so this ap
 unbound legacy record and to one of another managed session as well. Its dead-owner repair
 usually closes such a session, but may leave it open for an explicit `close-session`. On macOS this
 happens when a close is already pending, or when the terminal can outlive its owner (Terminal.app,
-Ghostty, Warp, WezTerm). For Herdr on every platform, see [Herdr close](terminals.md#closing-a-herdr-session).
+Ghostty, Warp, WezTerm). Windows retains an active managed console for explicit close and settles an exited or failed session from its records, preserving eligibility for `reopen`. For Herdr on every platform, see [Herdr close](terminals.md#closing-a-herdr-session).
 On any platform it happens for a launch that was never confirmed, which
 launch repair settles instead. `recovery_required` means a completion journal is pending, and
 recovery can change every later gate. `owner_unverified` means the native session's recorded owner process could
@@ -1786,7 +1786,7 @@ A timeout means the close was not confirmed and may have partly happened. A retr
 the current records and, for a native surface action, establishes authority again.
 It may still refuse the close.
 
-For a native tmux session, explicit close ends the session's entire tmux server, including windows you added.
+TAB creates a private detached tmux server with no desktop window to end manually. Explicit close ends that server, including windows you added.
 The socket file stays in the session directory until the session is pruned. It verifies the recorded server birth through a pidfd before SIGTERM;
 a repeated close or a server already ended sends no further signal. Pane processes can take
 a few seconds to end after close returns. See [Linux / tmux](terminals.md#linux--tmux).
@@ -1795,6 +1795,8 @@ Every open session loads its terminal, including finished sessions that were nev
 you delegate many tasks, cap the number of open sessions, count finished but unclosed ones, and
 close a session before you open its replacement. If the terminal answers slowly, give the close a
 longer `--timeout-secs`.
+
+For an ordinary macOS application surface without a verified owner, explicit close requires proof that the recorded surface is absent. If it is still present, end it and repeat `tabcli close-session SESSION --explicit`.
 
 On macOS, a terminal application can end while the session's processes survive, as observed
 after iTerm2 was killed. If the ownership proof fails, TAB checks whether the recorded

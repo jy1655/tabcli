@@ -130,6 +130,10 @@ pub(in crate::native) trait CloseObservation {
     fn ownership_proof(&self) -> Result<()>;
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn observe_owner_record(&self, owner: &NativeSessionOwner) -> OwnerAttestation;
+    #[cfg(windows)]
+    fn console_owner(&self, owner: &NativeSessionOwner) -> ProcessObservation {
+        self.observe_owner_record(owner).process
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -236,15 +240,8 @@ impl CloseObservation for Production<'_> {
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn owner_present(&self) -> Result<bool> {
-        // A record that cannot be read is refused here, before anything else is read; a
-        // malformed one is present and the owner read reports it.
-        Ok(
-            match crate::native::session::owner::observe(&self.reader()) {
-                OwnerRecord::Absent => false,
-                OwnerRecord::Unreadable(error) => return Err(error),
-                OwnerRecord::Malformed { .. } | OwnerRecord::Recorded(_) => true,
-            },
-        )
+        // Only actual absence can qualify a startup for ownerless surface close.
+        Ok(!matches!(self.read_owner()?, OwnerRead::Absent))
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -325,6 +322,56 @@ impl CloseObservation for Production<'_> {
         attest_owner(owner)
     }
 
+    #[cfg(windows)]
+    fn console_owner(&self, owner: &NativeSessionOwner) -> ProcessObservation {
+        use crate::native::process_identity::{Attested, Gone};
+        // A verified live wrapper only needs limited query access, as in the owned close.
+        // The stronger synchronized observation distinguishes exit from inspection failure
+        // when that proof is unavailable, including for PID-only records.
+        if let Some(identity) = &owner.windows_process_identity
+            && identity.creation_time != 0
+            && !identity.executable_path.is_empty()
+            && terminal::windows::verify_process_identity(
+                owner.pid,
+                identity.creation_time,
+                &identity.executable_path,
+            )
+            .is_ok()
+        {
+            return ProcessObservation::Live(Attested::Incarnation);
+        }
+        match terminal::observe_windows_process_identity(owner.pid) {
+            Err(error) => ProcessObservation::Unknown(format!("{error:#}")),
+            Ok(None) => ProcessObservation::Gone(Gone::Exited),
+            Ok(Some(live)) => match &owner.windows_process_identity {
+                None => ProcessObservation::Live(Attested::PidOnly),
+                Some(recorded)
+                    if recorded.creation_time == 0 || recorded.executable_path.is_empty() =>
+                {
+                    ProcessObservation::Unknown(
+                        "The recorded Windows owner has an incomplete process identity".into(),
+                    )
+                }
+                Some(recorded) if recorded.creation_time != live.creation_time => {
+                    ProcessObservation::Gone(Gone::Reused(format!(
+                        "owner PID {} was reused",
+                        owner.pid
+                    )))
+                }
+                Some(recorded)
+                    if recorded
+                        .executable_path
+                        .eq_ignore_ascii_case(&live.executable_path) =>
+                {
+                    ProcessObservation::Live(Attested::Incarnation)
+                }
+                Some(_) => ProcessObservation::Unknown(
+                    "The recorded Windows owner executable identity changed".into(),
+                ),
+            },
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn pid_alive(&self, pid: u32) -> bool {
         (self.pid_is_alive)(pid)
@@ -354,6 +401,35 @@ impl CloseObservation for Production<'_> {
     fn evidence(&self) -> &dyn terminal::close_evidence::CloseEvidence {
         terminal::close_evidence(self.session.kind)
     }
+}
+
+/// An ordinary unowned surface grants only settlement on positive absence. The adapter
+/// may use a trustworthy recorded app identity, even if the wrapper itself has exited.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn unowned_close(
+    observation: &dyn CloseObservation,
+    id: &str,
+    session: &TerminalSession,
+    owner: Option<&NativeSessionOwner>,
+    surface_present: impl FnOnce() -> Result<bool>,
+) -> Result<TerminalCloseAuthority> {
+    session.verify_managed_session(id)?;
+    #[cfg(unix)]
+    let absent = observation
+        .evidence()
+        .surface_absent(owner, Box::new(surface_present))?;
+    #[cfg(windows)]
+    let absent = {
+        let _ = (observation, owner);
+        !surface_present()?
+    };
+    if absent {
+        return Ok(TerminalCloseAuthority::Absent);
+    }
+    bail!(
+        "The recorded {} surface is still present. End it, then run `tabcli close-session {id} --explicit` again.",
+        session.kind.display_name()
+    )
 }
 
 // The decision. Its Record reads and their order are part of its contract: teardown
@@ -427,7 +503,24 @@ pub(in crate::native) fn decide(
         } else {
             None
         };
-        if core_kept_owner.is_some() || observation.owner_present()? {
+        let ordinary = observation.cause() == CloseCause::Explicit
+            && core_kept_owner.is_none()
+            && !has_teardown_intent;
+        let unowned = |owner: Option<&NativeSessionOwner>| {
+            unowned_close(
+                observation,
+                expected_session_id,
+                session,
+                owner,
+                surface_present,
+            )
+        };
+        if core_kept_owner.is_some()
+            || match observation.owner_present() {
+                Err(_) if ordinary => return unowned(None),
+                present => present?,
+            }
+        {
             // An explicit close may reclaim the exact startup surface after its wrapper
             // died, including an uncertain spawn. This is not automatic failure cleanup:
             // neither a live/unknown owner nor an unbound/foreign handle gains authority.
@@ -440,7 +533,13 @@ pub(in crate::native) fn decide(
                 && terminal::facts(session.kind).failed_start_identity
             {
                 let status: SessionStatus = observation.status()?;
-                let owner: NativeSessionOwner = observation.owner()?;
+                let owner = match observation.owner() {
+                    Err(_) if ordinary => return unowned(None),
+                    owner => owner?,
+                };
+                if ordinary && owner.binding(expected_session_id) != OwnerBinding::Bound {
+                    return unowned(None);
+                }
                 let observed = observation.observe_owner_record(&owner);
                 if status.state == SessionState::Failed
                     && owner.binding(expected_session_id) == OwnerBinding::Bound
@@ -478,11 +577,31 @@ pub(in crate::native) fn decide(
                 let (owner, attestation) = match core_kept_owner {
                     Some(observed) => observed,
                     None => {
-                        let owner: NativeSessionOwner = observation.owner()?;
+                        let owner = match observation.owner() {
+                            Err(_) if ordinary => return unowned(None),
+                            owner => owner?,
+                        };
+                        if ordinary
+                            && (owner.binding(expected_session_id) != OwnerBinding::Bound
+                                || crate::native::session::owner::record_conflicts(&owner)
+                                || !owner.control_record().is_complete()
+                                || owner.terminal_tty.as_deref().is_none_or(str::is_empty))
+                        {
+                            return unowned(None);
+                        }
                         let attestation = observation.posix_owner_live(&owner);
                         (owner, attestation)
                     }
                 };
+                if ordinary {
+                    use crate::native::process_identity::Attested;
+                    match &attestation.process {
+                        ProcessObservation::Gone(_) => return unowned(Some(&owner)),
+                        ProcessObservation::Unknown(_)
+                        | ProcessObservation::Live(Attested::PidOnly) => return unowned(None),
+                        ProcessObservation::Live(Attested::Incarnation) => {}
+                    }
+                }
                 if let ProcessObservation::Unknown(reason) = &attestation.process {
                     bail!("{reason}");
                 }
@@ -490,6 +609,9 @@ pub(in crate::native) fn decide(
                     crate::native::session::owner::ControlAttestation::Changed(reason)
                     | crate::native::session::owner::ControlAttestation::Unknown(reason) => {
                         bail!("{reason}")
+                    }
+                    crate::native::session::owner::ControlAttestation::Exited if ordinary => {
+                        return unowned(Some(&owner));
                     }
                     crate::native::session::owner::ControlAttestation::Exited => {
                         bail!("exited during attestation")
@@ -532,13 +654,47 @@ pub(in crate::native) fn decide(
             }
             #[cfg(windows)]
             {
-                let _ = core_kept_owner;
+                if ordinary && session.kind == terminal::TerminalKind::WindowsConsole {
+                    let owner = match observation.owner() {
+                        Ok(owner) if owner.binding(expected_session_id) == OwnerBinding::Bound => {
+                            owner
+                        }
+                        _ => return unowned(None),
+                    };
+                    let reason = match observation.console_owner(&owner) {
+                        ProcessObservation::Gone(_) => return unowned(None),
+                        ProcessObservation::Unknown(reason) => reason,
+                        ProcessObservation::Live(
+                            crate::native::process_identity::Attested::PidOnly,
+                        ) => format!(
+                            "The recorded owner PID {} is live, but its process identity was not recorded",
+                            owner.pid
+                        ),
+                        ProcessObservation::Live(_)
+                            if crate::native::session::owner::record_conflicts(&owner) =>
+                        {
+                            "The recorded owner has conflicting platform identities".to_owned()
+                        }
+                        ProcessObservation::Live(_) => match ownership_proof() {
+                            Ok(()) => return Ok(TerminalCloseAuthority::LiveOwner),
+                            Err(error) => {
+                                unowned(None)?;
+                                return Err(error);
+                            }
+                        },
+                    };
+                    unowned(None)?;
+                    bail!("{reason}");
+                }
                 ownership_proof()?;
                 return Ok(TerminalCloseAuthority::LiveOwner);
             }
         }
         let status: SessionStatus = observation.status()?;
         if !matches!(status.state, SessionState::Launching | SessionState::Failed) {
+            if ordinary {
+                return unowned(None);
+            }
             bail!(
                 "terminal close requires a live native-session owner while the session is {}",
                 status.state
@@ -634,7 +790,15 @@ pub(in crate::native) fn close_windows_owned_surface_with(
     let authority = authority()?;
     close_remaining(deadline)?;
     match authority {
-        TerminalCloseAuthority::Absent => Ok(terminal::CloseOutcome::Missing.into()),
+        TerminalCloseAuthority::Absent => {
+            if session.kind == terminal::TerminalKind::WindowsConsole {
+                adapters
+                    .adapter(session.kind)?
+                    .end_recorded_tab_host(directory, deadline)?;
+                close_remaining(deadline)?;
+            }
+            Ok(terminal::CloseOutcome::Missing.into())
+        }
         TerminalCloseAuthority::CreatedSurface(evidence) => {
             let generated = evidence.generated_reason();
             windows_dispatch::close_created_surface(
@@ -768,12 +932,18 @@ mod projected_authority_tests {
             for proof_succeeds in [false, true] {
                 let surface = TerminalSession::new(kind, "4242".into())
                     .with_binding(Some("session-test".into()));
+                let owner = owner_record(Record::Bound).unwrap();
+                #[cfg(unix)]
+                let owner = NativeSessionOwner {
+                    terminal_tty: Some("/dev/test".into()),
+                    terminal_tty_device: Some(1),
+                    process_group: Some(4242),
+                    terminal_process_group: Some(4242),
+                    ..owner
+                };
+                let first = std::cell::Cell::new(true);
                 let observation = TestObservation::from_values(RecordValues {
-                    owner: Some(NativeSessionOwner {
-                        pid: 4242,
-                        managed_session_id: Some("session-test".into()),
-                        ..Default::default()
-                    }),
+                    owner: Some(owner),
                     state: SessionState::Failed,
                     launch: Some(launch::Record {
                         schema: 1,
@@ -782,7 +952,17 @@ mod projected_authority_tests {
                         phase: launch::Phase::Spawning,
                     }),
                 })
-                .with_owner_record(|_| attestation())
+                .with_owner_record(|_| {
+                    if first.replace(false) {
+                        attestation()
+                    } else {
+                        OwnerAttestation {
+                            process: ProcessObservation::Live(Attested::Incarnation),
+                            control: ControlAttestation::Verified,
+                            pid_alive: Some(true),
+                        }
+                    }
+                })
                 .with_presence(|| Ok(true))
                 .with_proof(|| {
                     if proof_succeeds {
@@ -811,9 +991,14 @@ mod projected_authority_tests {
                 if !surface_only {
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     calls.extend(["resumable", "owner", "mac-live"]);
+                    #[cfg(windows)]
+                    if kind == terminal::TerminalKind::WindowsConsole {
+                        calls.extend(["owner", "owner-record"]);
+                    }
                     calls.push("proof");
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
-                    if !proof_succeeds {
+                    if !proof_succeeds
+                        && (!cfg!(windows) || kind == terminal::TerminalKind::WindowsConsole)
+                    {
                         calls.push("presence");
                     }
                 }
@@ -830,7 +1015,11 @@ mod projected_authority_tests {
                 } else {
                     assert_eq!(
                         result.unwrap_err().to_string(),
-                        "injected full ownership proof failure"
+                        if cfg!(windows) && kind == terminal::TerminalKind::WindowsConsole {
+                            "The recorded Windows Console surface is still present. End it, then run `tabcli close-session session-test --explicit` again."
+                        } else {
+                            "injected full ownership proof failure"
+                        }
                     );
                 }
             }
@@ -893,6 +1082,7 @@ mod projected_authority_tests {
         Absent,
         /// A record that cannot be decoded.
         Damaged,
+        Unreadable,
         /// Bound to this session, naming an incarnation this platform can produce.
         Bound,
         /// Bound, with another platform's birth beside its own: attestation answers Unknown.
@@ -938,7 +1128,7 @@ mod projected_authority_tests {
             }
         };
         match record {
-            Record::Absent | Record::Damaged => return None,
+            Record::Absent | Record::Damaged | Record::Unreadable => return None,
             Record::Bound | Record::Unbound | Record::Foreign => incarnation(&mut owner),
             Record::Conflicting => {
                 incarnation(&mut owner);
@@ -1013,6 +1203,302 @@ mod projected_authority_tests {
             control: ControlAttestation::NotRecorded,
             pid_alive: None,
         }
+    }
+
+    #[test]
+    fn ordinary_close_without_verified_owner_requires_positive_absence() {
+        use crate::native::session::Store;
+        #[cfg(windows)]
+        let kinds = [terminal::TerminalKind::WindowsConsole];
+        #[cfg(unix)]
+        let kinds = [
+            terminal::TerminalKind::Ghostty,
+            terminal::TerminalKind::Iterm2,
+            terminal::TerminalKind::Warp,
+            terminal::TerminalKind::WezTerm,
+        ];
+        for kind in kinds {
+            for (record, process) in [
+                (
+                    Record::Absent,
+                    (|| ProcessObservation::Gone(Gone::Exited)) as fn() -> _,
+                ),
+                (Record::Damaged, || ProcessObservation::Gone(Gone::Exited)),
+                (Record::Unreadable, || {
+                    ProcessObservation::Gone(Gone::Exited)
+                }),
+                (Record::Foreign, || {
+                    ProcessObservation::Live(Attested::Incarnation)
+                }),
+                (Record::Foreign, || ProcessObservation::Gone(Gone::Exited)),
+                (Record::Unbound, || {
+                    ProcessObservation::Live(Attested::Incarnation)
+                }),
+                (Record::Bound, || {
+                    ProcessObservation::Gone(Gone::Reused("different birth".into()))
+                }),
+                (Record::Bound, || {
+                    ProcessObservation::Unknown("owner inspection denied".into())
+                }),
+                (Record::PidOnly, || {
+                    ProcessObservation::Live(Attested::PidOnly)
+                }),
+                (Record::ConflictingNested, || {
+                    ProcessObservation::Live(Attested::Incarnation)
+                }),
+            ] {
+                for presence in [Some(false), Some(true), None] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let store = Store::open_unchecked(dir.path());
+                    if let Some(owner) = owner_record(record) {
+                        store.write_owner(&owner).unwrap();
+                    } else if matches!(record, Record::Damaged) {
+                        std::fs::write(store.record(CoreRecord::Owner).path(), b"{").unwrap();
+                    } else if matches!(record, Record::Unreadable) {
+                        std::fs::create_dir(store.record(CoreRecord::Owner).path()).unwrap();
+                    }
+                    let surface = TerminalSession::new(kind, "4242".into())
+                        .with_binding(Some("session-test".into()));
+                    let deadline = crate::native::session::close::budget::close_deadline();
+                    let observation =
+                        TestObservation::on_records(dir.path(), "session-test", &surface, deadline)
+                            .with_launch(|| Ok(None))
+                            .with_status(|| {
+                                Ok(SessionStatus {
+                                    state: SessionState::Ready,
+                                    generation: 0,
+                                    updated_unix_ms: 1,
+                                    exit_code: None,
+                                    error: None,
+                                    residual_surface: None,
+                                })
+                            })
+                            .with_owner_record(|_| attestation(process))
+                            .with_presence(|| {
+                                presence
+                                    .ok_or_else(|| anyhow::anyhow!("terminal inspection denied"))
+                            })
+                            .with_proof(|| {
+                                panic!("ordinary ownerless close cannot call owned close")
+                            });
+                    #[cfg(unix)]
+                    let observation = observation
+                        .with_evidence(terminal::close_evidence(kind))
+                        .with_resumable(|| Ok(false))
+                        .with_pid_alive(|_| true)
+                        .with_posix_owner_live(|_| attestation(process));
+                    let result = observation.decide("session-test", &surface, deadline);
+                    #[cfg(windows)]
+                    let result = match result {
+                        Err(error) => {
+                            // An R7 refusal must reach neither the helper nor the tab host.
+                            struct NoCalls;
+                            impl terminal::windows_dispatch::Adapters for NoCalls {
+                                fn adapter(
+                                    &self,
+                                    _: terminal::TerminalKind,
+                                ) -> Result<&dyn terminal::windows_dispatch::WindowsTerminalAdapter>
+                                {
+                                    panic!("refused console close reached an adapter");
+                                }
+                            }
+                            Err(close_windows_owned_surface_with(
+                                || Err(error),
+                                &NoCalls,
+                                dir.path(),
+                                &surface,
+                                deadline,
+                            )
+                            .unwrap_err())
+                        }
+                        ok => ok,
+                    };
+                    let label = format!("{kind:?} {record:?} {:?} {presence:?}", process());
+                    match presence {
+                        None => assert_eq!(
+                            result.unwrap_err().root_cause().to_string(),
+                            "terminal inspection denied",
+                            "{label}"
+                        ),
+                        Some(true) => assert_eq!(
+                            result.unwrap_err().to_string(),
+                            format!(
+                                "The recorded {} surface is still present. End it, then run `tabcli close-session session-test --explicit` again.",
+                                kind.display_name()
+                            ),
+                            "{label}"
+                        ),
+                        #[cfg(windows)]
+                        Some(false) if matches!(process(), ProcessObservation::Unknown(_)) => {
+                            assert_eq!(
+                                result.unwrap_err().to_string(),
+                                "owner inspection denied",
+                                "{label}"
+                            )
+                        }
+                        #[cfg(windows)]
+                        Some(false)
+                            if matches!(record, Record::PidOnly | Record::ConflictingNested) =>
+                        {
+                            assert_eq!(
+                                result.unwrap_err().to_string(),
+                                if matches!(record, Record::PidOnly) {
+                                    "The recorded owner PID 4242 is live, but its process identity was not recorded"
+                                } else {
+                                    "The recorded owner has conflicting platform identities"
+                                },
+                                "{label}"
+                            )
+                        }
+                        Some(false) => {
+                            assert_eq!(result.unwrap(), TerminalCloseAuthority::Absent, "{label}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_spawning_malformed_owner_observes_absence_without_startup_grant() {
+        use crate::native::session::Store;
+        #[cfg(windows)]
+        let kinds = [terminal::TerminalKind::WindowsConsole];
+        #[cfg(unix)]
+        let kinds = [
+            terminal::TerminalKind::Ghostty,
+            terminal::TerminalKind::Iterm2,
+        ];
+        for kind in kinds {
+            let surface =
+                TerminalSession::new(kind, "42".into()).with_binding(Some("session-test".into()));
+            for malformed in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Store::open_unchecked(directory.path());
+                if malformed {
+                    std::fs::write(store.record(CoreRecord::Owner).path(), b"{").unwrap();
+                }
+                store
+                    .write_status(&SessionStatus {
+                        state: SessionState::Failed,
+                        generation: 0,
+                        updated_unix_ms: 1,
+                        exit_code: None,
+                        error: None,
+                        residual_surface: None,
+                    })
+                    .unwrap();
+                store
+                    .record(CoreRecord::Launch)
+                    .write_json(&launch::Record {
+                        schema: 1,
+                        claim_token: "claim".into(),
+                        deadline_unix_ms: 1,
+                        phase: launch::Phase::Spawning,
+                    })
+                    .unwrap();
+                for present in [false, true] {
+                    let deadline = crate::native::session::close::budget::close_deadline();
+                    let observation = TestObservation::on_records(
+                        directory.path(),
+                        "session-test",
+                        &surface,
+                        deadline,
+                    )
+                    .with_presence(|| {
+                        assert!(malformed);
+                        Ok(present)
+                    });
+                    #[cfg(unix)]
+                    let observation = observation.with_evidence(terminal::close_evidence(kind));
+                    let result = observation.decide("session-test", &surface, deadline);
+                    if malformed && present {
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            format!(
+                                "The recorded {} surface is still present. End it, then run `tabcli close-session session-test --explicit` again.",
+                                kind.display_name()
+                            )
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap(),
+                            if malformed {
+                                TerminalCloseAuthority::Absent
+                            } else {
+                                TerminalCloseAuthority::SurfaceOnly
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_disappearing_during_control_attestation_requires_independent_absence() {
+        let kind = terminal::TerminalKind::Ghostty;
+        let surface =
+            TerminalSession::new(kind, "42".into()).with_binding(Some("session-test".into()));
+        let owner = NativeSessionOwner {
+            terminal_tty: Some("/dev/test".into()),
+            terminal_tty_device: Some(1),
+            process_group: Some(4242),
+            terminal_process_group: Some(4242),
+            ..owner_record(Record::Bound).unwrap()
+        };
+        let observation = TestObservation::from_values(RecordValues {
+            owner: Some(owner),
+            state: SessionState::Ready,
+            launch: None,
+        })
+        .with_posix_owner_live(|_| OwnerAttestation {
+            process: ProcessObservation::Live(Attested::Incarnation),
+            control: ControlAttestation::Exited,
+            pid_alive: Some(true),
+        })
+        .with_evidence(terminal::close_evidence(kind))
+        .with_presence(|| Ok(false));
+        assert_eq!(
+            observation
+                .decide(
+                    "session-test",
+                    &surface,
+                    crate::native::session::close::budget::close_deadline()
+                )
+                .unwrap(),
+            TerminalCloseAuthority::Absent
+        );
+    }
+
+    #[test]
+    fn cleanup_gains_no_absence_authority_for_a_ready_session_without_an_owner() {
+        let kind = if cfg!(windows) {
+            terminal::TerminalKind::WindowsConsole
+        } else {
+            terminal::TerminalKind::Ghostty
+        };
+        let surface =
+            TerminalSession::new(kind, "42".into()).with_binding(Some("session-test".into()));
+        let observation = TestObservation::from_values(RecordValues {
+            owner: None,
+            state: SessionState::Ready,
+            launch: None,
+        })
+        .with_cause(CloseCause::Cleanup)
+        .with_presence(|| panic!("cleanup has no independent absence grant"));
+        assert_eq!(
+            observation
+                .decide(
+                    "session-test",
+                    &surface,
+                    crate::native::session::close::budget::close_deadline()
+                )
+                .unwrap_err()
+                .to_string(),
+            "terminal close requires a live native-session owner while the session is ready"
+        );
     }
 
     /// What the decision answers for a row.

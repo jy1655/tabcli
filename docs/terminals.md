@@ -314,6 +314,7 @@ earlier than the clock reading just before `new-session`, with exactly its one s
 pane. Each later operation checks that incarnation through a pidfd. Only its verified absence
 means the surface is gone; a live recorded server whose socket refuses is an error.
 
+TAB creates a private detached tmux server for each session, with no desktop window to end manually.
 `close-session --explicit` sends SIGTERM through a pidfd verified against the server birth,
 ending the whole session server, including any windows you added. The socket file stays in
 the session directory, inert, until the session is pruned.
@@ -546,7 +547,15 @@ Ghostty currently records no close intent. Its retained handle does not enable a
 retry after the owner ends. Without separate failed-start close authority or proof that the surface
 is absent, TAB refuses the close and retains the handle. Check the named surface in Ghostty.
 
-Windows repair can close the managed console whose owner exited, using the same close checks.
+Without a verified owner, ordinary explicit close of a macOS application surface requires proof
+that the recorded surface is absent. End a still-present surface and repeat
+`tabcli close-session SESSION --explicit`.
+
+Windows Repair retains an active managed console whose owner has gone and settles an exited
+or failed session from its records. Without a verified owner, explicit close of a retained console requires proof that
+its root process has ended. A live or uninspectable owner bound to the session without verified
+ownership prevents tab-host cleanup and settlement. TAB cannot close an active console with an
+invalid root PID or unusable root identity. End the console manually.
 Missing or unreadable evidence can stop repair. Run
 `sessions` to attempt repair. Use `inspect`, timeline, `result`, `search`, or `doctor` when you want
 to read the records without changing them.
@@ -559,12 +568,16 @@ window, so it does not bring the closed empty object back. See the
 [cleanup evidence](verification/2026-10-02-terminal-cleanup.md) and
 [follow-up verification](verification/2026-10-03-v0.1.0-issues.md) (Korean).
 
-On Windows, close ends the processes it finds in the managed console. It ends a remaining attested
+On Windows, an owned close ends the processes it finds in the managed console. It ends a remaining attested
 tab host last, with a successful exit, so Windows Terminal does not retain a failed tab. A process
 started during close can escape that enumeration; this limit applies to both surface forms. TAB
 ends an unattached root directly only when its records show that the wrapper never ran and its
 process identity still matches. The records must have no owner and no recorded spawn attempt;
 unreadable launch evidence does not qualify. Failure to attach alone is insufficient.
+
+Attached clients can keep a separate console window open after its root exits. In the Windows
+Terminal form, successful exit of the recorded tab host closes the tab and ends attached clients,
+including any wrapper or provider still attached.
 
 ## Focus and keyboard behaviour
 

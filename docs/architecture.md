@@ -764,15 +764,13 @@ completed teardown. An ambiguous identity retains the handle. The platform adapt
 surface close, and `terminal::ownership` performs owner teardown. `session::close` claims the
 handle, records the transition and tombstones, and converges interrupted Close.
 
-`terminal::close_authority::owner_exit` owns the ordinary dead-owner Close decision on macOS
-and Linux and the dead-owner Surface decision in Repair. Repair scans active then claimed
+An ordinary application surface without a verified owner requires independent proof of absence
+for explicit Close. Repair scans active then claimed
 handles through the same reader and retains damaged evidence. On macOS and Linux, Repair
 preserves an intent or a Surface that can outlive its owner for explicit Close. For a
 core-retained terminal see [Herdr close](agents/herdr.md#close-by-creation-record).
-An exited or failed console session settles from its
-Records. Repair uses the same handle claim as explicit Close when it must call an adapter.
-For terminal kinds other than Herdr, the platform differences remain and are tracked in
-[issue #421](https://github.com/jy1655/tabcli/issues/421).
+Windows Repair retains an active managed console for explicit Close and settles an exited
+or failed session from its Records.
 
 ## Where to add things
 

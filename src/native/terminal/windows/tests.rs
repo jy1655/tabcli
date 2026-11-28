@@ -272,6 +272,41 @@ fn verified_control_handle_retains_the_exact_process_object_after_exit() {
 }
 
 #[test]
+fn invalid_console_pid_is_an_error_for_verify_retain_terminate_and_wait() {
+    let identity = query_process_identity(std::process::id()).unwrap();
+    for error in [
+        verify_control_process_identity(0, &identity).unwrap_err(),
+        open_verified_control_process(0, &identity).unwrap_err(),
+        super::terminate_by_identity(0, &identity, Instant::now()).unwrap_err(),
+        super::wait_for_console_process_exit(0, &identity).unwrap_err(),
+    ] {
+        assert_eq!(
+            error.root_cause().to_string(),
+            "invalid Windows console pid"
+        );
+    }
+}
+
+#[test]
+fn conflicting_console_image_fails_verify_retain_terminate_and_wait() {
+    let (mut root, _pinned) = private_console_process();
+    let mut identity = query_process_identity(root.id()).unwrap();
+    identity.executable_path.push_str(".different");
+    for error in [
+        verify_control_process_identity(root.id(), &identity).unwrap_err(),
+        open_verified_control_process(root.id(), &identity).unwrap_err(),
+        super::terminate_by_identity(root.id(), &identity, Instant::now()).unwrap_err(),
+        super::wait_for_console_process_exit(root.id(), &identity).unwrap_err(),
+    ] {
+        assert_eq!(
+            error.root_cause().to_string(),
+            "Windows console process executable identity changed"
+        );
+    }
+    assert!(root.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn missing_console_process_converges_to_the_standard_missing_result() {
     let mut child = std::process::Command::new("cmd")
         .args(["/C", "exit", "0"])
@@ -279,15 +314,18 @@ fn missing_console_process_converges_to_the_standard_missing_result() {
         .unwrap();
     let pid = child.id();
     child.wait().unwrap();
-    let error = verify_control_process_identity(
-        pid,
-        &super::WindowsProcessIdentity {
-            creation_time: 0,
-            executable_path: String::new(),
-        },
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("no longer available"));
+    let identity = super::WindowsProcessIdentity {
+        creation_time: 0,
+        executable_path: String::new(),
+    };
+    assert!(!verify_control_process_identity(pid, &identity).unwrap());
+    let error = open_verified_control_process(pid, &identity).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::native::console_control::MISSING_PROCESS
+    );
+    super::terminate_by_identity(pid, &identity, Instant::now()).unwrap();
+    super::wait_for_console_process_exit(pid, &identity).unwrap();
 }
 
 #[test]
@@ -653,6 +691,86 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
         "{error:#}"
     );
     assert_eq!(host.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn absent_console_close_settles_only_after_cleaning_the_bound_tab_host() {
+    use crate::native::{
+        close::close_session_surface,
+        session::{
+            CoreRecord, SessionState, Store, test_support::lifecycle::write_owned_terminal_state,
+        },
+        terminal::{close_authority::CloseCause, ownership::NativeSessionOwner},
+    };
+    for in_tab in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session-retained");
+        std::fs::create_dir(&path).unwrap();
+        let (mut root, _pinned) = private_console_process();
+        write_owned_terminal_state(&path, "working", root.id());
+        let store = Store::open_unchecked(&path);
+        let bytes = store.record(CoreRecord::Terminal).bytes().unwrap();
+        std::fs::remove_file(store.record(CoreRecord::Owner).path()).unwrap();
+        let close = || {
+            close_session_surface(
+                &path,
+                "session-retained",
+                None,
+                CloseCause::Explicit,
+                crate::native::session::close::budget::close_deadline(),
+            )
+        };
+        let refused = close().unwrap_err();
+        assert_eq!(
+            refused.root_cause().to_string(),
+            "The recorded Windows Console surface is still present. End it, then run `tabcli close-session session-retained --explicit` again."
+        );
+        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), bytes);
+        root.kill().unwrap();
+        root.wait().unwrap();
+        let mut host = None;
+        if in_tab {
+            let record_path = path.join("console-host-process.json");
+            let record = crate::native::session::RecordStore::at(&record_path);
+            record.write_private(b"{").unwrap();
+            assert!(close().is_err());
+            assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), bytes);
+            let (child, _pin) = private_console_process();
+            let identity = query_process_identity(child.id()).unwrap();
+            record
+                .write_json(
+                    &serde_json::json!({ "schema": 1, "pid": child.id(), "identity": identity }),
+                )
+                .unwrap();
+            host = Some(child);
+        }
+        // The current test process stands in for an owner recorded with just a PID.
+        let pid = std::process::id();
+        store
+            .write_owner(&NativeSessionOwner {
+                managed_session_id: Some("session-retained".into()),
+                pid,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            close().unwrap_err().root_cause().to_string(),
+            format!(
+                "The recorded owner PID {pid} is live, but its process identity was not recorded"
+            )
+        );
+        if let Some(child) = &mut host {
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), bytes);
+        std::fs::remove_file(store.record(CoreRecord::Owner).path()).unwrap();
+        close().unwrap();
+        if let Some(child) = &mut host {
+            assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(0));
+        }
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        close().unwrap();
+    }
 }
 
 #[test]

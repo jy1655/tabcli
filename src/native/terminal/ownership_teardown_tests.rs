@@ -777,7 +777,7 @@ fn terminal_owner_second_verification_uses_close_deadline() {
 }
 
 #[test]
-fn owner_control_failure_or_reuse_grants_no_ordinary_surface_authority() {
+fn changed_live_control_refuses_and_reused_owner_requires_surface_absence() {
     use crate::native::process_identity::Attested;
     use crate::native::session::owner::ControlAttestation;
     for control in [
@@ -810,7 +810,7 @@ fn owner_control_failure_or_reuse_grants_no_ordinary_surface_authority() {
     let (dir, _, surface, _) = fixture(terminal::TerminalKind::Iterm2);
     let deadline = crate::native::session::close::budget::close_deadline();
     let result = TestObservation::on_records(dir.path(), "session-owner123", &surface, deadline)
-        .with_presence(|| panic!("reuse grants no absence"))
+        .with_presence(|| Ok(false))
         .with_owner_record(|_| panic!("not startup"))
         .with_pid_alive(|_| false)
         .with_posix_owner_live(|_| OwnerAttestation {
@@ -823,7 +823,7 @@ fn owner_control_failure_or_reuse_grants_no_ordinary_surface_authority() {
         .with_attest(|| panic!("reused"))
         .with_group_gone(|_| panic!("reused"))
         .decide("session-owner123", &surface, deadline);
-    assert!(result.is_err());
+    assert_eq!(result.unwrap(), TerminalCloseAuthority::Absent);
 }
 
 #[test]
@@ -859,7 +859,10 @@ fn r1_c8_reused_birth_resumes_only_through_exact_intent_at_authority_seam() {
         let deadline = crate::native::session::close::budget::close_deadline();
         let result =
             TestObservation::on_records(dir.path(), "session-owner123", &surface, deadline)
-                .with_presence(|| panic!("no surface observation granted"))
+                .with_presence(|| {
+                    assert!(!intent);
+                    Ok(false)
+                })
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
                 .with_posix_owner_live(observe)
@@ -873,7 +876,7 @@ fn r1_c8_reused_birth_resumes_only_through_exact_intent_at_authority_seam() {
         if intent {
             assert_eq!(result.unwrap(), TerminalCloseAuthority::SurfaceOnly);
         } else {
-            assert!(result.is_err());
+            assert_eq!(result.unwrap(), TerminalCloseAuthority::Absent);
         }
     }
 }

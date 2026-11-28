@@ -457,9 +457,13 @@ fn nested_windows_repair_rechecks_a_restored_copy_before_dispatch() {
                 ..Default::default()
             })
             .unwrap();
-        // Windows Repair dispatches a console. Its restored copy must state a foreign kind on this OS.
+        // A restored copy must state a foreign kind on this OS.
         let kind = if restore {
-            foreign_kind()
+            if cfg!(target_os = "macos") {
+                TerminalKind::Tmux
+            } else {
+                TerminalKind::Warp
+            }
         } else {
             TerminalKind::WindowsConsole
         };
@@ -469,7 +473,7 @@ fn nested_windows_repair_rechecks_a_restored_copy_before_dispatch() {
         let from = claimed.path().to_owned();
         let to = store.record(CoreRecord::Terminal).path().to_owned();
         let mut locks = 0;
-        let mut calls = 0;
+
         let changed = close_io_test::during(
             move |point| {
                 if point == Point::BeforeLock("turn claim lifecycle") {
@@ -483,32 +487,20 @@ fn nested_windows_repair_rechecks_a_restored_copy_before_dispatch() {
                 repair_owner(
                     &store,
                     |_| Ok(false),
-                    RepairSurfaces::Windows(&mut |surface| {
-                        assert_eq!(surface.kind, TerminalKind::WindowsConsole);
-                        calls += 1;
-                        Ok(terminal::CloseOutcome::Missing)
-                    }),
+                    RepairSurfaces::Windows,
                     budget::close_deadline(),
                     None,
                 )
             },
         )
         .unwrap();
-        assert_eq!(changed, !restore);
-        assert_eq!(calls, usize::from(!restore));
-        assert_eq!(
-            store.status().unwrap().state,
-            if restore {
-                SessionState::Working
-            } else {
-                SessionState::Closed
-            }
-        );
+        assert!(!changed);
+        assert_eq!(store.status().unwrap().state, SessionState::Working);
         assert_eq!(
             store.record(CoreRecord::Terminal).bytes().unwrap(),
-            restore.then_some(bytes)
+            restore.then_some(bytes.clone())
         );
-        assert!(!claimed.present().unwrap());
+        assert_eq!(claimed.bytes().unwrap(), (!restore).then_some(bytes));
     }
 }
 

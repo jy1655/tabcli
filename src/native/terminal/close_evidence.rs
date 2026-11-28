@@ -68,7 +68,7 @@ static PRESENCE_ONLY: PresenceOnly = PresenceOnly {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT: PresenceOnly = PresenceOnly {
     ownerless_context: Some(
-        "could not prove absence of the ownerless startup surface; no close was sent",
+        "could not prove absence of the ownerless terminal surface; no close was sent",
     ),
 };
 
@@ -198,7 +198,7 @@ mod tests {
             };
             let ownerless: &[&str] = if with_context {
                 &[
-                    "could not prove absence of the ownerless startup surface; no close was sent",
+                    "could not prove absence of the ownerless terminal surface; no close was sent",
                     "presence cause",
                 ]
             } else {
