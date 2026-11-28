@@ -518,7 +518,7 @@ def record_run(output, cwd, command=None, stream=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    record = commands.add_parser("run", help="run the unchanged serial Cargo test command")
+    record = commands.add_parser("run", help="run the serial Cargo test command")
     record.add_argument("--output-dir", type=Path, required=True, help="new artifact directory")
     comparison = commands.add_parser("compare", help="compare two downloaded timings.json files")
     comparison.add_argument("before", type=Path)
