@@ -22,7 +22,7 @@ jobs:
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features -- --test-threads=1
+      - run: cargo test --all-targets --all-features --no-fail-fast -- --test-threads=1
         # A hang fails here instead of at the 6-hour job limit; this step normally takes under 3 minutes.
         timeout-minutes: 20
 
@@ -30,6 +30,9 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     strategy:
+      # A failing runner does not cancel the others, and the test steps run every test target
+      # (`--no-fail-fast`), so one run reports every failure.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -62,7 +65,7 @@ jobs:
         if: runner.os != 'Windows'
         # A hang fails here instead of at the 6-hour job limit; macOS normally takes 3-7 minutes.
         timeout-minutes: 30
-        run: cargo test --all-targets --all-features -- --test-threads=1
+        run: cargo test --all-targets --all-features --no-fail-fast -- --test-threads=1
       - name: Run Windows serial tests with timing
         if: runner.os == 'Windows'
         # Fixtures use the runner's temporary-storage volume while it is NTFS; see

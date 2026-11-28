@@ -138,7 +138,7 @@ jobs:
         # A hang fails here instead of at the 6-hour job limit. This step also runs Windows
         # tests for historical tags, which took up to 22 minutes there, so it has Windows's bound.
         timeout-minutes: 60
-        run: cargo test --all-targets --all-features -- --test-threads=1
+        run: cargo test --all-targets --all-features --no-fail-fast -- --test-threads=1
       - name: Run Windows serial tests with timing
         if: runner.os == 'Windows' && hashFiles('scripts/ci_test_timing.py') != ''
         # Fixtures use the runner's temporary-storage volume while it is NTFS; see

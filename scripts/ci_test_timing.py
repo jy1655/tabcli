@@ -15,7 +15,8 @@ import sys
 import time
 
 
-COMMAND = ["cargo", "test", "--all-targets", "--all-features", "--", "--test-threads=1"]
+COMMAND = ["cargo", "test", "--all-targets", "--all-features", "--no-fail-fast", "--",
+           "--test-threads=1"]
 # An absolute directory for the tests' TEMP and TMP, used only on an NTFS volume (see
 # docs/testing.md#windows-ci-performance-observations). Not passed on to the tests.
 FIXTURE_TEMP_ENV = "CI_TEST_FIXTURE_TEMP"
@@ -517,7 +518,7 @@ def record_run(output, cwd, command=None, stream=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    record = commands.add_parser("run", help="run the unchanged serial Cargo test command")
+    record = commands.add_parser("run", help="run the serial Cargo test command")
     record.add_argument("--output-dir", type=Path, required=True, help="new artifact directory")
     comparison = commands.add_parser("compare", help="compare two downloaded timings.json files")
     comparison.add_argument("before", type=Path)

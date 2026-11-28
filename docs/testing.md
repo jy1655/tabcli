@@ -248,7 +248,11 @@ trip rather than enabling every ignored test, which also runs the subprocess fix
 | Integration packages | Ubuntu | Build, verify and upload host integration packages |
 
 The formatting command in CI is `cargo fmt --all -- --check`; Clippy uses
-`cargo clippy --all-targets --all-features -- -D warnings`. Tests use the serial command above.
+`cargo clippy --all-targets --all-features -- -D warnings`. Tests use the serial command above
+with `--no-fail-fast`, here and in the Release workflow, and a failing stable Rust runner does not
+cancel the others, so one run reports every failing test target on every runner. On Windows a
+release rehearsal of `v0.4.27` to `v0.4.51` runs that tag's recorder and still stops at the first
+failing target; an earlier tag has no recorder and takes the workflow's command.
 Each serial test step has a `timeout-minutes` bound so that a hang fails in bounded time: 20
 minutes for the minimum Rust job, 30 for Linux and macOS, and 60 for Windows and for both Release
 test steps, one of which also runs Windows tests for historical tags.
