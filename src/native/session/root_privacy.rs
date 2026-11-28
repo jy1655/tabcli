@@ -22,16 +22,29 @@ pub(super) use diagnosis::Observation;
 use diagnosis::{Cause, Entries, Flags};
 pub(in crate::native) use diagnosis::{Diagnosis, RootStatus};
 
+fn missing_below_directory(path: &Path) -> bool {
+    // As in directory creation, stop at the first existing name, including a
+    // link. Only an ancestor may be followed to check whether it is a directory.
+    let path = path.components().as_path();
+    for ancestor in path.ancestors() {
+        let name = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match std::fs::symlink_metadata(name) {
+            Ok(_) => return ancestor != path && name.is_dir(),
+            Err(error) if Cause::of(&error) == Cause::Missing => continue,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 impl Action {
     fn open_failure(self, path: &Path, error: std::io::Error) -> anyhow::Error {
-        // An open follows the final link. Only a separate no-follow inspection
-        // can distinguish an absent name from a link whose target is missing.
         let cause = Cause::of(&error);
-        if self == Self::Inspect
-            && cause == Cause::Missing
-            && std::fs::symlink_metadata(path.components().as_path())
-                .is_err_and(|e| Cause::of(&e) == Cause::Missing)
-        {
+        if self == Self::Inspect && cause == Cause::Missing && missing_below_directory(path) {
             return Observation::Absent.render(path, &self.unopened(), Flags::None, None);
         }
         let issue = if cause == Cause::NotDirectory {

@@ -132,29 +132,26 @@ fn doctor_reports_a_missing_root_without_creating_it() {
     }
 }
 
-#[test]
-fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
-    let temp = tempfile::tempdir().unwrap();
-    let parent = temp.path();
-    let target = parent.join("target");
-    let root = parent.join("root");
-    std::fs::create_dir(&target).unwrap();
+const SELECT_ROOT: &str = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+
+fn directory_link(target: &Path, link: &Path) {
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&target, &root).unwrap();
+    std::os::unix::fs::symlink(target, link).unwrap();
     #[cfg(windows)]
     {
         let output = Command::new("cmd")
             .args(["/d", "/c", "mklink", "/J"])
-            .arg(&root)
-            .arg(&target)
+            .arg(link)
+            .arg(target)
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
     }
-    let destination = std::fs::read_link(&root).unwrap();
-    std::fs::remove_dir(&target).unwrap();
+}
+
+fn missing_open_detail(root: &Path) -> String {
     #[cfg(unix)]
-    let error = std::fs::File::open(&root).unwrap_err();
+    let error = std::fs::File::open(root).unwrap_err();
     #[cfg(windows)]
     let error = {
         use std::os::windows::fs::OpenOptionsExt;
@@ -164,7 +161,7 @@ fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
         std::fs::OpenOptions::new()
             .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&root)
+            .open(root)
             .unwrap_err()
     };
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -173,11 +170,23 @@ fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
     } else {
         "open state directory"
     };
-    let remedy = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
-    let detail = format!(
-        "state root {}: {operation}; {remedy}: {error}",
+    format!(
+        "state root {}: {operation}; {SELECT_ROOT}: {error}",
         root.display()
-    );
+    )
+}
+
+#[test]
+fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path();
+    let target = parent.join("target");
+    let root = parent.join("root");
+    std::fs::create_dir(&target).unwrap();
+    directory_link(&target, &root);
+    let destination = std::fs::read_link(&root).unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    let detail = missing_open_detail(&root);
     let warning = format!("warning: {detail}");
     for args in [
         &["settings", "macos-open-mode", "tab-first"][..],
@@ -194,9 +203,43 @@ fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
     }
     let doctor = diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
     assert_eq!(doctor["reason_code"], "state_root_unreadable");
-    assert_eq!(doctor["next_action"], remedy);
+    assert_eq!(doctor["next_action"], SELECT_ROOT);
     assert_eq!(doctor["detail"], detail);
     assert_eq!(std::fs::read_link(&root).unwrap(), destination);
+    assert!(!target.exists());
+}
+
+#[test]
+fn doctor_and_settings_select_another_root_when_an_ancestor_link_dangles() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    let ancestor = temp.path().join("ancestor");
+    std::fs::create_dir(&target).unwrap();
+    directory_link(&target, &ancestor);
+    let destination = std::fs::read_link(&ancestor).unwrap();
+    let missing_parent = ancestor.join("missing");
+    let root = missing_parent.join("root");
+
+    let doctor = || diagnosis(&root, &["doctor", "--provider", "pi", "--json"]);
+    let row = doctor();
+    assert_eq!(row["reason_code"], "state_root_absent");
+    assert_eq!(row["next_action"], "TAB creates it at the first session.");
+    // This succeeds only if inspection left the linked directory empty.
+    std::fs::remove_dir(&target).unwrap();
+
+    let row = doctor();
+    let output = run(&root, &["settings", "macos-open-mode", "tab-first"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected = format!(
+        "Error: failed to create state directory {}; {SELECT_ROOT}",
+        missing_parent.display()
+    );
+    assert_eq!(stderr.lines().next(), Some(expected.as_str()), "{stderr}");
+    assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
+    assert_eq!(row["next_action"], SELECT_ROOT);
+    assert_eq!(row["detail"], missing_open_detail(&root));
+    assert_eq!(std::fs::read_link(&ancestor).unwrap(), destination);
     assert!(!target.exists());
 }
 

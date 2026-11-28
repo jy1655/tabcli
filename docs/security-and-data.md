@@ -221,10 +221,10 @@ On macOS the root must report no extended ACL, including an inherited or zero-en
 For a recognized TAB directory with an extended ACL, TAB identifies the entry when readable.
 Clear a user immutable flag with `chflags nouchg` before retrying a permission repair. An
 administrator must clear a system immutable flag. When TAB reads an extended ACL on a
-recognized root with no immutable flag or failed permission change, it names `chmod -N`
-for that directory. If macOS denies the directory open or
-ACL read with an unexplained permission error (`EPERM`), TAB advises checking the terminal's
-privacy access even when it cannot establish which entries the directory holds.
+recognized root with no immutable flag or failed permission change, it names `chmod -N` for
+that directory. If macOS denies the directory open or ACL read with an unexplained permission
+error (`EPERM`), TAB advises checking the terminal's privacy access even when it cannot
+establish which entries the directory holds.
 
 On Windows the root must have a protected DACL whose only entry grants the token user
 inheritable full control. Its owner must match the token user or default owner.
@@ -240,6 +240,9 @@ repair, set `AGENT_BRIDGE_NATIVE_STATE_DIR` to a directory meant for TAB. When r
 privacy failure, doctor, Session creators and standalone writers give the same advice if
 they cannot determine whether the directory holds a TAB entry, except for the macOS privacy
 access advice above. The Windows DACL can still be repaired when the owner is refused.
+Doctor's `state_root` row reports a missing root as absent only when its nearest existing
+ancestor resolves to a directory, without testing whether permissions, a read-only filesystem
+or a quota would prevent creation.
 These checks cover the root itself at preparation time. Ancestor security and descendant ACLs
 are outside the check. Administrators and the operating system can still access the data.
 
