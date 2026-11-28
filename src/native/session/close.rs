@@ -693,7 +693,16 @@ fn close_native_locked(
     let result = match crate::native::session::close::budget::close_remaining(deadline)
         .and_then(|_| close_terminal(&terminal))
         .and_then(|result| {
-            crate::native::session::close::budget::close_remaining(deadline)?;
+            let remaining = budget::close_remaining(deadline);
+            // Windows Herdr has no teardown intent to replay the confirmed stops.
+            #[cfg(windows)]
+            let remaining = remaining.map_err(|expired| match &result.reason {
+                Some(reason) if terminal.kind == terminal::TerminalKind::Herdr => {
+                    expired.context(format!("{reason}; the handle is retained"))
+                }
+                _ => expired,
+            });
+            remaining?;
             Ok(result)
         }) {
         Ok(result) => result,
@@ -702,6 +711,12 @@ fn close_native_locked(
             return Err(error);
         }
     };
+    #[cfg(windows)]
+    let teardown_reason = result
+        .reason
+        .as_ref()
+        .filter(|_| terminal.kind == terminal::TerminalKind::Herdr)
+        .cloned();
     if result.reason.is_some() || result.keeps_diagnosis {
         let diagnosis = if result.keeps_diagnosis {
             status.error.clone().or(result.generated_reason)
@@ -722,9 +737,24 @@ fn close_native_locked(
     // Only this path has the adapter's positive close/absence result. No-handle
     // close, repair, and replay of a consumed handle cannot clear the observation.
     let cleared = status.residual_surface().map(|_| ResidualSurface::Cleared);
-    finish_consumption(consume_result, || {
+    let finished = finish_consumption(consume_result, || {
         mark_session_closed_with_residual_locked(store, marker, &claim_path, close_error, cleared)
-    })
+    });
+    #[cfg(windows)]
+    let finished = finished.map_err(|error| {
+        let Some(reason) = teardown_reason else {
+            return error;
+        };
+        // A published marker already carries the stops, even if its write reported a sync error.
+        if matches!(marker.observe(store), Ok(Some(facts)) if facts.committed) {
+            error
+        } else if closing.present().unwrap_or(false) {
+            error.context(format!("{reason}; the claimed handle is kept for a retry"))
+        } else {
+            error.context(reason)
+        }
+    });
+    finished
 }
 
 // Native consumption can fail after changing records. Finish from disk and return the

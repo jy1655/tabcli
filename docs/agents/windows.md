@@ -20,6 +20,19 @@
   host (`windows/launch_host.rs`) starts the same PowerShell root through
   `console_root_arguments`; change that root in one place for both surfaces.
 
+- With a live attested Herdr owner, explicit close requires `not_found` from the bound core at
+  the recorded local address before ending processes outside the terminal.
+  The targets are the session's provider in `provider-process.json` and wrapper in
+  `native-session.json`. Each verified target has one handle for its PID, creation time,
+  case-insensitive image path, termination and bounded exit confirmation.
+  Close skips the provider if its record is missing, unreadable, foreign, invalid, or changed
+  during the close, or if its recorded incarnation is proven gone. The close result identifies
+  the skipped provider or record error.
+  If a validly recorded provider could still be live and its identity cannot be verified, close
+  keeps the terminal handle and ends neither process.
+  Windows has no foreground process group and TAB places the interactive provider in no job
+  object, so its descendants can survive.
+
 - A managed console on native Windows is a tab of Windows Terminal, and a console window
   of its own only when no tab can be had: `wt.exe` is not on an absolute `PATH` entry, the
   desktop has no shell window, a path is one that Windows Terminal would alter, or no tab

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use std::{path::Path, time::Duration};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(in crate::native) struct NativeSessionOwner {
     pub(in crate::native) pid: u32,
     #[serde(

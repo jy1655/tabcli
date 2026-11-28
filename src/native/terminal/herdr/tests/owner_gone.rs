@@ -2229,22 +2229,26 @@ fn a_replay_keeps_a_committed_marker_and_repairs_a_damaged_one() {
     );
 }
 
-// The close with a live owner is unchanged by the owner's decision.
-// Its ownership proof needs the terminal present and running on its recorded core. The surface
-// part of that proof is the production one here (`verify_surface` through the Herdr adapter on
-// the scripted core): a finished terminal fails it on every OS; an absent one fails it on
-// Windows, and on macOS and Linux its proven absence leads to the live owner's teardown, which
-// has its own checks (scripted to pass here). Nothing is sent to the core in any of these.
+// All three runners decide the same Herdr rows on a scripted, identity-bound core.
 #[test]
-fn a_live_owner_close_needs_its_terminal_running() {
+fn live_herdr_owner_requires_teardown_only_on_proven_absence() {
     use crate::native::terminal::close_authority::{
         TerminalCloseAuthority, decide, test_support::TestObservation,
     };
     type Terminal = fn(&Fixture);
-    let rows: [(&str, Terminal); 3] = [
+    let rows: [(&str, Terminal); 6] = [
         ("running", |_| {}),
         ("finished", Fixture::finish),
         ("absent", Fixture::remove),
+        ("kept", |fixture| {
+            fixture.core.set("t7", "keep", json!(true))
+        }),
+        ("core unavailable", |fixture| {
+            fixture.core.0.borrow_mut().running = false
+        }),
+        ("different core", |fixture| {
+            fixture.core.0.borrow_mut().core_id = "core-b".into()
+        }),
     ];
     for (label, change) in rows {
         let fixture = Fixture::new("ready", &complete_owner());
@@ -2292,24 +2296,101 @@ fn a_live_owner_close_needs_its_terminal_running() {
                         crate::native::terminal::windows_dispatch::verify_surface(
                             &dispatch, &surface, None,
                         )
+                    })
+                    .with_presence(|| {
+                        crate::native::terminal::windows_dispatch::surface_present(
+                            &dispatch,
+                            &fixture.directory,
+                            &surface,
+                            std::time::Duration::from_secs(60),
+                        )
                     });
             decide(&observation, SESSION, &surface, deadline)
         };
+        // Exercise the Windows proof decision with the same core even on POSIX runners.
+        let dispatch = crate::native::terminal::windows_dispatch::Dispatch::new(
+            Adapter::with_core(fixture.console.clone()),
+            Adapter::with_core(fixture.core.clone()),
+        );
+        use crate::native::terminal::{
+            close_authority::windows_live_herdr_teardown, windows_dispatch,
+        };
+        let projected = windows_live_herdr_teardown(
+            windows_dispatch::verify_surface(&dispatch, &surface, None),
+            CloseCause::Explicit,
+            || {
+                windows_dispatch::surface_present(
+                    &dispatch,
+                    &fixture.directory,
+                    &surface,
+                    Duration::from_secs(60),
+                )
+            },
+        );
+        match label {
+            "running" => assert!(!projected.unwrap()),
+            "finished" | "kept" | "core unavailable" | "different core" => {
+                assert!(projected.is_err())
+            }
+            _ => assert!(
+                projected.unwrap(),
+                "the absent Windows Herdr terminal requires teardown"
+            ),
+        }
         match label {
             "running" => assert_eq!(answer.unwrap(), TerminalCloseAuthority::LiveOwner),
+            "kept" | "core unavailable" | "different core" => assert!(answer.is_err()),
             "finished" => {
                 let text = error_text(&answer.unwrap_err());
-                assert!(text.contains("has finished"), "{label}: {text}");
+                assert_eq!(text, "Herdr terminal t7 has finished");
             }
             _ => {
                 #[cfg(unix)]
                 assert_eq!(answer.unwrap(), TerminalCloseAuthority::OwnerTeardown);
                 #[cfg(windows)]
-                assert!(answer.is_err(), "{label}: {answer:?}");
+                assert_eq!(
+                    answer.unwrap(),
+                    TerminalCloseAuthority::WindowsHerdrTeardown(Box::new(complete_owner()))
+                );
             }
         }
         assert_eq!(fixture.mutations(), (0, 0), "{label}");
     }
+}
+
+#[test]
+fn cleanup_of_an_absent_live_herdr_terminal_never_selects_windows_teardown() {
+    use crate::native::terminal::{close_authority, windows_dispatch};
+    let fixture = Fixture::new("ready", &complete_owner());
+    fixture.remove();
+    let surface = fixture.store().terminal().unwrap();
+    let dispatch = windows_dispatch::Dispatch::new(
+        Adapter::with_core(fixture.console.clone()),
+        Adapter::with_core(fixture.core.clone()),
+    );
+    let proof = || windows_dispatch::verify_surface(&dispatch, &surface, None);
+    let presence = || panic!("cleanup cannot request presence for teardown");
+    let error =
+        close_authority::windows_live_herdr_teardown(proof(), CloseCause::Cleanup, presence)
+            .unwrap_err();
+    assert_eq!(error.to_string(), "Herdr terminal t7 no longer exists");
+    #[cfg(windows)]
+    {
+        let deadline = later();
+        let observation = close_authority::test_support::TestObservation::on_records(
+            &fixture.directory,
+            SESSION,
+            &surface,
+            deadline,
+        )
+        .with_owner_record(|_| live_other())
+        .with_cause(CloseCause::Cleanup)
+        .with_proof(proof)
+        .with_presence(presence);
+        let error = close_authority::decide(&observation, SESSION, &surface, deadline).unwrap_err();
+        assert_eq!(error.to_string(), "Herdr terminal t7 no longer exists");
+    }
+    assert_eq!(fixture.mutations(), (0, 0));
 }
 
 // The attestation reads the owner's birth, then its control identity.
@@ -2871,3 +2952,6 @@ fn a_claimed_foreign_herdr_birth_is_evidence_only_after_restore() {
     assert!(fixture.console.methods().is_empty());
     assert_eq!(store.status().unwrap().state, SessionState::Closed);
 }
+
+#[cfg(windows)]
+mod windows_live;

@@ -49,11 +49,11 @@ pub(in crate::native) use process::{QueriedProcess, observe_process_identity};
 mod security;
 mod tab;
 pub(in crate::native) use process::query_process_identity;
-pub(super) use process::verify_process_identity;
 use process::{
     open_verified_control_process, query_process_identity_from_handle,
     verify_control_process_identity,
 };
+pub(super) use process::{pin_teardown_process, verify_process_identity};
 pub(in crate::native) use security::{process_user_sid, set_private_permissions};
 pub(super) use tab::run_host as run_console_host;
 

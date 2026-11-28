@@ -25,8 +25,11 @@
 - Without a verified owner, a retained Windows console requires proof of root absence before tab-host cleanup and settlement.
   A bound owner whose process may still be live and whose ownership cannot be verified prevents both.
 - When the Herdr core proves the terminal absent, explicit close on macOS and Linux ends the
-  live attested owner's foreground process group and settles the session. Windows refuses the
-  close because it has no foreground process group ([#421](https://github.com/jy1655/tabcli/issues/421)).
+  live attested owner's foreground process group and settles the session. On Windows, explicit
+  close ends the recorded provider and then the wrapper, confirming their exits before settling.
+  A valid provider record whose process may be live but cannot be inspected blocks both stops.
+  Windows has no foreground process group and TAB places the interactive provider in no job
+  object, so descendants can survive ([#461](https://github.com/jy1655/tabcli/issues/461)).
 - An owned Windows console close can
   settle on root exit while the verified wrapper survives
   ([#460](https://github.com/jy1655/tabcli/issues/460)).

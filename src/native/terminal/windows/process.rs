@@ -5,12 +5,13 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Storage::FileSystem::SYNCHRONIZE,
     System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW, WaitForSingleObject,
+        GetProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     },
 };
 
 use super::WindowsProcessIdentity;
+use crate::native::terminal::close_authority::windows_herdr::ProcessPin;
 
 pub(super) fn verify_control_process_identity(
     pid: u32,
@@ -177,6 +178,75 @@ fn observe_process_identity_from_handle(
             Err(std::io::Error::last_os_error()).context("failed to observe Windows process exit")
         }
         other => bail!("unexpected Windows process wait result {other}"),
+    }
+}
+
+pub(in crate::native::terminal) fn pin_teardown_process(
+    pid: u32,
+    identity: &WindowsProcessIdentity,
+) -> Result<ProcessPin<OwnedHandle>> {
+    anyhow::ensure!(
+        identity.creation_time != 0 && !identity.executable_path.is_empty(),
+        "incomplete recorded Windows process identity"
+    );
+    let Some((handle, live)) = open_observed_process(pid, PROCESS_TERMINATE)? else {
+        return Ok(ProcessPin::Exited);
+    };
+    let live_pid = unsafe { GetProcessId(handle.as_raw_handle()) };
+    if live_pid == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("could not read the pinned Windows process PID");
+    }
+    anyhow::ensure!(
+        live_pid == pid,
+        "recorded Windows process {pid} pinned a handle for PID {live_pid}"
+    );
+    if live.creation_time != identity.creation_time {
+        return Ok(ProcessPin::Reused);
+    }
+    anyhow::ensure!(
+        live.executable_path
+            .eq_ignore_ascii_case(&identity.executable_path),
+        "recorded Windows process {pid} has a different executable at the same creation time"
+    );
+    Ok(ProcessPin::Live(handle))
+}
+
+impl crate::native::terminal::close_authority::windows_herdr::PinnedProcess for OwnedHandle {
+    fn exited(&self) -> Result<bool> {
+        match unsafe { WaitForSingleObject(self.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(std::io::Error::last_os_error())
+                .context("failed to observe Windows process exit"),
+            other => bail!("unexpected Windows process wait result {other}"),
+        }
+    }
+
+    fn stop(&self, deadline: std::time::Instant) -> Result<bool> {
+        use crate::native::session::close::budget::close_remaining;
+        if self.exited()? {
+            return Ok(false);
+        }
+        close_remaining(deadline)?;
+        if unsafe { TerminateProcess(self.as_raw_handle(), 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if self.exited()? {
+                return Ok(false);
+            }
+            return Err(error).context("failed to terminate Windows process");
+        }
+        let remaining = close_remaining(deadline)?;
+        let millis = remaining.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        match unsafe { WaitForSingleObject(self.as_raw_handle(), millis) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => {
+                bail!("Windows process exit was not confirmed within the close deadline")
+            }
+            WAIT_FAILED => Err(std::io::Error::last_os_error())
+                .context("failed to wait for Windows process exit"),
+            other => bail!("unexpected Windows process wait result {other}"),
+        }
     }
 }
 
