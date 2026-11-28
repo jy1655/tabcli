@@ -161,6 +161,66 @@ mod unix {
     }
 
     #[test]
+    fn doctor_mode_remedy_depends_on_a_real_tab_entry() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let select = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let chmod = format!(
+            "restore owner permissions with chmod 700 '{}'",
+            root.path().display()
+        );
+        for (marked, suffix, action) in [
+            (
+                false,
+                format!(
+                    "the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); {select}"
+                ),
+                select,
+            ),
+            (true, chmod.clone(), chmod.as_str()),
+        ] {
+            if marked {
+                fs::create_dir(root.path().join("workspace-consent")).unwrap();
+            }
+            let row = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+            assert_eq!(
+                row["detail"],
+                format!(
+                    "state root {}: mode 0750, expected 0700; {suffix}",
+                    root.path().display()
+                )
+            );
+            assert_eq!(row["next_action"], action);
+            assert_eq!(mode(root.path()), 0o750);
+        }
+    }
+
+    #[test]
+    fn doctor_reports_a_failed_tab_entry_check_without_changing_search_access() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("requires a caller subject to directory search permissions");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("workspace-consent")).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o400)).unwrap();
+        let row = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+        let after = mode(root.path());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let remedy = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(
+            row["detail"],
+            format!(
+                "state root {}: mode 0400, expected 0700; cannot determine whether the directory holds a TAB entry (inspect TAB entries: {denied}); {remedy}",
+                root.path().display()
+            )
+        );
+        assert_eq!(row["next_action"], remedy);
+        assert_eq!(after, 0o400);
+    }
+
+    #[test]
     fn standalone_consent_prepares_the_root_before_creating_its_records() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("state");
@@ -187,7 +247,7 @@ mod unix {
         assert_eq!(row["reason_code"], "state_root_not_private");
         assert_eq!(
             row["next_action"],
-            "Session creation repairs what it can. Otherwise, follow the remedy in the detail."
+            "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
         );
         assert_eq!(mode(&dir), 0o750);
         successful(run(&root, &["settings", "macos-open-mode", "tab-first"]));
@@ -209,6 +269,11 @@ mod unix {
         symlink(&target, &root).unwrap();
         successful(run(&root, &["settings", "macos-open-mode", "tab-first"]));
         fs::set_permissions(&target, fs::Permissions::from_mode(0o300)).unwrap();
+        let reason = format!(
+            "warning: state root {}: open state directory; cannot determine whether the directory holds a TAB entry; set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB: {}",
+            root.display(),
+            std::io::Error::from_raw_os_error(libc::EACCES)
+        );
         for action in ["revoke", "reset"] {
             let output = run(
                 &root,
@@ -217,19 +282,13 @@ mod unix {
             let warning = String::from_utf8(output.stderr.clone()).unwrap();
             let record = successful(output);
             assert_eq!(record["revoked"], action == "revoke");
-            assert!(
-                warning.starts_with(&format!("warning: state root {}: ", root.display())),
-                "{warning}"
-            );
+            assert_eq!(warning.lines().next(), Some(reason.as_str()), "{warning}");
             assert_eq!(mode(&target), 0o300);
         }
         let output = run(&root, &["settings", "macos-open-mode", "tab-first"]);
         let warning = String::from_utf8(output.stderr).unwrap();
         // Syncing a settings write may itself need read access to the root.
-        assert!(
-            warning.starts_with(&format!("warning: state root {}: ", root.display())),
-            "{warning}"
-        );
+        assert_eq!(warning.lines().next(), Some(reason.as_str()), "{warning}");
         assert_eq!(mode(&target), 0o300);
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -254,7 +313,7 @@ mod unix {
         assert_eq!(row["reason_code"], "state_root_unreadable");
         assert_eq!(
             row["next_action"],
-            "Check access to the directory and its parents, then rerun doctor."
+            "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
         );
         assert!(fs::read_dir(&root).unwrap().next().is_none());
     }
@@ -385,7 +444,7 @@ mod unix {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_directory_list_denial_reports_acl_remedy() {
+    fn macos_directory_list_denial_reports_unknown_tab_membership() {
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("requires a caller subject to directory access checks");
             return;
@@ -403,10 +462,23 @@ mod unix {
                 .unwrap()
                 .success()
         );
-        let remedy = format!("run chmod -N '{}' and retry", root.path().display());
+        let remedy = "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
+        let reason = format!(
+            "state root {}: owner mode permits access but the directory open was denied; cannot determine whether the directory holds a TAB entry; {remedy}: {}",
+            root.path().display(),
+            std::io::Error::from_raw_os_error(libc::EACCES)
+        );
         assert_eq!(row["reason_code"], "state_root_unreadable");
-        assert!(row["detail"].as_str().unwrap().contains(&remedy), "{row}");
-        assert!(String::from_utf8(output.stderr).unwrap().contains(&remedy));
+        assert_eq!(row["detail"], reason);
+        assert_eq!(row["next_action"], remedy);
+        assert_eq!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+            format!("warning: {reason}")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -417,6 +489,15 @@ mod unix {
         // Darwin's well-known GUID for the everyone principal.
         let refusal = "ACL entry 0 (deny, principal abcdefab-cdef-abcd-efab-cdef0000000c); the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
         let workspace = root.path().to_str().unwrap();
+        let doctor = diagnosis(root.path(), &["doctor", "--provider", "pi", "--json"]);
+        assert_eq!(
+            doctor["detail"],
+            format!("state root {workspace}: {refusal}")
+        );
+        assert_eq!(
+            doctor["next_action"],
+            "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
+        );
         for args in [
             &["settings", "macos-open-mode", "tab-first"][..],
             &["consent", "revoke", workspace, "--json"],

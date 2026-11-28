@@ -2,7 +2,7 @@
 //! distinguishes an absent ACL property from an unreadable descriptor.
 use super::*;
 use std::{
-    ffi::{CStr, c_int, c_void},
+    ffi::{c_int, c_void},
     os::fd::AsRawFd,
     ptr::{self, NonNull},
 };
@@ -98,71 +98,6 @@ fn first_entry(acl: &AclAllocation) -> String {
     format!("ACL entry 0 ({named}, principal {text})")
 }
 
-fn has_tab_entry(root: &File) -> io::Result<bool> {
-    // fdopendir owns the duplicate; readdir and fstatat stay on the opened root.
-    let duplicate = root.try_clone()?;
-    use std::os::fd::IntoRawFd;
-    let stream = unsafe { libc::fdopendir(duplicate.as_raw_fd()) };
-    if stream.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let _ = duplicate.into_raw_fd();
-    struct Stream(*mut libc::DIR);
-    impl Drop for Stream {
-        fn drop(&mut self) {
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-    let stream = Stream(stream);
-    loop {
-        unsafe {
-            *libc::__error() = 0;
-        }
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(0) {
-                Ok(false)
-            } else {
-                Err(error)
-            };
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let Ok(text) = name.to_str() else { continue };
-        if !super::super::tab_entry(text, true, true) {
-            continue;
-        }
-        let mut stat = std::mem::MaybeUninit::uninit();
-        if unsafe {
-            libc::fstatat(
-                root.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::NotFound {
-                continue;
-            }
-            return Err(error);
-        }
-        let kind = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
-        if super::super::tab_entry(text, kind == libc::S_IFDIR, kind == libc::S_IFREG) {
-            return Ok(true);
-        }
-    }
-}
-
-pub(super) fn is_immutable(file: &File) -> bool {
-    use std::os::darwin::fs::MetadataExt;
-    file.metadata()
-        .is_ok_and(|meta| meta.st_flags() & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0)
-}
-
 pub(super) fn clear_acl(file: &File) -> io::Result<()> {
     let sec = FileSec::new()?;
     let mode: libc::mode_t = 0o700;
@@ -177,21 +112,6 @@ pub(super) fn clear_acl(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn acl_remedy(path: &Path) -> String {
-    format!(
-        "run chmod -N '{}' and retry",
-        path.display().to_string().replace('\'', "'\\''")
-    )
-}
-
 pub(super) fn first_acl_entry(file: &File) -> io::Result<Option<String>> {
     acl(file).map(|acl| acl.as_ref().map(first_entry))
-}
-
-pub(super) fn acl_removal_allowed(file: &File, mode: u32) -> io::Result<bool> {
-    // Search may need the owner's mode restored before it can see TAB entries.
-    if mode != 0o700 {
-        file.set_permissions(fs::Permissions::from_mode(0o700))?;
-    }
-    has_tab_entry(file)
 }

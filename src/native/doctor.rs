@@ -369,47 +369,38 @@ fn terminal_selection_check(
     )
 }
 
-fn state_root_check() -> Check {
-    use crate::native::session::root_privacy::{self, Action, Mismatch};
-    let result = Reader::state_root().and_then(|root| root_privacy::check(&root, Action::Inspect));
-    let (availability, reason, detail, next_action) = match result {
-        Ok(_) => (
+pub(in crate::native) fn state_root_check() -> Check {
+    state_root_diagnosis(crate::native::session::root_privacy::inspect_selected())
+}
+
+pub(in crate::native) fn state_root_diagnosis(result: Result<bool>) -> Check {
+    use crate::native::session::root_privacy::{Diagnosis, RootStatus};
+    match result {
+        Ok(_) => Check::new(
+            CheckId::STATE_ROOT,
             Availability::Available,
             Reason::STATE_ROOT_PRIVATE,
-            "State root has private permissions.".to_owned(),
+            "State root has private permissions.",
             "No action is needed.",
         ),
-        Err(e) if e.is::<Mismatch>() => (
-            Availability::Unavailable,
-            Reason::STATE_ROOT_NOT_PRIVATE,
-            format!("{e:#}"),
-            "Session creation repairs what it can. Otherwise, follow the remedy in the detail.",
-        ),
-        Err(e)
-            if e.downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            (
-                Availability::Unknown,
-                Reason::STATE_ROOT_ABSENT,
-                format!("{e:#}"),
-                "TAB creates it at the first session.",
+        Err(error) => {
+            let diagnosis = error.downcast_ref::<Diagnosis>();
+            let (availability, reason) = match diagnosis.map(|d| d.status) {
+                Some(RootStatus::NotPrivate) => {
+                    (Availability::Unavailable, Reason::STATE_ROOT_NOT_PRIVATE)
+                }
+                Some(RootStatus::Absent) => (Availability::Unknown, Reason::STATE_ROOT_ABSENT),
+                _ => (Availability::Unknown, Reason::STATE_ROOT_UNREADABLE),
+            };
+            Check::new(
+                CheckId::STATE_ROOT,
+                availability,
+                reason,
+                format!("{error:#}"),
+                diagnosis.map(|d| d.remedy.as_str()).unwrap_or_default(),
             )
         }
-        Err(e) => (
-            Availability::Unknown,
-            Reason::STATE_ROOT_UNREADABLE,
-            format!("{e:#}"),
-            "Check access to the directory and its parents, then rerun doctor.",
-        ),
-    };
-    Check::new(
-        CheckId::STATE_ROOT,
-        availability,
-        reason,
-        detail,
-        next_action,
-    )
+    }
 }
 
 // Keep record reads and probes interleaved in their original order. record_checks

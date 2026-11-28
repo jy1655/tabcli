@@ -252,12 +252,7 @@ fn windows_state_root_owners_and_dacl() {
         };
         assert_eq!(observed.owner(), expected_owner);
         let before = observed.as_text();
-        let crate::native::NativeCommand::Doctor(request) =
-            crate::native::parse_args(["doctor", "--provider", "pi", "--json"]).unwrap()
-        else {
-            panic!()
-        };
-        crate::native::doctor::run(request).unwrap();
+        let doctor = crate::native::doctor::state_root_check();
         assert_eq!(SavedAccess::capture(&root, 0).as_text(), before);
         if matches!(case, "repair" | "partial") {
             probe_right(&root, WRITE_OWNER).unwrap_or_else(|error| {
@@ -333,6 +328,11 @@ fn windows_state_root_owners_and_dacl() {
                     "state root {}: owner SID {administrators}, expected {}; the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB",
                     root.display(),
                     account.owners.join(" or ")
+                );
+                assert_eq!(doctor.detail, expected);
+                assert_eq!(
+                    doctor.next_action,
+                    "set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB"
                 );
                 assert_eq!(format!("{:#}", result.unwrap_err()), expected);
                 assert_private_dacl(&SavedAccess::capture(&root, 0));

@@ -45,9 +45,11 @@ pub(in crate::native) fn create_root_directories(
                 }
             }
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to inspect state directory {}", probe.display())
-                });
+                return Err(root_privacy::path_error(
+                    probe,
+                    root_privacy::Observation::InspectPath,
+                    error,
+                ));
             }
         }
     }
@@ -71,9 +73,11 @@ pub(in crate::native) fn create_root_directories(
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to create state directory {}", directory.display())
-                });
+                return Err(root_privacy::path_error(
+                    directory,
+                    root_privacy::Observation::CreatePath,
+                    error,
+                ));
             }
         }
     }
@@ -430,7 +434,11 @@ mod privacy_tests {
             .find(|reason| reason.starts_with("ACL entry 0 (allow, principal "))
             .unwrap();
         assert!(
-            reason.ends_with(&format!("); run chmod -N '{}' and retry", path.display())),
+            reason
+                == format!(
+                    "ACL entry 0 (allow, principal abcdefab-cdef-abcd-efab-cdef0000000c); user immutable flag is set; clear the immutable flag with chflags nouchg '{}' and retry",
+                    path.display()
+                ),
             "{reason}"
         );
         assert_eq!(fs::read_dir(path).unwrap().count(), 1);

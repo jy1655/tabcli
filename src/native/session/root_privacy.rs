@@ -1,6 +1,6 @@
 //! The selected state root. Other private directories retain their own policies.
 use anyhow::{Context, Result};
-use std::{fmt, path::Path};
+use std::path::Path;
 
 #[cfg(unix)]
 mod unix;
@@ -17,30 +17,68 @@ pub(in crate::native) enum Action {
     Prepare { created: bool },
 }
 
-#[derive(Debug)]
-pub(in crate::native) struct Mismatch(String);
-impl fmt::Display for Mismatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for Mismatch {}
+mod diagnosis;
+pub(super) use diagnosis::Observation;
+pub(in crate::native) use diagnosis::{Diagnosis, RootStatus};
+use diagnosis::{Entries, Flags};
 
-#[derive(Debug)]
-struct NoTabEntry(String);
-impl fmt::Display for NoTabEntry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}; the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB",
-            self.0
-        )
+impl Action {
+    fn entries(self, list: impl FnOnce() -> Result<bool>) -> Entries {
+        match self {
+            Self::Prepare { created: true } => Entries::Known,
+            _ => match list() {
+                Ok(true) => Entries::Known,
+                Ok(false) => Entries::Empty {
+                    required_for_repair: false,
+                },
+                Err(error) => Entries::Undetermined(Some(error)),
+            },
+        }
+    }
+
+    fn unopened(self) -> Entries {
+        match self {
+            Self::Prepare { created: true } => Entries::Known,
+            _ => Entries::Undetermined(None),
+        }
     }
 }
-impl std::error::Error for NoTabEntry {}
+
+pub(super) fn path_error(
+    path: &Path,
+    operation: Observation,
+    error: std::io::Error,
+) -> anyhow::Error {
+    operation.render(
+        path,
+        &Entries::Undetermined(None),
+        Flags::None,
+        Some(error.into()),
+    )
+}
+
+pub(in crate::native) fn inspect_selected() -> Result<bool> {
+    let root = crate::native::session::Reader::state_root().map_err(|error| {
+        Observation::Resolve.render(
+            Path::new(""),
+            &Entries::Undetermined(None),
+            Flags::None,
+            Some(error),
+        )
+    })?;
+    check(&root, Action::Inspect)
+}
 
 pub(in crate::native) fn check(path: &Path, action: Action) -> Result<bool> {
-    platform::check(path, action).with_context(|| format!("state root {}", path.display()))
+    platform::check(path, action)
+        .map_err(|error| {
+            if error.is::<Diagnosis>() {
+                error
+            } else {
+                Observation::Inspect.render(path, &action.unopened(), Flags::None, Some(error))
+            }
+        })
+        .with_context(|| format!("state root {}", path.display()))
 }
 
 #[derive(Clone, Copy)]
@@ -50,13 +88,31 @@ pub(in crate::native) enum FailurePolicy {
 }
 
 pub(in crate::native) fn prepare(path: &Path, created: bool, policy: FailurePolicy) -> Result<()> {
-    match check(path, Action::Prepare { created }) {
+    apply_policy(
+        check(path, Action::Prepare { created }),
+        policy,
+        |warning| eprintln!("{warning}"),
+    )
+}
+
+fn apply_policy(
+    result: Result<bool>,
+    policy: FailurePolicy,
+    warn: impl FnOnce(String),
+) -> Result<()> {
+    match result {
         Ok(true) => {
             crate::native::session_start::deadline::wrote("state root permissions were set")
         }
         Ok(false) => {}
         Err(error) => match policy {
-            FailurePolicy::Warn if !error.is::<NoTabEntry>() => eprintln!("warning: {error:#}"),
+            FailurePolicy::Warn
+                if !error
+                    .downcast_ref::<Diagnosis>()
+                    .is_some_and(|d| d.refuse_writers) =>
+            {
+                warn(format!("warning: {error:#}"))
+            }
             _ => return Err(error),
         },
     }
@@ -78,7 +134,6 @@ pub(in crate::native) fn create_leaf(path: &Path, _policy: FailurePolicy) -> std
     result
 }
 
-#[cfg(any(target_os = "macos", windows))]
 fn tab_entry(name: &str, directory: bool, regular: bool) -> bool {
     use crate::native::session::{names::STATE_ROOT_DURABLE_FILE, primitives::valid_session_id};
     (regular && matches!(name, STATE_ROOT_DURABLE_FILE | "settings.json"))

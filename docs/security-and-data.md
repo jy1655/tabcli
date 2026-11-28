@@ -214,13 +214,15 @@ sessions. Only a privileged Unix process can transfer ownership. Session creatio
 root owned by another UID. TAB leaves its owner and mode unchanged, even as UID 0. On Linux,
 zero group bits also mask named-user and group entries in a POSIX access ACL. Other Unix
 ACLs, including default ACLs, are outside the mode check except for the macOS rule below.
-A final link may select the root. If its Unix target lacks owner read permission, restore
-that permission on the intended target before retrying.
+A final link may select the root. If TAB cannot open its Unix target for reading, it cannot
+verify a TAB entry there and leaves the target permissions alone.
 
 On macOS the root must report no extended ACL, including an inherited or zero-entry ACL.
-For an eligible ACL repair, TAB identifies the entry when readable. If directory access is
-denied by the ACL, the remedy is `chmod -N` on the intended TAB directory. If macOS privacy
-controls prevent access, check the terminal's privacy settings.
+For a recognized TAB directory with an extended ACL, TAB identifies the entry when readable.
+Clear a user immutable flag with `chflags nouchg` before retrying a permission repair. An
+administrator must clear a system immutable flag. If an ACL prevents access to a recognized
+TAB directory, the remedy is `chmod -N` on that directory. If macOS privacy controls prevent
+access, check the terminal's privacy settings.
 
 On Windows the root must have a protected DACL whose only entry grants the token user
 inheritable full control. Its owner must match the token user or default owner.
@@ -232,8 +234,10 @@ retrying.
 TAB limits macOS ACL removal and Windows ownership changes to roots it just created or
 directories already containing a durability receipt, settings file, workspace-consent directory,
 or Session directory. When an existing directory lacks such an entry and would need either
-repair, set `AGENT_BRIDGE_NATIVE_STATE_DIR` to a directory meant for TAB. The Windows DACL
-can still be repaired when the owner is refused.
+repair, set `AGENT_BRIDGE_NATIVE_STATE_DIR` to a directory meant for TAB. When reporting a
+privacy failure, doctor, Session creators and standalone writers give the same advice if
+they cannot determine whether the directory holds a TAB entry. The Windows DACL can still
+be repaired when the owner is refused.
 These checks cover the root itself at preparation time. Ancestor security and descendant ACLs
 are outside the check. Administrators and the operating system can still access the data.
 

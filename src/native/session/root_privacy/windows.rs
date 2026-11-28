@@ -1,4 +1,4 @@
-use super::{Action, Mismatch, tab_entry};
+use super::{Action, Entries, Flags, Observation, tab_entry};
 use crate::native::consent::{windows_current_account, windows_owner_is_accepted, windows_sid};
 use anyhow::{Context, Result};
 use std::{
@@ -254,7 +254,8 @@ impl Security {
             )
         };
         if status != 0 {
-            return Err(io::Error::from_raw_os_error(status as i32)).context("GetSecurityInfo: read owner and DACL; take ownership of this TAB directory and grant access to its permissions");
+            return Err(io::Error::from_raw_os_error(status as i32))
+                .context("GetSecurityInfo: read owner and DACL");
         }
         let descriptor = Descriptor(descriptor);
         let owner = windows_sid(descriptor.owner()?)?;
@@ -262,25 +263,14 @@ impl Security {
         Ok(Self { owner, dacl_issue })
     }
 
-    fn owner_observation(&self, owners: &[String]) -> String {
-        format!("owner SID {}, expected {}", self.owner, owners.join(" or "))
-    }
-
-    fn judge(&self, owners: &[String]) -> Result<()> {
+    fn judge(&self, owners: &[String]) -> Option<Observation> {
         if !windows_owner_is_accepted(&self.owner, owners) {
-            return Err(Mismatch(format!(
-                "{}; take ownership of this TAB directory as the intended user and retry",
-                self.owner_observation(owners)
-            ))
-            .into());
+            return Some(Observation::Owner {
+                actual: self.owner.clone(),
+                expected: owners.join(" or "),
+            });
         }
-        if let Some(issue) = &self.dacl_issue {
-            return Err(Mismatch(format!(
-                "{issue}; grant the token user control of this TAB directory's DACL and retry"
-            ))
-            .into());
-        }
-        Ok(())
+        self.dacl_issue.clone().map(Observation::Dacl)
     }
 }
 
@@ -382,40 +372,50 @@ pub(super) fn check(path: &Path, action: Action) -> Result<bool> {
         .share_mode(SHARING)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .context("CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES; select a TAB directory or take ownership and grant access to its permissions")?;
+        .map_err(|error| {
+            Observation::Open.render(path, &action.unopened(), Flags::None, Some(error.into()))
+        })?;
     if !root
         .metadata()
         .context("read opened directory attributes")?
         .is_dir()
     {
-        return Err(
-            Mismatch("expected a directory; select a directory meant for TAB".into()).into(),
-        );
+        return Err(Observation::NotDirectory.render(
+            path,
+            &Entries::Undetermined(None),
+            Flags::None,
+            None,
+        ));
     }
+    let origin = std::cell::OnceCell::new();
+    let entries = || origin.get_or_init(|| action.entries(|| has_tab_entry(&root)));
+    let diagnose = |issue: Observation, error| issue.render(path, entries(), Flags::None, error);
     let owners = windows_current_account()
-        .context("read Windows token user and default owner")?
+        .map_err(|e| diagnose(Observation::ReadToken, Some(e)))?
         .owners;
     let user = &owners[0];
-    let before = Security::read(&root, user).context("read state root owner and DACL")?;
-    let Err(issue) = before.judge(&owners) else {
+    let before =
+        Security::read(&root, user).map_err(|e| diagnose(Observation::ReadSecurity, Some(e)))?;
+    let Some(issue) = before.judge(&owners) else {
         return Ok(false);
     };
-    let Action::Prepare { created } = action else {
-        return Err(issue);
-    };
-    let owner_change = !windows_owner_is_accepted(&before.owner, &owners);
+    if action == Action::Inspect {
+        return Err(diagnose(issue, None));
+    }
+
+    let owner_change = matches!(issue, Observation::Owner { .. });
     let descriptor = Descriptor::private(user, owner_change)
-        .context("build private Windows security descriptor")?;
+        .map_err(|e| diagnose(Observation::Descriptor, Some(e.into())))?;
     // Judge eligibility on the original directory before changing its grants.
     let owner_result = (|| -> Result<()> {
         if owner_change {
-            if !created && !has_tab_entry(&root).with_context(|| issue.to_string())? {
-                return Err(super::NoTabEntry(before.owner_observation(&owners)).into());
+            if !matches!(entries(), Entries::Known) {
+                return Err(issue.render(path, entries().required_for_repair(), Flags::None, None));
             }
             if before.owner != ADMINISTRATORS {
-                return Err(issue);
+                return Err(diagnose(issue, None));
             }
-            set(&root, &descriptor, true).with_context(|| issue.to_string())?;
+            set(&root, &descriptor, true).map_err(|e| diagnose(issue, Some(e)))?;
             #[cfg(test)]
             crate::native::session::primitives::fault_point("after setting the state root owner")?;
         }
@@ -423,17 +423,14 @@ pub(super) fn check(path: &Path, action: Action) -> Result<bool> {
     })();
     // The existing DACL repair applies even when ownership could not be repaired.
     let dacl_result = before.dacl_issue.map_or(Ok(()), |problem| {
-        set(&root, &descriptor, false).with_context(|| {
-            format!(
-                "{problem}; take ownership of this TAB directory and grant access to set the DACL"
-            )
-        })
+        set(&root, &descriptor, false).map_err(|e| diagnose(Observation::Dacl(problem), Some(e)))
     });
     owner_result?;
     dacl_result?;
-    Security::read(&root, user)
-        .and_then(|security| security.judge(&owners))
-        .context("verify state root owner and DACL after repair")?;
+    let after = Security::read(&root, user).map_err(|e| diagnose(Observation::Verify, Some(e)))?;
+    if let Some(issue) = after.judge(&owners) {
+        return Err(diagnose(issue, None)).context("verify state root owner and DACL after repair");
+    }
     Ok(true)
 }
 
