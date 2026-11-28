@@ -383,7 +383,7 @@ fn state_root_check() -> Check {
             Availability::Unavailable,
             Reason::STATE_ROOT_NOT_PRIVATE,
             format!("{e:#}"),
-            "Session creation attempts repair. If it fails, follow the reported remedy.",
+            "Session creation repairs what it can. Otherwise, follow the remedy in the detail.",
         ),
         Err(e)
             if e.downcast_ref::<std::io::Error>()

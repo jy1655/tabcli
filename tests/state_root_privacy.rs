@@ -187,7 +187,7 @@ mod unix {
         assert_eq!(row["reason_code"], "state_root_not_private");
         assert_eq!(
             row["next_action"],
-            "Session creation attempts repair. If it fails, follow the reported remedy."
+            "Session creation repairs what it can. Otherwise, follow the remedy in the detail."
         );
         assert_eq!(mode(&dir), 0o750);
         successful(run(&root, &["settings", "macos-open-mode", "tab-first"]));
@@ -414,6 +414,8 @@ mod unix {
     fn macos_writers_require_a_tab_entry_before_removing_a_deny_acl() {
         let root = tempfile::tempdir().unwrap();
         chmod(root.path(), "everyone deny delete");
+        // Darwin's well-known GUID for the everyone principal.
+        let refusal = "ACL entry 0 (deny, principal abcdefab-cdef-abcd-efab-cdef0000000c); the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB";
         let workspace = root.path().to_str().unwrap();
         for args in [
             &["settings", "macos-open-mode", "tab-first"][..],
@@ -422,6 +424,12 @@ mod unix {
         ] {
             let output = run(root.path(), args);
             assert!(!output.status.success(), "{args:?}: {output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.lines().take(4).collect::<Vec<_>>().join("\n"),
+                format!("Error: state root {workspace}\n\nCaused by:\n    {refusal}"),
+                "{args:?}: {stderr}"
+            );
             assert!(has_acl(root.path()));
             assert!(fs::read_dir(root.path()).unwrap().next().is_none());
         }

@@ -157,7 +157,13 @@ fn has_tab_entry(root: &File) -> io::Result<bool> {
     }
 }
 
-fn clear_acl(file: &File) -> io::Result<()> {
+pub(super) fn is_immutable(file: &File) -> bool {
+    use std::os::darwin::fs::MetadataExt;
+    file.metadata()
+        .is_ok_and(|meta| meta.st_flags() & (libc::UF_IMMUTABLE | libc::SF_IMMUTABLE) != 0)
+}
+
+pub(super) fn clear_acl(file: &File) -> io::Result<()> {
     let sec = FileSec::new()?;
     let mode: libc::mode_t = 0o700;
     // _FILESEC_REMOVE_ACL is the Darwin sentinel (void *)1 used by chmod -N.
@@ -182,15 +188,10 @@ pub(super) fn first_acl_entry(file: &File) -> io::Result<Option<String>> {
     acl(file).map(|acl| acl.as_ref().map(first_entry))
 }
 
-pub(super) fn remove_acl(file: &File, created: bool, mode: u32) -> Result<()> {
-    if !created {
-        // Search may need the owner's mode restored before it can see TAB entries.
-        if mode != 0o700 {
-            file.set_permissions(fs::Permissions::from_mode(0o700))?;
-        }
-        if !has_tab_entry(file)? {
-            return Err(super::super::NoTabEntry.into());
-        }
+pub(super) fn acl_removal_allowed(file: &File, mode: u32) -> io::Result<bool> {
+    // Search may need the owner's mode restored before it can see TAB entries.
+    if mode != 0o700 {
+        file.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
-    clear_acl(file).context("failed to remove the extended ACL")
+    has_tab_entry(file)
 }

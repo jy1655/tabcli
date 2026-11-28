@@ -210,24 +210,30 @@ TAB makes the directory named by `AGENT_BRIDGE_NATIVE_STATE_DIR` private. Choose
 meant for TAB. Session creation requires a verified private state root, including when
 workspace consent creates it first. On Unix its owner must match the effective UID and its
 mode must read back as `0700`. A mount with a fixed, incompatible mode cannot host new
-sessions. Only a privileged Unix process can transfer ownership. TAB refuses a root owned by
-another UID and leaves its owner and mode unchanged, even when TAB runs as UID 0. On Linux,
+sessions. Only a privileged Unix process can transfer ownership. Session creation refuses a
+root owned by another UID. TAB leaves its owner and mode unchanged, even as UID 0. On Linux,
 zero group bits also mask named-user and group entries in a POSIX access ACL. Other Unix
 ACLs, including default ACLs, are outside the mode check except for the macOS rule below.
-A final link may select the root. If TAB cannot open its Unix target for reading, restore
-owner access on the intended target before retrying.
+A final link may select the root. If its Unix target lacks owner read permission, restore
+that permission on the intended target before retrying.
 
 On macOS the root must report no extended ACL, including an inherited or zero-entry ACL.
-If TAB cannot clear and verify the ACL, its error identifies the entry when readable and gives
-the `chmod -N` remedy. On Windows the root must have a protected DACL whose only entry grants
-the token user inheritable full control. Its owner must match the token user or default owner.
+For an eligible ACL repair, TAB identifies the entry when readable. If directory access is
+denied by the ACL, the remedy is `chmod -N` on the intended TAB directory. If macOS privacy
+controls prevent access, check the terminal's privacy settings.
+
+On Windows the root must have a protected DACL whose only entry grants the token user
+inheritable full control. Its owner must match the token user or default owner.
 A later run may take ownership from Administrators when that SID is outside its accepted
-owners and its existing rights permit the change. For another foreign owner or a denied
-owner change, take ownership of the intended TAB directory before retrying.
+owners and its existing rights permit the change. For another foreign owner on a recognized
+TAB root or a denied owner change, take ownership of the intended TAB directory before
+retrying.
 
 TAB limits macOS ACL removal and Windows ownership changes to roots it just created or
 directories already containing a durability receipt, settings file, workspace-consent directory,
-or Session directory. The Windows DACL can still be repaired when the owner is refused.
+or Session directory. When an existing directory lacks such an entry and would need either
+repair, set `AGENT_BRIDGE_NATIVE_STATE_DIR` to a directory meant for TAB. The Windows DACL
+can still be repaired when the owner is refused.
 These checks cover the root itself at preparation time. Ancestor security and descendant ACLs
 are outside the check. Administrators and the operating system can still access the data.
 

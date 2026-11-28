@@ -292,17 +292,24 @@ fn windows_state_root_owners_and_dacl() {
                     "{error:#}"
                 );
             }
-            "foreign" | "unmarked" => {
+            "foreign" => {
                 assert!(result.is_err(), "{case} unexpectedly created a Session")
             }
+            "unmarked" => {
+                let expected = format!(
+                    "state root {}: owner SID {administrators}, expected {}; the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB",
+                    root.display(),
+                    account.owners.join(" or ")
+                );
+                assert_eq!(format!("{:#}", result.unwrap_err()), expected);
+                assert!(unsafe { (*observed.dacl).AceCount } > 1);
+                assert_private_dacl(&SavedAccess::capture(&root, 0));
+                let error =
+                    crate::native::session::Store::create_settings_root(&root, &[]).unwrap_err();
+                assert_eq!(format!("{error:#}"), expected);
+                assert!(fs::read_dir(&root).unwrap().next().is_none());
+            }
             _ => panic!("unknown case"),
-        }
-        if case == "unmarked" {
-            assert!(unsafe { (*observed.dacl).AceCount } > 1);
-            let repaired = SavedAccess::capture(&root, 0);
-            assert_private_dacl(&repaired);
-            assert!(crate::native::session::Store::create_settings_root(&root, &[]).is_err());
-            assert!(fs::read_dir(&root).unwrap().next().is_none());
         }
         let actual = SavedAccess::capture(&root, 0).owner();
         let expected = match case {

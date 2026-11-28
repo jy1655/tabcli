@@ -262,13 +262,17 @@ impl Security {
         Ok(Self { owner, dacl_issue })
     }
 
+    fn owner_observation(&self, owners: &[String]) -> String {
+        format!("owner SID {}, expected {}", self.owner, owners.join(" or "))
+    }
+
     fn judge(&self, owners: &[String]) -> Result<()> {
         if !windows_owner_is_accepted(&self.owner, owners) {
-            let owner = &self.owner;
-            let accepted = owners.join(" or ");
             return Err(Mismatch(format!(
-                "owner SID {owner}, expected {accepted}; take ownership of this TAB directory as the intended user and retry"
-            )).into());
+                "{}; take ownership of this TAB directory as the intended user and retry",
+                self.owner_observation(owners)
+            ))
+            .into());
         }
         if let Some(issue) = &self.dacl_issue {
             return Err(Mismatch(format!(
@@ -406,7 +410,7 @@ pub(super) fn check(path: &Path, action: Action) -> Result<bool> {
     let owner_result = (|| -> Result<()> {
         if owner_change {
             if !created && !has_tab_entry(&root).with_context(|| issue.to_string())? {
-                return Err(super::NoTabEntry).context(issue);
+                return Err(super::NoTabEntry(before.owner_observation(&owners)).into());
             }
             if before.owner != ADMINISTRATORS {
                 return Err(issue);

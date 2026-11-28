@@ -27,10 +27,14 @@ impl fmt::Display for Mismatch {
 impl std::error::Error for Mismatch {}
 
 #[derive(Debug)]
-struct NoTabEntry;
+struct NoTabEntry(String);
 impl fmt::Display for NoTabEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("no TAB entry authorizes this repair")
+        write!(
+            f,
+            "{}; the directory holds no TAB entry (state-root.durable, settings.json, workspace-consent/ or a session-* directory); set AGENT_BRIDGE_NATIVE_STATE_DIR to a directory meant for TAB",
+            self.0
+        )
     }
 }
 impl std::error::Error for NoTabEntry {}
