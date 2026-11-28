@@ -152,7 +152,14 @@ fn directory_link(target: &Path, link: &Path) {
 
 fn failed_open_detail(root: &Path, expected_kinds: &[ErrorKind]) -> String {
     #[cfg(unix)]
-    let error = std::fs::File::open(root).unwrap_err();
+    let error = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(root)
+            .unwrap_err()
+    };
     #[cfg(windows)]
     let error = {
         use std::os::windows::fs::OpenOptionsExt;
@@ -251,7 +258,7 @@ fn doctor_and_settings_select_another_root_when_an_ancestor_link_dangles() {
 }
 
 #[test]
-fn doctor_reports_a_root_below_a_regular_file_as_unreadable() {
+fn doctor_distinguishes_a_selected_file_from_a_root_below_it() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("file");
     std::fs::write(&file, b"fixture").unwrap();
@@ -267,20 +274,38 @@ fn doctor_reports_a_root_below_a_regular_file_as_unreadable() {
     let expected_kinds = &[ErrorKind::NotADirectory, ErrorKind::NotFound][..];
     assert_eq!(row["detail"], failed_open_detail(&root, expected_kinds));
 
-    #[cfg(windows)]
-    {
-        // The directory-capable Windows open succeeds on the file itself.
-        let row = diagnosis(&file, &args);
+    let check_selected = |selected: &Path| {
+        let row = diagnosis(selected, &args);
         assert_eq!(row["reason_code"], "state_root_not_private", "{row}");
         assert_eq!(row["availability"], "unavailable");
         assert_eq!(row["next_action"], SELECT_ROOT);
+        #[cfg(unix)]
+        let detail = failed_open_detail(selected, &[ErrorKind::NotADirectory]);
+        #[cfg(windows)]
+        let detail = format!(
+            "state root {}: expected a directory; {SELECT_ROOT}",
+            selected.display()
+        );
+        assert_eq!(row["detail"], detail);
+    };
+    check_selected(&file);
+    #[cfg(unix)]
+    {
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        check_selected(&link);
+        assert_eq!(std::fs::read_link(&link).unwrap(), file);
+
+        let broken = temp.path().join("broken");
+        std::os::unix::fs::symlink(&root, &broken).unwrap();
+        let row = diagnosis(&broken, &args);
+        assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
         assert_eq!(
             row["detail"],
-            format!(
-                "state root {}: expected a directory; {SELECT_ROOT}",
-                file.display()
-            )
+            failed_open_detail(&broken, &[ErrorKind::NotADirectory])
         );
+        assert_eq!(row["next_action"], SELECT_ROOT);
+        assert_eq!(std::fs::read_link(&broken).unwrap(), root);
     }
     assert_eq!(std::fs::read(file).unwrap(), b"fixture");
 }

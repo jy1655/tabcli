@@ -1306,8 +1306,8 @@ configuration and current observations are reported separately.
 
 The `state_root` check reports `available` for `state_root_private`, `unavailable` for
 `state_root_not_private`, and `unknown` for `state_root_absent` or `state_root_unreadable`.
-A root path below a regular file gives `state_root_unreadable`. If TAB opens the selected
-path and the handle identifies a non-directory, the reason is `state_root_not_private`.
+A selected path that resolves to a non-directory gives `state_root_not_private`. A path
+below a non-directory gives `state_root_unreadable`.
 A root privacy failure refuses session creation by `ask`, `reopen`, or `self-test`.
 Settings setters, `consent revoke`, and `consent reset` also refuse when removing a macOS ACL
 or changing a Windows owner would require an existing TAB entry and the directory has none.

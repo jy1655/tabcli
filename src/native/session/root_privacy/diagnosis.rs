@@ -118,7 +118,10 @@ pub(super) enum Flags {
 #[derive(Debug)]
 pub(in crate::native::session) enum Observation {
     Absent,
-    Open,
+    Open {
+        selected_non_directory: bool,
+    },
+    #[cfg(windows)]
     NotDirectory,
     InspectPath,
     CreatePath,
@@ -187,15 +190,19 @@ impl fmt::Display for Diagnosis {
 impl std::error::Error for Diagnosis {}
 
 impl Observation {
-    fn describe(&self, path: &Path) -> String {
+    fn describe(&self, path: &Path, cause: Option<Cause>) -> String {
         match self {
             Self::Absent => "state directory does not exist".into(),
+            Self::Open { .. } if cause == Some(Cause::NotDirectory) => {
+                "expected a directory".into()
+            }
             #[cfg(windows)]
-            Self::Open => {
+            Self::Open { .. } => {
                 "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES".into()
             }
             #[cfg(unix)]
-            Self::Open => "open state directory".into(),
+            Self::Open { .. } => "open state directory".into(),
+            #[cfg(windows)]
             Self::NotDirectory => "expected a directory".into(),
             Self::InspectPath => format!("failed to inspect state directory {}", path.display()),
             Self::CreatePath => format!("failed to create state directory {}", path.display()),
@@ -251,9 +258,12 @@ impl Observation {
         let cause = os.map(Cause::of);
         let status = match self {
             Self::Absent => Absent,
-            // A failed open cannot identify the selected object by handle.
-            Self::NotDirectory if failure.is_some() => Unreadable,
-            Self::NotDirectory | Self::Owner { .. } => NotPrivate,
+            Self::Open {
+                selected_non_directory: true,
+            }
+            | Self::Owner { .. } => NotPrivate,
+            #[cfg(windows)]
+            Self::NotDirectory => NotPrivate,
             #[cfg(unix)]
             Self::Mode(_) => NotPrivate,
             #[cfg(target_os = "macos")]
@@ -262,11 +272,14 @@ impl Observation {
             Self::Dacl(_) => NotPrivate,
             _ => Unreadable,
         };
-        let mut detail = self.describe(path);
-        let no_directory = matches!(
-            self,
-            Self::Absent | Self::NotDirectory | Self::CreatePath | Self::Resolve
-        ) || (matches!(self, Self::Open) && cause == Some(Cause::Missing));
+        let mut detail = self.describe(path, cause);
+        let no_directory = match self {
+            Self::Absent | Self::CreatePath | Self::Resolve => true,
+            Self::Open { .. } => matches!(cause, Some(Cause::Missing | Cause::NotDirectory)),
+            #[cfg(windows)]
+            Self::NotDirectory => true,
+            _ => false,
+        };
         let read_only = cause == Some(Cause::ReadOnly);
         #[cfg(unix)]
         let quoted = || format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
@@ -307,7 +320,7 @@ impl Observation {
             _ if status == Absent => "TAB creates it at the first session.".into(),
             _ if no_directory => SELECT_ROOT.into(),
             #[cfg(target_os = "macos")]
-            _ if (matches!(self, Self::Open)
+            _ if (matches!(self, Self::Open { .. })
                 || (matches!(self, Self::AclRead(_)) && failure.is_none()))
                 && flags == Flags::None
                 && cause == Some(Cause::NotPermitted) =>
@@ -345,7 +358,8 @@ impl Observation {
                 String::new()
             }
             Entries::Known => match self {
-                Self::Open => "check access to the state directory".into(),
+                Self::Open { .. } => "check access to the state directory".into(),
+                #[cfg(windows)]
                 Self::NotDirectory => SELECT_ROOT.into(),
                 Self::InspectPath => "check search access to its parent directories".into(),
                 #[cfg(unix)]

@@ -47,12 +47,13 @@ impl Action {
         if self == Self::Inspect && cause == Cause::Missing && missing_below_directory(path) {
             return Observation::Absent.render(path, &self.unopened(), Flags::None, None);
         }
-        let issue = if cause == Cause::NotDirectory {
-            Observation::NotDirectory
-        } else {
-            Observation::Open
-        };
-        issue.render(path, &self.unopened(), Flags::None, Some(error.into()))
+        // Metadata follows the selected path just as the open did. Failure to
+        // examine it gives no evidence about the type of the selected object.
+        Observation::Open {
+            selected_non_directory: self == Self::Inspect
+                && std::fs::metadata(path).is_ok_and(|meta| !meta.is_dir()),
+        }
+        .render(path, &self.unopened(), Flags::None, Some(error.into()))
     }
 
     fn entries(self, list: impl FnOnce() -> Result<bool>) -> Entries {

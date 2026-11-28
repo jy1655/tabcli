@@ -56,20 +56,20 @@ fn open_root(path: &Path, action: Action) -> Result<(File, bool)> {
     }
 }
 
-fn open_denied_root(path: &Path, action: Action, error: io::Error) -> Result<(File, bool)> {
+fn open_denied_root(selected: &Path, action: Action, error: io::Error) -> Result<(File, bool)> {
     let entries = action.unopened();
     #[cfg(target_os = "macos")]
     if Cause::of(&error) == Cause::NotPermitted {
-        return Err(Observation::Open.render(path, &entries, Flags::None, Some(error.into())));
+        return Err(action.open_failure(selected, error));
     }
     // A trailing slash (or "/.") makes lstat follow a final link.
-    let path = path.components().as_path();
+    let path = selected.components().as_path();
     let meta = fs::symlink_metadata(path).map_err(|e| {
         Observation::InspectPath.render(path, &entries, Flags::None, Some(e.into()))
     })?;
     let flags = flags(&meta);
     if !meta.is_dir() {
-        return Err(Observation::Open.render(path, &entries, flags, Some(error.into())));
+        return Err(action.open_failure(selected, error));
     }
     let user = unsafe { libc::geteuid() };
     if meta.uid() != user {

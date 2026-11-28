@@ -72,8 +72,9 @@ macro_rules! observations {
 
 observations! {
     Absent => [Absent], "state directory does not exist", ABSENT;
-    Open => [Open], if cfg!(windows) { "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES" }
+    Open { .. } => [Open { selected_non_directory: false }, Open { selected_non_directory: true }], if cfg!(windows) { "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES" }
         else { "open state directory" }, "check access to the state directory";
+    #[cfg(windows)]
     NotDirectory => [NotDirectory], "expected a directory", SELECT;
     InspectPath => [InspectPath], "failed to inspect state directory tab", "check search access to its parent directories";
     CreatePath => [CreatePath], "failed to create state directory tab", "";
@@ -168,17 +169,26 @@ impl Case<'_> {
     }
 
     fn no_directory(&self) -> bool {
-        matches!(
-            self.issue,
-            Observation::Absent
-                | Observation::CreatePath
-                | Observation::NotDirectory
-                | Observation::Resolve
-        ) || (matches!(self.issue, Observation::Open) && self.cause == Some(Cause::Missing))
+        match self.issue {
+            Observation::Open { .. } => {
+                matches!(self.cause, Some(Cause::Missing | Cause::NotDirectory))
+            }
+            Observation::Absent | Observation::CreatePath | Observation::Resolve => true,
+            #[cfg(windows)]
+            Observation::NotDirectory => true,
+            _ => false,
+        }
     }
 
     fn expectation(&self) -> (String, &'static str, &'static str) {
         let (label, default) = labels(self.issue);
+        let label = if matches!(self.issue, Observation::Open { .. })
+            && self.cause == Some(Cause::NotDirectory)
+        {
+            "expected a directory"
+        } else {
+            label
+        };
         let mut detail = format!("state root tab: {label}");
         let cause = self.cause;
         #[cfg(target_os = "macos")]
@@ -194,7 +204,11 @@ impl Case<'_> {
         };
 
         let mismatch = match self.issue {
-            Observation::NotDirectory => self.failure.is_none(),
+            Observation::Open {
+                selected_non_directory,
+            } => *selected_non_directory,
+            #[cfg(windows)]
+            Observation::NotDirectory => true,
             Observation::Owner { .. } => true,
             #[cfg(unix)]
             Observation::Mode(_) => true,
@@ -292,7 +306,7 @@ impl Case<'_> {
             remedy = ABSENT;
         }
         #[cfg(target_os = "macos")]
-        if (matches!(self.issue, Observation::Open)
+        if (matches!(self.issue, Observation::Open { .. })
             || (matches!(self.issue, Observation::AclRead(_)) && self.failure.is_none()))
             && advice == Some(PRIVACY)
         {
