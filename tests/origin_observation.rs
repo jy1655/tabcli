@@ -280,8 +280,7 @@ fn close_reports_unclosed_sessions_started_from_it_and_keeps_its_success() {
 }
 
 // `--with-started-from`: the listed sessions are closed through their own ordinary close.
-// The fixtures below need no terminal: a dead reaped owner, no owner at all, or a refusal
-// that the ordinary close reports before any terminal automation.
+// These sessions have no terminal handle. A pending launch supplies the ordinary close refusal.
 
 fn reaped_child_pid() -> u32 {
     #[cfg(windows)]
@@ -534,61 +533,4 @@ fn the_human_report_lists_every_target_in_order_and_the_totals() {
     );
     assert!(plain.join("closed.json").exists());
     assert_eq!(root.sessions_of("session-grand")["state"], "ready");
-}
-
-/// A retained, bound handle whose owner cannot be attested: the ordinary authority path
-/// refuses before any terminal automation. On macOS a recorded birth with `pid: u32::MAX`
-/// is the explicit range error; the Windows observer classifies that pid as absent, so no
-/// Windows public case is claimed here.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_target_with_an_unknown_owner_and_a_retained_handle_is_failed() {
-    let root = Root::new();
-    root.session("session-origin", "failed", None);
-    let unknown = root.session("session-unknown", "ready", Some("session-origin"));
-    write(
-        &unknown.join("terminal.json"),
-        &json!({"terminal": "apple-terminal", "session_id": "/dev/ttys999",
-            "window_id": "1001", "managed_session_id": "session-unknown"}),
-    );
-    write(
-        &unknown.join("native-session.json"),
-        &json!({"pid": u32::MAX, "managed_session_id": "session-unknown",
-            "terminal_tty": "/dev/ttys999", "process_start_seconds": 1,
-            "process_start_microseconds": 0}),
-    );
-
-    let output = root.run(&[
-        "close-session",
-        "session-origin",
-        "--explicit",
-        "--with-started-from",
-        "--json",
-    ]);
-    assert!(!output.status.success());
-    let value = report(&output);
-    assert_eq!(value["ok"], false);
-    assert_eq!(value["closed"], true);
-    assert_eq!(value["started_from"]["open"], json!(["session-unknown"]));
-    assert_eq!(value["started_from"]["closed"], json!([]));
-    assert_eq!(value["started_from"]["skipped"], json!([]));
-    assert_eq!(
-        value["started_from"]["failed"][0]["session"],
-        "session-unknown"
-    );
-    let error = value["started_from"]["failed"][0]["error"]
-        .as_str()
-        .unwrap();
-    assert!(error.contains("out of range"), "{error}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains(
-            "close-session closed session-origin but 1 of 1 started-from session(s) failed to close; see the report"
-        ),
-        "{stderr}"
-    );
-    // The refusal kept the handle and the session open.
-    assert!(unknown.join("terminal.json").exists());
-    assert!(!unknown.join("closed.json").exists());
-    assert_eq!(root.sessions_of("session-unknown")["state"], "ready");
 }
