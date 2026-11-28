@@ -2,6 +2,7 @@ mod support;
 
 use serde_json::Value;
 use std::{
+    io::ErrorKind,
     path::Path,
     process::{Command, Output},
 };
@@ -149,7 +150,7 @@ fn directory_link(target: &Path, link: &Path) {
     }
 }
 
-fn missing_open_detail(root: &Path) -> String {
+fn failed_open_detail(root: &Path, expected_kinds: &[ErrorKind]) -> String {
     #[cfg(unix)]
     let error = std::fs::File::open(root).unwrap_err();
     #[cfg(windows)]
@@ -164,11 +165,14 @@ fn missing_open_detail(root: &Path) -> String {
             .open(root)
             .unwrap_err()
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    let operation = if cfg!(windows) {
-        "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES"
-    } else {
-        "open state directory"
+    assert!(expected_kinds.contains(&error.kind()), "{root:?}: {error}");
+    let operation = match error.kind() {
+        ErrorKind::NotADirectory => "expected a directory",
+        ErrorKind::NotFound if cfg!(windows) => {
+            "CreateFileW: open directory for READ_CONTROL and FILE_READ_ATTRIBUTES"
+        }
+        ErrorKind::NotFound => "open state directory",
+        other => panic!("unexpected open error {other:?} for {root:?}"),
     };
     format!(
         "state root {}: {operation}; {SELECT_ROOT}: {error}",
@@ -186,7 +190,7 @@ fn dangling_final_link_reports_an_open_failure_to_writers_and_doctor() {
     directory_link(&target, &root);
     let destination = std::fs::read_link(&root).unwrap();
     std::fs::remove_dir(&target).unwrap();
-    let detail = missing_open_detail(&root);
+    let detail = failed_open_detail(&root, &[ErrorKind::NotFound]);
     let warning = format!("warning: {detail}");
     for args in [
         &["settings", "macos-open-mode", "tab-first"][..],
@@ -238,9 +242,47 @@ fn doctor_and_settings_select_another_root_when_an_ancestor_link_dangles() {
     assert_eq!(stderr.lines().next(), Some(expected.as_str()), "{stderr}");
     assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
     assert_eq!(row["next_action"], SELECT_ROOT);
-    assert_eq!(row["detail"], missing_open_detail(&root));
+    assert_eq!(
+        row["detail"],
+        failed_open_detail(&root, &[ErrorKind::NotFound])
+    );
     assert_eq!(std::fs::read_link(&ancestor).unwrap(), destination);
     assert!(!target.exists());
+}
+
+#[test]
+fn doctor_reports_a_root_below_a_regular_file_as_unreadable() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("file");
+    std::fs::write(&file, b"fixture").unwrap();
+    let root = file.join("x");
+    let args = ["doctor", "--provider", "pi", "--json"];
+    let row = diagnosis(&root, &args);
+    assert_eq!(row["reason_code"], "state_root_unreadable", "{row}");
+    assert_eq!(row["availability"], "unknown");
+    assert_eq!(row["next_action"], SELECT_ROOT);
+    #[cfg(unix)]
+    let expected_kinds = &[ErrorKind::NotADirectory][..];
+    #[cfg(windows)]
+    let expected_kinds = &[ErrorKind::NotADirectory, ErrorKind::NotFound][..];
+    assert_eq!(row["detail"], failed_open_detail(&root, expected_kinds));
+
+    #[cfg(windows)]
+    {
+        // The directory-capable Windows open succeeds on the file itself.
+        let row = diagnosis(&file, &args);
+        assert_eq!(row["reason_code"], "state_root_not_private", "{row}");
+        assert_eq!(row["availability"], "unavailable");
+        assert_eq!(row["next_action"], SELECT_ROOT);
+        assert_eq!(
+            row["detail"],
+            format!(
+                "state root {}: expected a directory; {SELECT_ROOT}",
+                file.display()
+            )
+        );
+    }
+    assert_eq!(std::fs::read(file).unwrap(), b"fixture");
 }
 
 #[test]

@@ -251,6 +251,8 @@ impl Observation {
         let cause = os.map(Cause::of);
         let status = match self {
             Self::Absent => Absent,
+            // A failed open cannot identify the selected object by handle.
+            Self::NotDirectory if failure.is_some() => Unreadable,
             Self::NotDirectory | Self::Owner { .. } => NotPrivate,
             #[cfg(unix)]
             Self::Mode(_) => NotPrivate,

@@ -194,7 +194,8 @@ impl Case<'_> {
         };
 
         let mismatch = match self.issue {
-            Observation::NotDirectory | Observation::Owner { .. } => true,
+            Observation::NotDirectory => self.failure.is_none(),
+            Observation::Owner { .. } => true,
             #[cfg(unix)]
             Observation::Mode(_) => true,
             #[cfg(target_os = "macos")]
