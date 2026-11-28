@@ -1362,75 +1362,205 @@ mod projected_authority_tests {
     #[test]
     fn failed_spawning_malformed_owner_observes_absence_without_startup_grant() {
         use crate::native::session::Store;
+        use terminal::TerminalKind::*;
         #[cfg(windows)]
-        let kinds = [terminal::TerminalKind::WindowsConsole];
+        let kinds = [WindowsConsole];
         #[cfg(unix)]
-        let kinds = [
-            terminal::TerminalKind::Ghostty,
-            terminal::TerminalKind::Iterm2,
-        ];
+        let kinds = [Ghostty, Iterm2, AppleTerminal, Warp, WezTerm];
         for kind in kinds {
             let surface =
                 TerminalSession::new(kind, "42".into()).with_binding(Some("session-test".into()));
             for malformed in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
                 let store = Store::open_unchecked(directory.path());
+                let terminal_record = store.record(CoreRecord::Terminal);
+                terminal_record.write_json(&surface).unwrap();
+                let handle = terminal_record.bytes().unwrap();
                 if malformed {
                     std::fs::write(store.record(CoreRecord::Owner).path(), b"{").unwrap();
                 }
-                store
-                    .write_status(&SessionStatus {
-                        state: SessionState::Failed,
-                        generation: 0,
-                        updated_unix_ms: 1,
-                        exit_code: None,
-                        error: None,
-                        residual_surface: None,
-                    })
-                    .unwrap();
-                store
-                    .record(CoreRecord::Launch)
-                    .write_json(&launch::Record {
-                        schema: 1,
-                        claim_token: "claim".into(),
-                        deadline_unix_ms: 1,
-                        phase: launch::Phase::Spawning,
-                    })
-                    .unwrap();
-                for present in [false, true] {
-                    let deadline = crate::native::session::close::budget::close_deadline();
-                    let observation = TestObservation::on_records(
-                        directory.path(),
-                        "session-test",
-                        &surface,
-                        deadline,
-                    )
-                    .with_presence(|| {
-                        assert!(malformed);
-                        Ok(present)
-                    });
-                    #[cfg(unix)]
-                    let observation = observation.with_evidence(terminal::close_evidence(kind));
-                    let result = observation.decide("session-test", &surface, deadline);
-                    if malformed && present {
-                        assert_eq!(
-                            result.unwrap_err().to_string(),
-                            format!(
-                                "The recorded {} surface is still present. End it, then run `tabcli close-session session-test --explicit` again.",
-                                kind.display_name()
-                            )
-                        );
-                    } else {
-                        assert_eq!(
-                            result.unwrap(),
-                            if malformed {
-                                TerminalCloseAuthority::Absent
-                            } else {
-                                TerminalCloseAuthority::SurfaceOnly
-                            }
-                        );
+                for (state, phase) in [
+                    (SessionState::Launching, launch::Phase::Pending),
+                    (SessionState::Launching, launch::Phase::Spawning),
+                    (SessionState::Failed, launch::Phase::Pending),
+                    (SessionState::Failed, launch::Phase::Spawning),
+                ] {
+                    crate::native::session::update_status(directory.path(), state, None, None)
+                        .unwrap();
+                    store
+                        .record(CoreRecord::Launch)
+                        .write_json(&launch::Record {
+                            schema: 1,
+                            claim_token: "claim".into(),
+                            deadline_unix_ms: 1,
+                            phase,
+                        })
+                        .unwrap();
+                    for presence in [Some(true), Some(false), None] {
+                        check_startup_owner_read(directory.path(), &surface, malformed, presence);
+                        assert_eq!(terminal_record.bytes().unwrap(), handle);
                     }
                 }
+            }
+        }
+    }
+
+    fn check_startup_owner_read(
+        directory: &std::path::Path,
+        surface: &TerminalSession,
+        malformed: bool,
+        presence: Option<bool>,
+    ) {
+        use terminal::TerminalKind::*;
+        let kind = surface.kind;
+        let deadline = crate::native::session::close::budget::close_deadline();
+        let stable_id = matches!(kind, Ghostty | Iterm2 | WindowsConsole);
+        let stable_start = !malformed && stable_id;
+        let trace = std::cell::RefCell::new(Vec::new());
+        #[cfg(target_os = "macos")]
+        let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
+            |_| panic!("no trusted app identity"),
+            || {
+                trace
+                    .borrow_mut()
+                    .push(test_support::Call::new("instances", ""));
+                Ok(vec![])
+            },
+        );
+        let observation = TestObservation::on_records(directory, "session-test", surface, deadline)
+            .with_trace(&trace)
+            .with_presence(|| {
+                assert!(!stable_start);
+                presence.ok_or_else(|| anyhow::anyhow!("surface read failed"))
+            });
+        #[cfg(target_os = "macos")]
+        let observation = observation.with_evidence(if kind == AppleTerminal {
+            &apple
+        } else {
+            terminal::close_evidence(kind)
+        });
+        let result = observation.decide("session-test", surface, deadline);
+        if stable_start {
+            assert_eq!(
+                result.as_ref().unwrap(),
+                &TerminalCloseAuthority::SurfaceOnly
+            );
+        } else {
+            match presence {
+                Some(false) => {
+                    assert_eq!(result.as_ref().unwrap(), &TerminalCloseAuthority::Absent)
+                }
+                None => assert_eq!(
+                    result.as_ref().unwrap_err().root_cause().to_string(),
+                    "surface read failed"
+                ),
+                Some(true) => {
+                    let expected = if malformed {
+                        format!(
+                            "The recorded {} surface is still present. End it, then run `tabcli close-session session-test --explicit` again.",
+                            kind.display_name()
+                        )
+                    } else if cfg!(target_os = "macos") && kind == AppleTerminal {
+                        "Terminal.app startup has no native owner/app incarnation and its window is not proven gone; no close was sent and the surface handle is retained".into()
+                    } else {
+                        "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained".into()
+                    };
+                    assert_eq!(result.as_ref().unwrap_err().to_string(), expected);
+                }
+            }
+        }
+        #[cfg(unix)]
+        if !stable_start {
+            let closed = close_owned_surface_with(
+                || result,
+                || panic!("read-only startup evidence authorized owner teardown"),
+                |_| panic!("read-only startup evidence reached a terminal adapter"),
+                deadline,
+            );
+            match presence {
+                Some(false) => {
+                    assert_eq!(closed.unwrap().outcome, CloseOutcome::Missing)
+                }
+                _ => assert!(closed.is_err()),
+            }
+        }
+
+        let mut calls = Vec::new();
+        #[cfg(unix)]
+        calls.push("teardown-intent");
+        calls.push("owner-present");
+        if malformed {
+            calls.extend([
+                "launch",
+                if stable_id { "status" } else { "resumable" },
+                "owner",
+            ]);
+        } else {
+            calls.push("status");
+        }
+        if !stable_start {
+            if cfg!(target_os = "macos") && kind == AppleTerminal {
+                calls.push("instances");
+            }
+            calls.push("presence");
+            if cfg!(target_os = "macos") && kind == AppleTerminal && presence.is_some() {
+                calls.push("instances");
+            }
+        }
+        assert_eq!(observation.calls(), calls);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmux_startup_with_a_malformed_owner_depends_only_on_the_created_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(directory.path());
+        std::fs::write(store.record(CoreRecord::Owner).path(), b"{").unwrap();
+        let surface = TerminalSession::new(terminal::TerminalKind::Tmux, "pane".into())
+            .with_binding(Some("session-test".into()));
+        for (state, phase) in [
+            (SessionState::Launching, launch::Phase::Pending),
+            (SessionState::Failed, launch::Phase::Spawning),
+        ] {
+            crate::native::session::update_status(directory.path(), state, None, None).unwrap();
+            store
+                .record(CoreRecord::Launch)
+                .write_json(&launch::Record {
+                    schema: 1,
+                    claim_token: "claim".into(),
+                    deadline_unix_ms: 1,
+                    phase,
+                })
+                .unwrap();
+            for (host, expected) in [
+                (
+                    ProcessObservation::Gone(Gone::Exited),
+                    TerminalCloseAuthority::Absent,
+                ),
+                (
+                    ProcessObservation::Live(Attested::Incarnation),
+                    TerminalCloseAuthority::SurfaceOnly,
+                ),
+            ] {
+                let mut host = Some(host);
+                let deadline = crate::native::session::close::budget::close_deadline();
+                let observation = TestObservation::on_records(
+                    directory.path(),
+                    "session-test",
+                    &surface,
+                    deadline,
+                )
+                .with_created_host(|| Ok(host.take()));
+                assert_eq!(
+                    observation
+                        .decide("session-test", &surface, deadline)
+                        .unwrap(),
+                    expected
+                );
+                assert!(
+                    observation.calls().is_empty(),
+                    "the created server decides before reading the owner"
+                );
             }
         }
     }
@@ -1568,6 +1698,24 @@ mod projected_authority_tests {
                 exited,
                 SessionState::Ready,
                 None,
+                CloseCause::Explicit,
+                created(false),
+            ),
+            (
+                "damaged owner during launch",
+                Record::Damaged,
+                exited,
+                SessionState::Launching,
+                Some(launch::Phase::Pending),
+                CloseCause::Explicit,
+                created(false),
+            ),
+            (
+                "damaged owner after failed startup",
+                Record::Damaged,
+                exited,
+                SessionState::Failed,
+                Some(launch::Phase::Spawning),
                 CloseCause::Explicit,
                 created(false),
             ),

@@ -1,7 +1,7 @@
 use super::support::*;
 use super::*;
 use crate::native::session::close as session_close;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::native::session::launch;
 use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -13,7 +13,7 @@ use crate::native::session::test_support::{
 use crate::native::session::turn::{JournaledEventState, recover_pending_completion};
 use crate::native::session::{SessionState, SessionStatus, update_status};
 use crate::native::terminal;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::native::terminal::close_authority::{
     TerminalCloseAuthority, test_support::TestObservation,
 };
@@ -348,7 +348,7 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     let session = terminal::TerminalSession::new(
@@ -381,19 +381,28 @@ fn explicit_close_allows_only_bound_ownerless_launch_failures() {
 
     let ready_directory = tempfile::tempdir().unwrap();
     update_status(ready_directory.path(), SessionState::Ready, None, None).unwrap();
-    assert!(
-        {
-            let deadline = crate::native::session::close::budget::close_deadline();
-            TestObservation::on_records(
-                ready_directory.path(),
-                "session-owner123",
-                &session,
-                deadline,
-            )
-            .decide("session-owner123", &session, deadline)
+    for present in [false, true] {
+        let deadline = session_close::budget::close_deadline();
+        let authority = TestObservation::on_records(
+            ready_directory.path(),
+            "session-owner123",
+            &session,
+            deadline,
+        )
+        .with_presence(|| Ok(present))
+        .decide("session-owner123", &session, deadline);
+        if present {
+            assert_eq!(
+                authority.unwrap_err().to_string(),
+                format!(
+                    "The recorded {} surface is still present. End it, then run `tabcli close-session session-owner123 --explicit` again.",
+                    session.kind.display_name()
+                )
+            );
+        } else {
+            assert_eq!(authority.unwrap(), TerminalCloseAuthority::Absent);
         }
-        .is_err()
-    );
+    }
 
     let launching_directory = tempfile::tempdir().unwrap();
     update_status(
@@ -557,13 +566,11 @@ fn a_live_owner_keeps_unrecoverable_journal_damage_as_a_repair_error() {
 }
 
 // An explicit close after a failed startup whose wrapper recorded itself and ended.
-// A surface with an app-unique native id (an iTerm2 session, a Windows console) is
-// still closed by that id. A macOS surface that can outlive its owner is not: a
-// failed launch is no close intent, and an owner record without the whole identity
-// does not even allow the observation that could prove the surface gone.
+// The bound stable-ID startup grant takes precedence. Other surfaces can settle
+// only from read-only absence evidence when the recorded owner cannot be verified.
 // Close authority is terminal-kind policy, so this test lives at the native boundary and
 // not in `session::launch`, which must know nothing about terminal kinds.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
     // The launch fixture: a launching session whose claim the launcher retains and whose
@@ -605,44 +612,79 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
         },
     )
     .unwrap();
-    let authority = |kind, managed_session_id: &str| {
-        let deadline = crate::native::session::close::budget::close_deadline();
-        let surface = terminal::TerminalSession::new(kind, "missing-owned-surface".to_owned())
-            .with_binding(Some(managed_session_id.to_owned()));
-        #[cfg(target_os = "macos")]
-        let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
-            |_| panic!("no app incarnation is recorded"),
-            || panic!("no app incarnation is recorded"),
-        );
-        let observation = TestObservation::on_records(directory.path(), id, &surface, deadline)
-            .with_presence(|| panic!("an unproven owner allows no surface observation"));
-        #[cfg(target_os = "macos")]
-        let observation =
-            observation.with_evidence(if kind == terminal::TerminalKind::AppleTerminal {
-                &apple
-            } else {
-                terminal::close_evidence(kind)
-            });
-        observation.decide(id, &surface, deadline)
+    let stable_kind = if cfg!(windows) {
+        terminal::TerminalKind::WindowsConsole
+    } else {
+        terminal::TerminalKind::Iterm2
     };
+    let stable = |binding: &str| {
+        let surface = terminal::TerminalSession::new(stable_kind, "startup-id".into())
+            .with_binding(Some(binding.to_owned()));
+        let deadline = session_close::budget::close_deadline();
+        TestObservation::on_records(directory.path(), id, &surface, deadline)
+            .with_presence(|| panic!("stable startup identity needs no presence probe"))
+            .decide(id, &surface, deadline)
+    };
+    assert_eq!(stable(id).unwrap(), TerminalCloseAuthority::SurfaceOnly);
     assert_eq!(
-        authority(terminal::TerminalKind::Iterm2, id).unwrap(),
-        TerminalCloseAuthority::SurfaceOnly
+        stable("session-foreign").unwrap_err().to_string(),
+        format!("terminal handle belongs to managed session session-foreign, not {id}")
     );
-    assert!(authority(terminal::TerminalKind::Iterm2, "session-foreign").is_err());
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     for kind in [
         terminal::TerminalKind::AppleTerminal,
         terminal::TerminalKind::Warp,
         terminal::TerminalKind::WezTerm,
     ] {
-        let error = authority(kind, id).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no terminal observation or close was sent"),
-            "{kind:?}: {error:#}"
-        );
+        let surface = terminal::TerminalSession::new(kind, "startup-id".into())
+            .with_binding(Some(id.to_owned()));
+        let path = directory.path().join(TERMINAL_HANDLE_FILE);
+        write_json_atomic(&path, &surface).unwrap();
+        let before = fs::read(&path).unwrap();
+        for presence in [Some(false), Some(true), None] {
+            #[cfg(target_os = "macos")]
+            let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
+                |_| panic!("PID-only owner supplied an app birth"),
+                || Ok(vec![]),
+            );
+            let deadline = session_close::budget::close_deadline();
+            let observation = TestObservation::on_records(directory.path(), id, &surface, deadline)
+                .with_presence(|| presence.ok_or_else(|| anyhow::anyhow!("surface read failed")));
+            #[cfg(target_os = "macos")]
+            let observation =
+                observation.with_evidence(if kind == terminal::TerminalKind::AppleTerminal {
+                    &apple
+                } else {
+                    terminal::close_evidence(kind)
+                });
+            let result = observation.decide(id, &surface, deadline);
+            match presence {
+                Some(false) => assert_eq!(result.unwrap(), TerminalCloseAuthority::Absent),
+                Some(true) => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!(
+                        "The recorded {} surface is still present. End it, then run `tabcli close-session {id} --explicit` again.",
+                        kind.display_name()
+                    )
+                ),
+                None => assert_eq!(
+                    result.unwrap_err().root_cause().to_string(),
+                    "surface read failed"
+                ),
+            }
+            assert_eq!(
+                observation.calls(),
+                [
+                    "teardown-intent",
+                    "owner-present",
+                    "launch",
+                    "resumable",
+                    "owner",
+                    "presence"
+                ]
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
     }
     assert!(directory.path().join(TURN_CLAIM_FILE).exists());
 }

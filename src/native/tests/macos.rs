@@ -612,6 +612,8 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                 assert_eq!(claim.is_some(), phase == launch::Phase::Spawning, "{case}");
                 assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
 
+                let handle_path = directory.path().join(TERMINAL_HANDLE_FILE);
+                let original_handle = fs::read(&handle_path).unwrap();
                 let (mut observations, mut adapter_calls) = (0, 0);
                 let result = { let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
                             let deadline = crate::native::session::close::budget::close_deadline();
@@ -651,6 +653,22 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                         }; session_close::close(&Store::open_unchecked(directory.path()), None, session_close::budget::close_deadline(), |surface| closer(surface).map(Into::into)) }
                 .map(|_| ());
 
+                if mode != "absent" {
+                    let expected = if mode == "present" {
+                        format!(
+                            "The recorded {} surface is still present. End it, then run `tabcli close-session session-owner123 --explicit` again.",
+                            kind.display_name()
+                        )
+                    } else {
+                        "injected unreadable target".to_owned()
+                    };
+                    assert_eq!(
+                        result.as_ref().unwrap_err().root_cause().to_string(),
+                        expected,
+                        "{case}"
+                    );
+                    assert_eq!(fs::read(&handle_path).unwrap(), original_handle, "{case}");
+                }
                 if adapter_calls != 0 {
                     failures.push(format!("{case}: {adapter_calls} close/signal step reached"));
                 }

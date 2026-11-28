@@ -1172,24 +1172,97 @@ fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
     }
 }
 
-// The launch record is read before the kind is tested: a kind without failed-start
-// identity reads it and nothing more of the failed start.
+// These kinds have no stable failed-start close identity. A missing owner uses
+// the startup refusal, while a recorded owner permits ordinary read-only evidence.
 #[test]
 fn failed_unspawned_terminal_warp_wezterm_skip_native_identity_recovery() {
     for kind in [AppleTerminal, Warp, WezTerm] {
-        let mut row = Row::new(kind);
-        row.state = SessionState::Failed;
-        row.phase = Some(launch::Phase::Spawning);
-        row.present = true;
-        let mut calls = with(&OWNED, &["resumable", "owner", "mac-live"]);
-        if kind == AppleTerminal {
-            calls.extend(["birth", "instances"]);
+        for state in [SessionState::Launching, SessionState::Failed] {
+            for phase in [launch::Phase::Pending, launch::Phase::Spawning] {
+                for shape in [
+                    "missing",
+                    "pid-only",
+                    "incomplete",
+                    "foreign",
+                    "unbound",
+                    "reused",
+                    "exited",
+                ] {
+                    for presence in [Some(false), Some(true), None] {
+                        check_unspawned_surface(kind, state.clone(), phase, shape, presence);
+                    }
+                }
+            }
         }
-        calls.push("presence");
-        if kind == AppleTerminal {
-            calls.extend(["birth", "instances"]);
+    }
+}
+
+fn check_unspawned_surface(
+    kind: terminal::TerminalKind,
+    state: SessionState,
+    phase: launch::Phase,
+    shape: &str,
+    presence: Option<bool>,
+) {
+    let mut row = Row::new(kind);
+    row.state = state;
+    row.phase = Some(phase);
+    let owner = row.owner.as_mut().unwrap();
+    match shape {
+        "missing" => row.owner = None,
+        "pid-only" => {
+            *owner = NativeSessionOwner {
+                pid: owner.pid,
+                managed_session_id: Some(ID.into()),
+                ..Default::default()
+            }
         }
-        row.check(Err(DEAD_PRESENT), &calls);
+        "incomplete" => owner.terminal_tty_device = None,
+        "foreign" => owner.managed_session_id = Some("foreign".into()),
+        "unbound" => owner.managed_session_id = None,
+        "reused" => row.reused = true,
+        "exited" => {}
+        _ => unreachable!(),
+    }
+    let attests = matches!(shape, "exited" | "reused");
+    let mut calls = if shape == "missing" {
+        OWNERLESS.to_vec()
+    } else {
+        with(&OWNED, &["resumable", "owner"])
+    };
+    if attests {
+        calls.push("mac-live");
+    }
+    let app_reads: &[&str] = match (kind, attests) {
+        (AppleTerminal, true) => &["birth", "instances"],
+        (AppleTerminal, false) => &["instances"],
+        _ => &[],
+    };
+    calls.extend_from_slice(app_reads);
+    calls.push("presence");
+    let Some(present) = presence else {
+        row.observation_error = Some(("presence", 1));
+        let mut chain = vec![];
+        if kind != AppleTerminal && !attests {
+            chain.push(
+                "could not prove absence of the ownerless terminal surface; no close was sent",
+            );
+        }
+        chain.extend(["injected presence failure", "injected presence cause"]);
+        row.check_error_chain(&chain, &calls);
+        return;
+    };
+    calls.extend_from_slice(app_reads);
+    row.present = present;
+    if present {
+        let message = match (shape, kind) {
+            ("missing", AppleTerminal) => "Terminal.app startup has no native owner/app incarnation and its window is not proven gone; no close was sent and the surface handle is retained".into(),
+            ("missing", _) => "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained".into(),
+            _ => format!("The recorded {} surface is still present. End it, then run `tabcli close-session {ID} --explicit` again.", kind.display_name()),
+        };
+        row.check_error_chain(&[&message], &calls);
+    } else {
+        row.check(Ok(TerminalCloseAuthority::Absent), &calls);
     }
 }
 
