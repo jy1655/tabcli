@@ -123,6 +123,16 @@
   Replace the refusal with a Windows Herdr route that keeps argument semantics and size, or a
   first-party addressed input.
 
+- On Windows, TAB matches Codex project keys by ASCII case and refuses multiple matches as ambiguous.
+  A single untrusted entry declines for every matching spelling.
+  With no ASCII-case match, TAB declines if any untrusted key equals the folder key after
+  Unicode lowercasing of both, and reports no match otherwise.
+  A trusted entry requires the exact spelling if any directory from the volume root through
+  the folder's parent is case-sensitive or its flag cannot be read, including on volumes
+  that do not support the query.
+  The launch override lowercases ASCII letters, while the key in recorded evidence retains
+  the Unicode lowercase spelling of the judged folder.
+
 - The injected Windows initial paste is a bounded best-effort console fallback (#124),
   pinned to Codex 0.163.0. It assumes no concurrent input; screen snapshots are not atomic
   with TUI transitions and placeholder counts are not content receipts. Non-injected or

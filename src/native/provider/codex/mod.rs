@@ -12,6 +12,7 @@ mod test_support;
 #[cfg(test)]
 pub(in crate::native) use test_support::LaunchDecisionFixture;
 mod transcript;
+mod trust;
 mod turn;
 use self::correlation::{
     codex_input_correlates, codex_owned_string, codex_string, correlated_prompt,
@@ -388,55 +389,9 @@ impl NativeProviderAdapter for CodexAdapter {
         env: &super::super::consent::Environment,
         store: Option<&Path>,
     ) -> Result<super::super::consent::Trust> {
-        use super::super::consent::{self, Evidence, Trust};
-        let store = match store {
-            Some(store) => store.to_path_buf(),
-            None => Home::resolve(env)?.config,
-        };
-        let Some(text) = consent::read_store(&store)? else {
-            return Ok(Trust::Absent);
-        };
-        let config: toml::Value = text.parse().context("invalid Codex trust config")?;
-        let mut key = consent::native_key(workspace)?;
-        if cfg!(windows) {
-            key = key.to_lowercase();
-        }
-        let Some(projects) = config.get("projects") else {
-            return Ok(Trust::Absent);
-        };
-        let projects = projects
-            .as_table()
-            .context("Codex projects is not a table")?;
-        let entry = projects.get(&key).or_else(|| {
-            if cfg!(windows) {
-                projects
-                    .iter()
-                    .find(|(k, _)| k.to_lowercase() == key)
-                    .map(|(_, v)| v)
-            } else {
-                None
-            }
-        });
-        let entry = entry
-            .map(|v| {
-                v.as_table()
-                    .context("Codex project trust entry is not a table")
-            })
-            .transpose()?;
-        match entry.and_then(|v| v.get("trust_level")) {
-            None => Ok(Trust::Absent),
-            Some(v) if v.as_str() == Some("trusted") => Ok(Trust::Trusted(Evidence {
-                provider: "codex".into(),
-                store,
-                key,
-            })),
-            Some(v) if v.as_str() == Some("untrusted") => Ok(Trust::Declined),
-            _ => bail!("unknown Codex trust level"),
-        }
+        trust::Lookup::Workspace.read(workspace, env, store)
     }
 
-    // `workspace_trust` is already store-only: it resolves the store from `env`, reads that
-    // file, and compares `workspace` as a string key.
     fn store_lists_trusted(
         &self,
         workspace: &Path,
@@ -444,7 +399,7 @@ impl NativeProviderAdapter for CodexAdapter {
         store: Option<&Path>,
     ) -> Result<bool> {
         Ok(matches!(
-            self.workspace_trust(workspace, env, store)?,
+            trust::Lookup::StoreOnly.read(workspace, env, store)?,
             super::super::consent::Trust::Trusted(_)
         ))
     }
